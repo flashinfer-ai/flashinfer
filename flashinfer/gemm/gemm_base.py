@@ -1564,9 +1564,31 @@ def _cute_dsl_direct_bf16_gemm_runner(
         autotune_tactics,
         default_tactic,
         run_direct_dense,
+        validate_tactic,
     )
 
     class CuteDSLDirectBf16Runner(TunableRunner):
+        def is_tactic_compatible(
+            self, inputs: List[torch.Tensor], tactic: object
+        ) -> bool:
+            if tactic == -1:
+                return True
+            a, b, bias, *_ = inputs
+            if bias is not None:
+                return False
+            try:
+                if not isinstance(tactic, (DirectTactic, tuple, list)):
+                    return False
+                tactic = (
+                    tactic
+                    if isinstance(tactic, DirectTactic)
+                    else DirectTactic(*tactic)
+                )
+                validate_tactic(tactic, a.shape[0], b.shape[1], a.shape[1])
+            except (TypeError, ValueError):
+                return False
+            return True
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, _, _, pdl, out, *_ = inputs
             return (
@@ -1632,6 +1654,7 @@ def bf16_gemm_sm100(
     is_b_k_major = b.stride(-2) == 1
 
     runners = []
+    direct_runner = None
     if "cudnn" in runner_names:
         runners.append(
             _cudnn_gemm_bf16_runner(
@@ -1678,6 +1701,13 @@ def bf16_gemm_sm100(
         _BF16_GEMM_SM100_TUNING_CONFIG,
         inputs,
     )
+
+    if (
+        direct_runner is not None
+        and runner is direct_runner
+        and not direct_runner.is_tactic_compatible(inputs, tactic)
+    ):
+        runner, tactic = runners[0], -1
 
     runner(inputs=inputs, tactic=tactic)
 

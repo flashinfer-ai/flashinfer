@@ -1,3 +1,5 @@
+import functools
+import math
 from enum import IntEnum
 
 import torch
@@ -8,11 +10,16 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu import warpgroup
 
-from ...utils import get_device_sm_count, _get_cache_buf
+from ...utils import (
+    _get_cache_buf,
+    get_compute_capability,
+    get_device_name,
+    get_device_sm_count,
+)
 from .alpha import AlphaProcessor
 from .collective_inverse_hmma import CollectiveInverse
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import KeyedCompileMixin, cached_compile
+from .custom_compile_cache import KeyedCompileMixin, cached_compile, get_cached_compile
 from .helpers import (
     SM90,
     TF32,
@@ -37,6 +44,14 @@ from .delta_rule_sm90 import (
     LoadStoreWarpRole,
 )
 from .schedule import WorkDesc
+
+
+_SM90_COMPILE_OPTIONS = (cute.EnableTVMFFI(True), cute.GPUArch("sm_90a"))
+
+
+def _get_cp_workspace(name, shape, dtype, device):
+    nbytes = math.prod(shape) * dtype.itemsize
+    return _get_cache_buf(name, nbytes, device)[:nbytes].view(dtype).view(shape)
 
 
 class NamedBarrier(IntEnum):
@@ -440,6 +455,11 @@ class CPDeltaRuleTPrecomputeSm90(KeyedCompileMixin):
             beta_pipeline.consumer_release(beta_consumer_state)
 
 
+@functools.cache
+def _get_t_precompute_kernel(kernel_dtype):
+    return CPDeltaRuleTPrecomputeSm90(kernel_dtype)
+
+
 def cp_delta_rule_t_precompute_dsl_sm90(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -448,6 +468,8 @@ def cp_delta_rule_t_precompute_dsl_sm90(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Precompute signed, beta-folded CP T tiles on SM90.
 
@@ -458,9 +480,9 @@ def cp_delta_rule_t_precompute_dsl_sm90(
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
@@ -508,8 +530,11 @@ def cp_delta_rule_t_precompute_dsl_sm90(
                 raise RuntimeError(f"{name} must be contiguous")
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     max_t_blocks_per_seq = max_num_chunks_host(max_seqlen, 64)
-    t = torch.empty(
-        (total_t_blocks, num_sab_heads, 64, 64), dtype=k.dtype, device=k.device
+    t = _get_cp_workspace(
+        "gdn_cp_sm90_t",
+        (total_t_blocks, num_sab_heads, 64, 64),
+        k.dtype,
+        device,
     )
     if total_t_blocks == 0:
         return t
@@ -523,34 +548,45 @@ def cp_delta_rule_t_precompute_dsl_sm90(
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    kernel = _get_t_precompute_kernel(kernel_dtype)
+    compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
+    if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    kernel = CPDeltaRuleTPrecomputeSm90(kernel_dtype)
-    kernel_args = (
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(t.view(-1), assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(total_t_blocks),
-        cutlass.Int32(max_t_blocks_per_seq),
-        cutlass.Int32(num_seqs),
+        kernel_args = (
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(t.view(-1), assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(total_t_blocks),
+            cutlass.Int32(max_t_blocks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(
+            kernel, *kernel_args, compile_options=_SM90_COMPILE_OPTIONS
+        )
+    compiled(
+        k_tma,
+        beta.reshape(-1),
+        t.view(-1),
+        cu_seqlens,
+        num_k_heads,
+        num_sab_heads,
+        total_t_blocks,
+        max_t_blocks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled(*kernel_args)
     return t
 
 
@@ -1583,6 +1619,11 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
                 )
 
 
+@functools.cache
+def _get_mn_precompute_kernel(kernel_dtype):
+    return CPDeltaRuleMNPrecomputeSm90(kernel_dtype)
+
+
 def cp_delta_rule_mn_precompute_dsl_sm90(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1594,6 +1635,8 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Run the SM90 CP preprocess kernel and return its native output layout.
 
@@ -1604,9 +1647,9 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
@@ -1694,11 +1737,12 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             num_sab_heads * 64 * 64,
         ),
     )
-    transfer_t = torch.empty(
-        (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
+    workspace_shape = (total_cp_chunks, num_sab_heads, d, d)
+    transfer_t = _get_cp_workspace(
+        "gdn_cp_sm90_local_transfer", workspace_shape, torch.float32, device
     )
-    state_t = torch.empty(
-        (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
+    state_t = _get_cp_workspace(
+        "gdn_cp_sm90_local_state", workspace_shape, torch.float32, device
     )
     if total_cp_chunks == 0:
         return transfer_t, state_t
@@ -1708,39 +1752,55 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    kernel = _get_mn_precompute_kernel(kernel_dtype)
+    compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
+    if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    kernel = CPDeltaRuleMNPrecomputeSm90(kernel_dtype)
-    kernel_args = (
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(alpha.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(transfer_t.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(state_t.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(max_cp_chunks_per_seq),
-        cutlass.Int32(num_seqs),
+        kernel_args = (
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(alpha.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(transfer_t.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(state_t.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(max_cp_chunks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(
+            kernel, *kernel_args, compile_options=_SM90_COMPILE_OPTIONS
+        )
+    compiled(
+        k_tma,
+        v_tma,
+        t_tma,
+        alpha.view(-1),
+        transfer_t.view(-1),
+        state_t.view(-1),
+        cu_seqlens,
+        cp_chunk_len,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        total_cp_chunks,
+        max_cp_chunks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled(*kernel_args)
     return transfer_t, state_t
 
 
@@ -2550,6 +2610,17 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         self.zero_invalid_slots(gFixedState_gap, gap_end - gap_start, col)
 
 
+@functools.cache
+def _get_fixup_kernel(needs_initial_state, kernel_kind):
+    if kernel_kind == "simt_row4":
+        return CPDeltaRuleFixupSimtSm90(needs_initial_state, 4)
+    if kernel_kind == "simt_row8":
+        return CPDeltaRuleFixupSimtSm90(needs_initial_state, 8)
+    if kernel_kind == "hmma":
+        return CPDeltaRuleFixupHmmaSm90(needs_initial_state)
+    raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
+
+
 def cp_delta_rule_fixup_dsl_sm90(
     local_transfer: torch.Tensor,
     local_state: torch.Tensor,
@@ -2560,6 +2631,8 @@ def cp_delta_rule_fixup_dsl_sm90(
     *,
     _skip_check: bool = False,
     _kernel_kind: str | None = None,
+    _device=None,
+    _stream=None,
 ):
     """Fix CP precompute chunk artifacts into global chunk-boundary states.
 
@@ -2567,9 +2640,9 @@ def cp_delta_rule_fixup_dsl_sm90(
     `(total_cp_chunks, num_heads, DimV, DimK)` layout produced by
     `cp_delta_rule_mn_precompute_dsl_sm90`.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = local_transfer.device if _device is None else _device
     if not _skip_check:
         if local_transfer.ndim != 4:
             raise RuntimeError(
@@ -2634,12 +2707,17 @@ def cp_delta_rule_fixup_dsl_sm90(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = torch.empty_like(local_state)
+    fixed_state = _get_cp_workspace(
+        "gdn_cp_sm90_fixed_state", local_state.shape, local_state.dtype, device
+    )
     if total_cp_chunks == 0:
         return fixed_state
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
     d = local_transfer.shape[-1]
     local_transfer_tma = local_transfer.as_strided(
         (d, d, num_heads, total_cp_chunks),
@@ -2650,18 +2728,7 @@ def cp_delta_rule_fixup_dsl_sm90(
         (d, 1, d * d, num_heads * d * d),
     )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-
     needs_initial_state = initial_state is not None
-    initial_state_cute = (
-        from_dlpack(initial_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_initial_state
-        else None
-    )
     if _kernel_kind is None:
         if num_heads <= 8:
             _kernel_kind = "simt_row4"
@@ -2669,36 +2736,52 @@ def cp_delta_rule_fixup_dsl_sm90(
             _kernel_kind = "simt_row8"
         else:
             _kernel_kind = "hmma"
-    if _kernel_kind == "simt_row4":
-        kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 4)  # type: ignore
-    elif _kernel_kind == "simt_row8":
-        kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 8)  # type: ignore
-    elif _kernel_kind == "hmma":
-        kernel = CPDeltaRuleFixupHmmaSm90(needs_initial_state)  # type: ignore
-    else:
-        raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
-    kernel_args = (
-        from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
-            leading_dim=1
-        ),
-        from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
-            leading_dim=1
-        ),
-        initial_state_cute,
-        from_dlpack(fixed_state.reshape(-1), assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(num_seqs),
-        cutlass.Int32(num_heads),
+    kernel = _get_fixup_kernel(needs_initial_state, _kernel_kind)
+    compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
+    if compiled is None:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
+        initial_state_cute = (
+            from_dlpack(
+                initial_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_initial_state
+            else None
+        )
+        kernel_args = (
+            from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            initial_state_cute,
+            from_dlpack(
+                fixed_state.reshape(-1), assumed_align=128
+            ).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(num_seqs),
+            cutlass.Int32(num_heads),
+            stream,
+        )
+        compiled = cached_compile(
+            kernel, *kernel_args, compile_options=_SM90_COMPILE_OPTIONS
+        )
+    compiled(
+        local_transfer_tma,
+        local_state_tma,
+        initial_state.reshape(-1) if needs_initial_state else None,
+        fixed_state.reshape(-1),
+        cu_seqlens,
+        cp_chunk_len,
+        total_cp_chunks,
+        num_seqs,
+        num_heads,
         stream,
     )
-    compiled = cached_compile(
-        kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled(*kernel_args)
     return fixed_state
 
 
@@ -3900,6 +3983,15 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                     )
 
 
+@functools.cache
+def _get_prefill_kernel(kernel_dtype, needs_initial_state, store_final_state):
+    return CPDeltaRulePrefillSm90(
+        kernel_dtype,
+        needs_initial_state=needs_initial_state,
+        store_final_state=store_final_state,
+    )
+
+
 def cp_delta_rule_prefill_dsl_sm90(
     o: torch.Tensor,
     state: torch.Tensor | None,
@@ -3917,6 +4009,8 @@ def cp_delta_rule_prefill_dsl_sm90(
     initial_state: torch.Tensor | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Run CP main prefill with precomputed T and fixed-up chunk states.
 
@@ -3924,9 +4018,9 @@ def cp_delta_rule_prefill_dsl_sm90(
     workspaces. `state` is the public per-sequence final state in native
     `(DimV, DimK)` layout.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = q.device if _device is None else _device
     if not _skip_check:
         if q.ndim != 3:
             raise RuntimeError(
@@ -4089,59 +4183,81 @@ def cp_delta_rule_prefill_dsl_sm90(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    workspace_size = get_device_sm_count(q.device) * 128
-    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, q.device)
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
-
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
+    workspace_size = get_device_sm_count(device) * 128
+    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, device)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
     needs_initial_state = initial_state is not None
     store_final_state = state is not None
-    initial_state_cute = (
-        from_dlpack(initial_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_initial_state
-        else None
-    )
-    kernel = CPDeltaRulePrefillSm90(
-        kernel_dtype,
-        needs_initial_state=needs_initial_state,
-        store_final_state=store_final_state,
-    )
+    kernel = _get_prefill_kernel(kernel_dtype, needs_initial_state, store_final_state)
     state_arg = state if store_final_state else fixed_state
-    kernel_args = (
-        from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(state_arg.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(fixed_state.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        initial_state_cute,
-        from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(max_cp_chunks_per_seq),
-        cutlass.Int32(num_seqs),
+    compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
+    if compiled is None:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
+        initial_state_cute = (
+            from_dlpack(
+                initial_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_initial_state
+            else None
+        )
+        kernel_args = (
+            from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(state_arg.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(
+                fixed_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic(),
+            initial_state_cute,
+            from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Float32(scale),
+            cutlass.Int32(num_q_heads),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(max_cp_chunks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(
+            kernel, *kernel_args, compile_options=_SM90_COMPILE_OPTIONS
+        )
+    compiled(
+        q_tma,
+        k_tma,
+        v_tma,
+        t_tma,
+        o_tma,
+        alpha.reshape(-1),
+        state_arg.reshape(-1),
+        fixed_state.reshape(-1),
+        initial_state.reshape(-1) if needs_initial_state else None,
+        tensormaps_t,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        cp_chunk_len,
+        total_cp_chunks,
+        max_cp_chunks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled(*kernel_args)
 
 
 def cp_delta_rule_dsl_sm90(
@@ -4166,6 +4282,14 @@ def cp_delta_rule_dsl_sm90(
     prefill path. Internal T, M, N, and fixed-state tensors use the varlen
     workspace layout.
     """
+    import cuda.bindings.driver as cuda_driver
+
+    device = q.device
+    device_name = get_device_name(device)
+    device_capability = get_compute_capability(device)
+    num_sms = get_device_sm_count(device)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
     total_seqlen = q.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
     if max_seqlen is None and num_seqs == 1:
@@ -4176,15 +4300,15 @@ def cp_delta_rule_dsl_sm90(
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     if cp_chunk_len is None:
         num_heads = max(q.shape[1], v.shape[1])
-        num_sms = get_device_sm_count(q.device)
         cp_chunk_len = choose_cp_chunk_len_host(
             max_seqlen,
             num_heads,
             num_sms,
             chunk_len_granularity=cp_chunk_len_granularity,
-            device_capability=torch.cuda.get_device_capability(q.device),
+            device_capability=device_capability,
             total_seqlen=total_seqlen,
-            device_name=torch.cuda.get_device_properties(q.device).name,
+            num_seqs=num_seqs,
+            device_name=device_name,
         )
     if q.ndim != 3:
         raise RuntimeError(
@@ -4282,7 +4406,14 @@ def cp_delta_rule_dsl_sm90(
             raise RuntimeError(f"{name} must be contiguous")
 
     t = cp_delta_rule_t_precompute_dsl_sm90(
-        k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen, _skip_check=True
+        k,
+        beta,
+        cu_seqlens,
+        total_seqlen,
+        max_seqlen=max_seqlen,
+        _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
         k,
@@ -4294,6 +4425,8 @@ def cp_delta_rule_dsl_sm90(
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
     fixed_state = cp_delta_rule_fixup_dsl_sm90(
         local_transfer,
@@ -4303,6 +4436,8 @@ def cp_delta_rule_dsl_sm90(
         cp_chunk_len=cp_chunk_len,
         initial_state=initial_state,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
 
     cp_delta_rule_prefill_dsl_sm90(
@@ -4321,4 +4456,6 @@ def cp_delta_rule_dsl_sm90(
         max_seqlen=max_seqlen,
         initial_state=initial_state,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )

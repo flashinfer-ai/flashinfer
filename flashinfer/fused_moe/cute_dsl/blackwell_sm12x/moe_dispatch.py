@@ -7,6 +7,7 @@ selection.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import weakref
 from dataclasses import dataclass
@@ -19,11 +20,11 @@ import torch
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,
-    current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
 )
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -31,7 +32,11 @@ from .moe_direct_micro_kernel import (
     compile_direct_micro_kernel,
     compiled_direct_micro_accepts_block_dim,
 )
-from .moe_dynamic_kernel import _TASK_SLICE_CHUNK, MoEDynamicKernel
+from .moe_dynamic_kernel import (
+    _MAX_SHARED_INPUT_TOPK,
+    _TASK_SLICE_CHUNK,
+    MoEDynamicKernel,
+)
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
 from .moe_w4a16_fp4_helpers import swizzle_block_scale
@@ -54,6 +59,7 @@ from .moe_w4a16_prepare import (
 # Constants
 # ---------------------------------------------------------------------------
 _NVFP4_BLOCK_SIZE = 16
+_MXFP4_BLOCK_SIZE = 32
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 # Must equal the kernel's task materialization granularity or the task
@@ -193,6 +199,7 @@ def _normalize_quant_mode(
         "fp4": "nvfp4",
         "nvfp4": "nvfp4",
         "w4a4": "nvfp4",
+        "mxfp4": "mxfp4",
         "bf16": "w4a16",
         "w4a16": "w4a16",
     }
@@ -200,8 +207,17 @@ def _normalize_quant_mode(
         return aliases[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+            "quant_mode must be 'nvfp4'/'w4a4', 'mxfp4', or 'w4a16' "
+            f"(got {quant_mode!r})."
         ) from exc
+
+
+def _sf_params_for_quant_mode(quant_mode: str):
+    """Return (vector size, CuTe scale dtype) for a W4A4 mode."""
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "mxfp4":
+        return _MXFP4_BLOCK_SIZE, cutlass.Float8E8M0FNU
+    return _NVFP4_BLOCK_SIZE, cutlass.Float8E4M3FN
 
 
 def _activation_precision_from_quant_mode(quant_mode: str) -> str:
@@ -210,7 +226,7 @@ def _activation_precision_from_quant_mode(quant_mode: str) -> str:
 
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
     normalized = _normalize_source_format(source_format)
-    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
+    if quant_mode != "w4a16" and normalized == "compressed_tensors":
         raise ValueError(
             "source_format='compressed_tensors' requires quant_mode='w4a16'."
         )
@@ -334,6 +350,7 @@ class Sm120StaticMoEWorkspace:
     num_topk: int
     device: torch.device
     activation_precision: str
+    quant_mode: str
 
     # Buffers
     row_counts: torch.Tensor  # [state_E] int32
@@ -380,6 +397,7 @@ def allocate_sm120_static_workspace(
     num_topk: int,
     device: torch.device,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> Sm120StaticMoEWorkspace:
     """Allocate workspace buffers for the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -389,8 +407,10 @@ def allocate_sm120_static_workspace(
             "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
         )
 
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
     _check_memref_limit("static packed_input", state_E * max_rows * (k // 2))
     _check_memref_limit("static packed_input_scale", state_E * rows_pad_k * cols_pad_k)
     packed_input = torch.empty(
@@ -406,6 +426,7 @@ def allocate_sm120_static_workspace(
         num_topk=num_topk,
         device=device,
         activation_precision=activation_precision,
+        quant_mode=quant_mode,
         row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
         token_weights=torch.zeros(
@@ -426,7 +447,6 @@ def allocate_sm120_static_workspace(
     )
 
     # Finalize views
-    sf_dtype = cutlass.Float8E4M3FN
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
         torch.float4_e2m1fn_x2
     )
@@ -441,7 +461,11 @@ def allocate_sm120_static_workspace(
 
     # Direct micro reads weights by global expert id, so its planes are only
     # useful without EP remapping.
-    if state_E == weight_E and _direct_micro_candidate(k, n, num_topk, weight_E):
+    if (
+        quant_mode == "nvfp4"
+        and state_E == weight_E
+        and _direct_micro_candidate(k, n, num_topk, weight_E)
+    ):
         dm_rows = min(max_rows, _MICRO_MAX_TOKENS * num_topk)
         # The epoch-based barriers restore their slots after each launch, so
         # the zeroed allocation is the only reset needed (graph-replay safe).
@@ -509,6 +533,7 @@ def _get_weight_views(
     n: int,
     k: int,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> _WeightViews:
     """Create permuted weight views for the static kernel.
 
@@ -516,6 +541,8 @@ def _get_weight_views(
     via a single TMA descriptor.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     tile_n = _level_tile_n(activation_precision)
     # The kernel splits w13 into gate/up halves by tile index. This only works
     # when the boundary between halves lands on a tile-aligned column.
@@ -527,6 +554,7 @@ def _get_weight_views(
 
     key = (
         activation_precision,
+        quant_mode,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -540,10 +568,18 @@ def _get_weight_views(
         w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
         cached = (
             convert_sf_from_mma_layout(
-                w1_blockscale, m=w1_rows, k=k, num_groups=w1_fp4.shape[0]
+                w1_blockscale,
+                m=w1_rows,
+                k=k,
+                num_groups=w1_fp4.shape[0],
+                sf_vec_size=sf_vec_size,
             ).contiguous(),
             convert_sf_from_mma_layout(
-                w2_blockscale, m=k, k=n, num_groups=w2_fp4.shape[0]
+                w2_blockscale,
+                m=k,
+                k=n,
+                num_groups=w2_fp4.shape[0],
+                sf_vec_size=sf_vec_size,
             ).contiguous(),
             w1_alphas.contiguous().to(torch.float32),
             w2_alphas.contiguous().to(torch.float32),
@@ -562,7 +598,6 @@ def _get_weight_views(
     w13_sf_contiguous, down_sf_contiguous, w1_alpha, w2_alpha = cached
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy).
-    sf_dtype = cutlass.Float8E4M3FN
     w13 = w1_fp4.permute(1, 2, 0)
     down = w2_fp4.permute(1, 2, 0)
     return _WeightViews(
@@ -593,7 +628,211 @@ def _get_weight_views(
 
 # ---------------------------------------------------------------------------
 # Kernel compilation cache
+#
+# The three kernels below are compiled through the shared on-disk CuTe-DSL
+# cache (#3874, #4029; docs/design_docs/cute_dsl_kernel_cache.md), so a fresh
+# process JITLinks an exported ``.o`` instead of re-running the MLIR pipeline.
+# The in-process dicts stay as the level-1 memoization the design describes.
 # ---------------------------------------------------------------------------
+_CUTE_DSL_MODULE = "b12x_moe"
+
+
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache.
+
+    Every module contributing device code to the three kernels compiled here:
+    the kernel bodies, the shared activation and FP4 device helpers, and the
+    SM120 layout builders and block-scaled mainloop they are built from.
+    """
+    from flashinfer.cute_dsl import fp4_common
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm120_b12x
+
+    from ._moe_dynamic import gated as moe_dynamic_gated
+    from ._moe_dynamic import generic as moe_dynamic_generic
+    from . import (
+        moe_activation,
+        moe_dynamic_kernel,
+        moe_micro_kernel,
+        moe_static_kernel,
+    )
+
+    return (
+        __file__,
+        moe_activation.__file__,
+        moe_static_kernel.__file__,
+        moe_micro_kernel.__file__,
+        moe_dynamic_kernel.__file__,
+        moe_dynamic_gated.__file__,
+        moe_dynamic_generic.__file__,
+        cute_dsl_utils.__file__,
+        fp4_common.__file__,
+        dense_blockscaled_gemm_sm120_b12x.__file__,
+    )
+
+
+def _disk_kernel_name(prefix: str, cache_key: Tuple) -> str:
+    """On-disk specialization name for an in-process kernel cache key.
+
+    The name is the *sole* per-kernel cache key — the module ``meta.json``
+    guards only module-wide facts (arch, DSL stack, source hashes) — so it has
+    to be injective in every codegen parameter. It is therefore derived from
+    the very tuple that keys the in-process cache: a readable shape prefix for
+    humans browsing ``cached_ops/``, plus a digest of the exact tuple.
+
+    The digest, rather than a formatted field list, is what makes the mapping
+    injective: the keys contain floats and ``None`` (``swiglu_alpha`` /
+    ``swiglu_beta`` / ``swiglu_limit``) whose textual forms would collide once
+    sanitized into a filename (``1.5`` and ``-1.5`` both sanitize to ``1_5``).
+    """
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _static_kernel_cache_key(
+    *,
+    activation_precision: str,
+    quant_mode: str,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+) -> Tuple:
+    """The static kernel's cache key: every parameter affecting its codegen.
+
+    Single source of truth for both cache levels — the in-process dict and,
+    through :func:`_disk_kernel_name`, the on-disk artifact name.
+    """
+    return (
+        "static",
+        activation_precision,
+        quant_mode,
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+    )
+
+
+def _micro_kernel_cache_key(
+    *,
+    quant_mode: str,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    single_token: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+) -> Tuple:
+    """The micro kernel's cache key (see :func:`_static_kernel_cache_key`)."""
+    return (
+        "micro",
+        quant_mode,
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        share_input_across_experts,
+        share_expert_scales,
+        single_token,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+    )
+
+
+def _dynamic_kernel_cache_key(
+    *,
+    activation_precision: str,
+    quant_mode: str,
+    E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+    share_input_across_experts: bool,
+) -> Tuple:
+    """The dynamic kernel's cache key (see :func:`_static_kernel_cache_key`).
+
+    Deliberately free of ``m`` / ``max_rows``: the dynamic kernel takes its
+    runtime-shaped operands as pointers, so one artifact serves every batch
+    size.
+    """
+    return (
+        "dynamic",
+        activation_precision,
+        quant_mode,
+        E,
+        k,
+        n,
+        num_topk,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        share_input_across_experts,
+    )
+
+
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -615,6 +854,7 @@ def _get_static_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -622,7 +862,8 @@ def _get_static_kernel(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
         )
-    sf_vec_size = 16
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
         mac_override
@@ -636,25 +877,25 @@ def _get_static_kernel(
     if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
-    cache_key = (
-        "static",
-        activation_precision,
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
+    cache_key = _static_kernel_cache_key(
+        activation_precision=activation_precision,
+        quant_mode=quant_mode,
+        state_E=state_E,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        max_rows=max_rows,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -662,7 +903,6 @@ def _get_static_kernel(
 
     ab_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -683,7 +923,7 @@ def _get_static_kernel(
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation
     a_input_fake = cute.runtime.make_fake_compact_tensor(
@@ -805,35 +1045,41 @@ def _get_static_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        lambda: cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -864,9 +1110,11 @@ def _get_micro_kernel(
     swiglu_alpha: float = 1.702,
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
-    sf_vec_size = 16
+    quant_mode = _normalize_quant_mode(quant_mode)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
         mac_override
@@ -878,34 +1126,33 @@ def _get_micro_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 
-    cache_key = (
-        "micro",
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
+    cache_key = _micro_kernel_cache_key(
+        quant_mode=quant_mode,
+        state_E=state_E,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        max_rows=max_rows,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -928,7 +1175,7 @@ def _get_micro_kernel(
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation (identical to static kernel)
     a_input_fake = cute.runtime.make_fake_compact_tensor(
@@ -1050,35 +1297,41 @@ def _get_micro_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"micro_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        lambda: cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -1209,6 +1462,7 @@ def launch_sm120_static_moe(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Launch the SM120 static, micro, or direct micro MoE kernel.
 
@@ -1220,6 +1474,7 @@ def launch_sm120_static_moe(
     """
     _check_memref_limit("scatter_output", scatter_output.numel())
     activation_precision = _normalize_activation_precision(activation_precision)
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static launcher"
@@ -1255,7 +1510,7 @@ def launch_sm120_static_moe(
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
     use_direct_micro = (
-        activation_precision == "fp4"
+        quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
@@ -1266,6 +1521,10 @@ def launch_sm120_static_moe(
     )
     if _FORCED_BACKEND is not None:
         if _FORCED_BACKEND == "direct_micro":
+            if quant_mode != "nvfp4":
+                raise ValueError(
+                    "forced direct_micro backend only supports quant_mode=nvfp4"
+                )
             if workspace.dm_barrier_count is None or not (
                 MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
             ):
@@ -1436,6 +1695,7 @@ def launch_sm120_static_moe(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            quant_mode=quant_mode,
         )
     else:
         compiled, mac = _get_static_kernel(
@@ -1455,10 +1715,15 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
         launch_ids = flat_ids
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
+    # No stream argument: the kernels compile against
+    # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
+    # the caller's current stream and the parameter is absent from the
+    # compiled signature.
     runtime_args: Tuple[Any, ...] = (
         a,
         launch_ids,
@@ -1485,7 +1750,7 @@ def launch_sm120_static_moe(
         workspace.token_map,
         workspace.token_weights,
     )
-    compiled(*runtime_args, current_cuda_stream())
+    compiled(*runtime_args)
 
     return scatter_output
 
@@ -1532,6 +1797,7 @@ class Sm120DynamicMoEWorkspace:
     num_topk: int
     device: torch.device
     activation_precision: str
+    quant_mode: str
 
     # Core buffers
     row_counts: torch.Tensor
@@ -1601,6 +1867,7 @@ def allocate_sm120_dynamic_workspace(
     device: torch.device,
     activation_precision: str = "fp4",
     activation: str = "silu",
+    quant_mode: str = "nvfp4",
 ) -> Sm120DynamicMoEWorkspace:
     """Allocate workspace buffers for the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1609,6 +1876,8 @@ def allocate_sm120_dynamic_workspace(
             "allocate_sm120_dynamic_workspace only supports quant_mode='nvfp4'; "
             "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
         )
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     tile_m = _select_dynamic_tile_m(routed_rows, state_E, activation)
     physical_tiles, _, max_tasks = _dynamic_task_geometry(
         state_E,
@@ -1621,7 +1890,7 @@ def allocate_sm120_dynamic_workspace(
     # The kernel addresses activation scales in 128-row SF atoms regardless of
     # tile_m, so the scale plane must cover the last partial atom.
     scale_rows = _align_up(rows_padded, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
     _check_memref_limit("dynamic packed_input", rows_padded * (k // 2))
     _check_memref_limit("dynamic packed_input_scale", scale_rows * cols_pad_k)
     packed_input = torch.empty(1, rows_padded, k // 2, dtype=torch.uint8, device=device)
@@ -1635,6 +1904,7 @@ def allocate_sm120_dynamic_workspace(
         num_topk=num_topk,
         device=device,
         activation_precision=activation_precision,
+        quant_mode=quant_mode,
         routed_rows_capacity=routed_rows,
         physical_tiles_capacity=physical_tiles,
         task_capacity=max_tasks,
@@ -1658,7 +1928,6 @@ def allocate_sm120_dynamic_workspace(
     )
 
     # Finalize views
-    sf_dtype = cutlass.Float8E4M3FN
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
         torch.float4_e2m1fn_x2
     )
@@ -1681,7 +1950,14 @@ def allocate_sm120_dynamic_workspace(
 class _DynamicMoELaunch:
     """Thin JIT wrapper that makes num_tokens and max_rows runtime Int32."""
 
-    def __init__(self, kernel, k, num_topk, activation_precision: str = "fp4"):
+    def __init__(
+        self,
+        kernel,
+        k,
+        num_topk,
+        activation_precision: str = "fp4",
+        sf_vec_size: int = _NVFP4_BLOCK_SIZE,
+    ):
         activation_precision = _normalize_activation_precision(activation_precision)
         if activation_precision == "bf16":
             raise ValueError(
@@ -1691,7 +1967,7 @@ class _DynamicMoELaunch:
         self._k = k
         self._packed_storage_cols = k // 2
         self._num_topk = num_topk
-        self._cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+        self._cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     @cute.jit
     def __call__(
@@ -1832,6 +2108,7 @@ def _get_dynamic_kernel(
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
     tile_m: int = _LEVEL_TILE_M,
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1839,10 +2116,16 @@ def _get_dynamic_kernel(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic compiler"
         )
+    # Both dynamic implementations reserve 32 route slots per token for the
+    # shared-input fast path. Larger top-k values remain correct by using the
+    # generic per-route producer instead.
     share_input_across_experts = bool(
-        share_input_across_experts and activation_precision == "fp4"
+        share_input_across_experts
+        and activation_precision == "fp4"
+        and num_topk <= _MAX_SHARED_INPUT_TOPK
     )
-    sf_vec_size = 16
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
     tuned_mac = _lookup_mac_ladder(_DYNAMIC_MAC_LADDER, m * num_topk)
@@ -1851,23 +2134,23 @@ def _get_dynamic_kernel(
     # and scale indexing matches the allocated scratch geometry.
     mma_tiler_mn = (tile_m, _level_tile_n(activation_precision))
 
-    cache_key = (
-        "dynamic",
-        activation_precision,
-        E,
-        k,
-        n,
-        num_topk,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        share_input_across_experts,
+    cache_key = _dynamic_kernel_cache_key(
+        activation_precision=activation_precision,
+        quant_mode=quant_mode,
+        E=E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        share_input_across_experts=share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1878,7 +2161,6 @@ def _get_dynamic_kernel(
 
     scratch_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -1892,12 +2174,16 @@ def _get_dynamic_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
+        hidden_size=k,
+        intermediate_size=n,
+        num_topk=num_topk,
     )
     launch = _DynamicMoELaunch(
         kernel,
         k=k,
         num_topk=num_topk,
         activation_precision=activation_precision,
+        sf_vec_size=sf_vec_size,
     )
 
     topk_ids_cutlass_dtype = (
@@ -1991,43 +2277,49 @@ def _get_dynamic_kernel(
         alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
     )
 
-    compiled = cute.compile(
-        launch,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        pair_head_fake,
-        task_head_fake,
-        task_tail_fake,
-        task_expert_fake,
-        task_valid_rows_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        expert_write_rows_fake,
-        expert_tile_base_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        1,
-        1,
-        1,
-        1,  # runtime Int32 placeholders
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"dynamic_e{E}_k{k}_n{n}_t{num_topk}", cache_key),
+        lambda: cute.compile(
+            launch,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            pair_head_fake,
+            task_head_fake,
+            task_tail_fake,
+            task_expert_fake,
+            task_valid_rows_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            expert_write_rows_fake,
+            expert_tile_base_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            1,
+            1,
+            1,
+            1,  # runtime Int32 placeholders
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -2060,6 +2352,7 @@ def launch_sm120_dynamic_moe(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -2068,6 +2361,7 @@ def launch_sm120_dynamic_moe(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic launcher"
         )
     _check_memref_limit("scatter_output", scatter_output.numel())
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
     input_gs_is_shared = input_gs.numel() == 1
@@ -2093,10 +2387,12 @@ def launch_sm120_dynamic_moe(
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
         tile_m=workspace.tile_m,
+        quant_mode=quant_mode,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
-    # fixed-shape args are Tensor (pass torch tensor directly).
+    # fixed-shape args are Tensor (pass torch tensor directly).  No stream
+    # argument -- see the note in launch_sm120_static_moe.
     runtime_args: Tuple[Any, ...] = (
         a.data_ptr(),
         flat_ids.data_ptr(),
@@ -2131,7 +2427,7 @@ def launch_sm120_dynamic_moe(
         workspace.physical_tiles_capacity * workspace.tile_m,
         workspace.task_capacity,
     )
-    compiled(*runtime_args, current_cuda_stream())
+    compiled(*runtime_args)
 
     return scatter_output
 
@@ -2607,6 +2903,7 @@ def allocate_sm120_moe_workspace(
             ),
             num_topk=int(num_topk),
             activation_precision=activation_precision,
+            quant_mode=mode,
         )
     if backend == "dynamic":
         return allocate_sm120_dynamic_workspace(
@@ -2619,6 +2916,7 @@ def allocate_sm120_moe_workspace(
             device=device,
             activation_precision=activation_precision,
             activation=activation,
+            quant_mode=mode,
         )
     if backend == "static":
         return allocate_sm120_static_workspace(
@@ -2630,6 +2928,7 @@ def allocate_sm120_moe_workspace(
             num_topk=num_topk,
             device=device,
             activation_precision=activation_precision,
+            quant_mode=mode,
         )
     raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
@@ -2733,11 +3032,14 @@ def _pad_intermediate_to_tile(
     h,
     num_experts,
     is_gated,
+    quant_mode="nvfp4",
 ):
-    """Zero-pad NVFP4 weights + scale factors so the intermediate size is a
+    """Zero-pad W4A4 weights + scale factors so the intermediate size is a
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
     zero, so the result is numerically identical.
     """
+    quant_mode = _normalize_quant_mode(quant_mode)
+    sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
     n_pad = ((n + tile - 1) // tile) * tile
     if n_pad == n:
         return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
@@ -2749,6 +3051,7 @@ def _pad_intermediate_to_tile(
         h,
         E,
         bool(is_gated),
+        quant_mode,
         w1_weight.data_ptr(),
         w1_weight_sf.data_ptr(),
         w2_weight.data_ptr(),
@@ -2760,18 +3063,46 @@ def _pad_intermediate_to_tile(
         return cached
 
     def mma_to_logical(sf, m, k):
-        sw = convert_sf_from_mma_layout(sf, m=m, k=k, num_groups=E)
+        sw = convert_sf_from_mma_layout(
+            sf,
+            m=m,
+            k=k,
+            num_groups=E,
+            sf_vec_size=sf_vec_size,
+        )
         m_pad = ((m + 127) // 128) * 128
         sw = sw.reshape(E, m_pad, -1)
-        cb = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE
+        cb = (k + sf_vec_size - 1) // sf_vec_size
+        # MXFP4 logical scales remain raw UE8M0 bytes.
+        if quant_mode == "mxfp4":
+            cols_padded = ((cb + 3) // 4) * 4
+            return torch.stack(
+                [
+                    sw[e]
+                    .reshape(m_pad // 128, cols_padded // 4, 32, 4, 4)
+                    .permute(0, 3, 2, 1, 4)
+                    .contiguous()
+                    .reshape(m_pad, cols_padded)[:m, :cb]
+                    for e in range(E)
+                ],
+                0,
+            )
+        # NVFP4 logical scales are decoded float32 magnitudes.
         return torch.stack(
             [unswizzle_block_scale(sw[e], rows=m, cols_blocks=cb) for e in range(E)], 0
         )
 
     def logical_to_mma(log, m, k):
         sw = torch.stack([swizzle_block_scale(log[e]) for e in range(E)], 0)
-        sw2d = sw.reshape(E * sw.shape[1], sw.shape[2]).to(torch.float8_e4m3fn)
-        return convert_sf_to_mma_layout(sw2d, m=m, k=k, num_groups=E)
+        scale_dtype = torch.uint8 if quant_mode == "mxfp4" else torch.float8_e4m3fn
+        sw2d = sw.reshape(E * sw.shape[1], sw.shape[2]).to(scale_dtype)
+        return convert_sf_to_mma_layout(
+            sw2d,
+            m=m,
+            k=k,
+            num_groups=E,
+            sf_vec_size=sf_vec_size,
+        )
 
     def pad_dim(t, dim, old, new):
         if new == old:
@@ -2799,8 +3130,8 @@ def _pad_intermediate_to_tile(
     # w2 reduces over the intermediate dim: pad its packed columns + SF columns.
     w2p = pad_dim(w2_weight, 2, n // 2, n_pad // 2)
     log2 = mma_to_logical(w2_weight_sf, m=h, k=n)
-    cb_n = (n + SF_VEC_SIZE - 1) // SF_VEC_SIZE
-    cb_np = (n_pad + SF_VEC_SIZE - 1) // SF_VEC_SIZE
+    cb_n = (n + sf_vec_size - 1) // sf_vec_size
+    cb_np = (n_pad + sf_vec_size - 1) // sf_vec_size
     w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
 
     if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
@@ -2870,8 +3201,10 @@ def launch_sm120_moe(
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
+    if quant_mode == "mxfp4" and k % 128 != 0:
+        raise ValueError(f"MXFP4 b12x hidden_size ({k}) must be a multiple of 128.")
 
-    # NVFP4 kernels need padded intermediate size.
+    # W4A4 kernels need a tile-aligned gate/up split.
     if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
         (
             w1_weight,
@@ -2891,6 +3224,7 @@ def launch_sm120_moe(
             k,
             w1_weight.size(0),
             is_gated,
+            quant_mode,
         )
 
     routed_rows = num_tokens * top_k
@@ -2918,9 +3252,15 @@ def launch_sm120_moe(
         )
 
     if fc2_input_scale is None:
-        raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
-    down_input_scale = fc2_input_scale
-    if input_global_scale is not None:
+        if quant_mode == "nvfp4":
+            raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
+        # MXFP4 has no tensor-wide FC2 input scale. Reuse an existing
+        # per-expert tensor because the shared kernel signature still carries
+        # the argument; the MXFP4 quantizer ignores it.
+        down_input_scale = w2_alpha
+    else:
+        down_input_scale = fc2_input_scale
+    if quant_mode == "nvfp4" and input_global_scale is not None:
         input_gs = input_global_scale
         if _weight_views is None:
             # Alpha must carry input_gs back or the output magnitude is wrong.
@@ -2944,6 +3284,7 @@ def launch_sm120_moe(
             n=n,
             k=k,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
     )
 
@@ -2960,6 +3301,12 @@ def launch_sm120_moe(
             raise ValueError(
                 "pre-allocated workspace activation_precision does not match "
                 f"requested activation_precision={activation_precision!r}."
+            )
+        workspace_quant_mode = getattr(workspace, "quant_mode", quant_mode)
+        if workspace_quant_mode != quant_mode:
+            raise ValueError(
+                "pre-allocated workspace quant_mode does not match "
+                f"requested quant_mode={quant_mode!r}."
             )
         if isinstance(workspace, Sm120DynamicMoEWorkspace):
             if num_local_experts != num_experts:
@@ -2978,6 +3325,7 @@ def launch_sm120_moe(
             num_tokens=num_tokens,
             num_topk=top_k,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
@@ -3021,6 +3369,7 @@ def launch_sm120_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
     else:
         return launch_sm120_static_moe(
@@ -3044,4 +3393,5 @@ def launch_sm120_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )

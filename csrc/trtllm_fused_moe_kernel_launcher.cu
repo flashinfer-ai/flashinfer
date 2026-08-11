@@ -100,6 +100,10 @@ inline bool hasOptionalGemm1ActivationParams(Optional<TensorView> const& gemm1_a
   return gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value();
 }
 
+// MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
+// fused activation and applies them in the separate activation kernel
+// (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
+// scalar dequant factor, so no host-side rescaling of the limit is needed.
 inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
@@ -107,9 +111,12 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
     return;
   }
-  TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+  TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8 ||
+                 quantization_type == Fp8QuantizationType::DeepSeekFp8)
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-         "Fp8QuantizationType::MxFp8 in FP8 block scale MoE.";
+         "Fp8QuantizationType::MxFp8 and Fp8QuantizationType::DeepSeekFp8 in FP8 block scale "
+         "MoE, got "
+      << fp8QuantizationTypeToString(quantization_type) << ".";
   TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
          "ActivationType::Swiglu.";
@@ -896,10 +903,19 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& moe_tactic) override {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
+    // Blackwell TMA may select BASE_128KB address generation from the logical tensor-map shape.
+    // Keep at least 128 KiB mapped from each activation base, as the quantized launchers do below.
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
-    gemm1_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
+    int32_t max_num_padded_tokens_gemm1 =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args->intermediate_size,
+            btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
+    int32_t max_num_padded_tokens_gemm2 =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args->hidden_size, btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
+    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
                                 hidden_states.device());
-    gemm2_output = alloc_tensor({max_num_padded_tokens, args->hidden_size}, dl_bfloat16,
+    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
