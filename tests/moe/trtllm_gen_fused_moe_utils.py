@@ -39,6 +39,7 @@ from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
+    bgmv_moe_gemm1_lora_delta,
     convert_to_block_layout,
     prims_ts_bf16_moe,
     prims_ts_fp8_block_scale_moe,
@@ -46,6 +47,7 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_per_tensor_scale_moe,
     prims_ts_fp4_block_scale_moe,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -770,6 +772,8 @@ class FP4Moe(Moe):
         num_fused_shared_experts = kwargs.get("num_fused_shared_experts", 0)
         num_routed_experts = num_experts - num_fused_shared_experts
         routed_top_k = top_k - num_fused_shared_experts
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
@@ -822,7 +826,6 @@ class FP4Moe(Moe):
                 is_swizzling=False,
             )
             op_kwargs = {
-                "routing_logits": expert_logits,
                 "routing_bias": routing_bias,
                 "hidden_states": input_quantized["hidden_states"],
                 "hidden_states_scale": input_quantized["hidden_states_scale"],
@@ -853,6 +856,16 @@ class FP4Moe(Moe):
                 "norm_topk_prob": norm_topk_prob,
                 "num_fused_shared_experts": num_fused_shared_experts or None,
             }
+            if gemm1_lora_delta is None:
+                op_kwargs["routing_logits"] = expert_logits
+            else:
+                moe_op = trtllm_fp4_block_scale_routed_moe
+                op_kwargs["topk_ids"] = pack_topk_for_routed_moe(
+                    permute_info["topKIndices"], permute_info["topKLogits"]
+                )
+                op_kwargs["gemm1_lora_delta"] = gemm1_lora_delta
+                op_kwargs["do_finalize"] = True
+                op_kwargs.pop("norm_topk_prob")
             if moe_gemm_backend == MoeGemmBackend.PRIMS_TS:
                 op_kwargs["weight_layout"] = static_data.get(
                     "weight_layout", WeightLayout.MajorK
@@ -875,6 +888,26 @@ class FP4Moe(Moe):
     def get_tolerances(self):
         """Get FP4-specific accuracy tolerances."""
         return {"atol": 0.1, "rtol": 0.85, "percent": 0.92}
+
+    def check_intermediate_output(self, raw_kernel_output, reference_args):
+        """Validate the kernel's exposed quantized post-activation FC1 output."""
+        assert isinstance(raw_kernel_output, list) and len(raw_kernel_output) >= 3, (
+            f"Expected the kernel to return [output, "
+            f"expanded_idx_to_permuted_idx, gemm1_output]; got "
+            f"{type(raw_kernel_output).__name__} of length "
+            f"{len(raw_kernel_output) if isinstance(raw_kernel_output, list) else 'n/a'}"
+        )
+        intermediate = raw_kernel_output[2]
+        expected_last_dim = (
+            reference_args.intermediate_size // 2
+            if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4
+            and intermediate.dtype == torch.uint8
+            else reference_args.intermediate_size
+        )
+        assert intermediate.shape[-1] == expected_last_dim, (
+            f"Expected the quantized post-activation FC1 output to have "
+            f"last-dim {expected_last_dim}; got shape {tuple(intermediate.shape)}."
+        )
 
 
 # ====================================================================================
@@ -3015,6 +3048,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
@@ -3577,11 +3611,17 @@ def run_moe_test(
     norm_topk_prob=True,
     check_reference=True,
     check_intermediate_output=False,
+    gemm1_lora_args=None,
     verify_unfinalized_weight_dtype=False,
     moe_gemm_backend=MoeGemmBackend.TRTLLM,
 ):
-    """Common test logic for all routing methods."""
-    if gemm1_lora_delta is not None:
+    """Common test logic for all routing methods.
+
+    ``gemm1_lora_args``: optional dict of LoRA inputs (``w_ptr_a``, ``lora_stride_a``,
+    ``w_ptr_b``, ``lora_stride_b``, ``lora_ids``, ``rank``, optional ``scale``) used to
+    build the real FC1 delta internally against the generated hidden states/routing.
+    """
+    if gemm1_lora_delta is not None or gemm1_lora_args is not None:
         check_intermediate_output = True
 
     skip_checks(
@@ -3594,7 +3634,9 @@ def run_moe_test(
         intermediate_size,
         routing_logits_dtype,
         zero_hidden_states=zero_hidden_states,
-        gemm1_lora_delta=gemm1_lora_delta,
+        gemm1_lora_delta=(
+            gemm1_lora_delta if gemm1_lora_delta is not None else gemm1_lora_args
+        ),
         moe_gemm_backend=moe_gemm_backend,
     )
 
@@ -3716,6 +3758,22 @@ def run_moe_test(
     else:
         raise NotImplementedError(
             f"Routing method {routing_method_type} not implemented"
+        )
+
+    # Build the real FC1 LoRA delta from the generated hidden states + routing.
+    if gemm1_lora_delta is None and gemm1_lora_args is not None:
+        gemm1_lora_delta = bgmv_moe_gemm1_lora_delta(
+            hidden_states,
+            gemm1_lora_args["w_ptr_a"],
+            gemm1_lora_args["lora_stride_a"],
+            gemm1_lora_args["w_ptr_b"],
+            gemm1_lora_args["lora_stride_b"],
+            permute_info["topKIndices"].to(torch.int64),
+            gemm1_lora_args["lora_ids"],
+            gemm1_lora_args["rank"],
+            intermediate_size,
+            scale=gemm1_lora_args.get("scale", 1.0),
+            out_dtype=torch.bfloat16,
         )
 
     # 1. Quantize weights offline
