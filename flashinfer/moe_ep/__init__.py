@@ -11,6 +11,25 @@ Package layout::
         mega/
           kernel/           fused comm + local MoE kernels
       modes/                split and mega orchestration layers
+      kernel_src/           vendored kernel drops (verbatim src/ + shim/)
+
+Import layering (strict, one direction)::
+
+    layer / modes / core  -->  backends  -->  kernel_src.<drop> shim  -->  src/
+
+- Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
+  nothing else imports ``src/``, ever.
+- Only ``backends/`` may import a drop's shim, and only through the drop's
+  package ``__init__`` (``kernel_src.<drop>``), never shim submodules.
+- The layer, ``modes/``, ``core/``, and everything above use backend APIs
+  only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
+  no shim.
+- Sole exception: kernel-oracle *tests* may import a drop's package
+  ``__init__`` to validate the drop below the backend — still never ``src/``
+  internals or shim submodules.
+
+Keeping upper layers off ``kernel_src`` is what makes a drop swappable (see
+``kernel_src/README.md``) without touching user-facing APIs.
 """
 
 from __future__ import annotations
