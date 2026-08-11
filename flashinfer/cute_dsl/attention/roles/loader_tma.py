@@ -76,12 +76,15 @@ class LoaderRole:
     ):
         """Issue one K or V tile's per-page TMA copies.
 
-        ``unroll=1`` is required: left to heuristics, LLVM/ptxas
-        fully unroll this constant-trip loop (static UTMALDGs 12 -> 68)
-        and the enlarged loader text regresses ps16 to ~1.2x ragged via
-        instruction-fetch stalls (four warp-group code regions share
-        fetch).  K and V run separate loops and re-read the ids —
-        fusing the loops or staging ids across them measured worse.
+        The loop is kept (nearly) rolled rather than unrolled: the four
+        warp-group code regions share instruction fetch, and a fully
+        unrolled body is large enough to stall them all on fetch.  The
+        one exception is 16+ pages per tile (page_size 8), where the
+        per-iteration id-load latency dominates instead; unrolling by 2
+        keeps two id loads in flight without giving back the fetch win.
+        Deeper unrolling measured slower on both counts.  K and V run
+        separate loops and re-read the ids — fusing the loops or
+        staging ids across them measured worse.
 
         A page id of -1 puts the TMA coordinate out of bounds: the copy
         writes zeros to smem and still credits the barrier with the full
@@ -100,7 +103,8 @@ class LoaderRole:
         which plan() enforces by rejecting zero-length KV items.
         """
         logical0 = kv_tile * self.pages_per_kv_tile
-        for p in cutlass.range(self.pages_per_kv_tile, unroll=1):
+        unroll = 2 if self.pages_per_kv_tile >= 16 else 1
+        for p in cutlass.range(self.pages_per_kv_tile, unroll=unroll):
             logical_page = logical0 + p
             safe_page = cutlass.min(logical_page, num_pages_kv - 1)
             page_idx = kv_page_table[table_base + safe_page]
