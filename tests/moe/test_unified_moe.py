@@ -2494,19 +2494,13 @@ class TestFusedSharedExpertsBackendGating:
 # Autotune cache keying
 # ---------------------------------------------------------------------------
 #
-# The autotuner keys on (custom_op, runner_class_name, runner_hash,
-# nearest_profile, extras). custom_op is constant per backend, and
-# nearest_profile sees only the profiled tensor list -- which carries
-# activations and routing but not the weights, since those travel in
-# _static_kwargs. So expert geometry is invisible to the profile.
-# ProfilingCacheKey.file_key additionally drops runner_hash, leaving the
-# on-disk cache keyed on extras alone. A tactic-relevant dimension must
-# therefore appear in get_cache_key_extras() or two configurations silently
-# share one tuned tactic.
+# In-memory tuning keys include runner_hash, nearest_profile, and extras.
+# nearest_profile sees only profiled activation/routing tensors, so weight and
+# config geometry must come from _cache_key_extras(). Persisted file_key drops
+# runner_hash, making those same extras the config discriminator on disk. Every
+# tactic-relevant field must therefore appear in the shared extras tuple.
 
-# (runner class, backend config, quant variant, alternate quant variant or None)
-# FP8 covers variant changes and MxInt4 the single-variant skip path. Registry
-# coverage below verifies that every backend inherits the shared key contract.
+# FP8 and FP4 exercise cross-variant keys; MxInt4 covers the single-variant case.
 _RUNNERS = [
     pytest.param(
         TrtllmFp8BlockRunner,
@@ -2514,6 +2508,13 @@ _RUNNERS = [
         QuantVariant.DeepSeekFp8,
         QuantVariant.MxFp8,
         id="fp8_block",
+    ),
+    pytest.param(
+        TrtllmFp4RoutedRunner,
+        TrtllmFp4Config(),
+        QuantVariant.NVFP4,
+        QuantVariant.MXFP4,
+        id="fp4",
     ),
     pytest.param(
         TrtllmMxInt4RoutedRunner,
