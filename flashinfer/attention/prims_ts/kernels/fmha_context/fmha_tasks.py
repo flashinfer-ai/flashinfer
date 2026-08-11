@@ -1027,18 +1027,16 @@ def create_mma_task(
                     skv.release()
                     skv.release()
 
-                # TAIL: both PVs on V_{n-1} (no QK). Empty sp matches Softmax
-                # TAIL drain: both peers if non-causal; peer0 only if causal
-                # (drop peer0 pair → TAIL correction regress).
+                # TAIL: both PVs on V_{n-1} (no QK). Non-causal drains an empty
+                # sp0+sp1 pair to match Softmax's TAIL. The causal branch drains
+                # neither: peer0/peer1 stay paired through the to/tp handshake
+                # alone (verified deadlock-free on SM103a, incl. the
+                # skip_causal_invalid_peer0 geometry).
                 skv.wait()
                 desc_v_base = skv.v_desc()
                 if cutlass.const_expr(
                     smem_q.cfg.uses_qk_pv_interleaved_causal_paired_schedule
                 ):
-                    # Peer0 empty S slot, kept even when PV0 is elided so sp0
-                    # stays paired with Softmax0's ghost slot.
-                    sp0.acquire()
-                    sp0.commit()
                     # Peer0 PV0 over V_{n-1}: math is a constexpr no-op under
                     # skip_causal_invalid_peer0, but the to/tp0 handshake still
                     # cycles to stay paired with Softmax0's ghost and Correction.
@@ -1928,17 +1926,8 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.cfg.uses_qk_pv_interleaved_causal_paired_schedule:
-                # Causal TAIL. Peer0's masked row-max must read the REAL last
-                # causal tile S, which MMA commits from its last LOOP sp0 slot;
-                # the empty peer0 slot that matches MMA's TAIL sp0.acquire/commit
-                # is drained AFTER the masked slot (below) so FIFO sp0 binding
-                # lines up: masked <- MMA LOOP[last], empty <- MMA TAIL. Draining
-                # it *before* masked would swap the binding -- masked would read
-                # MMA's empty TAIL slot while the real last-tile S is silently
-                # consumed -- which both corrupts the result and desynchronises
-                # the peer0/peer1 OrderedSequence phase. This mirrors the
-                # skip_causal_invalid_peer0 layout, where the empty slot likewise
-                # trails the ghost slot.
+                # Causal TAIL: masked wait binds to MMA's last LOOP sp commit.
+                # No empty TAIL sp drain.
                 sp.wait()
                 old_row_max, row_max = sp.masked_row_max(
                     row_max=row_max,
@@ -2010,22 +1999,6 @@ def create_softmax_task(
                         tp.commit()
                     if s0s1_seq is not None:
                         seq.commit()
-                    sp.release()
-                if tmem_sp.uses_query_paired_invalid_tail:
-                    # Peer0's empty TAIL S slot (consumes MMA's TAIL
-                    # sp0.acquire/commit), no OrderedSequence/tp -- the tile is
-                    # fully elided so there is no P to order. Placed AFTER the
-                    # ghost so the ghost binds to MMA's early LOOP commit; see the
-                    # Causal TAIL note above.
-                    sp.wait()
-                    sp.release()
-                elif index == 0:
-                    # Non-skip peer0: same empty TAIL S slot as the skip case,
-                    # but there is no ghost slot in front of it. It trails the
-                    # masked slot so masked binds to MMA's real last LOOP sp0
-                    # commit and this drain binds to MMA's empty TAIL commit. No
-                    # OrderedSequence/tp: nothing real is produced here.
-                    sp.wait()
                     sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.acquire()
