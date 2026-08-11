@@ -48,7 +48,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     trtllm_fp8_block_scale_routed_moe,
 )
 
-
+pytestmark = pytest.mark.long_running
 @pytest.fixture(scope="module")
 
 
@@ -755,8 +755,6 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
-
-
 def test_mxfp4_moe_gemm_bias(
     num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
 ):
@@ -817,8 +815,6 @@ def test_mxfp4_moe_gemm_bias(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBF16"),
     ],
 )
-
-
 def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     """Test FP4-family Prims-TS MoE with FC1 and FC2 GEMM bias."""
     num_tokens = 32
@@ -1062,8 +1058,6 @@ def test_bf16_prims_ts_identity_activation(cache_permute_indices):
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
     ],
 )
-
-
 def test_fp4_moe_gemm_bias_changes_output(
     num_tokens,
     hidden_size,
@@ -1149,8 +1143,6 @@ def test_fp4_moe_gemm_bias_changes_output(
         pytest.param(QuantMode.FP4_NVFP4_NVFP4, id="NvFP4xNvFP4"),
     ],
 )
-
-
 def test_fp4_moe_gemm_bias(
     num_tokens, hidden_size, intermediate_size, bias, quant_mode, cache_permute_indices
 ):
@@ -1170,35 +1162,58 @@ def test_fp4_moe_gemm_bias(
             (num_experts, hidden_size), device=device, dtype=torch.float32
         )
 
-    run_moe_test(
+    routing_config = {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP4Moe],
+        "compatible_intermediate_size": [512, 768, 1024, 2048],
+        "enable_autotune": True,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+    }
+    moe_impl = FP4Moe(quant_mode=quant_mode)
+
+    _, output_with_bias, _ = run_moe_test(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP4Moe(quant_mode=quant_mode),
-        routing_config={
-            "num_experts": num_experts,
-            "top_k": top_k,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Renormalize,
-            "compatible_moe_impls": [FP4Moe],
-            "compatible_intermediate_size": [512, 768, 1024, 2048],
-            "enable_autotune": True,
-        },
-        weight_processing={
-            "use_shuffled_weight": True,
-            "layout": WeightLayout.MajorK,
-            "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
-        },
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
         activation_type=ActivationType.Swiglu,
         cache_permute_indices=cache_permute_indices,
         routing_logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
     )
+    _, output_without_bias, _ = run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+    )
+
+    # Sanity check to ensure the bias is actually changing the output
+    # If the weights and activations are too large we might not see a difference which would invalidate the tests
+    # Also useful for debugging if the bias is skipped vs incorrect
+    assert not torch.allclose(
+        output_with_bias, output_without_bias, atol=1e-3, rtol=1e-3
+    )
+
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 64, 256, 1000, 4000])

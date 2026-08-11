@@ -1395,9 +1395,7 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, (
-<<<<<<< HEAD
         f"Mismatch percentage is {mismatch_pct:.2f}%"
-=======
         f"{routing_format} mismatch percentage is {mismatch_pct:.2f}%"
     )
 
