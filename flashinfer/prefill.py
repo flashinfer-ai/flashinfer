@@ -5295,10 +5295,18 @@ def trtllm_fmha_v2_prefill(
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]
-        if hasattr(torch, "float8_e4m3fn") and query.dtype == torch.float8_e4m3fn:
+        if (
+            hasattr(torch, "float8_e4m3fn")
+            and query.dtype == torch.float8_e4m3fn
+            and not is_sm12x_supported(query.device)
+        ):
+            # SM120/SM121 ship prebuilt e4m3 SEPARATE_Q_K_V kernels
+            # (fmha_v2_flash_attention_e4m3_*_192x128_sm120); other archs
+            # have e4m3 kernels only for the packed/contiguous/paged layouts.
             raise ValueError(
-                "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout. "
-                "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+                "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout "
+                "on this architecture. Use PACKED_QKV, CONTIGUOUS_Q_KV, or "
+                "Q_PAGED_KV layout instead."
             )
         if logits_soft_cap_scale is not None and logits_soft_cap_scale > 0:
             raise ValueError(
@@ -5379,11 +5387,14 @@ def trtllm_fmha_v2_prefill(
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
-    if is_e4m3:
-        if is_sm12x_supported(query.device):
+    if is_e4m3 and is_sm12x_supported(query.device):
+        if input_layout != "SEPARATE_Q_K_V":
+            # The generated e4m3 kernel set for SM120 covers only the
+            # SEPARATE_Q_K_V layout (the packed/contiguous e4m3 templates do
+            # not instantiate for sm120 — see the Kernel_traits build errors).
             raise ValueError(
-                "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "
-                "Use fp16 or bf16 instead."
+                "FP8 (e4m3) on SM120 currently supports only the "
+                "SEPARATE_Q_K_V input layout."
             )
     # Always pass 1.0: the C++ auto-detect (scale_softmax == 0.0) handles FP16/INT8/E4M3
     # but has no branch for BF16, where 0.0 would zero out the softmax output.
