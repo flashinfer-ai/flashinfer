@@ -717,13 +717,33 @@ class TmemCastAResource(MemoryResource):
         return lo_bits | (hi_bits << Int32(16))
 
     @cute.jit
-    def _cvt_e2m1x2_to_bf16x2(self, packed_byte: Int32) -> Int32:
+    def _cvt_e2m1x2_to_bf16x2_scaled(
+        self,
+        packed_word: Int32,
+        packed_scale_word: Int32,
+        byte_lane: Constexpr[int],
+        scale_lane: Constexpr[int],
+    ) -> Int32:
+        extract = (
+            "mov.b32 {byte, _, _, _}, {$r0}; ",
+            "mov.b32 {_, byte, _, _}, {$r0}; ",
+            "mov.b32 {_, _, byte, _}, {$r0}; ",
+            "mov.b32 {_, _, _, byte}, {$r0}; ",
+        )[byte_lane]
+        scale_permute = (
+            "prmt.b32 scale_pair, {$r1}, 0, 0x7700; ",
+            "prmt.b32 scale_pair, {$r1}, 0, 0x7711; ",
+            "prmt.b32 scale_pair, {$r1}, 0, 0x7722; ",
+            "prmt.b32 scale_pair, {$r1}, 0, 0x7733; ",
+        )[scale_lane]
         return prims.inline_ptx_hl(
-            "{ .reg .b8 byte; "
-            "mov.b32 {byte, _, _, _}, {$r0}; "
-            "cvt.rn.bf16x2.e2m1x2 {$w0}, byte; }",
+            "{ .reg .b8 byte; .reg .b16 scale; .reg .b32 scale_pair; "
+            + extract
+            + scale_permute
+            + "mov.b32 {scale, _}, scale_pair; "
+            + "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 {$w0}, byte, scale; }",
             write_only_types=[Int32],
-            read_only_args=[packed_byte & Int32(0xFF)],
+            read_only_args=[packed_word, packed_scale_word],
         )
 
     @cute.jit
@@ -817,31 +837,14 @@ class TmemCastAResource(MemoryResource):
                 sf_word = sf_word0
                 if chunk_idx >= 4:
                     sf_word = sf_word1
-                sf_shift_bits = Int32((chunk_idx % 4) * 8)
-                sf_byte = (sf_word >> sf_shift_bits) & Int32(0xFF)
-                sf_pair = sf_byte | (sf_byte << Int32(8))
-                sf_bf16x2 = self._cvt_ue8m0x2_to_bf16x2(sf_pair)
                 words = self._load_cast_chunk_words(smem_a_ptr, local_thread, chunk_idx)
-                word0 = words[0]
-                word1 = words[1]
-                word2 = words[2]
-                word3 = words[3]
-                for local_col in cutlass.range_constexpr(16):
-                    word = word0
-                    if local_col < 4:
-                        word = word0
-                    elif local_col < 8:
-                        word = word1
-                    elif local_col < 12:
-                        word = word2
-                    else:
-                        word = word3
-                    shift_bits = Int32((local_col % 4) * 8)
-                    value = self._cvt_e2m1x2_to_bf16x2(
-                        (word >> shift_bits) & Int32(0xFF)
-                    )
-                    value = self._mul_bf16x2(value, sf_bf16x2)
-                    slice_vals.append(value)
+                for word_idx in cutlass.range_constexpr(4):
+                    word = words[word_idx]
+                    for byte_lane in cutlass.range_constexpr(4):
+                        value = self._cvt_e2m1x2_to_bf16x2_scaled(
+                            word, sf_word, byte_lane, chunk_idx % 4
+                        )
+                        slice_vals.append(value)
             src = cutlass.Vector.from_elements(tuple(slice_vals), dtype=cutlass.Int32)
             tmem_addr = (
                 self.cast_a_tmem_addr_base + stage_col_offset + Int32(slice_idx * 32)
