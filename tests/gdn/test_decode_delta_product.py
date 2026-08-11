@@ -30,6 +30,8 @@ Layout note: decode is DENSE [B, T, ...], not varlen. The reference is still
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import pytest
 import torch
 
@@ -62,8 +64,30 @@ def gates_from_logits(A_log, a, dt_bias, b):
     return alpha, torch.sigmoid(b)
 
 
+class DecodeInputs(NamedTuple):
+    q: torch.Tensor  # [B, T,      Hq, K]
+    k: torch.Tensor  # [B, T, n_h, Hq, K]
+    v: torch.Tensor  # [B, T, n_h, HV, V]
+    A_log: torch.Tensor  # [HV]
+    a: torch.Tensor  # [B, T,      HV]
+    dt_bias: torch.Tensor  # [HV]
+    b: torch.Tensor  # [B, T, n_h, HV]
+    pool: torch.Tensor  # [pool_size, HV, V, K]
+    initial_state_indices: torch.Tensor  # [B]
+    ssm_state_indices: torch.Tensor  # [B, T] one snapshot slot per REAL token
+    scratch_state_indices: torch.Tensor  # [B]
+
+
 def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device, seed):
-    """Dense decode inputs plus a state pool with B live slots and B scratch."""
+    """Dense decode inputs plus a state pool partitioned into disjoint regions.
+
+    Pool layout -- every region must be disjoint or the tests measure nothing:
+
+        row 0                       unused (0 is a sentinel elsewhere in flashinfer)
+        [1, 1+B)                    initial states, one per batch row
+        [1+B, 1+B+B*T)              per-REAL-token snapshots, ssm_state_indices
+        [1+B+B*T, 1+B+B*T+B)        scratch, absorbs the intermediate micro-steps
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     HV = num_v_heads
@@ -78,23 +102,11 @@ def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device,
         a = torch.randn(B, T, HV, dtype=torch.float32)
         b = torch.randn(B, T, n_h, HV, dtype=torch.float32)
 
-        # pool: rows [0, B) live, rows [B, 2B) scratch. Row 0 of a pool is a
-        # common sentinel elsewhere in flashinfer, so start live slots at 1.
-        pool = torch.randn(2 * B + 1, HV, V, K, dtype=torch.float32) * 0.1
-        initial_state_indices = torch.arange(1, B + 1, dtype=torch.int32)
-        scratch_state_indices = torch.arange(B + 1, 2 * B + 1, dtype=torch.int32)
-    return (
-        q,
-        k,
-        v,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        pool,
-        initial_state_indices,
-        scratch_state_indices,
-    )
+        pool = torch.randn(1 + B + B * T + B, HV, V, K, dtype=torch.float32) * 0.1
+        initial = torch.arange(1, 1 + B, dtype=torch.int32)
+        ssm = torch.arange(1 + B, 1 + B + B * T, dtype=torch.int32).reshape(B, T)
+        scratch = torch.arange(1 + B + B * T, 1 + B + B * T + B, dtype=torch.int32)
+    return DecodeInputs(q, k, v, A_log, a, dt_bias, b, pool, initial, ssm, scratch)
 
 
 def _reference(q, k, v, A_log, a, dt_bias, b, pool, idx, scale=1.0, use_l2_norm=True):
@@ -162,7 +174,7 @@ def test_decode_nh1_matches_gdn_mtp(T):
 
     B, n_h, H, K, V = 2, 1, 4, 128, 128
     device, dtype = torch.device("cuda"), torch.float16
-    (q, k, v, A_log, a, dt_bias, b, pool, idx, _) = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
         B, T, n_h, H, H, K, V, dtype, device, seed=0
     )
     pool_ref = pool.clone()
@@ -224,7 +236,7 @@ def test_decode_matches_reference(num_householder, T, num_heads):
     n_h = num_householder
     device, dtype = torch.device("cuda"), torch.float16
 
-    (q, k, v, A_log, a, dt_bias, b, pool, idx, scratch) = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device, seed=1
     )
     ref_o, ref_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
@@ -240,7 +252,10 @@ def test_decode_matches_reference(num_householder, T, num_heads):
         dt_bias,
         b,
         scale=1.0,
-        scratch_state_indices=scratch,
+        # no ssm_state_indices: this is the PLAIN continuous-batching path.
+        # State moves via initial_state_indices (read) and output_state_indices
+        # (write, defaulting to the read slot); no per-token scatter, hence no
+        # scratch. Snapshots are test 7's job.
         disable_state_update=False,
     )
     torch.cuda.synchronize()
@@ -270,8 +285,9 @@ def test_scratch_slots_are_inert(num_householder):
     B, T, n_h, H, K, V = 3, 2, num_householder, 4, 128, 128
     device, dtype = torch.device("cuda"), torch.float16
 
-    args = _gen_decode_inputs(B, T, n_h, H, H, K, V, dtype, device, seed=2)
-    (q, k, v, A_log, a, dt_bias, b, pool, idx, scratch) = args
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+        B, T, n_h, H, H, K, V, dtype, device, seed=2
+    )
     clean_o, _ = gated_delta_product_mtp(
         q,
         k,
@@ -283,6 +299,7 @@ def test_scratch_slots_are_inert(num_householder):
         dt_bias,
         b,
         scale=1.0,
+        ssm_state_indices=ssm,
         scratch_state_indices=scratch,
         disable_state_update=False,
     )
@@ -300,6 +317,7 @@ def test_scratch_slots_are_inert(num_householder):
         dt_bias,
         b,
         scale=1.0,
+        ssm_state_indices=ssm,
         scratch_state_indices=scratch,
         disable_state_update=False,
     )
@@ -313,25 +331,32 @@ def test_scratch_slots_are_inert(num_householder):
 
 
 # --------------------------------------------------------------------------
-# 5. Distinct scratch rows per batch entry.
+# 5. Batch rows must not contaminate one another.
+#
+# NOT a scratch-race test: sharing one scratch row across the batch is legal.
+# The kernel reads the pool once, before the recurrence, via
+# initial_state_indices; the per-token scatter is write-only after that, so
+# concurrent stores to a row nobody reads are benign. This checks the broader
+# invariant -- a row's result must not depend on who it was batched with --
+# and pins that BOTH scratch layouts satisfy it.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
 )
-def test_batch_rows_do_not_share_scratch(num_householder):
-    """Every batch row must land its intermediates in its own pool row.
-
-    Shared scratch is a write race: nondeterministic, and invisible unless the
-    rows carry different data. Running each row alone and comparing against the
-    batched run is what surfaces it.
-    """
+@pytest.mark.parametrize("shared_scratch", [True, False], ids=["shared", "per_row"])
+def test_batch_rows_are_independent(num_householder, shared_scratch):
+    """Running a row alone must match running it in a batch."""
     _skip_if_unsupported()
     B, T, n_h, H, K, V = 4, 2, num_householder, 4, 128, 128
     device, dtype = torch.device("cuda"), torch.float16
 
-    (q, k, v, A_log, a, dt_bias, b, pool, idx, scratch) = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
         B, T, n_h, H, H, K, V, dtype, device, seed=3
     )
+    if shared_scratch:
+        # every row funnels its intermediates into ONE throwaway pool row
+        scratch = scratch[:1].expand(B).contiguous()
+
     batched_o, _ = gated_delta_product_mtp(
         q,
         k,
@@ -343,34 +368,36 @@ def test_batch_rows_do_not_share_scratch(num_householder):
         dt_bias,
         b,
         scale=1.0,
+        ssm_state_indices=ssm,
         scratch_state_indices=scratch,
         disable_state_update=False,
     )
     torch.cuda.synchronize()
 
     for i in range(B):
-        s = slice(i, i + 1)
+        sl = slice(i, i + 1)
         solo_o, _ = gated_delta_product_mtp(
-            q[s],
-            k[s],
-            v[s],
+            q[sl],
+            k[sl],
+            v[sl],
             pool.clone(),
-            idx[s],
+            idx[sl],
             A_log,
-            a[s],
+            a[sl],
             dt_bias,
-            b[s],
+            b[sl],
             scale=1.0,
-            scratch_state_indices=scratch[s],
+            ssm_state_indices=ssm[sl],
+            scratch_state_indices=scratch[sl],
             disable_state_update=False,
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(
-            batched_o[s],
+            batched_o[sl],
             solo_o,
             atol=0,
             rtol=0,
-            msg=lambda m: f"batch row {i} differs when run alone -- scratch race\n{m}",
+            msg=lambda m: f"row {i} differs when run alone -- cross-batch leak\n{m}",
         )
 
 
@@ -396,7 +423,7 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
     T, n_h, K, V = 1, 1, 128, 128  # decode_delta_rule is single-step, n_h-free
     device = torch.device("cuda")
 
-    (q, k, v, A_log, a, dt_bias, b, pool, idx, _) = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, torch.float32, device, seed=0
     )
     mine_o, mine_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
@@ -416,3 +443,74 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
 
     torch.testing.assert_close(mine_o.squeeze(1), ref_o, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(mine_state, ref_state, atol=1e-5, rtol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# 7. Per-token state snapshots -- the property speculative decoding needs.
+#
+# ssm_state_indices[i, t] must end up holding the state AS OF real token t, so
+# that a rejected draft can roll the sequence back to any accepted prefix. This
+# is the only test that pins the scatter remap: it fails if the LAST micro-step
+# of each token is not the one routed to the caller's slot (e.g. an off-by-one
+# leaving the state after householder 0 there instead), and it fails if the
+# intermediates land on live rows rather than scratch.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "num_householder", [1, 2, 3], ids=lambda nh: f"num_householder={nh}"
+)
+@pytest.mark.parametrize("T", [2, 3], ids=lambda t: f"T={t}")
+def test_per_token_state_snapshots(num_householder, T):
+    _skip_if_unsupported()
+    B, n_h, H, K, V = 3, num_householder, 4, 128, 128
+    device, dtype = torch.device("cuda"), torch.float16
+
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+        B, T, n_h, H, H, K, V, dtype, device, seed=5
+    )
+
+    # state after each REAL token: rerun the reference over growing prefixes
+    want = []
+    for t in range(T):
+        _, st = _reference(
+            q[:, : t + 1],
+            k[:, : t + 1],
+            v[:, : t + 1],
+            A_log,
+            a[:, : t + 1],
+            dt_bias,
+            b[:, : t + 1],
+            pool,
+            idx,
+        )
+        want.append(st)
+
+    _, got_pool = gated_delta_product_mtp(
+        q,
+        k,
+        v,
+        pool,
+        idx,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        scale=1.0,
+        ssm_state_indices=ssm,
+        scratch_state_indices=scratch,
+        disable_state_update=False,
+    )
+    torch.cuda.synchronize()
+
+    for t in range(T):
+        got = got_pool[ssm[:, t].long()].transpose(-1, -2)  # [.., V, K] -> [.., K, V]
+        torch.testing.assert_close(
+            got,
+            want[t],
+            atol=1e-3,
+            rtol=1e-4,
+            msg=lambda m: (
+                f"snapshot for real token {t} is wrong. A state after only the "
+                f"FIRST householder here means the scatter remap targets "
+                f"[0::n_h] instead of [n_h-1::n_h].\n{m}"
+            ),
+        )

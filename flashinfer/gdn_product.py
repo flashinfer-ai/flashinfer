@@ -280,8 +280,8 @@ def gated_delta_product_mtp(
        writes ``h_{t+1}`` to ``initial_state[ssm_state_indices[i, t]]`` for
        every ``t``, with no "skip this one" sentinel (unlike FLA, whose kernel
        guards on a non-positive slot id). Intermediate micro-steps must
-       therefore be pointed at a **throwaway pool row**, one per batch row --
-       see ``scratch_state_indices``.
+       therefore be pointed at a **throwaway pool row** -- one shared row for
+       the whole batch is enough; see ``scratch_state_indices``.
 
     Parameters
     ----------
@@ -294,10 +294,22 @@ def gated_delta_product_mtp(
         ``1..n_h-1`` to the scratch rows and only the last micro-step of each
         token to the caller's slot.
     scratch_state_indices : torch.Tensor, optional
-        ``[B]`` int32. Pool rows whose contents are discarded -- one per batch
-        row, and they **must be distinct from each other and from every live
-        slot**, or two batch rows will race writing the same pool row. Required
-        when ``ssm_state_indices`` is given and ``n_h > 1``.
+        ``[B]`` or ``[1]`` int32. Pool rows that absorb the intermediate
+        micro-steps' state writes and are never read. Required when
+        ``ssm_state_indices`` is given and ``n_h > 1``.
+
+        The only constraint is that these rows are **disjoint from every live
+        slot** (anything in ``initial_state_indices`` / ``ssm_state_indices`` /
+        ``output_state_indices``). They need *not* be distinct from one another:
+        a single shared row for the whole batch is correct, because the kernel
+        reads the pool exactly once -- before the recurrence, through
+        ``initial_state_indices`` -- and the per-token scatter is write-only
+        thereafter. Concurrent stores to an address nobody reads are benign.
+
+        Prefer one shared row. A per-row scratch costs ``B`` state slots
+        (``HV * V * K * 4`` bytes each -- ~2 MiB at HV=32, K=V=128, so ~512 MiB
+        at B=256) to buy only better write locality, for traffic that is pure
+        waste either way. Phase 2's scatter guard removes these writes entirely.
     expanded_* : torch.Tensor, optional
         Scratch for the expansion; required for CUDA graph capture. See
         :func:`chunk_gated_delta_product` for why.
@@ -350,30 +362,117 @@ def gated_delta_product_mtp(
             output_state_indices=output_state_indices,
         )
 
-    # -----------------------------------------------------------------------
-    # TODO(you): the decode expansion.
-    #
-    #   k, v, b   [B, T, n_h, H, D] -> [B, T*n_h, H, D]      (flatten dims 1,2)
-    #   q         scatter into [:, n_h-1 :: n_h]             (read at the LAST)
-    #   a         scatter into [:, 0     :: n_h],
-    #             ALL OTHER ROWS = GATE_NEUTRAL_A_SENTINEL   (not 1.0! fused gate)
-    #   ssm_state_indices  [B, T] -> [B, T*n_h] int32:
-    #                 [:, n_h-1 :: n_h] = the caller's slots
-    #                 everything else   = scratch_state_indices[:, None]
-    #   out       gather [:, n_h-1 :: n_h]
-    #
-    # `initial_state`, `initial_state_indices` and `output_state_indices` pass
-    # through untouched -- the number of SEQUENCES is unchanged, only the token
-    # axis grows, and the state shape never depends on n_h.
-    #
-    # Watch for:
-    #  * The kernel asserts `ssm_state_indices.dtype == torch.int32` and
-    #    `T >= 2`. The expanded T is n_h*T so T>=2 is automatic for n_h>=2, but
-    #    the dtype is easy to lose through a `torch.full` default of int64.
-    #  * `expanded_a` must be PRE-FILLED with the sentinel, not zeros -- only
-    #    the [0::n_h] rows get written, exactly like expanded_g in prefill
-    #    (where the pre-fill value is 1.0 instead).
-    #  * Every batch row needs its OWN scratch slot. Sharing one across rows is
-    #    a data race, silent and nondeterministic.
-    # -----------------------------------------------------------------------
-    raise NotImplementedError("gated_delta_product_mtp: the n_h expansion")
+    # GDP = GDN with a sequence n_h times longer
+    k = torch.flatten(k, start_dim=1, end_dim=2)
+    v = torch.flatten(v, start_dim=1, end_dim=2)
+    b = torch.flatten(b, start_dim=1, end_dim=2)
+
+    if expanded_q is None:
+        expanded_q = torch.empty(
+            q.size(0),
+            q.size(1) * num_householder,
+            *q.shape[2:],
+            dtype=q.dtype,
+            device=q.device,
+        )
+    elif expanded_q.shape != (q.size(0), q.size(1) * num_householder, *q.shape[2:]):
+        raise ValueError("expanded_q shape must be [B, T*n_h, num_q_heads,  D]")
+    elif expanded_q.dtype != q.dtype:
+        raise ValueError(
+            f"expanded_q.dtype and q.dtype must match, got {expanded_q.dtype} != {q.dtype}"
+        )
+
+    expanded_q[:, num_householder - 1 :: num_householder] = q
+
+    if a.dtype != torch.float32:
+        raise ValueError(
+            f"a must be float32 (g/beta are always fp32 in this API, "
+            f"unlike q/k/v); got {a.dtype}"
+        )
+
+    if expanded_a is None:
+        expanded_a = torch.full(
+            (a.size(0), a.size(1) * num_householder, *a.shape[2:]),
+            GATE_NEUTRAL_A_SENTINEL,
+            dtype=a.dtype,
+            device=a.device,
+        )
+    elif expanded_a.shape != (a.size(0), a.size(1) * num_householder, *a.shape[2:]):
+        raise ValueError("expanded_a shape must be [B, T*n_h, num_sab_heads]")
+    elif expanded_a.dtype != torch.float32:
+        raise ValueError(
+            f"expanded_a must be float32 (a/beta are always fp32 in this API, "
+            f"unlike q/k/v); got {expanded_a.dtype}"
+        )
+    expanded_a[:, ::num_householder] = a
+
+    if expanded_output is None:
+        expanded_output = torch.empty(
+            expanded_q.size(0),
+            expanded_q.size(1),
+            max(q.size(2), v.size(2)),
+            q.size(3),
+            dtype=output.dtype if output is not None else q.dtype,
+            device=output.device if output is not None else q.device,
+        )
+    elif expanded_output.shape != (
+        expanded_q.size(0),
+        expanded_q.size(1),
+        max(q.size(2), v.size(2)),
+        q.size(3),
+    ):
+        raise ValueError("expanded_output shape must be [B, T*n_h, num_o_heads,  D]")
+
+    if ssm_state_indices is not None:
+        if scratch_state_indices is None:
+            raise ValueError(
+                "scratch_state_indices are required if ssm_state_indices is given"
+            )
+        if expanded_ssm_state_indices is None:
+            expanded_ssm_state_indices = torch.empty(
+                ssm_state_indices.size(0),
+                ssm_state_indices.size(1) * num_householder,
+                dtype=ssm_state_indices.dtype,
+                device=ssm_state_indices.device,
+            )
+        elif expanded_ssm_state_indices.shape != (
+            ssm_state_indices.size(0),
+            ssm_state_indices.size(1) * num_householder,
+        ):
+            raise ValueError("expanded_ssm_state_indices shape must be [B, T*n_h]")
+        elif expanded_ssm_state_indices.dtype != ssm_state_indices.dtype:
+            raise ValueError(
+                f"expanded_ssm_state_indices dtype must be {ssm_state_indices.dtype}"
+            )
+
+        expanded_ssm_state_indices[:] = scratch_state_indices[:, None]
+        expanded_ssm_state_indices[:, num_householder - 1 :: num_householder] = (
+            ssm_state_indices
+        )
+    else:
+        expanded_ssm_state_indices = None
+
+    _, state = gated_delta_rule_mtp(
+        expanded_q,
+        k,
+        v,
+        initial_state,
+        initial_state_indices,
+        A_log,
+        expanded_a,
+        dt_bias,
+        b,
+        scale=scale,
+        output=expanded_output,
+        ssm_state_indices=expanded_ssm_state_indices,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+        output_state_indices=output_state_indices,
+    )
+
+    if output is not None:
+        output[:] = expanded_output[:, num_householder - 1 :: num_householder]
+    else:
+        output = expanded_output[:, num_householder - 1 :: num_householder].clone()
+
+    return output, state
