@@ -26,15 +26,16 @@ from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
 from .trace.templates.sampling import (
     top_k_cub_trace,
-    top_k_page_table_transform_trace,
+    top_k_page_table_transform_trace_dispatch,
     top_k_ragged_transform_trace,
 )
 from .utils import (
     _get_cache_buf,
+    check_shape_dtype_device,
     get_compute_capability,
+    get_shared_bytes_per_block_optin,
     register_custom_op,
     register_fake_op,
-    get_shared_bytes_per_block_optin,
 )
 
 
@@ -76,7 +77,7 @@ def get_topk_module():
         deterministic: bool,
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
+        output_values: Optional[torch.Tensor],
         dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         device = input.device
@@ -109,7 +110,7 @@ def get_topk_module():
         deterministic: bool,
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
+        output_values: Optional[torch.Tensor],
         dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         batch_size = input.size(0)
@@ -246,7 +247,11 @@ def get_topk_module():
 
     @register_custom_op(
         "flashinfer::radix_topk_page_table_transform",
-        mutates_args=("row_states_buffer", "output_page_table"),
+        mutates_args=(
+            "row_states_buffer",
+            "output_page_table",
+            "output_raw_indices",
+        ),
     )
     def radix_topk_page_table_transform(
         input: torch.Tensor,
@@ -258,9 +263,11 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        page_size: int = 1,
         dsa_graph_safe: bool = False,
         row_starts: Optional[torch.Tensor] = None,
         page_table_row_starts: Optional[torch.Tensor] = None,
+        output_raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -275,9 +282,11 @@ def get_topk_module():
             top_k,
             deterministic,
             tie_break,
+            page_size,
             dsa_graph_safe,
             row_starts,
             page_table_row_starts,
+            output_raw_indices,
         )
 
     @register_fake_op("flashinfer::radix_topk_page_table_transform")
@@ -291,9 +300,11 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        page_size: int = 1,
         dsa_graph_safe: bool = False,
         row_starts: Optional[torch.Tensor] = None,
         page_table_row_starts: Optional[torch.Tensor] = None,
+        output_raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -714,7 +725,7 @@ def top_k(
 topk = top_k
 
 
-@flashinfer_api(trace=top_k_page_table_transform_trace)
+@flashinfer_api(trace=top_k_page_table_transform_trace_dispatch)
 def top_k_page_table_transform(
     input: torch.Tensor,
     src_page_table: torch.Tensor,
@@ -726,18 +737,22 @@ def top_k_page_table_transform(
     dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
     page_table_row_starts: Optional[torch.Tensor] = None,
+    *,
+    page_size: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
-    This function performs top-k selection on input scores and transforms the
-    selected indices through a page table lookup in a single fused kernel.
-    Used in sparse attention's second stage where selected KV cache positions
-    need to be mapped through page tables.
+    This function performs top-k selection on input scores and translates the
+    selected indices through a page table in a single fused kernel. Each
+    page-table entry represents ``page_size`` consecutive score positions. For
+    each selected local index ``idx`` in row ``i``::
 
-    For each row i:
-        output_page_table[i, j] = src_page_table[
-            batch_idx, page_table_row_start[i] + topk_indices[j]
+        physical_page = src_page_table[
+            batch_idx, page_table_row_start[i] + idx // page_size
         ]
+        output[i, j] = physical_page * page_size + idx % page_size
 
     where ``batch_idx`` is determined by ``row_to_batch[i]`` if provided,
     otherwise ``i``. ``topk_indices`` are relative to ``row_starts[i]``.
@@ -748,7 +763,10 @@ def top_k_page_table_transform(
         Input scores tensor of shape ``(num_rows, max_len)``.
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     src_page_table : torch.Tensor
-        Source page table of shape ``(batch_size, max_len)`` with dtype ``int32``.
+        Source page table of shape ``(batch_size, max_page_table_length)`` with
+        dtype ``int32``. Entries used by selected indices must be nonnegative,
+        and each resulting ``physical_page * page_size + offset`` must fit in
+        signed ``int32``. These value constraints are not checked at runtime.
     lengths : torch.Tensor
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
@@ -781,22 +799,38 @@ def top_k_page_table_transform(
         Default is None (equivalent to all zeros).
     page_table_row_starts : Optional[torch.Tensor], optional
         Per-row page-table start indices of shape ``(num_rows,)`` with dtype
-        ``int32``. If None, defaults to ``row_starts`` to preserve the legacy
-        behavior where score and page-table windows share the same start.
+        ``int32``, measured in page-table entries. If None, defaults to
+        ``row_starts``, so score and page-table windows share the same start.
+        When ``page_size > 1`` and
+        ``row_starts`` is provided, this argument must also be provided because
+        the two starts use different units.
+    page_size : int, optional
+        Number of score positions represented by each page-table entry. Must
+        be a positive power of two no greater than ``2**30``. Setting this to
+        1 preserves the one-entry-per-score behavior. Default is 1.
+    out : Optional[torch.Tensor], optional
+        Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
+        Supplying this buffer avoids an allocation and is CUDA-graph friendly.
+    out_raw_indices : Optional[torch.Tensor], optional
+        Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
+        Receives selected indices relative to each score window before
+        page-table translation. Padding positions are set to -1 and remain
+        positionally aligned with ``out``. Must not overlap ``out``.
 
     Returns
     -------
-    output_page_table : torch.Tensor
-        Output page table entries of shape ``(num_rows, k)`` with dtype ``int32``.
-        Contains the gathered page table entries for the top-k indices.
-        Positions beyond actual length are set to -1.
+    output : torch.Tensor
+        Physical indices of shape ``(num_rows, k)`` with dtype ``int32``. This
+        is the same tensor as ``out`` when one is supplied. Positions beyond
+        actual length are set to -1.
 
     Note
     ----
     - This is specifically designed for sparse attention's second stage.
-    - If lengths[i] <= k, the output simply contains
-      ``src_page_table[batch_idx, page_table_row_start[i]:page_table_row_start[i] + lengths[i]]``
-      with remaining positions set to -1.
+    - ``input`` may have padding between rows, but its last dimension must be
+      contiguous.
+    - If ``lengths[i] <= k``, raw indices are ``0..lengths[i]-1`` and remaining
+      positions are set to -1.
 
     Examples
     --------
@@ -815,6 +849,31 @@ def top_k_page_table_transform(
     device = input.device
     num_rows = input.size(0)
 
+    if page_size != 1:
+        if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
+            raise ValueError(
+                "page_size must be a positive power of two no greater than 2**30, "
+                f"got {page_size}"
+            )
+        if row_starts is not None and page_table_row_starts is None:
+            raise ValueError(
+                "page_table_row_starts is required with page_size > 1 and row_starts"
+            )
+    if out is not None:
+        check_shape_dtype_device(out, (num_rows, k), torch.int32, device, "out")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+    if out_raw_indices is not None:
+        check_shape_dtype_device(
+            out_raw_indices,
+            (num_rows, k),
+            torch.int32,
+            device,
+            "out_raw_indices",
+        )
+        if not out_raw_indices.is_contiguous():
+            raise ValueError("out_raw_indices must be contiguous")
+
     if (
         can_use_clusters_topk(
             input.device,
@@ -825,6 +884,10 @@ def top_k_page_table_transform(
         and row_to_batch is None
         and row_starts is None
         and page_table_row_starts is None
+        and page_size == 1
+        and out is None
+        and out_raw_indices is None
+        and input.is_contiguous()
     ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
@@ -836,12 +899,12 @@ def top_k_page_table_transform(
         zero_init=True,
     )
 
-    # Allocate output
-    output_page_table = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+    if out is None:
+        out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
 
     get_topk_module().radix_topk_page_table_transform(
         input,
-        output_page_table,
+        out,
         src_page_table,
         row_to_batch,
         lengths,
@@ -849,12 +912,14 @@ def top_k_page_table_transform(
         k,
         deterministic,
         tie_break,
+        page_size,
         dsa_graph_safe,
         row_starts=row_starts,
         page_table_row_starts=page_table_row_starts,
+        output_raw_indices=out_raw_indices,
     )
 
-    return output_page_table
+    return out
 
 
 @flashinfer_api(trace=top_k_ragged_transform_trace)
