@@ -913,6 +913,44 @@ def test_tuning_overrides_preserve_tensor_initializers():
     assert overridden.tensor_initializers == config.tensor_initializers
 
 
+def test_autotune_context_overrides_cuda_graph_profile_replays(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128,),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        use_cuda_graph=True,
+        cuda_graph_profile_replays=1,
+    )
+    seen_replays = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_replays.append(tuning_config.cuda_graph_profile_replays)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_replays_test", [runner], config, inputs)
+
+    assert seen_replays == [20]
+
+
+def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
+    with (
+        pytest.raises(ValueError, match="must be at least one"),
+        autotune(tune_mode=True, cuda_graph_profile_replays=0),
+    ):
+        pass
+
+
 def test_autotune_context_round_up(monkeypatch):
     """autotune(round_up=True) uses ceil rounding for cache lookup."""
     tuner = reset_autotuner()
@@ -994,13 +1032,21 @@ def test_autotune_context_restores_overrides():
 
     assert tuner._override_tuning_buckets is None
     assert tuner._override_round_up is False
+    assert tuner._override_cuda_graph_profile_replays is None
 
-    with autotune(tune_mode=False, tuning_buckets=(100, 200), round_up=True):
+    with autotune(
+        tune_mode=False,
+        tuning_buckets=(100, 200),
+        round_up=True,
+        cuda_graph_profile_replays=20,
+    ):
         assert tuner._override_tuning_buckets == (100, 200)
         assert tuner._override_round_up is True
+        assert tuner._override_cuda_graph_profile_replays == 20
 
     assert tuner._override_tuning_buckets is None
     assert tuner._override_round_up is False
+    assert tuner._override_cuda_graph_profile_replays is None
 
 
 def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):

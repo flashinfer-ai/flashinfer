@@ -474,6 +474,10 @@ class TuningConfig:
             This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
+        cuda_graph_profile_replays (int): Number of back-to-back CUDA graph
+            warmup replays followed by the same number of timed replays. Values
+            greater than one measure sustained execution instead of the first
+            isolated replay.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -499,6 +503,7 @@ class TuningConfig:
     tensor_initializers: tuple[tuple[int, TensorInitializer], ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
+    cuda_graph_profile_replays: int = 1
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
@@ -802,6 +807,7 @@ def autotune(
     tuning_buckets: tuple[int, ...] | None = None,
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
+    cuda_graph_profile_replays: int | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -869,9 +875,14 @@ def autotune(
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
             ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+        cuda_graph_profile_replays: Optional number of back-to-back CUDA graph
+            warmup replays followed by the same number of timed replays for
+            every operation profiled in this context. ``None`` inherits the
+            enclosing context or each operation's ``TuningConfig`` value.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
+        ValueError: If ``cuda_graph_profile_replays`` is less than one.
 
     .. rubric:: Edge-case behaviour
 
@@ -927,6 +938,10 @@ def autotune(
         # Skip autotuning for specific ops (use heuristic fallback)
         with autotune(True, skip_ops={"fp4_gemm"}):
             model(inputs)  # mm_fp4 uses heuristic, other ops are autotuned
+
+        # Measure every tactic under sustained CUDA graph execution
+        with autotune(True, cuda_graph_profile_replays=20):
+            model(inputs)
     """
     tuner = AutoTuner.get()
 
@@ -935,6 +950,8 @@ def autotune(
             "tuning_buckets must contain at least one value when provided; "
             "pass None (or omit) to inherit the current buckets"
         )
+    if cuda_graph_profile_replays is not None and cuda_graph_profile_replays < 1:
+        raise ValueError("cuda_graph_profile_replays must be at least one")
 
     # Load configs from cache file on entry (if it exists).  A file with
     # mismatched metadata is ignored here; whether it may be overwritten on
@@ -964,15 +981,25 @@ def autotune(
     override_stack = tuner._get_override_stack()
     current_buckets = override_stack[-1][0] if override_stack else None
     current_round_up = override_stack[-1][1] if override_stack else False
+    current_profile_replays = override_stack[-1][2] if override_stack else None
     new_buckets = (
         tuple(sorted(set(tuning_buckets)))
         if tuning_buckets is not None
         else current_buckets
     )
     new_round_up = round_up if round_up is not None else current_round_up
-    pushed = tuning_buckets is not None or round_up is not None
+    new_profile_replays = (
+        cuda_graph_profile_replays
+        if cuda_graph_profile_replays is not None
+        else current_profile_replays
+    )
+    pushed = (
+        tuning_buckets is not None
+        or round_up is not None
+        or cuda_graph_profile_replays is not None
+    )
     if pushed:
-        override_stack.append((new_buckets, new_round_up))
+        override_stack.append((new_buckets, new_round_up, new_profile_replays))
 
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
@@ -1308,7 +1335,8 @@ class AutoTuner:
         # File generation observed at cache-context entry or explicit load.
         self._observed_cache_generations: dict[str, str | None] = {}
 
-        # Per-thread stack of (tuning_buckets, round_up) overrides set by
+        # Per-thread stack of (tuning_buckets, round_up,
+        # cuda_graph_profile_replays) overrides set by
         # autotune() context manager.  Using threading.local ensures concurrent
         # autotune() contexts on different threads don't clobber each other.
         self._override_local: _OverrideLocal = _OverrideLocal()
@@ -1316,11 +1344,13 @@ class AutoTuner:
         self._skip_ops_local: _SkipOpsLocal = _SkipOpsLocal()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for the nearest-profile LRU cache.
-        # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
+        # Two-level: WeakKeyDictionary[TuningConfig,
+        # Dict[(buckets, round_up, profile_replays), TuningConfig]]
         # keyed by identity so configs that share a hash but carry distinct
         # closures (e.g. gen/map buckets, tensor_initializers) don't collide.
         self._override_config_cache: weakref.WeakKeyDictionary[
-            TuningConfig, dict[tuple[tuple[int, ...] | None, bool], TuningConfig]
+            TuningConfig,
+            dict[tuple[tuple[int, ...] | None, bool, int | None], TuningConfig],
         ] = weakref.WeakKeyDictionary()
 
         # Timing backend: globaltimer kernel vs cuda events.
@@ -1387,6 +1417,14 @@ class AutoTuner:
         if stack:
             return stack[-1][1]
         return False
+
+    @property
+    def _override_cuda_graph_profile_replays(self) -> Optional[int]:
+        """Active CUDA graph profile-replay override, or ``None``."""
+        stack = self._get_override_stack()
+        if stack:
+            return stack[-1][2]
+        return None
 
     @classmethod
     def get(cls):
@@ -1520,16 +1558,17 @@ class AutoTuner:
             return False, 0, -1, None
 
     def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
-        """Return a TuningConfig with overridden buckets/rounding if overrides are active.
+        """Return a ``TuningConfig`` with active context overrides applied.
 
         The result is cached so the same logical override produces the same
         object, keeping the nearest-profile LRU cache effective.
         """
         buckets = self._override_tuning_buckets
         round_up_flag = self._override_round_up
+        profile_replays = self._override_cuda_graph_profile_replays
 
         per_config = self._override_config_cache.get(tuning_config)
-        cache_key = (buckets, round_up_flag)
+        cache_key = (buckets, round_up_flag, profile_replays)
         if per_config is not None and cache_key in per_config:
             return per_config[cache_key]
 
@@ -1578,6 +1617,11 @@ class AutoTuner:
             tensor_initializers=tuning_config.tensor_initializers,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            cuda_graph_profile_replays=(
+                profile_replays
+                if profile_replays is not None
+                else tuning_config.cuda_graph_profile_replays
+            ),
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
@@ -1638,7 +1682,11 @@ class AutoTuner:
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
 
             input_shapes = tuple(self._get_input_sizes(inputs))
@@ -2164,17 +2212,30 @@ class AutoTuner:
                 )
                 delay_kernel(delay_kernel_time_usec)
 
+                if tuning_config.use_cuda_graph:
+                    profile_replays = tuning_config.cuda_graph_profile_replays
+                    if profile_replays < 1:
+                        raise ValueError(
+                            "cuda_graph_profile_replays must be at least one"
+                        )
+                    if profile_replays > 1:
+                        for _ in range(profile_replays):
+                            graph.replay()
+                else:
+                    profile_replays = 1
+
                 record_start()
 
                 if tuning_config.use_cuda_graph:
-                    graph.replay()
+                    for _ in range(profile_replays):
+                        graph.replay()
                 else:
                     _run_kernels()
 
                 record_end()
                 stream.synchronize()
 
-                return elapsed_time() / repeat
+                return elapsed_time() / (repeat * profile_replays)
 
         # Run the timing under ``_profile_measurement_scope`` (so runners
         # can consult ``is_in_profile_measurement()``), then — if a

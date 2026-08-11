@@ -157,6 +157,7 @@ def _run_benchmark(
     iterations: int,
     config_str: str,
     tuning_buckets: Optional[list[int]] = None,
+    cuda_graph_profile_replays: int = 1,
 ):
     AutoTuner.get().clear_cache()
 
@@ -172,7 +173,11 @@ def _run_benchmark(
     for setup in setups:
         if setup.backend in tuned_backends:
             continue
-        with autotune(True, tuning_buckets=tuning_buckets_tuple):
+        with autotune(
+            True,
+            tuning_buckets=tuning_buckets_tuple,
+            cuda_graph_profile_replays=cuda_graph_profile_replays,
+        ):
             setup.fn(**setup.input_kwargs)
         tuned_backends.add(setup.backend)
 
@@ -609,6 +614,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     backends: list[str],
     tuning_buckets: Optional[list[int]] = None,
     routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -792,6 +798,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
         tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -812,6 +819,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     tuning_buckets: Optional[list[int]] = None,
     use_bias: bool = True,
     routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -1015,6 +1023,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
         f"  bias={use_bias}",
         tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -1029,6 +1038,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
     warmups: int,
     iterations: int,
     activation_type: int,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -1097,6 +1107,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         iterations,
         f"quant_mode={quant_mode}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -1190,6 +1201,15 @@ if __name__ == "__main__":
         "--iterations", type=int, default=100, help="Number of benchmark iterations"
     )
     parser.add_argument(
+        "--cuda-graph-profile-replays",
+        type=int,
+        default=1,
+        help=(
+            "Back-to-back CUDA graph warmup and timed replays used to profile "
+            "every autotuned config."
+        ),
+    )
+    parser.add_argument(
         "--activation-type",
         type=enum_type(ActivationType),
         metavar=str([e.name for e in ActivationType]),
@@ -1274,6 +1294,7 @@ if __name__ == "__main__":
             backends,
             tuning_buckets=args.tuning_buckets,
             routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     elif is_mxint4:
         results = bench_trtllm_gen_fused_moe_autotuner_mxint4(
@@ -1287,6 +1308,7 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     else:
         results = bench_trtllm_gen_fused_moe_autotuner_fp4(
@@ -1306,6 +1328,7 @@ if __name__ == "__main__":
             tuning_buckets=args.tuning_buckets,
             use_bias=args.use_bias,
             routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
 
     if args.output_json is not None:
