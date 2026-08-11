@@ -22,6 +22,8 @@
 
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
@@ -606,6 +608,7 @@ void trtllm_ragged_attention_launcher(
   runner_params.qPtr = query;
   runner_params.kPtr = key;
   runner_params.vPtr = value;
+  runner_params.qkvPtr = query;
   runner_params.kvPageIdxPtr = nullptr;
   runner_params.seqLensKvPtr = seq_lens;
   runner_params.oPtr = out;
@@ -617,6 +620,32 @@ void trtllm_ragged_attention_launcher(
   runner_params.mBatchSize = batch_size;
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mQkvLayout = QkvLayout::SeparateQkv;
+  if (char const* layout = std::getenv("FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT")) {
+    if (std::strcmp(layout, "packed") == 0) {
+      if (q_data_type != DATA_TYPE_BF16 || q_data_type != k_data_type ||
+          q_data_type != v_data_type ||
+          num_qo_heads != num_kv_heads || head_dim_qk != head_dim_v) {
+        FLASHINFER_ERROR(
+            "packed ragged QKV diagnostic requires BF16 Q/K/V with matching head counts and "
+            "head dimensions");
+      }
+      int64_t const bytes_per_element = get_size_in_bits(q_data_type) / 8;
+      auto const* q_bytes = reinterpret_cast<char const*>(query);
+      auto const* expected_k =
+          q_bytes + num_qo_heads * head_dim_qk * bytes_per_element;
+      auto const* expected_v =
+          q_bytes + (num_qo_heads + num_kv_heads) * head_dim_qk * bytes_per_element;
+      if (reinterpret_cast<char const*>(key) != expected_k ||
+          reinterpret_cast<char const*>(value) != expected_v) {
+        FLASHINFER_ERROR(
+            "packed ragged QKV requires Q/K/V views of one head-major fused allocation");
+      }
+      runner_params.mQkvLayout = QkvLayout::PackedQkv;
+    } else if (std::strcmp(layout, "separate") != 0) {
+      FLASHINFER_ERROR(
+          "FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT must be 'separate' or 'packed'");
+    }
+  }
   runner_params.mMultiProcessorCount = sm_count;
   runner_params.stream = stream;
   runner_params.qStrideTokens = q_stride_tokens;
@@ -648,6 +677,15 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
+  if (char const* scheduler =
+          std::getenv("FLASHINFER_TRTLLM_RAGGED_TILE_SCHEDULER")) {
+    if (std::strcmp(scheduler, "static") == 0) {
+      runner_params.mTileScheduler = TileScheduler::Static;
+    } else if (std::strcmp(scheduler, "persistent") != 0) {
+      FLASHINFER_ERROR(
+          "FLASHINFER_TRTLLM_RAGGED_TILE_SCHEDULER must be 'static' or 'persistent'");
+    }
+  }
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
 

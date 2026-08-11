@@ -99,12 +99,32 @@ def _launch(
     [(80, 128), (896, 1024), (1008, 1024)],
     ids=("tail48", "aligned128", "tail16"),
 )
+@pytest.mark.parametrize(
+    "layout,scheduler",
+    [
+        ("separate", "persistent"),
+        ("separate", "static"),
+        ("packed", "persistent"),
+        ("packed", "static"),
+    ],
+    ids=(
+        "separate-persistent",
+        "separate-static",
+        "packed-persistent",
+        "packed-static",
+    ),
+)
 def test_trtllm_ragged_h3_fused_qkv_split_view_stride(
     used_tokens: int,
     total_tokens: int,
+    layout: str,
+    scheduler: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The public runner must consume H3 split views without materialization."""
     _require_b200_trtllm_gen()
+    monkeypatch.setenv("FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT", layout)
+    monkeypatch.setenv("FLASHINFER_TRTLLM_RAGGED_TILE_SCHEDULER", scheduler)
     torch.manual_seed(20260810 + used_tokens)
     device = torch.device("cuda")
     live_qkv = (

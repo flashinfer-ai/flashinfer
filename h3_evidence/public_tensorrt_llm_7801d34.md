@@ -60,3 +60,24 @@ it is not consumed as multi-CTA scratch by these kernels.
 
 Runtime launch/correctness eligibility is recorded separately and must remain
 false until exact-ABI BF16 and Sage smoke tests complete without a CUDA error.
+
+## Public BF16 layout/scheduler matrix
+
+The child diagnostic branch restores FlashInfer's immutable public FMHA
+artifact directory
+`158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/` and manifest
+SHA-256 `c2d9399b2537be785882354a4f9902ed6c03136c0ea341e201eac40c3923e1dc`.
+That artifact publishes all four H128 BF16 Dense VarSeq combinations needed
+for a bounded H3 structural comparison:
+
+- SeparateQkv Static: `7bb1c7081725d4884296c6071705d9744768f0b4eb909cce4d7f5e2932727c3a`;
+- SeparateQkv Persistent: `8ce2d53fa98a6138b3a888433c23dc06d133dc6082b1f35fe4a799ba98f70800`;
+- PackedQkv Static: `99aea57238cee34596d237ad773ab5a3b432ebb13badcb28053daef52719b56a`;
+- PackedQkv Persistent: `d7d03f4c4a1c77e7eb05a8f72202fd96d693550e7d32339b30e9fb64caa437c3`.
+
+For this diagnostic only, the ragged launcher accepts two fail-closed runtime
+selectors: `FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT={separate,packed}` and
+`FLASHINFER_TRTLLM_RAGGED_TILE_SCHEDULER={static,persistent}`. Defaults remain
+SeparateQkv/Persistent. Packed mode additionally proves that Q, K, and V are
+the exact head-major subviews of one fused allocation before setting `qkvPtr`;
+it therefore cannot silently reinterpret unrelated tensors.
