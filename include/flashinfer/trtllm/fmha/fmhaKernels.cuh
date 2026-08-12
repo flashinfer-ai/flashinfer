@@ -392,9 +392,9 @@ class TllmGenFmhaKernel {
                                             params.enable_pdl, params.stream);
 
     if (params.lsePtr != nullptr) {
-      flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
-                                   params.mNumHeadsQ, params.lseStrideTokens, params.lseStrideHeads,
-                                   params.enable_pdl, params.stream);
+      FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
+          params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ, params.mNumHeadsQ,
+          params.lseStrideTokens, params.lseStrideHeads, params.enable_pdl, params.stream));
     }
   }
 
