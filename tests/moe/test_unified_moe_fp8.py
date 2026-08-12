@@ -1056,6 +1056,27 @@ def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     _assert_fp8_close(actual, expected)
 
 
+@pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
+def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
+    num_shared = 1
+    pack, weights, config, view, _ = _make_shared_expert_case(
+        QuantVariant.DeepSeekFp8, num_shared=num_shared
+    )
+    runner = MoELayer(config).runners[0]
+    device = pack.hidden_states_q.device
+
+    view[key] = torch.ones(
+        SHARED_EXPERTS_E + num_shared, device=device, dtype=torch.float32
+    )
+    runner.pack_inputs(pack, weights)
+
+    view[key] = torch.ones(SHARED_EXPERTS_E, device=device, dtype=torch.float32)
+    with pytest.raises(
+        ValueError, match=rf"{key} shape.*expected \({SHARED_EXPERTS_E + num_shared},\)"
+    ):
+        runner.pack_inputs(pack, weights)
+
+
 def test_block_fp8_fused_shared_experts_contribute():
     """Verify shared rows contribute independently of the legacy cross-check."""
     variant = QuantVariant.DeepSeekFp8

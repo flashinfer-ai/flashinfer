@@ -182,7 +182,7 @@ def _validate_logits_inputs(
 
 def _validate_optional_gemm1_activation_params(
     view: dict,
-    num_local_experts: int,
+    num_expert_rows: int,
     device: torch.device,
     runner: str,
 ) -> None:
@@ -203,10 +203,10 @@ def _validate_optional_gemm1_activation_params(
             )
         if tensor.dtype != torch.float32:
             raise TypeError(f"{runner}: {key} must be float32, got {tensor.dtype}.")
-        if tuple(tensor.shape) != (num_local_experts,):
+        if tuple(tensor.shape) != (num_expert_rows,):
             raise ValueError(
                 f"{runner}: {key} shape {tuple(tensor.shape)} "
-                f"!= expected ({num_local_experts},)."
+                f"!= expected ({num_expert_rows},)."
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{runner}: {key} must be contiguous.")
@@ -1719,7 +1719,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 )
         _validate_optional_gemm1_activation_params(
             view,
-            self._num_local_experts,
+            self._num_weight_rows,
             act.hidden_states_q.device,
             "TrtllmFp8BlockRunner",
         )
