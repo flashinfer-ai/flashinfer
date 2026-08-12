@@ -409,10 +409,21 @@ jobs:
           # Read release notes from file
           NOTES=$(cat "${NOTES_FILE}")
 
+          # Mark pre-release tags (rc/alpha/beta/dev) as such. GitHub only
+          # infers this in the web UI, never via the API, so an rc created here
+          # would otherwise be published as a full release and could take over
+          # the "Latest" badge. .postN is a real release and stays unflagged.
+          PRERELEASE_FLAG=""
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.?(rc|alpha|beta|dev|a|b)[0-9]*$ ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "Detected pre-release tag: ${RELEASE_TAG}"
+          fi
+
           # Create new release without assets first
           gh release create "${RELEASE_TAG}" \
             --title "Release v${RELEASE_VERSION}" \
-            --notes "$NOTES"
+            --notes "$NOTES" \
+            $PRERELEASE_FLAG
 
       - name: Download flashinfer-python artifact
         uses: actions/download-artifact@v4
