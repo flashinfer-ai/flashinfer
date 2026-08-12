@@ -15,6 +15,12 @@ limitations under the License.
 
 CuTe-DSL backend for serving-native packed Kimi K3 T=1 recurrent decode.
 
+INTERNAL IMPLEMENTATION -- not public API. The supported way to reach these
+kernels is the public ``flashinfer.recurrent_kda`` operation, whose T=1 fast
+path dispatches eligible decode calls here (toggle with
+``FLASHINFER_KDA_T1_FAST_PATH=0``). ``run_packed_kda_decode_cute`` is kept
+for tests and benchmarks of the packed-input entry point.
+
 Same numerical contract and tensor layouts as the exported Cake backend in
 ``flashinfer.kda_kernels.packed_kda_decode``: packed bf16 QKV rows, raw gate
 and beta logits, ``scale = 1/sqrt(128)``, L2 epsilon ``1e-6``,

@@ -37,10 +37,11 @@ except (ImportError, RuntimeError):
     run_fused_kda_decode = None  # type: ignore
     fused_kda_decode = None  # type: ignore
 
-try:
-    from .packed_kda_decode_cute import run_packed_kda_decode_cute
-except (ImportError, RuntimeError):
-    run_packed_kda_decode_cute = None  # type: ignore
+# NOTE: flashinfer.kda_kernels.packed_kda_decode_cute is an internal
+# implementation module, not public API. Its kernels back the T=1 fast path
+# of the public ``flashinfer.recurrent_kda`` operation (see
+# ``run_recurrent_kda`` in ``recurrent_kda.py``); import it by module path
+# only for tests and benchmarks.
 
 try:
     if _torch.cuda.is_available():
@@ -64,6 +65,5 @@ __all__ = [
     "fused_kda_decode",
     "recurrent_kda",
     "run_fused_kda_decode",
-    "run_packed_kda_decode_cute",
     "run_recurrent_kda",
 ]
