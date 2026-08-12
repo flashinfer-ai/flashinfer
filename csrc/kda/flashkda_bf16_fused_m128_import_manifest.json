@@ -1,7 +1,7 @@
 {
   "architecture_artifacts_are_separate": true,
-  "cake_revision": "0e84db9f6bdc6198229c7ec19d90a09503c0bc73",
-  "cake_tree": "8ac8ee00d8b74e9df6d357039b77c46092cc9894",
+  "cake_revision": "cef14598bf3866211db1a6650161b70fa5ebb995",
+  "cake_tree": "ae299fa2eae0ada244580ccc9c82c30cdf512140",
   "generated_invariants": [
     "six fence.proxy.tensormap::generic.acquire.sys operations",
     "CTA barrier after tensor-map acquisition"
@@ -22,7 +22,7 @@
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n16-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-      "profile_sha256": "d5c2e9c526d0446587bdad15ebb8490547a38f15bb2d8afbc62b2b4b720cf381",
+      "profile_sha256": "8efb002b1c03ca017fa36a9980aef1b820900a1361b235294c3c2060ea26d12f",
       "variant": "n16"
     },
     "sm100_n32": {
@@ -36,7 +36,7 @@
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n16-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-      "profile_sha256": "d83d3abdf21751a796d110966eedff060902bc75a3519f8d3479ca876d09103d",
+      "profile_sha256": "1dcd6d3e944888f057c1b7a5fad767d32cd72b4b35200a0fc3dc95231f559f28",
       "variant": "n16"
     },
     "sm103_n32": {
@@ -52,13 +52,13 @@
   "variants": {
     "n16": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
-      "cake_revision": "0e84db9f6bdc6198229c7ec19d90a09503c0bc73",
-      "cake_tree": "8ac8ee00d8b74e9df6d357039b77c46092cc9894",
+      "cake_revision": "cef14598bf3866211db1a6650161b70fa5ebb995",
+      "cake_tree": "ae299fa2eae0ada244580ccc9c82c30cdf512140",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
-      "frozen_sha256": "4b1143ac7833bb650e170cd771a8e5fd0ac7f89fa72ae3302b77f825e2c790ef",
-      "module_ident": "flashkda_bf16_fused_m128_a92c507890",
-      "raw_bytes": 157689,
-      "raw_sha256": "bd93704ea861526ef9efe4aa7db4f5862e73ecfe7ede6a34432a8f7263d805d7",
+      "frozen_sha256": "e8fc5308c4e7df4e28b5eef999c4fa015e7119feeb46079e2f89d6681ad69588",
+      "module_ident": "flashkda_bf16_fused_m128_b4a3308106",
+      "raw_bytes": 157677,
+      "raw_sha256": "100fad0f0184ba73de9889dcc10124b6c7ffb397b2257d162060172e22e03f02",
       "smem_bytes": 219136
     },
     "n32": {

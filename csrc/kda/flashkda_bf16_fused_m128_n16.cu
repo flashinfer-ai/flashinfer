@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_a92c507890.
-// Cake revision: 0e84db9f6bdc6198229c7ec19d90a09503c0bc73; raw SHA-256: bd93704ea861526ef9efe4aa7db4f5862e73ecfe7ede6a34432a8f7263d805d7.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_b4a3308106.
+// Cake revision: cef14598bf3866211db1a6650161b70fa5ebb995; raw SHA-256: 100fad0f0184ba73de9889dcc10124b6c7ffb397b2257d162060172e22e03f02.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -2107,8 +2107,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         #pragma unroll
                         for (int publish_pair = 0; publish_pair < 2; publish_pair++) {
                             int publish_row = publish_pair * 8 + (lane & 7);
-                            int publish_col = 128 + lane / 8 * 8;
-                            uint32_t _stmatrix_addr_6 = static_cast<uint32_t>((unsigned long long)(smem_final_trans_addr + prep_stage * 41984 + (unsigned int)(publish_col / 64 * 2048 + publish_row * 128 + publish_col % 64 * 2 ^ (publish_col / 64 * 2048 + publish_row * 128 + publish_col % 64 * 2 >> 7 & 7) << 4)));
+                            int publish_col = lane / 8 * 8;
+                            uint32_t _stmatrix_addr_6 = static_cast<uint32_t>((unsigned long long)(smem_mqk_trans_addr + prep_stage * 41984 + (unsigned int)(publish_col / 16 * 512 + publish_row * 32 + publish_col % 16 * 2 ^ (publish_col / 16 * 512 + publish_row * 32 + publish_col % 16 * 2 >> 7 & 1) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n"
                                 :: "r"(_stmatrix_addr_6), "r"(*reinterpret_cast<const uint32_t*>(&mqk_packed[publish_pair * 2])), "r"(*reinterpret_cast<const uint32_t*>(&mqk_packed[publish_pair * 2 + 1]))
                                 : "memory");

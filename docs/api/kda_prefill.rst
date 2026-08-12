@@ -45,10 +45,10 @@ H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.
 
 The frozen H12 N16 provenance is Cake revision
-``0e84db9f6bdc6198229c7ec19d90a09503c0bc73`` at tree
-``8ac8ee00d8b74e9df6d357039b77c46092cc9894``. The schedule is module
-``flashkda_bf16_fused_m128_a92c507890`` with raw source SHA-256
-``bd93704ea861526ef9efe4aa7db4f5862e73ecfe7ede6a34432a8f7263d805d7``.
+``cef14598bf3866211db1a6650161b70fa5ebb995`` at tree
+``ae299fa2eae0ada244580ccc9c82c30cdf512140``. The schedule is module
+``flashkda_bf16_fused_m128_b4a3308106`` with raw source SHA-256
+``100fad0f0184ba73de9889dcc10124b6c7ffb397b2257d162060172e22e03f02``.
 Its residual recurrence rounds four intermediates through BF16: the state/K
 prediction, the V-minus-prediction delta, sigmoid beta, and the post-beta
 update carrier. The final-state contraction starts from a zero accumulator;
