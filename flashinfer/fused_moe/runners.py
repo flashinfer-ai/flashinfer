@@ -180,8 +180,45 @@ def _validate_logits_inputs(
             raise ValueError(f"{runner}: routing_bias must be contiguous.")
 
 
+def _validate_optional_gemm1_activation_params(
+    view: dict,
+    num_local_experts: int,
+    device: torch.device,
+    runner: str,
+) -> None:
+    """Runner-boundary validation for the optional SwiGLU OA weight-side params.
+
+    ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are independent: any
+    subset may be absent, and absent means the neutral value (alpha=1, beta=0, no
+    clamp).  The launcher re-checks all of this, but failing here names the runner
+    and the offending key instead of surfacing a bare TVM-FFI ICHECK.
+    """
+    for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+        tensor = view.get(key)
+        if tensor is None:
+            continue
+        if tensor.device != device:
+            raise ValueError(
+                f"{runner}: {key} is on {tensor.device}, expected {device}."
+            )
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"{runner}: {key} must be float32, got {tensor.dtype}.")
+        if tuple(tensor.shape) != (num_local_experts,):
+            raise ValueError(
+                f"{runner}: {key} shape {tuple(tensor.shape)} "
+                f"!= expected ({num_local_experts},)."
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{runner}: {key} must be contiguous.")
+
+
 class MoERunner(TunableRunner):
-    """Base class for unified MoE backend runners."""
+    """Unified MoE runner lifecycle: validate, build once, then execute.
+
+    Concrete runners implement ``_check_support()`` and ``_build()``. Keeping
+    the public methods here ensures a failed support check cannot authorize a
+    build and execution cannot silently initialize backend resources.
+    """
 
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
@@ -189,7 +226,16 @@ class MoERunner(TunableRunner):
 
     config: MoEConfig
 
+    def __init__(self) -> None:
+        self._support_checked = False
+        self._built = False
+
     def check_support(self) -> None:
+        self._support_checked = False
+        self._check_support()
+        self._support_checked = True
+
+    def _check_support(self) -> None:
         """Raise if the initialized runner cannot execute its configuration."""
         variant = self.config.quant.variant
         if variant not in self.supported_quant_variants:
@@ -198,12 +244,23 @@ class MoERunner(TunableRunner):
             )
 
     def build(self) -> None:
-        """Prepare backend resources after support has been validated.
+        if getattr(self, "_built", False):
+            return
+        if not getattr(self, "_support_checked", False):
+            raise RuntimeError(
+                f"{type(self).__name__}.check_support() must succeed before build()."
+            )
+        self._build()
+        self._built = True
 
-        Existing runners that finish initialization in ``__init__`` inherit
-        this no-op. Backends can migrate expensive module loading here
-        incrementally.
-        """
+    def _build(self) -> None:
+        """Prepare shape-independent resources for a supported runner."""
+
+    def _require_built(self) -> None:
+        if not getattr(self, "_built", False):
+            raise RuntimeError(
+                f"{type(self).__name__}.build() must be called before execution."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +285,13 @@ class _CutlassRunnerBase(MoERunner):
     _use_w4_group_scaling: ClassVar[bool]
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
+    # Keep top-k tactics per GEMM stage, then return their Cartesian product as
+    # compound candidates for the outer end-to-end autotuner. k=1 preserves the
+    # legacy independent-winner behavior.
+    _stage_tactic_top_k: ClassVar[int] = 2
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -255,6 +316,7 @@ class _CutlassRunnerBase(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..utils import device_support_pdl, get_compute_capability
 
         self.config = config
@@ -283,11 +345,8 @@ class _CutlassRunnerBase(MoERunner):
         self._workspace_num_tokens = 0
         self._workspace_hidden_size: int | None = None
 
-    def build(self) -> None:
-        """Load the CUTLASS module and create the inner runner once."""
-        if self._inner is not None:
-            return
-
+    def _build(self) -> None:
+        """Load the CUTLASS module and create the inner runner."""
         from .core import get_cutlass_fused_moe_module
 
         with torch.cuda.device(self.device):
@@ -315,14 +374,6 @@ class _CutlassRunnerBase(MoERunner):
                 use_wfp4afp8_humming=False,
             )
 
-    def _require_built(self) -> None:
-        """Reject execution before the explicit runner lifecycle completes."""
-        if self._inner is None:
-            raise RuntimeError(
-                f"{type(self).__name__} must be initialized with "
-                "check_support() followed by build()."
-            )
-
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
         num_tokens = inputs[1].shape[0]
@@ -343,37 +394,41 @@ class _CutlassRunnerBase(MoERunner):
         self._require_built()
         self._validate_input_count(inputs)
         # The two GEMMs have independent tactic spaces. Preserve the legacy
-        # O(n1+n2) tuning flow, then let the outer unified tuner profile only
-        # the selected pair as one full-MoE candidate.
-        # FIXME: get_valid_tactics() is supposed to list candidates, but the
-        # autotuner cannot express multi-stage / factorized tactics yet, so we
-        # nest choose_one() per GEMM and return one compound winner. Refine the
-        # autotuner to own staged tuning instead of selecting winners here.
+        # O(n1+n2) stage search, keep the top-k tactics per stage, then let the
+        # outer unified tuner profile only the k² compound pairs end-to-end.
+        # FIXME: Prefer a first-class factorized/multi-stage autotuner API so
+        # runners do not need to nest stage ranking inside get_valid_tactics().
         tuner = AutoTuner.get()
         profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
         stage_tuning_config = TuningConfig()
+        top_k = self._stage_tactic_top_k
         try:
             self._inner.gemm_idx_for_tuning = 1
-            _, gemm1 = tuner.choose_one(
+            gemm1_tactics = tuner.rank_tactics(
                 f"moe_{self.backend_key}_sm{self._device_arch}_gemm1",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
+                k=top_k,
                 gemm_idx=1,
             )
             self._inner.gemm_idx_for_tuning = 2
-            _, gemm2 = tuner.choose_one(
+            gemm2_tactics = tuner.rank_tactics(
                 f"moe_{self.backend_key}_sm{self._device_arch}_gemm2",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
+                k=top_k,
                 gemm_idx=2,
             )
         finally:
             self._inner.gemm_idx_for_tuning = None
-        if gemm1 is None or gemm2 is None:
-            return [-1]
-        return [(int(gemm1), int(gemm2))]
+        pairs: List[Any] = [
+            (int(gemm1), int(gemm2))
+            for gemm1 in gemm1_tactics
+            for gemm2 in gemm2_tactics
+        ]
+        return pairs if pairs else [-1]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
         max_num_tokens = self.config.execution.tune_max_num_tokens
@@ -695,8 +750,8 @@ class CuteDslNvfp4Runner(MoERunner):
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -711,45 +766,53 @@ class CuteDslNvfp4Runner(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        self._inner: Any = None
+        self.tuning_config = TuningConfig()
+
+    def _build(self) -> None:
+        """Create the shape-independent CuTe DSL tuning runner."""
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
         from .cute_dsl.tuner import (
             CuteDslFusedMoENvfp4Runner,
             CuteDslFusedMoEW4A16Runner,
         )
 
-        self.config = config
-        experts = config.experts
-        routing = config.routing
+        experts = self.config.experts
+        routing = self.config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
         enable_pdl = (
-            True if config.execution.enable_pdl is None else config.execution.enable_pdl
+            True
+            if self.config.execution.enable_pdl is None
+            else self.config.execution.enable_pdl
         )
-        self._inner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
-        if config.quant.variant is QuantVariant.NVFP4:
+        if self.config.quant.variant is QuantVariant.NVFP4:
             self._inner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(config.activation.type),
-                use_per_token_activation=bool(config.quant.per_token_scale),
+                activation_type=int(self.config.activation.type),
+                use_per_token_activation=bool(self.config.quant.per_token_scale),
             )
-        elif config.quant.variant is QuantVariant.W4A16:
+        elif self.config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(config.activation.type),
+                activation_type=int(self.config.activation.type),
             )
         else:
             raise NotImplementedError(
-                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
+                f"CuteDslNvfp4Runner does not support {self.config.quant.variant}."
             )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
@@ -757,6 +820,7 @@ class CuteDslNvfp4Runner(MoERunner):
         self.tuning_config = self._inner.tuning_config
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -769,6 +833,7 @@ class CuteDslNvfp4Runner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         return self._inner.forward(
             inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
         )
@@ -785,6 +850,7 @@ class CuteDslNvfp4Runner(MoERunner):
         tuning configurations include the output buffer so profiling can replace
         it for each token bucket.
         """
+        self._require_built()
         # MoELayer already filters by supported_routing_modes; this guards the
         # direct-runner path (tests/benchmarks) against silently forwarding a
         # logits pack's None topk tensors into the kernel launch.
@@ -879,15 +945,25 @@ class CuteDslNvfp4Runner(MoERunner):
             )
 
     def __hash__(self):
+        self._require_built()
         return hash(("cute_dsl_nvfp4", hash(self._inner)))
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM FP4 routed runner — delegates to the canonical trtllm-gen MoERunner
+# TRTLLM runners — shared module lifecycle, shape-specific inner runners
 # ---------------------------------------------------------------------------
 
 
-class TrtllmFp4RoutedRunner(MoERunner):
+class _TrtllmRunnerBase(MoERunner):
+    """Load the shared TRTLLM-gen module after support validation."""
+
+    def _build(self) -> None:
+        from .core import get_trtllm_moe_sm100_module
+
+        self._module = get_trtllm_moe_sm100_module()
+
+
+class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
@@ -928,8 +1004,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
         QuantVariant.W4A16,
     )
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -953,13 +1029,13 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .core import get_trtllm_moe_sm100_module
 
         self.config = config
         self.device = device
-        self._module = get_trtllm_moe_sm100_module()
+        self._module: Any = None
 
         routing = config.routing
         experts = config.experts
@@ -1001,6 +1077,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
         if self._inner is not None:
             return
         from ..tllm_enums import WeightLayout
@@ -1023,6 +1100,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
+        self._require_built()
         # The inner runner reads num_tokens from inputs + its own instance key;
         # no static kwargs are needed for tactic enumeration.
         return self._inner.get_valid_tactics(inputs, profile)
@@ -1034,6 +1112,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         # MoELayer's autotuner call passes no kwargs, so the static weight/config
         # kwargs are injected here.  The inner runner writes the result in-place
         # into inputs[0] (the output buffer of the MoeRunnerInputs list).
@@ -1173,6 +1252,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         (passed via the static kwargs) and dropping ids outside
         ``[offset, offset + local_num_experts)``.
         """
+        self._require_built()
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -1329,7 +1409,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmFp8BlockRunner(MoERunner):
+class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     """Block-FP8 adapter over the canonical trtllm-gen ``MoERunner``.
 
     DeepSeek FP8 and MXFP8 share the kernel family but not scale contracts:
@@ -1347,8 +1427,8 @@ class TrtllmFp8BlockRunner(MoERunner):
         QuantVariant.MxFp8,
     )
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -1369,10 +1449,10 @@ class TrtllmFp8BlockRunner(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
         from .api import QuantVariant
-        from .core import get_trtllm_moe_sm100_module
 
         if config.quant.variant is QuantVariant.MxFp8:
             dtype = DtypeTrtllmGen.MxE4m3
@@ -1385,7 +1465,7 @@ class TrtllmFp8BlockRunner(MoERunner):
 
         self.config = config
         self.device = device
-        self._module = get_trtllm_moe_sm100_module()
+        self._module: Any = None
         self._variant = config.quant.variant
         self._dtype_act = dtype
         self._dtype_weights = dtype
@@ -1411,6 +1491,7 @@ class TrtllmFp8BlockRunner(MoERunner):
         self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
         if self._inner is not None:
             return
         from ..tllm_enums import WeightLayout
@@ -1433,6 +1514,7 @@ class TrtllmFp8BlockRunner(MoERunner):
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
+        self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -1442,6 +1524,7 @@ class TrtllmFp8BlockRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         self._inner.forward(
             inputs,
             tactic=tactic,
@@ -1533,11 +1616,18 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{name} must be {scale_dtype} with shape {expected}, got "
                     f"{tensor.dtype} {tuple(tensor.shape)}."
                 )
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            "TrtllmFp8BlockRunner",
+        )
         return scale
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         from ..tllm_enums import WeightLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
@@ -1593,9 +1683,12 @@ class TrtllmFp8BlockRunner(MoERunner):
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            # Optional SwiGLU OA controls; absent keys mean alpha=1 / beta=0 / no clamp.
+            # Both block-scale variants consume them: MxFp8 in the fused FC1 epilogue,
+            # DeepSeekFp8 in its separate activation kernel.
+            gemm1_alpha=view.get("gemm1_alpha"),
+            gemm1_beta=view.get("gemm1_beta"),
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
             gemm2_weights=view["gemm2_weights"],
             gemm2_weights_scale=view["gemm2_weights_scale"],
             num_experts=routing.num_experts,
@@ -1633,7 +1726,7 @@ class TrtllmFp8BlockRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmFp8PerTensorRunner(MoERunner):
+class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     """Per-tensor-FP8 adapter over the canonical trtllm-gen ``MoERunner``.
 
     The kernel consumes prequantized E4M3 activations and weights. Its calibrated
@@ -1650,8 +1743,8 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     )
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         from ..tllm_enums import RoutingMethodType
         from ..utils import get_compute_capability
         from .api import TrtllmFp8PerTensorConfig
@@ -1680,13 +1773,13 @@ class TrtllmFp8PerTensorRunner(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .core import get_trtllm_moe_sm100_module
 
         self.config = config
         self.device = device
-        self._module = get_trtllm_moe_sm100_module()
+        self._module: Any = None
         self._dtype_act = DtypeTrtllmGen.E4m3
         self._dtype_weights = DtypeTrtllmGen.E4m3
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
@@ -1710,6 +1803,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
         if self._inner is not None:
             return
         from ..tllm_enums import WeightLayout
@@ -1732,6 +1826,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
+        self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -1741,6 +1836,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         self._inner.forward(
             inputs,
             tactic=tactic,
@@ -1806,6 +1902,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         from ..tllm_enums import RoutingMethodType
         from .core import MoeRunnerInputs
 
@@ -1897,7 +1994,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmBf16RoutedRunner(MoERunner):
+class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     """BF16 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Mirrors :class:`TrtllmFp4RoutedRunner` but with ``Bfloat16`` activation +
@@ -1920,8 +2017,8 @@ class TrtllmBf16RoutedRunner(MoERunner):
     )
     supported_quant_variants = (QuantVariant.BF16,)
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -1941,13 +2038,13 @@ class TrtllmBf16RoutedRunner(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .core import get_trtllm_moe_sm100_module
 
         self.config = config
         self.device = device
-        self._module = get_trtllm_moe_sm100_module()
+        self._module: Any = None
 
         routing = config.routing
         experts = config.experts
@@ -1972,6 +2069,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
         self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
         if self._inner is not None:
             return
         from ..tllm_enums import WeightLayout
@@ -1994,6 +2092,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
+        self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -2003,6 +2102,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         self._inner.forward(
             inputs,
             tactic=tactic,
@@ -2021,6 +2121,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
         (the EP bridge does not quantize on the bf16 path);
         ``act.hidden_states_scale`` is unused.
         """
+        self._require_built()
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -2119,7 +2220,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-class TrtllmMxInt4RoutedRunner(MoERunner):
+class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
     """MxInt4 adapter over the canonical TRTLLM MoE runner."""
 
     backend_key = "trtllm_mxint4_routed"
@@ -2129,8 +2230,8 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
     )
     supported_quant_variants = (QuantVariant.MxInt4,)
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
@@ -2151,13 +2252,13 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .core import get_trtllm_moe_sm100_module
 
         self.config = config
         self.device = device
-        self._module = get_trtllm_moe_sm100_module()
+        self._module: Any = None
 
         routing = config.routing
         experts = config.experts
@@ -2182,6 +2283,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
         self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
         if self._inner is not None:
             return
         from ..tllm_enums import WeightLayout
@@ -2204,6 +2306,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
+        self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -2213,6 +2316,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         self._inner.forward(
             inputs,
             tactic=tactic,
@@ -2224,6 +2328,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
@@ -2341,26 +2446,12 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
                     f"{type(self).__name__}: {key} shape "
                     f"{tuple(view[key].shape)} != expected {expected}."
                 )
-        for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
-            tensor = view.get(key)
-            if tensor is None:
-                continue
-            if tensor.device != hidden_states.device:
-                raise ValueError(
-                    f"{type(self).__name__}: {key} is on {tensor.device}, "
-                    f"expected {hidden_states.device}."
-                )
-            if tensor.dtype != torch.float32:
-                raise TypeError(
-                    f"{type(self).__name__}: {key} must be float32, got {tensor.dtype}."
-                )
-            if tuple(tensor.shape) != (self._num_local_experts,):
-                raise ValueError(
-                    f"{type(self).__name__}: {key} shape {tuple(tensor.shape)} "
-                    f"!= expected ({self._num_local_experts},)."
-                )
-            if not tensor.is_contiguous():
-                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            hidden_states.device,
+            type(self).__name__,
+        )
 
         output = hidden_states.new_empty((num_tokens, hidden_size))
         moe_inputs = MoeRunnerInputs(
@@ -2419,8 +2510,8 @@ class _B12xRunner(MoERunner):
     backend_key: ClassVar[str] = ""
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
 
         from ..cute_dsl import is_cute_dsl_available
         from ..jit.cpp_ext import get_cuda_version
@@ -2448,6 +2539,7 @@ class _B12xRunner(MoERunner):
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
     def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         from .utils import get_b12x_activation_name
 
         self.config = config
@@ -2458,8 +2550,16 @@ class _B12xRunner(MoERunner):
         self.tuning_config = TuningConfig()
         self._prepared_weights: dict[str, torch.Tensor] | None = None
         self._inner: Any = None
+        self._wrapper_cls: Any = None
+
+    def _build(self) -> None:
+        """Load the b12x wrapper factory; shapes remain per-call."""
+        from .cute_dsl import B12xMoEWrapper
+
+        self._wrapper_cls = B12xMoEWrapper
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
         return [-1]
 
     def _get_quant_mode_name(self) -> str:
@@ -2491,15 +2591,14 @@ class _B12xRunner(MoERunner):
             raise TypeError(f"{self.backend_key} prepared weights must be tensors.")
 
     def _ensure_inner(self, hidden_size: int, num_tokens: int) -> None:
+        self._require_built()
         if (
             self._inner is not None
             and hidden_size == self._inner.hidden_size
             and num_tokens <= self._inner.max_num_tokens
         ):
             return
-        from .cute_dsl import B12xMoEWrapper
-
-        self._inner = B12xMoEWrapper(
+        self._inner = self._wrapper_cls(
             num_experts=self.config.routing.num_experts,
             top_k=self.config.routing.top_k,
             hidden_size=hidden_size,
@@ -2515,6 +2614,7 @@ class _B12xRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
         first_weight = v[self.required_weight_keys[0]]
@@ -2578,6 +2678,7 @@ class _B12xRunner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         if tactic != -1:
             raise ValueError(f"{self.backend_key} supports only tactic -1.")
         if self._prepared_weights is None:
@@ -2635,8 +2736,8 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_alpha",
     )
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type not in (
             ActivationType.Swiglu,
             ActivationType.Relu2,

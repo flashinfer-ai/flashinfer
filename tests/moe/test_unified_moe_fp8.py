@@ -34,6 +34,13 @@ from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
 
+def _build_per_tensor_fp8_runner(config):
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    return runner
+
+
 def _is_trtllm_fp8_arch() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
@@ -109,8 +116,29 @@ def _requant_intermediate(inter: torch.Tensor, variant) -> torch.Tensor:
     return _mxfp8_dequant_matrix(q, sf)
 
 
-def _block_fp8_reference(x, w1, w2, ids, weights, variant, expert_offset=0):
+def _block_fp8_reference(
+    x,
+    w1,
+    w2,
+    ids,
+    weights,
+    variant,
+    expert_offset=0,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
+):
+    """Dequantized block-FP8 MoE reference.
+
+    ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are the optional
+    per-expert SwiGLU OA controls; leaving all three unset reproduces plain SwiGLU.
+    """
     weights = weights.to(torch.bfloat16).float()
+    has_oa = (
+        gemm1_alpha is not None
+        or gemm1_beta is not None
+        or gemm1_clamp_limit is not None
+    )
     out = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=torch.float32)
     for local_expert in range(w1.shape[0]):
         token, slot = torch.where(ids == local_expert + expert_offset)
@@ -118,7 +146,17 @@ def _block_fp8_reference(x, w1, w2, ids, weights, variant, expert_offset=0):
             continue
         up = x[token] @ w1[local_expert, :INTERMEDIATE].t()
         gate = x[token] @ w1[local_expert, INTERMEDIATE:].t()
-        inter = _requant_intermediate(F.silu(gate) * up, variant)
+        if gemm1_clamp_limit is not None:
+            limit = gemm1_clamp_limit[local_expert].float()
+            up = up.clamp(min=-limit, max=limit)
+            gate = gate.clamp(max=limit)
+        if has_oa:
+            alpha = 1.0 if gemm1_alpha is None else gemm1_alpha[local_expert].float()
+            beta = 0.0 if gemm1_beta is None else gemm1_beta[local_expert].float()
+            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+        else:
+            act = F.silu(gate) * up
+        inter = _requant_intermediate(act, variant)
         expert_out = inter @ w2[local_expert].t()
         out[token] += weights[token, slot, None] * expert_out
     return out
@@ -221,6 +259,74 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
+
+
+@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
+    """The unified runner forwards the SwiGLU OA params from the weight view.
+
+    Both block-scale variants consume them, by different routes: MxFp8 in the fused
+    FC1 epilogue of the cubins, DeepSeekFp8 in its separate activation kernel.
+    """
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
+    device = pack.hidden_states_q.device
+    view = weights.get_view("trtllm_fp8_block")
+
+    def per_expert(value):
+        return torch.full((NUM_EXPERTS,), value, device=device, dtype=torch.float32)
+
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    baseline = runner.forward(runner.pack_inputs(pack, weights), tactic=-1).clone()
+
+    # FC1 outputs have std ~0.32 for this generator (w1 is 0.02*randn over
+    # HIDDEN=256), so 0.3 clamps ~35% of the linear half and ~17% of the gate
+    # half rather than being a silent no-op.
+    alpha, beta, clamp_limit = per_expert(1.702), per_expert(1.0), per_expert(0.3)
+    view["gemm1_alpha"] = alpha
+    view["gemm1_beta"] = beta
+    view["gemm1_clamp_limit"] = clamp_limit
+
+    reference = _block_fp8_reference(
+        x,
+        w1,
+        w2,
+        pack.topk_ids,
+        pack.topk_weights,
+        variant,
+        gemm1_alpha=alpha,
+        gemm1_beta=beta,
+        gemm1_clamp_limit=clamp_limit,
+    )
+    actual = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    _assert_fp8_close(actual, reference)
+    # Guard against the params being accepted and then dropped on the way down.
+    assert not torch.allclose(actual.float(), baseline.float(), atol=1e-2, rtol=1e-2)
+
+    # An explicit no-op set (alpha=1, beta=0, limit above the FC1 range) must
+    # reproduce the baseline, which pins the neutral-value semantics.
+    view["gemm1_alpha"] = per_expert(1.0)
+    view["gemm1_beta"] = per_expert(0.0)
+    view["gemm1_clamp_limit"] = per_expert(1.0e9)
+    noop = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    torch.testing.assert_close(noop.float(), baseline.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
+def test_block_fp8_swiglu_oa_params_rejected_when_malformed(key):
+    """Malformed OA params fail at the runner boundary, naming the offending key."""
+    pack, weights, config, _ = _make_block_fp8_case(QuantVariant.DeepSeekFp8)
+    runner = MoELayer(config).runners[0]
+    view = weights.get_view("trtllm_fp8_block")
+    device = pack.hidden_states_q.device
+
+    view[key] = torch.ones(NUM_EXPERTS, device=device, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match=f"{key} must be float32"):
+        runner.pack_inputs(pack, weights)
+
+    view[key] = torch.ones(NUM_EXPERTS + 1, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match=f"{key} shape"):
+        runner.pack_inputs(pack, weights)
 
 
 def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
@@ -668,7 +774,7 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
     layer_out = MoELayer(config)(act, weights)
     _assert_per_tensor_fp8_close(layer_out, ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
@@ -687,7 +793,7 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     )
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
     invalid_config = dataclasses.replace(
@@ -715,7 +821,7 @@ def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     assert torch.count_nonzero(ref)
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
 
@@ -734,7 +840,7 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
         act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     )
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
     packed = moe_inputs.topk_ids
     assert moe_inputs.expert_weights is None
@@ -753,7 +859,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
     assert not act.topk_ids.is_contiguous()
     assert not act.topk_weights.is_contiguous()
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     assert MoeRunnerInputs.from_list(inputs).topk_ids.is_contiguous()
     _assert_per_tensor_fp8_close(runner.forward(inputs), ref)
@@ -761,7 +867,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
 
 def test_fp8_per_tensor_routing_replay_matches_reference():
     act, weights, config, _, selected_experts = _make_per_tensor_fp8_case()
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
@@ -785,7 +891,7 @@ def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
         routing_input_mode=routing_input_mode
     )
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     runner.forward(inputs)
     graph = torch.cuda.CUDAGraph()
