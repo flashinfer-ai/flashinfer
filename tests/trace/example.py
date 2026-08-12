@@ -21,6 +21,7 @@ gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -42,6 +43,12 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
+prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
+prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
@@ -703,6 +710,37 @@ flashinfer.kda_decode.recurrent_kda(
     beta_is_logit=True,
 )
 
+# ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
+fk_N, fk_H, fk_D = 4, 12, 128
+fk_hidden = fk_H * fk_D
+fk_x = torch.randn(fk_N, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+fk_weight = torch.randn(3, 4, fk_hidden, dtype=torch.float32, device=device)
+fk_conv_storage = torch.zeros(
+    fk_N + 1, 3 * fk_hidden, 3, dtype=torch.bfloat16, device=device
+)
+fk_conv_state = fk_conv_storage.transpose(1, 2).contiguous().transpose(1, 2)
+fk_raw_gate = torch.randn(1, fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_raw_beta = torch.randn(1, fk_N, fk_H, dtype=torch.bfloat16, device=device)
+fk_A_log = torch.randn(fk_H, dtype=torch.float32, device=device)
+fk_dt_bias = torch.randn(fk_hidden, dtype=torch.float32, device=device)
+fk_indices = torch.arange(fk_N, 0, -1, dtype=torch.int32, device=device)
+fk_state = torch.zeros(fk_N + 1, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
+fk_output_gate = torch.randn(fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_norm_weight = torch.randn(fk_D, dtype=torch.float32, device=device)
+flashinfer.kda_decode.fused_kda_decode(
+    fk_x,
+    fk_weight,
+    fk_conv_state,
+    fk_raw_gate,
+    fk_raw_beta,
+    fk_A_log,
+    fk_dt_bias,
+    fk_indices,
+    fk_state,
+    fk_output_gate,
+    fk_norm_weight,
+)
+
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
 # Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.
 # Routing is fused in-kernel from router_logits.  SM90a-only and JIT-built,
@@ -1338,6 +1376,198 @@ with contextlib.suppress(Exception):
         bmm2_scale=1.0,
         is_var_seq=False,
     )
+
+# PrimTS FMHA decode: causal SQ4 through the one-shot, caller-workspace, and
+# reusable-wrapper public surfaces (SM100/SM103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
+        batch_decode_with_paged_kv_cache as _attention_ts_decode,
+        get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
+        prims_ts_batch_decode_with_kv_cache as _prims_ts_fmha_decode,
+    )
+
+    _pts_B, _pts_SQ, _pts_SK = 4, 4, 2048
+    _pts_Hq, _pts_Hkv, _pts_D, _pts_PS = 32, 4, 128, 32
+    _pts_pages_per_request = _pts_SK // _pts_PS
+    _pts_num_pages = _pts_B * _pts_pages_per_request
+    _pts_q = torch.randn(
+        _pts_B,
+        _pts_SQ,
+        _pts_Hq,
+        _pts_D,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _pts_k = torch.randn(
+        _pts_num_pages,
+        _pts_Hkv,
+        _pts_PS,
+        _pts_D,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _pts_v = torch.randn_like(_pts_k)
+    _pts_indptr = torch.arange(
+        0,
+        _pts_num_pages + 1,
+        _pts_pages_per_request,
+        dtype=torch.int32,
+        device=device,
+    )
+    _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
+    _pts_last_page_len = torch.full(
+        (_pts_B,), _pts_PS, dtype=torch.int32, device=device
+    )
+    _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
+    _pts_cache = (_pts_k, _pts_v)
+
+    _attention_ts_decode(
+        _pts_q,
+        _pts_cache,
+        _pts_indptr,
+        _pts_indices,
+        _pts_last_page_len,
+        seq_len_q=_pts_SQ,
+        mask_type="causal",
+    )
+
+    _pts_workspace_size = _prims_ts_fmha_ws_size(
+        _pts_B,
+        _pts_Hq,
+        _pts_Hkv,
+        _pts_D,
+        _pts_PS,
+        _pts_SK,
+        seq_len_q=_pts_SQ,
+        q_dtype=_pts_q.dtype,
+        kv_dtype=_pts_k.dtype,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        device=_pts_q.device,
+    )
+    _pts_workspace = torch.zeros(_pts_workspace_size, dtype=torch.int8, device=device)
+    _prims_ts_fmha_decode(
+        _pts_q,
+        _pts_cache,
+        _pts_workspace,
+        _pts_indptr,
+        _pts_indices,
+        _pts_seq_lens,
+        _pts_SK,
+        seq_len_q=_pts_SQ,
+        mask_type="causal",
+        kv_layout="HND",
+    )
+
+    _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
+    _pts_wrapper.plan(
+        _pts_indptr,
+        _pts_indices,
+        _pts_last_page_len,
+        _pts_Hq,
+        _pts_Hkv,
+        _pts_D,
+        _pts_PS,
+        seq_len_q=_pts_SQ,
+        q_data_type=_pts_q.dtype,
+        kv_data_type=_pts_k.dtype,
+        o_data_type=torch.bfloat16,
+        mask_type="causal",
+        max_kv_len=_pts_SK,
+    )
+    _pts_wrapper.run(_pts_q, _pts_cache)
+
+# PrimTS MLA decode: the same causal SQ4 contract through all three public
+# surfaces (SM100/SM103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
+        batch_decode_mla_with_paged_kv_cache as _attention_ts_mla_decode,
+        get_prims_ts_batch_decode_mla_workspace_size as _prims_ts_mla_ws_size,
+        prims_ts_batch_decode_with_kv_cache_mla as _prims_ts_mla_decode,
+    )
+
+    _pmla_B, _pmla_SQ, _pmla_SK, _pmla_PS = 4, 4, 2048, 32
+    _pmla_H, _pmla_CKV, _pmla_KPE = 128, 512, 64
+    _pmla_D = _pmla_CKV + _pmla_KPE
+    _pmla_pages_per_request = _pmla_SK // _pmla_PS
+    _pmla_num_pages = _pmla_B * _pmla_pages_per_request
+    _pmla_q = torch.randn(
+        _pmla_B,
+        _pmla_SQ,
+        _pmla_H,
+        _pmla_D,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _pmla_cache = torch.randn(
+        _pmla_num_pages,
+        _pmla_PS,
+        _pmla_D,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _pmla_block_tables = torch.arange(
+        _pmla_num_pages, dtype=torch.int32, device=device
+    ).reshape(_pmla_B, _pmla_pages_per_request)
+    _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
+
+    _attention_ts_mla_decode(
+        _pmla_q,
+        _pmla_cache,
+        _pmla_block_tables,
+        _pmla_seq_lens,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        max_kv_len=_pmla_SK,
+    )
+
+    _pmla_workspace_size = _prims_ts_mla_ws_size(
+        _pmla_B,
+        _pmla_H,
+        _pmla_CKV,
+        _pmla_KPE,
+        _pmla_PS,
+        _pmla_SK,
+        max_seq_len_q=_pmla_SQ,
+        q_dtype=_pmla_q.dtype,
+        kv_dtype=_pmla_cache.dtype,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        device=_pmla_q.device,
+    )
+    _pmla_workspace = torch.empty(_pmla_workspace_size, dtype=torch.int8, device=device)
+    _prims_ts_mla_decode(
+        _pmla_q,
+        _pmla_cache,
+        _pmla_workspace,
+        _pmla_CKV,
+        _pmla_KPE,
+        _pmla_block_tables,
+        _pmla_seq_lens,
+        _pmla_SK,
+        max_seq_len_q=_pmla_SQ,
+        mask_type="causal",
+    )
+
+    _pmla_wrapper = _PrimTSMLADecodeWrapper()
+    _pmla_wrapper.plan(
+        _pmla_block_tables,
+        _pmla_seq_lens,
+        _pmla_H,
+        _pmla_CKV,
+        _pmla_KPE,
+        _pmla_PS,
+        seq_len_q=_pmla_SQ,
+        q_data_type=_pmla_q.dtype,
+        kv_data_type=_pmla_cache.dtype,
+        o_data_type=torch.bfloat16,
+        mask_type="causal",
+        max_kv_len=_pmla_SK,
+    )
+    _pmla_wrapper.run(_pmla_q, _pmla_cache)
 
 # trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
 # page tables and seq lens; SM100/103 only).

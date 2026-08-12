@@ -28,7 +28,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     in_kernel_fc2_reduce: bool = False
     token_back_by_dispatch: bool = False
-    # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
+    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
     # "auto" -> online autotune at the first forward: collectively time the

@@ -145,6 +145,30 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
     )
 
 
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "get_prims_ts_batch_decode_workspace_size",
+        "prims_ts_batch_decode_with_kv_cache",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Resolve PrimTS decode APIs without loading their runtime at import."""
+
+    if name in _PRIMS_TS_LAZY_EXPORTS:
+        from .attention.prims_ts import decode as prims_ts_decode
+
+        value = getattr(prims_ts_decode, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -1915,10 +1939,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
-        if (
-            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
-        ) and kv_cache_sf is None:
-            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
+        if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+            if get_compute_capability(q.device) == (10, 7):
+                raise ValueError("KV Cache NVFP4 is not supported on SM107")
+            if kv_cache_sf is None:
+                raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales, value_block_scales = (
             _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
             if kv_cache_sf is not None
@@ -2842,6 +2867,7 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            None,  # sparse_mla_top_k_lens
         )
         return out
 
@@ -3227,10 +3253,11 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    if (
-        k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
-    ) and kv_cache_sf is None:
-        raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
+    if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+        if get_compute_capability(query.device) == (10, 7):
+            raise ValueError("KV Cache NVFP4 is not supported on SM107")
+        if kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     is_nvfp4_kvcache = (
         k_cache.dtype == torch.uint8
         and v_cache.dtype == torch.uint8
@@ -3503,6 +3530,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens,
             lse_stride_heads,
             enable_block_sparse_attention,
+            None,  # sparse_mla_top_k_lens
         )
 
         result_out = (

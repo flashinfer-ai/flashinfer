@@ -71,6 +71,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
@@ -4873,10 +4874,11 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    if (
-        k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
-    ) and kv_cache_sf is None:
-        raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
+    if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+        if get_compute_capability(query.device) == (10, 7):
+            raise ValueError("KV Cache NVFP4 is not supported on SM107")
+        if kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     key_block_scales, value_block_scales = (
         _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
         if kv_cache_sf is not None

@@ -103,6 +103,19 @@ def is_cuda_tile_available() -> bool:
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False
+            # cuda.tile also compiles through NVRTC; an NVRTC older than the
+            # device arch fails at launch with "invalid value for
+            # --gpu-architecture" even when tileiras itself is fine.
+            try:
+                from cuda.bindings import nvrtc as _nvrtc
+
+                err, num_archs = _nvrtc.nvrtcGetNumSupportedArchs()
+                if int(err) == 0 and num_archs > 0:
+                    err, archs = _nvrtc.nvrtcGetSupportedArchs()
+                    if int(err) == 0 and (major * 10 + minor) not in list(archs):
+                        return False
+            except Exception:
+                pass  # bindings missing/too old — fall through to tileiras verdict
     except Exception:
         pass  # no torch or no GPU — skip arch check, let the caller decide
 
