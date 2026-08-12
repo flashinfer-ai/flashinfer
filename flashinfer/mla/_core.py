@@ -2165,7 +2165,7 @@ class BatchMLAPagedAttentionWrapper:
         head_dim_ckv : int
             The head dimension of compressed-kv.
         head_dim_kpe : int
-            The head dimension for rope k-cache.
+            The head dimension for rope k-cache. Zero is supported for NoPE MLA.
         page_size : int
             The page size of the paged kv-cache.
         causal : bool
@@ -2192,31 +2192,26 @@ class BatchMLAPagedAttentionWrapper:
             raise ValueError(f"head_dim_kpe must be >= 0, got {head_dim_kpe}.")
 
         if kv_data_type == torch.float8_e4m3fn:
-            if self._backend != "fa3":
+            if self._backend not in ("fa2", "fa3"):
                 raise ValueError(
-                    "FP8 kv_data_type for MLA is only supported with the fa3 "
+                    "FP8 kv_data_type for MLA is only supported with the fa2 or fa3 "
                     f"backend on SM90, got backend={self._backend!r}."
                 )
-            # Backend selection is independent of the runtime device; FP8 MLA
-            # requires SM90 specifically.
             major, minor = get_compute_capability(self.device)
             if major != 9:
                 raise ValueError(
                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                     f"got SM{major}{minor}."
                 )
-            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
-            # exists but is untested for MLA — silent wrong output.
             if q_data_type != torch.bfloat16:
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
                     f"q_data_type=torch.bfloat16, got {q_data_type}."
                 )
-            # Also enforced by static_assert in mla_hopper.cuh.
-            if head_dim_ckv != 512 or head_dim_kpe != 64:
+            if head_dim_ckv != 512 or head_dim_kpe not in (0, 64):
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
-                    "head_dim_ckv=512 and head_dim_kpe=64 (DeepSeek MLA), got "
+                    "head_dim_ckv=512 and head_dim_kpe in (0, 64), got "
                     f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
                 )
 
@@ -2247,6 +2242,7 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        self._head_dim_ckv = head_dim_ckv
         # Used by run() to reject dtype mismatches; the C++ launcher
         # reinterprets storage by the JIT-template type chosen at plan(),
         # so a mismatch produces silent wrong output.
@@ -2284,6 +2280,7 @@ class BatchMLAPagedAttentionWrapper:
         *,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2304,6 +2301,7 @@ class BatchMLAPagedAttentionWrapper:
         *,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -2324,6 +2322,7 @@ class BatchMLAPagedAttentionWrapper:
         *,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -2338,7 +2337,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_ckv`` is 512 in DeepSeek v2/v3 models.
         kpe_cache : torch.Tensor
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
-            ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
+            ``head_dim_kpe`` can be zero for NoPE MLA.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
             When ``o_scale`` is provided, this should be an FP8 tensor.
@@ -2366,12 +2365,17 @@ class BatchMLAPagedAttentionWrapper:
             Per-tensor dequantization scale for the compressed-KV cache when
             ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
             (together with ``kpe_scale``) for the FP8 KV cache path on the
-            ``fa3`` backend. Must be a finite positive value. Must not be
+            ``fa2`` or ``fa3`` backend. Must be a finite positive value. Must not be
             provided when ``kv_data_type`` is BF16/FP16.
         kpe_scale : Optional[float]
             Per-tensor dequantization scale for the rope-K cache when
             ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
             usage rules as ``ckv_scale``.
+        ckv_scale_arr : Optional[torch.Tensor]
+            Per-token, per-128-channel CKV dequantization scales. The expected
+            shape is ``ckv_cache.shape[:-1] + (head_dim_ckv // 128,)`` and the
+            dtype must be contiguous float32. When provided, these values
+            override ``ckv_scale`` for CKV dequantization.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -2380,10 +2384,14 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     "profiler_buffer does not support cutlass backend for now."
                 )
-            if ckv_scale is not None or kpe_scale is not None:
+            if (
+                ckv_scale is not None
+                or kpe_scale is not None
+                or ckv_scale_arr is not None
+            ):
                 raise ValueError(
-                    "ckv_scale / kpe_scale are only supported with the fa3 backend "
-                    "and FP8 kv_data_type."
+                    "ckv_scale / kpe_scale / ckv_scale_arr are only supported with "
+                    "an fa2/fa3 backend and FP8 kv_data_type."
                 )
             self._cached_module = get_mla_module()
             output_scale = 1.0
@@ -2507,7 +2515,22 @@ class BatchMLAPagedAttentionWrapper:
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
-        self._cached_module.run(
+        if ckv_scale_arr is not None:
+            if not kv_is_fp8:
+                raise ValueError(
+                    "ckv_scale_arr is only valid when kv_data_type is FP8."
+                )
+            expected_scale_shape = ckv_cache.shape[:-1] + (self._head_dim_ckv // 128,)
+            check_shape_dtype_device(
+                ckv_scale_arr,
+                expected_scale_shape,
+                torch.float32,
+                ckv_cache.device,
+                "ckv_scale_arr",
+            )
+            if not ckv_scale_arr.is_contiguous():
+                raise ValueError("ckv_scale_arr must be contiguous.")
+        run_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
@@ -2525,8 +2548,9 @@ class BatchMLAPagedAttentionWrapper:
             return_lse_base_on_e,
             ckv_scale_f,
             kpe_scale_f,
-            *profiler_args,
+            ckv_scale_arr,
         )
+        self._cached_module.run(*run_args, *profiler_args)
 
         return (out, lse) if return_lse else out
 
