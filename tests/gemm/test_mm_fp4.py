@@ -244,7 +244,7 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
 @pytest.mark.parametrize("n", [256, 512])
 @pytest.mark.parametrize("k", [128, 256])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "b12x", "auto"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
     """A per-token alpha must scale each output row by its own dequant scale."""
@@ -255,8 +255,6 @@ def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
             pytest.skip(f"No per-token alpha FP4 backend on SM{major}{minor}.")
     elif backend not in arch_backends:
         pytest.skip(f"{backend} has no per-token alpha epilogue on SM{major}{minor}.")
-    if backend == "b12x" and not version_at_least(torch.version.cuda, "13.0"):
-        pytest.skip("b12x backend requires CUDA 13+.")
 
     torch.manual_seed(0)
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)

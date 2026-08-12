@@ -209,7 +209,6 @@ class DenseGemmKernel:
         use_m1_non_tma_sfa: bool = False,
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
-        per_token_alpha: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -239,7 +238,6 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
-        self.per_token_alpha = per_token_alpha
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
@@ -389,8 +387,7 @@ class DenseGemmKernel:
             sfa: Scale factor tensor for A
             sfb: Scale factor tensor for B
             c: Output tensor C
-            alpha: Alpha scaling factor tensor, float32. Shape (1,) normally,
-                or (m,) when the kernel was built with per_token_alpha=True
+            alpha: Alpha scaling factor tensor, shape (1,), float32
             max_active_clusters: Max active clusters
             stream: CUDA stream
             epilogue_op: Elementwise epilogue function
@@ -843,12 +840,8 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
-        # Keep alpha in FP32 for precision. In per-token mode the row scale is
-        # applied once the global row index is known, so this stays neutral.
-        if cutlass.const_expr(self.per_token_alpha):
-            alpha_value = cutlass.Float32(1.0)
-        else:
-            alpha_value = alpha[0].to(cutlass.Float32)
+        # Keep alpha in FP32 for precision
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
@@ -1502,32 +1495,6 @@ class DenseGemmKernel:
                                 accumulators[None, _mt, _nt],
                             )
 
-                if cutlass.const_expr(self.per_token_alpha and not self.swap_ab):
-                    # Without swap_ab the M extent maps to acc_mn's first mode,
-                    # so one alpha load covers a whole accumulator row. Rows past
-                    # M are dropped by the store predication below.
-                    pt_acc_mn = _reshape_acc_to_mn(accumulators)
-                    pt_coord_mn = _reshape_acc_to_mn(
-                        thr_mma.partition_C(
-                            cute.make_identity_tensor(
-                                cute.slice_(self.tile_shape_mnk, (None, None, 0))
-                            )
-                        )
-                    )
-                    for acc_m in cutlass.range_constexpr(cute.size(pt_acc_mn.shape[0])):
-                        m_coord = (
-                            tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
-                            + pt_coord_mn[acc_m, 0][0]
-                        )
-                        if m_coord < Int32(directC_mnl.shape[0]):
-                            row_alpha = alpha[m_coord].to(cutlass.Float32)
-                            for acc_n in cutlass.range_constexpr(
-                                cute.size(pt_acc_mn.shape[1])
-                            ):
-                                pt_acc_mn[acc_m, acc_n] = (
-                                    pt_acc_mn[acc_m, acc_n] * row_alpha
-                                )
-
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
                     c_identity = cute.make_identity_tensor(
@@ -1553,12 +1520,6 @@ class DenseGemmKernel:
                             if m_coord < Int32(
                                 directC_mnl.shape[0]
                             ) and n_coord < Int32(directC_mnl.shape[1]):
-                                # swap_ab puts M on acc_mn's second mode, so the
-                                # row scale cannot be hoisted per row here.
-                                if cutlass.const_expr(self.per_token_alpha):
-                                    elem_alpha = alpha[m_coord].to(cutlass.Float32)
-                                else:
-                                    elem_alpha = alpha_value
                                 directC_mnl[
                                     (
                                         m_coord,
@@ -1566,7 +1527,9 @@ class DenseGemmKernel:
                                         tile_coord_mnl[2],
                                     )
                                 ] = epilogue_op(
-                                    (elem_alpha * acc_mn[acc_m, acc_n]).to(self.c_dtype)
+                                    (alpha_value * acc_mn[acc_m, acc_n]).to(
+                                        self.c_dtype
+                                    )
                                 )
                     if cutlass.const_expr(self.single_work_tile_per_cta):
                         work_tile = WorkTileInfo(

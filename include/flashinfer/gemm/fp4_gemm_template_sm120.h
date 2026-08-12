@@ -34,7 +34,6 @@
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "flashinfer/arch_condition.h"
 #include "flashinfer/cutlass_utils.cuh"
-#include "flashinfer/gemm/fp4_gemm_per_token_scale.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
@@ -79,21 +78,19 @@ constexpr auto always_false = false;
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
           typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB>
 size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
-                                    void const* weight_sf, float const* global_sf,
-                                    bool per_token_alpha, int m, int n, int k, int batch_count,
-                                    CutlassGemmConfig gemmConfig, char* workspace,
-                                    size_t const workspaceBytes, cudaStream_t stream,
-                                    int* occupancy);
+                                    void const* weight_sf, float const* global_sf, int m, int n,
+                                    int k, int batch_count, CutlassGemmConfig gemmConfig,
+                                    char* workspace, size_t const workspaceBytes,
+                                    cudaStream_t stream, int* occupancy);
 
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
           typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB>
 size_t genericFp4GemmKernelLauncherStreamK(void* D, void const* A, void const* B,
                                            void const* input_sf, void const* weight_sf,
-                                           float const* global_sf, bool per_token_alpha, int m,
-                                           int n, int k, int batch_count,
-                                           CutlassGemmConfig gemmConfig, char* workspace,
-                                           size_t const workspaceBytes, cudaStream_t stream,
-                                           int* occupancy);
+                                           float const* global_sf, int m, int n, int k,
+                                           int batch_count, CutlassGemmConfig gemmConfig,
+                                           char* workspace, size_t const workspaceBytes,
+                                           cudaStream_t stream, int* occupancy);
 
 // ============================================================================
 // Common helper functions to reduce code duplication
@@ -103,8 +100,8 @@ size_t genericFp4GemmKernelLauncherStreamK(void* D, void const* A, void const* B
 template <typename Gemm>
 inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void const* B,
                                                     void const* input_sf, void const* weight_sf,
-                                                    float const* global_sf, bool per_token_alpha,
-                                                    int m, int n, int k, int batch_count) {
+                                                    float const* global_sf, int m, int n, int k,
+                                                    int batch_count) {
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   using ElementC = void;
   using ElementD = typename Gemm::ElementD;
@@ -113,15 +110,6 @@ inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   operator_args.epilogue.thread.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
-  // Stride 0 replays alpha_ptr[0] for every element, 1 walks one alpha per
-  // token. Which mode holds the tokens follows the fusion's stride type.
-  using StrideAlpha = decltype(operator_args.epilogue.thread.dAlpha);
-  if constexpr (cute::is_same_v<cute::remove_cvref_t<decltype(cute::get<0>(StrideAlpha{}))>,
-                                bool>) {
-    operator_args.epilogue.thread.dAlpha = {per_token_alpha, cute::_0{}, int64_t(0)};
-  } else {
-    operator_args.epilogue.thread.dAlpha = {cute::_0{}, per_token_alpha, int64_t(0)};
-  }
   operator_args.problem_shape = cute::make_shape(m, n, k, batch_count);
 
   operator_args.mainloop.ptr_A = static_cast<cutlass::float_e2m1_t const*>(A);
@@ -163,13 +151,12 @@ inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void
 // Unified runGemm - works for both DP and StreamK schedulers
 template <typename Gemm>
 inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* input_sf,
-                             void const* weight_sf, float const* global_sf, bool per_token_alpha,
-                             int m, int n, int k, int batch_count, char* workspace,
-                             size_t const workspaceBytes, cudaStream_t stream,
-                             const char* scheduler_name) {
+                             void const* weight_sf, float const* global_sf, int m, int n, int k,
+                             int batch_count, char* workspace, size_t const workspaceBytes,
+                             cudaStream_t stream, const char* scheduler_name) {
   Gemm gemm;
-  auto args = prepareGemmArgsImpl<Gemm>(D, A, B, input_sf, weight_sf, global_sf, per_token_alpha, m,
-                                        n, k, batch_count);
+  auto args =
+      prepareGemmArgsImpl<Gemm>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count);
 
   // Return workspace size query
   if (!A && !B && !D) {
@@ -217,9 +204,8 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
                                       cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>,    \
                                       XSM_, SWAP_AB_>(                                            \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,         \
-      float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,         \
-      CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,                 \
-      cudaStream_t stream, int* occupancy) {                                                      \
+      float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig, \
+      char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {        \
     throw std::runtime_error(                                                                     \
         "FP4 gemm kernel is not compiled with support for "                                       \
         "this Architecture.");                                                                    \
@@ -255,11 +241,8 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     using ElementAccumulator = float;                                                                                \
     using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;                                                 \
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;                                        \
-    /* Runtime-strided alpha: one instantiation serves the per-tensor scale    */                                    \
-    /* and a per-token vector. SwapAB puts the tokens on N.                     */                                   \
-    using FusionOperation = std::conditional_t<                                                                      \
-        SWAP_AB_, cutlass::epilogue::fusion::PerColScaledAcc<OutElementType, float, float>,                          \
-        cutlass::epilogue::fusion::PerRowScaledAcc<OutElementType, float, float>>;                                   \
+    using FusionOperation =                                                                                          \
+        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>;                            \
     using ThreadBlockShape = cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                   \
     /* Epilogue: explicit TmaWarpSpecialized schedule (matches TRT-LLM SM120 pattern) */                             \
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                            \
@@ -311,18 +294,15 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
                                       cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>,                       \
                                       XSM_, SWAP_AB_>(                                                               \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                            \
-      float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,                            \
-      CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,                                    \
-      cudaStream_t stream, int* occupancy) {                                                                         \
+      float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                    \
+      char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
     using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_;                                  \
     if constexpr (SWAP_AB_) {                                                                                        \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf,                                \
-                                             per_token_alpha, n, m, k, batch_count, workspace,                       \
-                                             workspaceBytes, stream, "");                                            \
+      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
+                                             batch_count, workspace, workspaceBytes, stream, "");                    \
     } else {                                                                                                         \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf,                                \
-                                             per_token_alpha, m, n, k, batch_count, workspace,                       \
-                                             workspaceBytes, stream, "");                                            \
+      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,                       \
+                                             batch_count, workspace, workspaceBytes, stream, "");                    \
     }                                                                                                                \
   }                                                                                                                  \
                                                                                                                      \
@@ -332,18 +312,17 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>, cute::Int<CGA_M_>,                                 \
       cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_, SWAP_AB_>(                                                         \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                            \
-      float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,                            \
-      CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,                                    \
-      cudaStream_t stream, int* occupancy) {                                                                         \
+      float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                    \
+      char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
     using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK;                        \
     if constexpr (SWAP_AB_) {                                                                                        \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf,                                \
-                                             per_token_alpha, n, m, k, batch_count, workspace,                       \
-                                             workspaceBytes, stream, " StreamK");                                    \
+      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
+                                             batch_count, workspace, workspaceBytes, stream,                         \
+                                             " StreamK");                                                            \
     } else {                                                                                                         \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf,                                \
-                                             per_token_alpha, m, n, k, batch_count, workspace,                       \
-                                             workspaceBytes, stream, " StreamK");                                    \
+      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,                       \
+                                             batch_count, workspace, workspaceBytes, stream,                         \
+                                             " StreamK");                                                            \
     }                                                                                                                \
   }
 

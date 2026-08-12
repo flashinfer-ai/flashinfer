@@ -70,10 +70,9 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Sc
 
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(), mat1Scale.data_ptr(),
-                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()),
-                    /*per_token_alpha=*/false, m, n, k, batch_count, gemmConfig,
-                    reinterpret_cast<char*>(workspace), required_workspace_size,
-                    get_stream(mat1.device()));
+                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()), m, n, k,
+                    batch_count, gemmConfig, reinterpret_cast<char*>(workspace),
+                    required_workspace_size, get_stream(mat1.device()));
   };
 
   if (provided_workspace_size < required_workspace_size) {

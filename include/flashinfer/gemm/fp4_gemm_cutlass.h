@@ -45,11 +45,9 @@ class CutlassFp4GemmRunnerInterface {
 
   virtual ~CutlassFp4GemmRunnerInterface() {}
 
-  // per_token_alpha selects how global_sf is read: false is a device scalar,
-  // true is one dequant scale per row of A. Only SM120/SM121 implements it.
   virtual void gemm(void* D, void const* A, void const* B, void const* input_sf,
-                    void const* weight_sf, float const* global_sf, bool per_token_alpha, int m,
-                    int n, int k, int batch_count, CutlassGemmConfig gemmConfig, char* workspace,
+                    void const* weight_sf, float const* global_sf, int m, int n, int k,
+                    int batch_count, CutlassGemmConfig gemmConfig, char* workspace,
                     const size_t workspaceBytes, cudaStream_t stream) = 0;
 
   // Returns desired workspace size in bytes.
@@ -69,7 +67,7 @@ class CutlassFp4GemmRunner : public virtual CutlassFp4GemmRunnerInterface {
   ~CutlassFp4GemmRunner();
 
   void gemm(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
-            float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,
+            float const* global_sf, int m, int n, int k, int batch_count,
             CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,
             cudaStream_t stream) override;
 
@@ -80,10 +78,9 @@ class CutlassFp4GemmRunner : public virtual CutlassFp4GemmRunnerInterface {
 
  private:
   size_t dispatchToArch(T* D, void const* A, void const* B, void const* input_sf,
-                        void const* weight_sf, float const* global_sf, bool per_token_alpha, int m,
-                        int n, int k, int batch_count, CutlassGemmConfig gemmConfig,
-                        char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-                        int* occupancy = nullptr);
+                        void const* weight_sf, float const* global_sf, int m, int n, int k,
+                        int batch_count, CutlassGemmConfig gemmConfig, char* workspace,
+                        const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr);
 
   size_t getWorkspaceSizeImpl(int const m, int const n, int const k, int const batch_count);
 };

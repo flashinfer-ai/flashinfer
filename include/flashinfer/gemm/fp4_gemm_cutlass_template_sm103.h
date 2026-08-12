@@ -339,13 +339,8 @@ CutlassFp4GemmRunner<T, fp4GemmType>::~CutlassFp4GemmRunner() {}
 template <typename T, FP4GemmType fp4GemmType>
 size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
     T* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
-    float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,
-    CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy) {
-  if (per_token_alpha) {
-    throw std::runtime_error(
-        "[Error][CutlassFp4GemmRunner] Per-token alpha is only implemented for SM120/SM121.");
-  }
+    float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,
+    char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {
   if constexpr (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4) {
     return dispatchNVFP4xNVFP4GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                                                    batch_count, gemmConfig, workspace,
@@ -360,13 +355,13 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
 template <typename T, FP4GemmType fp4GemmType>
 void CutlassFp4GemmRunner<T, fp4GemmType>::gemm(void* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
-                                                float const* global_sf, bool per_token_alpha, int m,
-                                                int n, int k, int batch_count,
-                                                CutlassGemmConfig gemmConfig, char* workspace,
-                                                const size_t workspaceBytes, cudaStream_t stream) {
+                                                float const* global_sf, int m, int n, int k,
+                                                int batch_count, CutlassGemmConfig gemmConfig,
+                                                char* workspace, const size_t workspaceBytes,
+                                                cudaStream_t stream) {
   CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
-      reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k,
-      batch_count, gemmConfig, workspace, workspaceBytes, stream);
+      reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count,
+      gemmConfig, workspace, workspaceBytes, stream);
 }
 
 template <typename T, FP4GemmType fp4GemmType>
@@ -419,8 +414,8 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSizeImpl(int const m, i
   for (auto const& gemmConfig : gemmConfigs) {
     try {
       size_t curr_workspace_size = CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, /*per_token_alpha=*/false, m, n, k,
-          batch_count, gemmConfig, nullptr, 0, 0);
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k, batch_count, gemmConfig,
+          nullptr, 0, 0);
       workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error& e) {
       // Swallow errors when SMEM exceeds maximum allowed

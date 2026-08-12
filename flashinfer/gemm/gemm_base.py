@@ -1754,9 +1754,6 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
                     a_descale = a_descale.view(torch.uint8)
                 if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
                     b_descale = b_descale.view(torch.uint8)
-                if _is_per_token_alpha(alpha):
-                    # The binding reads per-token mode off alpha's element count.
-                    alpha = alpha.reshape(-1).contiguous()
                 module.fp4_gemm(
                     a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
                 )
@@ -4968,7 +4965,6 @@ _CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
 # that builds it.
 _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR = {
     10: ("cute-dsl",),
-    12: ("b12x", "cutlass"),
 }
 
 
@@ -5973,7 +5969,7 @@ def _cutlass_gemm_fp4_requirement(
     b: torch.Tensor,  # unused
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,  # unused
@@ -5986,10 +5982,6 @@ def _cutlass_gemm_fp4_requirement(
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if _is_per_token_alpha(alpha) and get_compute_capability(a.device)[0] != 12:
-        raise ValueError(
-            "The CUTLASS FP4 GEMM backend only supports per-token alpha on SM120/SM121."
-        )
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     if out is not None and not out.is_contiguous():
@@ -6518,8 +6510,6 @@ def _b12x_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN
             batch_size = 1
 
-            per_token_alpha = _is_per_token_alpha(alpha_tensor)
-
             if tactic is None or tactic == -1:
                 # Default path: the m-aware plan picks the tile (and swap_ab for
                 # narrow-N) for this shape; expected_m=m since m is the actual size.
@@ -6549,9 +6539,6 @@ def _b12x_gemm_fp4_runner(
             sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            # The b12x kernel reads alpha at the global row index under both
-            # swap_ab settings, so the vector always walks M.
-            alpha_mode = "m" if per_token_alpha else None
             cache_key = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -6562,7 +6549,6 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
                 enable_pdl,
                 out_dtype,
-                alpha_mode,
             )
 
             # ctor takes mma_k/tile_k/single_work_tile_per_cta before use_prefetch,
@@ -6574,7 +6560,6 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
-                per_token_alpha=per_token_alpha,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
@@ -6594,14 +6579,9 @@ def _b12x_gemm_fp4_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
-                per_token_alpha=alpha_mode,
             )
 
-            alpha_for_launch = (
-                alpha_tensor.reshape(m).contiguous()
-                if per_token_alpha
-                else _prepare_alpha_for_launch(alpha_tensor, a.device)
-            )
+            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
             # `out` passed as-is (row-major (m, n)).
             compiled_gemm(
@@ -6859,8 +6839,8 @@ def mm_fp4(
         Global scale tensor, float scalar, or a float32 tensor of ``m``
         elements holding one dequant scale per row of ``a`` (activations
         quantized with a dynamic per-token NVFP4 global scale). The per-token
-        form is served by ``"cute-dsl"`` on SM10X and by ``"b12x"`` /
-        ``"cutlass"`` on SM12X; ``backend="auto"`` narrows to those.
+        form is served by ``"cute-dsl"`` on SM10X; ``backend="auto"`` narrows
+        to it.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
