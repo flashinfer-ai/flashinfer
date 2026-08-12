@@ -1,32 +1,69 @@
-"""CuTeDSL GDN MTP Decode Kernel — WY-parallel, NOPREPACK variant.
+"""Gated Delta-Net (GDN) decode kernel with a history-ring cache (verify path).
 
-v6 (TMA + SW128 swizzle on H tile):
-- Replaces v5's 4-stage staggered cp.async H load with a single
-  `cp.async.bulk.tensor.4d.shared.cluster.global` TMA issued once per CTA.
-- sH SMEM tile is allocated as a SW128-swizzled tensor (mandatory for the
-  TMA dispatcher to encode swizzle_mode=SW128 — empirically required for
-  the (V=128, K=128) BF16 K-major box, see results/v6_tma_debug_summary.md).
-- H GEMM B-fragment ldmatrix.x2 addresses get the SW128 XOR transform
-  (`phys = L ^ ((L >> 3) & 0x70)`) applied per-lane to each of the 4
-  per-V-group base addresses.
+Implements the ReplaySSM chunked delta-rule decode for speculative decoding.
+For each (request, value-head) pair the kernel computes the draft-token
+outputs from the checkpoint state and a small per-request history ring, and
+appends the new correction vectors back to the ring so that later verify
+steps can replay the recurrence. The checkpoint state is read-only here;
+folding the ring into the state ("flush") is handled by the companion
+``*_flush`` kernel.
 
-Algorithmic structure mirrors Path 1:
-- Phase 1: KKT / QKT (T x T GEMMs)
-- Phase 2: Log-depth Neumann inverse (6 GEMMs at T=16)
-- Phase 3: A_full @ H^T + QT @ V → output
+Target: SM90+ (H200 / B200). Fixed K == V == 128.
+Native draft length T in {4, 8}.
 
-H0 layout differences from Path 1:
-- Path 1: H0 loaded directly from prepacked GMEM into MMA B-fragments via
-  ld.global.v2.b32. H0 layout (pool, HV, V//8, K//16, 8, 16).
-- This file (Path 2): H0 layout (pool, HV, V, K). Per-CTA tile is V=128, K=128
-  = 32 KB BF16. v6: TMA G2S issued once during the prologue, mbarrier
-  signals completion before the H GEMM. SW128-swizzled SMEM target.
+Precision
+---------
+Activations (q/k/v, a/b), the u and k rings, the checkpoint state, and the
+output are all bf16; g_cache and the accumulators are f32. All GEMM
+accumulation and the gate / log-decay math run in f32 internally.
 
-Other features inherited from Path 1:
-- Inline PTX ldmatrix for all SMEM->register MMA loads
-- Direct acc->SMEM writes (skip sC staging) for KKT/QKT
-- Vectorized cp.async (16 B / instruction) for K, Q
-- T-aware Phase-2 squaring depth (4 / 8 / 16 variants)
+Tensors (public entry point ``gated_delta_rule_mtp_ucache``)
+------------------------------------------------------------
+  Name                   Shape             Dtype   Dir    Meaning
+  ---------------------  ----------------  ------  -----  ------------------------
+  q, k                   [B, T, H,  K]     bf16    in     draft query / key
+  v                      [B, T, HV, V]     bf16    in     draft values
+  a, b                   [B, T, HV]        bf16    in     per-token gate / beta
+  A_log                  [HV]              bf16    in     per-head log-decay (cast+cached)
+  dt_bias                [HV]              bf16    in     per-head time-step bias (cast+cached)
+  initial_state_source   [pool, HV, V, K]  bf16    in     checkpoint S0 (read-only here)
+  initial_state_indices  [B]               int32   in     per-request pool slot
+  k_cache                [pool, H,  16, K]  bf16   in/out  ring: L2-normalized keys
+  u_cache                [pool, HV, 16, V]  bf16   in/out  ring: correction vectors
+  g_cache                [pool, HV, 16]    f32     in/out  ring: cumulative log-decay
+  hist_len               [B]               int32   in      filled ring slots P per request
+  output                 [B, T, HV, V]     bf16    out     draft-token outputs (returned)
+
+  Scalars: scale (float, default 1/sqrt(K)). softplus_beta / softplus_threshold
+  are FIXED (the kernel uses beta=1 and no threshold); the wrapper rejects any
+  non-default value rather than silently ignoring it.
+
+Ring tensors are pool-indexed via initial_state_indices and MUST be
+zero-initialized at allocation. The correction vector appended per token is
+u = Tmat @ (V - e^G * (S0 @ k)). New entries are written speculatively to
+slots [P, P+T); serving code rewinds after verification by setting
+hist_len = P + accepted. The caller must keep P + T <= 16 and flush the ring
+externally when it fills up.
+
+High-level flow
+---------------
+  1. Load and L2-normalize k, q into shared memory.
+  2. Form the T x T Gram matrices K@K^T and Q@K^T.
+  3. Build the WY transform Tmat via a block triangular solve.
+  4. GEMM the state S0 against the packed [k; q] tile, add the history-ring
+     contribution, and produce the token outputs.
+  5. Compute the new corrections u and append (normed k, u, G) to the ring.
+
+Implementation notes
+--------------------
+- The state tile is streamed with TMA into an SW128-swizzled shared buffer,
+  in two K-halves to halve its shared-memory footprint.
+- All SMEM->register loads for the MMAs use ldmatrix; MMA accumulators are
+  written straight to SMEM (no separate C-staging buffer).
+- One shared-memory region is reused for several tiles (q, ring keys, ring
+  corrections, v) whose lifetimes do not overlap.
+- The Gram / inverse / GEMM phases are specialized at compile time for the
+  effective draft length T in {4, 8, 16}.
 """
 
 import torch
@@ -38,6 +75,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
+import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -47,29 +85,28 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
-from .dtype_compat import as_bf16
-
 
 device = torch.device("cuda:0")
 
-# Fixed dims matching Triton v5
+# Problem dimensions. One CTA processes a full V tile per (request, head).
 T = 16
 K_DIM = 128
 V_DIM_C = 128  # full V tile per CTA
-BK_H = 16  # K-tile for H GEMM (must be a multiple of 16 for mma.k=16)
+BK_H = 16  # K-tile for the H GEMM (multiple of 16 for mma.k=16)
 EPS = 1e-6
 io = cutlass.BFloat16
 f32 = cutlass.Float32
 WARP = 32
 THREADS = 128
 T_PAD = 16
+W_RING = 16  # history-ring slots per (request, head) — one 16-row MMA tile
 
-# SMEM padding for sK/sQ — same as Path 1
-K_HALF = K_DIM // 2  # 64 — v13 half-H streaming (sH = 16 KiB instead of 32 KiB)
+# The state tile is streamed in two K-halves so its SMEM buffer is 16 KiB
+# instead of 32 KiB. Shared-memory rows are padded by 8 bf16 to avoid bank
+# conflicts on the ldmatrix / vectorized loads.
+K_HALF = K_DIM // 2  # 64 — K-half streamed per TMA copy
 K_PADDED = K_DIM + 8  # 136 — padded row stride for sK / sQ
 V_PADDED = V_DIM_C + 8  # 136 — padded row stride for sV / sH (V rows, K cols)
-# sH layout: (V=128 rows, K_PADDED=136 cols) stored contiguous K-first
-# → row_stride_bytes = K_PADDED * 2 = 272.
 
 TK = T * K_DIM
 TK_PAD = T * K_PADDED
@@ -78,7 +115,7 @@ BF_PAD = 24
 
 
 # ---------------------------------------------------------------------------
-# PTX helpers (inherited unchanged from Path 1's kernel)
+# Small inline-PTX helpers used throughout the kernel.
 # ---------------------------------------------------------------------------
 
 
@@ -181,22 +218,6 @@ def _mul_bf16x2_f32(packed_i32, scalar):
     return Int32(r)
 
 
-def _ld_global_v2_bf16(base_addr_i64, bf16_elem_offset):
-    r = llvm.inline_asm(
-        llvm.StructType.get_literal([mlir_T.i32(), mlir_T.i32()]),
-        [base_addr_i64.ir_value(), bf16_elem_offset.ir_value()],
-        "{ .reg .u64 _a; mad.wide.u32 _a, $3, 2, $2; ld.global.v2.b32 {$0,$1}, [_a]; }",
-        "=r,=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return (
-        Int32(llvm.extractvalue(mlir_T.i32(), r, [0])),
-        Int32(llvm.extractvalue(mlir_T.i32(), r, [1])),
-    )
-
-
 def _cp_async_bf16x8(base_addr_i64, bf16_elem_offset, smem_addr_i32):
     """cp.async.ca, 16 B (8 bf16). Uses .ca for K and Q (small reuse stream)."""
     r = llvm.inline_asm(
@@ -240,32 +261,6 @@ def _cp_async_bf16x8_cg(base_addr_i64, bf16_elem_offset, smem_addr_i32):
     return Int32(r)
 
 
-def _cp_async_bf16x8_cg_l2_128B(base_addr_i64, bf16_elem_offset, smem_addr_i32):
-    """v5 (Hypothesis A): cp.async.cg with `.L2::128B` cache hint.
-    The `.L2::128B` modifier asks the L2 to allocate a full 128-byte sector
-    for this load. Since each cp.async is 16 B and 8 lanes contiguously cover
-    a 128 B chunk of K, this should better-align L2 sector replacement and
-    reduce cross-set contention seen as `set_conflicts` (120k cycles).
-    If ptxas rejects this modifier, we fall back to plain .cg via the
-    USE_L2_HINT toggle in the caller."""
-    r = llvm.inline_asm(
-        mlir_T.i32(),
-        [
-            smem_addr_i32.ir_value(),
-            base_addr_i64.ir_value(),
-            bf16_elem_offset.ir_value(),
-        ],
-        "{ .reg .u64 _a; mad.wide.u32 _a, $3, 2, $2;"
-        " cp.async.cg.shared.global.L2::128B [$1], [_a], 16;"
-        " mov.u32 $0, 0; }",
-        "=r,r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return Int32(r)
-
-
 def _cp_async_commit_group():
     r = llvm.inline_asm(
         mlir_T.i32(),
@@ -292,12 +287,72 @@ def _cp_async_wait_group_0():
     return Int32(r)
 
 
-def _cp_async_wait_group_n(n_const):
-    """Wait until at most `n_const` cp.async groups remain in flight (constexpr int)."""
+def _exit_cta_if_neg(idx_i32):
+    """Retire the calling thread iff idx < 0 (PTX `exit`).
+
+    Padded CUDA-graph rows carry a sentinel index < 0 (batch padding); the
+    whole CTA retires at entry, BEFORE any SMEM/mbarrier/TMA/cp.async issue.
+    Must be called CTA-uniformly right after pid/lane setup. Rows with
+    idx >= 0 are untouched."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [idx_i32.ir_value()],
+        "{ .reg .pred _pexit; setp.lt.s32 _pexit, $1, 0;"
+        " @_pexit exit; mov.u32 $0, 0; }",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _st_global_f32(base_addr_i64, f32_elem_offset, val_f32):
+    """STG.32 of one f32 (offset in f32 elements). Used for the g_cache ring
+    append; all global writes in this kernel go through inline PTX."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            base_addr_i64.ir_value(),
+            f32_elem_offset.ir_value(),
+            val_f32.ir_value(),
+        ],
+        "{ .reg .u64 _a; mad.wide.u32 _a, $2, 4, $1;"
+        " st.global.f32 [_a], $3; mov.u32 $0, 0; }",
+        "=r,l,r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _prefetch_l2_bf16(base_addr_i64, bf16_elem_offset):
+    """prefetch.global.L2 of the 128-B line at base + 2*offset. Issued at
+    kernel entry for the khist/u ring rows so the mid-kernel cp.async waves
+    hit L2 instead of paying full DRAM latency."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [base_addr_i64.ir_value(), bf16_elem_offset.ir_value()],
+        "{ .reg .u64 _a; mad.wide.u32 _a, $2, 2, $1;"
+        " prefetch.global.L2 [_a]; mov.u32 $0, 0; }",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _bar_sync_1_64():
+    """Named barrier 1 over 64 threads (warps 2-3): orders the khist cp.async
+    wave (issued and waited only by warps 2-3) before the scores GEMM's
+    cross-warp ldmatrix reads, without stalling warps 0-1 which never touch
+    the tile."""
     r = llvm.inline_asm(
         mlir_T.i32(),
         [],
-        f"{{ cp.async.wait_group {int(n_const)}; mov.u32 $0, 0; }}",
+        "{ bar.sync 1, 64; mov.u32 $0, 0; }",
         "=r",
         has_side_effects=True,
         is_align_stack=False,
@@ -306,15 +361,36 @@ def _cp_async_wait_group_n(n_const):
     return Int32(r)
 
 
+def _r_sub_bf16x2(packed_i32, neg_eg_f32, hw0_f32, hw1_f32):
+    """R-pass pair op: unpack two bf16 v-values, fma each with
+    (-e^{G_s}) * hw_k, repack to bf16x2 in one i32 read-modify-write."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            packed_i32.ir_value(),
+            neg_eg_f32.ir_value(),
+            hw0_f32.ir_value(),
+            hw1_f32.ir_value(),
+        ],
+        "{ .reg .b16 _lo, _hi; .reg .f32 _flo, _fhi;"
+        " mov.b32 {_lo, _hi}, $1;"
+        " cvt.f32.bf16 _flo, _lo;"
+        " cvt.f32.bf16 _fhi, _hi;"
+        " fma.rn.f32 _flo, $2, $3, _flo;"
+        " fma.rn.f32 _fhi, $2, $4, _fhi;"
+        " cvt.rn.bf16x2.f32 $0, _fhi, _flo; }",
+        "=r,r,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
 def _sts_bf16x2_f32(smem_addr_i32, lo_f32, hi_f32):
-    """v5 (H3): packed FP32 → BF16x2 cast + STS.32 to SMEM.
-    Replaces a pair of (LDS f32 + F2FP.BF16 + STS.16) sequences with a
-    single `cvt.rn.bf16x2.f32` + `st.shared.b32` for adjacent BF16 pairs.
-    The cvt packs (hi, lo) into one 32-bit register; the store writes
-    both bf16 values in a single 4-byte SMEM transaction.
-    Halves the F2FP/STS instruction count for the Phase-2 sMat→sTmat
-    refresh loops (NCU v4: 6 of top 10 short_scoreboard stalls were on
-    F2FP.BF16 in this region)."""
+    """Packed FP32 -> BF16x2 cast + STS.32 to SMEM. The cvt packs (hi, lo)
+    into one 32-bit register; the store writes both bf16 values in a single
+    4-byte SMEM transaction."""
     r = llvm.inline_asm(
         mlir_T.i32(),
         [smem_addr_i32.ir_value(), lo_f32.ir_value(), hi_f32.ir_value()],
@@ -445,44 +521,6 @@ def _fused_ab_4mma_serial_brow(a_base, b_base, c0, c1, c2, c3):
     )
 
 
-def _afull_4mma(a0, a1, a2, a3, b_base):
-    """4 independent (ldmatrix_B_trans + MMA) with shared A. B stride = 64 B (BK_H=32)."""
-    zero = cutlass.Float32(0.0)
-    r = llvm.inline_asm(
-        llvm.StructType.get_literal([mlir_T.f32()] * 16),
-        [zero.ir_value()] * 16
-        + [
-            a0.ir_value(),
-            a1.ir_value(),
-            a2.ir_value(),
-            a3.ir_value(),
-            b_base.ir_value(),
-        ],
-        "{ .reg .b32 _b<2>;"
-        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
-        "   {$0,$1,$2,$3}, {$32,$33,$34,$35}, {_b0,_b1}, {$0,$1,$2,$3};"
-        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+64];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
-        "   {$4,$5,$6,$7}, {$32,$33,$34,$35}, {_b0,_b1}, {$4,$5,$6,$7};"
-        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+128];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
-        "   {$8,$9,$10,$11}, {$32,$33,$34,$35}, {_b0,_b1}, {$8,$9,$10,$11};"
-        " ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {_b0,_b1}, [$36+192];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
-        "   {$12,$13,$14,$15}, {$32,$33,$34,$35}, {_b0,_b1}, {$12,$13,$14,$15}; }",
-        "=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,"
-        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
-        "r,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return tuple(
-        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [i])) for i in range(16)
-    )
-
-
 def _qtv_4mma(a0, a1, a2, a3, b_base):
     """4 independent QT@V (ldmatrix_B_trans + MMA), B stride 16 B."""
     zero = cutlass.Float32(0.0)
@@ -549,9 +587,9 @@ def _h_gemm_4v(
 
     A is row-major bf16 [16, 16] (rows = T, cols = K-tile of 16). The lane-row-stride
     is row_stride_bytes (passed inside the SMEM address). For sK that's K_PADDED*2=272.
-    B is row-major bf16 [8, 16] non-trans (rows = V, cols = K-tile of 16). Row-stride
-    is row_stride_bytes_B. v6: B comes from SW128-swizzled sH (K_DIM*2=256 stride);
-    callers MUST apply `_sw128_xor` to each per-lane B address before calling this.
+    B is row-major bf16 [8, 16] non-trans (rows = V, cols = K-tile of 16). B comes
+    from the SW128-swizzled state tile (K_DIM*2=256 stride); callers MUST apply
+    `_sw128_xor` to each per-lane B address before calling this.
 
     The A-fragment is shared across all 4 MMAs — 4 different B-fragments at b{0..3}_addr.
     """
@@ -614,41 +652,18 @@ def _sw128_xor(addr_i32):
     bits 7..9). Equivalent: phys = L XOR ((L >> 3) & 0x70).
 
     This MUST match the swizzle the SMEM tensor was built with (see
-    `_make_sH_sw128_layout` and the SS h_buf alignment). Empirically verified
-    against `debug/tma_standalone_repro_stage5.py` (max diff 0.0 on a
-    natural-layout torch slice).
+    `_make_sH_sw128_layout_half`).
     """
     return addr_i32 ^ ((addr_i32 >> Int32(3)) & Int32(0x70))
 
 
-def _make_sH_sw128_layout():
-    """SW128 K-major BF16 SMEM layout for sH, tiled to (V_DIM_C=128, K_DIM=128).
-
-    Pattern from `debug/tma_standalone_repro_stage5.py` and the canonical
-    K_SW128 atom in cutlass.utils.blackwell_helpers. Required for both:
-    1. TMA descriptor encoding (TMA dispatcher silently stalls without it
-       on a 256-byte BF16 K-row box).
-    2. Conflict-free SMEM layout for ldmatrix.x2 reads (the SW128 XOR
-       eliminates the bank conflicts that a non-padded K=128 layout would
-       have).
-    """
-    sw = cute.make_swizzle(3, 4, 3)  # SW128: <3, 4, 3>
-    base = cute.make_layout((8, 64), stride=(64, 1))
-    atom = cute.make_composed_layout(sw, 0, base)
-    # order=(1, 0): tile inner-most along K first.
-    return cute.tile_to_shape(atom, (V_DIM_C, K_DIM), order=(1, 0))
-
-
 def _make_sH_sw128_layout_half():
-    """v13 half-H: SW128 K-major BF16 layout tiled to (V_DIM_C=128, K_HALF=64).
+    """SW128 K-major BF16 layout tiled to (V_DIM_C=128, K_HALF=64).
 
     K_HALF=64 BF16 = exactly one 128-byte row = one SW128 swizzle period.
-    The base atom (8 rows × 64 cols = 1 swizzle period) tiles 16x in V and
-    1x in K. The XOR pattern operates at sub-lane granularity within each
-    row, so the same `_sw128_xor()` helper works for both layouts.
-
-    Saves 16 KiB SMEM vs full-H. sH is reused across 2 TMA-half loads
-    (single-buffer streaming).
+    The base atom (8 rows x 64 cols = 1 swizzle period) tiles 16x in V and
+    1x in K. The state buffer is reused across the 2 TMA-half loads
+    (single-buffer streaming), halving its SMEM footprint.
     """
     sw = cute.make_swizzle(3, 4, 3)
     base = cute.make_layout((8, 64), stride=(64, 1))
@@ -656,8 +671,8 @@ def _make_sH_sw128_layout_half():
     return cute.tile_to_shape(atom, (V_DIM_C, K_HALF), order=(1, 0))
 
 
-class GdnDecodeKernel:
-    """CuTeDSL GDN MTP decode (noprepack) — WY-parallel, inference only."""
+class GdnDecodeUCacheKernel:
+    """CuTeDSL GDN decode output + u-cache (ReplaySSM Alg. 8, no flush)."""
 
     def __init__(
         self,
@@ -668,11 +683,13 @@ class GdnDecodeKernel:
         n_valid=16,
         qkv_row_stride=0,
         ab_native=False,
+        ab_t_stride=0,
+        launch_pdl=False,
     ):
         assert disable_state_update, "State update not implemented in CuTeDSL kernel"
-        # `bv` is accepted only for bench-script signature compatibility — the
-        # noprepack kernel always consumes the full V=128 tile in one CTA so
-        # the V-split path of Path 1 is not implemented here.
+        # `bv` is accepted only for bench-script signature compatibility — this
+        # kernel always consumes the full V=128 tile in one CTA so a V-split
+        # path is not implemented here.
         self._disable_state_update = disable_state_update
         self._min_blocks_per_mp = min_blocks_per_mp
         self._t_input = int(t_input)
@@ -694,8 +711,17 @@ class GdnDecodeKernel:
         # gate uses n_valid instead of T. Tail lanes [n_valid:T] are not loaded; their gamma
         # (log_alpha=0) cannot reach the real rows through the causal prefix-sum.
         self._ab_native = bool(ab_native)
+        # (strided-a/b) >0 -> a/b are regular strided views (packed a|b chunk:
+        # token stride 2*HV, batch stride rows*token, feature stride 1) read
+        # directly with NO host-side .contiguous(). 0 -> contiguous (HV).
+        self._ab_t_stride = int(ab_t_stride)
+        # Programmatic dependent launch (PDL): this kernel may begin while the
+        # preceding kernel (which fires launch_dependents at entry) is still
+        # running. No griddepcontrol wait needed: row disjointness means we
+        # never read its writes.
+        self._launch_pdl = bool(launch_pdl)
 
-    @cute.jit
+    @cute.experimental.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -707,6 +733,10 @@ class GdnDecodeKernel:
         gDtbias: cute.Tensor,
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
+        gKC: cute.Tensor,
+        gUC: cute.Tensor,
+        gGC: cute.Tensor,
+        gHlen: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         HV: cutlass.Int32,
@@ -717,20 +747,20 @@ class GdnDecodeKernel:
         op = MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
         tiled_mma = cute.make_tiled_mma(op)
         B_val = gH0idx.layout.shape[0]
-        # v6: build TMA atom for the H tile. gH0 logical shape is
+        # Build the TMA atom for the state tile. gH0 logical shape is
         # (pool, HV, V_DIM_C, K_DIM). cpasync.make_tiled_tma_atom tiles the
         # FIRST modes — we reorder modes to (V, K, HV, pool) by selecting
         # [2, 3, 1, 0] so the per-CTA tile is (V_DIM_C, K_DIM); the trailing
         # (HV, pool) modes survive tma_partition as outer iteration coords.
         # The SMEM target layout is SW128 swizzled — required for the TMA
-        # descriptor (see results/v6_tma_debug_summary.md).
+        # descriptor.
         gH0_vkhp = cute.make_tensor(
             gH0.iterator,
             cute.select(gH0.layout, mode=[2, 3, 1, 0]),
         )
-        # v13: half-H TMA atom — box = (V_DIM_C, K_HALF) = 16 KiB.
-        # Each CTA issues this atom TWICE (per K-half) into the SAME sH buffer
-        # via a 2-phase mbarrier ping-pong. Saves 16 KiB SMEM/CTA → 5→6 CTAs/SM.
+        # Half-K TMA atom — box = (V_DIM_C, K_HALF). Each CTA issues this atom
+        # twice (once per K-half) into the SAME shared buffer via a 2-phase
+        # mbarrier ping-pong, halving the state tile's SMEM footprint.
         sH_tma_layout = _make_sH_sw128_layout_half()
         tma_atom_h, tma_tensor_h = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -738,7 +768,7 @@ class GdnDecodeKernel:
             sH_tma_layout,
             (V_DIM_C, K_HALF),
         )
-        # noprepack runs one CTA per (b, hv) — full V tile per CTA.
+        # One CTA per (b, hv) — full V tile per CTA.
         self.kernel(
             gQ,
             gK,
@@ -749,6 +779,10 @@ class GdnDecodeKernel:
             gDtbias,
             gH0,
             gH0idx,
+            gKC,
+            gUC,
+            gGC,
+            gHlen,
             gOut,
             scale,
             tiled_mma,
@@ -763,9 +797,10 @@ class GdnDecodeKernel:
             cluster=(1, 1, 1),
             stream=stream,
             min_blocks_per_mp=self._min_blocks_per_mp,
+            use_pdl=self._launch_pdl,
         )
 
-    @cute.kernel
+    @cute.experimental.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
@@ -777,6 +812,10 @@ class GdnDecodeKernel:
         gDtbias: cute.Tensor,
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
+        gKC: cute.Tensor,
+        gUC: cute.Tensor,
+        gGC: cute.Tensor,
+        gHlen: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -822,16 +861,19 @@ class GdnDecodeKernel:
         # [B,n_valid,HV] passed) else T (staged T_KERNEL-row zero-padded buffer). The warp-3
         # load/compute gate below uses the same count so tail lanes never read OOB.
         _ab_rows = self._n_valid if self._ab_native else T
+        _ab_t = self._ab_t_stride if self._ab_t_stride > 0 else HV
         sa_hv = cutlass.Int32(1)
-        sa_t = HV
-        sa_b = _ab_rows * HV
+        sa_t = _ab_t
+        sa_b = _ab_rows * _ab_t
         sb_hv = cutlass.Int32(1)
-        sb_t = HV
-        sb_b = _ab_rows * HV
-        # H0 natural layout: (pool, HV, V, K) bf16 contiguous → strides (HV*V*K, V*K, K, 1)
-        # H0 layout strides — v6 unused (TMA handles addressing); kept for
-        # clarity if future cycles need raw GMEM offsets.
-        # sh_k = 1; sh_v = K_DIM; sh_hv = V_DIM * K_DIM; sh_pool = HV * V_DIM * K_DIM
+        # b carries the SAME token stride as a (wrapper enforces
+        # tuple(b.stride()) == tuple(a.stride())), so use _ab_t, not a
+        # hardcoded HV — else packed/chunk-view b (stride(1) != HV, the vLLM
+        # strided-qkv path) reads the wrong rows. _ab_t == HV when compact.
+        sb_t = _ab_t
+        sb_b = _ab_rows * _ab_t
+        # State pool natural layout: (pool, HV, V, K) bf16 contiguous. Addressing
+        # is handled by the TMA descriptor, so no raw GMEM strides are needed here.
 
         tidx, _, _ = cute.arch.thread_idx()
         _pid_vt, pid_hv, pid_b = cute.arch.block_idx()
@@ -841,17 +883,45 @@ class GdnDecodeKernel:
         # GQA head mapping
         i_h = pid_hv // (HV // H)
         cache_idx = gH0idx.iterator[pid_b]
+        # Padded CUDA-graph rows carry cache_idx < 0 (batch padding sentinel):
+        # the whole CTA retires here, before any SMEM/TMA/ring work. Real rows
+        # (idx >= 0) proceed unchanged.
+        _exit_cta_if_neg(cache_idx)
 
-        # v12 EXP3h: hoist γβ LDGs to ABSOLUTE START of kernel (before SMEM setup).
-        # Currently they're at line ~638, AFTER lots of SMEM struct definition and
-        # TMA partition setup. Moving them to right after pid/lane setup lets the
-        # compiler/scheduler emit them as the FIRST instructions warp 3 issues —
-        # maximum HBM round-trip hiding window.
+        # Ring addressing + per-request history fill level.
+        # k_cache [pool, H, W_RING, K] bf16 (L2-NORMED k),
+        # u_cache [pool, HV, W_RING, V] bf16,
+        # g_cache [pool, HV, W_RING] f32 (absolute log-decay since ckpt).
+        P_hist = gHlen.iterator[pid_b]
+        # Pool/head strides from the descriptor layouts, NOT dense shape
+        # products: paged serving pools (vLLM) are block-strided views whose
+        # dim-0 stride spans the whole multi-component page; inner dims stay
+        # dense. With contiguous pools these reduce to the old products.
+        skc_pool = gKC.layout.stride[0]
+        skc_h = gKC.layout.stride[1]
+        suc_pool = gUC.layout.stride[0]
+        suc_hv = gUC.layout.stride[1]
+        sgc_pool = gGC.layout.stride[0]
+        sgc_hv = gGC.layout.stride[1]
+        # 64-bit per-CTA pool ELEMENT offsets: block-strided paged pools can
+        # exceed 2^31 elements (cache_idx * pool_stride wraps in 32-bit).
+        cache_idx64 = Int64(cache_idx)
+        _kc_pool_e64 = cache_idx64 * skc_pool + Int64(i_h) * skc_h
+        _uc_pool_e64 = cache_idx64 * suc_pool + Int64(pid_hv) * suc_hv
+        _gc_pool_e64 = cache_idx64 * sgc_pool + Int64(pid_hv) * sgc_hv
+        # g-ring byte base with the pool offset absorbed (stores use small
+        # intra-row offsets only; do NOT re-add _gc_pool_e64 at call sites).
+        _gGC_base_st = gGC.iterator.toint() + _gc_pool_e64 * 4
+
+        # Issue the per-token gate/bias (a, b, A_log, dt_bias) loads for warp 3
+        # right after pid/lane setup so they are the first instructions warp 3
+        # emits — maximizing the HBM round-trip hiding window before the
+        # gamma/beta math consumes them.
         _v7e_a_bf16 = f32(0.0)
         _v7e_b_bf16 = f32(0.0)
         _v7e_alog_bf16 = f32(0.0)
         _v7e_dt_bf16 = f32(0.0)
-        # (native-a/b) load only the _ab_rows present in the a/b tensors (n_valid native,
+        # Load only the _ab_rows present in the a/b tensors (n_valid native,
         # T staged) so tail lanes never index past the real [B,n_valid,HV] rows.
         if warp_id == 3 and lane_id < _ab_rows:
             _v7e_a_bf16 = gA.iterator[
@@ -863,60 +933,86 @@ class GdnDecodeKernel:
             _v7e_alog_bf16 = gAlog.iterator[pid_hv].to(f32)
             _v7e_dt_bf16 = gDtbias.iterator[pid_hv].to(f32)
 
+        # Issue the g_cache ring LDG on warp 1 (idle until the norm phase, where
+        # it computes w_j/bdec from these values). Lanes >= W_RING keep 0.0;
+        # g_cache is f32 so the load is direct.
+        _g_hist_f32 = f32(0.0)
+        if warp_id == 1 and lane_id < W_RING:
+            _g_hist_f32 = gGC.iterator[_gc_pool_e64 + Int64(lane_id)]
+
+        # L2-prefetch the live khist/u ring rows (rows < P; 2 x 128-B lines per
+        # row) at kernel entry — the mid-kernel cp.async waves then hit L2,
+        # shrinking their exposed latency at small B.
+        _pf_row = (tidx & Int32(31)) >> 1
+        _pf_half = (tidx & Int32(1)) * Int32(64)
+        if _pf_row < P_hist:
+            if tidx < Int32(32):
+                _prefetch_l2_bf16(
+                    gKC.iterator.toint() + _kc_pool_e64 * 2,
+                    _pf_row * K_DIM + _pf_half,
+                )
+            if tidx >= Int32(32) and tidx < Int32(64):
+                _prefetch_l2_bf16(
+                    gUC.iterator.toint() + _uc_pool_e64 * 2,
+                    _pf_row * V_DIM + _pf_half,
+                )
+
         smem = utils.SmemAllocator()
 
         @cute.struct
         class SS:
-            # v6 TMA: mbarrier for H load. 8B Int64. Place first so its natural
-            # 8B alignment is preserved by the prefix; large 128-aligned buffers
-            # follow. ARRIVAL count = 1 (only one thread issues the TMA + arrive).
+            # mbarrier for the state-tile TMA load (8B Int64). Placed first so
+            # its natural 8B alignment is preserved by the prefix; the large
+            # 128-aligned buffers follow. Arrival count = 1 (only one thread
+            # issues the TMA + arrive; the TX-bytes complete it independently).
             h_load_mbar: cute.struct.MemRange[Int64, 1]
             k_buf: cute.struct.Align[cute.struct.MemRange[io, TK_PAD], 128]
-            # v12.2: q_buf and v_buf ALIASED onto one 4352-B region (qv_buf).
-            # K_PADDED == V_PADDED == 136 → T*K_PADDED == T*V_PADDED == 2176 bf16.
-            # sQ last read = line ~961 (A_full RMW into sK); sV first cp.async
-            # issue = line ~979. A sync_threads is added between them so all
-            # threads finish reading sQ before any cp.async fill can write the
-            # same bytes. Saves 4352 B per CTA.
+            # q_buf and v_buf are ALIASED onto one region (qv_buf): sQ is fully
+            # read before sV's cp.async fill writes the same bytes (a
+            # sync_threads orders the handoff). K_PADDED == V_PADDED == 136.
             qv_buf: cute.struct.Align[cute.struct.MemRange[io, TK_PAD], 128]
-            # v13 half-H: H tile = V=128 rows × K=64 cols bf16 = 16 KiB.
-            # SW128 swizzled, single-buffered. Reused across 2 TMA loads
-            # via mbarrier ping-pong. Saves 16 KiB SMEM/CTA vs v12.2.
+            # State tile = V=128 rows x K_HALF=64 cols bf16, SW128 swizzled,
+            # single-buffered and reused across the 2 TMA half-loads via the
+            # mbarrier ping-pong.
             h_buf: cute.struct.Align[cute.struct.MemRange[io, V_DIM_C * K_HALF], 128]
             tmat_bf: cute.struct.Align[cute.struct.MemRange[io, T * BF_PAD], 128]
             gamma: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
             beta: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
-            # v12.1: removed c_all (2 KiB) — was a sized template for partition_C
-            # only, never written-to. Now we build tCsC via partition_shape_C +
-            # make_fragment_C directly (no SMEM allocation needed).
             mat_fp32: cute.struct.Align[cute.struct.MemRange[f32, TT], 128]
             scratch_bf: cute.struct.Align[cute.struct.MemRange[io, T * BF_PAD], 128]
-            scratch2_bf: cute.struct.Align[cute.struct.MemRange[io, T * BF_PAD], 128]
+            # w-scaled TRANSPOSED scores tile [W_RING, BF_PAD] bf16 — the
+            # A-operand of the MMA history contraction
+            # (sWScores[r_packed, j] = w_j * khist_j . packed_r).
+            wscores_bf: cute.struct.Align[
+                cute.struct.MemRange[io, W_RING * BF_PAD], 128
+            ]
+            # G-ring scratch: [0:16]=G_j, [16:32]=w_j, [32]=bdec.
+            ghist_fp32: cute.struct.Align[cute.struct.MemRange[f32, 48], 128]
 
         st = smem.allocate(SS)
         sK = st.k_buf.get_tensor(cute.make_layout((T, K_PADDED), stride=(K_PADDED, 1)))
-        # v12.2: sQ and sV both view the same qv_buf SMEM region (alias).
+        # sQ and sV both view the same qv_buf SMEM region (alias).
         sQ = st.qv_buf.get_tensor(cute.make_layout((T, K_PADDED), stride=(K_PADDED, 1)))
-        # v13 half-H: sH = (V_DIM_C, K_HALF) SW128-swizzled = 16 KiB.
-        # Same swizzle as full-H (exactly one swizzle period in K), so the
-        # existing _sw128_xor() inline-PTX helper applies unchanged.
+        # State tile view: (V_DIM_C, K_HALF) SW128-swizzled (exactly one swizzle
+        # period in K, so the _sw128_xor() helper applies unchanged).
         sH_layout = _make_sH_sw128_layout_half()
         sH = st.h_buf.get_tensor(sH_layout.outer, swizzle=sH_layout.inner)
         sV = st.qv_buf.get_tensor(cute.make_layout((T, V_PADDED), stride=(V_PADDED, 1)))
         sTmat = st.tmat_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
         sGamma = st.gamma.get_tensor(cute.make_layout((WARP,)))
         sBeta = st.beta.get_tensor(cute.make_layout((WARP,)))
-        # v12.1: sC removed — no SMEM C-staging buffer needed.
         sMat = st.mat_fp32.get_tensor(cute.make_layout((T, T), stride=(T, 1)))
         sNegL = st.scratch_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
-        sPowk = st.scratch2_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
+        sWScores = st.wscores_bf.get_tensor(
+            cute.make_layout((W_RING, W_RING), stride=(BF_PAD, 1))
+        )
+        sGhist = st.ghist_fp32.get_tensor(cute.make_layout((48,)))
 
         # ============================================================
-        # v6 TMA: mbarrier init for the H tile load.
-        # Single-shot: thread 0 issues cp.async.bulk.tensor once; all 128
-        # threads block in mbarrier_wait(parity=0) before the H GEMM.
-        # Arrival count = 1 (the issuing thread is the sole arriver; the
-        # TX-bytes complete the barrier independently).
+        # mbarrier init for the state-tile TMA load. Thread 0 issues the
+        # bulk-tensor copy once; all 128 threads block in mbarrier_wait before
+        # the H GEMM. Arrival count = 1 (the issuing thread is the sole
+        # arriver; the TX-bytes complete the barrier independently).
         # ============================================================
         mbar_h_ptr = st.h_load_mbar.data_ptr()
         if warp_id == 0:
@@ -925,10 +1021,10 @@ class GdnDecodeKernel:
         cute.arch.mbarrier_init_fence()
         sync_threads()
 
-        # v13 half-H: partition the TMA tensor for this CTA's (cache_idx, pid_hv).
+        # Partition the TMA tensor for this CTA's (cache_idx, pid_hv).
         # tma_tensor_h logical shape (V, K, HV, pool) (mode-reordered on host).
-        # flat_divide with (V_DIM_C, K_HALF) → (V_TILE, K_TILE, V_REST=1, K_REST=2, HV, pool).
-        # Two slices, one per K-half. Both halves write to the SAME sH (16 KiB).
+        # flat_divide with (V_DIM_C, K_HALF) -> (V_TILE, K_TILE, V_REST=1, K_REST=2, HV, pool).
+        # Two slices, one per K-half; both write to the SAME state buffer.
         gH_tiled = cute.flat_divide(tma_tensor_h, (V_DIM_C, K_HALF))
         gH_slice0 = gH_tiled[None, None, None, 0, pid_hv, cache_idx]
         gH_slice1 = gH_tiled[None, None, None, 1, pid_hv, cache_idx]
@@ -951,7 +1047,7 @@ class GdnDecodeKernel:
         )
 
         thr_mma = tiled_mma.get_slice(lane_id)
-        # v12.1: build register-only C fragment template (no SMEM).
+        # Build a register-only C fragment template (no SMEM).
         # partition_shape_C((T, 8)) returns the per-thread partition shape for
         # an (M=T, N=8) tile under the m16n8k16 MMA; make_fragment_C creates
         # a register fragment of that shape with the MMA's accumulator dtype (f32).
@@ -961,18 +1057,8 @@ class GdnDecodeKernel:
 
         EPT_TT = TT // THREADS
 
-        # ============================================================
-        # v7 variant E: hoist warp-3 γβ scalar LDG.E.U16 issues to the very
-        # start of the kernel, BEFORE the K+Q cp.async issue. The BF16
-        # loads (a_val, b_val, A_log_val, dt_val) are tiny (8 B/lane total)
-        # but their LDG result-ready latency was previously serialized
-        # inside the γβ block, costing ~600 cyc. By hoisting issue, the
-        # results land in registers concurrent with cp.async issue/wait,
-        # so when γβ math runs it consumes already-retired registers.
-        # Materialized as a no-op (predicated to warp 3 + lane_id < T).
-        # No SMEM writes here; results stay in regs and feed γβ block.
-        # ============================================================
-        # γβ LDGs were hoisted to top of __call__ (v12 EXP3h). _v7e_* vars live.
+        # The warp-3 gamma/beta scalar loads were issued right after pid/lane
+        # setup above; the _v7e_* registers are already in flight here.
 
         # ============================================================
         # cp.async stage 1: K + Q (8 bf16 / instr, .ca for L1 reuse)
@@ -994,9 +1080,9 @@ class GdnDecodeKernel:
             _smem_byte_off = _kq_row * Int32(K_PADDED * 2) + _kq_col_bf16_async * Int32(
                 2
             )
-            # (native-short-T) when n_valid < T the q/k gmem tensors hold only
-            # n_valid rows; skip the cp.async for rows >= n_valid (those would read
-            # OOB). The sK/sQ[n_valid:T] smem tail is zeroed after the wait below.
+            # When n_valid < T the q/k gmem tensors hold only n_valid rows; skip
+            # the cp.async for rows >= n_valid (those would read OOB). The
+            # sK/sQ[n_valid:T] smem tail is zeroed after the wait below.
             if const_expr(self._n_valid < T):
                 if _kq_row < Int32(self._n_valid):
                     _cp_async_bf16x8(
@@ -1023,12 +1109,11 @@ class GdnDecodeKernel:
         _cp_async_commit_group()  # group 0 = K+Q
 
         # ============================================================
-        # v13 half-H TMA: ISSUE FIRST HALF (K=0..63).
-        # Same hiding window as v6 — overlaps with Phase-1 + Phase-2.
-        # The SECOND half is issued later (right before H GEMM half-1)
-        # after H GEMM half-0 finishes reading sH.
-        # mbarrier_arrive_and_expect_tx with V_DIM_C * K_HALF * 2 = 16384 B.
-        # cute.copy is OUTSIDE elect_one (v6 lesson — deadlocks the GPU).
+        # Issue the FIRST state-tile half (K=0..63); its load overlaps
+        # Phase 1 + Phase 2. The SECOND half is issued later (right before
+        # H GEMM half-1) once half-0 has finished reading the buffer.
+        # mbarrier_arrive_and_expect_tx with V_DIM_C * K_HALF * 2 bytes.
+        # cute.copy MUST stay OUTSIDE elect_one (else the GPU deadlocks).
         # ============================================================
         if warp_id == 0:
             with cute.arch.elect_one():
@@ -1039,14 +1124,13 @@ class GdnDecodeKernel:
             cute.copy(tma_atom_h, tHgH0, tHsH0, tma_bar_ptr=mbar_h_ptr)
 
         # ============================================================
-        # warp 3 computes gamma/beta in parallel with cp.async pipeline
-        # v7 variant E: scalar LDG.E.U16 loads were hoisted to kernel
-        # entry; here we consume the already-retired registers.
+        # warp 3 computes gamma/beta in parallel with the cp.async pipeline,
+        # consuming the gate/bias registers loaded at kernel entry.
         # ============================================================
         if warp_id == 3:
             log_alpha = f32(0.0)
             beta_val = f32(0.0)
-            # (native-a/b) gate by _ab_rows: tail lanes [n_valid:T] are not loaded (their
+            # Gate by _ab_rows: tail lanes [n_valid:T] are not loaded (their
             # _v7e_a/b regs are undefined), so they must keep log_alpha=beta=0. The causal
             # prefix-sum makes their (zero) contribution invisible to rows 0..n_valid-1.
             if lane_id < _ab_rows:
@@ -1068,11 +1152,11 @@ class GdnDecodeKernel:
             if lane_id < T:
                 exp_g = _exp_approx_f32(cumsum)
                 sGamma.iterator[T + lane_id] = exp_g
-                # (local fix) store log-domain cumsum in the free sGamma[0:T] slots so the
+                # Store the log-domain cumsum in the free sGamma[0:T] slots so the
                 # decay matrix can be formed as exp(cumsum_r - cumsum_c) directly (bounded
                 # <=1 for the causal r>=c region) instead of exp(cumsum_r)*exp(-cumsum_c),
                 # whose exp(-cumsum_c) overflows to inf for strong real decay (large A_log)
-                # -> 0*inf = NaN. Keeps exact math; fixes the NaN that broke MTP verify.
+                # -> 0*inf = NaN. Mathematically identical, but NaN-safe.
                 sGamma.iterator[lane_id] = cumsum
                 sBeta.iterator[lane_id] = beta_val
                 sBeta.iterator[T + lane_id] = f32(1.0) / exp_g
@@ -1097,15 +1181,14 @@ class GdnDecodeKernel:
 
         # L2 norm for K (warps 0,1) and Q (warps 2,3) — t-aware warp skip.
         # At T<=8, warps 1 and 3 (which normalize rows 8..15) are dead-elided.
-        # Rows 8..15 of sK/sQ feed only outputs that Stage B's Phase-2 already
-        # gates: T11 written as diag(beta1) at line 907-914 (no read of sMat
-        # [8..15, 8..15]), Y/T10 skipped, and Phase-4 STG bottom half at line
-        # 1235 is t_input-gated.
+        # Rows 8..15 of sK/sQ feed only outputs that Phase-2 already gates
+        # (T11 = diag(beta1) with no read of sMat[8..15, 8..15], Y/T10 skipped,
+        # and the Phase-4 STG bottom half is t_input-gated).
         # Warps 0 and 2 still process 8 lane-rows even at T=4 — rows 4..7 of
         # sK/sQ are wrapper-zero-padded, so L2-norm is a harmless no-op
         # (zero * any_inv_norm = zero). Predicating individual lanes would
         # break the shuffle_sync (mask 0xFFFFFFFF requires all 32 warp lanes).
-        # `self._t_input` is a Python int set at JIT compile time (line 485);
+        # `self._t_input` is a Python int fixed at JIT compile time, so
         # const_expr produces 2 specializations: t_input<=8 and t_input=16.
         if const_expr(self._t_input <= 8):
             if warp_id == Int32(0):
@@ -1113,27 +1196,35 @@ class GdnDecodeKernel:
                 norm_quarter = lane_id % 4
                 _norm_off_i32 = norm_row * (K_PADDED // 2) + norm_quarter
                 partial = f32(0.0)
-                for c in cutlass.range_constexpr(16):
-                    packed = _sK_i32.iterator[_norm_off_i32 + 4 * c]
-                    partial = _dot_sq_bf16x2(packed, partial)
+                # (perf) rows >= t are zeros — their L2-norm RMW is a no-op
+                # on zeros (bit-exact to skip); saves 32 LSU ops per tail
+                # lane. The quad shuffles below still run on all 32 lanes
+                # (tail partial stays 0; tail inv_norm is never stored).
+                if norm_row < Int32(self._t_input):
+                    for c in cutlass.range_constexpr(16):
+                        packed = _sK_i32.iterator[_norm_off_i32 + 4 * c]
+                        partial = _dot_sq_bf16x2(packed, partial)
                 for d in [1, 2]:
                     other = cute.arch.shuffle_sync(
                         partial, Int32(lane_id ^ d), Int32(0xFFFFFFFF), Int32(0x1F)
                     )
                     partial = partial + other
                 inv_norm = _rsqrt_approx_f32(partial + f32(EPS))
-                for c in cutlass.range_constexpr(16):
-                    _sK_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
-                        _sK_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
-                    )
+                if norm_row < Int32(self._t_input):
+                    for c in cutlass.range_constexpr(16):
+                        _sK_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
+                            _sK_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
+                        )
             if warp_id == Int32(2):
                 norm_row = lane_id // 4
                 norm_quarter = lane_id % 4
                 _norm_off_i32 = norm_row * (K_PADDED // 2) + norm_quarter
                 partial = f32(0.0)
-                for c in cutlass.range_constexpr(16):
-                    packed = _sQ_i32.iterator[_norm_off_i32 + 4 * c]
-                    partial = _dot_sq_bf16x2(packed, partial)
+                # (perf) tail-lane skip as in the K norm above (bit-exact).
+                if norm_row < Int32(self._t_input):
+                    for c in cutlass.range_constexpr(16):
+                        packed = _sQ_i32.iterator[_norm_off_i32 + 4 * c]
+                        partial = _dot_sq_bf16x2(packed, partial)
                 for d in [1, 2]:
                     other = cute.arch.shuffle_sync(
                         partial, Int32(lane_id ^ d), Int32(0xFFFFFFFF), Int32(0x1F)
@@ -1141,12 +1232,53 @@ class GdnDecodeKernel:
                     partial = partial + other
                 inv_norm = _rsqrt_approx_f32(partial + f32(EPS))
                 inv_norm = inv_norm * scale
-                for c in cutlass.range_constexpr(16):
-                    _sQ_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
-                        _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
+                if norm_row < Int32(self._t_input):
+                    for c in cutlass.range_constexpr(16):
+                        _qn_val = _mul_bf16x2_f32(
+                            _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
+                        )
+                        _sQ_i32.iterator[_norm_off_i32 + 4 * c] = _qn_val
+                        # (perf) fused packed-A-tile store: duplicate the
+                        # normed q rows [0:t) into sK rows [8:8+t) (dual
+                        # store) — removes the separate pack pass and one
+                        # CTA barrier; the norm-end sync publishes both.
+                        _sK_i32.iterator[
+                            _norm_off_i32 + 8 * (K_PADDED // 2) + 4 * c
+                        ] = _qn_val
+            if warp_id == Int32(1):
+                # (u-cache) publish the G ring + w_j/bdec while warps 0/2
+                # L2-normalize (warp 1 is idle here at t<=8). w_j =
+                # e^{G_P - G_j} for j < P else 0 — the j >= P mask is
+                # MANDATORY (stale slots -> inf * 0 = NaN). G_P is lane
+                # P-1's value, shuffled (all 32 lanes execute the shuffle).
+                if lane_id < Int32(W_RING):
+                    sGhist.iterator[lane_id] = _g_hist_f32
+                _p_src = P_hist - 1 if P_hist > 0 else Int32(0)
+                _gp_lane = cute.arch.shuffle_sync(
+                    _g_hist_f32, _p_src, Int32(0xFFFFFFFF), Int32(0x1F)
+                )
+                _gp = _gp_lane if P_hist > 0 else f32(0.0)
+                if lane_id < Int32(W_RING):
+                    _w_j = (
+                        _exp_approx_f32(_gp - _g_hist_f32)
+                        if lane_id < P_hist
+                        else f32(0.0)
+                    )
+                    sGhist.iterator[W_RING + lane_id] = _w_j
+                if lane_id == Int32(0):
+                    _bdec_v = _exp_approx_f32(_gp) if P_hist > 0 else f32(1.0)
+                    sGhist.iterator[32] = _bdec_v
+                # G-ring append: g_new[s] = G_P + cumsum_s. sGamma[0:T]
+                # (log-domain cumsum, warp 3) was published by the K/Q-wait
+                # sync before this norm phase.
+                if lane_id < Int32(self._t_input):
+                    _st_global_f32(
+                        _gGC_base_st,
+                        P_hist + lane_id,
+                        _gp + sGamma.iterator[lane_id],
                     )
         else:
-            # T=16 ORIGINAL PATH — unchanged.
+            # T=16 path.
             if warp_id < 2:
                 norm_row = warp_id * 8 + lane_id // 4
                 norm_quarter = lane_id % 4
@@ -1185,6 +1317,36 @@ class GdnDecodeKernel:
                         _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
                     )
         sync_threads()
+
+        # ============================================================
+        # (u-cache) PACKED A-TILE: the normed q rows [0:t) were already
+        # dual-stored into sK rows [8:8+t) inside the warp-2 norm pass
+        # (published by the sync above) — the H GEMM yields S0·k (rows
+        # 0..t-1) AND S0·q (rows 8..8+t-1) from ONE streamed S0 read.
+        # Safe with native-a/b at t<=8: Gram pollution from the packed
+        # rows lands only where beta=0 (rows >= t) or r<c masks it.
+        # k-ring append (one CTA per k-group) runs here, BEFORE the bdec
+        # row-scale corrupts the normed k rows; it is a pure global write
+        # of sK rows [0:t) (read-only vs the Grams below), so NO extra
+        # barrier is needed — it overlaps the Grams.
+        # ============================================================
+        if (pid_hv % (HV // H)) == 0:
+            _gKC_base_st = gKC.iterator.toint() + _kc_pool_e64 * 2
+            _kc_wr_base = P_hist * K_DIM
+            if tidx < Int32(self._t_input * (K_DIM // 8)):
+                _kc_row = tidx // Int32(K_DIM // 8)
+                _kc_pos = tidx % Int32(K_DIM // 8)
+                _kv0, _kv1, _kv2, _kv3 = _lds_v4_b32(
+                    _sK_base_async + _kc_row * Int32(K_PADDED * 2) + _kc_pos * Int32(16)
+                )
+                _st_global_v4_b32(
+                    _gKC_base_st,
+                    _kc_wr_base + _kc_row * K_DIM + _kc_pos * Int32(8),
+                    _kv0,
+                    _kv1,
+                    _kv2,
+                    _kv3,
+                )
 
         # KKT (warps 0-1) || QKT (warps 2-3) — direct acc → SMEM writes.
         acc.fill(f32(0.0))
@@ -1254,43 +1416,86 @@ class GdnDecodeKernel:
         sync_threads()
 
         # ============================================================
+        # (u-cache) tenant #2 of qv_buf: khist tile [W_RING, K_PADDED] via
+        # cp.async.ca (the tile is re-read by the 4 sibling CTAs of the
+        # k-group). sQ is dead after the Grams above. Landing is awaited
+        # (wait + one barrier) after Phase 2, before the scores GEMM.
+        # ============================================================
+        _gKC_base_rd = gKC.iterator.toint() + _kc_pool_e64 * 2
+        _kc_rd_base = Int32(0)
+        # (perf) the khist wave is ISSUED AND WAITED ONLY BY WARPS 2-3 (the
+        # tile's sole consumers, in the scores GEMM): warps 0-1 enter the
+        # block inverse without ever stalling on ring-load latency. The
+        # cross-warp (2<->3) visibility is ordered by their own wait_group
+        # + the 64-thread named barrier at the scores GEMM. Rows >= P stay
+        # unread (w-masked downstream).
+        if warp_id >= 2:
+            for _kh in cutlass.range_constexpr(W_RING * K_DIM // (64 * 8)):
+                _kh_group = (tidx - Int32(64)) + _kh * Int32(64)
+                _kh_row = _kh_group // Int32(K_DIM // 8)
+                _kh_col = (_kh_group % Int32(K_DIM // 8)) * Int32(8)
+                if _kh_row < P_hist:
+                    _cp_async_bf16x8(
+                        _gKC_base_rd,
+                        _kc_rd_base + _kh_row * K_DIM + _kh_col,
+                        _sQ_base_async
+                        + _kh_row * Int32(K_PADDED * 2)
+                        + _kh_col * Int32(2),
+                    )
+            _cp_async_commit_group()
+
+        # ============================================================
         # PHASE 2: log-depth Neumann inverse
         # ============================================================
         for idx in cutlass.range_constexpr(EPT_TT):
             flat = tidx + idx * THREADS
             r = flat // T
             c = flat % T
-            # (local fix) stable decay: exp(cumsum_r - cumsum_c) directly (<=1 for r>c),
-            # instead of sGamma[T+r]*sBeta[T+c] = exp(cumsum_r)*exp(-cumsum_c) (overflows).
-            # exp_gij is only consumed for r>=c (below); r<c value is discarded.
-            exp_gij = (
-                f32(1.0)
-                if r == c
-                else (
-                    _exp_approx_f32(sGamma.iterator[r] - sGamma.iterator[c])
+            # (perf) tail short-circuit: entries with r >= t or c >= t are
+            # structurally ZERO in both outputs under the packed-tile
+            # invariants (beta = 0 tail rows, zero k/q rows, r < c masking)
+            # — write the zeros directly and skip their sNegL/sMat/sGamma
+            # loads. Bit-exact: the skipped loads only ever fed values
+            # that reduced to 0 for these entries.
+            if r < Int32(self._t_input) and c < Int32(self._t_input):
+                # Stable decay: exp(cumsum_r - cumsum_c)
+                # directly (<=1 for r>c) instead of
+                # exp(cumsum_r)*exp(-cumsum_c) (overflows). exp_gij is only
+                # consumed for r>=c (below); r<c value is discarded.
+                exp_gij = (
+                    f32(1.0)
+                    if r == c
+                    else (
+                        _exp_approx_f32(sGamma.iterator[r] - sGamma.iterator[c])
+                        if r > c
+                        else f32(0.0)
+                    )
+                )
+                qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
+                sNegL.iterator[r * BF_PAD + c] = (
+                    (qkt * exp_gij).to(io) if r >= c else io(0.0)
+                )
+                kkt_val = sMat.iterator[_smat_off(r, c)]
+                negL_val = (
+                    (f32(0.0) - sBeta.iterator[r] * exp_gij * kkt_val)
                     if r > c
                     else f32(0.0)
                 )
-            )
-            qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
-            sNegL.iterator[r * BF_PAD + c] = (
-                (qkt * exp_gij).to(io) if r >= c else io(0.0)
-            )
-            kkt_val = sMat.iterator[_smat_off(r, c)]
-            negL_val = (
-                (f32(0.0) - sBeta.iterator[r] * exp_gij * kkt_val)
-                if r > c
-                else f32(0.0)
-            )
-            negL_bf = negL_val.to(io)
-            sTmat.iterator[r * BF_PAD + c] = negL_bf
+                negL_bf = negL_val.to(io)
+                sTmat.iterator[r * BF_PAD + c] = negL_bf
+            else:
+                sNegL.iterator[r * BF_PAD + c] = io(0.0)
+                sTmat.iterator[r * BF_PAD + c] = io(0.0)
+        # (u-cache) NOTE: the khist tile is NOT waited here — warps 2-3 own
+        # the wave and wait for it themselves at the scores GEMM, so this
+        # barrier only publishes phase-2's writes.
         sync_threads()
 
         _r0 = lane_id // 4
         _c0 = (lane_id & 3) * 2
 
         # ============================================================
-        # v11r BLOCK INVERSE for T=16 — register-resident forward sub.
+        # BLOCK INVERSE for T=16 — register-resident forward substitution.
         # Each lane owns one column of the 8x8 result, holding all 8 row
         # values in registers (no per-row SMEM round-trip). Eliminates
         # the SMEM store-then-load critical path (~240 cyc → ~120 cyc).
@@ -1316,6 +1521,65 @@ class GdnDecodeKernel:
 
         # === Step 1: parallel 8x8 diagonal forward substitutions (register-resident) ===
         if const_expr(self._t_input <= 8):
+            # (u-cache) scores GEMM on warps 2-3, CONCURRENT with the
+            # warp-0/1 block inverse: scores[j, col] = khist_j · packed_col
+            # (cols 0..t-1 = ·k_hat, cols 8..8+t-1 = ·q_hat), staged
+            # w-scaled + transposed + bf16 into sWScores (the contraction
+            # MMA's A operand). Same MMA pattern as KKT with A = khist.
+            # (perf) skipped entirely at P=0 (CTA-uniform branch): the
+            # contraction is also skipped there, so sWScores has no reader.
+            if warp_id >= 2 and P_hist > 0:
+                # own-wave wait: each of the 64 issuing threads drains its
+                # own cp.async groups, then the named barrier orders the
+                # cross-warp (2<->3) SMEM visibility. Warps 0-1 are already
+                # deep in the block inverse at this point.
+                _cp_async_wait_group_0()
+                _bar_sync_1_64()
+                acc.fill(f32(0.0))
+                _sc_col_off = (warp_id - Int32(2)) * Int32(8)
+                for _sc_g in cutlass.range_constexpr(K_DIM // 16 // 4):
+                    _sc_k_off = _sc_g * 4 * 16 * Int32(2)
+                    _sc_a = _sQ_int + _lane_mod16 * _rs_kpad + _lane_hi + _sc_k_off
+                    _sc_b = (
+                        _sK_int
+                        + (_sc_col_off + _lane_mod8) * _rs_kpad
+                        + _sc_k_off
+                        + _lane_b_col
+                    )
+                    (
+                        acc.iterator[0],
+                        acc.iterator[1],
+                        acc.iterator[2],
+                        acc.iterator[3],
+                    ) = _fused_ab_4mma_serial_brow(
+                        _sc_a,
+                        _sc_b,
+                        acc.iterator[0],
+                        acc.iterator[1],
+                        acc.iterator[2],
+                        acc.iterator[3],
+                    )
+                _sc_r0 = lane_id // 4
+                _sc_c0 = (lane_id & 3) * 2
+                # (perf) stage TRANSPOSED + w-scaled + bf16: acc element [e]
+                # is C[j, col] with j = _sc_r0 (+8 for e in {2,3}); store
+                # sWScores[col, j] = w_j * C[j, col]. Columns j >= P carry
+                # w = 0, so the stale u rows they meet in the contraction
+                # MMA contribute exact zeros.
+                _sc_w_lo = sGhist.iterator[W_RING + _sc_r0]
+                _sc_w_hi = sGhist.iterator[W_RING + _sc_r0 + 8]
+                sWScores.iterator[(_sc_col_off + _sc_c0) * BF_PAD + _sc_r0] = (
+                    acc.iterator[0] * _sc_w_lo
+                ).to(io)
+                sWScores.iterator[(_sc_col_off + _sc_c0 + 1) * BF_PAD + _sc_r0] = (
+                    acc.iterator[1] * _sc_w_lo
+                ).to(io)
+                sWScores.iterator[(_sc_col_off + _sc_c0) * BF_PAD + _sc_r0 + 8] = (
+                    acc.iterator[2] * _sc_w_hi
+                ).to(io)
+                sWScores.iterator[(_sc_col_off + _sc_c0 + 1) * BF_PAD + _sc_r0 + 8] = (
+                    acc.iterator[3] * _sc_w_hi
+                ).to(io)
             # === T≤8 PATH: only T00 (warp 0) is real work; T11 = diag(β1) ===
             if warp_id == Int32(0):
                 if lane_id < Int32(8):
@@ -1369,15 +1633,16 @@ class GdnDecodeKernel:
                             else f32(0.0)
                         )
                         sMat.iterator[_smat_off(8 + _r, 8 + _col)] = _v
-            sync_threads()
+            # No barrier here: in the t<=8 path there are zero cross-warp
+            # dependencies between the phase-2 barrier and the final solve
+            # barrier — step 2 is a no-op skip and each warp writes disjoint
+            # sMat regions that are only read after the CTA-wide barrier
+            # before Step 4.
 
             # === Step 2 SKIP: Y = M10 @ T00 = 0 ===
             # sMat[0:8, 8:16] (top-right) — no need to write zeros: Step 4's
             # stage line `_out0_v11 = io(0.0) if (_r0_v11 < 8 and _c0_v11 >= 8)`
             # already forces sTmat top-right to 0 regardless of sMat content.
-            # NO sync_threads needed here either — but we keep one to preserve
-            # the same barrier topology as the T=16 path (cheap; cluster=1).
-            sync_threads()
 
             # === Step 3 SKIP: T10 = solve(I, 0) = 0 → write zeros to sMat[8:16, 0:8] ===
             if warp_id == Int32(1):
@@ -1387,7 +1652,7 @@ class GdnDecodeKernel:
                         sMat.iterator[_smat_off(8 + _r, _col)] = f32(0.0)
             sync_threads()
         else:
-            # === T=16 ORIGINAL PATH (v11 block-inverse) ===
+            # === T=16 path (block inverse) ===
             if warp_id == Int32(0):
                 if lane_id < Int32(8):
                     _col = lane_id
@@ -1489,150 +1754,75 @@ class GdnDecodeKernel:
         sync_threads()
 
         # ============================================================
-        # PRECOMPUTE QT and A_full (V-tile independent)
+        # (u-cache) tenant #3 of qv_buf: the u tile [W_RING, V_PADDED] bf16
+        # via cp.async.cg (single consumer; keep L1 for k/q/v). khist's
+        # last read was the scores GEMM (pre-Step-4 sync, so the tenant
+        # handoff is ordered). Landing is awaited in the TMA half-1
+        # shadow, right before the history contraction consumes it.
         # ============================================================
-        # QT = QKTm @ Tmat → sPowk
-        if warp_id < 2:
-            acc.fill(f32(0.0))
-            col_off = warp_id * 8
-            _qt_a_addr = (
-                sNegL.iterator.toint() + _lane_mod16 * Int32(BF_PAD * 2) + _lane_hi
-            )
-            _qt_b_addr = (
-                sTmat.iterator.toint()
-                + _ldm_row * Int32(BF_PAD * 2)
-                + col_off * Int32(2)
-            )
-            acc.iterator[0], acc.iterator[1], acc.iterator[2], acc.iterator[3] = (
-                _fused_ab_1mma(
-                    _qt_a_addr,
-                    _qt_b_addr,
-                    acc.iterator[0],
-                    acc.iterator[1],
-                    acc.iterator[2],
-                    acc.iterator[3],
+        _gUC_base = gUC.iterator.toint() + _uc_pool_e64 * 2
+        _uc_base = Int32(0)
+        _sV_base_async_u = sV.iterator.toint()
+        for _uh in cutlass.range_constexpr(W_RING * V_DIM_C // (THREADS * 8)):
+            _uh_group = tidx + _uh * THREADS
+            _uh_row = _uh_group // Int32(V_DIM_C // 8)
+            _uh_col = (_uh_group % Int32(V_DIM_C // 8)) * Int32(8)
+            # (perf) same row < P predication as the khist wave — slots
+            # >= P are w-masked; skip their DRAM reads.
+            if _uh_row < P_hist:
+                _cp_async_bf16x8_cg(
+                    _gUC_base,
+                    _uc_base + _uh_row * V_DIM + _uh_col,
+                    _sV_base_async_u
+                    + _uh_row * Int32(V_PADDED * 2)
+                    + _uh_col * Int32(2),
                 )
-            )
-            _r0 = lane_id // 4
-            _c0 = (lane_id & 3) * 2
-            sPowk.iterator[_r0 * BF_PAD + col_off + _c0] = acc.iterator[0].to(io)
-            sPowk.iterator[_r0 * BF_PAD + col_off + _c0 + 1] = acc.iterator[1].to(io)
-            sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0] = acc.iterator[2].to(io)
-            sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0 + 1] = acc.iterator[3].to(
-                io
-            )
-
-        # eK = exp(gamma) * K_normed → sK
-        _ek_iters = (self._t_input * K_DIM) // (THREADS * 4)
-        for i in cutlass.range_constexpr(_ek_iters):
-            _ek_row = warp_id + i * (THREADS // WARP)
-            _ek_exp = sGamma.iterator[T + _ek_row]
-            _ek_base = _ek_row * _kpad_i32 + lane_id
-            _sK_i32.iterator[_ek_base] = _mul_bf16x2_f32(
-                _sK_i32.iterator[_ek_base], _ek_exp
-            )
-            _sK_i32.iterator[_ek_base + WARP] = _mul_bf16x2_f32(
-                _sK_i32.iterator[_ek_base + WARP], _ek_exp
-            )
-        sync_threads()
-
-        # QT@eK → A_full residual contribution
-        _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
-        _sK_base_af = sK.iterator.toint()
-        _af_b_base = _sK_base_af + _ldm_row * Int32(K_PADDED * 2) + warp_id * Int32(16)
-        _afr = _afull_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _af_b_base)
-
-        # A_full = eQ - QT@eK → sK (overwrite eK)
-        _r0 = lane_id // 4
-        _c0 = (lane_id & 3) * 2
-        _exp_eq_r0 = sGamma.iterator[T + _r0]
-        _exp_eq_r8 = sGamma.iterator[T + _r0 + 8]
-        BK_GROUPS = K_DIM // 32  # = 4
-        for bk_idx in cutlass.range_constexpr(BK_GROUPS):
-            k_col = bk_idx * 32 + warp_id * 8
-            sK.iterator[_r0 * K_PADDED + k_col + _c0] = (
-                _exp_eq_r0 * sQ.iterator[_r0 * K_PADDED + k_col + _c0].to(f32)
-                - _afr[bk_idx * 4]
-            ).to(io)
-            sK.iterator[_r0 * K_PADDED + k_col + _c0 + 1] = (
-                _exp_eq_r0 * sQ.iterator[_r0 * K_PADDED + k_col + _c0 + 1].to(f32)
-                - _afr[bk_idx * 4 + 1]
-            ).to(io)
-            sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0] = (
-                _exp_eq_r8 * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0].to(f32)
-                - _afr[bk_idx * 4 + 2]
-            ).to(io)
-            sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1] = (
-                _exp_eq_r8 * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1].to(f32)
-                - _afr[bk_idx * 4 + 3]
-            ).to(io)
-
-        # v12.2: CRITICAL barrier — sQ aliases sV in SMEM. All threads must
-        # finish reading sQ above BEFORE any thread issues cp.async writes
-        # to sV (same bytes). Without this, async fills can land in sV
-        # while other lanes are still mid-read on sQ → silent corruption.
-        sync_threads()
+        _cp_async_commit_group()
 
         # ============================================================
-        # v10: Load V tile via cp.async (LDGSTS) so the V transfer
-        # overlaps with the H GEMM below. Mirrors the K+Q LDGSTS
-        # pattern at lines 657-666. sV is non-swizzled, 128-aligned,
-        # so cp.async.ca writes directly with no swizzle transform.
-        # 8 BF16 / instruction × 2 iters / thread × 128 threads = 2048 BF16.
+        # bdec fold: scale the packed A-tile rows (k rows [0:t), q rows
+        # [8:8+t)) by bdec = e^{G_P} so the H GEMM directly yields
+        # bdec*(S0·x); the history term joins via the contraction below. The
+        # sync at the H-half-0 mbarrier wait publishes these writes.
         # ============================================================
-        # v17 t-aware: at T<=8 skip iter 2 (rows 8..15). Safe because the
-        # QT@V MMA reduction's k>=8 contribution is `sPowk[i, k] * sV[k, v]`
-        # with sPowk[0..t_input-1, 8..15] proven zero (sK[8..15]=wrapper-zero
-        # → QKT warp 3 (B=sK[8..15]) → sNegL[*, 8..15]=0 → sPowk[*, 8..15]=0
-        # through QT=sNegL@sTmat). So sV[8..15] garbage * 0 = 0 — no
-        # contamination of output rows 0..t_input-1. K cp.async is unchanged
-        # so the sK[8..15]=wrapper-zero invariant that this proof relies on
-        # is preserved.
-        _gV_base = gV.iterator.toint()
-        _sV_base_async = sV.iterator.toint()
-        _v_base_bf16 = pid_b * sv_b + pid_hv * sv_hv
-        _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
-        for i in cutlass.range_constexpr(_v_iters):
-            _v_group = tidx + i * THREADS
-            _v_row = _v_group // Int32(V_DIM_C // 8)
-            _v_col_bf16_async = (_v_group % Int32(V_DIM_C // 8)) * Int32(8)
-            _smem_byte_off_v = _v_row * Int32(V_PADDED * 2) + _v_col_bf16_async * Int32(
-                2
-            )
-            # (native-short-T) v holds only n_valid rows; skip rows >= n_valid (OOB).
-            # The sV working-set tail [n_valid:8] is zeroed after the V wait below;
-            # rows [8:16) stay garbage (proof-safe: sPowk[*,8:15]=0 -> garbage*0=0).
-            if const_expr(self._n_valid < T):
-                if _v_row < Int32(self._n_valid):
-                    _cp_async_bf16x8(
-                        _gV_base,
-                        _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
-                        _sV_base_async + _smem_byte_off_v,
-                    )
-            else:
-                _cp_async_bf16x8(
-                    _gV_base,
-                    _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
-                    _sV_base_async + _smem_byte_off_v,
+        # Skipped at P=0: bdec = 1 there and _mul_bf16x2_f32 by 1.0 is
+        # value-preserving, so the pass is a pure no-op — save the RMWs.
+        if P_hist > 0:
+            _bdec = sGhist.iterator[32]
+            for _bs in cutlass.range_constexpr(
+                2 * self._t_input * (K_DIM // 2) // THREADS
+            ):
+                _bs_idx = tidx + _bs * THREADS
+                _bs_rr = _bs_idx // Int32(K_DIM // 2)
+                _bs_col = _bs_idx % Int32(K_DIM // 2)
+                _bs_row = (
+                    _bs_rr
+                    if _bs_rr < Int32(self._t_input)
+                    else Int32(8 - self._t_input) + _bs_rr
                 )
-        _cp_async_commit_group()  # group = V (K+Q's group already waited at line 717)
+                _sK_i32.iterator[_bs_row * _kpad_i32 + _bs_col] = _mul_bf16x2_f32(
+                    _sK_i32.iterator[_bs_row * _kpad_i32 + _bs_col], _bdec
+                )
+
+        # The V load is issued later, in the TMA half-1 shadow below — sV's
+        # region (qv_buf) is occupied by the u tile until the history
+        # contraction has read it.
 
         # ============================================================
-        # v6 TMA: wait for the H tile to land in sH via mbarrier.
-        # The TMA store uses the async proxy; ldmatrix uses the generic
-        # proxy — fence_view_async_shared crosses the proxy boundary.
-        # NOTE: We do NOT wait for V here — V cp.async runs in parallel
-        # with the H GEMM below. wait_group(0) for V fires just before
-        # the QT@V consumer at line 1148.
+        # Wait for the state tile to land in sH via mbarrier. The TMA store
+        # uses the async proxy; ldmatrix uses the generic proxy —
+        # fence_view_async_shared crosses the proxy boundary. We do NOT wait
+        # for V here — its cp.async runs in parallel with the H GEMM below,
+        # and wait_group(0) for V fires just before the QT@V consumer.
         # ============================================================
         cute.arch.mbarrier_wait(mbar_h_ptr, 0)
         cute.arch.fence_view_async_shared()
         sync_threads()
 
         # ============================================================
-        # H GEMM: WH[16, 128] = A_full[16, 128] @ H^T
-        # 4 warps × 4 V-groups (8 rows each) × 8 K-tiles (16 K each)
-        # = 128 MMAs / 4 warps = 32 MMAs per warp.
+        # H GEMM: WH[16, 128] = A[16, 128] @ H^T, where A is the packed
+        # [k; q] tile in sK. 4 warps x 4 V-groups (8 rows each) x 8 K-tiles
+        # (16 K each) = 128 MMAs / 4 warps = 32 MMAs per warp.
         # ============================================================
         wh_acc_0 = cute.make_fragment_like(tCsC)
         wh_acc_0.fill(f32(0.0))
@@ -1643,10 +1833,14 @@ class GdnDecodeKernel:
         wh_acc_3 = cute.make_fragment_like(tCsC)
         wh_acc_3.fill(f32(0.0))
 
-        _sK_base_vl = sK.iterator.toint()  # A operand (A_full in sK, K_PADDED stride)
-        _sH_base_vl = sH.iterator.toint()  # B operand (H in sH, SW128-swizzled, half-K)
+        _sK_base_vl = (
+            sK.iterator.toint()
+        )  # A operand (packed tile in sK, K_PADDED stride)
+        _sH_base_vl = (
+            sH.iterator.toint()
+        )  # B operand (state in sH, SW128-swizzled, half-K)
         _rs_a = Int32(K_PADDED * 2)  # 272 — sK row stride (padded, full K)
-        _rs_b = Int32(K_HALF * 2)  # 128 — v13: sH row stride (half-K, SW128)
+        _rs_b = Int32(K_HALF * 2)  # 128 — sH row stride (half-K, SW128)
 
         # Per-warp V-group base (warp_id * 32 V-rows). For B-fragment ldmatrix.x2:
         # lane_id (0..31) maps to (lane%8) row × ((lane//8)%2) 16-col group.
@@ -1655,8 +1849,8 @@ class GdnDecodeKernel:
         _vg_base_row = warp_id * Int32(32)
 
         # ============================================================
-        # v13 half-H: H GEMM HALF-0 (ka=0..3, uses sH for K=0..63).
-        # sH currently holds H[:, 0:64] from the first TMA load.
+        # H GEMM HALF-0 (ka=0..3, uses sH for K=0..63). sH currently holds
+        # the state's K=0..63 columns from the first TMA load.
         # ============================================================
         for ka_local in cutlass.range_constexpr(4):
             col_byte_off_a = Int32(ka_local * 16 * 2)  # sK K=0..63
@@ -1732,9 +1926,9 @@ class GdnDecodeKernel:
             wh_acc_3.iterator[3] = _r[15]
 
         # ============================================================
-        # v13 half-H: ISSUE SECOND HALF TMA (K=64..127, overwrites sH).
-        # sync_threads ensures ALL warps finished reading sH (half-0 done).
-        # Then warp 0 issues the second TMA. Mbarrier parity flips to 1.
+        # Issue the SECOND state-tile half (K=64..127, overwrites sH). The
+        # sync_threads ensures ALL warps finished reading half-0; then warp 0
+        # issues the second TMA and the mbarrier parity flips to 1.
         # ============================================================
         sync_threads()
         if warp_id == 0:
@@ -1745,15 +1939,127 @@ class GdnDecodeKernel:
                 )
             cute.copy(tma_atom_h, tHgH1, tHsH1, tma_bar_ptr=mbar_h_ptr)
 
+        # ============================================================
+        # HISTORY CONTRACTION — placed in the TMA half-1 shadow. Consumes the
+        # u tile (viewed through sV) and the w-scaled transposed scores tile,
+        # accumulating hw[r, v] += sum_j sWScores[r, j] * u[j, v] into the
+        # wh_acc fragments via one _qtv_4mma. r = {r0 (k rows -> hw_k),
+        # r0+8 (q rows -> hw_q)} matches the packed A-tile row map, so the H
+        # GEMM and this MMA land in the same accumulator elements.
+        # ============================================================
+        _cp_async_wait_group_0()
+        sync_threads()
+        # MMA-based history contraction:
+        #   hw[r, v] += sum_j sWScores[r, j] * u[j, v]
+        # A = the w-scaled transposed scores tile (bf16, staged by the scores
+        # GEMM), B = the u tile (in sV's region) — the _qtv_4mma pattern,
+        # whose output fragments match wh_acc exactly. Skipped at P=0
+        # (CTA-uniform; wh_acc keeps only the S0 term).
+        if P_hist > 0:
+            _hc_a0, _hc_a1, _hc_a2, _hc_a3 = _ldmatrix_x4(sWScores, lane_id)
+            _hc_b_base = (
+                _sV_base_async_u + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
+            )
+            _hcr = _qtv_4mma(_hc_a0, _hc_a1, _hc_a2, _hc_a3, _hc_b_base)
+            wh_acc_0.iterator[0] = wh_acc_0.iterator[0] + _hcr[0]
+            wh_acc_0.iterator[1] = wh_acc_0.iterator[1] + _hcr[1]
+            wh_acc_0.iterator[2] = wh_acc_0.iterator[2] + _hcr[2]
+            wh_acc_0.iterator[3] = wh_acc_0.iterator[3] + _hcr[3]
+            wh_acc_1.iterator[0] = wh_acc_1.iterator[0] + _hcr[4]
+            wh_acc_1.iterator[1] = wh_acc_1.iterator[1] + _hcr[5]
+            wh_acc_1.iterator[2] = wh_acc_1.iterator[2] + _hcr[6]
+            wh_acc_1.iterator[3] = wh_acc_1.iterator[3] + _hcr[7]
+            wh_acc_2.iterator[0] = wh_acc_2.iterator[0] + _hcr[8]
+            wh_acc_2.iterator[1] = wh_acc_2.iterator[1] + _hcr[9]
+            wh_acc_2.iterator[2] = wh_acc_2.iterator[2] + _hcr[10]
+            wh_acc_2.iterator[3] = wh_acc_2.iterator[3] + _hcr[11]
+            wh_acc_3.iterator[0] = wh_acc_3.iterator[0] + _hcr[12]
+            wh_acc_3.iterator[1] = wh_acc_3.iterator[1] + _hcr[13]
+            wh_acc_3.iterator[2] = wh_acc_3.iterator[2] + _hcr[14]
+            wh_acc_3.iterator[3] = wh_acc_3.iterator[3] + _hcr[15]
+
+        # Next tenant of qv_buf: the V tile. The u tile's last read was the
+        # loop above; one barrier orders the handoff, then the V load runs
+        # here (its wait stays at the tail, so the transfer overlaps the H
+        # GEMM half-1).
+        sync_threads()
+        _gV_base = gV.iterator.toint()
+        _v_base_bf16 = pid_b * sv_b + pid_hv * sv_hv
+        _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
+        for i in cutlass.range_constexpr(_v_iters):
+            _v_group = tidx + i * THREADS
+            _v_row = _v_group // Int32(V_DIM_C // 8)
+            _v_col_bf16_async = (_v_group % Int32(V_DIM_C // 8)) * Int32(8)
+            _smem_byte_off_v = _v_row * Int32(V_PADDED * 2) + _v_col_bf16_async * Int32(
+                2
+            )
+            # v holds only n_valid rows; skip rows >= n_valid (OOB). Tail
+            # zeroing happens after the V wait below.
+            if const_expr(self._n_valid < T):
+                if _v_row < Int32(self._n_valid):
+                    _cp_async_bf16x8(
+                        _gV_base,
+                        _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
+                        _sV_base_async_u + _smem_byte_off_v,
+                    )
+            else:
+                _cp_async_bf16x8(
+                    _gV_base,
+                    _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
+                    _sV_base_async_u + _smem_byte_off_v,
+                )
+        _cp_async_commit_group()
+
+        # QT = sNegL @ sTmat, computed in the half-1 shadow on warps 0-1 into
+        # sWScores (dead after the contraction MMA above; the sync above
+        # orders the handoff, and the R-pass barrier below publishes QT before
+        # the y GEMM reads it). Associativity takes U off the output critical
+        # path: y_intra = sNegL @ (sTmat @ R) = QT @ R.
+        if warp_id < 2:
+            acc.fill(f32(0.0))
+            _qt_col_off = warp_id * 8
+            _qt_a_addr = (
+                sNegL.iterator.toint() + _lane_mod16 * Int32(BF_PAD * 2) + _lane_hi
+            )
+            _qt_b_addr = (
+                sTmat.iterator.toint()
+                + _ldm_row * Int32(BF_PAD * 2)
+                + _qt_col_off * Int32(2)
+            )
+            acc.iterator[0], acc.iterator[1], acc.iterator[2], acc.iterator[3] = (
+                _fused_ab_1mma(
+                    _qt_a_addr,
+                    _qt_b_addr,
+                    acc.iterator[0],
+                    acc.iterator[1],
+                    acc.iterator[2],
+                    acc.iterator[3],
+                )
+            )
+            _qt_r0 = lane_id // 4
+            _qt_c0 = (lane_id & 3) * 2
+            sWScores.iterator[_qt_r0 * BF_PAD + _qt_col_off + _qt_c0] = acc.iterator[
+                0
+            ].to(io)
+            sWScores.iterator[_qt_r0 * BF_PAD + _qt_col_off + _qt_c0 + 1] = (
+                acc.iterator[1].to(io)
+            )
+            sWScores.iterator[(_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0] = (
+                acc.iterator[2].to(io)
+            )
+            sWScores.iterator[(_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0 + 1] = (
+                acc.iterator[3].to(io)
+            )
+
         # Wait for second half to land before H GEMM half-1.
         cute.arch.mbarrier_wait(mbar_h_ptr, 1)
         cute.arch.fence_view_async_shared()
         sync_threads()
 
         # ============================================================
-        # v13 half-H: H GEMM HALF-1 (ka=4..7, uses sH for K=64..127).
-        # sH was overwritten by the second TMA — col offset into sH RESETS.
-        # sK col offset advances (sK still has full K_DIM=128 layout).
+        # H GEMM HALF-1 (ka=4..7, uses sH for K=64..127). sH was overwritten
+        # by the second TMA, so the col offset into sH RESETS; the sK col
+        # offset advances (sK still has the full K_DIM=128 layout).
         # ============================================================
         for ka_local in cutlass.range_constexpr(4):
             col_byte_off_a = Int32((4 + ka_local) * 16 * 2)  # sK K=64..127
@@ -1829,62 +2135,113 @@ class GdnDecodeKernel:
             wh_acc_3.iterator[3] = _r[15]
 
         # ============================================================
-        # OUTPUT: out = WH + QT@V
+        # (u-cache) TAIL: R → U (ring append) → y = e^G∘hw_q + F^T·U
         # ============================================================
-        _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
         _sV_base = sV.iterator.toint()
         _gOut_base = gOut.iterator.toint()
         _out_base = pid_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
-        # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
-        # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
-        # past it once the sync below (before QT@V) has run.
-        _sOutStage_base = sH.iterator.toint()
+        # h_buf staging (sH dead after the half-1 H GEMM): ONE [16, V_PADDED]
+        # tile at +8192 — rows [0:8) stage the output, rows [8:8+t) stage the
+        # U ring append (dead rows at t<=8), so a single barrier + a single
+        # flush region covers both.
+        _sOutStage_base = sH.iterator.toint() + Int32(8192)
 
-        # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16 within a warp,
-        # warp_id stride in V-cols = 32 → 64 bytes between warps.
-        _qtv_base = _sV_base + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
-        # v10: Wait for the V cp.async to land in sV before ldmatrix-ing
-        # from it. V was issued before the H GEMM; the wait here drains
-        # whatever didn't finish in the H GEMM's shadow. Same proxy as
-        # K+Q LDGSTS — no fence_view_async_shared needed.
+        # Wait for the V cp.async (tenant #4, issued in the half-1 shadow;
+        # the wait drains whatever didn't finish under the H GEMM half-1).
         _cp_async_wait_group_0()
-        # (native-short-T) zero the sV working-set tail rows [n_valid:8] that were NOT
-        # loaded (v held only n_valid rows). The QT@V reduction reads the 8-row working
-        # set for t_input<=8; rows [n_valid:8] must be zero (staging supplied them
-        # before). Rows [8:16) stay garbage — proof-safe (sPowk[*,8:15]=0). tidx in
-        # [0,THREADS=128) covers V_DIM_C=128 cols; the following sync publishes it.
+        # Zero the sV working-set tail rows [n_valid:8]. Rows [8:16) stay
+        # stale-but-finite — safe: the U GEMM's A (sTmat) has exact-zero
+        # cols >= t, so those rows cannot propagate.
         if const_expr(self._n_valid < T):
             for _zr in cutlass.range_constexpr(self._n_valid, 8):
                 sV.iterator[_zr * V_PADDED + tidx] = io(0.0)
         sync_threads()
-        _qtvr = _qtv_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _qtv_base)
 
+        # R = V − e^{G_s} ∘ hw_k, in place over sV rows [0:t). hw_k lives
+        # in wh_acc elements {0,1} (fragment rows r0 = packed k rows);
+        # beta is folded into sTmat, NOT applied here.
+        _y_r0 = lane_id // Int32(4)
+        _y_c0 = (lane_id & Int32(3)) * Int32(2)
+        if _y_r0 < Int32(self._t_input):
+            _neg_eg = f32(0.0) - sGamma.iterator[T + _y_r0]
+            # (perf) i32-paired RMW through the sQ i32 view (same buffer and
+            # row stride as sV: K_PADDED == V_PADDED) — 4 load+store pairs
+            # instead of 16 scalar bf16 chains; fma(-e^G, hw, v) is the
+            # fused form of the previous v - e^G*hw.
+            _r_i32 = (
+                _y_r0 * Int32(V_PADDED // 2)
+                + warp_id * Int32(16)
+                + (lane_id & Int32(3))
+            )
+            _sQ_i32.iterator[_r_i32] = _r_sub_bf16x2(
+                _sQ_i32.iterator[_r_i32],
+                _neg_eg,
+                wh_acc_0.iterator[0],
+                wh_acc_0.iterator[1],
+            )
+            _sQ_i32.iterator[_r_i32 + 4] = _r_sub_bf16x2(
+                _sQ_i32.iterator[_r_i32 + 4],
+                _neg_eg,
+                wh_acc_1.iterator[0],
+                wh_acc_1.iterator[1],
+            )
+            _sQ_i32.iterator[_r_i32 + 8] = _r_sub_bf16x2(
+                _sQ_i32.iterator[_r_i32 + 8],
+                _neg_eg,
+                wh_acc_2.iterator[0],
+                wh_acc_2.iterator[1],
+            )
+            _sQ_i32.iterator[_r_i32 + 12] = _r_sub_bf16x2(
+                _sQ_i32.iterator[_r_i32 + 12],
+                _neg_eg,
+                wh_acc_3.iterator[0],
+                wh_acc_3.iterator[1],
+            )
+        sync_threads()
+
+        # y FIRST, via associativity: y_intra = QT @ R with QT = sNegL @ sTmat
+        # precomputed into sWScores in the half-1 shadow (B = R). U is computed
+        # AFTER the output staging (off the critical path).
+        _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sWScores, lane_id)
+        _qtv_base = _sV_base + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
+        _qtvr = _qtv_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _qtv_base)
+        # U = sTmat @ R back-to-back with the y MMA (same B = sV(R)); its rows
+        # [0:t) are staged into OutStage rows [8:8+t) below, so the single
+        # pre-flush barrier publishes output AND ring-append data.
+        _u_a0, _u_a1, _u_a2, _u_a3 = _ldmatrix_x4(sTmat, lane_id)
+        _ur = _qtv_4mma(_u_a0, _u_a1, _u_a2, _u_a3, _qtv_base)
+
+        _eg_yq = sGamma.iterator[T + _y_r0]
         for h_iter in cutlass.range_constexpr(4):
             h = warp_id * 4 + h_iter
             acc.iterator[0] = _qtvr[h_iter * 4]
             acc.iterator[1] = _qtvr[h_iter * 4 + 1]
             acc.iterator[2] = _qtvr[h_iter * 4 + 2]
             acc.iterator[3] = _qtvr[h_iter * 4 + 3]
+            # + e^{G_s} ∘ hw_q: hw_q lives in wh_acc elements
+            # {2,3} (fragment rows r0+8 = packed q rows); it lands on the
+            # y elements {0,1} (output rows r0 = window tokens). Fragment
+            # rows r0+8 of y are garbage — neither staged (t<=8) nor
+            # stored (STG row-gated), so elements {2,3} get no add.
             if h_iter == 0:
-                for j in cutlass.range_constexpr(4):
-                    acc.iterator[j] = acc.iterator[j] + wh_acc_0.iterator[j]
+                acc.iterator[0] = acc.iterator[0] + _eg_yq * wh_acc_0.iterator[2]
+                acc.iterator[1] = acc.iterator[1] + _eg_yq * wh_acc_0.iterator[3]
             if h_iter == 1:
-                for j in cutlass.range_constexpr(4):
-                    acc.iterator[j] = acc.iterator[j] + wh_acc_1.iterator[j]
+                acc.iterator[0] = acc.iterator[0] + _eg_yq * wh_acc_1.iterator[2]
+                acc.iterator[1] = acc.iterator[1] + _eg_yq * wh_acc_1.iterator[3]
             if h_iter == 2:
-                for j in cutlass.range_constexpr(4):
-                    acc.iterator[j] = acc.iterator[j] + wh_acc_2.iterator[j]
+                acc.iterator[0] = acc.iterator[0] + _eg_yq * wh_acc_2.iterator[2]
+                acc.iterator[1] = acc.iterator[1] + _eg_yq * wh_acc_2.iterator[3]
             if h_iter == 3:
-                for j in cutlass.range_constexpr(4):
-                    acc.iterator[j] = acc.iterator[j] + wh_acc_3.iterator[j]
-            # SMEM-staged epilogue (NCU B=256 mbp8: the 8 fragment-direct 4-B
-            # STG.32s were the top uncoalesced-global source — 50% of each
-            # 32-B sector wasted, 2.1M of 2.6M excessive L2 sectors). Stage
-            # the [T,128] tile in SMEM (h_buf — sH is dead after the half-1 H
-            # GEMM; the sync at the QT@V wait above orders all warps past it),
-            # then flush with fully-coalesced 16-B STGs below. STS pattern
-            # (word = 68*r + 4*h + lane%4) is bank-conflict-free.
+                acc.iterator[0] = acc.iterator[0] + _eg_yq * wh_acc_3.iterator[2]
+                acc.iterator[1] = acc.iterator[1] + _eg_yq * wh_acc_3.iterator[3]
+            # SMEM-staged epilogue: stage the [T,128] tile in SMEM (h_buf — sH
+            # is dead after the half-1 H GEMM; the sync at the QT@V wait above
+            # orders all warps past it), then flush with fully-coalesced 16-B
+            # STGs below. The STS pattern (word = 68*r + 4*h + lane%4) is
+            # bank-conflict-free, avoiding the uncoalesced fragment-direct
+            # 4-B stores.
             _out_r0 = lane_id // 4
             _out_c0 = (lane_id & 3) * 2
             _stg_col = h * 8 + _out_c0
@@ -1898,6 +2255,18 @@ class GdnDecodeKernel:
                     _sOutStage_base + ((_out_r0 + 8) * V_PADDED + _stg_col) * 2,
                     acc.iterator[2],
                     acc.iterator[3],
+                )
+
+        # Stage U rows [0:t) at OutStage rows [8:8+t) (dead rows at t<=8):
+        # frag elements {0,1} hold U row _y_r0. Published by the same
+        # pre-flush barrier as the output rows.
+        if _y_r0 < Int32(self._t_input):
+            for _ug in cutlass.range_constexpr(4):
+                _uu_col = (warp_id * Int32(4) + Int32(_ug)) * Int32(8) + _y_c0
+                _sts_bf16x2_f32(
+                    _sOutStage_base + ((8 + _y_r0) * V_PADDED + _uu_col) * 2,
+                    _ur[_ug * 4],
+                    _ur[_ug * 4 + 1],
                 )
 
         # Coalesced flush: consecutive lanes write consecutive 16-B chunks
@@ -1921,36 +2290,47 @@ class GdnDecodeKernel:
                 if _fl_row < Int32(self._t_input):
                     _st_global_v4_b32(_gOut_base, _fl_off, _v0, _v1, _v2, _v3)
 
+        # (u-cache) ring append straight from OutStage rows [8:8+t) — same
+        # barrier and staging tile as the output, so this overlaps the
+        # output STGs above (no extra pass, no extra barrier).
+        _uc_wr_base = _uc_base + P_hist * V_DIM
+        if tidx < Int32(self._t_input * (V_DIM_C // 8)):
+            _uf_row = tidx // Int32(V_DIM_C // 8)
+            _uf_pos = tidx % Int32(V_DIM_C // 8)
+            _uv0, _uv1, _uv2, _uv3 = _lds_v4_b32(
+                _sOutStage_base
+                + (8 + _uf_row) * Int32(V_PADDED * 2)
+                + _uf_pos * Int32(16)
+            )
+            _st_global_v4_b32(
+                _gUC_base,
+                _uc_wr_base + _uf_row * V_DIM + _uf_pos * Int32(8),
+                _uv0,
+                _uv1,
+                _uv2,
+                _uv3,
+            )
+
 
 # ============================================================================
-# Public entry point — drop-in for
-#   flashinfer.gdn_kernels.gdn_decode_bf16_state.gated_delta_rule_mtp
-# restricted to the OUTPUT-ONLY (frozen-state) case.
+# Public entry point — gated_delta_rule_mtp_ucache: the draft-token decode
+# output PLUS the (k_cache, u_cache, g_cache, hist_len) history-ring append
+# (see the module docstring for the ring contract). Native T in {4, 8} only.
 #
-# This is the bank-conflict-eliminated "v18" no-prepack kernel. It consumes H0
-# in its natural (pool, HV, V, K) bf16 layout (NO external prepack) and computes
-# the MTP decode output, keeping the running state h in FP32 registers across
-# the T tokens (loaded/stored as BF16 at the boundary). It does NOT write state
-# back, cache intermediates, or do fused recovery; those paths raise
-# NotImplementedError so a mis-routed caller fails loudly rather than silently
-# returning wrong results.
+# Consumes the state pool in its natural (pool, HV, V, K) bf16 layout (no
+# external prepack) and computes the decode output. The checkpoint state is
+# read-only (never written back); state-update / intermediate-cache / fused-
+# recovery request flags raise NotImplementedError so a mis-routed caller
+# fails loudly rather than silently returning wrong results.
 #
-# Input/output contract matches the BF16-state MTP kernel for output-only use:
+# Input/output contract:
 #   A_log [HV], a [B,T,HV], dt_bias [HV], q/k [B,T,H,K], v [B,T,HV,V], b [B,T,HV],
 #   initial_state_source [pool,HV,V,K] bf16, initial_state_indices [B] int32,
 #   scale, output [B,T,HV,V] -> returns output [B,T,HV,V] bf16.
-# Requires SM90+ (TMA + mbarrier; validated on H200/SM90 and B200/GB300 SM100);
-# K == V == 128.
+# Requires SM90+ (TMA + mbarrier); K == V == 128.
 # ============================================================================
 
 _CACHE: dict = {}
-
-
-def _compile_options(device: torch.device) -> tuple:
-    major, minor = torch.cuda.get_device_capability(device)
-    return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
-
-
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
 # pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
@@ -1960,32 +2340,25 @@ _STAGE: dict = {}
 # q/k/v/a/b directly into the persistent T=16 buffers (the fixed-buffer serving
 # pattern) or to benchmark the bare kernel. Default True = always safe drop-in.
 _RESTAGE = True
-# (native-short-T) When set, the T<T_KERNEL path passes q/k to the kernel as the
-# real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
-# rows + zeros its sK/sQ smem tail. Removes the two big q/k gmem->gmem staging
-# copies. v/a/b stay staged (v is already minimized by _v_iters=1 at t_input<=8;
-# a/b feed the per-lane gamma path).
-# ON by default since the _BF16_CACHE stale-cast fix: the earlier "unsafe"
-# accuracy signal traced to that host-side bug, not this path. Validated on B200
-# (T=4 and T=8, BS=1..256): max|d| <= 9.77e-04 vs branch kernel and vs the torch
-# reference, full wy_output_only pytest green with native forced, and 2-6%
-# faster kernel time at BS>=8 plus 2 fewer host staging copies per call.
-# Set FLASHINFER_GDN_WY_NATIVE_T=0 to restore full staging.
+# When set, the T<T_KERNEL path passes q/k to the kernel as the real [B,T,...]
+# tensors (no host staging copy) and the kernel loads only those T rows + zeros
+# its sK/sQ smem tail, removing the two big q/k gmem->gmem staging copies. v/a/b
+# stay staged. Set SGLANG_GDN_WY_NATIVE_T=0 to restore full staging.
 import os as _os
 
-_NATIVE_T = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_T", "1") != "0"
+_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "1") != "0"
 # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
 # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
 # q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
-_STRIDED_QKV = _os.environ.get("FLASHINFER_GDN_WY_STRIDED_QKV", "0") != "0"
+_STRIDED_QKV = _os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "0") != "0"
 # (native-a/b) read a/b directly from the real [B, n_valid, HV] tensors instead of staging
 # them into T_KERNEL-row zero-padded buffers (removes the 2 a/b staging copies). Bit-exact on
 # the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
 # log_alpha=0 instead of the staged-zero value) cannot affect rows 0..n_valid-1, and the tail
 # output is discarded. Native path only (T in {4,8}).
-# ON by default alongside _NATIVE_T (same validation); FLASHINFER_GDN_WY_NATIVE_AB=0
+# ON by default alongside _NATIVE_T (same validation); SGLANG_GDN_WY_NATIVE_AB=0
 # restores a/b staging.
-_NATIVE_AB = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_AB", "1") != "0"
+_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "1") != "0"
 # Cache the bf16 cast of the per-layer CONSTANT weights A_log/dt_bias, keyed by
 # storage identity (data_ptr, shape). They are persistent tensors passed every verify
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
@@ -2016,7 +2389,7 @@ def _cached_bf16(t):
     return c
 
 
-def gated_delta_rule_mtp(
+def gated_delta_rule_mtp_ucache(
     A_log: torch.Tensor,
     a: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -2038,42 +2411,48 @@ def gated_delta_rule_mtp(
     output: Optional[torch.Tensor] = None,
     disable_output: bool = False,
     recovery_steps: int = 0,
+    k_cache: Optional[torch.Tensor] = None,
+    u_cache: Optional[torch.Tensor] = None,
+    g_cache: Optional[torch.Tensor] = None,
+    hist_len: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
 ) -> torch.Tensor:
-    """GDN MTP decode (BF16 state), bank-conflict-eliminated no-prepack kernel.
+    """GDN decode output + history-ring append (verify path, no state flush).
 
-    Output-only / frozen-state: computes ``output`` for all T tokens and never
-    writes ``initial_state_source`` back. Signature mirrors
-    ``gdn_decode_bf16_state.gated_delta_rule_mtp`` so it is a drop-in for that
-    kernel's output-only path; the state-update / recovery / cache / per-request
-    features are not implemented and raise ``NotImplementedError``.
+    Reads S0 (never written) and the (k_cache, u_cache, g_cache) ring at
+    hist_len[b] filled slots, computes the T draft outputs, and appends the T
+    new (normed-k, u, G) entries at ring slots [P, P+T) — speculatively;
+    serving rewinds by setting hist_len = P + accepted. Ring contract in the
+    module docstring; ring buffers must be ZERO-INITIALIZED at pool
+    allocation. Native T in {4, 8} only.
 
     Returns ``output`` of shape ``[B, T, HV, V]`` (bf16).
     """
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
 
-    # --- output-only kernel: reject the fused/state-update features ---
+    # --- reject request flags outside this kernel's contract ---
     if recovery_steps != 0:
         raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: recovery_steps>0 is not supported "
-            "(this is an output-only / frozen-state kernel)."
+            "gated_delta_rule_mtp_ucache: recovery_steps>0 is not supported "
+            "(fused recovery is not implemented)."
         )
     if disable_output:
         raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: disable_output=True (state-only mode) "
+            "gated_delta_rule_mtp_ucache: disable_output=True (state-only mode) "
             "is not supported (this kernel always emits output)."
         )
     if intermediate_states_buffer is not None:
         raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: intermediate-state caching is not supported."
+            "gated_delta_rule_mtp_ucache: intermediate-state caching is not supported."
         )
     if accepted_steps is not None or ssm_state_indices is not None:
         raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: per-request K / FLA-scatter is not supported."
+            "gated_delta_rule_mtp_ucache: per-request K / FLA-scatter is not supported."
         )
     if output_state_indices is not None:
         raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: split-pool (output_state_indices) is not supported."
+            "gated_delta_rule_mtp_ucache: split-pool (output_state_indices) is not supported."
         )
     # softplus_beta / softplus_threshold are hardcoded in the kernel (beta=1,
     # overflow-safe exp); reject non-default values rather than silently ignoring.
@@ -2087,16 +2466,11 @@ def gated_delta_rule_mtp(
     # The kernel always applies Q/K L2 normalization internally; reject False
     # rather than silently returning un-normalized-semantics results.
     assert use_qk_l2norm_in_kernel, (
-        "gdn_decode_bf16_wy_output_only: use_qk_l2norm_in_kernel=False is not supported "
+        "gated_delta_rule_mtp_ucache: use_qk_l2norm_in_kernel=False is not supported "
         "(the kernel always applies Q/K L2 normalization)."
     )
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
-    )
-    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
-    q, k, v, a, b = as_bf16(q, k, v, a, b)
-    assert output is None or output.dtype == torch.bfloat16, (
-        f"output must be bf16; got {output.dtype}."
     )
 
     B, T, H, K_dim = q.shape
@@ -2114,18 +2488,15 @@ def gated_delta_rule_mtp(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
-        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
-            f"initial_state_indices must be int32 or int64; "
-            f"got {initial_state_indices.dtype}."
+    # GDN-C1/C3 guard (#4214): the kernel body is bf16-only (module-level
+    # io=cutlass.BFloat16) and from_dlpack bakes operand dtypes into the
+    # compiled signature, so non-bf16 activations would either throw on a
+    # cache hit or be silently reinterpreted by a fresh compile. Fail loudly.
+    for _n, _t in (("q", q), ("k", k), ("v", v), ("a", a), ("b", b)):
+        assert _t.dtype == torch.bfloat16, (
+            f"gated_delta_rule_mtp_ucache: {_n}.dtype={_t.dtype} unsupported — "
+            "this kernel is bf16-only; cast activations to torch.bfloat16."
         )
-        # Kernel loads indices as int32; convert rather than reinterpret.
-        if initial_state_indices.dtype != torch.int32:
-            iinfo = torch.iinfo(torch.int32)
-            assert (
-                int(initial_state_indices.min()) >= iinfo.min
-                and int(initial_state_indices.max()) <= iinfo.max
-            ), "initial_state_indices must fit in int32 before narrowing"
-            initial_state_indices = initial_state_indices.to(torch.int32)
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2134,9 +2505,60 @@ def gated_delta_rule_mtp(
     # captured graph). Falls back to a plain cast if already bf16-contiguous.
     A_log = _cached_bf16(A_log)
     dt_bias = _cached_bf16(dt_bias)
-    h0 = initial_state_source.contiguous()
+
+    def _inner_dense(t: torch.Tensor, name: str) -> bool:
+        """Pools may be block-strided views (paged serving layouts, e.g. vLLM:
+        dim-0 stride spans the whole multi-component page). Inner dims must be
+        dense; returns whether the tensor is fully contiguous."""
+        dense_inner = torch.empty(t.shape[1:], device="meta").stride()
+        assert tuple(t.stride()[1:]) == tuple(dense_inner) and t.stride(0) >= (
+            t.shape[1] * dense_inner[0] if t.dim() > 1 else 1
+        ), (
+            f"{name}: inner dims must be dense (block-strided dim 0 is OK); "
+            f"got shape {tuple(t.shape)} strides {tuple(t.stride())}"
+        )
+        return t.is_contiguous()
+
+    h0 = initial_state_source
+    _pools_contig = _inner_dense(h0, "initial_state_source")
+
+    # --- (u-cache) ring validation -----------------------------------------
+    assert (
+        k_cache is not None
+        and u_cache is not None
+        and g_cache is not None
+        and hist_len is not None
+    ), "gated_delta_rule_mtp_ucache: k_cache/u_cache/g_cache/hist_len are required."
+    _pool = h0.shape[0]
+    assert k_cache.dtype == torch.bfloat16
+    _pools_contig &= _inner_dense(k_cache, "k_cache")
+    assert tuple(k_cache.shape) == (_pool, HK, 16, K_dim), (
+        f"k_cache must be [pool={_pool}, H={HK}, 16, K={K_dim}]; got "
+        f"{tuple(k_cache.shape)}. NOTE: this verify-only kernel uses the "
+        "LEGACY 16-deep flat ring (history at physical rows [0, hist_len), "
+        "no cache_base) and is NOT ring-format compatible with "
+        "gdn_decode_bf16_wy_ucache_flush (32-slot rotating ring). Do not "
+        "share one ring allocation between the two kernels, and do not pad "
+        "these rings to 32 — history would be read at the wrong physical "
+        "rows whenever the window origin is nonzero."
+    )
+    assert u_cache.dtype == torch.bfloat16, (
+        "v1 supports bf16 u_cache only (f32 is a documented extension point)."
+    )
+    _pools_contig &= _inner_dense(u_cache, "u_cache")
+    assert tuple(u_cache.shape) == (_pool, HV, 16, V_dim)
+    assert g_cache.dtype == torch.float32
+    _pools_contig &= _inner_dense(g_cache, "g_cache")
+    assert tuple(g_cache.shape) == (_pool, HV, 16)
+    assert hist_len.dtype == torch.int32 and hist_len.shape[0] == B
+    hist_len = hist_len.contiguous()
+    if T not in (4, 8):
+        raise NotImplementedError(
+            f"gated_delta_rule_mtp_ucache: T={T} unsupported — native T in {{4, 8}} "
+            "only (T=16 leaves no ring headroom; other T have no serving user)."
+        )
     # n_valid = token rows actually present in the q/k tensors handed to the kernel.
-    # Native-short-T (FLASHINFER_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
+    # Native-short-T (SGLANG_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
     # (n_valid=T); the kernel loads only those rows and zeros its sK/sQ smem tail,
     # skipping the two big q/k gmem->gmem staging copies. Otherwise q/k are staged
     # into a T_KERNEL-row zero-padded buffer (n_valid=T_KERNEL = original behavior).
@@ -2144,8 +2566,10 @@ def gated_delta_rule_mtp(
     # t_input-gated output STG writes exactly T rows (compact [B,T] output is safe) and
     # (b) the smem-tail zeroing aligns with the kernel's working-set masking. T=4 is the
     # draft-len-3 verify shape. Other T (1-3,5-7,9-15) fall back to full staging.
-    _native = _NATIVE_T and (T == 4 or T == 8)
-    n_valid = T if _native else T_KERNEL
+    # (u-cache) the kernel's ring math assumes t_input == T (native), so the
+    # native path is FORCED here (SGLANG_GDN_WY_NATIVE_T is ignored).
+    _native = True
+    n_valid = T
 
     # Contiguity: tensors the kernel reads DIRECTLY from gmem need canonical-compact
     # strides for the CuTe descriptor; staged tensors get this for free from .copy_().
@@ -2153,6 +2577,7 @@ def gated_delta_rule_mtp(
     _ab_native_flag = (
         False  # True => a/b read native [B,n_valid,HV] (no staging); _NATIVE_AB
     )
+    _ab_ts = 0  # a/b token stride baked into the cubin (0 = contiguous HV)
     if T == T_KERNEL:
         q = q.contiguous()
         k = k.contiguous()
@@ -2172,18 +2597,35 @@ def gated_delta_rule_mtp(
             k = k.contiguous()
             v = v.contiguous()
 
+    # Block-strided (paged) pools bake their strides into the STATIC
+    # descriptors of the strided mode; the compact-dynamic descriptors assume
+    # contiguous pools. Same contract as the flush wrapper.
+    if not _pools_contig and _qkv_rs == 0:
+        raise NotImplementedError(
+            "block-strided state pools require the static-descriptor mode: set "
+            "SGLANG_GDN_WY_STRIDED_QKV=1 and pass q/k/v slices sharing a token "
+            "stride (the compact-dynamic descriptors assume contiguous pools)."
+        )
+
     # For T<T_KERNEL, stage the inputs into persistent, pre-zeroed T_KERNEL-row
     # buffers (keyed by shape AND T so rows [T:T_KERNEL) stay zero) and copy only the
     # T valid rows per call. Those zero rows are load-bearing: the kernel's
     # ldmatrix/MMA reads the full tile (NaN-tail probe confirmed). The native path
     # stages only a/b and moves the q/k/v zero-fill into the kernel (smem tail).
     if T < T_KERNEL:
-        if _native and _NATIVE_AB and a.is_contiguous() and b.is_contiguous():
+        if (
+            _native
+            and _NATIVE_AB
+            and a.stride(-1) == 1
+            and tuple(b.stride()) == tuple(a.stride())
+            and a.stride(0) == a.shape[1] * a.stride(1)
+        ):
             # Native-a/b: pass the real [B, T(=n_valid), HV] tensors straight to the kernel
             # (batch stride = n_valid*HV, contiguous). The kernel gates the warp-3 load/compute
             # by n_valid, so no T_KERNEL zero-pad staging copy is needed. Bit-exact on the
             # compact [B,T] output (causal prefix-sum isolates the unloaded tail rows).
             _ab_native_flag = True
+            _ab_ts = a.stride(1)
             # q, k, v and a, b all stay native [B, T, ...].
         elif _native:
             skey: tuple = (str(device), B, HV, str(_io_dtype), T, "ab")
@@ -2207,9 +2649,9 @@ def gated_delta_rule_mtp(
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
-                # (local patch) allocate OUTSIDE inference_mode so they are normal
-                # tensors; otherwise the in-place .copy_() is rejected during
-                # sglang CUDA-graph capture ("Inplace update to inference tensor").
+                # Allocate OUTSIDE inference_mode so they are normal tensors;
+                # otherwise the in-place .copy_() is rejected during CUDA-graph
+                # capture ("Inplace update to inference tensor").
                 with torch.inference_mode(False):
                     buf = (
                         torch.zeros(
@@ -2235,15 +2677,19 @@ def gated_delta_rule_mtp(
             q, k, v, a, b = qb, kb, vb, ab, bb
 
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM (ncu, B200).
+    # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM.
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
-    # Cap raised 4 -> 8 (measured on B200, T=16/HV=64): launch bounds mbp=8 makes the
-    # compiler fit 64 regs/thread (was 73 -> 80 allocated -> 6-CTA register limit),
-    # unlocking the 7-CTA SMEM limit (29.8 KB/CTA): theoretical occupancy 37.5% -> 43.75%,
-    # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
-    # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
+    # min_blocks_per_mp (launch bounds) is capped at 8: mbp=8 makes the
+    # compiler fit 64 regs/thread, unlocking the 7-CTA SMEM limit (29.8 KB/CTA).
+    # Higher mbp gains no further occupancy (SMEM-capped at 7 CTAs) and is
+    # slower — do not raise past 8.
     mbp = max(1, min(_needed + 1, 8))
+    # GDN_WY_MBP overrides min_blocks_per_mp (launch bounds) for perf experiments.
+    # mbp is part of cache_key, so each value compiles its own kernel.
+    _mbp_env = _os.environ.get("GDN_WY_MBP")
+    if _mbp_env:
+        mbp = int(_mbp_env)
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
@@ -2256,20 +2702,21 @@ def gated_delta_rule_mtp(
     # descriptors stay fully static, so it keeps B/pool in the key (fallback).
     # HV/H/V_dim MUST be in the key: they are runtime Int32 kernel args, but the
     # compiled artifact bakes in the captured tensors' layouts (H0 TMA descriptor,
-    # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic). A
-    # process mixing HV values (e.g. HV=32 then HV=64) previously reused the first
-    # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
-    # by the intense correctness sweep; invisible to the tests/benches, which use
-    # one HV per process.
-    cc = torch.cuda.get_device_capability(device)
+    # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic), so a
+    # process mixing HV values would otherwise reuse a cubin with the wrong strides.
     cache_key: tuple = (
+        "ucache-v1",
         str(device),
-        cc,
+        # io dtype: constant bf16 today (asserted at entry), keyed so a future
+        # dtype-specialized body can never alias cubins across dtypes (GDN-C3).
+        str(_io_dtype),
         mbp,
         t_disc,
         n_valid,
         _qkv_rs,
         _ab_native_flag,
+        _ab_ts,
+        bool(use_pdl),
         HV,
         H,
         V_dim,
@@ -2294,8 +2741,22 @@ def gated_delta_rule_mtp(
     # [:, :T] VIEW (zero-copy). If the caller provided `output`, honor it:
     # T==16 writes straight in; T<16 uses a scratch tile and copies the T valid
     # rows back.
+    _out_aliased = False
     if output is not None and T == T_KERNEL:
         out16 = output
+        _out_aliased = True
+    elif (
+        output is not None
+        and _native
+        and output.shape == (B, T, HV, V_dim)
+        and output.dtype == _io_dtype
+        and output.is_contiguous()
+    ):
+        # (split) zero-copy alias: the kernel STGs write the caller's buffer
+        # directly (retired pad-skip rows write nothing), so two masked
+        # launches can share one output with no merge/copy.
+        out16 = output
+        _out_aliased = True
     elif _native:
         # Native (T in {4,8}): the STG writes exactly T rows, so a compact [B,T,HV,V]
         # output is correct. Returning it contiguous makes the caller's
@@ -2315,6 +2776,10 @@ def gated_delta_rule_mtp(
         mk(dt_bias, 16),
         mk_dyn(h0),
         mk_dyn(initial_state_indices),
+        mk_dyn(k_cache),
+        mk_dyn(u_cache),
+        mk_dyn(g_cache),
+        mk_dyn(hist_len),
         mk_dyn(out16),
         scale,
         HV,
@@ -2324,27 +2789,32 @@ def gated_delta_rule_mtp(
     ]
 
     if cache_key not in _CACHE:
-        kernel = GdnDecodeKernel(
-            disable_state_update=True,
-            min_blocks_per_mp=mbp,
-            t_input=t_disc,
-            n_valid=n_valid,
-            qkv_row_stride=_qkv_rs,
-            ab_native=_ab_native_flag,
-        )
-        options = _compile_options(device)
-        _CACHE[cache_key] = (
-            cute.compile[options](kernel, *args)
-            if options
-            else cute.compile(kernel, *args)
+        _CACHE[cache_key] = cute.compile(
+            GdnDecodeUCacheKernel(
+                disable_state_update=True,
+                min_blocks_per_mp=mbp,
+                t_input=t_disc,
+                n_valid=n_valid,
+                qkv_row_stride=_qkv_rs,
+                ab_native=_ab_native_flag,
+                ab_t_stride=_ab_ts,
+                launch_pdl=use_pdl,
+            ),
+            *args,
         )
     _CACHE[cache_key](*args)
 
     if output is None:
         return out16[:, :T]  # zero-copy view of the valid tokens
-    if T < T_KERNEL:
+    if T < T_KERNEL and not _out_aliased:
         output.copy_(out16[:, :T])
     return output
 
 
-__all__ = ["gated_delta_rule_mtp", "GdnDecodeKernel", "K_DIM", "V_DIM_C"]
+__all__ = [
+    "gated_delta_rule_mtp_ucache",
+    "GdnDecodeUCacheKernel",
+    "K_DIM",
+    "V_DIM_C",
+    "W_RING",
+]

@@ -34,6 +34,13 @@ from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
 
+def _build_per_tensor_fp8_runner(config):
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    return runner
+
+
 def _is_trtllm_fp8_arch() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
@@ -767,7 +774,7 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
     layer_out = MoELayer(config)(act, weights)
     _assert_per_tensor_fp8_close(layer_out, ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
@@ -786,7 +793,7 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     )
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
     invalid_config = dataclasses.replace(
@@ -814,7 +821,7 @@ def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     assert torch.count_nonzero(ref)
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
 
@@ -833,7 +840,7 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
         act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     )
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
     packed = moe_inputs.topk_ids
     assert moe_inputs.expert_weights is None
@@ -852,7 +859,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
     assert not act.topk_ids.is_contiguous()
     assert not act.topk_weights.is_contiguous()
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     assert MoeRunnerInputs.from_list(inputs).topk_ids.is_contiguous()
     _assert_per_tensor_fp8_close(runner.forward(inputs), ref)
@@ -860,7 +867,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
 
 def test_fp8_per_tensor_routing_replay_matches_reference():
     act, weights, config, _, selected_experts = _make_per_tensor_fp8_case()
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
@@ -884,7 +891,7 @@ def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
         routing_input_mode=routing_input_mode
     )
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     runner.forward(inputs)
     graph = torch.cuda.CUDAGraph()
