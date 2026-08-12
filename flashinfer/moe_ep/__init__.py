@@ -77,6 +77,13 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
 )
+from .backends.mega.kernel.sm90_push_nvfp4 import (
+    Sm90PushNvFp4MegaMoeConfig,
+    load_modelopt_folded_fp8_weights as load_sm90_push_nvfp4_modelopt_folded_fp8_weights,
+    load_modelopt_transformed_weights as load_sm90_push_nvfp4_modelopt_weights,
+    make_folded_fp8_weights_from_checkpoints as make_sm90_push_nvfp4_folded_fp8_weights,
+    preprocess_mega_weights as preprocess_sm90_push_nvfp4_mega_weights,
+)
 
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
@@ -89,7 +96,6 @@ Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
-
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -201,6 +207,7 @@ __all__ = [
     "NCCLEPConfig",
     "NcclEpConfig",
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm90PushNvFp4MegaMoeConfig",
     "NvepConfig",
     "QuantType",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
@@ -211,6 +218,10 @@ __all__ = [
     "bootstrap_ep_rank_world",
     "bootstrap_ep_world_size",
     "bootstrap_moe_ep_runtime",
+    "load_sm90_push_nvfp4_modelopt_folded_fp8_weights",
+    "load_sm90_push_nvfp4_modelopt_weights",
+    "make_sm90_push_nvfp4_folded_fp8_weights",
+    "preprocess_sm90_push_nvfp4_mega_weights",
     "create_fleet",
     "dummy_moe_weights",
     "ensure_bootstrap_dist_validated",

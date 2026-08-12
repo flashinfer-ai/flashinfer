@@ -813,13 +813,17 @@ struct SM90_U32x4_STSM_T {
   }
 };
 
-__device__ void warpgroup_arrive() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void warpgroup_arrive() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
 
-__device__ void warpgroup_commit_batch() {
+__device__ __forceinline__ void warpgroup_commit_batch() {
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
-__device__ void warpgroup_fence_operand(float& reg) { asm volatile("" : "+f"(reg)::"memory"); }
+__device__ __forceinline__ void warpgroup_fence_operand(float& reg) {
+  asm volatile("" : "+f"(reg)::"memory");
+}
 
 __forceinline__ __device__ uint32_t get_lane_id() {
   uint32_t lane_id;

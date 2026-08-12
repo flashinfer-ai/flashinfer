@@ -675,6 +675,33 @@ class Sm90PushPipe:
             self._next_row,
         )
 
+    def proto_compact_bf16_padded(
+        self,
+        a_bf16: torch.Tensor,
+        meta: torch.Tensor,
+        real_to_padded: torch.Tensor,
+        padded_offsets: torch.Tensor,
+        tile_prefix: torch.Tensor,
+        padded_m: torch.Tensor,
+        token_tile_n: int,
+    ) -> None:
+        self.module.sm90_push_compact_bf16_padded(
+            a_bf16,
+            meta,
+            real_to_padded,
+            padded_offsets,
+            tile_prefix,
+            padded_m,
+            token_tile_n,
+            *self._layout_args(),
+            self._offsets,
+            self._seg_src_base,
+            self._seg_out_base,
+            self._m_dev,
+            self._next_row,
+            self._round,
+        )
+
     def proto_silu_mul_quant(
         self,
         h: torch.Tensor,
@@ -721,6 +748,22 @@ class Sm90PushPipe:
         fn(
             y,
             meta,
+            *self._layout_args(),
+            self._m_dev,
+            self._rows_per_src,
+            self._cdone_local,
+            self._round,
+        )
+
+    def proto_combine_mapped(
+        self, y: torch.Tensor, meta: torch.Tensor, row_map: torch.Tensor
+    ) -> None:
+        if self.config.combine_dtype != Sm90PushCombine.BF16:
+            raise RuntimeError("mapped combine supports only BF16 wire output")
+        self.module.sm90_push_combine_mapped(
+            y,
+            meta,
+            row_map,
             *self._layout_args(),
             self._m_dev,
             self._rows_per_src,

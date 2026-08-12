@@ -1,9 +1,11 @@
-"""SM90 push FP8 MegaMoE kernels and their stable Python boundary."""
+"""SM90 push MegaMoE kernels and their stable Python boundary."""
 
 from .shim import (
     Sm90PushCombine,
     Sm90PushConfig,
     Sm90PushMoERunner,
+    Sm90PushNvFp4MoERunner,
+    Sm90PushNvFp4Weights,
     Sm90PushPayload,
     Sm90PushPipe,
     Sm90PushWeights,
@@ -14,6 +16,17 @@ from .shim import (
     sm90_push_a2a_uri,
     sm90_push_fp8_moe_gemm_uri,
     transform_weights_for_sm90_push,
+    create_sm90_push_nvfp4_w4a8_gemm,
+    gen_sm90_push_nvfp4_w4a8_gemm_module,
+    get_sm90_push_nvfp4_w4a8_gemm_uri,
+    create_sm90_push_nvfp4_rs_gemm_runner,
+    gen_sm90_push_nvfp4_rs_gemm_module,
+    get_sm90_push_nvfp4_rs_gemm_uri,
+    fold_nvfp4_checkpoint_to_fp8_blockscale,
+    load_sm90_push_nvfp4_modelopt_folded_fp8_weights,
+    load_sm90_push_nvfp4_modelopt_weights,
+    make_sm90_push_folded_fp8_weights_from_checkpoints,
+    make_sm90_push_nvfp4_weights_from_checkpoints,
 )
 
 __all__ = [
@@ -23,6 +36,9 @@ __all__ = [
     "Sm90PushWeights",
     "Sm90PushPipe",
     "Sm90PushMoERunner",
+    "Sm90PushNvFp4MoERunner",
+    "Sm90PushNvFp4Weights",
+    "fold_nvfp4_checkpoint_to_fp8_blockscale",
     "make_sm90_push_weights",
     "transform_weights_for_sm90_push",
     "gen_sm90_push_a2a_module",
@@ -30,4 +46,14 @@ __all__ = [
     "create_sm90_push_fp8_moe_gemm_runner",
     "gen_sm90_push_fp8_moe_gemm_module",
     "sm90_push_fp8_moe_gemm_uri",
+    "create_sm90_push_nvfp4_w4a8_gemm",
+    "gen_sm90_push_nvfp4_w4a8_gemm_module",
+    "get_sm90_push_nvfp4_w4a8_gemm_uri",
+    "create_sm90_push_nvfp4_rs_gemm_runner",
+    "gen_sm90_push_nvfp4_rs_gemm_module",
+    "get_sm90_push_nvfp4_rs_gemm_uri",
+    "load_sm90_push_nvfp4_modelopt_weights",
+    "load_sm90_push_nvfp4_modelopt_folded_fp8_weights",
+    "make_sm90_push_folded_fp8_weights_from_checkpoints",
+    "make_sm90_push_nvfp4_weights_from_checkpoints",
 ]
