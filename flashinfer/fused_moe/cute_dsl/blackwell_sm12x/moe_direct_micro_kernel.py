@@ -5072,6 +5072,11 @@ _CUTE_DSL_MODULE = "b12x_moe_direct_micro"
 # recomputed after a reload.
 _PROBE_SUFFIX = ".launch_probe.json"
 
+# Options for the reference compile the block-dim probe measures. Deliberately
+# without --enable-tvm-ffi, which makes a compile opaque to introspection; see
+# the probe() docstring in compile_direct_micro_kernel.
+_PROBE_OPTIONS = "--opt-level 2"
+
 
 def _kernel_source_files() -> Tuple[str, ...]:
     """Source files whose content invalidates the on-disk kernel cache.
@@ -5175,7 +5180,7 @@ def compile_direct_micro_kernel(
     # baked into an exported .o is meaningless to the process that reloads it.
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    def compile_fn():
+    def compile_with(compile_options: str):
         return cute.compile(
             kernel,
             dummy(cutlass.BFloat16),  # x_ptr
@@ -5196,22 +5201,46 @@ def compile_direct_micro_kernel(
             Int32(compile_m),  # m_val
             Int32(1),  # grid_x
             stream_fake,  # stream
-            options=resolved_options,
+            options=compile_options,
         )
 
-    block_dim = int(kernel.launch_block_dim)
-    if disk_kernel_name is None or cute_dsl_cache_disabled():
-        compiled = compile_fn()
-        return compiled, compiled_direct_micro_accepts_block_dim(compiled, block_dim)
+    def compile_fn():
+        return compile_with(resolved_options)
 
-    # The probe reads compile-time internals, so it can only run on a fresh
-    # compile. Capture it from inside the closure: on a cache hit the closure
-    # never runs and the recorded value is read back instead.
+    block_dim = int(kernel.launch_block_dim)
+
+    def probe():
+        """Measure the launchable block dim via a non-TVM-FFI reference compile.
+
+        A ``--enable-tvm-ffi`` compile is opaque: measured on an H100, its
+        ``prefix`` is None, ``artifacts`` carries no PTX/CUBIN/SASS/MLIR, its
+        engine exposes only ``lookup``, ``.library`` raises ``no
+        cudaLibrary_t``, and ``_load_cuda_library()`` needs a ``raw_lookup``
+        the TVM-FFI engine does not implement -- so nothing can read
+        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK off it. The same kernel
+        compiled *without* the flag does expose ``.library``.
+
+        Only the host entry ABI differs between the two, so the device code --
+        and therefore its register allocation and max threads per block -- is
+        the same. This costs one extra compile, paid once per artifact on a
+        cold miss and never again: the answer is persisted next to the ``.o``
+        and every later process reads it back.
+        """
+        return compiled_direct_micro_accepts_block_dim(
+            compile_with(_PROBE_OPTIONS), block_dim
+        )
+
+    if disk_kernel_name is None or cute_dsl_cache_disabled():
+        return compile_fn(), probe()
+
+    # The probe can only run against a fresh compile, so capture it from inside
+    # the closure: on a cache hit the closure never runs and the recorded value
+    # is read back instead.
     probed: dict[str, bool] = {}
 
     def compile_and_probe():
         compiled = compile_fn()
-        probed["accepts"] = compiled_direct_micro_accepts_block_dim(compiled, block_dim)
+        probed["accepts"] = probe()
         return compiled
 
     compiled = build_and_load_cute_dsl_kernel(
@@ -5244,23 +5273,24 @@ def _compiled_cuda_library(compiled):
     only have the ``.to(None).jit_module.cuda_library`` chain, kept so a
     caller passing explicit ``options`` is not broken.
     """
-    # A --enable-tvm-ffi compile never populates ``jit_module``: launches go
-    # through the TVM-FFI entry rather than ``CudaDialectJitModule``, so both
-    # the ``.library`` property and the legacy chain below come up empty even
-    # though ``has_gpu_module`` is True and ``kernel_info`` is populated
-    # (measured on an H100). ``_load_cuda_library()`` is how the DSL itself
-    # materializes the library in that state -- it reads the engine's
-    # ``cuda_init`` / ``cuda_load_to_device`` symbols directly and does not
-    # touch ``jit_module``.
+    # Callers must pass a compile made *without* --enable-tvm-ffi: a TVM-FFI
+    # compile exposes no route to its device code at all (see the probe()
+    # docstring in compile_direct_micro_kernel), so every branch here would
+    # fail for one. ``_load_cuda_library()`` is tried first because it is what
+    # the DSL itself uses, then the public property, then the pre-property
+    # chain.
     if getattr(compiled, "has_gpu_module", False):
         loader = getattr(compiled, "_load_cuda_library", None)
         if loader is not None:
-            libraries = loader()
+            try:
+                libraries = loader()
+            except AttributeError:
+                libraries = None  # engine without raw_lookup (TVM-FFI)
             if libraries:
                 return libraries[0]
 
-    # Non-TVM-FFI compiles: the public property, which lazily materializes the
-    # library and raises (rather than returning None) for a host-only compile.
+    # The public property lazily materializes the library and raises (rather
+    # than returning None) when the compile produced no gpu.module.
     try:
         library = compiled.library
     except AttributeError:
