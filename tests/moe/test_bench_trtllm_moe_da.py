@@ -81,10 +81,23 @@ def _assert_result_file(path: Path) -> None:
     policies = {row["policy"] for row in rows}
     assert policies <= {"da_switch", "da_single_body"}
     assert len(policies) == 1
-    if policies == {"da_switch"}:
+    capture_policies = {row["capture_policy"] for row in rows}
+    assert len(capture_policies) == 1
+    capture_policy = capture_policies.pop()
+    if capture_policy == "da_switch":
+        assert policies == {"da_switch"}
         assert all(row["conditional_nodes"] == 1 for row in rows)
-    else:
+        assert all(row["selected_body"] is not None for row in rows)
+    elif capture_policy == "da_single_body":
+        assert policies == {"da_single_body"}
+        assert all(row["conditional_nodes"] in (None, 0) for row in rows)
         assert all(int(row["selected_body"]) == 0 for row in rows)
+    else:
+        assert capture_policy == "noda_capture_fallback"
+        assert policies == {"da_switch"}
+        assert all(row["capture_fallback_reason"] for row in rows)
+        assert all(row["conditional_nodes"] in (None, 0) for row in rows)
+        assert all(row["selected_body"] is None for row in rows)
 
 
 def test_cli_json_cache_restores_in_a_fresh_process(tmp_path: Path) -> None:
