@@ -54,7 +54,9 @@ V-minus-prediction delta, sigmoid beta, and the post-beta update carrier. All
 three oracles must pass the full output and final-state tolerance for all six
 cases before timing is reportable. Their agreement is also recorded as
 `diagnostic_consensus`; a numerical disagreement fails the case and suppresses
-timing.
+timing. Its FP32 contractions run with TF32 disabled and PyTorch's `highest`
+float32 matmul precision, and the prior process policy is restored even if the
+oracle raises.
 
 The smaller repository H12 smoke tests use a clean-room chunk-16 recurrence.
 It applies the same four BF16 residual carrier boundaries, rounds the FP32
@@ -116,7 +118,7 @@ python -m pytest -q \
 ```
 
 This is the H6/H12 changed-beta CUDA Graph regression at source lines
-1092–1166. It compares a captured replay bitwise against an independent eager
+1090–1164. It compares a captured replay bitwise against an independent eager
 launch with separate tensors and a separate workspace, for both output and full
 final state, and proves that changing beta changes the replayed result. The
 receipt records the exact source line range, command, node, parameterization,

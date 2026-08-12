@@ -52,7 +52,7 @@ SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 REQUIRED_ARCHITECTURES = ("sm100a", "sm103a")
 
 GRAPH_TEST_SOURCE = "tests/kda/test_recurrent_kda_prefill.py"
-GRAPH_TEST_SOURCE_LINE_RANGE = (1092, 1166)
+GRAPH_TEST_SOURCE_LINE_RANGE = (1090, 1164)
 GRAPH_TEST_NODE_ID = (
     "tests/kda/test_recurrent_kda_prefill.py::"
     "test_frozen_prefill_non_aligned_heads_graph_refreshes_beta"

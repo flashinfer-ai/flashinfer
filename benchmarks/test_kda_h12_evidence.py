@@ -639,8 +639,8 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
         "requires_force_rebuild": True,
     }
     assert payload["changed_beta_cuda_graph_test"]["source_line_range"] == [
-        1092,
-        1166,
+        1090,
+        1164,
     ]
     assert payload["changed_beta_cuda_graph_test"]["parameterization"] == {
         "num_heads": [6, 12]
@@ -651,6 +651,21 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
         "reducer": "benchmarks/reduce_kda_h12_phase_a.py",
         "dual_arch_flag": "promotion_complete_dual_arch",
     }
+
+
+def test_graph_source_line_range_matches_decorated_test_node():
+    source_path = BENCHMARKS_DIR.parent / evidence.GRAPH_TEST_SOURCE
+    tree = ast.parse(source_path.read_text())
+    node = next(
+        candidate
+        for candidate in tree.body
+        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and candidate.name == evidence.GRAPH_TEST_NODE_ID.rsplit("::", 1)[-1]
+    )
+    first_line = min(
+        [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+    )
+    assert evidence.GRAPH_TEST_SOURCE_LINE_RANGE == (first_line, node.end_lineno)
 
 
 def _timing_receipt(name, *, num_sequences):
@@ -1725,6 +1740,35 @@ def test_independent_recurrence_allocates_a_bf16_output_buffer():
         and node.func.id == "_h12_bf16_residual_carriers"
     ]
     assert len(carrier_calls) == 1
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_independent_recurrence_forces_and_restores_float32_matmul_policy(raises):
+    runner = _load_runner_module()
+    policy = {"precision": "medium"}
+    fake_torch = SimpleNamespace(
+        backends=SimpleNamespace(
+            cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=True))
+        ),
+        get_float32_matmul_precision=lambda: policy["precision"],
+        set_float32_matmul_precision=lambda value: policy.update(precision=value),
+    )
+
+    @runner._strict_float32_matmul
+    def probe(torch):
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.get_float32_matmul_precision() == "highest"
+        if raises:
+            raise RuntimeError("expected probe failure")
+        return "ok"
+
+    if raises:
+        with pytest.raises(RuntimeError, match="expected probe failure"):
+            probe(fake_torch)
+    else:
+        assert probe(fake_torch) == "ok"
+    assert fake_torch.backends.cuda.matmul.allow_tf32 is True
+    assert fake_torch.get_float32_matmul_precision() == "medium"
 
 
 def test_runner_h12_residual_carriers_round_every_selected_boundary_on_cpu():

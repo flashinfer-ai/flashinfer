@@ -723,6 +723,24 @@ def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
     return prediction_carrier, delta_carrier, beta_carrier, update_carrier
 
 
+def _strict_float32_matmul(function):
+    """Run an oracle with deterministic IEEE FP32 contraction policy."""
+
+    def wrapped(torch, *args, **kwargs):
+        previous_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        previous_precision = torch.get_float32_matmul_precision()
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.set_float32_matmul_precision("highest")
+            return function(torch, *args, **kwargs)
+        finally:
+            torch.set_float32_matmul_precision(previous_precision)
+            torch.backends.cuda.matmul.allow_tf32 = previous_allow_tf32
+
+    return wrapped
+
+
+@_strict_float32_matmul
 def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     """Direct recurrence with local chunk-16 state and H12 BF16 carriers.
 
@@ -1386,7 +1404,7 @@ def main() -> None:
                 assert args.json is not None
                 write_json_atomic(args.json, report)
                 raise RuntimeError(
-                    "pinned FlashKDA correctness failed; timing was not run and "
+                    "three-oracle correctness failed; timing was not run and "
                     f"receipt was written to {args.json}"
                 )
             print(

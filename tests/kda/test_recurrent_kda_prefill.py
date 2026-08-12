@@ -205,8 +205,8 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
     the state/K prediction, V-minus-prediction delta, sigmoid beta, and
     post-beta update carrier each round through BF16.  A BF16 state snapshot
     becomes the next chunk's carrier, while each output projects the unrounded
-    FP32 state for its token.  The pinned FlashKDA implementation is the sole
-    hard Phase-A correctness oracle.
+    FP32 state for its token.  This helper is diagnostic only; the three-oracle
+    Phase-A evidence harness is authoritative.
     """
 
     q = inputs["q"]
