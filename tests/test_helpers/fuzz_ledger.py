@@ -136,3 +136,20 @@ class FuzzLedger:
             f"appears fixed; remove its ledger entry ({finding.reason})",
             pytrace=False,
         )
+
+    def report_expected_failures(
+        self,
+        failures: Sequence[tuple[Finding, str]],
+        *,
+        context: str,
+    ) -> None:
+        """Report tracked failures after all healthy backends have run.
+
+        Delaying the XFAIL lets a multi-backend fuzz case continue validating
+        unaffected runners while ensuring tolerated failures and quarantined
+        backends cannot make the overall test appear as PASS or SKIP.
+        """
+        if not failures:
+            return
+        details = "; ".join(f"{tag}: {finding.reason}" for finding, tag in failures)
+        pytest.xfail(f"[{self.op}] {context}: {details}")

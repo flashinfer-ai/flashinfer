@@ -63,7 +63,7 @@ def cache_permute_indices():
 # tests/moe/test_unified_moe_fuzz.py.
 @pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 384])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -181,7 +181,7 @@ def test_sigmoid_routing(
 # coverage this grid exists for.
 @pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2688, 2048, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [

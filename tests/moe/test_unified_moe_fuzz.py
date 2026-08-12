@@ -102,9 +102,10 @@ CI log alone tells you whether the output is all-zero / all-NaN / Inf without ha
 
 ------------------------------------------------------------------------------------------------
 EXTENDING (cheap, by design):
-  * New backend -> nothing to do: it is auto-discovered from ``_BACKEND_RUNNERS`` the moment its
-    runner registers and ``supported(sm)`` is true. If it ships with a tracked bug, add one
-    ledger ``Finding`` (a non-quarantine case still RUNS; an xpass then hard-fails until the entry is removed).
+  * New backend -> add its config class to the matching dtype handler's ``candidate_configs``;
+    the live ``_BACKEND_RUNNERS`` registry then supplies the runner and architecture gate. If it
+    ships with a tracked bug, add one ledger ``Finding`` (a non-quarantine case still RUNS; an
+    xpass then hard-fails until the entry is removed).
   * New dtype -> add ONE ``DTypeHandler`` to ``_DTYPE`` (snap / make_act_pack / reference / poison
     / tolerances). Everything else (config gen, all 7 checks, the cache test) is dtype-generic.
 
@@ -184,6 +185,8 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.api import (
     ActivationConfig,
     BackendOptions,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
@@ -198,6 +201,7 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
@@ -228,11 +232,10 @@ _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 # default run on a B200-class SM100): #3547 is fixed (its EP-offset configs pass), and the abort
 # is root-caused mechanically -- an async device-side assert from one config poisons the CUDA
 # context and the pending c10 error escapes a destructor at interpreter shutdown
-# (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this file's
-# pytest process after the failure is reported. CI runners execute each test FILE as its own
-# pytest invocation, so the failure is contained to this FILE (other test files still run and
-# the job reports this file in its failure list) -- a loud red on a real bug is
-# the point of running the fuzzer, not a hazard to waive. The historical gh #3957 finding
+# (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this fuzzer's
+# pytest process after the failure is reported. The shard_group marker keeps the accumulated
+# sequence together in one pytest invocation, preserving the regression while the sharding runner
+# can still isolate failures in other groups. The historical gh #3957 finding
 # (a silent OOB write with a moving victim) was fixed by gh #4186; keeping this accumulated
 # sequence enabled is its regression coverage.
 # Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
@@ -246,6 +249,8 @@ pytestmark = pytest.mark.skipif(
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an
 # upstream note), because a deterministic->non-deterministic regression is exactly a bug to catch.
 _DETERMINISTIC = {
+    "cutlass_bf16": True,
+    "cutlass_w4a16": True,
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
     "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
@@ -390,14 +395,15 @@ def _bf16_snap(t: torch.Tensor) -> torch.Tensor:
 
 
 def _bf16_act_pack(x, selected_experts, final_scales):
-    # Raw bf16 activations; the bf16 runner reads hidden_states_q directly and
-    # ignores hidden_states_scale.
+    # Raw bf16 activations. Use BF16-grid routing weights represented as FP32
+    # so TRTLLM's packed-id path and CUTLASS's separate-weight path share one
+    # exact semantic input.
     return MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=None,
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        topk_weights=final_scales.to(torch.bfloat16).float(),
     )
 
 
@@ -465,24 +471,20 @@ def _mxfp8_quant_matrix(x):
 
 
 def _mxfp4_quant_dequant_matrix(x):
-    """Quantize/dequantize one logical MXFP4 matrix with linear UE8M0 scales."""
-    one = torch.tensor([1.0], device=x.device)
-    q, sf = fp4_quantize(
-        x.to(torch.bfloat16),
-        global_scale=one,
-        sf_vec_size=32,
-        sf_use_ue8m0=True,
-        is_sf_swizzled_layout=False,
+    """Torch MXFP4 round-trip that is valid on both Hopper and Blackwell."""
+    q, sf = _quantize_mxfp4_linear(x.to(torch.bfloat16).contiguous())
+    low = q & 0xF
+    high = q >> 4
+    codes = torch.stack((low, high), dim=-1).reshape(x.shape).to(torch.long)
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=x.device,
+        dtype=torch.float32,
     )
-    deq = e2m1_and_ufp8sf_scale_to_float(
-        q.cpu(),
-        sf.cpu().view(torch.uint8).reshape(-1),
-        (1.0 / one).cpu(),
-        32,
-        0,
-        False,
-    )
-    return deq.reshape(x.shape).to(x.device)
+    values = magnitudes[codes & 0x7]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scales = torch.exp2(sf.to(torch.int16).to(torch.float32) - 127)
+    return values * scales.repeat_interleave(32, dim=-1)
 
 
 def _mxfp4_snap(t: torch.Tensor, *, bf16_activation: bool) -> torch.Tensor:
@@ -503,7 +505,10 @@ def _mxfp4_act_pack(x, selected_experts, final_scales, *, variant: QuantVariant)
         hidden_states_scale=sf,
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        # TRTLLM's packed-id ABI rounds routing weights through BF16, whereas
+        # CUTLASS consumes FP32. Supplying BF16-grid values in FP32 gives both
+        # backends one exact routing-weight contract.
+        topk_weights=final_scales.to(torch.bfloat16).float(),
     )
 
 
@@ -776,7 +781,7 @@ _DTYPE = {
     ),
     QuantVariant.BF16: DTypeHandler(
         variant=QuantVariant.BF16,
-        candidate_configs=(TrtllmBf16Config,),
+        candidate_configs=(TrtllmBf16Config, CutlassBf16Config),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
         make_act_pack_logits=_bf16_act_pack_logits,
@@ -850,7 +855,7 @@ _DTYPE = {
     ),
     QuantVariant.W4A16: DTypeHandler(
         variant=QuantVariant.W4A16,
-        candidate_configs=(TrtllmFp4Config,),
+        candidate_configs=(TrtllmFp4Config, CutlassW4A16Config),
         snap=lambda t: _mxfp4_snap(t, bf16_activation=True),
         make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
             x, ids, weights, variant=QuantVariant.W4A16
@@ -1399,7 +1404,7 @@ _CURATED = [
         4,
         "mxfp4",
         "uniform",
-        900_032,
+        900_042,
         routing_input_mode="unpacked",
     ),
     Cfg(
@@ -1410,7 +1415,7 @@ _CURATED = [
         4,
         "w4a16",
         "imbalanced",
-        900_036,
+        900_043,
         routing_input_mode="unpacked",
         unpacked_weights_dtype="fp32",
     ),
@@ -1495,10 +1500,18 @@ _CURATED = [
         )
     ],
 ]
+_CURATED_BY_SEED = {}
+for _cfg in _CURATED:
+    if _cfg.seed in _CURATED_BY_SEED:
+        raise ValueError(
+            "duplicate curated unified-MoE fuzz seed "
+            f"{_cfg.seed}: {_CURATED_BY_SEED[_cfg.seed].label} and {_cfg.label}"
+        )
+    _CURATED_BY_SEED[_cfg.seed] = _cfg
+
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
-    _curated_by_seed = {c.seed: c for c in _CURATED}
     _CONFIGS = [
-        _curated_by_seed.get(s) or _gen(s)
+        _CURATED_BY_SEED.get(s) or _gen(s)
         for s in (int(t) for t in _ONLY_SEEDS.split(",") if t.strip())
     ]
 else:
@@ -1740,6 +1753,7 @@ def _fail(cfg: Cfg, tag: str, why: str, out=None, ref=None):
     pytest.fail("\n".join(parts))
 
 
+@pytest.mark.shard_group("unified-moe-accumulated")
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
@@ -2005,11 +2019,15 @@ def test_unified_moe_fuzz(cfg):
             assert_correct(o, f"{tag} [tactic={tactic}]")
 
     n_ran = 0
+    expected_failures = []
+    quarantined_backends = []
     for runner in layer.runners:
         # Backend-scoped crash quarantine: skip ONLY this runner (never launch
         # it), keep testing the other backends of the same config. Global
         # quarantines already xfailed the whole test at the top.
-        if LEDGER.skip_backend(cfg, runner.backend_key):
+        quarantine = LEDGER.skip_backend(cfg, runner.backend_key)
+        if quarantine:
+            quarantined_backends.append((quarantine, runner.backend_key))
             continue
         try:
             out = run(runner)
@@ -2025,12 +2043,17 @@ def test_unified_moe_fuzz(cfg):
             try:
                 check_backend(runner, out, tag)
             except (AssertionError, pytest.fail.Exception):
+                expected_failures.append((known, tag))
                 continue
             LEDGER.flag_xpass(known, tag)
         else:
             check_backend(runner, out, tag)
 
     if n_ran == 0:
+        LEDGER.report_expected_failures(
+            quarantined_backends,
+            context=f"all candidate backends quarantined for {cfg.label}",
+        )
         pytest.skip(f"no runner ran {cfg.label} on SM{sm}")
 
     # (6) autotune-ON: drive the REAL production path -- MoELayer._select_winner profiles every
@@ -2060,6 +2083,10 @@ def test_unified_moe_fuzz(cfg):
     torch.cuda.synchronize()
     assert torch.isfinite(probe).all(), (
         f"{cfg.label}: CUDA context corrupted after MoE run"
+    )
+    LEDGER.report_expected_failures(
+        [*expected_failures, *quarantined_backends],
+        context=f"tracked backend failures for {cfg.label}",
     )
 
 
