@@ -45,15 +45,18 @@ H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.
 
 The frozen H12 N16 provenance is Cake revision
-``cef14598bf3866211db1a6650161b70fa5ebb995`` at tree
-``ae299fa2eae0ada244580ccc9c82c30cdf512140``. The schedule is module
-``flashkda_bf16_fused_m128_b4a3308106`` with raw source SHA-256
-``100fad0f0184ba73de9889dcc10124b6c7ffb397b2257d162060172e22e03f02``.
+``5abb116c396b8eb78e6ede721b4ba552e5b1ec4c`` at tree
+``12567143d101ee987aaca7f859ce19ef569bfab3``. The schedule is module
+``flashkda_bf16_fused_m128_d28b3f23fc`` with raw source SHA-256
+``0b546eae3224d8518ab7b08894a8cf213aee8700c25444272b939ed8b9ef3461``.
 Its residual recurrence rounds four intermediates through BF16: the state/K
 prediction, the V-minus-prediction delta, sigmoid beta, and the post-beta
 update carrier. The final-state contraction starts from a zero accumulator;
 the old BF16 state is multiplied by the total decay and explicitly added to
 that product in FP32 before the 16-token chunk boundary rounds back to BF16.
+The N16 prepare carrier also matches the source-visible BF16 arithmetic graph:
+normalized Q/K, positive and inverse prefix decay, and every chained Qd/Kd/Ki/Kr
+multiplication round through BF16 at their respective boundaries.
 The N32 schedule remains provenance-pinned to Cake revision
 ``691136208f24a5160fcc5940ea4064e5613db2e4`` at tree
 ``48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3`` as module
