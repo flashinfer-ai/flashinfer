@@ -36,6 +36,8 @@ TraceRegistryEntry = tuple[Callable[..., Any], Any, str]
 _TRACE_REGISTRATION_MODULES = (
     "flashinfer.activation",
     "flashinfer.attention._core",
+    "flashinfer.attention.prims_ts.decode",
+    "flashinfer.attention.prims_ts.mla_decode",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
@@ -61,6 +63,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.gemm.gemm_svdquant",
     "flashinfer.gemm.kernels.grouped_gemm_masked_blackwell",
     "flashinfer.gemm.routergemm",
+    "flashinfer.kda",
     "flashinfer.kda_decode",
     "flashinfer.mamba.selective_state_update",
     "flashinfer.mhc",
@@ -79,6 +82,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.sampling",
     "flashinfer.sparse",
     "flashinfer.topk",
+    "flashinfer.topk_varlen.topk_varlen",
     "flashinfer.xqa",
 )
 

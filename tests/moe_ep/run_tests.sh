@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Run moe_ep tests (unit + multirank + smoke + mega).
+# Run moe_ep tests (unit + multirank + sm90_push + smoke + mega).
 #
 # Usage (from repo root):
 #   bash tests/moe_ep/run_tests.sh
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper push FP8
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
+#   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_pull_fp8 mega multirank
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
+#   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90_pull_fp8 vs drop reference
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
 #
@@ -36,6 +39,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 PY="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
+NPROC_SM90_PUSH="${NPROC_SM90_PUSH:-2}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
 # NOTE: no --confcutdir. The moe_ep pytest hooks (--backend option, nvep/gpu_*/
 # arch_blackwell markers, env/GPU/arch auto-skips) live in the root
@@ -88,9 +92,12 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -99,10 +106,18 @@ run_unit() {
     -k "not multirank_roundtrip"
 }
 
-run_multirank() {
-  require_nccl_ep
+run_sm90_push() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_fp8_kernel.py \
+    tests/moe_ep/test_sm90_push_fp8_backend.py -v
+}
 
+run_multirank() {
   local rc=0
+
+  run_sm90_push || rc=1
+  require_nccl_ep || return "${rc}"
 
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -198,6 +213,20 @@ run_oracle() {
   return "${rc}"
 }
 
+# Single-GPU Hopper torch-oracle correctness: sm90_pull_fp8 mega kernel vs the
+# kernel drop's own pure-torch reference (compute_megamoe_reference_fp8).
+# Runs in its OWN pytest process: the SM90 and SM100 kernel trees share
+# top-level module names and are mutually exclusive per process, so this file
+# is excluded from run_unit and must not share an invocation with
+# SM100-importing tests.  MEGA_NO_DIST=1 single-rank (the sm90 shim's comm
+# bootstrap supports it, like the sm100 cutedsl oracle runs above).
+run_oracle_sm90() {
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py -v \
+    -m arch_hopper
+}
+
 run_mega() {
   local rc=0
 
@@ -215,6 +244,18 @@ run_mega() {
     -m arch_blackwell || rc=1
 
   return "${rc}"
+}
+
+# 4-GPU Hopper sm90_pull_fp8 mega multirank (layer-vs-direct-shim parity on
+# real cross-rank EP traffic).  Own torchrun pytest process: the SM90 and
+# SM100 kernel trees share top-level module names and are mutually exclusive
+# per process, so this must not share an invocation with the Blackwell mega
+# tests above (and is excluded from run_unit).
+run_mega_sm90() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py -v \
+    -m "gpu_4 and arch_hopper"
 }
 
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
@@ -307,16 +348,19 @@ run_all() {
 case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
+  oracle_sm90) run_section "sm90_pull_fp8 torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
+  sm90_push) run_section "SM90 push FP8 (2 GPU)" run_sm90_push; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
+  mega_sm90) run_section "sm90_pull_fp8 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

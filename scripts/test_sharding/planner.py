@@ -241,20 +241,17 @@ def build_plan(
     nodes = tuple(sorted(collected_nodes, key=lambda node: node.order))
     if len({node.nodeid for node in nodes}) != len(nodes):
         raise ValueError("collection contains duplicate node IDs")
-    coverage = estimate_book.coverage(node.nodeid for node in nodes)
     duration_ms: dict[str, int] = {}
     fallback_counts: Counter[str] = Counter()
     fallback_sources: dict[str, str] = {}
     for node in nodes:
-        lookup = estimate_book.lookup(
+        lookup = estimate_book.lookup_runtime(
             node.nodeid,
-            options.profile,
-            options.unknown_case_seconds,
-            coverage=coverage,
+            options.default_case_seconds,
         )
         duration_ms[node.nodeid] = max(1, round(lookup.seconds * 1000))
         fallback_counts[lookup.source] += 1
-        if lookup.source != "exact-current-profile":
+        if lookup.source != "provided":
             fallback_sources[node.nodeid] = lookup.source
 
     source_nodes: dict[str, list[CollectedNode]] = defaultdict(list)
@@ -264,7 +261,9 @@ def build_plan(
     batches: list[Batch] = []
     solo_sources = {node.source_file for node in nodes if node.solo}
     for source_file in sorted(source_nodes, key=lambda value: value.encode("utf-8")):
-        overhead_ms = estimate_book.overhead_ms(source_file, options.profile)
+        overhead_ms = estimate_book.overhead_ms_runtime(
+            source_file, options.default_source_overhead_seconds
+        )
         baseline_capacity = max(1, options.checkpoint_seconds * 1000 - overhead_ms)
         unit_capacity = max(1, options.target_unit_seconds * 1000 - overhead_ms)
         overhead_aware_capacity = min(

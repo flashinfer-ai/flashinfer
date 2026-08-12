@@ -654,19 +654,19 @@ _STANDARD_INPUTS = {
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
         optional=True,
     ),
     "gemm1_beta": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
         optional=True,
     ),
     "gemm1_clamp_limit": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
+        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
         optional=True,
     ),
     "gemm2_weights": Tensor(
@@ -990,19 +990,19 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         "gemm1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
             optional=True,
         ),
         "gemm1_beta": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
             optional=True,
         ),
         "gemm1_clamp_limit": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
             optional=True,
         ),
         "gemm2_weights": Tensor(
@@ -2205,13 +2205,26 @@ def _moe_bf16_run_experts(
     gemm1_beta=None,
     gemm1_clamp_limit=None,
     activation_type=ActivationType.Swiglu.value,
+    situ_beta=None,
+    situ_linear_beta=None,
 ):
-    """Un-quantized (bf16) MoE expert computation (SwiGLU/OAI or ReLU^2)."""
+    """Un-quantized (bf16) MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+    if situ_beta is not None or situ_linear_beta is not None:
+        from ...fused_moe.cute_dsl.moe_utils import (
+            validate_cute_dsl_moe_situ_config,
+        )
+
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
+            f"expected {ActivationType.Swiglu!r}, "
+            f"{ActivationType.GegluTanh!r}, or {ActivationType.Relu2!r}"
         )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
@@ -2236,14 +2249,25 @@ def _moe_bf16_run_experts(
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
-            limit = _moe_expert_param(
-                gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
-            )
-            alpha = _moe_expert_param(gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device)
-            beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
-            up = torch.clamp(X1, min=-limit, max=limit)
-            gate = torch.clamp(X2, max=limit)
-            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+            if situ_beta is not None:
+                gate = situ_beta * torch.tanh(X2 / situ_beta) * torch.sigmoid(X2)
+                up = X1
+                if situ_linear_beta is not None:
+                    up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                act = gate * up
+            elif activation_type == ActivationType.GegluTanh:
+                act = torch.nn.functional.gelu(X2, approximate="tanh") * X1
+            else:
+                limit = _moe_expert_param(
+                    gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+                )
+                alpha = _moe_expert_param(
+                    gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device
+                )
+                beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+                up = torch.clamp(X1, min=-limit, max=limit)
+                gate = torch.clamp(X2, max=limit)
+                act = gate * torch.sigmoid(alpha * gate) * (up + beta)
         expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -3112,19 +3136,19 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
         ),
         "gemm1_beta": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
         ),
         "gemm1_clamp_limit": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
+            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
@@ -3287,9 +3311,8 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_fused_moe_nvfp4",
     description=(
-        "CuteDSL NVFP4 fused MoE (SM100/SM103). Accepts NvFP4-packed input + "
-        "scales with precomputed top-k routing (token_selected_experts + "
-        "token_final_scales) and per-expert alpha scales."
+        "CuteDSL NVFP4 fused MoE (SM100/SM103). Runs explicit W4A4 or W4A16 "
+        "compute with precomputed top-k routing and per-expert alpha scales."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3298,6 +3321,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "num_local_experts": Const(abbrev="e"),
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "input_width": Var(
+            description="hidden_size // 2 for NVFP4 input or hidden_size for BF16."
+        ),
         "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
         "num_packed_intermediate": Var(
             description="intermediate_size // 2 (NvFP4 packed)."
@@ -3318,12 +3344,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     },
     inputs={
         "x": Tensor(
-            ["num_tokens", "num_packed_hidden"],
-            description="NvFP4-packed input (uint8, 2 fp4 per byte).",
+            ["num_tokens", "input_width"],
+            description="Packed NVFP4 input for W4A4 or BF16 input for W4A16.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
-            description="NvFP4 scale factors for x (float8_e4m3fn).",
+            optional=True,
+            description="NVFP4 activation scales for W4A4; omitted for W4A16.",
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -3351,7 +3378,10 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "fc2_input_scale": Tensor(
             ["one"],
             dtype="float32",
-            description="Global scale for FC2 input quantization.",
+            optional=True,
+            description=(
+                "Global scale for W4A4 FC2 input quantization; omitted for W4A16."
+            ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
@@ -3370,7 +3400,12 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             ["num_tokens"],
             dtype="float32",
             optional=True,
-            description="Optional per-token input row scale.",
+            description="Optional W4A4 per-token input row scale.",
+        ),
+        "quant_mode": Scalar(
+            "string",
+            optional=True,
+            description="Compute mode: 'nvfp4'/'w4a4' or 'w4a16'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -3382,7 +3417,9 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             optional=True,
             description=(
                 "GEMM1 activation type: ActivationType.Swiglu for gated "
-                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
+                "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
+                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
+                "non-gated ReLU^2. "
                 "Determines gemm1_out_size."
             ),
         ),
@@ -3400,6 +3437,16 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             "float32",
             optional=True,
             description="SwiGLU clamp limit.",
+        ),
+        "situ_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SiTU gate tanh-clamp beta; enables SiTU when set.",
+        ),
+        "situ_linear_beta": Scalar(
+            "float32",
+            optional=True,
+            description="Optional SiTU up-branch tanh-clamp beta.",
         ),
     },
     outputs={
@@ -3443,6 +3490,21 @@ _cute_dsl_wrapper_inputs["swiglu_beta"] = Scalar(
     description="Set at wrapper __init__, not passed to run().",
 )
 _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["quant_mode"] = Scalar(
+    "string",
+    optional=True,
+    description="Compute mode set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
@@ -3645,6 +3707,9 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    quant_mode="w4a4",
+    situ_beta=None,
+    situ_linear_beta=None,
     per_token_scale=None,
     **_unused,
 ):
@@ -3653,7 +3718,17 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
-    hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    quant_mode = quant_mode.lower()
+    if quant_mode in ("nvfp4", "w4a4"):
+        if x_sf is None:
+            raise ValueError("x_sf is required when quant_mode='w4a4'")
+        hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    elif quant_mode == "w4a16":
+        if x_sf is not None:
+            raise ValueError("x_sf must be None when quant_mode='w4a16'")
+        hs_deq = x.to(torch.float32)
+    else:
+        raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
     W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
     W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
     if per_token_scale is not None:
@@ -3672,6 +3747,8 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         gemm1_alpha=swiglu_alpha,
         gemm1_beta=swiglu_beta,
         gemm1_clamp_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 

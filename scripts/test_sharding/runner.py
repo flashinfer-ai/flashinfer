@@ -11,6 +11,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,9 @@ from .junit import (
     SyntheticBatchMetadata,
     create_synthetic_batch_xml,
     finalized_batch_outcomes,
+    validate_batch_xml,
 )
-from .models import CollectedNode, Plan, PlanningOptions, Unit
+from .models import RUNTIME_TIMING_PROFILE, CollectedNode, Plan, PlanningOptions, Unit
 from .planner import build_plan, capacity_metrics, source_affine_unit_bins
 from .processes import terminate_process_group
 from .state import (
@@ -54,6 +56,7 @@ from .summary import (
     batch_is_final,
     batch_xml_path,
     exit_code_for_summary,
+    exit_code_for_shard,
     publish_summary,
     publish_summary_under_lock,
 )
@@ -62,6 +65,24 @@ from .workers import BatchExecutionRequest, execute_batch, write_console
 
 _COLLECTION_HEARTBEAT_SECONDS = 30.0
 _LEASE_HEARTBEAT_SECONDS = 10.0
+_LEASE_CLOSE_SECONDS = 2.0
+_CONTROLLER_PROGRESS_SECONDS = 60.0
+
+# The SM90 pull-style and SM100 MegaMoE drops both import vendored modules such
+# as ``common`` as top-level packages, so they cannot be imported by one pytest
+# collection process. Keep the smaller SM90 family isolated for now. Long term,
+# namespace both vendored trees and use package-relative imports; once they can
+# coexist in ``sys.modules``, remove this collection partition.
+_COLLECTION_ISOLATION_GROUPS = (
+    (
+        "sm90-pull-style-cutedsl-megakernel",
+        ("test_moe_ep_sm90_pull_*_mega_multirank.py",),
+    ),
+)
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 @dataclass(frozen=True)
@@ -130,6 +151,7 @@ def _reject_runner_path_collisions(junit_dir: Path, *, include_attempts: bool) -
         junit_dir / "run-summary.json",
         claims_dir(junit_dir),
         units_dir(junit_dir),
+        junit_dir / "shards",
     ]
     if include_attempts:
         runner_paths.append(attempts_dir(junit_dir))
@@ -149,6 +171,7 @@ class ExecutionSettings:
     monitor_memory: bool = True
     memory_interval: float = 2.0
     pytest_command_prefix: tuple[str, ...] = ()
+    timing_profile: str = RUNTIME_TIMING_PROFILE
 
 
 @dataclass(frozen=True)
@@ -162,6 +185,8 @@ class ManifestPreparation:
     attempt_settings: AttemptSettings | None = None
     operation_started_at: float | None = None
     pytest_command_prefix: tuple[str, ...] = ()
+    duration_estimates: Path | None = None
+    overhead_estimates: Path | None = None
 
 
 def _report_shard_status(
@@ -186,19 +211,15 @@ def _report_shard_status(
     )
 
 
-def _estimate_paths(repo_root: Path) -> tuple[Path, Path]:
-    data = repo_root / "tests" / "data"
-    return (
-        data / "unit_test_duration_estimates.csv.gz",
-        data / "unit_test_overhead_estimates.csv",
-    )
-
-
-def _estimate_checksums(repo_root: Path) -> dict[str, str | None]:
-    duration, overhead = _estimate_paths(repo_root)
+def _estimate_checksums(
+    duration: Path | None, overhead: Path | None
+) -> dict[str, str | None]:
+    for label, path in (("duration", duration), ("overhead", overhead)):
+        if path is not None and not path.is_file():
+            raise RunnerStateError(f"{label} estimate file does not exist: {path}")
     return {
-        "duration": sha256_file(duration) if duration.exists() else None,
-        "overhead": sha256_file(overhead) if overhead.exists() else None,
+        "duration": sha256_file(duration) if duration is not None else None,
+        "overhead": sha256_file(overhead) if overhead is not None else None,
     }
 
 
@@ -237,61 +258,165 @@ def _wait_for_collection(
             )
 
 
+def _isolated_collection_groups(test_path: Path) -> list[tuple[str, list[Path]]]:
+    groups = []
+    for name, patterns in _COLLECTION_ISOLATION_GROUPS:
+        matches: set[Path] = set()
+        for pattern in patterns:
+            if test_path.is_file():
+                if test_path.match(pattern):
+                    matches.add(test_path)
+            else:
+                matches.update(
+                    path for path in test_path.rglob(pattern) if path.is_file()
+                )
+        if matches:
+            groups.append(
+                (name, sorted(matches, key=lambda path: str(path).encode("utf-8")))
+            )
+    return groups
+
+
+def _collect_partition(
+    repo_root: Path,
+    test_path: Path,
+    targets: list[Path],
+    ignored_paths: list[Path],
+    timeout_seconds: float | None,
+    grace_seconds: float,
+    directory: Path,
+    partition_index: int,
+    partition_name: str,
+    *,
+    allow_empty: bool,
+) -> list[dict[str, Any]]:
+    output = directory / f"collection-{partition_index:02d}.json"
+    log_path = directory / f"collection-{partition_index:02d}.log"
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else str(repo_root)
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-q",
+        "--continue-on-collection-errors",
+        "-p",
+        "scripts.test_sharding.pytest_plugin",
+        f"--flashinfer-collection-json={output}",
+        *(f"--ignore={path}" for path in ignored_paths),
+        *(str(path) for path in targets),
+    ]
+    with log_path.open("wb") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=repo_root,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        _wait_for_collection(
+            process,
+            test_path=test_path,
+            timeout_seconds=timeout_seconds,
+            grace_seconds=grace_seconds,
+        )
+    if allow_empty and process.returncode == 5:
+        return []
+    if process.returncode != 0 or not output.exists():
+        diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+        raise RunnerStateError(
+            f"pytest collection failed for {partition_name} "
+            f"with exit code {process.returncode}:\n{diagnostic}"
+        )
+    try:
+        value = json.loads(output.read_text(encoding="utf-8"))
+        nodes = value["nodes"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RunnerStateError(
+            f"invalid collection metadata for {partition_name}: {error}"
+        ) from error
+    if not nodes and not allow_empty:
+        raise RunnerStateError(f"pytest collected no tests for {partition_name}")
+    return nodes
+
+
 def _collect_nodes(
     repo_root: Path,
     test_path: Path,
     timeout_seconds: float | None,
     grace_seconds: float,
 ) -> list[dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix="flashinfer-test-collection-") as directory:
-        output = Path(directory) / "collection.json"
-        log_path = Path(directory) / "collection.log"
-        env = os.environ.copy()
-        pythonpath = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else str(repo_root)
-        )
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-q",
-            "--continue-on-collection-errors",
-            "-p",
-            "scripts.test_sharding.pytest_plugin",
-            f"--flashinfer-collection-json={output}",
-            str(test_path),
-        ]
-        with log_path.open("wb") as log:
-            process = subprocess.Popen(
-                command,
-                cwd=repo_root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            _wait_for_collection(
-                process,
-                test_path=test_path,
-                timeout_seconds=timeout_seconds,
-                grace_seconds=grace_seconds,
-            )
-        if process.returncode != 0 or not output.exists():
-            diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
-            raise RunnerStateError(
-                f"pytest collection failed with exit code {process.returncode}:\n{diagnostic}"
-            )
-        try:
-            value = json.loads(output.read_text(encoding="utf-8"))
-            nodes = value["nodes"]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise RunnerStateError(f"invalid collection metadata: {error}") from error
-        if not nodes:
-            raise RunnerStateError(f"pytest collected no tests below {test_path}")
-        return nodes
+    started_at = time.monotonic()
+    isolated_groups = _isolated_collection_groups(test_path)
+    isolated_paths = [path for _, paths in isolated_groups for path in paths]
+
+    def remaining_timeout() -> float | None:
+        if timeout_seconds is None:
+            return None
+        return max(0.0, timeout_seconds - (time.monotonic() - started_at))
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="flashinfer-test-collection-"
+        ) as temporary_directory:
+            directory = Path(temporary_directory)
+            partitions = []
+            if test_path not in isolated_paths:
+                partitions.append(
+                    _collect_partition(
+                        repo_root,
+                        test_path,
+                        [test_path],
+                        isolated_paths,
+                        remaining_timeout(),
+                        grace_seconds,
+                        directory,
+                        0,
+                        "primary test scope",
+                        allow_empty=bool(isolated_paths),
+                    )
+                )
+            for partition_index, (name, paths) in enumerate(isolated_groups, start=1):
+                partitions.append(
+                    _collect_partition(
+                        repo_root,
+                        test_path,
+                        paths,
+                        [],
+                        remaining_timeout(),
+                        grace_seconds,
+                        directory,
+                        partition_index,
+                        name,
+                        allow_empty=False,
+                    )
+                )
+    except CollectionTimeoutError as error:
+        error.elapsed_seconds = time.monotonic() - started_at
+        raise
+
+    nodes = []
+    seen_nodeids = set()
+    for partition in partitions:
+        for node in partition:
+            nodeid = node["nodeid"]
+            if nodeid in seen_nodeids:
+                raise RunnerStateError(
+                    f"duplicate pytest node ID across collection partitions: {nodeid}"
+                )
+            seen_nodeids.add(nodeid)
+            merged = dict(node)
+            merged["order"] = len(nodes)
+            nodes.append(merged)
+    if not nodes:
+        raise RunnerStateError(f"pytest collected no tests below {test_path}")
+    return nodes
 
 
 def _validate_selection(selection: SelectionSettings) -> None:
@@ -323,6 +448,7 @@ def _selected_nodes(
             order=int(node["order"]),
             shard_group=node.get("shard_group"),
             solo=bool(node.get("solo", False)),
+            long_running=bool(node.get("long_running", False)),
         )
         for node in raw_nodes
     ]
@@ -356,6 +482,9 @@ def _write_new_manifest(
                 selection=request.selection.to_dict(),
                 planning_options=request.planning.to_dict(),
                 pytest_command_prefix=request.pytest_command_prefix,
+                estimate_files=_estimate_checksums(
+                    request.duration_estimates, request.overhead_estimates
+                ),
             )
             _verify_collection(concurrent, nodes)
             return concurrent, Plan.from_dict(concurrent["plan"]), False
@@ -382,6 +511,9 @@ def prepare_manifest(
     junit_dir.mkdir(parents=True, exist_ok=True)
     source_git_sha = source_git_sha_from_env()
     selection_value = selection.to_dict()
+    estimate_files = _estimate_checksums(
+        request.duration_estimates, request.overhead_estimates
+    )
     existing = load_manifest(junit_dir)
     existing_plan: Plan | None = None
     if existing is not None:
@@ -392,6 +524,7 @@ def prepare_manifest(
             selection=selection_value,
             planning_options=planning.to_dict(),
             pytest_command_prefix=request.pytest_command_prefix,
+            estimate_files=estimate_files,
         )
         existing_plan = Plan.from_dict(existing["plan"])
     if existing is None:
@@ -449,8 +582,10 @@ def prepare_manifest(
             error.record_deadline_clock(deadline_clock)
         raise
     nodes = _selected_nodes(raw_nodes, selection)
-    duration_path, overhead_path = _estimate_paths(repo_root)
-    estimates = EstimateBook.from_files(duration_path, overhead_path)
+    estimates = EstimateBook.from_files(
+        request.duration_estimates,
+        request.overhead_estimates,
+    )
     plan = build_plan(nodes, estimates, planning)
     manifest = build_manifest(
         ManifestBuild(
@@ -459,7 +594,7 @@ def prepare_manifest(
             source_git_sha=source_git_sha,
             plan=plan,
             selection=selection_value,
-            estimate_files=_estimate_checksums(repo_root),
+            estimate_files=estimate_files,
             pytest_command_prefix=request.pytest_command_prefix,
         )
     )
@@ -672,7 +807,7 @@ def finalize_attempt(
                                 unit_id=unit.id,
                                 shard_index=unit.shard_index,
                                 attempt_id=attempt["id"],
-                                profile=plan.options.profile,
+                                profile=RUNTIME_TIMING_PROFILE,
                             ),
                         )
             summary = publish_summary_under_lock(junit_dir, plan)
@@ -705,6 +840,7 @@ class _LeaseHeartbeat:
         self.failed = threading.Event()
         self.failure: Exception | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
+        self.started = False
 
     def add(self, path: Path, worker: str) -> None:
         self.raise_if_failed()
@@ -715,8 +851,14 @@ class _LeaseHeartbeat:
 
     def remove(self, path: Path) -> None:
         with self.lock:
-            self.paths.pop(path, None)
-        path.unlink(missing_ok=True)
+            worker = self.paths.pop(path, None)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            if worker is not None:
+                with self.lock:
+                    self.paths[path] = worker
+            raise
 
     def _renew(self, path: Path, worker: str) -> None:
         atomic_write_json(
@@ -750,16 +892,32 @@ class _LeaseHeartbeat:
 
     def start(self) -> None:
         self.thread.start()
+        self.started = True
 
     def close(self) -> None:
         self.stop.set()
-        self.thread.join(timeout=2)
+        if self.started:
+            self.thread.join(timeout=_LEASE_CLOSE_SECONDS)
+            if self.thread.is_alive():
+                raise RunnerStateError(
+                    "lease heartbeat did not stop within "
+                    f"{_LEASE_CLOSE_SECONDS:g} seconds"
+                )
         with self.lock:
             paths = list(self.paths)
             self.paths.clear()
+        errors: list[str] = []
         for path in paths:
-            path.unlink(missing_ok=True)
-        self.raise_if_failed()
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                errors.append(f"cannot remove lease {path}: {error}")
+        try:
+            self.raise_if_failed()
+        except RunnerStateError as error:
+            errors.append(str(error))
+        if errors:
+            raise RunnerStateError("; ".join(errors))
 
 
 @dataclass(frozen=True)
@@ -769,39 +927,6 @@ class _UnitTimer:
 
     def elapsed(self) -> float:
         return self.prior_elapsed + (time.monotonic() - self.started_monotonic)
-
-
-@dataclass
-class _ExecutionGate:
-    condition: threading.Condition = field(default_factory=threading.Condition)
-    regular_active: int = 0
-    solo_active: bool = False
-    solo_waiting: int = 0
-
-    def acquire(self, *, solo: bool) -> None:
-        with self.condition:
-            if solo:
-                self.solo_waiting += 1
-                try:
-                    self.condition.wait_for(
-                        lambda: not self.solo_active and self.regular_active == 0
-                    )
-                    self.solo_active = True
-                finally:
-                    self.solo_waiting -= 1
-                return
-            self.condition.wait_for(
-                lambda: not self.solo_active and self.solo_waiting == 0
-            )
-            self.regular_active += 1
-
-    def release(self, *, solo: bool) -> None:
-        with self.condition:
-            if solo:
-                self.solo_active = False
-            else:
-                self.regular_active -= 1
-            self.condition.notify_all()
 
 
 def _next_worker_unit(
@@ -830,6 +955,61 @@ def _next_worker_unit(
 
 
 @dataclass
+class _ShardProgress:
+    shard_index: int
+    planned: int
+    finalized: int
+    outcomes: Counter[str]
+    synthetic: int = 0
+    finalized_this_invocation: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    stop: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"shard-{self.shard_index}-progress",
+            daemon=True,
+        )
+        self.thread.start()
+        self.report()
+
+    def close(self) -> None:
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.report()
+
+    def _run(self) -> None:
+        while not self.stop.wait(_CONTROLLER_PROGRESS_SECONDS):
+            self.report()
+
+    def record(self, outcomes: Counter[str], *, synthetic: int = 0) -> None:
+        count = sum(outcomes.values())
+        with self.lock:
+            self.finalized += count
+            self.finalized_this_invocation += count
+            self.outcomes.update(outcomes)
+            self.synthetic += synthetic
+        self.report()
+
+    def report(self) -> None:
+        with self.lock:
+            finalized = self.finalized
+            current = self.finalized_this_invocation
+            outcomes = Counter(self.outcomes)
+            synthetic = self.synthetic
+        write_console(
+            f"PROGRESS shard={self.shard_index} finalized={finalized}/{self.planned} "
+            f"finalized_this_invocation={current} passed={outcomes['passed']} "
+            f"failed={outcomes['failed']} skipped={outcomes['skipped']} "
+            f"unknown={outcomes['unknown']} pending={max(0, self.planned - finalized)} "
+            f"synthetic={synthetic}"
+        )
+
+
+@dataclass
 class _ShardExecutor:
     repo_root: Path
     junit_dir: Path
@@ -840,14 +1020,22 @@ class _ShardExecutor:
     devices: list[str | None]
     heartbeat: _LeaseHeartbeat
     solo_sources: frozenset[str]
-    work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
-    execution_gate: _ExecutionGate = field(default_factory=_ExecutionGate)
+    long_running_sources: frozenset[str]
+    progress: _ShardProgress
+    long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
+    normal_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
+    solo_units: list[Unit] = field(default_factory=list)
+    non_solo_units: list[Unit] = field(default_factory=list)
+    all_non_solo_units: list[Unit] = field(default_factory=list)
     infrastructure_errors: list[str] = field(default_factory=list)
     interruption_reasons: set[str] = field(default_factory=set)
     errors_lock: threading.Lock = field(default_factory=threading.Lock)
     stop_workers: threading.Event = field(default_factory=threading.Event)
 
     def add_units(self, units: list[Unit]) -> None:
+        self.all_non_solo_units = [
+            unit for unit in units if not self._unit_is_solo(unit)
+        ]
         pending = []
         for unit in units:
             timed_out = (self.attempt_path / "timed-out" / f"{unit.id}.json").exists()
@@ -856,55 +1044,178 @@ class _ShardExecutor:
                 for batch in unit.batches
             ):
                 pending.append(unit)
-        self.work_by_worker = []
-        for worker_units in source_affine_unit_bins(pending, self.execution.workers):
-            work: queue.Queue[Unit] = queue.Queue()
+        self.solo_units = sorted(
+            (unit for unit in pending if self._unit_is_solo(unit)),
+            key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
+        )
+        self.non_solo_units = [unit for unit in pending if not self._unit_is_solo(unit)]
+        self.long_work_by_worker = []
+        self.normal_work_by_worker = []
+        for worker_units in source_affine_unit_bins(
+            self.non_solo_units, self.execution.workers
+        ):
+            long_work: queue.Queue[Unit] = queue.Queue()
+            normal_work: queue.Queue[Unit] = queue.Queue()
             for unit in sorted(
                 worker_units,
                 key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
             ):
-                work.put(unit)
-            self.work_by_worker.append(work)
+                target = long_work if self._unit_is_long_running(unit) else normal_work
+                target.put(unit)
+            self.long_work_by_worker.append(long_work)
+            self.normal_work_by_worker.append(normal_work)
 
     def run(self) -> None:
-        with ThreadPoolExecutor(
-            max_workers=self.execution.workers,
-            thread_name_prefix="test-worker",
-        ) as executor:
-            futures = {
-                executor.submit(self._worker, index): index
-                for index in range(self.execution.workers)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    future.result()
-                except Exception as error:
-                    self.stop_workers.set()
-                    self._record_infrastructure_error(
-                        f"worker-{index}: {type(error).__name__}: {error}"
-                    )
+        self.progress.start()
+        try:
+            with ThreadPoolExecutor(
+                max_workers=self.execution.workers,
+                thread_name_prefix="test-worker",
+            ) as executor:
+                futures = {
+                    executor.submit(self._worker, index): index
+                    for index in range(self.execution.workers)
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        future.result()
+                    except Exception as error:
+                        self.stop_workers.set()
+                        self._record_infrastructure_error(
+                            f"worker-{index}: {type(error).__name__}: {error}"
+                        )
+            if self.stop_workers.is_set() or not self._non_solo_finalized():
+                return
+            self._run_solo_phase()
+        finally:
+            self.progress.close()
 
     def _record_infrastructure_error(self, diagnostic: str) -> None:
         with self.errors_lock:
             self.infrastructure_errors.append(diagnostic)
 
     def _worker(self, index: int) -> None:
-        while not self.stop_workers.is_set():
-            try:
-                work, unit = _next_worker_unit(self.work_by_worker, index)
-            except queue.Empty:
-                return
-            solo = self._unit_is_solo(unit)
-            self.execution_gate.acquire(solo=solo)
-            try:
-                self._execute_unit(index, unit, solo=solo)
-            finally:
-                self.execution_gate.release(solo=solo)
-                work.task_done()
+        started = time.monotonic()
+        stats: Counter[str] = Counter()
+        device = self.devices[index]
+        write_console(
+            f"WORKER START worker={index} time={_timestamp()} "
+            f"device={device if device is not None else 'unassigned'}"
+        )
+        try:
+            while not self.stop_workers.is_set():
+                try:
+                    try:
+                        work, unit = _next_worker_unit(self.long_work_by_worker, index)
+                    except queue.Empty:
+                        work, unit = _next_worker_unit(
+                            self.normal_work_by_worker, index
+                        )
+                except queue.Empty:
+                    return
+                before = {
+                    batch.id
+                    for batch in unit.batches
+                    if batch_is_final(self.junit_dir, unit, batch)
+                }
+                pending_nodes = sum(
+                    len(batch.nodeids)
+                    for batch in unit.batches
+                    if batch.id not in before
+                )
+                self._report_worker_task(index, unit, pending_nodes, solo=False)
+                try:
+                    self._execute_unit(index, unit, solo=False)
+                    stats.update(self._new_unit_outcomes(unit, before))
+                finally:
+                    work.task_done()
+        finally:
+            self._report_worker_end(index, started, stats, solo=False)
+
+    def _run_solo_phase(self) -> None:
+        if not self.solo_units:
+            return
+        started = time.monotonic()
+        stats: Counter[str] = Counter()
+        write_console(
+            f"WORKER START worker=solo-0 time={_timestamp()} device=all-visible-gpus"
+        )
+        try:
+            for unit in self.solo_units:
+                if self.stop_workers.is_set():
+                    return
+                before = {
+                    batch.id
+                    for batch in unit.batches
+                    if batch_is_final(self.junit_dir, unit, batch)
+                }
+                pending_nodes = sum(
+                    len(batch.nodeids)
+                    for batch in unit.batches
+                    if batch.id not in before
+                )
+                self._report_worker_task("solo-0", unit, pending_nodes, solo=True)
+                self._execute_unit(0, unit, solo=True)
+                stats.update(self._new_unit_outcomes(unit, before))
+        finally:
+            self._report_worker_end("solo-0", started, stats, solo=True)
+
+    def _report_worker_task(
+        self, worker: int | str, unit: Unit, node_count: int, *, solo: bool
+    ) -> None:
+        source = unit.batches[0].source_file if unit.batches else "unknown"
+        first_node = unit.batches[0].nodeids[0] if unit.batches else "unknown"
+        write_console(
+            f"WORKER TASK worker={worker} time={_timestamp()} solo={str(solo).lower()} "
+            f"source={source} unit={unit.id} nodes={node_count} first_node={first_node}"
+        )
+
+    def _report_worker_end(
+        self,
+        worker: int | str,
+        started: float,
+        outcomes: Counter[str],
+        *,
+        solo: bool,
+    ) -> None:
+        handled = sum(outcomes.values())
+        write_console(
+            f"WORKER END worker={worker} time={_timestamp()} solo={str(solo).lower()} "
+            f"elapsed={time.monotonic() - started:.3f}s handled={handled} "
+            f"passed={outcomes['passed']} failed={outcomes['failed']} "
+            f"skipped={outcomes['skipped']} unknown={outcomes['unknown']}"
+        )
+
+    def _new_unit_outcomes(
+        self, unit: Unit, previously_final: set[str]
+    ) -> Counter[str]:
+        outcomes: Counter[str] = Counter()
+        for batch in unit.batches:
+            if batch.id in previously_final or not batch_is_final(
+                self.junit_dir, unit, batch
+            ):
+                continue
+            batch_outcomes, _ = finalized_batch_outcomes(
+                batch_xml_path(self.junit_dir, unit, batch), batch.nodeids
+            )
+            outcomes.update(batch_outcomes)
+        return outcomes
 
     def _unit_is_solo(self, unit: Unit) -> bool:
         return any(batch.source_file in self.solo_sources for batch in unit.batches)
+
+    def _unit_is_long_running(self, unit: Unit) -> bool:
+        return any(
+            batch.source_file in self.long_running_sources for batch in unit.batches
+        )
+
+    def _non_solo_finalized(self) -> bool:
+        return all(
+            batch_is_final(self.junit_dir, unit, batch)
+            for unit in self.all_non_solo_units
+            for batch in unit.batches
+        )
 
     def _execute_unit(self, worker_index: int, unit: Unit, *, solo: bool) -> None:
         claim_path = claims_dir(self.junit_dir) / f"{unit.id}.json"
@@ -956,7 +1267,7 @@ class _ShardExecutor:
                         unit=unit,
                         batch=batch,
                         attempt_id=self.attempt["id"],
-                        profile=self.plan.options.profile,
+                        profile=self.execution.timing_profile,
                         timeout_seconds=remaining,
                         timeout_reason=timeout_reason,
                         grace_seconds=self.execution.attempt.timeout_grace_seconds,
@@ -970,11 +1281,16 @@ class _ShardExecutor:
                 )
                 self.heartbeat.raise_if_failed()
                 status = result.status
-                if status == "infrastructure":
-                    self._record_infrastructure_error(
-                        f"{batch.id}: {result.diagnostic}"
-                    )
+            if status == "infrastructure":
+                diagnostic = (
+                    f"source={batch.source_file} batch={batch.id} "
+                    f"nodes={len(batch.nodeids)} first_node={batch.nodeids[0]} "
+                    f"cause={result.diagnostic}"
+                )
+                write_console(f"ERROR: {diagnostic}")
+                self._record_infrastructure_error(diagnostic)
             if status == "finalized":
+                self._record_batch_progress(unit, batch)
                 continue
             if status == "infrastructure":
                 return False
@@ -988,6 +1304,20 @@ class _ShardExecutor:
                 return True
             return False
         return True
+
+    def _record_batch_progress(self, unit: Unit, batch: Any) -> None:
+        path = batch_xml_path(self.junit_dir, unit, batch)
+        outcomes, diagnostics = finalized_batch_outcomes(path, batch.nodeids)
+        if diagnostics:
+            raise RunnerStateError(
+                f"cannot record progress for {batch.source_file} {batch.id}: "
+                + "; ".join(diagnostics)
+            )
+        validation = validate_batch_xml(path, batch.nodeids)
+        self.progress.record(
+            outcomes,
+            synthetic=sum(case.synthetic for case in validation.cases),
+        )
 
     def _report_unit_complete(self, worker_index: int, unit: Unit) -> None:
         outcomes: Counter[str] = Counter()
@@ -1058,23 +1388,11 @@ class _ShardExecutor:
                         unit_id=unit.id,
                         shard_index=unit.shard_index,
                         attempt_id=self.attempt["id"],
-                        profile=self.plan.options.profile,
+                        profile=self.execution.timing_profile,
                     ),
                 )
+                self._record_batch_progress(unit, pending)
         return True
-
-
-@dataclass
-class _ShardLeases:
-    heartbeat: _LeaseHeartbeat
-    process: Path
-    workers: list[Path]
-
-    def close(self) -> None:
-        for path in self.workers:
-            self.heartbeat.remove(path)
-        self.heartbeat.remove(self.process)
-        self.heartbeat.close()
 
 
 def _claim_shard_leases(
@@ -1082,7 +1400,7 @@ def _claim_shard_leases(
     attempt_path: Path,
     attempt: AttemptRecord,
     execution: ExecutionSettings,
-) -> _ShardLeases:
+) -> _LeaseHeartbeat:
     lease_root = attempt_path / "leases"
     lease_root.mkdir(parents=True, exist_ok=True)
     process_lease = lease_root / f"shard-{execution.shard_index:04d}.json"
@@ -1100,15 +1418,25 @@ def _claim_shard_leases(
             ),
         )
     heartbeat = _LeaseHeartbeat(attempt, execution.shard_index)
-    heartbeat.add(process_lease, "coordinator")
     worker_leases = [
         lease_root / f"shard-{execution.shard_index:04d}-worker-{index:03d}.json"
         for index in range(execution.workers)
     ]
-    for index, path in enumerate(worker_leases):
-        heartbeat.add(path, f"worker-{index}")
-    heartbeat.start()
-    return _ShardLeases(heartbeat, process_lease, worker_leases)
+    try:
+        heartbeat.add(process_lease, "coordinator")
+        for index, path in enumerate(worker_leases):
+            heartbeat.add(path, f"worker-{index}")
+        heartbeat.start()
+    except Exception as error:
+        try:
+            heartbeat.close()
+        except Exception as cleanup_error:
+            raise RunnerStateError(
+                f"cannot claim shard leases: {error}; "
+                f"lease rollback also failed: {cleanup_error}"
+            ) from error
+        raise
+    return heartbeat
 
 
 def _existing_shard_result(
@@ -1136,7 +1464,7 @@ def _existing_shard_result(
         state="completed" if shard_summary["complete"] else "incomplete",
         deadline_clock=deadline_clock,
     )
-    return exit_code_for_summary(summary)
+    return exit_code_for_shard(summary, execution.shard_index)
 
 
 def _report_shard_result(
@@ -1154,7 +1482,7 @@ def _report_shard_result(
     )
     if shard_executor.infrastructure_errors:
         for error in shard_executor.infrastructure_errors:
-            print(f"ERROR: {error}", file=sys.stderr)
+            print(f"ERROR: {error}")
         _report_shard_status(
             summary,
             execution.shard_index,
@@ -1178,7 +1506,7 @@ def _report_shard_result(
         deadline_clock=deadline_clock,
         reason=reason,
     )
-    return exit_code_for_summary(summary)
+    return exit_code_for_shard(summary, execution.shard_index)
 
 
 def execute_shard(
@@ -1213,7 +1541,7 @@ def execute_shard(
             state="completed",
             deadline_clock=deadline_clock,
         )
-        return exit_code_for_summary(initial_summary)
+        return exit_code_for_shard(initial_summary, execution.shard_index)
     devices = visible_devices()
     if execution.workers <= 0:
         raise RunnerStateError("workers must be positive")
@@ -1234,40 +1562,73 @@ def execute_shard(
     )
     if existing_result is not None:
         return existing_result
-    leases = _claim_shard_leases(junit_dir, attempt_path, attempt, execution)
+    lease_heartbeat = _claim_shard_leases(junit_dir, attempt_path, attempt, execution)
+    shard_executor: _ShardExecutor | None = None
 
-    atomic_write_json(
-        attempt_path / "shards" / f"shard-{execution.shard_index:04d}.settings.json",
-        {
-            "shard_index": execution.shard_index,
-            "workers": execution.workers,
-            "recorded_at": time.time(),
-        },
-    )
-
-    shard_units = sorted(
-        (unit for unit in plan.units if unit.shard_index == execution.shard_index),
-        key=lambda unit: (-unit.estimated_ms, unit.id.encode("utf-8")),
-    )
-    shard_executor = _ShardExecutor(
-        repo_root=repo_root,
-        junit_dir=junit_dir,
-        plan=plan,
-        execution=execution,
-        attempt_path=attempt_path,
-        attempt=attempt,
-        devices=devices,
-        heartbeat=leases.heartbeat,
-        solo_sources=frozenset(node.source_file for node in plan.nodes if node.solo),
-    )
-    shard_executor.add_units(shard_units)
     try:
+        atomic_write_json(
+            attempt_path
+            / "shards"
+            / f"shard-{execution.shard_index:04d}.settings.json",
+            {
+                "shard_index": execution.shard_index,
+                "workers": execution.workers,
+                "recorded_at": time.time(),
+            },
+        )
+
+        shard_units = sorted(
+            (unit for unit in plan.units if unit.shard_index == execution.shard_index),
+            key=lambda unit: (-unit.estimated_ms, unit.id.encode("utf-8")),
+        )
+        shard_executor = _ShardExecutor(
+            repo_root=repo_root,
+            junit_dir=junit_dir,
+            plan=plan,
+            execution=execution,
+            attempt_path=attempt_path,
+            attempt=attempt,
+            devices=devices,
+            heartbeat=lease_heartbeat,
+            solo_sources=frozenset(
+                node.source_file for node in plan.nodes if node.solo
+            ),
+            long_running_sources=frozenset(
+                node.source_file for node in plan.nodes if node.long_running
+            ),
+            progress=_ShardProgress(
+                shard_index=execution.shard_index,
+                planned=initial_summary["shards"][str(execution.shard_index)][
+                    "planned_nodes"
+                ],
+                finalized=initial_summary["shards"][str(execution.shard_index)][
+                    "finalized_nodes"
+                ],
+                outcomes=Counter(
+                    initial_summary["shards"][str(execution.shard_index)]["outcomes"]
+                ),
+                synthetic=sum(
+                    int(row["synthetic"])
+                    for row in initial_summary["sources"]
+                    if int(row["shard_index"]) == execution.shard_index
+                ),
+            ),
+        )
+        shard_executor.add_units(shard_units)
         shard_executor.run()
     finally:
+        primary_error = sys.exc_info()[1]
         try:
-            leases.close()
-        except RunnerStateError as error:
-            shard_executor._record_infrastructure_error(str(error))
+            lease_heartbeat.close()
+        except Exception as cleanup_error:
+            if shard_executor is not None:
+                shard_executor._record_infrastructure_error(str(cleanup_error))
+            if primary_error is not None:
+                print(f"ERROR: lease cleanup also failed: {cleanup_error}", flush=True)
+            elif shard_executor is None:
+                raise
+
+    assert shard_executor is not None
 
     shard_done = (
         attempt_path / "shards" / f"shard-{execution.shard_index:04d}.done.json"

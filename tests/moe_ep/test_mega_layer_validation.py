@@ -139,6 +139,46 @@ def test_mega_layer_forward_accepts_partial_batch():
     assert out.shape == (16, 128)
 
 
+def test_mega_layer_allocates_output_before_staging_round():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer()
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+    )
+    events: list[str] = []
+    real_empty = torch.empty
+
+    def allocate_output(*args, **kwargs):
+        events.append("allocate")
+        return real_empty(*args, **kwargs)
+
+    def stage_inputs(*args, **kwargs):
+        events.append("stage")
+
+    def compute(*args, output, **kwargs):
+        events.append("compute")
+        return output
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.modes.mega_layer.torch.empty",
+            side_effect=allocate_output,
+        ),
+        mock.patch.object(layer._kernel, "stage_inputs", side_effect=stage_inputs),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
+    ):
+        out = layer.forward(t)
+
+    assert events == ["allocate", "stage", "compute"]
+    assert out.shape == (8, 128)
+
+
 def test_mega_layer_forward_rejects_topk_mismatch():
     import torch
 
@@ -238,7 +278,7 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
         _mega_layer()
 
 
-def test_mega_layer_forward_passes_quantize_input_to_kernel():
+def test_mega_layer_forward_passes_staging_context_to_kernel():
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
@@ -251,13 +291,20 @@ def test_mega_layer_forward_passes_quantize_input_to_kernel():
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
         topk_weights=torch.zeros(8, 2),
     )
+
+    def compute(*args, output, **kwargs):
+        return output
+
     with (
-        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
         mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
     ):
-        layer.forward(t)
+        out = layer.forward(t)
         stage_mock.assert_called_once()
         assert stage_mock.call_args.kwargs["quantize_input"] is True
+        assert "transformed_weights" not in stage_mock.call_args.kwargs
+        assert "output" not in stage_mock.call_args.kwargs
+        assert out.shape == (8, 128)
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -632,9 +679,9 @@ def test_mega_layer_workspace_alloc_raises_during_capture():
 
 def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.comm import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
         ensure_not_capturing,
     )
 
