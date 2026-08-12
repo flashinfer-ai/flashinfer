@@ -154,6 +154,13 @@ def _group_all(flag: bool, device, group) -> bool:
     return bool(t.item())
 
 
+def _provenance(config, seed, tuning: bool) -> str:
+    """How this row's configuration was chosen."""
+    if seed != config:
+        return f"  (seed: {seed})" if tuning else ""
+    return "  (seed -- no tuned entry)" if not tuning else ""
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--hidden", type=int, default=None)
@@ -584,13 +591,15 @@ def main() -> None:
         dtype=dtype,
         tune_cache=args.tune_cache,
     )
-    seed_configs = {}
+    # Recorded before tuning overwrites it: under --tune this shows what the
+    # search changed, without it which rows found no cache entry.
+    seed_configs = {
+        batch: workspace.launch_config(
+            torch.empty(batch, hidden, dtype=dtype, device=device)
+        )
+        for batch in batches
+    }
     if args.tune:
-        # Record what the seed would have chosen before overwriting it, so the
-        # report shows what tuning actually changed rather than just the result.
-        for batch in batches:
-            probe = torch.empty(batch, hidden, dtype=dtype, device=device)
-            seed_configs[batch] = workspace.launch_config(probe)
         if rank == 0:
             print(f"tuning {len(batches)} batch buckets at hidden {hidden} ...")
         torch.cuda.synchronize()
@@ -661,11 +670,7 @@ def main() -> None:
                 f"{batch:>7} {ours_us:>10.2f} {nccl_us:>10.2f} "
                 f"{nccl_us / ours_us:>8.2f}x  blocks={config.blocks} "
                 f"threads={config.threads} variant={config.variant.name}"
-                + (
-                    ""
-                    if not args.tune or seed_configs.get(batch) == config
-                    else f"  (seed: {seed_configs[batch]})"
-                )
+                + _provenance(config, seed_configs.get(batch), args.tune)
             )
 
     if rank == 0 and args.json:

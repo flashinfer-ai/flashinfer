@@ -265,6 +265,61 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
 
+def _synthesise_cache(monkeypatch, *entries) -> None:
+    """Install file-backed entries keyed the way ``save_configs`` writes them."""
+    from flashinfer.autotuner import AutoTuner
+
+    configs = {
+        str((tuning.PCIE_IPC_CUSTOM_OP, "PcieIpcAllReduceRunner", ((1, 4096),), e)): [
+            "PcieIpcAllReduceRunner",
+            [1, 8, 256],
+        ]
+        for e in entries
+    }
+    monkeypatch.setattr(AutoTuner.get(), "_file_configs", configs, raising=False)
+
+
+def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -> None:
+    """A key mismatch misses every entry, which looks exactly like a hit."""
+    tuned = dict(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+    _synthesise_cache(
+        monkeypatch, tuning.cache_key_extras(**tuned, dtype=torch.bfloat16)
+    )
+
+    assert tuning.cache_covers_workspace(**tuned)
+    for field, other in (
+        ("max_numel", 6144 * 256),
+        ("world_size", 8),
+        ("max_blocks", 32),
+        ("profile", PROFILE_SWITCHPAIR),
+    ):
+        assert not tuning.cache_covers_workspace(**{**tuned, field: other}), field
+
+
+def test_coverage_ignores_the_dtype(monkeypatch) -> None:
+    """One workspace serves both 2-byte dtypes, each with its own entries.
+
+    Requiring a dtype match would report an uncovered workspace for a cache that
+    covers it perfectly well in the dtype the caller is not using right now.
+    """
+    tuned = dict(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+    _synthesise_cache(
+        monkeypatch, tuning.cache_key_extras(**tuned, dtype=torch.float16)
+    )
+    assert tuning.cache_covers_workspace(**tuned)
+
+
+def test_an_empty_cache_covers_nothing(monkeypatch) -> None:
+    _synthesise_cache(monkeypatch)
+    assert not tuning.cache_covers_workspace(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+
+
 def test_cache_key_extras_are_synthesis_invariant() -> None:
     """The tuner keys on synthesized tensors and looks up with real ones.
 

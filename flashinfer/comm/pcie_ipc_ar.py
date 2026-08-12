@@ -38,6 +38,7 @@ from .pcie_ipc_tuning import (
     TUNE_REPEAT,
     TUNE_WARMUP,
     PcieIpcAllReduceRunner,
+    cache_covers_workspace,
     default_cache_path,
     pack_config,
     pcie_ipc_tuning_config,
@@ -210,6 +211,7 @@ class PcieIpcAllReduceWorkspace:
         self._tune_group: Optional[ProcessGroup] = None
         self._tune_batches = tuple(int(b) for b in tune_batches)
         self._tune_cache = tune_cache or default_cache_path(self.world_size)
+        self._tune_cache_exists = False
         self._tuned_configs_loaded = False
         self._warned_untuned = False
 
@@ -448,22 +450,31 @@ class PcieIpcAllReduceWorkspace:
         # on it: half a group running tuned configurations and half running the
         # seed is a hang, not a slowdown.
         self._joint_check({"error": None, "cache": exists}, "checking the tune cache")
-        self._tuned_configs_loaded = exists
+        self._tune_cache_exists = exists
         if exists:
             from ..autotuner import AutoTuner
 
             AutoTuner.get().load_configs(path)
+        # Settled against the loaded keys, where the answer is known, rather
+        # than inferred from a miss later.
+        self._tuned_configs_loaded = exists and cache_covers_workspace(
+            self.world_size, self.profile, self.max_blocks, self.max_numel
+        )
         self._joint_check(
-            {"error": None, "digest": self._cache_digest()}, "loading the tune cache"
+            {
+                "error": None,
+                "digest": self._cache_digest(),
+                "covers": self._tuned_configs_loaded,
+            },
+            "loading the tune cache",
         )
 
     def _warn_if_untuned(self) -> None:
-        """Say once that no tuned configurations were found for this machine.
+        """Say once that this workspace resolved to seed configurations.
 
-        Keyed on the cache file found at construction, not on whether a given
-        shape fell back -- an entry can be missing for one shape while the file
-        holds plenty of others, and that is a normal miss rather than an untuned
-        machine.
+        Two causes with different fixes, so two messages: a machine nobody
+        tuned, or a cache keyed for a different workspace (see
+        :func:`~flashinfer.comm.pcie_ipc_tuning.cache_covers_workspace`).
 
         On the cold path only, so the steady state is untouched: a serving loop
         reaches this at most once per distinct shape, and the flag makes it once
@@ -474,16 +485,29 @@ class PcieIpcAllReduceWorkspace:
         if self._tuned_configs_loaded or self._warned_untuned:
             return
         self._warned_untuned = True
-        warnings.warn(
-            "PCIe IPC all-reduce is running seed launch configurations: "
-            f"nothing has been tuned for {self.world_size} ranks on this "
-            f"machine ({self._tune_cache} does not exist). The seed picks a "
-            "workable kernel, not a fast one. Call workspace.tune([hidden]) "
-            "once per machine; the result is persisted and later processes "
-            "pick it up.",
-            UserWarning,
-            stacklevel=4,
-        )
+        if self._tune_cache_exists:
+            warnings.warn(
+                f"PCIe IPC all-reduce loaded {self._tune_cache} but it holds no "
+                f"entry for this workspace ({self.world_size} ranks, "
+                f"max_numel={self.max_numel}, max_blocks={self.max_blocks}, "
+                f"profile={self.profile}); it was tuned for a different one, so "
+                "every shape falls back to a seed configuration. Re-tune with "
+                "this workspace's parameters, or build it with the ones the "
+                "cache was written for.",
+                UserWarning,
+                stacklevel=4,
+            )
+        else:
+            warnings.warn(
+                "PCIe IPC all-reduce is running seed launch configurations: "
+                f"nothing has been tuned for {self.world_size} ranks on this "
+                f"machine ({self._tune_cache} does not exist). The seed picks a "
+                "workable kernel, not a fast one. Call workspace.tune([hidden]) "
+                "once per machine; the result is persisted and later processes "
+                "pick it up.",
+                UserWarning,
+                stacklevel=4,
+            )
 
     def _cache_digest(self) -> str:
         """Fingerprint of the tuned entries this rank will actually use.

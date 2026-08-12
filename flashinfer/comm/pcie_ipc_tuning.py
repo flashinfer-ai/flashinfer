@@ -144,6 +144,43 @@ def tactic_to_config(tactic: Sequence[int]) -> IpcLaunchConfig:
         raise ValueError(f"tactic {tactic!r} names no variant: {exc}") from exc
 
 
+def cache_covers_workspace(
+    world_size: int, profile: str, max_blocks: int, max_numel: int
+) -> bool:
+    """Whether the loaded cache holds any entry written for this workspace.
+
+    ``max_numel`` is part of the key, so a workspace sized differently from the
+    tuned one misses every entry at once rather than a few -- a configuration
+    mistake rather than an untuned shape, and no single lookup can tell those
+    apart, since the seed is a valid answer either way.
+
+    dtype is not compared: one workspace serves both 2-byte dtypes and each gets
+    its own entries, so a match would be required for a cache that covers the
+    workspace perfectly well in the dtype the caller is not using.
+
+    Scanned rather than parsed for the same reason
+    :meth:`PcieIpcAllReduceWorkspace._cache_digest` scans -- the key format
+    belongs to the autotuner.
+    """
+    from ..autotuner import AutoTuner
+
+    prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
+    # cache_key_extras up to the dtype, with the closing paren traded for the
+    # separator that must follow it.
+    head = (
+        PCIE_IPC_TUNE_VERSION,
+        int(world_size),
+        str(profile),
+        int(max_blocks),
+        int(max_numel),
+    )
+    needle = repr(head)[:-1] + ", "
+    return any(
+        key.startswith(prefix) and needle in key
+        for key in AutoTuner.get()._file_configs
+    )
+
+
 def resolve_tuned_config(
     table_config: IpcLaunchConfig,
     tactic,

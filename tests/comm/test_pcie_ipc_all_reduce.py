@@ -1099,7 +1099,12 @@ def _untuned_warning_worker(world_size: int, rank: int, port: int, tmpdir: str) 
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 fn()
-            return [w for w in caught if "seed launch configurations" in str(w.message)]
+            return [
+                w
+                for w in caught
+                if "PCIe IPC all-reduce" in str(w.message)
+                and issubclass(w.category, UserWarning)
+            ]
 
         ws = _build()
         first = _untuned_warnings(lambda: ws.all_reduce(_tune_input(1, device)))
@@ -1126,6 +1131,21 @@ def _untuned_warning_worker(world_size: int, rank: int, port: int, tmpdir: str) 
         ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
         after = _untuned_warnings(lambda: ws.all_reduce(_tune_input(4, device)))
         assert not after, after
+
+        # max_numel is part of the cache key, so a workspace differing only in
+        # it reads the same file and misses every entry.
+        ws.destroy()
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=2 * _TUNE_HIDDEN * max(_TUNE_BATCHES),
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=_TUNE_BATCHES,
+            tune_cache=path,
+        )
+        mismatch = _untuned_warnings(lambda: ws.all_reduce(_tune_input(1, device)))
+        assert len(mismatch) == 1, mismatch
+        assert "holds no entry for this workspace" in str(mismatch[0].message)
     finally:
         if ws is not None:
             ws.destroy()
