@@ -31,6 +31,13 @@ from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 
+def _build_mxint4_runner(config):
+    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    return runner
+
+
 def _is_mxint4_arch() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
@@ -349,7 +356,7 @@ def test_mxint4_layer_and_direct_runner_match_reference(routing_input_mode):
     layer_output = MoELayer(config)(act, weights)
     _assert_mxint4_close(layer_output, reference)
 
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     direct_output = runner.forward(runner.pack_inputs(act, weights))
     _assert_mxint4_close(direct_output, reference)
 
@@ -387,7 +394,7 @@ def test_mxint4_from_logits_rejects_fp32_until_validated():
         routing_input_mode=RoutingInputMode.FromLogits
     )
     act.routing_logits = act.routing_logits.float()
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(TypeError, match="requires bfloat16 routing_logits"):
         runner.pack_inputs(act, weights)
 
@@ -399,7 +406,7 @@ def test_mxint4_from_logits_rejects_fp32_bias():
         routing_method=RoutingMethodType.DeepSeekV3,
     )
     act.routing_bias = act.routing_bias.float()
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(TypeError, match="routing_bias must be bfloat16"):
         runner.pack_inputs(act, weights)
 
@@ -419,7 +426,7 @@ def test_mxint4_runner_rejects_noncontiguous_runtime_inputs(field):
     assert not tensor.is_contiguous()
     setattr(act, field, tensor)
 
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(ValueError, match=rf"{field} must be contiguous"):
         runner.pack_inputs(act, weights)
 
@@ -438,7 +445,7 @@ def test_mxint4_runner_rejects_malformed_prepared_view(key):
     act, weights, config, _, _ = _make_case()
     view = weights.get_view("trtllm_mxint4_routed")
     view[key] = view[key][..., :-1].contiguous()
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(ValueError, match=rf"{key} shape"):
         runner.pack_inputs(act, weights)
 
@@ -459,7 +466,7 @@ def test_mxint4_runner_rejects_unaligned_runtime_geometry(dimension):
             config,
             experts=dataclasses.replace(config.experts, intermediate_size=384),
         )
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(ValueError, match="divisible by 256"):
         runner.pack_inputs(act, weights)
 
@@ -497,7 +504,7 @@ def test_mxint4_runner_validates_optional_gemm1_params(mutation, error_type, mat
         assert not value.is_contiguous()
     view["gemm1_alpha"] = value
 
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     with pytest.raises(error_type, match=match):
         runner.pack_inputs(act, weights)
 
@@ -512,7 +519,7 @@ def test_mxint4_cuda_graph_replay(routing_input_mode):
     act, weights, config, reference, _ = _make_case(
         routing_input_mode=routing_input_mode
     )
-    runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
+    runner = _build_mxint4_runner(config)
     inputs = runner.pack_inputs(act, weights)
     eager = runner.forward(inputs).clone()
     graph = torch.cuda.CUDAGraph()
