@@ -44,7 +44,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # A fork's head branch does not exist in the base repository, so use
+          # its repository and immutable SHA for pull-request dry runs.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Verify tag matches version.txt
@@ -94,7 +97,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -128,7 +132,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -180,7 +185,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Build wheel in container
