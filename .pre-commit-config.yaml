@@ -18,7 +18,7 @@
 # periodically (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs.
 # The shim/ layers next to them are ours and stay checked.
-exclude: ^flashinfer/moe_ep/kernel_src/(cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/
+exclude: ^flashinfer/moe_ep/kernel_src/(cutedsl_megamoe|next_cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/
 
 repos:
   # Standard hooks
