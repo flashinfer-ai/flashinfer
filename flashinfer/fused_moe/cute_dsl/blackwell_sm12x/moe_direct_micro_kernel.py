@@ -5234,7 +5234,7 @@ _PROBE_FAILURE_WARNED = False
 
 
 def _compiled_cuda_library(compiled):
-    """The `cudaLibrary_t` backing a freshly compiled kernel.
+    """The ``cudaLibrary_t`` backing a freshly compiled kernel.
 
     Two object shapes reach this. A ``--enable-tvm-ffi`` compile returns a
     ``TVMFFIJitCompiledFunctionWithKwargs`` whose ``.to(None).jit_module`` is
@@ -5244,35 +5244,30 @@ def _compiled_cuda_library(compiled):
     only have the ``.to(None).jit_module.cuda_library`` chain, kept so a
     caller passing explicit ``options`` is not broken.
     """
-    if getattr(compiled, "has_gpu_module", False):
-        loader = getattr(compiled, "_load_cuda_library", None)
-        if loader is not None:
-            libraries = loader()
-            if libraries:
-                return libraries[0]
-
-    # Non-TVM-FFI compiles: the public property, which lazily materializes the
-    # library and raises (rather than returning None) for a host-only compile.
+    # TODO: verify on sm12x hardware. The attribute surface was confirmed on a
+    # T4 (a --enable-tvm-ffi compile exposes `.library`, and the old
+    # `.to(None).jit_module` is None there), but the full
+    # cudaLibraryGetKernel + cuKernelGetAttribute round-trip has not been run
+    # against a real direct-micro compile on SM120/SM121.
+    # ``.library`` raises rather than returning None when the compile produced
+    # no gpu.module, so the legacy chain has to be reached through except, not
+    # through a getattr default.
     try:
         library = compiled.library
     except AttributeError:
-        library = None  # older object: no such property
+        library = None  # pre-TVM-FFI object: no such property
     except RuntimeError:
         return None  # compiled, but genuinely has no device module
-
     if library is not None:
         return library
 
     executor = compiled.to(None)
     jit_module = getattr(executor, "jit_module", None)
     cuda_library = getattr(jit_module, "cuda_library", None)
-
     if isinstance(cuda_library, (list, tuple)):
         cuda_library = cuda_library[0] if cuda_library else None
-
     if cuda_library is None:
         cuda_library = getattr(executor, "kernel", None)
-
     return cuda_library
 
 
