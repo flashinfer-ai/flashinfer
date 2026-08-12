@@ -286,12 +286,12 @@ jobs:
           # Read release notes from file
           NOTES=$(cat ${{ steps.release-notes.outputs.notes_file }})
 
-          # Mark pre-release tags (rc/alpha/beta/dev) as such. GitHub only
-          # infers this in the web UI, never via the API, so an rc created here
-          # would otherwise be published as a full release and could take over
-          # the "Latest" badge. .postN is a real release and stays unflagged.
+          # gh/the API never infer pre-release status from the tag name (that is
+          # web-UI only), so flag PEP 440 pre-release suffixes explicitly --
+          # otherwise an rc publishes as a full release and can take over
+          # "Latest". .postN is a real release and stays unflagged.
           PRERELEASE_FLAG=""
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.?(rc|alpha|beta|dev|a|b)[0-9]*$ ]]; then
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.?(a|b|rc|dev)[0-9]*$ ]]; then
             PRERELEASE_FLAG="--prerelease"
             echo "Detected pre-release tag: $TAG"
           fi
