@@ -1370,6 +1370,66 @@ def _duplicate_first_logical_launch_kind(payload):
     _refresh_timing_summary_arrays(timing)
 
 
+def _refresh_prepared_timing_summary(timing):
+    prepared = timing["prepared_recurrence"]
+    raw_samples = [sample["prepared_recurrence"] for sample in timing["raw_samples"]]
+    prepared["raw_samples"] = raw_samples
+    prepared.update(
+        evidence._summarize_numeric(raw_samples, evidence._PREPARED_NUMERIC_FIELDS)
+    )
+    for summary_key, sample_key in (
+        ("launch_activity_names_samples", "launch_activity_names"),
+        ("launch_activity_order_samples", "launch_activity_order"),
+        ("gpu_activity_names_samples", "gpu_activity_names"),
+        ("kernel_activity_names_samples", "kernel_activity_names"),
+        ("activity_order_samples", "activity_order"),
+    ):
+        prepared[summary_key] = [sample[sample_key] for sample in raw_samples]
+
+
+def _shift_first_prepared_recurrence_away_from_public_sample(payload):
+    timing = payload["cases"][0]["timings"]["flashinfer_public"]
+    prepared = timing["raw_samples"][0]["prepared_recurrence"]
+    shift_ns = 1_000_000
+    for field in ("launch_activity_order", "activity_order"):
+        for record in prepared[field]:
+            record["start_ns"] += shift_ns
+            record["end_ns"] += shift_ns
+    prepared.update(
+        evidence._interval_metrics(
+            [
+                evidence.GpuActivity(
+                    start_ns=record["start_ns"],
+                    end_ns=record["end_ns"],
+                    correlation_id=record["correlation_id"],
+                    kind=record["kind"],
+                    name=record["name"],
+                )
+                for record in prepared["activity_order"]
+            ]
+        )
+    )
+    _refresh_prepared_timing_summary(timing)
+
+
+def _make_pinned_route_markers_ambiguous(payload, path_name):
+    timing = payload["cases"][0]["timings"][path_name]
+    ambiguous_name = "__".join(evidence._ALL_PINNED_FLASH_KDA_ROUTE_MARKERS)
+    for sample in timing["raw_samples"]:
+        for record in sample["activity_order"]:
+            if record["kind"] == "kernel":
+                record["name"] = ambiguous_name
+        sample["gpu_activity_names"] = [
+            record["name"] for record in sample["activity_order"]
+        ]
+        sample["kernel_activity_names"] = [
+            record["name"]
+            for record in sample["activity_order"]
+            if record["kind"] == "kernel"
+        ]
+    _refresh_timing_summary_arrays(timing)
+
+
 def _rewrite_first_adapted_copy(payload, *, kind, name):
     timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
     for sample in timing["raw_samples"]:
@@ -1541,6 +1601,24 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
     reject(
         _duplicate_first_logical_launch_kind,
         "one timely logical launch correlation per GPU activity",
+    )
+    reject(
+        _shift_first_prepared_recurrence_away_from_public_sample,
+        "prepared recurrence is not derived from the same public sample",
+    )
+    reject(
+        lambda payload: _make_pinned_route_markers_ambiguous(
+            payload,
+            "flash_kda_raw",
+        ),
+        "one-hot stage markers",
+    )
+    reject(
+        lambda payload: _make_pinned_route_markers_ambiguous(
+            payload,
+            "flash_kda_public_semantics_adapted",
+        ),
+        "one-hot stage markers",
     )
     reject(
         lambda payload: _rewrite_first_case_kernel(

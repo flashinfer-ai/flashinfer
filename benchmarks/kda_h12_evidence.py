@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 9
+EVIDENCE_REPORT_SCHEMA_VERSION = 10
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
 FROZEN_PRESET_SHA256 = (
@@ -1343,6 +1343,14 @@ def _pinned_flash_kda_route_markers(layout: str) -> tuple[str, ...]:
     raise EvidenceSchemaError(f"unsupported pinned FlashKDA layout {layout!r}")
 
 
+_ALL_PINNED_FLASH_KDA_ROUTE_MARKERS = (
+    PINNED_FLASH_KDA_DIRECT_COPY_ACTIVITY_MARKER,
+    PINNED_FLASH_KDA_TILE_PREFIX_ACTIVITY_MARKER,
+    PINNED_FLASH_KDA_PREPARE_ACTIVITY_MARKER,
+    PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER,
+)
+
+
 def _validate_pinned_flash_kda_kernel_route(
     kernel_records: Sequence[dict],
     *,
@@ -1363,13 +1371,17 @@ def _validate_pinned_flash_kda_kernel_route(
         raise EvidenceSchemaError(
             f"{label} is not the exact ordered pinned FlashKDA {layout} raw route"
         )
-    if any(
-        marker not in record["name"]
-        for marker, record in zip(expected_markers, kernel_records, strict=True)
-    ):
-        raise EvidenceSchemaError(
-            f"{label} is not the exact ordered pinned FlashKDA {layout} raw route"
+    for expected_marker, record in zip(expected_markers, kernel_records, strict=True):
+        matched_markers = tuple(
+            marker
+            for marker in _ALL_PINNED_FLASH_KDA_ROUTE_MARKERS
+            if marker in record["name"]
         )
+        if matched_markers != (expected_marker,):
+            raise EvidenceSchemaError(
+                f"{label} is not the exact ordered pinned FlashKDA {layout} raw "
+                "route with one-hot stage markers"
+            )
     if any(
         current["end_ns"] > following["start_ns"]
         for current, following in zip(kernel_records, kernel_records[1:], strict=False)
@@ -1508,6 +1520,21 @@ def _validate_raw_sample(
         _validate_prepared_raw_sample(
             sample["prepared_recurrence"], label=f"{label} prepared recurrence"
         )
+        recurrence_record = candidate_recurrence_records[0]
+        recurrence_launches = [
+            launch
+            for launch in launches
+            if launch["correlation_id"] == recurrence_record["correlation_id"]
+        ]
+        prepared_sample = sample["prepared_recurrence"]
+        if (
+            prepared_sample["activity_order"] != [recurrence_record]
+            or prepared_sample["launch_activity_order"] != recurrence_launches
+        ):
+            raise EvidenceSchemaError(
+                f"{label} prepared recurrence is not derived from the same public "
+                "sample activity and logical launch records"
+            )
     elif path_name == "flash_kda_raw":
         if len(activities) != len(kernel_records) or copy_records:
             raise EvidenceSchemaError(
