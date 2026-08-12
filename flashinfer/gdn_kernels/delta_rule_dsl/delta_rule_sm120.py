@@ -184,15 +184,15 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         o_head_idx = bx % num_sab_heads
         q_head_idx = o_head_idx * num_q_heads // num_sab_heads
         v_head_idx = o_head_idx * num_v_heads // num_sab_heads
-        tok_start = cutlass.Int32(cu_seqlens[seq_idx])
-        tok_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
+        tok_start = cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(cu_seqlens[seq_idx + 1] - tok_start)
 
         return WorkDesc(
             seq_idx=seq_idx,
             private_q_head_idx=q_head_idx,
             private_v_head_idx=v_head_idx,
             tok_offset=tok_start,
-            seq_len=tok_end - tok_start,
+            seq_len=seq_len,
             tile_idx=cutlass.Int32(0),
         )
 
@@ -503,7 +503,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         v_pipeline,
         v_producer_state,
         blk: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -596,7 +596,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         g_alpha: cute.Tensor,
         blk_tok: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         alpha_stage: cutlass.Int32,
@@ -623,7 +623,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         sBeta: cute.Tensor,
         g_beta: cute.Tensor,
         blk_tok: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         beta_stage: cutlass.Int32,
@@ -1074,7 +1074,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         k_pipeline,
         v_pipeline,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -1124,8 +1124,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         alpha_pipeline,
         scale: cutlass.Float32,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_start,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
     ):
@@ -1160,8 +1160,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_beta: cute.Tensor,
         beta_pipeline,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_start,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
     ):

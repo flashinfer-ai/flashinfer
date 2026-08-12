@@ -104,7 +104,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         sK_DS: cute.Tensor,
         k_pipeline,
         k_producer_state,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         head_idx: cutlass.Int32,
     ):
         mK = cute.domain_offset(
@@ -135,7 +135,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         sBeta: cute.Tensor,
         beta_pipeline,
         beta_producer_state,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         head_idx: cutlass.Int32,
         valid_len: cutlass.Int32,
         num_heads: cutlass.Int32,
@@ -326,9 +326,8 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         sab_head_idx = bx % num_sab_heads
         k_head_idx = sab_head_idx * num_k_heads // num_sab_heads
         block_idx_in_seq = bx // num_sab_heads
-        seq_start = cutlass.Int32(cu_seqlens[seq_idx])
-        seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
+        seq_start = cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(cu_seqlens[seq_idx + 1] - seq_start)
         num_blocks = chunks_for_len(seq_len, self.BLK)
         if block_idx_in_seq < num_blocks:
             tok_offset = seq_start + block_idx_in_seq * self.BLK
@@ -750,7 +749,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         sTensor: cute.Tensor,
         tensor_pipeline,
         tensor_producer_state,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         t_block_start: cutlass.Int32,
         head_idx: cutlass.Int32,
         blk: cutlass.Int32,
@@ -796,7 +795,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         self,
         g_alpha: cute.Tensor,
         sAlpha: cute.Tensor,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         head_idx: cutlass.Int32,
         blk: cutlass.Int32,
         chunk_len: cutlass.Int32,
@@ -1020,7 +1019,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         sTensor: cute.Tensor,
         tensor_pipeline,
         tensor_producer_state,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         t_block_start: cutlass.Int32,
         head_idx: cutlass.Int32,
         num_blocks: cutlass.Int32,
@@ -1048,7 +1047,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         alpha_pipeline,
         alpha_producer_state,
-        tok_offset: cutlass.Int32,
+        tok_offset,
         head_idx: cutlass.Int32,
         chunk_len: cutlass.Int32,
         num_blocks: cutlass.Int32,
@@ -1377,9 +1376,8 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         k_head_idx = sab_head_idx * num_k_heads // num_sab_heads
         v_head_idx = sab_head_idx * num_v_heads // num_sab_heads
         chunk_idx_in_seq = bx // num_sab_heads
-        seq_start = cutlass.Int32(g_cu_seqlens[seq_idx])
-        seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
+        seq_start = g_cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(g_cu_seqlens[seq_idx + 1] - seq_start)
         num_cp_chunks = chunks_for_len(seq_len, chunk_len)
         is_valid_chunk = chunk_idx_in_seq < num_cp_chunks
 
@@ -2188,9 +2186,8 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         head_seq_idx = bx // self.row_ctas
         head_idx = head_seq_idx % num_heads
         seq_idx = head_seq_idx // num_heads
-        seq_start = cutlass.Int32(g_cu_seqlens[seq_idx])
-        seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
+        seq_start = g_cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(g_cu_seqlens[seq_idx + 1] - seq_start)
         num_chunks = chunks_for_len(seq_len, chunk_len)
         chunk_start = varlen_chunk_idx(seq_idx, seq_start, 0, chunk_len)
 
@@ -2721,9 +2718,9 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         head_seq_idx = bx // self.row_ctas
         head_idx = head_seq_idx % num_heads
         seq_idx = head_seq_idx // num_heads
-        seq_start = cutlass.Int32(g_cu_seqlens[seq_idx])
-        seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
+        seq_start = g_cu_seqlens[seq_idx]
+        seq_end = g_cu_seqlens[seq_idx + 1]
+        seq_len = cutlass.Int32(seq_end - seq_start)
         num_chunks = chunks_for_len(seq_len, chunk_len)
         chunk_start = varlen_chunk_idx(seq_idx, seq_start, 0, chunk_len)
         gap_start = chunk_start + num_chunks
@@ -3303,7 +3300,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         v_pipeline,
         v_producer_state,
         blk: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -3392,7 +3389,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         g_alpha: cute.Tensor,
         blk_tok: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         alpha_stage: cutlass.Int32,
@@ -3426,7 +3423,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         k_pipeline,
         v_pipeline,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -3476,8 +3473,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         alpha_pipeline,
         scale: cutlass.Float32,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_start,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
     ):
@@ -4792,9 +4789,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         k_head_idx = o_head_idx * num_k_heads // num_sab_heads
         v_head_idx = o_head_idx * num_v_heads // num_sab_heads
         chunk_idx_in_seq = bx // num_sab_heads
-        seq_start = cutlass.Int32(g_cu_seqlens[seq_idx])
-        seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
+        seq_start = g_cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(g_cu_seqlens[seq_idx + 1] - seq_start)
         num_cp_chunks = chunks_for_len(seq_len, chunk_len)
         is_valid_chunk = chunk_idx_in_seq < num_cp_chunks
 
