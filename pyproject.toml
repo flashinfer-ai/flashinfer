@@ -80,6 +80,15 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.hpp",
   "instantiations/*.cu",
 ]
+# Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+# runtime; registered so non-editable installs ship them (PR #4069).
+"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+  "*.md",
+  "src/a2a/*.cu",
+  "src/a2a/*.cuh",
+  "src/fp8_gemm/*.cu",
+  "src/fp8_gemm/*.cuh",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]

@@ -102,14 +102,20 @@ band, that is a real signal, not marginality.
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
 
-- **unit** — host-only pytest (mocks + single-GPU). One test,
-  `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`, runs
-  in a second pytest process: inside the full ~200-test run it crashes the
-  interpreter (`Fatal Python error: Aborted`) during the nvfp4 layer warmup's
-  kernel-module imports — process-heap state from the preceding in-suite GPU
-  work, not a kernel or test bug (passes 100% standalone, per-file, and in
-  every subset tried; observed 2026-07-22 → deterministic 2026-08-12, B200,
-  dsl 4.6.1). If the isolated invocation ever fails, that is a real signal.
+- **unit** — host-only pytest (mocks + single-GPU). The full run accumulates
+  native heap damage somewhere in the GPU/DSL/transport stack: with every
+  test PASSING, the process aborts either (a) at the first heavy
+  import/compile burst — historically
+  `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`
+  (`Fatal Python error: Aborted` in the nvfp4 warmup's module imports) — or
+  (b) in CPython teardown after the pytest summary
+  (`malloc(): unaligned tcache chunk detected`, job 2388315). Not a kernel
+  or test bug: everything passes standalone, per-file, and in every subset
+  tried (observed since 2026-07-22; B200, dsl 4.6.1). `run_tests.sh unit`
+  therefore (1) runs that test in its own pytest process and (2) exits both
+  processes via `os._exit(pytest_rc)` to skip interpreter finalization. If
+  the isolated invocation ever FAILS (not crashes), that is a real signal.
+  Root cause still open — needs an ASAN/valgrind pass over the suite.
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
@@ -458,7 +464,9 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo; a push-style tree will be added later)
+  (a fork of the same kernel repo)
+- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
+  JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The

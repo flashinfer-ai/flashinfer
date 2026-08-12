@@ -24,7 +24,7 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
-  backends/mega/kernel/sm90/fp8_fp8_bf16_pull_cutedsl
+  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
@@ -35,6 +35,9 @@ moe_ep/
   kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
     src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
+  kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
+    src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
+    shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
   modes/{split_layer,mega_layer,config}.py
 ```
 
