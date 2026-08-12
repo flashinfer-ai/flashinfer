@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 from kda_h12_evidence import (
+    load_candidate_source_expectation,
     load_preset,
     reduce_dual_arch_receipts,
     write_json_atomic,
@@ -45,7 +46,15 @@ def main() -> None:
     parser.add_argument("--sm100a", type=Path, required=True)
     parser.add_argument("--sm103a", type=Path, required=True)
     parser.add_argument("--expected-flashinfer-commit", required=True)
+    parser.add_argument(
+        "--expected-flashinfer-source-manifest", type=Path, required=True
+    )
+    parser.add_argument("--expected-flashinfer-source-manifest-sha256", required=True)
     parser.add_argument("--expected-fla-commit", required=True)
+    parser.add_argument("--expected-sm100a-run-id", required=True)
+    parser.add_argument("--expected-sm103a-run-id", required=True)
+    parser.add_argument("--expected-sm100a-receipt-sha256", required=True)
+    parser.add_argument("--expected-sm103a-receipt-sha256", required=True)
     parser.add_argument("--preset", type=Path, default=DEFAULT_PRESET)
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
@@ -57,8 +66,16 @@ def main() -> None:
         sm103a_report=sm103a,
         sm100a_receipt_sha256=sm100a_sha256,
         sm103a_receipt_sha256=sm103a_sha256,
-        expected_candidate_commit=args.expected_flashinfer_commit,
+        expected_sm100a_receipt_sha256=args.expected_sm100a_receipt_sha256,
+        expected_sm103a_receipt_sha256=args.expected_sm103a_receipt_sha256,
+        expected_candidate=load_candidate_source_expectation(
+            manifest_path=args.expected_flashinfer_source_manifest,
+            expected_manifest_sha256=(args.expected_flashinfer_source_manifest_sha256),
+            expected_candidate_commit=args.expected_flashinfer_commit,
+        ),
         expected_fla_commit=args.expected_fla_commit,
+        expected_sm100a_run_id=args.expected_sm100a_run_id,
+        expected_sm103a_run_id=args.expected_sm103a_run_id,
         preset=load_preset(args.preset),
     )
     result["receipts"]["sm100a"]["path"] = str(args.sm100a.resolve())

@@ -32,7 +32,7 @@ import statistics
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Sequence
 
 
@@ -42,9 +42,9 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 10
+EVIDENCE_REPORT_SCHEMA_VERSION = 11
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
-DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
+DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 4
 FROZEN_PRESET_SHA256 = (
     "eef38e8697e2818822186f6c0537c34c1defa41e0b0e08ee272448103a3cf314"
 )
@@ -94,7 +94,12 @@ REQUIRED_CANDIDATE_SOURCE_PATHS = (
     "benchmarks/kda_h12_evidence.py",
     "benchmarks/presets/recurrent_kda_prefill_h12_phase_a.json",
     "benchmarks/reduce_kda_h12_phase_a.py",
+    "benchmarks/test_kda_h12_evidence.py",
+    "benchmarks/KDA_H12_PHASE_A.md",
     GRAPH_TEST_SOURCE,
+    "tests/jit/test_flash_kda_jit.py",
+    "tests/jit/test_flash_kda_packed_t1_jit.py",
+    "docs/api/kda_prefill.rst",
 )
 
 PUBLIC_TIMING_SCOPE = (
@@ -137,6 +142,125 @@ CUPTI_MEMCPY_KIND_DEVICE_TO_DEVICE = 8
 
 class EvidenceSchemaError(ValueError):
     """Raised when checked-in evidence input or activity shape is invalid."""
+
+
+@dataclass(frozen=True)
+class CandidateSourceExpectation:
+    """Candidate commit and source hashes fixed outside the evidence receipt."""
+
+    source_commit: str
+    manifest_sha256: str
+    source_sha256: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{40}", self.source_commit) is None:
+            raise EvidenceSchemaError("expected FlashInfer commit is not exact")
+        if re.fullmatch(r"[0-9a-f]{64}", self.manifest_sha256) is None:
+            raise EvidenceSchemaError(
+                "expected FlashInfer source manifest SHA-256 is not exact"
+            )
+        expected_paths = tuple(REQUIRED_CANDIDATE_SOURCE_PATHS)
+        observed_paths = tuple(path for path, _ in self.source_sha256)
+        if observed_paths != expected_paths:
+            raise EvidenceSchemaError(
+                "expected FlashInfer source manifest paths/order are not exact"
+            )
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for _, digest in self.source_sha256
+        ):
+            raise EvidenceSchemaError(
+                "expected FlashInfer source manifest contains an invalid SHA-256"
+            )
+
+    @property
+    def source_hashes(self) -> dict[str, str]:
+        return dict(self.source_sha256)
+
+    @property
+    def binding_sha256(self) -> str:
+        payload = {
+            "schema_version": 1,
+            "source_commit": self.source_commit,
+            "manifest_sha256": self.manifest_sha256,
+            "source_sha256": list(self.source_sha256),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+def load_candidate_source_expectation(
+    *,
+    manifest_path: Path,
+    expected_manifest_sha256: str,
+    expected_candidate_commit: str,
+) -> CandidateSourceExpectation:
+    """Load the sealed GNU SHA-256 manifest used as an external trust root."""
+
+    raw_bytes = Path(manifest_path).read_bytes()
+    actual_manifest_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_manifest_sha256 != expected_manifest_sha256:
+        raise EvidenceSchemaError(
+            "FlashInfer source manifest differs from its external SHA-256"
+        )
+    try:
+        text = raw_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise EvidenceSchemaError("FlashInfer source manifest must be ASCII") from error
+    if not text.endswith("\n") or "\r" in text:
+        raise EvidenceSchemaError(
+            "FlashInfer source manifest must use canonical LF-terminated lines"
+        )
+    rows: list[tuple[str, str]] = []
+    for index, line in enumerate(text.splitlines()):
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^\s]+)", line)
+        if match is None:
+            raise EvidenceSchemaError(
+                f"FlashInfer source manifest row {index} is malformed"
+            )
+        digest, path = match.groups()
+        parsed = PurePosixPath(path)
+        raw_parts = path.split("/")
+        if (
+            parsed.is_absolute()
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in raw_parts)
+        ):
+            raise EvidenceSchemaError(
+                f"FlashInfer source manifest row {index} has an unsafe path"
+            )
+        rows.append((path, digest))
+    return CandidateSourceExpectation(
+        source_commit=expected_candidate_commit,
+        manifest_sha256=expected_manifest_sha256,
+        source_sha256=tuple(rows),
+    )
+
+
+def canonical_receipt_sha256(payload: dict) -> str:
+    """Hash the exact canonical JSON encoding emitted by ``write_json_atomic``."""
+
+    encoded = (
+        json.dumps(payload, indent=2, allow_nan=False, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_exact_compute_capability(value: object, expected: list[int]) -> bool:
+    """Reject bool-as-int and non-list encodings of a CUDA capability pair."""
+
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(type(component) is int for component in value)
+        and value == expected
+    )
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -615,7 +739,10 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
             "FlashKDA build architecture must be sm100a or sm103a"
         )
     expected_capabilities = {"sm100a": [10, 0], "sm103a": [10, 3]}
-    if hardware["compute_capability"] != expected_capabilities[hardware["cuda_arch"]]:
+    if not _is_exact_compute_capability(
+        hardware["compute_capability"],
+        expected_capabilities[hardware["cuda_arch"]],
+    ):
         raise EvidenceSchemaError(
             "FlashKDA build architecture and compute capability disagree"
         )
@@ -864,6 +991,83 @@ def _activity_identity(activity: GpuActivity) -> dict:
     return payload
 
 
+def _case_trace_fingerprint(case: CasePreset) -> str:
+    """Bind timing samples to one exact frozen case and its tensor shapes."""
+
+    num_sequences = len(case.seq_lens)
+    total_tokens = case.total_tokens
+    payload = {
+        "name": case.name,
+        "layout": case.layout,
+        "seq_lens": list(case.seq_lens),
+        "total_tokens": total_tokens,
+        "num_sequences": num_sequences,
+        "seed": case.seed,
+        "num_heads": 12,
+        "head_dim_qk": 128,
+        "head_dim_vo": 128,
+        "dtype": "bfloat16",
+        "initial_state": "provided_bfloat16",
+        "variant": "m128_n16",
+        "tensor_shapes": {
+            "q": [1, total_tokens, 12, 128],
+            "k": [1, total_tokens, 12, 128],
+            "v": [1, total_tokens, 12, 128],
+            "g": [1, total_tokens, 12, 128],
+            "beta": [1, total_tokens, 12],
+            "initial_state": [num_sequences, 12, 128, 128],
+        },
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _trace_context(
+    *,
+    run_id: str,
+    case: CasePreset,
+    case_index: int,
+    path: str,
+    block_index: int,
+    order_index: int,
+) -> dict:
+    """Return the exact identity fixed before one CUPTI trace batch starts."""
+
+    trace_ordinal = (
+        case_index * PHASE_A_MEASUREMENT_CONTRACT["blocks"] + block_index
+    ) * len(REQUIRED_TIMING_PATHS) + order_index
+    payload = {
+        "run_id": run_id,
+        "trace_ordinal": trace_ordinal,
+        "dropped_records": 0,
+        "preset_sha256": FROZEN_PRESET_SHA256,
+        "case_index": case_index,
+        "case_name": case.name,
+        "case_fingerprint": _case_trace_fingerprint(case),
+        "path": path,
+        "block_index": block_index,
+        "order_index": order_index,
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {**payload, "trace_id": hashlib.sha256(canonical).hexdigest()}
+
+
+def _trace_scope(*, trace_context: dict, sample_index: int) -> dict:
+    """Bind one measured invocation to its predeclared trace and sample slot."""
+
+    return {**trace_context, "sample_index": sample_index}
+
+
 def _launch_identity(launch: LaunchActivity) -> dict:
     payload = asdict(launch)
     payload["duration_ms"] = (launch.end_ns - launch.start_ns) / 1e6
@@ -877,6 +1081,7 @@ def _correlated_sample(
     launches: Sequence[LaunchActivity],
     activities: Sequence[GpuActivity],
     require_h12_public_route: bool,
+    trace_context: dict | None = None,
 ) -> dict:
     _validate_timestamp_range(bracket.start_ns, bracket.submitted_ns, "CPU submission")
     _validate_timestamp_range(
@@ -889,6 +1094,10 @@ def _correlated_sample(
         for launch in launches
         if bracket.start_ns <= launch.start_ns <= bracket.submitted_ns
     ]
+    if any(launch.end_ns > bracket.submitted_ns for launch in selected_launches):
+        raise EvidenceSchemaError(
+            f"sample {sample_index} contains a launch after its submitted boundary"
+        )
     correlation_ids = {launch.correlation_id for launch in selected_launches}
     selected_activities = sorted(
         (
@@ -903,7 +1112,9 @@ def _correlated_sample(
             f"sample {sample_index} has no GPU activities correlated to its host call"
         )
     if any(
-        activity.end_ns > bracket.synchronized_ns for activity in selected_activities
+        activity.start_ns < bracket.start_ns
+        or activity.end_ns > bracket.synchronized_ns
+        for activity in selected_activities
     ):
         raise EvidenceSchemaError(
             f"sample {sample_index} contains an activity after its synchronized boundary"
@@ -930,6 +1141,7 @@ def _correlated_sample(
     public_metrics = _interval_metrics(selected_activities)
     result = {
         "sample_index": sample_index,
+        "cpu_bracket": asdict(bracket),
         **public_metrics,
         "submission_ms": (bracket.submitted_ns - bracket.start_ns) / 1e6,
         "synchronized_e2e_ms": (bracket.synchronized_ns - bracket.start_ns) / 1e6,
@@ -946,6 +1158,13 @@ def _correlated_sample(
         "copy_activity_names": [activity.name for activity in copies],
         "activity_order": [_activity_identity(item) for item in selected_activities],
     }
+    if trace_context is not None:
+        result["trace_scope"] = _trace_scope(
+            trace_context=trace_context,
+            sample_index=sample_index,
+        )
+        result["block_index"] = trace_context["block_index"]
+        result["order_index"] = trace_context["order_index"]
     if require_h12_public_route:
         beta_pack = [
             activity
@@ -996,6 +1215,7 @@ def correlate_samples(
     launches: Iterable[LaunchActivity],
     activities: Iterable[GpuActivity],
     require_h12_public_route: bool = False,
+    trace_context: dict | None = None,
 ) -> list[dict]:
     """Correlate CPU brackets to named GPU activities and reduce every sample."""
 
@@ -1015,6 +1235,7 @@ def correlate_samples(
                 launches=launch_list[lo:hi],
                 activities=activity_list,
                 require_h12_public_route=require_h12_public_route,
+                trace_context=trace_context,
             )
         )
     return samples
@@ -1191,9 +1412,9 @@ def _validate_activity_records(
             type(start_ns) is not int
             or type(end_ns) is not int
             or type(record["correlation_id"]) is not int
-            or record["correlation_id"] < 0
+            or record["correlation_id"] <= 0
             or start_ns < previous_start
-            or start_ns < 0
+            or start_ns <= 0
             or end_ns < start_ns
             or record["kind"] not in allowed_kinds
             or not isinstance(record["name"], str)
@@ -1222,11 +1443,11 @@ def _validate_activity_launch_correlations(
     *,
     label: str,
 ) -> None:
-    """Bind each GPU activity to one logical runtime/driver launch.
+    """Bind each GPU activity to exactly one runtime or driver API invocation.
 
-    CUPTI may emit both a runtime API record and a driver API record for one
-    logical launch.  They share one correlation ID and are both preserved in
-    raw evidence.  The GPU side remains one activity per logical correlation.
+    CUPTI assigns a unique correlation ID to every API invocation. The GPU
+    activity carries the ID of the single invocation that launched it; a
+    runtime and driver record therefore cannot share one correlation ID.
     """
 
     activity_by_correlation: dict[int, dict] = {}
@@ -1247,19 +1468,62 @@ def _validate_activity_launch_correlations(
         )
     for correlation_id, activity in activity_by_correlation.items():
         correlated_launches = launches_by_correlation[correlation_id]
-        launch_kinds = [launch["kind"] for launch in correlated_launches]
         if (
-            not 1 <= len(correlated_launches) <= 2
-            or len(set(launch_kinds)) != len(launch_kinds)
-            or any(
-                launch["start_ns"] > activity["start_ns"]
-                for launch in correlated_launches
-            )
+            len(correlated_launches) != 1
+            or correlated_launches[0]["start_ns"] > activity["start_ns"]
         ):
             raise EvidenceSchemaError(
                 f"{label} does not provide one timely logical launch correlation "
                 "per GPU activity"
             )
+
+
+def _validate_cpu_bracket(
+    sample: dict,
+    launches: Sequence[dict],
+    activities: Sequence[dict],
+    *,
+    label: str,
+) -> None:
+    bracket = sample["cpu_bracket"]
+    if not isinstance(bracket, dict):
+        raise EvidenceSchemaError(f"{label} CPU bracket must be an object")
+    _require_exact_keys(
+        bracket,
+        {"start_ns", "submitted_ns", "synchronized_ns"},
+        f"{label} CPU bracket",
+    )
+    start_ns = bracket["start_ns"]
+    submitted_ns = bracket["submitted_ns"]
+    synchronized_ns = bracket["synchronized_ns"]
+    if (
+        type(start_ns) is not int
+        or type(submitted_ns) is not int
+        or type(synchronized_ns) is not int
+        or not 0 < start_ns < submitted_ns < synchronized_ns
+    ):
+        raise EvidenceSchemaError(f"{label} CPU bracket timestamps are malformed")
+    if any(
+        launch["start_ns"] < start_ns or launch["end_ns"] > submitted_ns
+        for launch in launches
+    ):
+        raise EvidenceSchemaError(
+            f"{label} launch activity falls outside its CPU submission bracket"
+        )
+    if any(
+        activity["start_ns"] < start_ns or activity["end_ns"] > synchronized_ns
+        for activity in activities
+    ):
+        raise EvidenceSchemaError(
+            f"{label} GPU activity falls outside its synchronized CPU bracket"
+        )
+    if (
+        sample["submission_ms"] != (submitted_ns - start_ns) / 1e6
+        or sample["synchronized_e2e_ms"] != (synchronized_ns - start_ns) / 1e6
+    ):
+        raise EvidenceSchemaError(
+            f"{label} host timing metrics do not match its raw CPU bracket"
+        )
 
 
 def _validate_prepared_raw_sample(sample: object, *, label: str) -> None:
@@ -1401,9 +1665,12 @@ def _validate_raw_sample(
     order_index: int,
     sample_index: int,
     expected_final_state_bytes: int,
+    expected_trace_scope: dict,
 ) -> None:
     expected_keys = {
         "sample_index",
+        "cpu_bracket",
+        "trace_scope",
         *_PUBLIC_NUMERIC_FIELDS,
         "launch_activity_names",
         "launch_activity_order",
@@ -1421,11 +1688,29 @@ def _validate_raw_sample(
         raise EvidenceSchemaError(f"{label} must be an object")
     _require_exact_keys(sample, expected_keys, label)
     if (
-        sample["sample_index"] != sample_index
+        type(sample["sample_index"]) is not int
+        or type(sample["block_index"]) is not int
+        or type(sample["order_index"]) is not int
+        or sample["sample_index"] != sample_index
         or sample["block_index"] != block_index
         or sample["order_index"] != order_index
     ):
         raise EvidenceSchemaError(f"{label} sample/block/order identity is wrong")
+    trace_scope = sample["trace_scope"]
+    if not isinstance(trace_scope, dict) or any(
+        type(trace_scope.get(field)) is not int
+        for field in (
+            "trace_ordinal",
+            "dropped_records",
+            "case_index",
+            "block_index",
+            "order_index",
+            "sample_index",
+        )
+    ):
+        raise EvidenceSchemaError(f"{label} trace scope integer identity is malformed")
+    if sample["trace_scope"] != expected_trace_scope:
+        raise EvidenceSchemaError(f"{label} trace scope is not the exact frozen case")
     for field in _PUBLIC_NUMERIC_FIELDS:
         if field.endswith("_count"):
             if type(sample[field]) is not int or sample[field] < 0:
@@ -1476,6 +1761,7 @@ def _validate_raw_sample(
     ):
         raise EvidenceSchemaError(f"{label} activity counts/names are inconsistent")
     _validate_activity_launch_correlations(activities, launches, label=label)
+    _validate_cpu_bracket(sample, launches, activities, label=label)
     recomputed = _interval_metrics(
         [
             GpuActivity(
@@ -1585,6 +1871,9 @@ def _validate_timing_summary(
     *,
     path_name: str,
     layout: str,
+    expected_case: CasePreset,
+    case_index: int,
+    run_id: str,
     expected_sample_count: int,
     expected_final_state_bytes: int,
 ) -> None:
@@ -1638,6 +1927,17 @@ def _validate_timing_summary(
             order_index=order_index,
             sample_index=sample_index,
             expected_final_state_bytes=expected_final_state_bytes,
+            expected_trace_scope=_trace_scope(
+                trace_context=_trace_context(
+                    run_id=run_id,
+                    case=expected_case,
+                    case_index=case_index,
+                    path=path_name,
+                    block_index=block_index,
+                    order_index=order_index,
+                ),
+                sample_index=sample_index,
+            ),
         )
     derived_arrays = {
         "launch_activity_names_samples": [
@@ -1751,6 +2051,7 @@ def _require_oracle(
                 {
                     "passed",
                     "max_abs",
+                    "max_reference_abs",
                     "max_allowed_abs",
                     "mismatch_count",
                     "atol",
@@ -1764,6 +2065,9 @@ def _require_oracle(
         max_allowed_abs = (
             result.get("max_allowed_abs") if isinstance(result, dict) else None
         )
+        max_reference_abs = (
+            result.get("max_reference_abs") if isinstance(result, dict) else None
+        )
         passed = result.get("passed") if isinstance(result, dict) else None
         mismatch_count = (
             result.get("mismatch_count") if isinstance(result, dict) else None
@@ -1775,10 +2079,16 @@ def _require_oracle(
             or not isinstance(max_abs, (int, float))
             or not math.isfinite(max_abs)
             or max_abs < 0
+            or isinstance(max_reference_abs, bool)
+            or not isinstance(max_reference_abs, (int, float))
+            or not math.isfinite(max_reference_abs)
+            or max_reference_abs < 0
             or isinstance(max_allowed_abs, bool)
             or not isinstance(max_allowed_abs, (int, float))
             or not math.isfinite(max_allowed_abs)
             or max_allowed_abs < 0
+            or max_allowed_abs
+            != BF16_CORRECTNESS_ATOL + BF16_CORRECTNESS_RTOL * max_reference_abs
             or type(mismatch_count) is not int
             or mismatch_count < 0
             or result.get("atol") != BF16_CORRECTNESS_ATOL
@@ -1800,6 +2110,8 @@ def _validate_case_receipt(
     case: dict,
     expected: CasePreset,
     *,
+    case_index: int,
+    run_id: str,
     expected_sample_count: int,
 ) -> None:
     expected_identity = {
@@ -1892,6 +2204,9 @@ def _validate_case_receipt(
             timings[path_name],
             path_name=path_name,
             layout=expected.layout,
+            expected_case=expected,
+            case_index=case_index,
+            run_id=run_id,
             expected_sample_count=expected_sample_count,
             expected_final_state_bytes=(len(expected.seq_lens) * 12 * 128 * 128 * 2),
         )
@@ -1957,6 +2272,95 @@ def _validate_case_receipt(
         )
 
 
+def _validate_receipt_timing_ledger(
+    cases: Sequence[dict],
+    preset: EvidencePreset,
+    *,
+    run_id: str,
+) -> None:
+    """Validate one fresh, canonically ordered CUPTI ledger for the receipt."""
+
+    repeat_iters = PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+    blocks = PHASE_A_MEASUREMENT_CONTRACT["blocks"]
+    base_order = list(REQUIRED_TIMING_PATHS)
+    previous_synchronized_ns: int | None = None
+    seen_trace_ids: set[str] = set()
+    seen_gpu_correlations: set[int] = set()
+    seen_launch_correlations: set[int] = set()
+    sample_count = 0
+    for case_index, (case, expected_case) in enumerate(
+        zip(cases, preset.cases, strict=True)
+    ):
+        for block_index in range(blocks):
+            block_order = (
+                base_order if block_index % 2 == 0 else list(reversed(base_order))
+            )
+            for order_index, path_name in enumerate(block_order):
+                expected_context = _trace_context(
+                    run_id=run_id,
+                    case=expected_case,
+                    case_index=case_index,
+                    path=path_name,
+                    block_index=block_index,
+                    order_index=order_index,
+                )
+                trace_id = expected_context["trace_id"]
+                if trace_id in seen_trace_ids:
+                    raise EvidenceSchemaError("receipt timing ledger reuses a trace ID")
+                seen_trace_ids.add(trace_id)
+                raw_samples = case["timings"][path_name]["raw_samples"]
+                block_samples = raw_samples[
+                    block_index * repeat_iters : (block_index + 1) * repeat_iters
+                ]
+                for sample_index, sample in enumerate(block_samples):
+                    expected_scope = _trace_scope(
+                        trace_context=expected_context,
+                        sample_index=sample_index,
+                    )
+                    if sample["trace_scope"] != expected_scope:
+                        raise EvidenceSchemaError(
+                            "receipt timing ledger has a noncanonical trace scope"
+                        )
+                    bracket = sample["cpu_bracket"]
+                    start_ns = bracket["start_ns"]
+                    synchronized_ns = bracket["synchronized_ns"]
+                    if (
+                        previous_synchronized_ns is not None
+                        and start_ns <= previous_synchronized_ns
+                    ):
+                        raise EvidenceSchemaError(
+                            "receipt timing ledger is replayed, overlapping, or out "
+                            "of canonical execution order"
+                        )
+                    previous_synchronized_ns = synchronized_ns
+                    for activity in sample["activity_order"]:
+                        correlation_id = activity["correlation_id"]
+                        if correlation_id in seen_gpu_correlations:
+                            raise EvidenceSchemaError(
+                                "receipt timing ledger reuses a GPU correlation ID"
+                            )
+                        seen_gpu_correlations.add(correlation_id)
+                    for launch in sample["launch_activity_order"]:
+                        correlation_id = launch["correlation_id"]
+                        if correlation_id in seen_launch_correlations:
+                            raise EvidenceSchemaError(
+                                "receipt timing ledger reuses a logical launch "
+                                "correlation ID"
+                            )
+                        seen_launch_correlations.add(correlation_id)
+                    sample_count += 1
+    expected_count = (
+        len(preset.cases) * blocks * len(REQUIRED_TIMING_PATHS) * repeat_iters
+    )
+    if sample_count != expected_count:
+        raise EvidenceSchemaError("receipt timing ledger denominator is incomplete")
+    expected_trace_count = len(preset.cases) * blocks * len(REQUIRED_TIMING_PATHS)
+    if len(seen_trace_ids) != expected_trace_count:
+        raise EvidenceSchemaError(
+            "receipt timing ledger trace denominator is incomplete"
+        )
+
+
 def _validate_graph_receipt(graph: object) -> None:
     if not isinstance(graph, dict):
         raise EvidenceSchemaError("receipt lacks changed-beta CUDA Graph evidence")
@@ -2012,20 +2416,25 @@ def validate_per_arch_receipt(
     report: dict,
     *,
     expected_arch: str,
-    expected_candidate_commit: str,
+    expected_candidate: CandidateSourceExpectation,
     expected_fla_commit: str,
+    expected_run_id: str,
     preset: EvidencePreset,
 ) -> dict:
     """Validate one complete per-architecture receipt and return its identity."""
 
-    _require_commit(expected_candidate_commit, "expected FlashInfer commit")
+    if not isinstance(expected_candidate, CandidateSourceExpectation):
+        raise EvidenceSchemaError("expected FlashInfer source binding is required")
     _require_commit(expected_fla_commit, "expected FLA commit")
+    if re.fullmatch(r"[0-9a-f]{32}", expected_run_id) is None:
+        raise EvidenceSchemaError("expected allocation run challenge is not exact")
     if not isinstance(report, dict):
         raise EvidenceSchemaError("per-architecture receipt must be an object")
     _require_exact_keys(
         report,
         {
             "schema_version",
+            "run_id",
             "suite",
             "preset",
             "candidate_provenance",
@@ -2041,6 +2450,14 @@ def validate_per_arch_receipt(
     )
     if report.get("schema_version") != EVIDENCE_REPORT_SCHEMA_VERSION:
         raise EvidenceSchemaError("unexpected per-architecture receipt schema")
+    run_id = report.get("run_id")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+        raise EvidenceSchemaError("per-architecture receipt run_id is not exact")
+    if run_id != expected_run_id:
+        raise EvidenceSchemaError(
+            "per-architecture receipt does not match its external allocation run "
+            "challenge"
+        )
     if report.get("suite") != "recurrent_kda_prefill_h12_phase_a":
         raise EvidenceSchemaError("unexpected per-architecture receipt suite")
     if report.get("complete_per_arch_denominator") is not True:
@@ -2092,7 +2509,9 @@ def validate_per_arch_receipt(
             "torch_cuda_version",
         }
         or hardware.get("cuda_arch") != expected_arch
-        or hardware.get("compute_capability") != expected_capabilities[expected_arch]
+        or not _is_exact_compute_capability(
+            hardware.get("compute_capability"), expected_capabilities[expected_arch]
+        )
         or not isinstance(hardware.get("device_name"), str)
         or not hardware["device_name"]
         or not isinstance(hardware.get("device_uuid"), str)
@@ -2163,7 +2582,7 @@ def validate_per_arch_receipt(
         != "https://github.com/flashinfer-ai/flashinfer.git"
         or not isinstance(candidate.get("source_dir"), str)
         or not Path(candidate["source_dir"]).is_absolute()
-        or candidate.get("source_commit") != expected_candidate_commit
+        or candidate.get("source_commit") != expected_candidate.source_commit
         or candidate.get("required_ancestor_revisions") != required_ancestors
         or candidate.get("worktree_clean_including_untracked") is not True
     ):
@@ -2208,6 +2627,10 @@ def validate_per_arch_receipt(
             raise EvidenceSchemaError(
                 f"candidate imported module {module_name} hash differs from source"
             )
+    if source_hashes != expected_candidate.source_hashes:
+        raise EvidenceSchemaError(
+            "candidate source hashes differ from the external sealed manifest"
+        )
 
     baselines = report.get("baselines")
     if not isinstance(baselines, dict) or set(baselines) != {
@@ -2320,6 +2743,10 @@ def validate_per_arch_receipt(
         or current_binding.get("same_python_torch_cuda_runtime") is not True
         or current_binding.get("allocation") != build_manifest["allocation"]
         or current_binding.get("hardware") != expected_binding_hardware
+        or not _is_exact_compute_capability(
+            current_binding["hardware"].get("compute_capability"),
+            expected_capabilities[expected_arch],
+        )
         or current_binding.get("runtime") != expected_binding_runtime
     ):
         raise EvidenceSchemaError(
@@ -2399,14 +2826,19 @@ def validate_per_arch_receipt(
     cases = report.get("cases")
     if not isinstance(cases, list) or len(cases) != len(preset.cases):
         raise EvidenceSchemaError("receipt does not contain exactly six cases")
-    for case, expected_case in zip(cases, preset.cases, strict=True):
+    for case_index, (case, expected_case) in enumerate(
+        zip(cases, preset.cases, strict=True)
+    ):
         if not isinstance(case, dict):
             raise EvidenceSchemaError("receipt case must be an object")
         _validate_case_receipt(
             case,
             expected_case,
+            case_index=case_index,
+            run_id=run_id,
             expected_sample_count=expected_sample_count,
         )
+    _validate_receipt_timing_ledger(cases, preset, run_id=run_id)
     diagnostic_consensus = all(
         case["correctness"]["diagnostic_consensus"] for case in cases
     )
@@ -2417,6 +2849,8 @@ def validate_per_arch_receipt(
         "preset_sha256": FROZEN_PRESET_SHA256,
         "candidate": {
             "source_commit": candidate["source_commit"],
+            "source_manifest_sha256": expected_candidate.manifest_sha256,
+            "source_binding_sha256": expected_candidate.binding_sha256,
             "required_ancestor_revisions": candidate["required_ancestor_revisions"],
             "imported_module_sha256": candidate["imported_module_sha256"],
             "source_sha256": candidate["source_sha256"],
@@ -2446,25 +2880,65 @@ def reduce_dual_arch_receipts(
     sm103a_report: dict,
     sm100a_receipt_sha256: str,
     sm103a_receipt_sha256: str,
-    expected_candidate_commit: str,
+    expected_sm100a_receipt_sha256: str,
+    expected_sm103a_receipt_sha256: str,
+    expected_candidate: CandidateSourceExpectation,
     expected_fla_commit: str,
+    expected_sm100a_run_id: str,
+    expected_sm103a_run_id: str,
     preset: EvidencePreset,
 ) -> dict:
     """Fail closed unless both architecture receipts form one frozen result."""
+
+    sm100a_receipt_sha256 = _require_sha256(sm100a_receipt_sha256, "SM100a receipt")
+    sm103a_receipt_sha256 = _require_sha256(sm103a_receipt_sha256, "SM103a receipt")
+    try:
+        canonical_receipt_hashes = {
+            "sm100a": canonical_receipt_sha256(sm100a_report),
+            "sm103a": canonical_receipt_sha256(sm103a_report),
+        }
+    except (TypeError, ValueError) as error:
+        raise EvidenceSchemaError(
+            "per-architecture receipt is not canonical JSON"
+        ) from error
+    if sm100a_receipt_sha256 != canonical_receipt_hashes["sm100a"]:
+        raise EvidenceSchemaError(
+            "SM100a receipt SHA-256 is not bound to its canonical report payload"
+        )
+    if sm103a_receipt_sha256 != canonical_receipt_hashes["sm103a"]:
+        raise EvidenceSchemaError(
+            "SM103a receipt SHA-256 is not bound to its canonical report payload"
+        )
+    if sm100a_receipt_sha256 != _require_sha256(
+        expected_sm100a_receipt_sha256,
+        "externally recorded SM100a receipt",
+    ):
+        raise EvidenceSchemaError(
+            "SM100a receipt differs from its external allocation digest"
+        )
+    if sm103a_receipt_sha256 != _require_sha256(
+        expected_sm103a_receipt_sha256,
+        "externally recorded SM103a receipt",
+    ):
+        raise EvidenceSchemaError(
+            "SM103a receipt differs from its external allocation digest"
+        )
 
     identities = {
         "sm100a": validate_per_arch_receipt(
             sm100a_report,
             expected_arch="sm100a",
-            expected_candidate_commit=expected_candidate_commit,
+            expected_candidate=expected_candidate,
             expected_fla_commit=expected_fla_commit,
+            expected_run_id=expected_sm100a_run_id,
             preset=preset,
         ),
         "sm103a": validate_per_arch_receipt(
             sm103a_report,
             expected_arch="sm103a",
-            expected_candidate_commit=expected_candidate_commit,
+            expected_candidate=expected_candidate,
             expected_fla_commit=expected_fla_commit,
+            expected_run_id=expected_sm103a_run_id,
             preset=preset,
         ),
     }
@@ -2473,16 +2947,41 @@ def reduce_dual_arch_receipts(
             "SM100a and SM103a receipts do not have exactly matching "
             "preset/candidate/peer/graph identities"
         )
+    if expected_sm100a_run_id == expected_sm103a_run_id:
+        raise EvidenceSchemaError(
+            "SM100a and SM103a receipts must come from distinct evidence runs"
+        )
+
+    def timing_ledger_payload(report: dict) -> list[dict]:
+        """Return raw timing evidence without its caller-selected trace labels."""
+
+        return [
+            {
+                "cpu_bracket": sample["cpu_bracket"],
+                "launch_activity_order": sample["launch_activity_order"],
+                "activity_order": sample["activity_order"],
+            }
+            for case in report["cases"]
+            for path_name in REQUIRED_TIMING_PATHS
+            for sample in case["timings"][path_name]["raw_samples"]
+        ]
+
+    if timing_ledger_payload(sm100a_report) == timing_ledger_payload(sm103a_report):
+        raise EvidenceSchemaError(
+            "SM100a and SM103a receipts replay the same raw timing ledger"
+        )
     return {
         "schema_version": DUAL_ARCH_PROMOTION_SCHEMA_VERSION,
         "suite": "recurrent_kda_prefill_h12_phase_a_dual_arch_promotion",
         "frozen_identity": identities["sm100a"],
         "receipts": {
             "sm100a": {
-                "sha256": _require_sha256(sm100a_receipt_sha256, "SM100a receipt")
+                "sha256": sm100a_receipt_sha256,
+                "run_id": expected_sm100a_run_id,
             },
             "sm103a": {
-                "sha256": _require_sha256(sm103a_receipt_sha256, "SM103a receipt")
+                "sha256": sm103a_receipt_sha256,
+                "run_id": expected_sm103a_run_id,
             },
         },
         "cross_shape_aggregate": None,

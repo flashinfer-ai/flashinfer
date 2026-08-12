@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -101,6 +102,8 @@ def test_checked_in_preset_is_exact_and_per_case_only():
 
 def test_candidate_provenance_binds_exact_n16_import_surface():
     required = set(evidence.REQUIRED_CANDIDATE_SOURCE_PATHS)
+    assert len(evidence.REQUIRED_CANDIDATE_SOURCE_PATHS) == 24
+    assert len(required) == 24
     assert {
         "flashinfer/aot.py",
         "flashinfer/jit/__init__.py",
@@ -113,6 +116,7 @@ def test_candidate_provenance_binds_exact_n16_import_surface():
         "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
         "csrc/kda/flashkda_bf16_fused_m128_import_manifest.json",
         "tools/import-cake-flashkda-prefill",
+        "tests/jit/test_flash_kda_packed_t1_jit.py",
     } <= required
 
 
@@ -510,8 +514,6 @@ def test_h12_public_activity_reduction_preserves_span_decomposition_and_names():
     brackets = [evidence.CpuBracket(100, 250, 1000)]
     launches = [
         evidence.LaunchActivity(110, 120, 7, "runtime", "runtime:cudaLaunchKernel"),
-        evidence.LaunchActivity(130, 140, 8, "runtime", "runtime:cudaLaunchKernel"),
-        evidence.LaunchActivity(115, 125, 7, "driver", "driver:cuLaunchKernel"),
         evidence.LaunchActivity(135, 145, 8, "driver", "driver:cuLaunchKernel"),
         evidence.LaunchActivity(300, 310, 9, "runtime", "runtime:outside"),
     ]
@@ -550,11 +552,11 @@ def test_h12_public_activity_reduction_preserves_span_decomposition_and_names():
     assert report["inter_kernel_gap_ms_samples"] == [0.00005]
     assert report["submission_ms_samples"] == [0.00015]
     assert report["synchronized_e2e_ms_samples"] == [0.0009]
-    assert report["launch_activity_count_samples"] == [4]
+    assert report["launch_activity_count_samples"] == [2]
     assert [
         launch["correlation_id"]
         for launch in report["launch_activity_order_samples"][0]
-    ] == [7, 7, 8, 8]
+    ] == [7, 8]
     assert report["kernel_activity_count_samples"] == [2]
     assert report["kernel_activity_names_samples"] == [
         [
@@ -568,10 +570,8 @@ def test_h12_public_activity_reduction_preserves_span_decomposition_and_names():
     assert prepared["derived_from_same_public_samples"] is True
     assert prepared["includes_beta_pack"] is False
     assert prepared["gpu_span_ms_samples"] == [0.00045]
-    assert prepared["launch_activity_count_samples"] == [2]
-    assert prepared["launch_activity_names_samples"] == [
-        ["runtime:cudaLaunchKernel", "driver:cuLaunchKernel"]
-    ]
+    assert prepared["launch_activity_count_samples"] == [1]
+    assert prepared["launch_activity_names_samples"] == [["driver:cuLaunchKernel"]]
     assert prepared["kernel_activity_count_samples"] == [1]
 
 
@@ -618,6 +618,7 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
     )
     payload = json.loads(completed.stdout)
 
+    assert payload["evidence_report_schema_version"] == 11
     assert payload["gpu_execution"] == "not_requested"
     assert payload["flash_kda_required_revision"] == (
         "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
@@ -650,6 +651,7 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
         "required_architectures": ["sm100a", "sm103a"],
         "reducer": "benchmarks/reduce_kda_h12_phase_a.py",
         "dual_arch_flag": "promotion_complete_dual_arch",
+        "external_run_challenge_required": True,
     }
 
 
@@ -694,18 +696,21 @@ def test_graph_receipt_canonicalizes_symlinked_venv_python(tmp_path, monkeypatch
     assert captured["kwargs"]["cwd"] == runner.REPOSITORY_ROOT
 
 
-def _timing_receipt(name, *, layout, num_sequences):
-    def launch_records(count, *, cbid):
+def _timing_receipt(name, *, case, case_index, run_id):
+    layout = case.layout
+    num_sequences = len(case.seq_lens)
+
+    def launch_records(count, *, cbid, correlation_base):
         return [
             evidence.LaunchActivity(
-                start_ns=base + 1_000 + index * 400 + kind_index * 100,
-                end_ns=base + 1_050 + index * 400 + kind_index * 100,
-                correlation_id=index + 1,
-                kind=kind,
+                start_ns=base + 1_000 + index * 400,
+                end_ns=base + 1_050 + index * 400,
+                correlation_id=correlation_base + index + 1,
+                kind="runtime" if index % 2 == 0 else "driver",
                 name=f"{kind}:cbid={cbid}",
             )
             for index in range(count)
-            for kind_index, kind in enumerate(("runtime", "driver"))
+            for kind in ("runtime" if index % 2 == 0 else "driver",)
         ]
 
     base_order = list(evidence.REQUIRED_TIMING_PATHS)
@@ -716,21 +721,36 @@ def _timing_receipt(name, *, layout, num_sequences):
         for sample_index in range(
             evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
         ):
-            base = (block_index * 100 + sample_index) * 100_000
+            trace_ordinal = (
+                (
+                    case_index * evidence.PHASE_A_MEASUREMENT_CONTRACT["blocks"]
+                    + block_index
+                )
+                * len(evidence.REQUIRED_TIMING_PATHS)
+                + order_index
+            ) * evidence.PHASE_A_MEASUREMENT_CONTRACT[
+                "repeat_iters_per_block"
+            ] + sample_index
+            base = (int(run_id[0], 16) * 1_000 + trace_ordinal + 1) * 100_000
+            correlation_base = trace_ordinal * 16
             if name == "flashinfer_public":
-                launches = launch_records(2, cbid=13)
+                launches = launch_records(
+                    2,
+                    cbid=13,
+                    correlation_base=correlation_base,
+                )
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
                         end_ns=base + 6_500,
-                        correlation_id=1,
+                        correlation_id=correlation_base + 1,
                         kind="kernel",
                         name="void PackBetaForTmaKernel<bf16>",
                     ),
                     evidence.GpuActivity(
                         start_ns=base + 7_000,
                         end_ns=base + 9_000,
-                        correlation_id=2,
+                        correlation_id=correlation_base + 2,
                         kind="kernel",
                         name="kernel_flashkda_bf16_fused_m128",
                     ),
@@ -743,12 +763,13 @@ def _timing_receipt(name, *, layout, num_sequences):
                 launches = launch_records(
                     len(markers) + (name == "flash_kda_public_semantics_adapted"),
                     cbid=211,
+                    correlation_base=correlation_base,
                 )
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000 + index * 700,
                         end_ns=base + 6_400 + index * 700,
-                        correlation_id=index + 1,
+                        correlation_id=correlation_base + index + 1,
                         kind="kernel",
                         name=marker,
                     )
@@ -760,7 +781,7 @@ def _timing_receipt(name, *, layout, num_sequences):
                         evidence.GpuActivity(
                             start_ns=base + 6_000 + copy_index * 700,
                             end_ns=base + 6_400 + copy_index * 700,
-                            correlation_id=copy_index + 1,
+                            correlation_id=correlation_base + copy_index + 1,
                             kind="memcpy",
                             name=(
                                 "MEMCPY(copy_kind=8,bytes="
@@ -769,12 +790,16 @@ def _timing_receipt(name, *, layout, num_sequences):
                         )
                     )
             else:
-                launches = launch_records(1, cbid=13)
+                launches = launch_records(
+                    1,
+                    cbid=13,
+                    correlation_base=correlation_base,
+                )
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
                         end_ns=base + 8_000,
-                        correlation_id=1,
+                        correlation_id=correlation_base + 1,
                         kind="kernel",
                         name="triton_red_fused_kda",
                     )
@@ -789,9 +814,15 @@ def _timing_receipt(name, *, layout, num_sequences):
                 launches=launches,
                 activities=activities,
                 require_h12_public_route=name == "flashinfer_public",
+                trace_context=evidence._trace_context(
+                    run_id=run_id,
+                    case=case,
+                    case_index=case_index,
+                    path=name,
+                    block_index=block_index,
+                    order_index=order_index,
+                ),
             )
-            sample["block_index"] = block_index
-            sample["order_index"] = order_index
             raw_samples.append(sample)
     timing = evidence.summarize_samples(
         raw_samples,
@@ -801,7 +832,7 @@ def _timing_receipt(name, *, layout, num_sequences):
     return timing
 
 
-def _complete_per_arch_report(tmp_path, arch):
+def _complete_per_arch_report(tmp_path, arch, *, run_id=None):
     preset = evidence.load_preset(_preset_path())
     source_dir, package_path, extension_path, _ = _flash_kda_paths(tmp_path / arch)
     build_manifest_path, build_manifest = _build_manifest(
@@ -813,12 +844,14 @@ def _complete_per_arch_report(tmp_path, arch):
     )
     candidate_commit = "1" * 40
     fla_commit = "2" * 40
+    run_id = run_id or (("a" if arch == "sm100a" else "b") * 32)
     cases = []
-    for case in preset.cases:
+    for case_index, case in enumerate(preset.cases):
         oracle_result = {
             "output": {
                 "passed": True,
                 "max_abs": 0.0,
+                "max_reference_abs": 0.0,
                 "max_allowed_abs": 0.01,
                 "mismatch_count": 0,
                 "atol": 0.01,
@@ -829,6 +862,7 @@ def _complete_per_arch_report(tmp_path, arch):
             "final_state": {
                 "passed": True,
                 "max_abs": 0.0,
+                "max_reference_abs": 0.0,
                 "max_allowed_abs": 0.01,
                 "mismatch_count": 0,
                 "atol": 0.01,
@@ -840,8 +874,9 @@ def _complete_per_arch_report(tmp_path, arch):
         timings = {
             name: _timing_receipt(
                 name,
-                layout=case.layout,
-                num_sequences=len(case.seq_lens),
+                case=case,
+                case_index=case_index,
+                run_id=run_id,
             )
             for name in evidence.REQUIRED_TIMING_PATHS
         }
@@ -908,6 +943,7 @@ def _complete_per_arch_report(tmp_path, arch):
     capability = [10, 0] if arch == "sm100a" else [10, 3]
     report = {
         "schema_version": evidence.EVIDENCE_REPORT_SCHEMA_VERSION,
+        "run_id": run_id,
         "suite": "recurrent_kda_prefill_h12_phase_a",
         "preset": {
             "name": preset.name,
@@ -1035,6 +1071,129 @@ def _complete_per_arch_report(tmp_path, arch):
     return report, candidate_commit, fla_commit, preset
 
 
+def _candidate_expectation(report, candidate_commit):
+    rows = tuple(
+        (path, report["candidate_provenance"]["source_sha256"][path])
+        for path in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS
+    )
+    return evidence.CandidateSourceExpectation(
+        source_commit=candidate_commit,
+        manifest_sha256="f" * 64,
+        source_sha256=rows,
+    )
+
+
+def _write_manifest_rows(tmp_path, rows, *, name="flashinfer-source-sha256s.txt"):
+    path = tmp_path / name
+    path.write_text(
+        "".join(f"{digest}  {source}\n" for source, digest in rows),
+        encoding="ascii",
+    )
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_candidate_manifest(tmp_path, report):
+    return _write_manifest_rows(
+        tmp_path,
+        (
+            (
+                source,
+                report["candidate_provenance"]["source_sha256"][source],
+            )
+            for source in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS
+        ),
+    )
+
+
+def test_candidate_source_manifest_loads_exact_external_binding(tmp_path):
+    rows = tuple(
+        (source, "b" * 64) for source in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS
+    )
+    manifest, manifest_sha256 = _write_manifest_rows(tmp_path, rows)
+
+    expectation = evidence.load_candidate_source_expectation(
+        manifest_path=manifest,
+        expected_manifest_sha256=manifest_sha256,
+        expected_candidate_commit="1" * 40,
+    )
+
+    assert expectation.source_commit == "1" * 40
+    assert expectation.manifest_sha256 == manifest_sha256
+    assert expectation.source_sha256 == rows
+    assert expectation.source_hashes == dict(rows)
+    assert len(expectation.binding_sha256) == 64
+
+
+def test_candidate_source_manifest_rejects_wrong_external_digest(tmp_path):
+    rows = tuple(
+        (source, "b" * 64) for source in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS
+    )
+    manifest, _ = _write_manifest_rows(tmp_path, rows)
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="differs from its external SHA-256",
+    ):
+        evidence.load_candidate_source_expectation(
+            manifest_path=manifest,
+            expected_manifest_sha256="0" * 64,
+            expected_candidate_commit="1" * 40,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "extra", "duplicate", "reordered"],
+)
+def test_candidate_source_manifest_rejects_nonexact_denominator(tmp_path, mutation):
+    rows = [(source, "b" * 64) for source in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS]
+    if mutation == "missing":
+        rows.pop()
+    elif mutation == "extra":
+        rows.append(("unexpected.py", "c" * 64))
+    elif mutation == "duplicate":
+        rows[1] = rows[0]
+    else:
+        rows[0], rows[1] = rows[1], rows[0]
+    manifest, manifest_sha256 = _write_manifest_rows(
+        tmp_path, rows, name=f"{mutation}.txt"
+    )
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="paths/order are not exact",
+    ):
+        evidence.load_candidate_source_expectation(
+            manifest_path=manifest,
+            expected_manifest_sha256=manifest_sha256,
+            expected_candidate_commit="1" * 40,
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/absolute.py",
+        "../outside.py",
+        "flashinfer/../outside.py",
+        "flashinfer/./kda.py",
+        "flashinfer//kda.py",
+        "flashinfer\\kda.py",
+    ],
+)
+def test_candidate_source_manifest_rejects_unsafe_paths(tmp_path, unsafe_path):
+    rows = [(source, "b" * 64) for source in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS]
+    rows[0] = (unsafe_path, rows[0][1])
+    manifest, manifest_sha256 = _write_manifest_rows(tmp_path, rows, name="unsafe.txt")
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="unsafe path"):
+        evidence.load_candidate_source_expectation(
+            manifest_path=manifest,
+            expected_manifest_sha256=manifest_sha256,
+            expected_candidate_commit="1" * 40,
+        )
+
+
 def _record_oracle_mismatch(report, oracle_name):
     result = report["cases"][0]["correctness"][oracle_name]["output"]
     result.update(
@@ -1064,8 +1223,9 @@ def test_per_arch_receipt_accepts_valid_diagnostic_disagreement(
     identity = evidence.validate_per_arch_receipt(
         report,
         expected_arch="sm100a",
-        expected_candidate_commit=candidate_commit,
+        expected_candidate=_candidate_expectation(report, candidate_commit),
         expected_fla_commit=fla_commit,
+        expected_run_id=report["run_id"],
         preset=preset,
     )
 
@@ -1085,8 +1245,9 @@ def test_per_arch_receipt_rejects_inconsistent_diagnostic_consensus(tmp_path):
         evidence.validate_per_arch_receipt(
             report,
             expected_arch="sm100a",
-            expected_candidate_commit=candidate_commit,
+            expected_candidate=_candidate_expectation(report, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_run_id=report["run_id"],
             preset=preset,
         )
 
@@ -1101,8 +1262,59 @@ def test_per_arch_receipt_rejects_pinned_oracle_failure(tmp_path):
         evidence.validate_per_arch_receipt(
             report,
             expected_arch="sm100a",
-            expected_candidate_commit=candidate_commit,
+            expected_candidate=_candidate_expectation(report, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_run_id=report["run_id"],
+            preset=preset,
+        )
+
+
+def test_per_arch_receipt_requires_host_formula_for_nonzero_oracle_bound(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    result = report["cases"][0]["correctness"]["pinned_flash_kda"]["output"]
+    result["max_reference_abs"] = 1.5
+    result["max_allowed_abs"] = 0.01 + 0.01 * 1.5
+    expectation = _candidate_expectation(report, candidate_commit)
+
+    evidence.validate_per_arch_receipt(
+        report,
+        expected_arch="sm100a",
+        expected_candidate=expectation,
+        expected_fla_commit=fla_commit,
+        expected_run_id=report["run_id"],
+        preset=preset,
+    )
+
+    result["max_allowed_abs"] = 0.03
+    with pytest.raises(evidence.EvidenceSchemaError, match="exact BF16 full-tensor"):
+        evidence.validate_per_arch_receipt(
+            report,
+            expected_arch="sm100a",
+            expected_candidate=expectation,
+            expected_fla_commit=fla_commit,
+            expected_run_id=report["run_id"],
+            preset=preset,
+        )
+
+
+def test_per_arch_receipt_rejects_bool_compute_capability_components(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    report["hardware"]["compute_capability"] = [True, 0]
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="hardware does not match required sm100a",
+    ):
+        evidence.validate_per_arch_receipt(
+            report,
+            expected_arch="sm100a",
+            expected_candidate=_candidate_expectation(report, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_run_id=report["run_id"],
             preset=preset,
         )
 
@@ -1116,16 +1328,210 @@ def test_dual_arch_reducer_requires_matching_complete_receipts(tmp_path):
     result = evidence.reduce_dual_arch_receipts(
         sm100a_report=sm100a,
         sm103a_report=sm103a,
-        sm100a_receipt_sha256="1" * 64,
-        sm103a_receipt_sha256="2" * 64,
-        expected_candidate_commit=candidate_commit,
+        sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+        sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+        expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+        expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+        expected_candidate=_candidate_expectation(sm100a, candidate_commit),
         expected_fla_commit=fla_commit,
+        expected_sm100a_run_id=sm100a["run_id"],
+        expected_sm103a_run_id=sm103a["run_id"],
         preset=preset,
     )
 
     assert result["promotion_complete_dual_arch"] is True
     assert result["cross_shape_aggregate"] is None
     assert set(result["receipts"]) == {"sm100a", "sm103a"}
+
+
+def test_dual_arch_reducer_rejects_wrong_external_receipt_digest(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="SM100a receipt differs from its external allocation digest",
+    ):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256="3" * 64,
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_dual_arch_reducer_binds_digest_to_canonical_report_payload(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    sm100a_sha256 = evidence.canonical_receipt_sha256(sm100a)
+    sm103a_sha256 = evidence.canonical_receipt_sha256(sm103a)
+    sm103a["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][0]["cpu_bracket"][
+        "start_ns"
+    ] += 1
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="SM103a receipt SHA-256 is not bound to its canonical report payload",
+    ):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=sm100a_sha256,
+            sm103a_receipt_sha256=sm103a_sha256,
+            expected_sm100a_receipt_sha256=sm100a_sha256,
+            expected_sm103a_receipt_sha256=sm103a_sha256,
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_dual_arch_reducer_rejects_colluding_source_hash_rewrite(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    expectation = _candidate_expectation(sm100a, candidate_commit)
+    for report in (sm100a, sm103a):
+        report["candidate_provenance"]["source_sha256"]["flashinfer/kda.py"] = "0" * 64
+        report["candidate_provenance"]["imported_module_sha256"]["flashinfer.kda"] = (
+            "0" * 64
+        )
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="source hashes differ from the external sealed manifest",
+    ):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=expectation,
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_dual_arch_reducer_rejects_colluding_candidate_commit_rewrite(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    expectation = _candidate_expectation(sm100a, candidate_commit)
+    for report in (sm100a, sm103a):
+        report["candidate_provenance"]["source_commit"] = "3" * 40
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="candidate identity is not frozen/clean",
+    ):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=expectation,
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_dual_arch_reducer_requires_fresh_per_arch_runs(tmp_path):
+    shared_run_id = "c" * 32
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path,
+        "sm100a",
+        run_id=shared_run_id,
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(
+        tmp_path,
+        "sm103a",
+        run_id=shared_run_id,
+    )
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="distinct evidence runs"):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_dual_arch_reducer_rejects_relabelled_cross_arch_timing_replay(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    repeat_iters = evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+    base_order = list(evidence.REQUIRED_TIMING_PATHS)
+    for case_index, expected_case in enumerate(preset.cases):
+        for path_name in evidence.REQUIRED_TIMING_PATHS:
+            replay = json.loads(
+                json.dumps(sm100a["cases"][case_index]["timings"][path_name])
+            )
+            for raw_index, sample in enumerate(replay["raw_samples"]):
+                block_index, sample_index = divmod(raw_index, repeat_iters)
+                block_order = (
+                    base_order if block_index % 2 == 0 else list(reversed(base_order))
+                )
+                order_index = block_order.index(path_name)
+                sample["trace_scope"] = evidence._trace_scope(
+                    trace_context=evidence._trace_context(
+                        run_id=sm103a["run_id"],
+                        case=expected_case,
+                        case_index=case_index,
+                        path=path_name,
+                        block_index=block_index,
+                        order_index=order_index,
+                    ),
+                    sample_index=sample_index,
+                )
+            sm103a["cases"][case_index]["timings"][path_name] = replay
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="same raw timing ledger"):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
 
 
 def test_dual_arch_reducer_keeps_valid_diagnostic_disagreement_non_blocking(
@@ -1146,10 +1552,14 @@ def test_dual_arch_reducer_keeps_valid_diagnostic_disagreement_non_blocking(
     result = evidence.reduce_dual_arch_receipts(
         sm100a_report=sm100a,
         sm103a_report=sm103a,
-        sm100a_receipt_sha256="1" * 64,
-        sm103a_receipt_sha256="2" * 64,
-        expected_candidate_commit=candidate_commit,
+        sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+        sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+        expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+        expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+        expected_candidate=_candidate_expectation(sm100a, candidate_commit),
         expected_fla_commit=fla_commit,
+        expected_sm100a_run_id=sm100a["run_id"],
+        expected_sm103a_run_id=sm103a["run_id"],
         preset=preset,
     )
 
@@ -1164,8 +1574,13 @@ def test_dual_arch_reducer_cli_emits_only_after_both_receipts(tmp_path):
     sm100a_path = tmp_path / "sm100a.json"
     sm103a_path = tmp_path / "sm103a.json"
     result_path = tmp_path / "dual-arch.json"
-    sm100a_path.write_text(json.dumps(sm100a))
-    sm103a_path.write_text(json.dumps(sm103a))
+    evidence.write_json_atomic(sm100a_path, sm100a)
+    evidence.write_json_atomic(sm103a_path, sm103a)
+    source_manifest, source_manifest_sha256 = _write_candidate_manifest(
+        tmp_path, sm100a
+    )
+    sm100a_sha256 = hashlib.sha256(sm100a_path.read_bytes()).hexdigest()
+    sm103a_sha256 = hashlib.sha256(sm103a_path.read_bytes()).hexdigest()
 
     completed = subprocess.run(
         [
@@ -1177,8 +1592,20 @@ def test_dual_arch_reducer_cli_emits_only_after_both_receipts(tmp_path):
             str(sm103a_path),
             "--expected-flashinfer-commit",
             candidate_commit,
+            "--expected-flashinfer-source-manifest",
+            str(source_manifest),
+            "--expected-flashinfer-source-manifest-sha256",
+            source_manifest_sha256,
             "--expected-fla-commit",
             fla_commit,
+            "--expected-sm100a-run-id",
+            sm100a["run_id"],
+            "--expected-sm103a-run-id",
+            sm103a["run_id"],
+            "--expected-sm100a-receipt-sha256",
+            sm100a_sha256,
+            "--expected-sm103a-receipt-sha256",
+            sm103a_sha256,
             "--json",
             str(result_path),
         ],
@@ -1205,8 +1632,9 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
         evidence.validate_per_arch_receipt(
             missing_oracle,
             expected_arch="sm100a",
-            expected_candidate_commit=candidate_commit,
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_run_id=missing_oracle["run_id"],
             preset=preset,
         )
 
@@ -1216,8 +1644,9 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
         evidence.validate_per_arch_receipt(
             failed_graph,
             expected_arch="sm100a",
-            expected_candidate_commit=candidate_commit,
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_run_id=failed_graph["run_id"],
             preset=preset,
         )
 
@@ -1232,8 +1661,9 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
         evidence.validate_per_arch_receipt(
             stale_build,
             expected_arch="sm100a",
-            expected_candidate_commit=candidate_commit,
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_run_id=stale_build["run_id"],
             preset=preset,
         )
 
@@ -1241,14 +1671,21 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
     sm103a["candidate_provenance"]["imported_module_sha256"]["flashinfer.kda"] = (
         "0" * 64
     )
-    with pytest.raises(evidence.EvidenceSchemaError, match="exactly matching"):
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="source hashes differ from the external sealed manifest",
+    ):
         evidence.reduce_dual_arch_receipts(
             sm100a_report=sm100a,
             sm103a_report=sm103a,
-            sm100a_receipt_sha256="1" * 64,
-            sm103a_receipt_sha256="2" * 64,
-            expected_candidate_commit=candidate_commit,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
             preset=preset,
         )
 
@@ -1356,14 +1793,16 @@ def _duplicate_first_logical_launch_kind(payload):
     timing = payload["cases"][0]["timings"]["flash_kda_raw"]
     for sample in timing["raw_samples"]:
         first_correlation = sample["activity_order"][0]["correlation_id"]
-        correlated_launches = [
-            record
-            for record in sample["launch_activity_order"]
+        first_index = next(
+            index
+            for index, record in enumerate(sample["launch_activity_order"])
             if record["correlation_id"] == first_correlation
-        ]
-        assert len(correlated_launches) == 2
-        correlated_launches[1]["kind"] = "runtime"
-        correlated_launches[1]["name"] = "runtime:duplicate"
+        )
+        duplicate = dict(sample["launch_activity_order"][first_index])
+        duplicate["kind"] = "driver" if duplicate["kind"] == "runtime" else "runtime"
+        duplicate["name"] = f"{duplicate['kind']}:duplicate"
+        sample["launch_activity_order"].insert(first_index + 1, duplicate)
+        sample["launch_activity_count"] += 1
         sample["launch_activity_names"] = [
             record["name"] for record in sample["launch_activity_order"]
         ]
@@ -1500,6 +1939,158 @@ def _overlap_first_adapted_copy(payload):
     _refresh_timing_summary_arrays(timing)
 
 
+def _forge_first_host_timing_metrics(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    sample = timing["raw_samples"][0]
+    sample["submission_ms"] += 1.0
+    sample["synchronized_e2e_ms"] += 1.0
+    _refresh_timing_summary_arrays(timing)
+
+
+def _replay_first_sample_across_one_trace(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    source = timing["raw_samples"][0]
+    repeat_iters = evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+    for sample_index in range(1, repeat_iters):
+        replay = json.loads(json.dumps(source))
+        replay["sample_index"] = sample_index
+        replay["trace_scope"]["sample_index"] = sample_index
+        timing["raw_samples"][sample_index] = replay
+    _refresh_timing_summary_arrays(timing)
+
+
+def _reuse_first_sample_correlations_within_trace(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    source = timing["raw_samples"][0]
+    target = timing["raw_samples"][1]
+    source_correlations = [
+        record["correlation_id"] for record in source["activity_order"]
+    ]
+    for record, correlation_id in zip(
+        target["activity_order"], source_correlations, strict=True
+    ):
+        record["correlation_id"] = correlation_id
+    for record in target["launch_activity_order"]:
+        original_index = (record["correlation_id"] - 1) % 16
+        record["correlation_id"] = source_correlations[original_index]
+    _refresh_timing_summary_arrays(timing)
+
+
+def _set_first_correlation_unknown(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    sample = timing["raw_samples"][0]
+    original = sample["activity_order"][0]["correlation_id"]
+    sample["activity_order"][0]["correlation_id"] = 0
+    for launch in sample["launch_activity_order"]:
+        if launch["correlation_id"] == original:
+            launch["correlation_id"] = 0
+    _refresh_timing_summary_arrays(timing)
+
+
+def _move_first_launch_outside_submission_bracket(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    sample = timing["raw_samples"][0]
+    launch = sample["launch_activity_order"][-1]
+    launch["end_ns"] = sample["cpu_bracket"]["submitted_ns"] + 1
+    launch["duration_ms"] = (launch["end_ns"] - launch["start_ns"]) / 1e6
+    _refresh_timing_summary_arrays(timing)
+
+
+def _substitute_other_shape_timings(payload):
+    payload["cases"][5]["timings"] = json.loads(
+        json.dumps(payload["cases"][1]["timings"])
+    )
+
+
+def _replay_raw_route_into_adapted(payload):
+    case = payload["cases"][0]
+    raw = case["timings"]["flash_kda_raw"]["raw_samples"][0]
+    adapted_timing = case["timings"]["flash_kda_public_semantics_adapted"]
+    adapted = adapted_timing["raw_samples"][0]
+    adapted_copy = json.loads(json.dumps(adapted["activity_order"][-1]))
+    adapted_copy_launches = [
+        json.loads(json.dumps(launch))
+        for launch in adapted["launch_activity_order"]
+        if launch["correlation_id"] == adapted_copy["correlation_id"]
+    ]
+    adapted["activity_order"] = json.loads(json.dumps(raw["activity_order"])) + [
+        adapted_copy
+    ]
+    adapted["launch_activity_order"] = (
+        json.loads(json.dumps(raw["launch_activity_order"])) + adapted_copy_launches
+    )
+    adapted["launch_activity_names"] = [
+        record["name"] for record in adapted["launch_activity_order"]
+    ]
+    adapted["gpu_activity_names"] = [
+        record["name"] for record in adapted["activity_order"]
+    ]
+    adapted["kernel_activity_names"] = [
+        record["name"]
+        for record in adapted["activity_order"]
+        if record["kind"] == "kernel"
+    ]
+    adapted["copy_activity_names"] = [adapted_copy["name"]]
+    adapted["launch_activity_count"] = len(adapted["launch_activity_order"])
+    adapted["gpu_activity_count"] = len(adapted["activity_order"])
+    adapted["kernel_activity_count"] = len(adapted["kernel_activity_names"])
+    adapted["copy_activity_count"] = 1
+    adapted.update(
+        evidence._interval_metrics(
+            [
+                evidence.GpuActivity(
+                    start_ns=record["start_ns"],
+                    end_ns=record["end_ns"],
+                    correlation_id=record["correlation_id"],
+                    kind=record["kind"],
+                    name=record["name"],
+                )
+                for record in adapted["activity_order"]
+            ]
+        )
+    )
+    _refresh_timing_summary_arrays(adapted_timing)
+
+
+def test_per_arch_receipt_rejects_numeric_correlations_reused_across_traces(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    raw_samples = report["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"]
+    repeat_iters = evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+    first_trace_correlations = [
+        record["correlation_id"] for record in raw_samples[0]["activity_order"]
+    ]
+    second_trace_correlations = [
+        record["correlation_id"]
+        for record in raw_samples[repeat_iters]["activity_order"]
+    ]
+    assert first_trace_correlations != second_trace_correlations
+    assert (
+        raw_samples[0]["trace_scope"]["trace_id"]
+        != raw_samples[repeat_iters]["trace_scope"]["trace_id"]
+    )
+
+    correlation_map = dict(
+        zip(second_trace_correlations, first_trace_correlations, strict=True)
+    )
+    for record in raw_samples[repeat_iters]["activity_order"]:
+        record["correlation_id"] = correlation_map[record["correlation_id"]]
+    for record in raw_samples[repeat_iters]["launch_activity_order"]:
+        record["correlation_id"] = correlation_map[record["correlation_id"]]
+    _refresh_timing_summary_arrays(report["cases"][0]["timings"]["flash_kda_raw"])
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="reuses a GPU correlation"):
+        evidence.validate_per_arch_receipt(
+            report,
+            expected_arch="sm100a",
+            expected_candidate=_candidate_expectation(report, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_run_id=report["run_id"],
+            preset=preset,
+        )
+
+
 def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
     report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
         tmp_path, "sm100a"
@@ -1512,8 +2103,9 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
             evidence.validate_per_arch_receipt(
                 mutated,
                 expected_arch="sm100a",
-                expected_candidate_commit=candidate_commit,
+                expected_candidate=_candidate_expectation(report, candidate_commit),
                 expected_fla_commit=fla_commit,
+                expected_run_id=report["run_id"],
                 preset=preset,
             )
 
@@ -1601,6 +2193,44 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
     reject(
         _duplicate_first_logical_launch_kind,
         "one timely logical launch correlation per GPU activity",
+    )
+    reject(
+        _forge_first_host_timing_metrics,
+        "host timing metrics do not match its raw CPU bracket",
+    )
+    reject(
+        _replay_first_sample_across_one_trace,
+        "replayed, overlapping, or out of canonical execution order",
+    )
+    reject(
+        _reuse_first_sample_correlations_within_trace,
+        "timing ledger reuses a GPU correlation ID",
+    )
+    reject(
+        _set_first_correlation_unknown,
+        "activity 0 is malformed",
+    )
+    reject(
+        _move_first_launch_outside_submission_bracket,
+        "launch activity falls outside its CPU submission bracket",
+    )
+    reject(
+        _substitute_other_shape_timings,
+        "trace scope is not the exact frozen case",
+    )
+    reject(
+        _replay_raw_route_into_adapted,
+        "incomplete correlated timing",
+    )
+    reject(
+        lambda payload: payload.__setitem__("run_id", "b" * 32),
+        "does not match its external allocation run challenge",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
+            0
+        ]["trace_scope"].__setitem__("dropped_records", 1),
+        "trace scope is not the exact frozen case",
     )
     reject(
         _shift_first_prepared_recurrence_away_from_public_sample,
@@ -1771,10 +2401,14 @@ def test_dual_arch_reducer_rejects_different_cupti_contract_identity(tmp_path):
         evidence.reduce_dual_arch_receipts(
             sm100a_report=sm100a,
             sm103a_report=sm103a,
-            sm100a_receipt_sha256="1" * 64,
-            sm103a_receipt_sha256="2" * 64,
-            expected_candidate_commit=candidate_commit,
+            sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=evidence.canonical_receipt_sha256(sm100a),
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
             expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
             preset=preset,
         )
 
@@ -1790,6 +2424,12 @@ def test_runner_rejects_non_exact_phase_a_sampling_without_gpu_import(tmp_path):
             str(tmp_path / "manifest.json"),
             "--warmup-iters",
             "1",
+            "--evidence-run-id",
+            "a" * 32,
+            "--expected-source-manifest",
+            str(tmp_path / "flashinfer-source-sha256s.txt"),
+            "--expected-source-manifest-sha256",
+            "f" * 64,
             "--json",
             str(tmp_path / "receipt.json"),
         ],
@@ -1938,6 +2578,8 @@ def test_runner_pinned_contract_controls_timing(
         stack=SimpleNamespace(torch=SimpleNamespace(cuda=_FakeCuda())),
         tracer=object(),
         case=object(),
+        case_index=0,
+        run_id="a" * 32,
         flash_kda=object(),
         fla_chunk_kda=lambda: None,
         warmup_iters=1,

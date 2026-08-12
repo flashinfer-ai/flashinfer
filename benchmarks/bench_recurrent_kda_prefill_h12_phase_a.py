@@ -34,12 +34,14 @@ the exact changed-beta CUDA Graph test and matching SM100a+SM103a receipts.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib
 import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -63,7 +65,9 @@ from kda_h12_evidence import (
     GpuActivity,
     LaunchActivity,
     SUPPORTED_ARCHITECTURES,
+    _trace_context,
     correlate_samples,
+    load_candidate_source_expectation,
     load_preset,
     summarize_samples,
     verify_flash_kda_current_receipt_binding,
@@ -839,7 +843,10 @@ def _compare_bf16_close(torch, *, label: str, actual, expected) -> dict:
     absolute_error = (actual.float() - expected.float()).abs()
     allowed_error = BF16_ATOL + BF16_RTOL * expected.float().abs()
     max_abs = float(absolute_error.max())
-    max_allowed_abs = float(allowed_error.max())
+    max_reference_abs = float(expected.float().abs().max())
+    # Use the validator's host-double formula for the receipt summary. The
+    # elementwise float32 tensor above remains authoritative for mismatch_count.
+    max_allowed_abs = BF16_ATOL + BF16_RTOL * max_reference_abs
     mismatch_count = int((absolute_error > allowed_error).count_nonzero())
     passed = True
     try:
@@ -854,6 +861,7 @@ def _compare_bf16_close(torch, *, label: str, actual, expected) -> dict:
     return {
         "passed": passed,
         "max_abs": max_abs,
+        "max_reference_abs": max_reference_abs,
         "max_allowed_abs": max_allowed_abs,
         "mismatch_count": mismatch_count,
         "atol": BF16_ATOL,
@@ -1028,11 +1036,23 @@ class _CuptiTracer:
         warmup_iters: int,
         repeat_iters: int,
         require_h12_public_route: bool,
+        trace_context: dict,
     ) -> list[dict]:
         """Trace one block without an event or wall-clock timing fallback."""
 
         if self._closed:
             raise RuntimeError("CUPTI tracer has already been finalized")
+        dropped_before = ctypes.c_size_t()
+        self._cupti.activity_get_num_dropped_records(
+            0,
+            0,
+            ctypes.addressof(dropped_before),
+        )
+        if dropped_before.value != 0:
+            raise RuntimeError(
+                "CUPTI reported stale dropped activity records before the measured "
+                f"trace: {dropped_before.value}"
+            )
         torch = self._stack.torch
         for _ in range(warmup_iters):
             run()
@@ -1057,6 +1077,17 @@ class _CuptiTracer:
                 synchronized_ns = int(self._cupti.get_timestamp())
                 brackets.append(CpuBracket(start_ns, submitted_ns, synchronized_ns))
             self._cupti.activity_flush_all(1)
+            dropped_after = ctypes.c_size_t()
+            self._cupti.activity_get_num_dropped_records(
+                0,
+                0,
+                ctypes.addressof(dropped_after),
+            )
+            if dropped_after.value != 0:
+                raise RuntimeError(
+                    "CUPTI dropped activity records during the measured trace: "
+                    f"{dropped_after.value}"
+                )
         finally:
             for kind in enabled:
                 self._cupti.activity_disable(kind)
@@ -1065,6 +1096,7 @@ class _CuptiTracer:
             launches=self._launches,
             activities=self._activities,
             require_h12_public_route=require_h12_public_route,
+            trace_context=trace_context,
         )
 
     def close(self) -> None:
@@ -1078,6 +1110,9 @@ def _run_timing_blocks(
     stack: SimpleNamespace,
     tracer: _CuptiTracer,
     runtime: CaseRuntime,
+    run_id: str,
+    case,
+    case_index: int,
     warmup_iters: int,
     repeat_iters: int,
     blocks: int,
@@ -1115,10 +1150,21 @@ def _run_timing_blocks(
                 warmup_iters=warmup_iters,
                 repeat_iters=repeat_iters,
                 require_h12_public_route=require_h12_public_route,
+                trace_context=_trace_context(
+                    run_id=run_id,
+                    case=case,
+                    case_index=case_index,
+                    path=name,
+                    block_index=block_index,
+                    order_index=order_index,
+                ),
             )
             for sample in samples:
-                sample["block_index"] = block_index
-                sample["order_index"] = order_index
+                if (
+                    sample["block_index"] != block_index
+                    or sample["order_index"] != order_index
+                ):
+                    raise RuntimeError("CUPTI trace scope changed after measurement")
             sample_blocks[name].extend(samples)
             measurement_order.append(
                 {
@@ -1164,6 +1210,8 @@ def _case_result(
     stack: SimpleNamespace,
     tracer: _CuptiTracer,
     case,
+    case_index: int,
+    run_id: str,
     flash_kda,
     fla_chunk_kda: Callable,
     warmup_iters: int,
@@ -1200,6 +1248,9 @@ def _case_result(
         stack=stack,
         tracer=tracer,
         runtime=runtime,
+        case=case,
+        case_index=case_index,
+        run_id=run_id,
         warmup_iters=warmup_iters,
         repeat_iters=repeat_iters,
         blocks=blocks,
@@ -1235,8 +1286,28 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--flash-kda-source-dir is required for GPU evidence")
     if args.flash_kda_build_manifest is None:
         parser.error("--flash-kda-build-manifest is required for GPU evidence")
+    if args.expected_source_manifest is None:
+        parser.error("--expected-source-manifest is required for GPU evidence")
+    if (
+        args.expected_source_manifest_sha256 is None
+        or re.fullmatch(r"[0-9a-f]{64}", args.expected_source_manifest_sha256) is None
+    ):
+        parser.error(
+            "--expected-source-manifest-sha256 must be the sealed 64-character "
+            "lowercase manifest digest"
+        )
+    if args.expected_source_manifest.resolve().is_relative_to(REPOSITORY_ROOT):
+        parser.error("--expected-source-manifest must be outside the source checkout")
     if args.json is None:
         parser.error("--json is required so raw activity samples are preserved")
+    if (
+        args.evidence_run_id is None
+        or re.fullmatch(r"[0-9a-f]{32}", args.evidence_run_id) is None
+    ):
+        parser.error(
+            "--evidence-run-id must be a 32-character lowercase hexadecimal "
+            "challenge supplied and recorded by the allocation launcher"
+        )
     if args.json.resolve().is_relative_to(REPOSITORY_ROOT):
         parser.error("--json must be outside the verified FlashInfer checkout")
     if args.json.resolve().is_relative_to(args.flash_kda_source_dir.resolve()):
@@ -1286,9 +1357,12 @@ def main() -> None:
     )
     parser.add_argument("--flash-kda-source-dir", type=Path)
     parser.add_argument("--flash-kda-build-manifest", type=Path)
+    parser.add_argument("--expected-source-manifest", type=Path)
+    parser.add_argument("--expected-source-manifest-sha256")
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--repeat-iters", type=int, default=20)
     parser.add_argument("--blocks", type=int, default=2)
+    parser.add_argument("--evidence-run-id")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     _validate_args(parser, args)
@@ -1298,6 +1372,7 @@ def main() -> None:
         print(
             json.dumps(
                 {
+                    "evidence_report_schema_version": EVIDENCE_REPORT_SCHEMA_VERSION,
                     "preset": _preset_summary(preset),
                     "flash_kda_required_revision": FLASH_KDA_BASELINE_REVISION,
                     "flash_kda_build_manifest": {
@@ -1330,6 +1405,7 @@ def main() -> None:
                         "required_architectures": ["sm100a", "sm103a"],
                         "reducer": "benchmarks/reduce_kda_h12_phase_a.py",
                         "dual_arch_flag": "promotion_complete_dual_arch",
+                        "external_run_challenge_required": True,
                     },
                     "flashinfer_required_ancestor_revisions": {
                         "phase_a_upstream_main": (
@@ -1346,11 +1422,24 @@ def main() -> None:
         )
         return
 
+    expected_candidate = load_candidate_source_expectation(
+        manifest_path=args.expected_source_manifest,
+        expected_manifest_sha256=args.expected_source_manifest_sha256,
+        expected_candidate_commit=_git_output(REPOSITORY_ROOT, "rev-parse", "HEAD"),
+    )
+
     stack = _import_gpu_stack()
     cupti, cupti_version = _require_cupti()
     hardware = _hardware_metadata(stack)
     graph_receipt = _run_changed_beta_graph_test()
     candidate_provenance = _candidate_provenance(stack)
+    if (
+        candidate_provenance["source_commit"] != expected_candidate.source_commit
+        or candidate_provenance["source_sha256"] != expected_candidate.source_hashes
+    ):
+        raise RuntimeError(
+            "candidate source differs from the external sealed source manifest"
+        )
     assert args.flash_kda_source_dir is not None
     assert args.flash_kda_build_manifest is not None
     flash_kda, flash_kda_provenance = _load_flash_kda(
@@ -1368,6 +1457,7 @@ def main() -> None:
 
     report = {
         "schema_version": EVIDENCE_REPORT_SCHEMA_VERSION,
+        "run_id": args.evidence_run_id,
         "suite": "recurrent_kda_prefill_h12_phase_a",
         "preset": _preset_summary(preset),
         "candidate_provenance": candidate_provenance,
@@ -1398,11 +1488,13 @@ def main() -> None:
         )
     tracer = _CuptiTracer(stack=stack, cupti=cupti)
     try:
-        for case in preset.cases:
+        for case_index, case in enumerate(preset.cases):
             result = _case_result(
                 stack=stack,
                 tracer=tracer,
                 case=case,
+                case_index=case_index,
+                run_id=report["run_id"],
                 flash_kda=flash_kda,
                 fla_chunk_kda=fla_chunk_kda,
                 warmup_iters=args.warmup_iters,
