@@ -37,6 +37,9 @@ _MXFP8_MOE_TACTICS = (
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
 )
+_MXFP8_MOE_PLAIN_TACTICS_GRANK32 = _MXFP8_MOE_TACTICS + (
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
+)
 _MXFP8_MOE_TACTICS_GRANK128 = _MXFP8_MOE_TACTICS + (
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
 )
@@ -114,11 +117,18 @@ class _CuteSm120Mxfp8MoeRunner(Sm120MoeTunableRunner):
         scale_granularity_mnk: Tuple[int, int, int],
         scale_major_mode: str,
     ) -> None:
-        tactics = (
-            _MXFP8_MOE_TACTICS_GRANK128
-            if scale_granularity_mnk[2] == 128
-            else _MXFP8_MOE_TACTICS
-        )
+        if is_gated:
+            tactics = (
+                _MXFP8_MOE_TACTICS_GRANK128
+                if scale_granularity_mnk[2] == 128
+                else _MXFP8_MOE_TACTICS
+            )
+        else:
+            tactics = (
+                _MXFP8_MOE_TACTICS_GRANK128
+                if scale_granularity_mnk[2] == 128
+                else _MXFP8_MOE_PLAIN_TACTICS_GRANK32
+            )
         super().__init__(
             out,
             is_gated,

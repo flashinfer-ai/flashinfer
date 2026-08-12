@@ -325,8 +325,8 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
                       (tactic_tile_m == 128 && tactic_tile_n == 128);
   TVM_FFI_ICHECK(valid_tactic) << "unsupported MXFP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m
                                << ", " << tactic_tile_n << ")";
-  TVM_FFI_ICHECK(tactic_tile_m != 128 || tactic_tile_n != 128 || granK == 128)
-      << "unsupported MXFP8 GranK=32 MoE tactic (TileM, TileN)=(128, 128)";
+  TVM_FFI_ICHECK(tactic_tile_m != 128 || tactic_tile_n != 128 || !is_gated || granK == 128)
+      << "unsupported gated MXFP8 GranK=32 MoE tactic (TileM, TileN)=(128, 128)";
   DISPATCH_GRAN_K(granK, GRAN_K, {
     if (is_gated) {
       fused_moe_mxfp8_nt_groupwise_tuned_impl<GRAN_K>(D, A, B, token_offset, num_experts,
@@ -415,6 +415,7 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
   using KT_M64_N128 =
       sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
   using KT_M128_N64 = sm120_blockscaled::SM120BlockScaledBuilder<128, 64, 64, 4, GranK, kGT>;
+  using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
   using KT_M32_N128 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
   using KT_SWAPAB_N8 = sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, true>;
 
@@ -447,8 +448,7 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
     sm120_blockscaled::launch_moe_gemm<KT_M128_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                     total_rows, shape_n, shape_k, num_experts,
                                                     token_offset, num_sms, stream);
-  } else if constexpr (GranK == 128) {
-    using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+  } else {
     sm120_blockscaled::launch_moe_gemm<KT_M128_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                      total_rows, shape_n, shape_k, num_experts,
                                                      token_offset, num_sms, stream);
