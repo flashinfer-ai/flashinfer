@@ -585,6 +585,7 @@ void trtllm_ragged_attention_launcher(
     double bmm1_scale, double bmm2_scale, const float* bmm1_scale_log2_ptr,
     const float* bmm2_scale_ptr, double o_sf_scale, int64_t batch_size, int64_t window_left,
     int64_t sm_count, bool enable_pdl, bool is_causal, bool use_static_scheduler,
+    int64_t tile_size_q, int64_t tile_size_kv,
     int64_t q_stride_tokens, int64_t q_stride_heads, int64_t k_stride_keys_values,
     int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
@@ -651,6 +652,8 @@ void trtllm_ragged_attention_launcher(
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler =
       use_static_scheduler ? TileScheduler::Static : TileScheduler::Persistent;
+  runner_params.mTileSizeQ = static_cast<int>(tile_size_q);
+  runner_params.mTileSizeKv = static_cast<int>(tile_size_kv);
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
 
@@ -700,7 +703,7 @@ void trtllm_ragged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-void trtllm_ragged_attention_with_scheduler(
+void trtllm_ragged_attention_with_scheduler_and_tiles_impl(
     TensorView out, TensorView query, TensorView key, TensorView value, TensorView workspace_buffer,
     TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
@@ -712,7 +715,7 @@ void trtllm_ragged_attention_with_scheduler(
     Optional<TensorView> sage_attn_sfs_p, Optional<TensorView> sage_attn_sfs_v,
     int64_t num_elts_per_sage_attn_blk_q, int64_t num_elts_per_sage_attn_blk_k,
     int64_t num_elts_per_sage_attn_blk_p, int64_t num_elts_per_sage_attn_blk_v,
-    bool use_static_scheduler) {
+    bool use_static_scheduler, int64_t tile_size_q, int64_t tile_size_kv) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
@@ -745,6 +748,25 @@ void trtllm_ragged_attention_with_scheduler(
   int sum_seq_kv = key.size(0);
   int head_dim_qk = query.size(2);
   int head_dim_v = value.size(2);
+  bool const explicitly_selects_tiles = tile_size_q != 0 || tile_size_kv != 0;
+  TVM_FFI_ICHECK_EQ(tile_size_q == 0, tile_size_kv == 0)
+      << "ragged context tileSizeQ and tileSizeKv must be selected together";
+  if (explicitly_selects_tiles) {
+    TVM_FFI_ICHECK_EQ(getSMVersion(), kSM_100)
+        << "explicit ragged context tile selection is restricted to SM100";
+    TVM_FFI_ICHECK_EQ(head_dim_qk, 128)
+        << "explicit ragged context tile selection requires headDimQk=128";
+    TVM_FFI_ICHECK_EQ(key.size(2), 128)
+        << "explicit ragged context tile selection requires headDimK=128";
+    TVM_FFI_ICHECK_EQ(head_dim_v, 128)
+        << "explicit ragged context tile selection requires headDimV=128";
+    TVM_FFI_ICHECK_EQ(out.size(2), 128)
+        << "explicit ragged context tile selection requires headDimO=128";
+    TVM_FFI_ICHECK(tile_size_q == 64 || tile_size_q == 128)
+        << "explicit ragged context tileSizeQ must be 64 or 128";
+    TVM_FFI_ICHECK(tile_size_kv == 64 || tile_size_kv == 128)
+        << "explicit ragged context tileSizeKv must be 64 or 128";
+  }
   int q_stride_tokens = query.stride(0);
   int q_stride_heads = query.stride(1);
   int k_stride_keys_values = key.stride(0);
@@ -801,6 +823,7 @@ void trtllm_ragged_attention_with_scheduler(
       max_kv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv,
       bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale,
       batch_size, window_left, sm_count, enable_pdl, is_causal, use_static_scheduler,
+      tile_size_q, tile_size_kv,
       q_stride_tokens, q_stride_heads, k_stride_keys_values, k_stride_heads, k_stride_batch,
       v_stride_keys_values, v_stride_heads, v_stride_batch,
       skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size,
@@ -809,6 +832,56 @@ void trtllm_ragged_attention_with_scheduler(
       static_cast<int>(num_elts_per_sage_attn_blk_k),
       static_cast<int>(num_elts_per_sage_attn_blk_p),
       static_cast<int>(num_elts_per_sage_attn_blk_v), lse_stride_tokens, lse_stride_heads, stream);
+}
+
+void trtllm_ragged_attention_with_scheduler_and_tiles(
+    TensorView out, TensorView query, TensorView key, TensorView value, TensorView workspace_buffer,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl, bool is_causal,
+    int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<TensorView> lse,
+    Optional<TensorView> sage_attn_sfs_q, Optional<TensorView> sage_attn_sfs_k,
+    Optional<TensorView> sage_attn_sfs_p, Optional<TensorView> sage_attn_sfs_v,
+    int64_t num_elts_per_sage_attn_blk_q, int64_t num_elts_per_sage_attn_blk_k,
+    int64_t num_elts_per_sage_attn_blk_p, int64_t num_elts_per_sage_attn_blk_v,
+    bool use_static_scheduler, int64_t tile_size_q, int64_t tile_size_kv) {
+  TVM_FFI_ICHECK(tile_size_q == 64 || tile_size_q == 128)
+      << "explicit ragged context tileSizeQ must be 64 or 128";
+  TVM_FFI_ICHECK(tile_size_kv == 64 || tile_size_kv == 128)
+      << "explicit ragged context tileSizeKv must be 64 or 128";
+  trtllm_ragged_attention_with_scheduler_and_tiles_impl(
+      out, query, key, value, workspace_buffer, seq_lens, max_q_len, max_kv_len, bmm1_scale,
+      bmm2_scale, o_sf_scale, batch_size, window_left, cum_seq_lens_q, cum_seq_lens_kv, sm_count,
+      enable_pdl, is_causal, workspace_size, attention_sinks, skip_softmax_threshold_scale_factor,
+      lse, sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v,
+      num_elts_per_sage_attn_blk_q, num_elts_per_sage_attn_blk_k,
+      num_elts_per_sage_attn_blk_p, num_elts_per_sage_attn_blk_v, use_static_scheduler,
+      tile_size_q, tile_size_kv);
+}
+
+void trtllm_ragged_attention_with_scheduler(
+    TensorView out, TensorView query, TensorView key, TensorView value, TensorView workspace_buffer,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl, bool is_causal,
+    int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<TensorView> lse,
+    Optional<TensorView> sage_attn_sfs_q, Optional<TensorView> sage_attn_sfs_k,
+    Optional<TensorView> sage_attn_sfs_p, Optional<TensorView> sage_attn_sfs_v,
+    int64_t num_elts_per_sage_attn_blk_q, int64_t num_elts_per_sage_attn_blk_k,
+    int64_t num_elts_per_sage_attn_blk_p, int64_t num_elts_per_sage_attn_blk_v,
+    bool use_static_scheduler) {
+  trtllm_ragged_attention_with_scheduler_and_tiles_impl(
+      out, query, key, value, workspace_buffer, seq_lens, max_q_len, max_kv_len, bmm1_scale,
+      bmm2_scale, o_sf_scale, batch_size, window_left, cum_seq_lens_q, cum_seq_lens_kv, sm_count,
+      enable_pdl, is_causal, workspace_size, attention_sinks, skip_softmax_threshold_scale_factor,
+      lse, sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v,
+      num_elts_per_sage_attn_blk_q, num_elts_per_sage_attn_blk_k,
+      num_elts_per_sage_attn_blk_p, num_elts_per_sage_attn_blk_v, use_static_scheduler,
+      /*tile_size_q=*/0, /*tile_size_kv=*/0);
 }
 
 void trtllm_ragged_attention(
@@ -971,5 +1044,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention_with_scheduler,
                               trtllm_ragged_attention_with_scheduler);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention_with_scheduler_and_tiles,
+                              trtllm_ragged_attention_with_scheduler_and_tiles);
 
 }  // namespace flashinfer

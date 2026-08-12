@@ -190,6 +190,9 @@ struct TllmGenFmhaRunnerParams {
   FmhaKernelType mKernelType;
   // The tile scheduler.
   TileScheduler mTileScheduler;
+  // Explicit context-kernel tile selection. Zero retains the historical 128x128 default.
+  int mTileSizeQ;
+  int mTileSizeKv;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
 
@@ -421,6 +424,27 @@ struct TllmGenSelectKernelParams {
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
 
+  static int resolveExplicitContextTile(TllmGenFmhaRunnerParams const& params, bool selectsQ) {
+    bool const selectsTileQ = params.mTileSizeQ != 0;
+    bool const selectsTileKv = params.mTileSizeKv != 0;
+    FLASHINFER_CHECK(selectsTileQ == selectsTileKv,
+                     "Explicit tileSizeQ and tileSizeKv must be selected together");
+    if (!selectsTileQ) {
+      return 128;
+    }
+    FLASHINFER_CHECK(params.mKernelType == FmhaKernelType::Context,
+                     "Explicit tile selection is restricted to context kernels");
+    FLASHINFER_CHECK(params.mQkvLayout == QkvLayout::SeparateQkv,
+                     "Explicit tile selection is restricted to SeparateQkv");
+    FLASHINFER_CHECK(params.mHeadDimQk == 128 && params.mHeadDimV == 128,
+                     "Explicit tile selection requires H128 QK and V");
+    FLASHINFER_CHECK(params.mTileSizeQ == 64 || params.mTileSizeQ == 128,
+                     "Explicit tileSizeQ must be 64 or 128");
+    FLASHINFER_CHECK(params.mTileSizeKv == 64 || params.mTileSizeKv == 128,
+                     "Explicit tileSizeKv must be 64 or 128");
+    return selectsQ ? params.mTileSizeQ : params.mTileSizeKv;
+  }
+
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
       : mKernelType(params.mKernelType),
@@ -437,7 +461,7 @@ struct TllmGenSelectKernelParams {
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mTileScheduler(params.mTileScheduler),
-        mTileSizeQ(128),
-        mTileSizeKv(128),
+        mTileSizeQ(resolveExplicitContextTile(params, true)),
+        mTileSizeKv(resolveExplicitContextTile(params, false)),
         mUses2CtaMma(false) {};
 };
