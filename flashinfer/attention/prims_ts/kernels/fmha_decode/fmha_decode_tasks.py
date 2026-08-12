@@ -858,7 +858,7 @@ def create_load_task(
 
         # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set
         # (K0,V0,K1,V1) so the domain matches MMA's 1:1.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             for label in ("load_k0", "load_v0", "load_k1", "load_v1"):
                 _kv_load(label, FmhaStage.Loop)
 
@@ -982,7 +982,7 @@ def create_page_offsets_task(
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.
-            with domain_loop(0, domain, 1):
+            with domain_loop(0, domain, 1, unroll=1):
                 pass
             return
         # Page offsets are staged by a separate producer so the load warp can
@@ -992,7 +992,7 @@ def create_page_offsets_task(
         _produce_staged_page_offsets(smem_page_offsets, "load_k1", FmhaStage.Head, cfg)
 
         # LOOP: mirror LoadTask's K/V production cadence exactly.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             for label in ("load_k0", "load_v0", "load_k1", "load_v1"):
                 _produce_staged_page_offsets(
                     smem_page_offsets, label, FmhaStage.Loop, cfg
@@ -1063,7 +1063,7 @@ def create_page_offsets_task_split_kv(
         _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
@@ -1134,7 +1134,7 @@ def create_page_offsets_task_one_inst_qkv(
         smem_page_offsets.init_load_state()
 
         _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             for label in ("load_k0", "load_v0"):
                 _page_offsets_produce(smem_page_offsets, label, FmhaStage.Loop)
         _page_offsets_produce(smem_page_offsets, "load_v0", FmhaStage.Tail)
@@ -1247,7 +1247,7 @@ def create_load_task_split_kv(
             load_tile(smem_k0, "load_k0", smem_page_offsets, FmhaStage.Head)
             load_tile(smem_k1, "load_k1", smem_page_offsets, FmhaStage.Head)
 
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             if smem_page_offsets_v is not None:
                 load_tile(smem_v0, "load_v0", smem_page_offsets_v_local, FmhaStage.Loop)
                 load_tile(smem_k0, "load_k0", smem_page_offsets_k, FmhaStage.Loop)
@@ -1457,7 +1457,7 @@ def create_load_task_one_inst_qkv(
         smem_q.commit()
         load_tile(smem_k, "load_k0", FmhaStage.Head)
 
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             load_tile(smem_k, "load_k0", FmhaStage.Loop)
             load_tile(smem_v, "load_v0", FmhaStage.Loop)
 
@@ -1676,7 +1676,7 @@ def create_mma_task_split_kv(
             FmhaStage.Head,
         )
 
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
             qk_mma(
                 smem_k0,
@@ -1988,7 +1988,7 @@ def create_mma_task_one_inst_qkv(
 
         qk_mma(q_desc, "qk_mma_head", FmhaStage.Head)
 
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             qk_mma(q_desc, "qk_mma_loop", FmhaStage.Loop)
             pv_mma("vp_mma_loop", FmhaStage.Loop)
 
@@ -2132,7 +2132,7 @@ def create_mma_task(
         )
 
         # LOOP: overlap next K x Q^T waves with P x V waves from the current scores.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s0,
@@ -2312,7 +2312,7 @@ def create_softmax0_task(
         ) = tmem_s0.init_softmax_state()
         smem_p0.init_compute_state()
 
-        with domain_loop(0, domain, 1) as d:
+        with domain_loop(0, domain, 1, unroll=1) as d:
             # ConsWait/ConsWork: load S from TMEM and compute the tile max.
             tmem_s0.wait()
             old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s0.compute_softmax_loop(
@@ -2530,7 +2530,7 @@ def create_softmax1_task(
         ) = tmem_s1.init_softmax_state()
         smem_p1.init_compute_state()
 
-        with domain_loop(0, domain, 1) as d:
+        with domain_loop(0, domain, 1, unroll=1) as d:
             # ConsWait/ConsWork: load the second S instance and compute max.
             tmem_s1.wait()
             old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s1.compute_softmax_loop(
@@ -2863,7 +2863,7 @@ def create_correction_task(
 
         # LOOP: each iteration corrects O0 and O1 before later BMM2 waves
         # accumulate into the same TMEM columns.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             local0_state, tail_0, tail_1 = correct_o(
                 tmem_softmax_local0,
                 tmem_stats_done0,
@@ -3212,7 +3212,7 @@ def create_correction_task_one_inst_qkv(
         )
         # LOOP: each payload/O pair corresponds to a completed BMM2 wave whose
         # accumulator must be max-corrected before more V work accumulates.
-        with domain_loop(0, domain, 1):
+        with domain_loop(0, domain, 1, unroll=1):
             local_state, tail_0, tail_1 = correct_o(local_state, tail_0, tail_1)
         # TAIL: the final payload carries sum/new max and the final O stage is
         # normalized/stored instead of being prepared for another accumulation.
@@ -3308,14 +3308,14 @@ def create_correction_task_one_inst_qkv(
 
 
 # ======================================================================
-# PaddingTask — warps 13-14, 2 warps
+# PaddingTask — fills the unused tail warps of one warp group
 # ======================================================================
 def create_padding_task(
     cfg: FmhaDecodeConfig,
     work_queue: WorkQueue | None = None,
     *,
-    warp_idx: int | None = None,
-    num_warps: int | None = None,
+    warp_idx: int,
+    num_warps: int,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -3328,7 +3328,7 @@ def create_padding_task(
         def padding_body() -> None:
             # Empty loop body: this warp participates in task/register
             # scheduling so the persistent warpgroup layout remains balanced.
-            with domain_loop(0, 1, 1):
+            with domain_loop(0, 1, 1, unroll=1):
                 pass
 
         _decode_work_tile_schedule(cfg, work_queue, padding_body)
@@ -3343,8 +3343,8 @@ def create_padding_task(
         src_resources=src,
         dst_resources=[],
         cfg=cfg,
-        warp_idx=cfg.padding_warp_idx if warp_idx is None else warp_idx,
-        num_warps=cfg.padding_num_warps if num_warps is None else num_warps,
+        warp_idx=warp_idx,
+        num_warps=num_warps,
         schedule=captured_schedule,
         num_registers=cfg.mma_load_task_num_registers,
         name="PaddingTask",
@@ -3377,7 +3377,7 @@ def create_scheduler_task(
             # The scheduler owns work-tile discovery for persistent kernels.
             # Empty domain keeps the generated schedule shape consistent with
             # other TS tasks while all real work happens through WorkQueue.
-            with domain_loop(0, 0, 1):
+            with domain_loop(0, 0, 1, unroll=1):
                 pass
             _schedule_token_throttle_tail(schedule_token_throttle)
             # ProdAcquire/ProdWork/ProdCommit: fetch and publish the next work
