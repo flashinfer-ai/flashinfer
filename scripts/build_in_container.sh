@@ -128,7 +128,7 @@ uv pip install --python "${VENV}/bin/python" --no-deps \
 # nccl4py's cuda.core/cuda-bindings come along here.
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
-    "nvidia-cutlass-dsl[cu13]>=4.6.0" "nvidia-cudnn-frontend>=1.13.0" \
+    "nvidia-cutlass-dsl[cu13]==4.7.0" "nvidia-cudnn-frontend>=1.13.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" "nccl4py>=0.3.1" \
     "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
 
