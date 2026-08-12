@@ -186,6 +186,57 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   });
 }
 
+// Add-residual + RMSNorm + 1x128 fp8 block-quant. Emits fp8 `output` [M,d], fp32 `block_scale`
+// (d/128, round_up(M,4)) column-major TMA layout, bf16 `normed_out` [M,d], and updates `residual`
+// in place with (input+residual). See norm::FusedAddRMSNormFP8BlockQuant.
+void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale,
+                                       TensorView normed_out, TensorView input, TensorView residual,
+                                       TensorView weight, double eps, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(normed_out);
+  CHECK_DEVICE(input, residual);
+  CHECK_DEVICE(input, weight);
+  CHECK_DEVICE(input, output);
+  CHECK_DEVICE(input, block_scale);
+  CHECK_DEVICE(input, normed_out);
+  CHECK_DIM(2, input);     // (batch_size, hidden_size)
+  CHECK_DIM(2, residual);  // (batch_size, hidden_size)
+  CHECK_DIM(1, weight);    // (hidden_size)
+  CHECK_DIM(2, output);    // fp8 (batch_size, hidden_size)
+  CHECK_DIM(2, normed_out);
+  CHECK_DIM(2, block_scale);  // (hidden_size/128, round_up(batch_size, 4))
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  unsigned int m_pad = (batch_size + 3) & ~3u;
+  TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
+  TVM_FFI_ICHECK_EQ(normed_out.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(normed_out.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(block_scale.size(0), hidden_size / 128);
+  TVM_FFI_ICHECK_EQ(block_scale.size(1), m_pad);
+  TVM_FFI_ICHECK_EQ(hidden_size % 128, 0);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
+
+  // 1x128 block-scale activations are e4m3 (the layout DeepGEMM/flashinfer fp8 block GEMMs
+  // consume).
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    cudaError_t status = norm::FusedAddRMSNormFP8BlockQuant<c_type, __nv_fp8_e4m3>(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
+        static_cast<c_type*>(weight.data_ptr()), static_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+        static_cast<float*>(block_scale.data_ptr()), static_cast<c_type*>(normed_out.data_ptr()),
+        batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0),
+        block_scale.stride(0), eps, enable_pdl, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "FusedAddRMSNormFP8BlockQuant failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
+}
+
 void gemma_rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
                    bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
