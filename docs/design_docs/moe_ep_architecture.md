@@ -25,6 +25,7 @@ moe_ep/
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/fp8_fp8_bf16_pull_cutedsl
+  backends/mega/kernel/sm107/mxfp8_mxfp8_bf16_cutedsl
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
@@ -35,6 +36,9 @@ moe_ep/
   kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
     src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
+  kernel_src/next_cutedsl_megamoe/  ← Rubin (SM107) "next" greenfield tree, fprop-only so far
+    src/                       ← drop subtree (sources/), see VENDOR.md for the recorded fprop-scope diffs
+    shim/, __init__.py, VENDOR.md  ← same layering; relative-import drop, no module-name collision with the other trees
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -189,19 +193,21 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|oracle_sm107|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|mega_sm107|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
 - **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm107** — single-GPU (Rubin) torch oracle for the sm107_mxfp8_mxfp8_bf16_cutedsl mega kernel
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm107** — 4-GPU (Rubin) sm107_mxfp8_mxfp8_bf16_cutedsl MoEEpLayer vs multi-rank torch oracle; own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
 
-`all` runs the eight Blackwell-relevant sections (everything above except the two `*_sm90` targets, which need Hopper).
+`all` runs the eight Blackwell-relevant sections (everything above except the `*_sm90` targets, which need Hopper, and the `*_sm107` targets, which need Rubin).
 
 Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
 

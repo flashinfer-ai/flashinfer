@@ -191,6 +191,15 @@ process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
 `bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
 
+### SM107 (Rubin) mega tests
+
+Rubin-only (`sm107_mxfp8_mxfp8_bf16_cutedsl`, the `next_cutedsl_megamoe` fprop
+drop) targets, also in their own pytest processes:
+`bash tests/moe_ep/run_tests.sh oracle_sm107` (1 GPU, `MEGA_NO_DIST=1`) and
+`bash tests/moe_ep/run_tests.sh mega_sm107` (4 GPUs). Tests are gated on the
+`arch_rubin` marker (auto-skip unless compute capability == 10.7); the sm100
+`arch_blackwell` tests conversely auto-skip ON Rubin hosts.
+
 The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
 token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
 topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
@@ -668,6 +677,9 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 - `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo; a push-style tree will be added later)
+- `kernel_src/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
+  greenfield tree (mxfp8 GLU fprop only so far; other archs/kernels from the
+  same tree migrate into this directory later — see its `VENDOR.md`)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
