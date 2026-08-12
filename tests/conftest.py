@@ -215,9 +215,7 @@ def pytest_collection_modifyitems(config, items):
         # sm_100 kernel targets — Blackwell-marked tests fail there (ptxas /
         # DSL target mismatch), so they skip gracefully instead.
         if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
-            item.add_marker(
-                pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)")
-            )
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
         # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
         if "arch_rubin" in item.keywords and cc != (10, 7):
             item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))

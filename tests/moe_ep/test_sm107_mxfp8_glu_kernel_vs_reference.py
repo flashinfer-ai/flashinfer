@@ -47,19 +47,21 @@ def _single_rank_problem():
     num_tokens, max_tokens = 96, 128
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     w13 = (
-        torch.randn(num_experts, 2 * intermediate, hidden, device="cuda", dtype=torch.float32)
+        torch.randn(
+            num_experts, 2 * intermediate, hidden, device="cuda", dtype=torch.float32
+        )
         * hidden**-0.5
     ).to(torch.bfloat16)
     w2 = (
-        torch.randn(num_experts, hidden, intermediate, device="cuda", dtype=torch.float32)
+        torch.randn(
+            num_experts, hidden, intermediate, device="cuda", dtype=torch.float32
+        )
         * intermediate**-0.5
     ).to(torch.bfloat16)
     topk_ids = torch.stack(
         [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]
     ).to(torch.int32)
-    topk_weights = torch.softmax(
-        torch.randn(num_tokens, top_k, device="cuda"), dim=-1
-    )
+    topk_weights = torch.softmax(torch.randn(num_tokens, top_k, device="cuda"), dim=-1)
     return dict(
         hidden=hidden,
         intermediate=intermediate,

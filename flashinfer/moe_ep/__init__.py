@@ -77,6 +77,7 @@ from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm107_mxfp8_glu_mega_weights,
 )
+
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
 # These WILL BE REMOVED in a future release, together with the matching

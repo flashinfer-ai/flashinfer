@@ -108,7 +108,9 @@ def to_blocked(scale_2d: torch.Tensor) -> torch.Tensor:
             (padded_rows, padded_cols), dtype=scale_2d.dtype, device=scale_2d.device
         )
         padded[:rows, :cols] = scale_2d
-    blocks = padded.view(row_blocks, SfAtomRows, col_blocks, SfAtomCols).permute(0, 2, 1, 3)
+    blocks = padded.view(row_blocks, SfAtomRows, col_blocks, SfAtomCols).permute(
+        0, 2, 1, 3
+    )
     rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
     return rearranged.flatten()
 

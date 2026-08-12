@@ -30,7 +30,7 @@ from typing import Any, Literal, Optional, Tuple
 import torch
 
 from . import comm
-from .kernel_helpers import Mxfp8BlockSize, ceil_div, round_up
+from .kernel_helpers import Mxfp8BlockSize
 
 Sm107Mxfp8GluKind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
@@ -61,7 +61,9 @@ def _configure_dsl_arch() -> None:
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"
 
 
-def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, dynamic_leading: bool = True):
+def _to_cute(
+    tensor: torch.Tensor, assumed_align: int = 16, dynamic_leading: bool = True
+):
     """torch -> cute tensor via dlpack; leading dim marked dynamic by default."""
     import cutlass.torch as cutlass_torch
 
@@ -98,9 +100,7 @@ def _max_active_clusters(cluster_size: int) -> int:
     if cached is None:
         import cutlass.utils as cutlass_utils
 
-        cached = int(
-            cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size)
-        )
+        cached = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
         _MAX_ACTIVE_CLUSTERS_CACHE[cluster_size] = cached
     return cached
 
@@ -119,14 +119,16 @@ class Sm107MegaMoEMxfp8GluConfig:
     kind: Sm107Mxfp8GluKind = "mxfp8_e4m3"
     mma_tiler_mnk: Tuple[int, int, int] = (256, 256, 128)
     cluster_shape_mnk: Tuple[int, int, int] = (2, 1, 1)
-    group_hint: Optional[int] = 768  # tuned fc1->fc2 scheduler lead; <=0/None -> HW clusters
+    group_hint: Optional[int] = (
+        768  # tuned fc1->fc2 scheduler lead; <=0/None -> HW clusters
+    )
     token_padding_block: int = 128
     sf_padding_block: int = 128
     gate_up_clamp: Optional[float] = None
     in_kernel_fc2_reduce: bool = False
-    token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = (
-        "epi_warps"
-    )
+    token_back_mode: Literal[
+        "epi_warps", "standalone_warps", "reuse_dispatch_warps"
+    ] = "epi_warps"
     epi_flag_batch: Tuple[int, int] = (4, 2)
     flag_batch: int = 1
     apply_topk_in_fc1: bool = True
@@ -136,9 +138,7 @@ class Sm107MegaMoEMxfp8GluConfig:
         if self.kind not in _KIND_TO_TORCH_DTYPE:
             raise ValueError(f"unsupported kind {self.kind!r}.")
         if self.world_size < 1 or not (0 <= self.rank < self.world_size):
-            raise ValueError(
-                f"invalid rank/world_size {self.rank}/{self.world_size}."
-            )
+            raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
         if self.num_total_experts % self.world_size != 0:
             raise ValueError(
                 f"num_total_experts ({self.num_total_experts}) must divide evenly "
@@ -163,7 +163,9 @@ class Sm107MegaMoEMxfp8GluConfig:
                 "red-adds already-weighted terms)."
             )
         if self.in_kernel_fc2_reduce and self.token_back_mode != "epi_warps":
-            raise ValueError("in_kernel_fc2_reduce requires token_back_mode='epi_warps'.")
+            raise ValueError(
+                "in_kernel_fc2_reduce requires token_back_mode='epi_warps'."
+            )
 
     @property
     def experts_per_rank(self) -> int:
@@ -212,7 +214,9 @@ class Sm107Mxfp8GluSymmBuffer:
         # straight into the output, so it must live on the SYMMETRIC heap and
         # start zeroed; the separate-reduce path only sees local stores.
         if cfg.in_kernel_fc2_reduce:
-            self.output_activation = comm.sym_zeros((tokens, cfg.hidden), torch.bfloat16)
+            self.output_activation = comm.sym_zeros(
+                (tokens, cfg.hidden), torch.bfloat16
+            )
         else:
             self.output_activation = torch.zeros(
                 (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
@@ -319,7 +323,9 @@ class Sm107Mxfp8GluSymmBuffer:
         )
 
     def _runtime_kwargs(
-        self, transformed_l1: TransformedMxfp8GluWeights, transformed_l2: TransformedMxfp8GluWeights
+        self,
+        transformed_l1: TransformedMxfp8GluWeights,
+        transformed_l2: TransformedMxfp8GluWeights,
     ) -> dict:
         stream = torch.cuda.current_stream()
         return {
@@ -432,13 +438,13 @@ def get_symm_buffer_for_sm107_mxfp8_glu_mega_moe(
         rank=rank,
         world_size=world_size,
         kind=kind,
-        mma_tiler_mnk=tuple(mma_tiler_mnk),
-        cluster_shape_mnk=tuple(cluster_shape_mnk),
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
         group_hint=group_hint,
         gate_up_clamp=gate_up_clamp,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
-        epi_flag_batch=tuple(epi_flag_batch),
+        epi_flag_batch=epi_flag_batch,
         flag_batch=flag_batch,
         apply_topk_in_fc1=apply_topk_in_fc1,
         max_sm_count=max_sm_count,
@@ -493,9 +499,7 @@ def sm107_mxfp8_glu_mega_moe(
         )
     cfg = symm_buffer.config
     if num_tokens is None:
-        num_tokens = (
-            int(y.shape[0]) if y is not None else symm_buffer.staged_tokens()
-        )
+        num_tokens = int(y.shape[0]) if y is not None else symm_buffer.staged_tokens()
     if num_tokens is None:
         raise ValueError(
             "num_tokens unset and no tokens were staged; call the backend's "

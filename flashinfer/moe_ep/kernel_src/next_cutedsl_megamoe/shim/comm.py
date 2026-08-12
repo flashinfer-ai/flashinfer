@@ -120,4 +120,6 @@ def compute_peer_offsets(
         peer_buf = nvshmem.core.get_peer_buffer(buf, peer)
         return int(torch.utils.dlpack.from_dlpack(peer_buf).data_ptr())
 
-    return local_base, tuple(_peer_base(peer) - local_base for peer in range(world_size))
+    return local_base, tuple(
+        _peer_base(peer) - local_base for peer in range(world_size)
+    )

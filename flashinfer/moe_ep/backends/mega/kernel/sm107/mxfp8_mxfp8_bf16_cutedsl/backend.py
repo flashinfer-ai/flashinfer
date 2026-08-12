@@ -46,9 +46,7 @@ def _resolve_gate_up_clamp(
 class Sm107Mxfp8GluMegaKernelBackend(MegaKernelBackend):
     """Fused Rubin mxfp8 GLU fprop over the NVLink symmetric heap."""
 
-    def __init__(
-        self, config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    ) -> None:
+    def __init__(self, config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
 
@@ -175,9 +173,7 @@ class Sm107Mxfp8GluMegaKernelBackend(MegaKernelBackend):
                 t.scales.view(torch.uint8)
             )
             workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(
-                t.topk_weights.to(torch.float32)
-            )
+            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
@@ -199,8 +195,7 @@ class Sm107Mxfp8GluMegaKernelBackend(MegaKernelBackend):
             num_tokens = workspace.staged_tokens()
             if num_tokens is None:
                 raise RuntimeError(
-                    "compute() called before stage_inputs(); no token count "
-                    "is staged."
+                    "compute() called before stage_inputs(); no token count is staged."
                 )
 
         view = sm107_mxfp8_glu_mega_moe(

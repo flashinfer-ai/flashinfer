@@ -64,21 +64,33 @@ def _global_problem(world_size: int):
     gen = torch.Generator(device="cuda").manual_seed(20260811)
     w13 = (
         torch.randn(
-            NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN, device="cuda",
-            dtype=torch.float32, generator=gen,
+            NUM_EXPERTS,
+            2 * INTERMEDIATE,
+            HIDDEN,
+            device="cuda",
+            dtype=torch.float32,
+            generator=gen,
         )
         * HIDDEN**-0.5
     ).to(torch.bfloat16)
     w2 = (
         torch.randn(
-            NUM_EXPERTS, HIDDEN, INTERMEDIATE, device="cuda",
-            dtype=torch.float32, generator=gen,
+            NUM_EXPERTS,
+            HIDDEN,
+            INTERMEDIATE,
+            device="cuda",
+            dtype=torch.float32,
+            generator=gen,
         )
         * INTERMEDIATE**-0.5
     ).to(torch.bfloat16)
     x = torch.randn(
-        world_size, NUM_TOKENS, HIDDEN, device="cuda",
-        dtype=torch.float32, generator=gen,
+        world_size,
+        NUM_TOKENS,
+        HIDDEN,
+        device="cuda",
+        dtype=torch.float32,
+        generator=gen,
     ).to(torch.bfloat16)
     # Routing that guarantees cross-rank traffic: token 0 of every rank pins
     # one expert per EP rank; the rest is random distinct top-k.
@@ -100,8 +112,12 @@ def _global_problem(world_size: int):
     )
     topk_weights = torch.softmax(
         torch.randn(
-            world_size, NUM_TOKENS, TOP_K, device="cuda",
-            dtype=torch.float32, generator=gen,
+            world_size,
+            NUM_TOKENS,
+            TOP_K,
+            device="cuda",
+            dtype=torch.float32,
+            generator=gen,
         ),
         dim=-1,
     )
@@ -188,7 +204,9 @@ def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
 
     cfg = _megakernel_config(in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     kernel = create_mega_kernel(cfg)
-    runtime = bootstrap_moe_ep_runtime(bootstrap, kernel.runtime_requirements(bootstrap))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, kernel.runtime_requirements(bootstrap)
+    )
     try:
         mega = MoEEpLayer(
             bootstrap=BootstrapConfig(
@@ -213,7 +231,11 @@ def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
                 )
             )
             y_ref = _torch_oracle(
-                x[rank], topk_ids[rank], topk_weights[rank], w13, w2,
+                x[rank],
+                topk_ids[rank],
+                topk_weights[rank],
+                w13,
+                w2,
                 apply_topk_in_fc1=cfg.apply_topk_in_fc1,
             )[:NUM_TOKENS]
             yk = y[:NUM_TOKENS].to(torch.float32)
