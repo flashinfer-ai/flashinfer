@@ -1399,6 +1399,102 @@ def test_dual_arch_reducer_binds_digest_to_canonical_report_payload(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["reordered", "duplicate", "compact", "crlf", "bom", "missing_lf", "nan"],
+)
+def test_dual_arch_reducer_rejects_noncanonical_receipt_bytes(tmp_path, mutation):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    canonical = (
+        json.dumps(
+            sm100a,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode()
+    if mutation == "reordered":
+        raw = (
+            json.dumps(
+                dict(reversed(list(sm100a.items()))),
+                indent=2,
+                allow_nan=False,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode()
+    elif mutation == "duplicate":
+        raw = b'{\n  "suite": "shadowed",\n' + canonical[2:]
+    elif mutation == "compact":
+        raw = json.dumps(
+            sm100a,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            ensure_ascii=False,
+        ).encode()
+    elif mutation == "crlf":
+        raw = canonical.replace(b"\n", b"\r\n")
+    elif mutation == "bom":
+        raw = b"\xef\xbb\xbf" + canonical
+    elif mutation == "missing_lf":
+        raw = canonical[:-1]
+    elif mutation == "nan":
+        raw = canonical.replace(b'"blocks": 2', b'"blocks": NaN', 1)
+    else:
+        raise AssertionError(mutation)
+    parsed = json.loads(raw)
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match=(
+            "SM100a receipt SHA-256 is not bound to its canonical report payload|"
+            "per-architecture receipt is not canonical JSON"
+        ),
+    ):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=parsed,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256=raw_sha256,
+            sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_sm100a_receipt_sha256=raw_sha256,
+            expected_sm103a_receipt_sha256=evidence.canonical_receipt_sha256(sm103a),
+            expected_candidate=_candidate_expectation(sm100a, candidate_commit),
+            expected_fla_commit=fla_commit,
+            expected_sm100a_run_id=sm100a["run_id"],
+            expected_sm103a_run_id=sm103a["run_id"],
+            preset=preset,
+        )
+
+
+def test_write_json_atomic_uses_sorted_canonical_receipt_bytes(tmp_path):
+    payload = {"z": {"b": 1, "a": 2}, "a": 3}
+    path = tmp_path / "receipt.json"
+
+    evidence.write_json_atomic(path, payload)
+
+    expected = (
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode()
+    assert path.read_bytes() == expected
+    assert hashlib.sha256(expected).hexdigest() == evidence.canonical_receipt_sha256(
+        payload
+    )
+
+
 def test_dual_arch_reducer_rejects_colluding_source_hash_rewrite(tmp_path):
     sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
         tmp_path, "sm100a"

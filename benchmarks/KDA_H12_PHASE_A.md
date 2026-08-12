@@ -190,6 +190,13 @@ launcher digests. Its `--expected-sm100a-receipt-sha256` and
 they must never be copied from a receipt field or recomputed from the receipt
 being submitted for reduction.
 
+The receipt byte encoding is canonical and fail-closed: UTF-8 JSON, recursively
+sorted object keys, two-space indentation, no NaN/Infinity, and exactly one
+terminal LF. Before semantic validation, the raw receipt digest must equal the
+digest reconstructed from that encoding. Reordered or duplicate keys, compact
+JSON, CRLF/BOM encodings, and missing terminal newlines are therefore rejected
+even when a permissive JSON parser would produce the same object.
+
 Each raw sample also preserves the three CUPTI-clock CPU bracket timestamps
 (`start_ns`, `submitted_ns`, and `synchronized_ns`) and an exact trace scope
 covering the frozen preset, case/shape fingerprint, path, block/order, and

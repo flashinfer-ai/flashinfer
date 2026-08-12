@@ -247,7 +247,14 @@ def canonical_receipt_sha256(payload: dict) -> str:
     """Hash the exact canonical JSON encoding emitted by ``write_json_atomic``."""
 
     encoded = (
-        json.dumps(payload, indent=2, allow_nan=False, ensure_ascii=False) + "\n"
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -275,6 +282,7 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
                 payload,
                 stream,
                 indent=2,
+                sort_keys=True,
                 allow_nan=False,
                 ensure_ascii=False,
             )
