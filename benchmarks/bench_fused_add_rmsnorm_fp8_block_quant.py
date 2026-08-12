@@ -100,12 +100,13 @@ def bench_one(M, H, dtype=torch.bfloat16, iters=100, warmup=20):
 
     t_f = time_it(fused)
     t_b = time_it(baseline)
-    # fused byte model: read input+residual+weight (bf16), write residual+normed(bf16)+fp8+fp32 scale
+    # fused byte model: read input+residual (M*H bf16) + weight (H bf16);
+    # write residual+normed (M*H bf16) + fp8 out (M*H) + fp32 block scale.
     bytes_f = (
-        (3 * M * H * 2)
-        + (2 * M * H * 2)
-        + (M * H * 1)
-        + (H // 128 * _round_up(M, 4) * 4)
+        (4 * M * H * 2)  # input, residual reads + residual, normed writes
+        + (H * 2)  # weight (H elements, not M*H)
+        + (M * H * 1)  # fp8 out
+        + (H // 128 * _round_up(M, 4) * 4)  # block scale
     )
     gbps = bytes_f / (t_f * 1e-3) / 1e9
     print(
