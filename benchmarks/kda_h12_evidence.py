@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 6
+EVIDENCE_REPORT_SCHEMA_VERSION = 7
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
 FROZEN_PRESET_SHA256 = (
@@ -1825,6 +1825,7 @@ def _validate_graph_receipt(graph: object) -> None:
             "node_id",
             "parameterization",
             "command",
+            "python_executable_resolved",
             "returncode",
             "stdout",
             "stderr",
@@ -1853,6 +1854,8 @@ def _validate_graph_receipt(graph: object) -> None:
     if (
         not isinstance(command[0], str)
         or not Path(command[0]).is_absolute()
+        or not isinstance(graph["python_executable_resolved"], str)
+        or not Path(graph["python_executable_resolved"]).is_absolute()
         or not isinstance(graph["stdout"], str)
         or not isinstance(graph["stderr"], str)
         or re.search(r"\b2 passed\b", graph["stdout"]) is None
@@ -2243,7 +2246,7 @@ def validate_per_arch_receipt(
     _validate_graph_receipt(graph_receipt)
     if (
         graph_receipt["source_sha256"] != source_hashes[GRAPH_TEST_SOURCE]
-        or graph_receipt["command"][0]
+        or graph_receipt["python_executable_resolved"]
         != current_binding["runtime"]["python_executable"]
     ):
         raise EvidenceSchemaError(

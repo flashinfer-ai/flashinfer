@@ -310,6 +310,7 @@ def _run_changed_beta_graph_test() -> dict:
     """Run and receipt the exact H6/H12 changed-beta CUDA Graph regression."""
 
     command = [sys.executable, "-m", "pytest", "-q", GRAPH_TEST_NODE_ID]
+    python_executable_resolved = str(Path(sys.executable).resolve(strict=True))
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     completed = subprocess.run(
@@ -329,6 +330,7 @@ def _run_changed_beta_graph_test() -> dict:
         "node_id": GRAPH_TEST_NODE_ID,
         "parameterization": {"num_heads": [6, 12]},
         "command": command,
+        "python_executable_resolved": python_executable_resolved,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,

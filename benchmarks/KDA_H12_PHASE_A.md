@@ -126,8 +126,10 @@ This is the H6/H12 changed-beta CUDA Graph regression at source lines
 launch with separate tensors and a separate workspace, for both output and full
 final state, and proves that changing beta changes the replayed result. The
 receipt records the exact source line range, command, node, parameterization,
-source hash, return code, stdout, and stderr. A failure writes a non-complete
-receipt and stops the evidence run.
+source hash, return code, stdout, and stderr. It preserves the venv interpreter
+path actually executed and separately records its strict canonical path for
+runtime-provenance comparison. A failure writes a non-complete receipt and
+stops the evidence run.
 
 A successful single-GPU receipt sets only
 `complete_per_arch_denominator=true`. It is not a promotion claim. The reducer

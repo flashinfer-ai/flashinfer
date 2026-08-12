@@ -665,7 +665,33 @@ def test_graph_source_line_range_matches_decorated_test_node():
     first_line = min(
         [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
     )
-    assert evidence.GRAPH_TEST_SOURCE_LINE_RANGE == (first_line, node.end_lineno)
+    assert (first_line, node.end_lineno) == evidence.GRAPH_TEST_SOURCE_LINE_RANGE
+
+
+def test_graph_receipt_canonicalizes_symlinked_venv_python(tmp_path, monkeypatch):
+    runner = _load_runner_module()
+    canonical_python = tmp_path / "python3.12"
+    canonical_python.write_bytes(b"")
+    venv_python = tmp_path / "runtime-venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(canonical_python)
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="2 passed\n", stderr="")
+
+    monkeypatch.setattr(runner.sys, "executable", str(venv_python))
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    receipt = runner._run_changed_beta_graph_test()
+
+    assert receipt["command"][0] == str(venv_python)
+    assert receipt["python_executable_resolved"] == str(canonical_python.resolve())
+    assert captured["command"] == receipt["command"]
+    assert captured["kwargs"]["cwd"] == runner.REPOSITORY_ROOT
 
 
 def _timing_receipt(name, *, num_sequences):
@@ -996,6 +1022,7 @@ def _complete_per_arch_report(tmp_path, arch):
                 "-q",
                 evidence.GRAPH_TEST_NODE_ID,
             ],
+            "python_executable_resolved": "/venv/bin/python",
             "returncode": 0,
             "stdout": "2 passed\n",
             "stderr": "",
@@ -1490,8 +1517,8 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
         "process evidence is malformed",
     )
     reject(
-        lambda payload: payload["changed_beta_cuda_graph_test"]["command"].__setitem__(
-            0, "/different/python"
+        lambda payload: payload["changed_beta_cuda_graph_test"].__setitem__(
+            "python_executable_resolved", "/different/python"
         ),
         "source/runtime differs",
     )
