@@ -639,8 +639,8 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
         "requires_force_rebuild": True,
     }
     assert payload["changed_beta_cuda_graph_test"]["source_line_range"] == [
-        1034,
-        1108,
+        1092,
+        1166,
     ]
     assert payload["changed_beta_cuda_graph_test"]["parameterization"] == {
         "num_heads": [6, 12]
@@ -1008,7 +1008,7 @@ def _record_oracle_mismatch(report, oracle_name):
     "diagnostic_oracle",
     ["independent_bf16_recurrence", "fla_triton"],
 )
-def test_per_arch_receipt_accepts_diagnostic_disagreement(
+def test_per_arch_receipt_rejects_required_oracle_disagreement(
     tmp_path,
     diagnostic_oracle,
 ):
@@ -1019,17 +1019,14 @@ def test_per_arch_receipt_accepts_diagnostic_disagreement(
     report["cases"][0]["correctness"]["diagnostic_consensus"] = False
     report["diagnostic_consensus"] = False
 
-    evidence.validate_per_arch_receipt(
-        report,
-        expected_arch="sm100a",
-        expected_candidate_commit=candidate_commit,
-        expected_fla_commit=fla_commit,
-        preset=preset,
-    )
-
-    assert report["cases"][0]["correctness"]["passed"] is True
-    assert report["cases"][0]["performance_reportable"] is True
-    assert report["complete_per_arch_denominator"] is True
+    with pytest.raises(evidence.EvidenceSchemaError, match="exact BF16 full-tensor"):
+        evidence.validate_per_arch_receipt(
+            report,
+            expected_arch="sm100a",
+            expected_candidate_commit=candidate_commit,
+            expected_fla_commit=fla_commit,
+            preset=preset,
+        )
 
 
 def test_per_arch_receipt_rejects_pinned_oracle_failure(tmp_path):
@@ -1553,8 +1550,8 @@ def test_runner_requires_exact_observed_h12_candidate_variant():
     ("failed_label", "contract_passed", "diagnostic_consensus"),
     [
         (None, True, True),
-        ("independent recurrence", True, False),
-        ("FLA/Triton", True, False),
+        ("independent recurrence", False, False),
+        ("FLA/Triton", False, False),
         ("pinned FlashKDA", False, True),
     ],
 )
@@ -1606,12 +1603,12 @@ def test_runner_oracle_role_matrix(
 
 
 @pytest.mark.parametrize(
-    ("pinned_passed", "timing_called"),
+    ("all_oracles_passed", "timing_called"),
     [(True, True), (False, False)],
 )
-def test_runner_pinned_gate_alone_controls_timing(
+def test_runner_three_oracle_gate_controls_timing(
     monkeypatch,
-    pinned_passed,
+    all_oracles_passed,
     timing_called,
 ):
     runner = _load_runner_module()
@@ -1628,8 +1625,8 @@ def test_runner_pinned_gate_alone_controls_timing(
         runner,
         "_check_correctness",
         lambda torch, runtime: {
-            "passed": pinned_passed,
-            "diagnostic_consensus": False,
+            "passed": all_oracles_passed,
+            "diagnostic_consensus": all_oracles_passed,
         },
     )
 
@@ -1657,7 +1654,7 @@ def test_runner_pinned_gate_alone_controls_timing(
         blocks=2,
     )
 
-    assert result["performance_reportable"] is pinned_passed
+    assert result["performance_reportable"] is all_oracles_passed
     assert bool(calls) is timing_called
     assert (result["timings"] is not None) is timing_called
 
@@ -1720,3 +1717,160 @@ def test_independent_recurrence_allocates_a_bf16_output_buffer():
     ]
     assert contraction_signatures.count("hk,hvk->hv") == 2
     assert "nhk,nhvk->nhv" not in contraction_signatures
+    carrier_calls = [
+        node
+        for node in ast.walk(recurrence)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_h12_bf16_residual_carriers"
+    ]
+    assert len(carrier_calls) == 1
+
+
+def test_runner_h12_residual_carriers_round_every_selected_boundary_on_cpu():
+    torch = pytest.importorskip("torch")
+    runner = _load_runner_module()
+    prediction = torch.tensor(
+        [[-15.22768497, -1.95509577, 3.25501537, 0.3333]],
+        dtype=torch.float32,
+    )
+    value = torch.tensor(
+        [[3.81683922, -9.65635967, -4.79144955, 0.7123]],
+        dtype=torch.float32,
+    )
+    beta_logit = torch.tensor(
+        [-1.02760863],
+        dtype=torch.float32,
+    )
+
+    prediction_carrier, delta_carrier, beta_carrier, update_carrier = (
+        runner._h12_bf16_residual_carriers(
+            torch,
+            value=value,
+            prediction=prediction,
+            beta_logit=beta_logit,
+        )
+    )
+    expected_prediction = prediction.to(torch.bfloat16).float()
+    unrounded_delta = value - expected_prediction
+    expected_delta = unrounded_delta.to(torch.bfloat16).float()
+    unrounded_beta = torch.sigmoid(beta_logit)
+    expected_beta = unrounded_beta.to(torch.bfloat16).float()
+    unrounded_update = expected_beta.unsqueeze(-1) * expected_delta
+    expected_update = unrounded_update.to(torch.bfloat16).float()
+
+    assert torch.equal(prediction_carrier, expected_prediction)
+    assert torch.equal(delta_carrier, expected_delta)
+    assert torch.equal(beta_carrier, expected_beta)
+    assert torch.equal(update_carrier, expected_update)
+    assert not torch.equal(prediction_carrier, prediction)
+    assert not torch.equal(delta_carrier, unrounded_delta)
+    assert not torch.equal(beta_carrier, unrounded_beta)
+    assert not torch.equal(update_carrier, unrounded_update)
+
+
+def test_independent_recurrence_uses_sequence_local_chunk16_state_cadence():
+    torch = pytest.importorskip("torch")
+    runner = _load_runner_module()
+    generator = torch.Generator().manual_seed(8128)
+    seq_lens = (1, 17)
+    total_tokens = sum(seq_lens)
+    num_heads = 1
+    head_dim = 4
+    vector_shape = (1, total_tokens, num_heads, head_dim)
+
+    def _bf16_random(scale):
+        return (torch.randn(vector_shape, generator=generator) * scale).to(
+            torch.bfloat16
+        )
+
+    tensors = {
+        "q": _bf16_random(0.5),
+        "k": _bf16_random(0.5),
+        "v": _bf16_random(0.4),
+        # Keep decay close to one so a wrong state cadence remains visible in
+        # the final state rather than being washed out by later updates.
+        "g": torch.full(vector_shape, -8.0, dtype=torch.bfloat16),
+        "beta": (
+            torch.randn((1, total_tokens, num_heads), generator=generator) * 0.5
+        ).to(torch.bfloat16),
+        "A_log": torch.zeros((num_heads,), dtype=torch.float32),
+        "dt_bias": torch.zeros((num_heads, head_dim), dtype=torch.float32),
+    }
+    initial_state = (
+        torch.randn(
+            (len(seq_lens), num_heads, head_dim, head_dim),
+            generator=generator,
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    runtime = SimpleNamespace(
+        tensors=tensors,
+        initial_state_seed=initial_state,
+        metadata={"seq_lens": seq_lens},
+    )
+
+    def _reference(boundary_mode):
+        q_flat = torch.nn.functional.normalize(
+            tensors["q"].float(), dim=-1
+        ).reshape(-1, num_heads, head_dim)
+        k_flat = torch.nn.functional.normalize(
+            tensors["k"].float(), dim=-1
+        ).reshape(-1, num_heads, head_dim)
+        v_flat = tensors["v"].float().reshape(-1, num_heads, head_dim)
+        g_flat = tensors["g"].float().reshape(-1, num_heads, head_dim)
+        beta_logits = tensors["beta"].float().reshape(-1, num_heads)
+        decay = torch.exp(
+            -5.0
+            * torch.sigmoid(
+                torch.exp(tensors["A_log"]).reshape(1, num_heads, 1)
+                * (g_flat + tensors["dt_bias"].reshape(1, num_heads, head_dim))
+            )
+        )
+        offsets = [0]
+        for length in seq_lens:
+            offsets.append(offsets[-1] + length)
+        state = initial_state.clone()
+        output = torch.empty_like(q_flat, dtype=torch.bfloat16)
+        for sequence in range(len(seq_lens)):
+            carrier = state[sequence].float()
+            for local_token, token in enumerate(
+                range(offsets[sequence], offsets[sequence + 1]),
+                start=1,
+            ):
+                decayed = carrier * decay[token].unsqueeze(1)
+                prediction = torch.einsum(
+                    "hk,hvk->hv", k_flat[token], decayed
+                ).to(torch.bfloat16).float()
+                delta = (v_flat[token] - prediction).to(torch.bfloat16).float()
+                beta = torch.sigmoid(beta_logits[token]).to(torch.bfloat16).float()
+                update = (beta.unsqueeze(-1) * delta).to(torch.bfloat16).float()
+                updated = decayed + update.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+                snapshot = updated.to(torch.bfloat16)
+                state[sequence] = snapshot
+                projected = torch.einsum("hk,hvk->hv", q_flat[token], updated)
+                output[token] = (head_dim**-0.5 * projected).to(torch.bfloat16)
+                if boundary_mode == "local_chunk16":
+                    round_state = local_token % 16 == 0
+                elif boundary_mode == "global_chunk16":
+                    round_state = (token + 1) % 16 == 0
+                elif boundary_mode == "per_token":
+                    round_state = True
+                else:
+                    raise AssertionError(boundary_mode)
+                carrier = snapshot.float() if round_state else updated
+        return output.reshape_as(tensors["q"]), state
+
+    actual_output, actual_state = runner._independent_bf16_recurrence(
+        torch, runtime
+    )
+    expected_output, expected_state = _reference("local_chunk16")
+    per_token_output, per_token_state = _reference("per_token")
+    global_output, global_state = _reference("global_chunk16")
+
+    assert torch.equal(actual_output, expected_output)
+    assert torch.equal(actual_state, expected_state)
+    assert not torch.equal(actual_output, per_token_output)
+    assert not torch.equal(actual_state, per_token_state)
+    assert not torch.equal(actual_output, global_output)
+    assert not torch.equal(actual_state, global_state)

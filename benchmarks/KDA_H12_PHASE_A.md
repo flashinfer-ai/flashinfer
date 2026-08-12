@@ -41,21 +41,26 @@ not produced.
 
 For every case, the harness checks both the public output and the complete
 final state at BF16 `atol=rtol=1e-2`. The pinned MoonshotAI/FlashKDA
-implementation is the sole hard Phase-A contract oracle: its result alone sets
-`correctness.passed`, gates reportable timing, and controls per-architecture
-completion.
+implementation remains the external contract authority, while Phase-A
+completion additionally requires agreement with the independent recurrence
+and FLA/Triton. `correctness.passed`, reportable timing, and per-architecture
+completion therefore require all three comparisons to pass.
 
-Two additional comparisons are mandatory diagnostics: an independent direct
-token-by-token recurrence with a BF16 state store after every token, and FLA's
-Triton implementation. Both must execute and produce full output/final-state
-receipts for all six cases. Their agreement is recorded as
-`diagnostic_consensus`; a numerical disagreement does not override a passing
-pinned-oracle result or suppress timing.
+Two additional comparisons are mandatory: an independent direct recurrence
+with a sequence-local chunk-16 BF16 state carrier, and FLA's Triton
+implementation. The independent recurrence explicitly rounds four H12
+residual intermediates through BF16: the state/K prediction, the
+V-minus-prediction delta, sigmoid beta, and the post-beta update carrier. All
+three oracles must pass the full output and final-state tolerance for all six
+cases before timing is reportable. Their agreement is also recorded as
+`diagnostic_consensus`; a numerical disagreement fails the case and suppresses
+timing.
 
-The smaller repository H12 smoke tests use a clean-room chunk-16 recurrence:
-the FP32 carrier is rounded through BF16 between 16-token chunks and each
-token projects its unrounded updated state. That helper is diagnostic only and
-is explicitly not a substitute for the pinned six-case contract.
+The smaller repository H12 smoke tests use a clean-room chunk-16 recurrence.
+It applies the same four BF16 residual carrier boundaries, rounds the FP32
+state carrier through BF16 between 16-token chunks, and projects each token's
+unrounded updated state. That helper is diagnostic only and is explicitly not
+a substitute for the pinned six-case contract.
 
 The FlashKDA checkout must be exactly
 `1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b`, with its CUTLASS submodule at
@@ -111,7 +116,7 @@ python -m pytest -q \
 ```
 
 This is the H6/H12 changed-beta CUDA Graph regression at source lines
-1034–1108. It compares a captured replay bitwise against an independent eager
+1092–1166. It compares a captured replay bitwise against an independent eager
 launch with separate tensors and a separate workspace, for both output and full
 final state, and proves that changing beta changes the replayed result. The
 receipt records the exact source line range, command, node, parameterization,

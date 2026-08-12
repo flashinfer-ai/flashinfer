@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 4
+EVIDENCE_REPORT_SCHEMA_VERSION = 5
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 2
 FROZEN_PRESET_SHA256 = (
@@ -52,7 +52,7 @@ SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 REQUIRED_ARCHITECTURES = ("sm100a", "sm103a")
 
 GRAPH_TEST_SOURCE = "tests/kda/test_recurrent_kda_prefill.py"
-GRAPH_TEST_SOURCE_LINE_RANGE = (1034, 1108)
+GRAPH_TEST_SOURCE_LINE_RANGE = (1092, 1166)
 GRAPH_TEST_NODE_ID = (
     "tests/kda/test_recurrent_kda_prefill.py::"
     "test_frozen_prefill_non_aligned_heads_graph_refreshes_beta"
@@ -1721,7 +1721,7 @@ def _validate_case_receipt(
         required_to_pass=True,
     )
     for oracle in ("independent_bf16_recurrence", "fla_triton"):
-        _require_oracle(case, oracle, expected, required_to_pass=False)
+        _require_oracle(case, oracle, expected, required_to_pass=True)
     diagnostic_consensus = all(
         result["passed"]
         for oracle in (
@@ -1736,7 +1736,7 @@ def _validate_case_receipt(
         )
     if case.get("performance_reportable") is not True:
         raise EvidenceSchemaError(
-            f"case {expected.name!r} pinned correctness did not gate performance"
+            f"case {expected.name!r} three-oracle correctness did not gate performance"
         )
 
     timings = case.get("timings")

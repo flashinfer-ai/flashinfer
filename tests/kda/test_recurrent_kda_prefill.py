@@ -149,13 +149,64 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     return out.reshape_as(q), state
 
 
+def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
+    """Apply the four BF16 residual carriers selected by the public H12 ABI."""
+
+    prediction_carrier = prediction.to(torch.bfloat16).float()
+    delta_carrier = (value - prediction_carrier).to(torch.bfloat16).float()
+    beta_carrier = torch.sigmoid(beta_logit).to(torch.bfloat16).float()
+    update_carrier = (
+        (beta_carrier.unsqueeze(-1) * delta_carrier).to(torch.bfloat16).float()
+    )
+    return prediction_carrier, delta_carrier, beta_carrier, update_carrier
+
+
+def test_h12_smoke_reference_residual_carriers_round_every_boundary_on_cpu():
+    prediction = torch.tensor(
+        [[-15.22768497, -1.95509577, 3.25501537, 0.3333]],
+        dtype=torch.float32,
+    )
+    value = torch.tensor(
+        [[3.81683922, -9.65635967, -4.79144955, 0.7123]],
+        dtype=torch.float32,
+    )
+    beta_logit = torch.tensor([-1.02760863], dtype=torch.float32)
+
+    prediction_carrier, delta_carrier, beta_carrier, update_carrier = (
+        _h12_bf16_residual_carriers(
+            torch,
+            value=value,
+            prediction=prediction,
+            beta_logit=beta_logit,
+        )
+    )
+    expected_prediction = prediction.to(torch.bfloat16).float()
+    unrounded_delta = value - expected_prediction
+    expected_delta = unrounded_delta.to(torch.bfloat16).float()
+    unrounded_beta = torch.sigmoid(beta_logit)
+    expected_beta = unrounded_beta.to(torch.bfloat16).float()
+    unrounded_update = expected_beta.unsqueeze(-1) * expected_delta
+    expected_update = unrounded_update.to(torch.bfloat16).float()
+
+    assert torch.equal(prediction_carrier, expected_prediction)
+    assert torch.equal(delta_carrier, expected_delta)
+    assert torch.equal(beta_carrier, expected_beta)
+    assert torch.equal(update_carrier, expected_update)
+    assert not torch.equal(prediction_carrier, prediction)
+    assert not torch.equal(delta_carrier, unrounded_delta)
+    assert not torch.equal(beta_carrier, unrounded_beta)
+    assert not torch.equal(update_carrier, unrounded_update)
+
+
 def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
     """Clean-room H12 smoke reference; not the Phase-A contract authority.
 
-    The recurrent carrier stays in FP32 within each 16-token chunk.  A BF16
-    snapshot becomes the next chunk's carrier, while each output projects the
-    unrounded FP32 state for its token.  The pinned FlashKDA implementation is
-    the sole hard Phase-A correctness oracle.
+    The recurrent state carrier stays in FP32 within each 16-token chunk, but
+    the state/K prediction, V-minus-prediction delta, sigmoid beta, and
+    post-beta update carrier each round through BF16.  A BF16 state snapshot
+    becomes the next chunk's carrier, while each output projects the unrounded
+    FP32 state for its token.  The pinned FlashKDA implementation is the sole
+    hard Phase-A correctness oracle.
     """
 
     q = inputs["q"]
@@ -165,7 +216,7 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
     k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(-1, num_heads, head_dim)
     v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
     g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
-    beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))
+    beta_logits_flat = inputs["beta"].float().reshape(-1, num_heads)
     gate = lower_bound * torch.sigmoid(
         torch.exp(inputs["A_log"]).reshape(1, num_heads, 1)
         * (g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim))
@@ -191,8 +242,15 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
         ):
             decayed = carrier * decay[token].unsqueeze(1)
             predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
-            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
-            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+            _, _, _, update_carrier = _h12_bf16_residual_carriers(
+                torch,
+                value=v_flat[token],
+                prediction=predicted,
+                beta_logit=beta_logits_flat[token],
+            )
+            updated = decayed + update_carrier.unsqueeze(-1) * k_flat[token].unsqueeze(
+                1
+            )
             state[sequence] = updated.to(torch.bfloat16)
             projected = torch.einsum("hk,hvk->hv", q_flat[token], updated)
             out[token] = (scale * projected).to(torch.bfloat16)

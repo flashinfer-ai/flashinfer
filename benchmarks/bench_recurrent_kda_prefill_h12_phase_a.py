@@ -711,8 +711,27 @@ def _make_case_runtime(
     )
 
 
+def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
+    """Apply the four BF16 residual carriers selected by the public H12 ABI."""
+
+    prediction_carrier = prediction.to(torch.bfloat16).float()
+    delta_carrier = (value - prediction_carrier).to(torch.bfloat16).float()
+    beta_carrier = torch.sigmoid(beta_logit).to(torch.bfloat16).float()
+    update_carrier = (
+        (beta_carrier.unsqueeze(-1) * delta_carrier).to(torch.bfloat16).float()
+    )
+    return prediction_carrier, delta_carrier, beta_carrier, update_carrier
+
+
 def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
-    """Direct per-token recurrence with a BF16 state store after every token."""
+    """Direct recurrence with local chunk-16 state and H12 BF16 carriers.
+
+    The recurrent state remains FP32 within each sequence-local 16-token
+    chunk, and the chunk snapshot becomes the next BF16 state carrier.  Before
+    each update, the state/K prediction, V-minus-prediction delta, sigmoid
+    beta, and post-beta update carrier are each materialized through BF16,
+    matching the boundaries selected from the pinned public ``_fwd_raw`` ABI.
+    """
 
     tensors = runtime.tensors
     q = tensors["q"]
@@ -732,7 +751,7 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
         dim=-1,
     ).reshape(-1, num_heads, head_dim)
     v_flat = tensors["v"].float().reshape(-1, num_heads, head_dim)
-    beta_flat = torch.sigmoid(tensors["beta"].float().reshape(-1, num_heads))
+    beta_logits_flat = tensors["beta"].float().reshape(-1, num_heads)
     g_flat = tensors["g"].float().reshape(-1, num_heads, head_dim)
     gate = -5.0 * torch.sigmoid(
         torch.exp(tensors["A_log"]).reshape(1, num_heads, 1)
@@ -740,8 +759,8 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     )
     decay = torch.exp(gate)
     state = runtime.initial_state_seed.clone()
-    # q_flat is FP32 for the recurrence arithmetic, but the frozen contract
-    # rounds every output token to BF16 just as it rounds every state update.
+    # q_flat is FP32 for the recurrence arithmetic, while every public output
+    # token and every chunk-final state snapshot is stored as BF16.
     out = torch.empty_like(q_flat, dtype=torch.bfloat16)
     seq_lens = tuple(runtime.metadata["seq_lens"])
     offsets = _offsets(seq_lens)
@@ -750,20 +769,31 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     # API tests. A batched active-sequence einsum selects a different CUDA
     # contraction and its FP32 reduction drift compounds through BF16 stores.
     for sequence in range(len(offsets) - 1):
-        for token in range(offsets[sequence], offsets[sequence + 1]):
-            state_f32 = state[sequence].float()
-            decayed = state_f32 * decay[token].unsqueeze(1)
+        carrier = state[sequence].float()
+        for local_token, token in enumerate(
+            range(offsets[sequence], offsets[sequence + 1]),
+            start=1,
+        ):
+            decayed = carrier * decay[token].unsqueeze(1)
             predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
-            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
-            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+            _, _, _, update_carrier = _h12_bf16_residual_carriers(
+                torch,
+                value=v_flat[token],
+                prediction=predicted,
+                beta_logit=beta_logits_flat[token],
+            )
+            updated = decayed + update_carrier.unsqueeze(-1) * k_flat[token].unsqueeze(
+                1
+            )
             quantized_state = updated.to(torch.bfloat16)
             state[sequence] = quantized_state
             projected = torch.einsum(
                 "hk,hvk->hv",
                 q_flat[token],
-                quantized_state.float(),
+                updated,
             )
             out[token] = (scale * projected).to(torch.bfloat16)
+            carrier = quantized_state.float() if local_token % 16 == 0 else updated
     return out.reshape_as(q), state
 
 
@@ -864,9 +894,10 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
     diagnostic_consensus = all(
         result["passed"] for oracle in (independent, fla) for result in oracle.values()
     )
+    all_oracles_passed = pinned_passed and diagnostic_consensus
     return {
-        "passed": pinned_passed,
-        "public_output_and_full_final_state": pinned_passed,
+        "passed": all_oracles_passed,
+        "public_output_and_full_final_state": all_oracles_passed,
         "contract_oracle": "pinned_flash_kda",
         "diagnostic_consensus": diagnostic_consensus,
         "independent_bf16_recurrence": independent,

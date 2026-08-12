@@ -49,6 +49,10 @@ The frozen H12 N16 provenance is Cake revision
 ``98ce57eaa91123d2fbfea27f23f016824a221dfc``. The schedule is module
 ``flashkda_bf16_fused_m128_534260023d`` with raw source SHA-256
 ``4324be7ec3413d3c442e4e0733e52402acbb82c79d8fa28a249d63763968986e``.
+Its residual recurrence rounds four intermediates through BF16: the state/K
+prediction, the V-minus-prediction delta, sigmoid beta, and the post-beta
+update carrier. The state accumulation itself remains FP32 within each
+16-token recurrence chunk and is rounded through BF16 at the chunk boundary.
 The N32 schedule remains provenance-pinned to Cake revision
 ``691136208f24a5160fcc5940ea4064e5613db2e4`` at tree
 ``48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3`` as module
