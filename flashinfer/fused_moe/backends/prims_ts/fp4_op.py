@@ -280,7 +280,9 @@ def prims_ts_fp4_block_scale_moe(
     moe_runner.set_cache_key_static_extras(**common_kwargs)
     ok, reason = support_fn(moe_runner, moe_inputs, [-1, -1], **common_kwargs)
     if not ok:
-        raise RuntimeError(f"Config not supported by Prims-TS {mode_name} kernel ({reason})")
+        raise RuntimeError(
+            f"Config not supported by Prims-TS {mode_name} kernel ({reason})"
+        )
 
     _, tactic = AutoTuner.get().choose_one(
         "flashinfer::prims_ts_fp4_block_scale_moe",
@@ -298,7 +300,9 @@ def prims_ts_fp4_block_scale_moe(
         **common_kwargs,
     )
     if not ok:
-        raise RuntimeError(f"Config not supported by Prims-TS {mode_name} kernel ({reason})")
+        raise RuntimeError(
+            f"Config not supported by Prims-TS {mode_name} kernel ({reason})"
+        )
 
     intermediate_output = moe_runner.forward(
         moe_inputs.to_list(),
@@ -389,8 +393,12 @@ def _fake_prims_ts_fp4_block_scale_moe(
         if hidden_states.dtype == torch.uint8
         else hidden_states.shape[-1]
     )
-    out = output if output is not None else hidden_states.new_empty(
-        hidden_states.shape[0], hidden_size, dtype=torch.bfloat16
+    out = (
+        output
+        if output is not None
+        else hidden_states.new_empty(
+            hidden_states.shape[0], hidden_size, dtype=torch.bfloat16
+        )
     )
     return [out] if do_finalize else [out, hidden_states.new_empty(0)]
 

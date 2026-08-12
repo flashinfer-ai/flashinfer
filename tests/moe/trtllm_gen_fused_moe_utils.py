@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import math
-import os
 import pytest
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -113,9 +112,7 @@ def _default_block_major_k_bytes_for_prims_ts(args, weight_processing, quant_mod
             per_token_sf_dtype=1,
         )
     elif quant_mode == QuantMode.FP4_MXFP4_MXFP8:
-        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
-            [-1, -1], **common_with_activation
-        )
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic([-1, -1], **common_with_activation)
     elif quant_mode == QuantMode.FP4_MXFP4_Bf16:
         pair = map_trtllm_mxfp4_bf16_moe_tactic([-1, -1], **common_with_activation)
     elif quant_mode == QuantMode.FP8_PER_TENSOR:
@@ -130,9 +127,7 @@ def _default_block_major_k_bytes_for_prims_ts(args, weight_processing, quant_mod
     elif quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
         pair = map_trtllm_deepseek_fp8_moe_tactic([-1, -1], **common)
     elif quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8:
-        pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
-            [-1, -1], **common_with_activation
-        )
+        pair = map_trtllm_mxfp8_mxfp8_moe_tactic([-1, -1], **common_with_activation)
     else:
         return 128, 128
 
@@ -215,8 +210,9 @@ class CUDAGraphMoE:
         self.input_tensor = hidden_states_sample.clone()
 
         # Warmup
-        with torch.cuda.stream(torch_stream), autotune(
-            self.enable_autotune, tuning_buckets=self.autotune_tuning_buckets
+        with (
+            torch.cuda.stream(torch_stream),
+            autotune(self.enable_autotune, tuning_buckets=self.autotune_tuning_buckets),
         ):
             for _ in range(1):
                 self._run_moe_computation(runtime_args)
@@ -790,9 +786,7 @@ class FP4Moe(Moe):
             and self.quant_mode == QuantMode.FP4_NVFP4_NVFP4
             and activation_type == ActivationType.Situ
         ):
-            kernel_gemm1_clamp_limit = gemm1_clamp_limit / static_data[
-                "scale_gate_fc1"
-            ]
+            kernel_gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
         permute_info = kwargs.get("permute_info")
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
@@ -1382,9 +1376,7 @@ class FP8BlockScaleMoe(Moe):
                 # Reorder rows of W1 only for fused gated activation.
                 gemm1_weights_fp8_interleaved = []
                 gemm1_scales_fp8_interleaved = []
-                gemm1_bias_fp8_interleaved = (
-                    [] if args.gemm1_bias is not None else None
-                )
+                gemm1_bias_fp8_interleaved = [] if args.gemm1_bias is not None else None
                 for i in range(num_experts):
                     gemm1_w = (
                         args.gemm1_weights[i]
@@ -1574,7 +1566,9 @@ class FP8BlockScaleMoe(Moe):
         with autotune(enable_autotune):
             if gemm1_lora_delta is not None:
                 if moe_gemm_backend == MoeGemmBackend.PRIMS_TS:
-                    raise NotImplementedError("Prims-TS FP8 block-scale LoRA is not wired")
+                    raise NotImplementedError(
+                        "Prims-TS FP8 block-scale LoRA is not wired"
+                    )
                 packed_topk_ids = pack_topk_for_routed_moe(
                     permute_info["topKIndices"], permute_info["topKLogits"]
                 )

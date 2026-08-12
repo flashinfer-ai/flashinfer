@@ -34,6 +34,7 @@ pytestmark = [
     ),
 ]
 
+
 def _common_fp8_base(**overrides):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         BatchMode,
@@ -57,6 +58,7 @@ def _common_fp8_base(**overrides):
     )
     cfg.update(overrides)
     return cfg
+
 
 def _fc2_variant(
     tile_n,
@@ -92,6 +94,7 @@ def _fc2_variant(
         use_per_token_sf_a=use_per_token_sf_a,
         per_token_sf_dtype=per_token_sf_dtype,
     )
+
 
 def _fc1_variant(
     tile_n,
@@ -130,6 +133,7 @@ def _fc1_variant(
         per_token_sf_dtype=per_token_sf_dtype,
     )
 
+
 def _fp8_relu2_variant(
     tile_n,
     tile_k,
@@ -167,6 +171,7 @@ def _fp8_relu2_variant(
         per_token_sf_dtype=per_token_sf_dtype,
     )
 
+
 def _non_swap_fp8_fc1_variant(*, use_tma_store):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
@@ -183,6 +188,7 @@ def _non_swap_fp8_fc1_variant(*, use_tma_store):
         "use_tma_store": use_tma_store,
     }
 
+
 def _non_swap_fp8_relu2_variant(*, use_tma_store):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
@@ -198,6 +204,7 @@ def _non_swap_fp8_relu2_variant(*, use_tma_store):
         "transpose_mma_output": 0,
         "use_tma_store": use_tma_store,
     }
+
 
 def _deepseek_fp8_fc1_variant():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -230,6 +237,7 @@ def _deepseek_fp8_fc1_variant():
         load_sfab_regs=48,
     )
 
+
 def _deepseek_fp8_fc1_bf16_output_variant():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -241,6 +249,7 @@ def _deepseek_fp8_fc1_bf16_output_variant():
         num_stages_c_smem=1,
     )
     return cfg
+
 
 def _deepseek_fp8_fc2_variant():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -352,6 +361,7 @@ def test_fp8_config_schedule_validates(name, cfg):
         **cfg,
     )
 
+
 def test_fp8_fc2_low_latency_correctness_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -363,6 +373,7 @@ def test_fp8_fc2_low_latency_correctness_tile8():
         top_k=1,
         **_fc2_variant(8, 256, 6, 8, 128, 1),
     )
+
 
 def test_fp8_fc1_low_latency_tma_route_correctness_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -488,6 +499,7 @@ def test_fp8_deepseek_fc2_low_latency_correctness_tile8_small():
         **_deepseek_fp8_fc2_variant(),
     )
 
+
 def test_fp8_fc2_high_throughput_cluster2_correctness_tile64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -499,6 +511,7 @@ def test_fp8_fc2_high_throughput_cluster2_correctness_tile64():
         top_k=1,
         **_fc2_variant(64, 128, 8, 64, 256, 2),
     )
+
 
 def test_fp8_fc1_high_throughput_cluster2_tma_route_correctness_tile64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -512,6 +525,7 @@ def test_fp8_fc1_high_throughput_cluster2_tma_route_correctness_tile64():
         **_fc1_variant(64, 256, 5, 64, 256, 2),
     )
 
+
 def test_fp8_fc1_low_latency_tma_route_per_token_sfb_schedule_validates():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         build_batched_gemm_task_manager,
@@ -523,6 +537,7 @@ def test_fp8_fc1_low_latency_tma_route_per_token_sfb_schedule_validates():
         top_k=1,
         **_fc1_variant(8, 256, 6, 8, 128, 1, use_per_token_sf_b=1),
     )
+
 
 def test_fp8_fc1_low_latency_tma_route_per_token_sfb_correctness_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -539,6 +554,7 @@ def test_fp8_fc1_low_latency_tma_route_per_token_sfb_correctness_tile8():
     )
     assert ok
     assert out.float().abs().max().item() > 0.0
+
 
 def test_fp8_fc1_low_latency_tma_route_per_token_sfa_sfb_correctness_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
@@ -567,6 +583,7 @@ def test_fp8_fc1_low_latency_tma_route_per_token_sfa_sfb_correctness_tile8():
     assert ok
     assert out.float().abs().max().item() > 0.0
 
+
 def test_fp8_fc2_low_latency_per_token_sfa_correctness_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -589,6 +606,7 @@ def test_fp8_fc2_low_latency_per_token_sfa_correctness_tile8():
         ),
     )
 
+
 def test_fp8_relu2_plain_fp8_output_scale_c_nonzero_correctness_tile16():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -606,6 +624,7 @@ def test_fp8_relu2_plain_fp8_output_scale_c_nonzero_correctness_tile16():
     )
     assert ok
     assert out.float().abs().max().item() > 0.25
+
 
 def test_fp8_relu2_per_token_sfb_correctness_multi_epilogue_subtile():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (

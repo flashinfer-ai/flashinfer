@@ -30,7 +30,11 @@ def _is_gated_activation(activation_type: int) -> bool:
 
 
 def _fc1_out_hidden(intermediate_size: int, activation_type: int) -> int:
-    return intermediate_size * 2 if _is_gated_activation(activation_type) else intermediate_size
+    return (
+        intermediate_size * 2
+        if _is_gated_activation(activation_type)
+        else intermediate_size
+    )
 
 
 def _check_fp8_scale_storage(name: str, tensor: torch.Tensor) -> None:
@@ -324,6 +328,7 @@ def build_bf16_launch_io(
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _runtime_config,
     )
+
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
         in_hidden = hidden_size
@@ -410,7 +415,9 @@ def build_bf16_launch_io(
         kernel_a = activation_compact
         kernel_b = preprocessed_weights
 
-    logical_output_m = m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
+    logical_output_m = (
+        m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
+    )
     if output_buf.numel() < logical_output_m * n_val:
         raise ValueError(
             f"{fc} output buffer too small: need {logical_output_m * n_val}, "
@@ -429,13 +436,22 @@ def build_bf16_launch_io(
     )
 
     a_dp = make_ptr(
-        cutlass.BFloat16, kernel_a.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
+        cutlass.BFloat16,
+        kernel_a.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
     )
     b_dp = make_ptr(
-        cutlass.BFloat16, kernel_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
+        cutlass.BFloat16,
+        kernel_b.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
     )
     c0_dp = make_ptr(
-        cutlass.BFloat16, output_buf.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
+        cutlass.BFloat16,
+        output_buf.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
     )
     dummy_data_ptr = output_buf.data_ptr()
     sf_c_dp = make_ptr(
@@ -1084,7 +1100,10 @@ def build_mxfp4_mxfp8_launch_io(
         sf_dtype, weights_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     sfb_dp = make_ptr(
-        sf_dtype, activation_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
+        sf_dtype,
+        activation_scale.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=32,
     )
     if cfg.has_epilogue_quant:
         c0_dp = make_ptr(
@@ -1285,8 +1304,13 @@ def build_fp8_block_scale_launch_io(
 
     quantization_type = Fp8QuantizationType(int(fp8_quantization_type))
     is_deepseek = quantization_type == Fp8QuantizationType.DeepSeekFp8
-    if quantization_type not in (Fp8QuantizationType.DeepSeekFp8, Fp8QuantizationType.MxFp8):
-        raise ValueError(f"Unsupported FP8 block-scale quantization: {quantization_type}")
+    if quantization_type not in (
+        Fp8QuantizationType.DeepSeekFp8,
+        Fp8QuantizationType.MxFp8,
+    ):
+        raise ValueError(
+            f"Unsupported FP8 block-scale quantization: {quantization_type}"
+        )
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
@@ -1361,7 +1385,10 @@ def build_fp8_block_scale_launch_io(
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.float8_e4m3fn:
         raise ValueError("FP8 block-scale hidden_states must be float8_e4m3fn")
-    if gemm1_weights.dtype != torch.float8_e4m3fn or gemm2_weights.dtype != torch.float8_e4m3fn:
+    if (
+        gemm1_weights.dtype != torch.float8_e4m3fn
+        or gemm2_weights.dtype != torch.float8_e4m3fn
+    ):
         raise ValueError("FP8 block-scale weights must be float8_e4m3fn")
     if gemm1_output.dtype != torch.uint8 or activation_output.dtype != torch.uint8:
         raise ValueError("FP8 block-scale intermediate outputs must use uint8 storage")
@@ -1400,7 +1427,12 @@ def build_fp8_block_scale_launch_io(
             f"got {out_hidden}"
         )
 
-    m_val, n_val, k_val, l_val = out_hidden, logical_token_capacity, in_hidden, num_experts
+    m_val, n_val, k_val, l_val = (
+        out_hidden,
+        logical_token_capacity,
+        in_hidden,
+        num_experts,
+    )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
     data_dtype = cutlass.Float8E4M3FN
     sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
@@ -1431,7 +1463,10 @@ def build_fp8_block_scale_launch_io(
         sf_dtype, weights_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     sfb_dp = make_ptr(
-        sf_dtype, activation_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
+        sf_dtype,
+        activation_scale.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=32,
     )
     if cfg.uses_fp8_output or cfg.has_epilogue_quant:
         c0_dp = make_ptr(
@@ -2076,7 +2111,10 @@ def build_fp8_per_tensor_launch_io(
     )
     if cfg.uses_fp8_output:
         c0_dp = make_ptr(
-            data_dtype, output_buf.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
+            data_dtype,
+            output_buf.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
         )
     else:
         c0_dp = make_ptr(

@@ -97,9 +97,7 @@ def _merge_per_token_sf_dtype(
     if current is None:
         return int(candidate)
     if int(current) != int(candidate):
-        raise ValueError(
-            f"{current_name} and {candidate_name} must use the same dtype"
-        )
+        raise ValueError(f"{current_name} and {candidate_name} must use the same dtype")
     return int(current)
 
 
@@ -172,9 +170,7 @@ def _gemm_config_flags_from_static_extras(runner) -> dict[str, bool]:
         "fc2_has_bias": bool(static_extras.get("gemm2_bias", False)),
         "has_gemm1_alpha": bool(static_extras.get("gemm1_alpha", False)),
         "has_gemm1_beta": bool(static_extras.get("gemm1_beta", False)),
-        "has_gemm1_clamp_limit": bool(
-            static_extras.get("gemm1_clamp_limit", False)
-        ),
+        "has_gemm1_clamp_limit": bool(static_extras.get("gemm1_clamp_limit", False)),
     }
 
 
@@ -198,10 +194,7 @@ def _filter_valid_moe_tactics(valid_tactics: List[Any], map_tactic) -> List[Any]
             pair.fc1.cfg.build()
             pair.fc2.cfg.build()
         except Exception as exc:
-            logger.debug(
-                "[Prims-TS MoE] Skipping unsupported tactic "
-                f"{tactic}: {exc}"
-            )
+            logger.debug(f"[Prims-TS MoE] Skipping unsupported tactic {tactic}: {exc}")
             continue
         filtered_tactics.append(tactic)
     return filtered_tactics
@@ -233,7 +226,9 @@ def _routed_token_capacity(
     if tile_n <= 0:
         raise ValueError(f"Prims-TS MoE tile_N must be positive, got {tile_n}")
     num_tokens = int(moe_inputs.hidden_states.shape[0])
-    num_experts = int(kwargs.get("num_experts", getattr(runner, "num_local_experts", 0)))
+    num_experts = int(
+        kwargs.get("num_experts", getattr(runner, "num_local_experts", 0))
+    )
     top_k = int(getattr(runner, "top_k", 0))
 
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -499,9 +494,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -777,9 +770,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -914,8 +905,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if (
             routing_logits_for_routing is not None
             and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"])
-            == int(RoutingMethodType.DeepSeekV3)
+            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
         ):
             routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
 
@@ -1109,9 +1099,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -1532,9 +1520,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -1793,9 +1779,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = False
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -1926,7 +1910,9 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         )
         use_fc1_per_channel_weight_scale = fc1_per_channel_weight_scale is not None
         use_fc2_per_channel_weight_scale = fc2_per_channel_weight_scale is not None
-        use_routing_scales_on_input = bool(kwargs.get("use_routing_scales_on_input", False))
+        use_routing_scales_on_input = bool(
+            kwargs.get("use_routing_scales_on_input", False)
+        )
         per_token_sf_dtype = _fp8_per_tensor_scale_dtype(
             fc1_per_channel_weight_scale_dtype=(
                 _per_token_sf_dtype_value(fc1_per_channel_weight_scale)
@@ -1968,8 +1954,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if (
             routing_logits_for_routing is not None
             and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"])
-            == int(RoutingMethodType.DeepSeekV3)
+            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
         ):
             routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
 
@@ -2024,9 +2009,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         fc1_cfg = pair.fc1.cfg.build()
         fc2_cfg = pair.fc2.cfg.build()
-        routing_input_scales = (
-            expert_weights if use_routing_scales_on_input else None
-        )
+        routing_input_scales = expert_weights if use_routing_scales_on_input else None
 
         common_io_kwargs = dict(
             hidden_states=hidden_states,
@@ -2137,9 +2120,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.use_shuffled_weight = use_shuffled_weight
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = False
-        self.num_experts = (
-            num_experts if num_experts is not None else num_local_experts
-        )
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
 
     def _make_tuning_config(
         self,
@@ -2276,8 +2257,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if (
             routing_logits_for_routing is not None
             and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"])
-            == int(RoutingMethodType.DeepSeekV3)
+            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
         ):
             routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
 
@@ -2375,7 +2355,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             hidden_size=self.hidden_size,
         )
 
-        fc1_io = build_fp8_block_scale_launch_io(fc="fc1", cfg=fc1_cfg, **common_io_kwargs)
+        fc1_io = build_fp8_block_scale_launch_io(
+            fc="fc1", cfg=fc1_cfg, **common_io_kwargs
+        )
         fc1_hash = stable_config_hash(fc1_io["cfg"])
         fc1_fn = get_compiled_gemm(fc1_hash, "fp8_block_scale_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))
@@ -2395,7 +2377,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
             )
 
-        fc2_io = build_fp8_block_scale_launch_io(fc="fc2", cfg=fc2_cfg, **common_io_kwargs)
+        fc2_io = build_fp8_block_scale_launch_io(
+            fc="fc2", cfg=fc2_cfg, **common_io_kwargs
+        )
         fc2_hash = stable_config_hash(fc2_io["cfg"])
         fc2_fn = get_compiled_gemm(fc2_hash, "fp8_block_scale_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))

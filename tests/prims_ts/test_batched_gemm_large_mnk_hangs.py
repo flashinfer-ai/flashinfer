@@ -185,6 +185,7 @@ LARGE_MNK_CASES = [
     ),
 ]
 
+
 def _run_large_mnk_case(selection, variant_name, variant):
     kwargs = dict(variant["kwargs"])
     for stage_key in (
@@ -211,9 +212,11 @@ def _run_large_mnk_case(selection, variant_name, variant):
         **kwargs,
     )
 
+
 def test_large_mnk_variants_do_not_hang():
     for selection, variant_name, variant in LARGE_MNK_CASES:
         _run_large_mnk_case(selection, variant_name, variant)
+
 
 def test_swap_ab_hidden_m_workqueue_without_throttle_does_not_hang():
     """Focused persistent CLC repro for many hidden-M work IDs in swapAB mode."""
@@ -264,6 +267,7 @@ def test_swap_ab_hidden_m_workqueue_without_throttle_does_not_hang():
         bias_type=int(BiasType.M),
         has_gemm1_clamp_limit=1,
     )
+
 
 def test_mxe4m3_ldgsts_routed_sfs_does_not_hang():
     """Focused GPT-OSS MXE4M3 route-SF LDGSTS repro."""

@@ -62,6 +62,7 @@ BF16_FC2_BASE = dict(
     use_max_tmem_overlap=0,
 )
 
+
 def _run_bf16_fc2(
     *,
     tile_n,
@@ -101,6 +102,7 @@ def _run_bf16_fc2(
         f"dtype_c={dtype_c}"
     )
 
+
 class TestScheduleValidation:
     def test_validate_bf16_fc2_tile8(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -118,6 +120,7 @@ class TestScheduleValidation:
             **uniform_pipeline_stage_overrides(4),
             **BF16_FC2_BASE,
         )
+
     def test_validate_bf16_fc2_tile16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
@@ -134,6 +137,7 @@ class TestScheduleValidation:
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
+
     def test_validate_pdl_wait_for_num_non_exiting_ctas(self):
         from cutlass.experimental.task_scheduling.resources import (
             PdlLaunchBarrier,
@@ -172,6 +176,7 @@ class TestScheduleValidation:
         assert any(
             isinstance(resource, PdlLaunchBarrier) for resource in all_task_resources
         )
+
     def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_pdl(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
@@ -194,6 +199,7 @@ class TestScheduleValidation:
                 do_pdl_wait_for_num_non_exiting_ctas=1,
                 **BF16_FC2_BASE,
             )
+
     def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_early_exit(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
@@ -216,6 +222,7 @@ class TestScheduleValidation:
                 do_pdl_wait_for_num_non_exiting_ctas=1,
                 **BF16_FC2_BASE,
             )
+
 
 class TestBf16Fc2ReferenceCheck:
     @pytest.mark.parametrize(
@@ -330,6 +337,7 @@ class TestBf16Fc2ReferenceCheck:
     def test_nonrounded_topk_expanded_layout(self):
         _run_bf16_fc2(tile_n=16, num_experts=3, num_tokens=130, top_k=2)
 
+
 class TestBf16Fc2LargerProblem:
     def test_tile_n16_problem_n256_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -350,6 +358,7 @@ class TestBf16Fc2LargerProblem:
             **BF16_FC2_BASE,
         )
         assert result
+
     def test_tile_n16_problem_n1024_k1024(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -370,11 +379,14 @@ class TestBf16Fc2LargerProblem:
         )
         assert result
 
+
 class TestBf16Fc2MultiExpert:
     def test_2_experts(self):
         _run_bf16_fc2(tile_n=16, num_experts=2, num_tokens=256)
+
     def test_4_experts(self):
         _run_bf16_fc2(tile_n=16, num_experts=4, num_tokens=512)
+
 
 class TestBf16Fc2Persistent:
     PERSISTENT_CFG = {
@@ -465,6 +477,7 @@ class TestBf16Fc2Persistent:
         }
         assert dep_graph["GmemA"] == ["PdlWait"]
         assert dep_graph["PdlLaunch"] == []
+
     def test_persistent_tile16_stages5(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -482,6 +495,7 @@ class TestBf16Fc2Persistent:
             **self.PERSISTENT_CFG,
         )
         assert result
+
     def test_persistent_tile16_stages5_pdl(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -500,6 +514,7 @@ class TestBf16Fc2Persistent:
             **self.PERSISTENT_CFG,
         )
         assert result
+
     def test_persistent_early_exit_overestimated_token_grid(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -518,6 +533,7 @@ class TestBf16Fc2Persistent:
             **self.PERSISTENT_CFG,
         )
         assert result
+
     def test_persistent_tile8_stages4(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -535,6 +551,7 @@ class TestBf16Fc2Persistent:
             **self.PERSISTENT_CFG,
         )
         assert result
+
     def test_persistent_tile32_generated_rows(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -559,8 +576,8 @@ class TestBf16Fc2Persistent:
                 )
                 assert result
 
-class TestBf16Fc2DoubleBufferedAcc:
 
+class TestBf16Fc2DoubleBufferedAcc:
     def _run_double_buf(
         self, *, tile_n, pipeline_stages=5, num_experts=1, num_tokens=128
     ):
@@ -593,6 +610,7 @@ class TestBf16Fc2DoubleBufferedAcc:
             tile_n=16, pipeline_stages=5, num_experts=4, num_tokens=512
         )
 
+
 class TestBf16Fc2SwapAB:
     def test_swap_ab_true_2experts(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -616,6 +634,7 @@ class TestBf16Fc2SwapAB:
             **cfg,
         )
         assert result
+
     def test_swap_ab_false_2experts(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -634,6 +653,7 @@ class TestBf16Fc2SwapAB:
             **cfg,
         )
         assert result
+
     def test_swap_ab_true_4experts(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -656,6 +676,7 @@ class TestBf16Fc2SwapAB:
             **cfg,
         )
         assert result
+
 
 class TestBf16Fc2HighThroughput:
     HT_CFG = {
@@ -694,6 +715,7 @@ class TestBf16Fc2HighThroughput:
                 **uniform_pipeline_stage_overrides(pipeline_stages),
                 **cfg,
             )
+
     def test_ht_generated_rows_no_swap(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -720,6 +742,7 @@ class TestBf16Fc2HighThroughput:
                     **cfg,
                 )
                 assert result
+
     def test_ht_tile64_stages4_swap_ab(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -742,6 +765,7 @@ class TestBf16Fc2HighThroughput:
             **cfg,
         )
         assert result
+
     def test_ht_tile128_after_fc1_swiglu_reuses_output_block(self, monkeypatch):
         import gc
 
@@ -818,6 +842,7 @@ class TestBf16Fc2HighThroughput:
             **target_cfg,
         )
         assert result
+
 
 class TestBf16Fc2RepeatedLaunch:
     def test_repeated_launch_10x(self):

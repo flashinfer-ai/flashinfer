@@ -16,8 +16,6 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 
 def test_partial_route_map_padding_keeps_trt_absolute_limits():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -52,6 +50,7 @@ def test_partial_route_map_padding_keeps_trt_absolute_limits():
     assert padded_routes
     assert set(padded_routes) == {0}
 
+
 def test_early_exit_route_map_padding_is_not_semantic_metadata():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _launch_metadata_lists,
@@ -80,6 +79,7 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     assert len(route_map) == 4 * token_layout.tile_size
     assert extra_routes
     assert set(extra_routes) == {0}
+
 
 def test_clustered_persistent_normalization_keeps_invalid_static_grid():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -114,6 +114,7 @@ def test_clustered_persistent_normalization_keeps_invalid_static_grid():
     )
 
     assert normalized.is_persistent
+
 
 def test_clustered_persistent_normalization_keeps_max_tmem_overlap():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -150,6 +151,7 @@ def test_clustered_persistent_normalization_keeps_max_tmem_overlap():
 
     assert normalized.is_persistent
 
+
 def test_clustered_persistent_normalization_keeps_persistent_grid():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         TileScheduler,
@@ -184,6 +186,7 @@ def test_clustered_persistent_normalization_keeps_persistent_grid():
 
     assert normalized.tile_scheduler == int(TileScheduler.PERSISTENT)
 
+
 def test_persistent_multistage_workid_disables_c_scratch_ab_alias():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         TileScheduler,
@@ -196,6 +199,7 @@ def test_persistent_multistage_workid_disables_c_scratch_ab_alias():
     )
 
     assert not cfg.aliases_c_scratch_with_ab
+
 
 def test_single_stage_workid_allows_c_scratch_ab_alias():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (

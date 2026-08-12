@@ -266,8 +266,7 @@ class GmemCResource(MemoryResource):
         self.tile_token_limit = Int32(0)
         self.dsfp8_c_scale_stride = self.problem_n
         if cutlass.const_expr(
-            self.cfg.has_deepseek_fp8_c_scale
-            and self.gTotalNumPaddedTokens is not None
+            self.cfg.has_deepseek_fp8_c_scale and self.gTotalNumPaddedTokens is not None
         ):
             self.dsfp8_c_scale_stride = self.gTotalNumPaddedTokens.load(
                 idx=Int32(0), vector_size=1
@@ -298,9 +297,7 @@ class GmemCResource(MemoryResource):
             gate = self._clamp_swiglu_oai_gate(gate)
             gate_scaled = gate * scale_gate
             neg_gate_log2e = (
-                Float32(-1.4426950408889634)
-                * self.tile_gemm1_alpha
-                * gate_scaled
+                Float32(-1.4426950408889634) * self.tile_gemm1_alpha * gate_scaled
             )
             sigmoid_gate = cute.math.rcp(Float32(1.0) + cute.math.exp2(neg_gate_log2e))
             return (linear + self.tile_gemm1_beta) * gate_scaled * sigmoid_gate
@@ -624,9 +621,7 @@ class GmemCResource(MemoryResource):
                     elif cutlass.const_expr(
                         self.cfg.has_routed_act and self.route_map_view is not None
                     ):
-                        sf_idx = self.route_map_view.load(
-                            idx=m_row, vector_size=1
-                        )[0]
+                        sf_idx = self.route_map_view.load(idx=m_row, vector_size=1)[0]
                     if cutlass.const_expr(self.gPerTokenSfA is not None):
                         sf_val = Float32(
                             self.gPerTokenSfA.load(idx=sf_idx, vector_size=1)[0]
@@ -663,7 +658,9 @@ class GmemCResource(MemoryResource):
                     if channel_idx < self.problem_n:
                         if cutlass.const_expr(self.gPerTokenSfB is not None):
                             sf_val = Float32(
-                                self.gPerTokenSfB.load(idx=channel_idx, vector_size=1)[0]
+                                self.gPerTokenSfB.load(idx=channel_idx, vector_size=1)[
+                                    0
+                                ]
                             )
                 self.sPerTokenSfB.subview(local_col).store(sf_val)
             prims.barrier_cta_sync(
@@ -2274,9 +2271,7 @@ class GmemCResource(MemoryResource):
                         if cutlass.const_expr(self.cfg.has_per_token_sf_b):
                             local_token_col = n_subtile_offset + tmem_col_even
                             token_sf = self._load_per_token_sf_b(local_token_col)
-                            gate0, gate1 = self._fmul2(
-                                gate0, gate1, token_sf, token_sf
-                            )
+                            gate0, gate1 = self._fmul2(gate0, gate1, token_sf, token_sf)
                             up0, up1 = self._fmul2(up0, up1, token_sf, token_sf)
                         gate0 = self._maybe_add_bias_m(
                             gate0,

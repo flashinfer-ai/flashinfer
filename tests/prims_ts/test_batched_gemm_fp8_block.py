@@ -27,12 +27,14 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required"),
 ]
 
+
 def _require_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
     major, _minor = get_compute_capability(torch.device("cuda"))
     if major != 10:
         pytest.skip("Prims-TS FP8 block-scale tests require an SM100-class GPU")
+
 
 def _common_fp8_base(**overrides):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -58,6 +60,7 @@ def _common_fp8_base(**overrides):
     )
     cfg.update(overrides)
     return cfg
+
 
 def _deepseek_fp8_fc1_variant():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -90,6 +93,7 @@ def _deepseek_fp8_fc1_variant():
         load_sfab_regs=48,
     )
 
+
 def _deepseek_fp8_fc2_variant():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -121,10 +125,12 @@ def _deepseek_fp8_fc2_variant():
         load_sfab_regs=48,
     )
 
+
 def _with_deepseek_tile(cfg, tile_n):
     cfg = dict(cfg)
     cfg.update(tile_n=tile_n, mma_n=tile_n, epi_tile_n=tile_n)
     return cfg
+
 
 def _mx_fc1_base():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -170,6 +176,7 @@ def _mx_fc1_base():
         padding_regs=48,
         gather_regs=48,
     )
+
 
 def _mx_fc2_base():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -236,6 +243,7 @@ def test_deepseek_fp8_fc2_correctness_small(tile_n):
         **_with_deepseek_tile(_deepseek_fp8_fc2_variant(), tile_n),
     )
 
+
 def test_mxfp8_mxfp8_fc2_tile8_correctness():
     _require_sm100()
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import TileScheduler
@@ -258,6 +266,7 @@ def test_mxfp8_mxfp8_fc2_tile8_correctness():
         problem_k=256,
         **cfg,
     )
+
 
 def test_mxfp8_mxfp8_fc1_tile32_correctness():
     _require_sm100()

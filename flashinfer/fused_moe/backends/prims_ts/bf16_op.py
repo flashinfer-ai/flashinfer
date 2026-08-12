@@ -126,7 +126,9 @@ def prims_ts_bf16_moe_op(
     else:
         assert topk_ids is not None
         if topk_ids.dtype != torch.int32:
-            raise ValueError("topk_ids must be int32 for Prims-TS BF16 precomputed routing")
+            raise ValueError(
+                "topk_ids must be int32 for Prims-TS BF16 precomputed routing"
+            )
         expert_weights = (
             expert_weights
             if expert_weights is not None
@@ -192,9 +194,7 @@ def prims_ts_bf16_moe_op(
         **common_kwargs,
     )
     if not ok:
-        raise RuntimeError(
-            f"Config not supported by Prims-TS BF16 kernel ({reason})"
-        )
+        raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
 
     _, tactic = AutoTuner.get().choose_one(
         "flashinfer::prims_ts_bf16_moe",
@@ -211,9 +211,7 @@ def prims_ts_bf16_moe_op(
         **common_kwargs,
     )
     if not ok:
-        raise RuntimeError(
-            f"Config not supported by Prims-TS BF16 kernel ({reason})"
-        )
+        raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
 
     intermediate_output = moe_runner.forward(
         moe_inputs.to_list(),
@@ -284,8 +282,10 @@ def _fake_prims_ts_bf16_moe(
     )
     seq_len = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
-    out = output if output is not None else hidden_states.new_empty(
-        seq_len, hidden_size, dtype=torch.bfloat16
+    out = (
+        output
+        if output is not None
+        else hidden_states.new_empty(seq_len, hidden_size, dtype=torch.bfloat16)
     )
     return [out] if do_finalize else [out, hidden_states.new_empty(0)]
 

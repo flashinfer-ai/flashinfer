@@ -1147,10 +1147,8 @@ class SmemTmaGatherResource(MemoryResource):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if cutlass.const_expr(self.cfg.has_cluster and is_b):
             tile_rows_per_cta = tile_rows // self.cfg.cluster_m
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
         else:
             tile_rows_per_cta = tile_rows
-            cta_row_offset = Int32(0)
         bytes_per_stage = tile_rows_per_cta * self.cfg.tile_k * dtype_bits // 8
 
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)

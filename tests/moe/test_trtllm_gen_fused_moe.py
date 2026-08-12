@@ -49,9 +49,9 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
 )
 
 pytestmark = pytest.mark.long_running
+
+
 @pytest.fixture(scope="module")
-
-
 def cache_permute_indices():
     return {}
 
@@ -165,8 +165,6 @@ def cache_permute_indices():
         pytest.param(ActivationType.Geglu, id="Geglu"),
     ],
 )
-
-
 def test_sigmoid_routing(
     num_tokens,
     hidden_size,
@@ -438,8 +436,6 @@ def test_sigmoid_routing(
         pytest.param(torch.float32, id="FP32_logits"),
     ],
 )
-
-
 def test_deepseekv3_routing(
     num_tokens,
     hidden_size,
@@ -588,8 +584,6 @@ def test_deepseekv3_routing(
         pytest.param(torch.bfloat16, id="BF16_logits"),
     ],
 )
-
-
 def test_topk_routing(
     num_tokens,
     hidden_size,
@@ -722,8 +716,6 @@ def test_topk_routing(
         pytest.param(torch.bfloat16, id="BF16_logits"),
     ],
 )
-
-
 def test_llama4_routing(
     num_tokens,
     hidden_size,
@@ -895,16 +887,22 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
     hidden_states = 2 * torch.randn(
         (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
     )
-    gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / hidden_size**0.5
-    gemm2_weights = torch.randn(
-        (num_experts, hidden_size, intermediate_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / intermediate_size**0.5
+    gemm1_weights = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / hidden_size**0.5
+    )
+    gemm2_weights = (
+        torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / intermediate_size**0.5
+    )
     routing_logits = torch.randn(
         (num_tokens, num_experts), device=device, dtype=torch.bfloat16
     )
@@ -1004,9 +1002,7 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
         )[0].to(torch.float)
 
     check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
-    check_accuracy(
-        logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99
-    )
+    check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)
 
 
 def test_bf16_prims_ts_identity_activation(cache_permute_indices):
@@ -1132,6 +1128,7 @@ def test_fp4_moe_gemm_bias_changes_output(
         output_with_bias, output_without_bias, atol=1e-3, rtol=1e-3
     )
 
+
 @pytest.mark.parametrize("num_tokens", [32, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
@@ -1215,7 +1212,6 @@ def test_fp4_moe_gemm_bias(
     )
 
 
-
 @pytest.mark.parametrize("num_tokens", [1, 16, 64, 256, 1000, 4000])
 @pytest.mark.parametrize("hidden_size", [512, 1024])
 @pytest.mark.parametrize("intermediate_size", [512, 1024])
@@ -1278,8 +1274,6 @@ def test_fp4_moe_gemm_bias(
         ),
     ],
 )
-
-
 def test_mxfp8_block_scale_moe_relu2_non_gated(
     num_tokens,
     hidden_size,
@@ -1398,8 +1392,6 @@ def test_mxfp8_block_scale_moe_relu2_deepseekv3_topk22(cache_permute_indices):
         ),
     ],
 )
-
-
 def test_fp8_block_scale_autotune_valid_configs(autotune_case, cache_permute_indices):
     """Autotune smoke matrix to exercise C++ getValidConfigs across FP8 modes/shapes."""
     run_moe_test(
@@ -1460,8 +1452,6 @@ def test_fp8_block_scale_autotune_valid_configs(autotune_case, cache_permute_ind
         ),
     ],
 )
-
-
 def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
     autotune_case, cache_permute_indices
 ):
@@ -1515,8 +1505,6 @@ def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
     ],
 )
-
-
 def test_prims_ts_block_major_k_all_dtypes(moe_impl, cache_permute_indices):
     """Prims-TS accepts BlockMajorK weights for every supported MoE dtype."""
     hidden_size = 1024
@@ -1613,8 +1601,6 @@ def test_prims_ts_block_major_k_all_dtypes(moe_impl, cache_permute_indices):
     ],
 )
 @pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
-
-
 def test_dyn_block_kernel_routing(
     num_tokens,
     hidden_size,
@@ -1684,8 +1670,6 @@ def test_dyn_block_kernel_routing(
     ],
 )
 @pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
-
-
 def test_tier_1024_experts_routing(
     num_tokens,
     hidden_size,
@@ -1844,8 +1828,6 @@ def test_tier_1024_experts_routing(
         pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
-
-
 def test_deepseek_ngroup1_block_per_token_routing(
     num_tokens,
     hidden_size,
@@ -1882,6 +1864,7 @@ def test_deepseek_ngroup1_block_per_token_routing(
         moe_gemm_backend=moe_gemm_backend,
     )
 
+
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
     "num_tokens, num_experts, top_k, hidden_size, intermediate_size",
@@ -1890,8 +1873,6 @@ def test_deepseek_ngroup1_block_per_token_routing(
         pytest.param(1025, 896, 16, 128, 128, id="lane-owned-topk"),
     ],
 )
-
-
 def test_deepseek_ngroup1_sigmoid_bias_output_uses_unbiased_sigmoid(
     num_tokens,
     num_experts,
@@ -2152,8 +2133,6 @@ def test_deepseek_ngroup1_sigmoid_bias_output_uses_unbiased_sigmoid(
         pytest.param(torch.float32, id="FP32_bias"),
     ],
 )
-
-
 def test_routing_dtype_flexibility(
     num_tokens,
     hidden_size,
@@ -2572,6 +2551,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
             gemm1_alpha=per_expert,
         )
 
+
 def test_fp4_block_scale_deepseekv3_unfinalized_weight_dtype(cache_permute_indices):
     """Regression for #3595.
 
@@ -2653,6 +2633,7 @@ def test_fp8_block_scale_moe_fused_shared_experts_reject_ep():
         trtllm_fp8_block_scale_moe(
             **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
         )
+
 
 def test_fp4_block_scale_moe_fused_shared_experts_reject_ep():
     """FP4 sibling of the FP8 EP-rejection guard test above.
@@ -2814,6 +2795,7 @@ def test_fused_shared_experts_reject_replay_and_non_deepseek_routing():
                     **common_kwargs,
                     routing_method_type=method.value,
                 )
+
 
 def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
     """Routed-only expert-major tensors must fail host-side, not OOB on the GPU.

@@ -46,7 +46,8 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required"),
     pytest.mark.skipif(
-        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))), reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+"
+        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))),
+        reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+",
     ),
 ]
 
@@ -77,6 +78,7 @@ FP4_FC1_LL = dict(
     batch_mode=int(BatchMode.BATCH_M),
     transpose_mma_output=0,
 )
+
 
 def _run_fp4_fc1(
     *,
@@ -153,6 +155,7 @@ def _run_fp4_fc1(
     )
     assert result, f"FP4 FC1 failed: tile_n={tile_n}, tile_k={tile_k}, swap={swap_ab}"
 
+
 class TestFp4Fc1Validation:
     def test_validate_tile8_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -171,6 +174,7 @@ class TestFp4Fc1Validation:
             num_stages_tmem_acc=1,
             **FP4_FC1_LL,
         )
+
     def test_implicit_routed_sfb_warp_layout_matches_generated_k512(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             ActKind,
@@ -213,15 +217,19 @@ class TestFp4Fc1Validation:
         assert tile16.num_padding_warps == 1
         assert tile16.threads_per_cta == 20 * 32
 
+
 class TestFp4Fc1GPU:
     """FP4 FC1 GPU: TMA gather4 + FP4 MMA + SwiGLU."""
 
     def test_tile8_noact_noswap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=False, act_kind=0)
+
     def test_tile8_swiglu_noswap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=False, act_kind=1)
+
     def test_tile8_swiglu_bias_m(self):
         _run_fp4_fc1(tile_n=8, swap_ab=False, act_kind=1, bias_type=1)
+
     def test_tile8_swiglu_clamp(self):
         _run_fp4_fc1(
             tile_n=8,
@@ -229,6 +237,7 @@ class TestFp4Fc1GPU:
             act_kind=1,
             gemm1_clamp_limit_value=0.5,
         )
+
     def test_tile8_swiglu_global_scale_gate(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -260,12 +269,16 @@ class TestFp4Fc1GPU:
         )
         assert ok_base and ok_scaled
         assert (out_base.float() - out_scaled.float()).abs().max().item() > 0.0
+
     def test_tile16_swiglu_noswap(self):
         _run_fp4_fc1(tile_n=16, swap_ab=False, act_kind=1)
+
     def test_tile8_noact_swap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=True, act_kind=0, pipeline_stages=9)
+
     def test_tile8_swiglu_swap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=True, act_kind=1, pipeline_stages=9)
+
     def test_tile8_swiglu_swap_epilogue_quant(self):
         """FC1 can return packed E2M1 C plus R128c4 E4M3 output SF."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -315,6 +328,7 @@ class TestFp4Fc1GPU:
         diff = (out_fp4.float() - out_bf16.float()).abs()
         tolerance = max(0.75, out_bf16.float().abs().max().item() * 0.35)
         assert diff.max().item() < tolerance
+
     def test_tile8_swiglu_swap_epilogue_quant_per_token_sfb(self):
         """NVFP4 FC1 applies per-token SFB before bias in the E2M1 epilogue."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -358,6 +372,7 @@ class TestFp4Fc1GPU:
             bias_type=int(BiasType.M),
             **base,
         )
+
     def test_tile32_k512_swap_epilogue_quant_second_kbox(self):
         """Regression for the second FP4 K-box B descriptor stride."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -401,8 +416,10 @@ class TestFp4Fc1GPU:
             **base,
         )
         assert result, "FP4 FC1 tileN32/tileK512 second K-box regression failed"
+
     def test_tile8_4experts(self):
         _run_fp4_fc1(tile_n=8, num_experts=4, num_tokens=512)
+
     def test_tile8_swiglu_swap_nonrounded_topk(self):
         _run_fp4_fc1(
             tile_n=8,
@@ -414,10 +431,12 @@ class TestFp4Fc1GPU:
             pipeline_stages=9,
         )
 
+
 class TestFp4Fc1SfGather:
     """FP4 FC1 with SF gather for the routed activation's scale factors."""
 
     _BASE = {k: v for k, v in FP4_FC1_LL.items() if k != "route_sfs_act"}
+
     def test_sf_tma_gather4_blocked_at_k256(self):
         """SF TMA gather4 requires sf_k >= 32 for the routed operand."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -438,6 +457,7 @@ class TestFp4Fc1SfGather:
                 route_sfs_act=1,  # TMA — blocked at tile_k=256
                 **self._BASE,
             )
+
     def test_sf_tma_gather4_k512_validation(self):
         """SF TMA gather4 at tile_k=512: validation passes."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -457,6 +477,7 @@ class TestFp4Fc1SfGather:
             route_sfs_act=1,  # TMA gather4 — OK at tile_k=512
             **self._BASE,
         )
+
     def test_sf_tma_gather4_k512_gpu(self):
         """SF TMA gather4 at tile_k=512: GPU correctness."""
         base = {
@@ -486,6 +507,7 @@ class TestFp4Fc1SfGather:
             **base,
         )
         assert result, "FP4 FC1 SF TMA gather4 at tile_k=512 failed"
+
     def test_sf_ldgsts_gather_validation(self):
         """SF LDGSTS gather: schedule validation passes."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -505,6 +527,7 @@ class TestFp4Fc1SfGather:
             route_sfs_act=2,  # LDGSTS
             **self._BASE,
         )
+
     def test_sf_ldgsts_gather_gpu(self):
         """SF LDGSTS gather at tile_k=256: GPU correctness."""
         base = {
@@ -534,6 +557,7 @@ class TestFp4Fc1SfGather:
             **base,
         )
         assert result, "FP4 FC1 SF LDGSTS gather at tile_k=256 failed"
+
     def test_sf_ldgsts_gather_swap_gpu(self):
         """SwapAB SF LDGSTS gather: covers routed SFB + separate CopySf."""
         _run_fp4_fc1(
@@ -555,6 +579,7 @@ class TestFp4Fc1SfGather:
             swap_ab=True,
             act_kind=0,
         )
+
 
 class TestFp4Fc1HT:
     """FP4 FC1 HighThroughput: 2-CTA cluster with routed activation SF."""
@@ -634,6 +659,7 @@ class TestFp4Fc1HT:
             sf_layout_b=2,
             **base,
         )
+
     def test_ht_tile128_k256_ldgsts_gpu(self):
         """2-CTA HT routed-SF LDGSTS path that previously produced NaNs."""
         _run_fp4_fc1(
@@ -695,6 +721,7 @@ class TestFp4Fc1HT:
                 padding_regs=88,
             )
 
+
 class TestFp4Fc1SfbTmaRouteCluster2:
     """The two routed-SFB (routeSfsAct=tma) cluster_m=2 benchmark configs.
 
@@ -708,7 +735,6 @@ class TestFp4Fc1SfbTmaRouteCluster2:
     routed-SFB feature and the cancellation scenario depend on token count and
     cluster shape, not expert count.
     """
-
 
     @staticmethod
     def _base():

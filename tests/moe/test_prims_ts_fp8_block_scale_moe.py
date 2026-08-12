@@ -216,23 +216,27 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
     padding = 8
     activation_type = ActivationType.Swiglu
 
-    moe_impl = FP8BlockScaleMoe(
-        fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
-    )
+    moe_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
     moe_impl._cache_permute_indices = cache_permute_indices
     hidden_states = torch.randn(
         (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
     )
-    gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / hidden_size**0.5
-    gemm2_weights = torch.randn(
-        (num_experts, hidden_size, intermediate_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / intermediate_size**0.5
+    gemm1_weights = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / hidden_size**0.5
+    )
+    gemm2_weights = (
+        torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / intermediate_size**0.5
+    )
     routing_logits = torch.randn(
         (num_tokens, num_experts), device=device, dtype=torch.bfloat16
     )
@@ -329,6 +333,4 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
         ).to(torch.float)
 
     check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
-    check_accuracy(
-        logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99
-    )
+    check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)

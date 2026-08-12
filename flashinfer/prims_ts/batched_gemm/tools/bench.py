@@ -141,7 +141,6 @@ def _ts_unsupported_reason(kwargs: dict) -> str | None:
         RouteImpl.LDG_PLUS_STS
     ):
         reasons.append("Kernel does not implement routeSfsAct=LDG_PLUS_STS")
-    use_per_token_sf_a = int(kwargs.get("use_per_token_sf_a", 0))
     use_per_token_sf_b = int(kwargs.get("use_per_token_sf_b", 0))
     if use_per_token_sf_b and int(kwargs.get("transpose_mma_output", 1)) != 1:
         reasons.append("Kernel per-token sfB requires transpose_mma_output=1")
@@ -734,7 +733,7 @@ def _expanded_json_options(path: Path) -> list[tuple[int, str, int, dict]]:
                             f"Config {config_comment}: key group {key} expects "
                             f"{len(keys)} values, got {row}"
                         )
-                    choices.append(dict(zip(keys, row)))
+                    choices.append(dict(zip(keys, row, strict=True)))
             elif isinstance(value, list):
                 choices = [{key: item} for item in value]
             else:

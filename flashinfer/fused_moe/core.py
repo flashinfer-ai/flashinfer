@@ -16,9 +16,6 @@ limitations under the License.
 
 import functools
 import math
-import os
-from dataclasses import dataclass
-from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -64,21 +61,19 @@ from ..tllm_enums import (
     RoutingMethodType,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
-    trtllm_gen_dtype_has_scale,
 )
 from .shared.inputs import (
-    MoEInputs,
     MoeRunnerInputs,
     RoutingInputMode,
     alloc_trtllm_moe_output as _alloc_trtllm_moe_output,
     unpack_trtllm_moe_output as _unpack_trtllm_moe_output,
 )
-from .shared.tuning import make_moe_tuning_config
 from .backends.trtllm import (
     create_trtllm_moe_runner_class,
     register_trtllm_bf16_moe_op,
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
+
 # These helpers moved to prepare.py; keep aliases here for backward compatibility.
 from .prepare import (
     interleave_moe_scales_for_sm90_mixed_gemm as interleave_moe_scales_for_sm90_mixed_gemm,
@@ -127,9 +122,9 @@ def _moe_topk_ids_init(num_experts: int, *, packed: bool = True):
         ).view(shapes)
         if not packed:
             return expert_ids
-        expert_weights = torch.ones(
-            shapes, dtype=torch.bfloat16, device=device
-        ).view(torch.int16)
+        expert_weights = torch.ones(shapes, dtype=torch.bfloat16, device=device).view(
+            torch.int16
+        )
         return (expert_ids << 16) | expert_weights
 
     return _init
@@ -2483,7 +2478,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         trtllm_bf16_moe=trtllm_bf16_moe_op,
         trtllm_moe_run_routing=moe_op.trtllm_moe_run_routing,
         trtllm_moe_run_finalize=moe_op.trtllm_moe_run_finalize,
-
         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
         trtllm_fp8_per_tensor_scale_routed_moe=trtllm_fp8_per_tensor_scale_routed_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
@@ -3283,6 +3277,7 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
         return result[0]
     else:
         return result
+
 
 @flashinfer_api(trace=trtllm_fp8_block_scale_moe_trace_dispatch)
 def trtllm_fp8_block_scale_moe(

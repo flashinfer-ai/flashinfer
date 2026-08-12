@@ -190,9 +190,7 @@ def _normalize_backends(backends: list[str], quant_mode: str) -> list[str]:
 
     if "prims_ts" in resolved:
         if quant_mode == "MxInt4xBf16":
-            raise ValueError(
-                "Prims-TS is not wired for MxInt4xBf16 in this benchmark"
-            )
+            raise ValueError("Prims-TS is not wired for MxInt4xBf16 in this benchmark")
         if not is_prims_ts_available():
             raise RuntimeError(
                 "Prims-TS backend requested but dependencies are unavailable"
@@ -203,9 +201,7 @@ def _normalize_backends(backends: list[str], quant_mode: str) -> list[str]:
 def _fp4_ops(backend: str, routed: bool) -> Callable:
     if backend == "trtllm":
         return (
-            trtllm_fp4_block_scale_routed_moe
-            if routed
-            else trtllm_fp4_block_scale_moe
+            trtllm_fp4_block_scale_routed_moe if routed else trtllm_fp4_block_scale_moe
         )
     if backend == "prims_ts":
         return (
@@ -227,9 +223,7 @@ def _fp8_per_tensor_op(backend: str) -> Callable:
 def _fp8_block_ops(backend: str, routed: bool) -> Callable:
     if backend == "trtllm":
         return (
-            trtllm_fp8_block_scale_routed_moe
-            if routed
-            else trtllm_fp8_block_scale_moe
+            trtllm_fp8_block_scale_routed_moe if routed else trtllm_fp8_block_scale_moe
         )
     if backend == "prims_ts":
         return (
@@ -288,8 +282,9 @@ def _shuffle_fp4_major_k(
             is_gated_act_gemm=True,
         )
         gemm1_weights_shuffled.append(
-            gemm1_weights[expert_idx][permute_indices.to(gemm1_weights.device)]
-            .contiguous()
+            gemm1_weights[expert_idx][
+                permute_indices.to(gemm1_weights.device)
+            ].contiguous()
         )
 
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
@@ -324,8 +319,9 @@ def _shuffle_fp4_major_k(
             permute_cache, gemm2_weights[expert_idx], epilogue_tile_m
         )
         gemm2_weights_shuffled.append(
-            gemm2_weights[expert_idx][permute_indices.to(gemm2_weights.device)]
-            .contiguous()
+            gemm2_weights[expert_idx][
+                permute_indices.to(gemm2_weights.device)
+            ].contiguous()
         )
 
         permute_sf_indices = get_w2_permute_indices_with_cache(
@@ -614,9 +610,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     ).to(torch.bfloat16)
     w2 = torch.randn(
         local_num_experts, hidden_size, intermediate_size, device=device
-    ).to(
-        torch.bfloat16
-    )
+    ).to(torch.bfloat16)
     bias13 = (
         torch.randn(local_num_experts, intermediate_size * 2, device=device) * 10
         if use_bias

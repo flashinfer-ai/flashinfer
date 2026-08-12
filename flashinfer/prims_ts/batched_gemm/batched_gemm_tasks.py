@@ -107,7 +107,7 @@ def _work_tile_schedule_loop(cfg, work_queue):
 @contextmanager
 def _k_tile_schedule_loop(cfg, work_queue, num_k_tiles: int, domain_start: int = 0):
     """Wrap a task body in either the persistent work-tile loop or static K loop."""
-    with _work_tile_schedule_loop(cfg, work_queue):
+    with _work_tile_schedule_loop(cfg, work_queue):  # noqa: SIM117
         with domain_loop(domain_start, num_k_tiles, 1):
             yield
 
@@ -164,7 +164,7 @@ def create_load_a_task(
         _ = gmem.init_coords_state()
         smem.init_load_state()
         with _work_tile_schedule_loop(cfg, wq):
-            coords = gmem.compute_a_coords_head()
+            gmem.compute_a_coords_head()
             _call_named_aux_if_present(
                 smem, "prepare_gather_tile", has_prepare_gather_tile
             )
@@ -249,7 +249,7 @@ def create_load_b_task(
         _ = gmem.init_coords_state()
         smem.init_load_state()
         with _work_tile_schedule_loop(cfg, wq):
-            coords = gmem.compute_b_coords_head()
+            gmem.compute_b_coords_head()
             _call_named_aux_if_present(
                 smem, "prepare_gather_tile", has_prepare_gather_tile
             )

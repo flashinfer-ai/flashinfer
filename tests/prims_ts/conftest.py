@@ -59,7 +59,9 @@ def _scope_exhaustive_schedule_checker(monkeypatch, request):
 def pytest_report_header(config):
     del config
     if HAS_PRIMS_TS_RUNTIME:
-        return "Prims-TS runtime dependencies: available via installed CUTLASS DSL wheel"
+        return (
+            "Prims-TS runtime dependencies: available via installed CUTLASS DSL wheel"
+        )
     error = get_cutlass_dsl_bootstrap_error()
     return (
         "Prims-TS runtime dependencies: unavailable from installed CUTLASS "

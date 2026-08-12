@@ -458,16 +458,22 @@ def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
     hidden_states = torch.randn(
         (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
     )
-    gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / hidden_size**0.5
-    gemm2_weights = torch.randn(
-        (num_experts, hidden_size, intermediate_size),
-        device=device,
-        dtype=torch.bfloat16,
-    ) / intermediate_size**0.5
+    gemm1_weights = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / hidden_size**0.5
+    )
+    gemm2_weights = (
+        torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / intermediate_size**0.5
+    )
     routing_logits = torch.randn(
         (num_tokens, num_experts), device=device, dtype=torch.bfloat16
     )
@@ -567,9 +573,7 @@ def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
         )[0].to(torch.float)
 
     check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
-    check_accuracy(
-        logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99
-    )
+    check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)
 
 
 def _run_trtllm_gen_fp8_routed_fused_moe_case(

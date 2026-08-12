@@ -1266,7 +1266,7 @@ def shuffle_matrix(tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     indices = _SHUFFLE_BLOCK_32 if block_size == 32 else _SHUFFLE_BLOCK_16
 
     M = tensor.shape[-2]
-    if M < block_size:
+    if block_size > M:
         # Matrix too small for shuffling — return as-is.
         return tensor.clone()
     out = torch.empty_like(tensor)
@@ -1293,9 +1293,7 @@ def _block_major_k_weight_tensor(tensor: torch.Tensor, cfg) -> torch.Tensor:
     packed = []
     for expert_idx in range(tensor.shape[0]):
         expert_matrix = tensor[expert_idx].contiguous().view(torch.uint8)
-        packed.append(
-            convert_to_block_layout(expert_matrix, cfg.block_major_k_bytes)
-        )
+        packed.append(convert_to_block_layout(expert_matrix, cfg.block_major_k_bytes))
     return torch.stack(packed, dim=0).contiguous()
 
 
@@ -2060,9 +2058,7 @@ def reference_check(
             bias_logical_torch, cfg.epi_tile_m
         ).contiguous()
     else:
-        bias_logical_torch = torch.zeros(
-            (L, M), dtype=torch.float32, device=device
-        )
+        bias_logical_torch = torch.zeros((L, M), dtype=torch.float32, device=device)
         bias_torch = bias_logical_torch
     scale_c_torch = torch.full((L,), scale_c_value, dtype=torch.float32, device=device)
     scale_gate_torch = torch.full(

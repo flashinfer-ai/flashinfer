@@ -116,7 +116,9 @@ def _resolve_routing_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights must have the same shape as topk_ids")
     if topk_weights.dtype != torch.bfloat16:
-        raise ValueError("topk_weights must be bfloat16 for UnpackedPrecomputed routing")
+        raise ValueError(
+            "topk_weights must be bfloat16 for UnpackedPrecomputed routing"
+        )
     if topk_weights.device != hidden_states.device:
         raise ValueError("topk_weights must be on the same device as hidden_states")
     if not topk_weights.is_contiguous():
@@ -176,7 +178,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
         hidden_states=hidden_states,
     )
     scale_dtype = None
-    for name, tensor in (
+    for _, tensor in (
         ("fc1_per_channel_weight_scale", fc1_per_channel_weight_scale),
         ("fc2_per_channel_weight_scale", fc2_per_channel_weight_scale),
     ):
@@ -199,9 +201,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
             ("fc2_per_channel_weight_scale", fc2_per_channel_weight_scale),
         ):
             if tensor is not None and tensor.dtype != routing_logits.dtype:
-                raise ValueError(
-                    f"{name} and routing_logits must use the same dtype"
-                )
+                raise ValueError(f"{name} and routing_logits must use the same dtype")
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(hidden_states.device)
@@ -380,8 +380,12 @@ def _fake_prims_ts_fp8_per_tensor_scale_moe(
         fc2_per_channel_weight_scale,
         routing_replay_out,
     )
-    out = output if output is not None else hidden_states.new_empty(
-        hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bfloat16
+    out = (
+        output
+        if output is not None
+        else hidden_states.new_empty(
+            hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bfloat16
+        )
     )
     return out if do_finalize else [out, hidden_states.new_empty(0)]
 
@@ -806,7 +810,11 @@ def _fake_prims_ts_fp8_block_scale_moe(
         gemm1_bias,
         gemm2_bias,
     )
-    out = output if output is not None else hidden_states.new_empty(
-        hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bfloat16
+    out = (
+        output
+        if output is not None
+        else hidden_states.new_empty(
+            hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bfloat16
+        )
     )
     return out if do_finalize else [out, hidden_states.new_empty(0)]

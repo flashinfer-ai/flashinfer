@@ -19,7 +19,6 @@ import sys
 import pytest
 
 
-
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
@@ -102,6 +101,7 @@ def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
         for race in result.race_states
     )
 
+
 def test_validation_rejects_unimplemented_mma_unroll():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -146,6 +146,7 @@ def test_validation_rejects_unsupported_plain_output_store_dtype(dtype_c_name, m
     )
     with pytest.raises(ValueError, match=match):
         validate_config(cfg)
+
 
 def test_runner_uses_fp16_for_fp16_plain_output_store_dtype():
     import cutlass
@@ -205,7 +206,11 @@ def test_runner_logical_output_shape_for_gated_activation_abi(
     batch_mode_name, act_kind_name, expected_shape
 ):
     from flashinfer.prims_ts.batched_gemm import batched_gemm_run
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import ActKind, BatchMode, make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        make_config,
+    )
 
     batch_mode = getattr(BatchMode, batch_mode_name)
     cfg = make_config(
@@ -353,6 +358,7 @@ def test_validation_rejects_zero_active_sf_and_store_stage_counts(
     with pytest.raises(ValueError, match=f"{stage_name} must be positive"):
         validate_config(cfg)
 
+
 def test_validation_rejects_zero_persistent_workid_stages():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -470,6 +476,7 @@ def test_validation_rejects_incompatible_tile_and_mma_shapes(overrides, expected
     with pytest.raises(ValueError, match=expected):
         validate_config(cfg)
 
+
 def test_validation_rejects_nvfp4_mma_m64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -512,12 +519,17 @@ def test_validation_rejects_transpose_incompatible_with_batch_mode(
     with pytest.raises(ValueError, match="transpose_mma_output must match.*swap_ab"):
         validate_config(cfg)
 
+
 def test_validation_rejects_non_binary_transpose_mma_output():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config, validate_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        make_config,
+        validate_config,
+    )
 
     cfg = make_config(transpose_mma_output=2)
     with pytest.raises(ValueError, match="transpose_mma_output must be 0 or 1"):
         validate_config(cfg)
+
 
 def test_validation_rejects_tile_k_not_multiple_of_mma_k():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -537,6 +549,7 @@ def test_validation_rejects_tile_k_not_multiple_of_mma_k():
     with pytest.raises(ValueError, match="tile_k must be a multiple of mma_k"):
         validate_config(cfg)
 
+
 def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -555,6 +568,7 @@ def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
     assert cfg.use_bf16_kbox_tma_a
     with pytest.raises(ValueError, match="BF16 k-box TMA A path"):
         validate_config(cfg)
+
 
 def test_validation_rejects_casta_tile_k_not_256():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -598,6 +612,7 @@ def test_validation_accepts_casta_plain_output_store(dtype_c_name):
     assert cfg.has_cast_a
     validate_config(cfg)
 
+
 def test_validation_rejects_casta_output_quantization():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -624,6 +639,7 @@ def test_validation_rejects_casta_output_quantization():
     ):
         validate_config(cfg)
 
+
 def test_validation_accepts_silu_activation():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -642,6 +658,7 @@ def test_validation_accepts_silu_activation():
         act_kind=int(ActKind.SILU),
     )
     validate_config(cfg)
+
 
 def test_ldgsts_routed_sf_does_not_use_routed_tma_descriptors():
     """LDGSTS-routed scale factors must not build compact TMA TensorMaps."""
@@ -834,6 +851,7 @@ def test_deepseek_fp8_tma_route_uses_generated_load_b_warp_count(
     assert by_name["PaddingTask"].warp_idx == padding_warp_idx
     assert cfg.threads_per_cta == 512
 
+
 def test_validation_rejects_clc_fast_drain():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -890,6 +908,7 @@ def test_config_rejects_removed_non_config_options(removed_option):
             **{removed_option: 1},
         )
 
+
 def test_validation_rejects_ldg_plus_sts_routes():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -921,6 +940,7 @@ def test_validation_rejects_ldg_plus_sts_routes():
     )
     with pytest.raises(ValueError, match="LDG_PLUS_STS"):
         validate_config(cfg)
+
 
 def test_validation_accepts_minimal_plain_fp8_per_token_sfb():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -990,6 +1010,7 @@ def test_validation_accepts_minimal_plain_fp8_per_token_sfb():
         per_token_sf_dtype=int(DType.BF16),
     )
     validate_config(cfg)
+
 
 def test_validation_accepts_nvfp4_per_token_sfb_only():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1118,6 +1139,7 @@ def test_nvfp4_per_token_sfb_schedule_validates():
         per_token_sf_dtype=int(DType.FP32),
     )
 
+
 def test_fp4_json_variant_forwards_per_token_sfb_without_skip():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         BatchMode,
@@ -1177,6 +1199,7 @@ def test_fp4_json_variant_forwards_per_token_sfb_without_skip():
     with pytest.raises(ValueError, match="must match.*swap_ab"):
         validate_config(make_config(**non_transposed.kwargs))
 
+
 def test_trtllm_gen_json_transpose_option_is_normalized(tmp_path):
     import json
 
@@ -1203,6 +1226,7 @@ def test_trtllm_gen_json_transpose_option_is_normalized(tmp_path):
     assert options["transpose_mma_output"] is False
     assert bench.TRTLLM_GEN_TRANSPOSE_MMA_OUTPUT_KEY not in options
 
+
 def test_fp4_json_variant_forwards_fp16_dtype_c():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
     from flashinfer.prims_ts.batched_gemm.tools import bench
@@ -1225,6 +1249,7 @@ def test_fp4_json_variant_forwards_fp16_dtype_c():
     )
 
     assert variant.kwargs["dtype_c"] == int(DType.FP16)
+
 
 def test_bf16_json_variant_forwards_fp16_dtype_c():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
@@ -1249,6 +1274,7 @@ def test_bf16_json_variant_forwards_fp16_dtype_c():
     assert variant.kwargs["dtype_a"] == int(DType.BF16)
     assert variant.kwargs["dtype_b"] == int(DType.BF16)
     assert variant.kwargs["dtype_c"] == int(DType.FP16)
+
 
 def test_generated_command_treats_fp16_dtype_c_as_plain_output():
     from pathlib import Path
@@ -1288,6 +1314,7 @@ def test_generated_command_treats_fp16_dtype_c_as_plain_output():
     assert cmd[cmd.index("-dtypeC") + 1] == "fp16"
     assert "-eltwiseActType" not in cmd
 
+
 def test_runner_cli_accepts_batch_mode(monkeypatch):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
@@ -1322,6 +1349,7 @@ def test_runner_cli_accepts_batch_mode(monkeypatch):
     assert captured["batch_mode"] == int(BatchMode.BATCH_M)
     assert captured["transpose_mma_output"] == 0
 
+
 def test_validation_rejects_deepseek_fp8_fused_gated_activation():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -1343,6 +1371,7 @@ def test_validation_rejects_deepseek_fp8_fused_gated_activation():
     )
     with pytest.raises(ValueError, match="fused gated activation"):
         validate_config(cfg)
+
 
 def test_validation_rejects_deepseek_fp8_split_tma_c_scratch_stages():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1366,6 +1395,7 @@ def test_validation_rejects_deepseek_fp8_split_tma_c_scratch_stages():
     with pytest.raises(ValueError, match="num_stages_c_smem=1"):
         validate_config(cfg)
 
+
 def test_validation_rejects_deepseek_fp8_multi_epilogue_subtiles():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1388,6 +1418,7 @@ def test_validation_rejects_deepseek_fp8_multi_epilogue_subtiles():
     )
     with pytest.raises(ValueError, match="epi_subtile_cnt=1"):
         validate_config(cfg)
+
 
 def test_deepseek_fp8_epi_subtile_validation_uses_computed_warp_layout():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1413,6 +1444,7 @@ def test_deepseek_fp8_epi_subtile_validation_uses_computed_warp_layout():
     compute_warp_layout(cfg)
     assert cfg.num_epilogue_warps == 8
     validate_config(cfg)
+
 
 def test_validation_rejects_plain_fp8_output_without_activation_side():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (

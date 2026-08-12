@@ -244,9 +244,7 @@ def _selected_tile_ns(
     return tuple(sorted(selected_tiles))
 
 
-def _fp8_per_tensor_supported_tiles(
-    *, use_per_token_sf_b: bool
-) -> tuple[int, ...]:
+def _fp8_per_tensor_supported_tiles(*, use_per_token_sf_b: bool) -> tuple[int, ...]:
     del use_per_token_sf_b
     return SUPPORTED_FP8_TILE_N
 
@@ -302,9 +300,7 @@ def _parse_tactic(
 def _activation_act_kind(activation_type: int) -> int:
     act_kind = _ACTIVATION_TO_ACT_KIND.get(int(activation_type))
     if act_kind is None:
-        raise ValueError(
-            f"Unsupported Prims-TS activation_type={activation_type!r}"
-        )
+        raise ValueError(f"Unsupported Prims-TS activation_type={activation_type!r}")
     return act_kind
 
 
@@ -481,8 +477,7 @@ def _prims_ts_config_path() -> Path:
     path = Path(__file__).with_name("prims_ts_moe_configs.json")
     if not path.is_file():
         raise FileNotFoundError(
-            "Local Prims-TS MoE config JSON is required but was not found: "
-            f"{path}"
+            f"Local Prims-TS MoE config JSON is required but was not found: {path}"
         )
     return path
 
@@ -494,7 +489,9 @@ def _resolve_json_template(
     stack: tuple[str, ...] = (),
 ) -> dict[str, object]:
     if name in stack:
-        raise ValueError(f"Prims-TS config template cycle: {' -> '.join(stack + (name,))}")
+        raise ValueError(
+            f"Prims-TS config template cycle: {' -> '.join(stack + (name,))}"
+        )
     raw = templates[name]
     merged: dict[str, object] = {}
     parent = raw.get("_template")
@@ -553,7 +550,7 @@ def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
                             f"Prims-TS config {comment}: grouped key {key!r} "
                             f"expects {len(keys)} values, got {row!r}"
                         )
-                    choices.append(dict(zip(keys, row)))
+                    choices.append(dict(zip(keys, row, strict=True)))
             elif isinstance(value, list):
                 choices = [{key: item} for item in value]
             else:
@@ -635,7 +632,9 @@ def _json_config_matches_moe(
     if int(options.get("tile_n", -1)) != int(tile_n):
         return False
 
-    route_active = _json_route_value(options.get("route_act", False)) != int(_RouteImpl.NONE)
+    route_active = _json_route_value(options.get("route_act", False)) != int(
+        _RouteImpl.NONE
+    )
     if route_active != (fc == "fc1"):
         return False
 
@@ -662,9 +661,8 @@ def _json_config_matches_moe(
     elif json_use_per_token_sf_b != bool(use_per_token_sf_b):
         return False
     if (
-        (bool(use_per_token_sf_a) or bool(use_per_token_sf_b))
-        and per_token_sf_dtype is not None
-    ):
+        bool(use_per_token_sf_a) or bool(use_per_token_sf_b)
+    ) and per_token_sf_dtype is not None:
         try:
             json_per_token_sf_dtype = _json_dtype_value(
                 options.get("per_token_sf_dtype"), default="bf16"
@@ -774,7 +772,9 @@ def _resolve_moe_json_config_pair(
         )
     fc1_index = fc1_indices[moe_config_index // len(fc2_indices)]
     fc2_index = fc2_indices[moe_config_index % len(fc2_indices)]
-    return _json_config_by_global_index(fc1_index), _json_config_by_global_index(fc2_index)
+    return _json_config_by_global_index(fc1_index), _json_config_by_global_index(
+        fc2_index
+    )
 
 
 def _ensure_json_config_supported_by_ts(cfg: _JsonBatchedGemmConfig) -> None:
@@ -864,10 +864,14 @@ def _json_config_kwargs(
         "num_stages_tmem_sfb": int(options["num_stages_tmem_sfb"]),
         "num_stages_tmem_acc": tmem_acc_stages,
         "use_unroll_loop_2x_for_mma": 0,
-        "transpose_mma_output": int(_bool_value(options.get("transpose_mma_output", True))),
+        "transpose_mma_output": int(
+            _bool_value(options.get("transpose_mma_output", True))
+        ),
         "use_tma_oob_opt": int(_bool_value(options.get("use_tma_oob_opt", True))),
         "use_early_exit": int(_bool_value(options.get("use_early_exit", True))),
-        "use_clc_fast_drain": int(_bool_value(options.get("use_clc_fast_drain", False))),
+        "use_clc_fast_drain": int(
+            _bool_value(options.get("use_clc_fast_drain", False))
+        ),
         "use_two_tma_load_warps": int(
             _bool_value(options.get("use_two_tma_load_warps", True))
         ),
@@ -945,6 +949,7 @@ def _json_config_kwargs(
         )
     return kwargs
 
+
 def _make_config_spec(**kwargs: int) -> PrimsTsConfigSpec:
     return PrimsTsConfigSpec(kwargs=kwargs)
 
@@ -978,6 +983,7 @@ def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPai
             prims_ts_gemm_config_index=pair.fc2.prims_ts_gemm_config_index,
         ),
     )
+
 
 def _make_json_moe_config_pair(
     *,

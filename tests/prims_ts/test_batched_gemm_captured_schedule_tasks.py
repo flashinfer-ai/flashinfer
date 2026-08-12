@@ -89,7 +89,6 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 
-
 @dataclass(kw_only=True)
 class _DummyResource(MemoryResource):
     """Stub resource for schedule-shape tests.
@@ -453,6 +452,7 @@ class _DummyResource(MemoryResource):
     ):
         pass
 
+
 @dataclass(kw_only=True)
 class _DummyProxyResource(MemoryResource):
     """Proxy stub whose consumer publishes one pipeline-stage token."""
@@ -469,10 +469,12 @@ class _DummyProxyResource(MemoryResource):
     def consumer_work(self, stage_info):
         pass
 
+
 def _res(name: str, **kwargs) -> MemoryResource:
     if name == "Proxy":
         return _DummyProxyResource(name=name, **kwargs)
     return _DummyResource(name=name, **kwargs)
+
 
 def _work_queue() -> WorkQueue:
     scheduler_config = TileSchedulerConfig(
@@ -485,6 +487,7 @@ def _work_queue() -> WorkQueue:
         name="WorkQueue",
     )
 
+
 def _producer_aux_labels(schedule_list) -> list[str | None]:
     return [
         label
@@ -493,12 +496,14 @@ def _producer_aux_labels(schedule_list) -> list[str | None]:
         if stage == ScheduleStage.ProducerAuxWork
     ]
 
+
 def _all_producer_aux_labels(task) -> list[str | None]:
     return (
         _producer_aux_labels(task.head_schedule_list)
         + _producer_aux_labels(task.loop_schedule_list)
         + _producer_aux_labels(task.tail_schedule_list)
     )
+
 
 def _cfg(**overrides) -> SimpleNamespace:
     values = {
@@ -561,6 +566,7 @@ def _cfg(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
 
 def test_persistent_task_factories_build_captured_schedule_lists():
     cfg = _cfg(use_early_exit=True)
@@ -731,6 +737,7 @@ def test_persistent_task_factories_build_captured_schedule_lists():
         load_a.skippable_tail_slots
     )
 
+
 def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     cfg = _cfg(use_early_exit=False)
     work_queue = _work_queue()
@@ -745,6 +752,7 @@ def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     assert load_a.skip_if is None
     assert load_a.skippable_head_slots == frozenset()
     assert load_a.skippable_tail_slots == frozenset()
+
 
 def test_mma_task_rejects_partial_sf_pairs():
     with pytest.raises(ValueError, match="smem_sfa and smem_sfb together"):
@@ -771,6 +779,7 @@ def test_mma_task_rejects_partial_sf_pairs():
             num_k_tiles=5,
             tmem_sfa=_res("TmemSfA"),
         )
+
 
 def test_mma_task_rejects_conflicting_sf_modes_and_cast_a():
     with pytest.raises(ValueError, match="at most one SF mode"):
@@ -801,6 +810,7 @@ def test_mma_task_rejects_conflicting_sf_modes_and_cast_a():
             tmem_cast_a=_res("TmemCastA"),
         )
 
+
 def test_load_a_try_acquire_is_per_k_tile():
     cfg = _cfg(use_early_exit=False)
     work_queue = _work_queue()
@@ -821,6 +831,7 @@ def test_load_a_try_acquire_is_per_k_tile():
         resource is smem_a and stage == ScheduleStage.ProducerTryAcquire
         for resource, stage, *_ in load_a.loop_schedule_list
     )
+
 
 def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
     cfg = _cfg(use_early_exit=False, has_cluster=False)
@@ -845,6 +856,7 @@ def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
         for entry in load_sfa.loop_schedule_list
         for resource, stage, *_ in [entry]
     )
+
 
 def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     cfg = make_config(
@@ -894,11 +906,13 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert smem_sfb_cfg.producer_group.size == compact_cfg.num_load_sfb_warps * 32
     assert not smem_sfb_cfg.advance_on_acquire
 
+
 def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     source = inspect.getsource(ts_pipeline.TSPipelineAsyncUmma.producer_commit)
 
     assert "0xFEFFFFFF" in source
     assert source.count("mbarrier.arrive.shared::cluster.b64") == 1
+
 
 def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
     cfg = make_config(
@@ -937,6 +951,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
         name="SmemSfB",
     )
     assert two_stage_res.cp_async_wait_group_depth == 0
+
 
 def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     cfg = make_config(
@@ -1004,6 +1019,7 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     assert [entry[-1] for entry in tail_entries[::2]] == ["drain_tail"] * 3
     assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
 
+
 def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
     smem_sfa = _res(
         "SmemSfA",
@@ -1025,6 +1041,7 @@ def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
     assert [entry[-1] for entry in tail_entries[::2]] == ["drain_tail"] * 3
     assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
 
+
 def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
     cfg = make_config(
         cluster_m=2,
@@ -1045,6 +1062,7 @@ def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
 
     assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 1
 
+
 def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     cfg = make_config(
         cluster_m=2,
@@ -1060,6 +1078,7 @@ def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     assert tmem_sfab_cfg.pipeline_type == PipelineType.UmmaUmma
     assert tmem_sfab_cfg.producer_group.size == 1
     assert tmem_sfab_cfg.consumer_group.size == 1
+
 
 def test_combined_tmem_sfab_delays_commit_and_smem_release():
     cfg = _cfg()
@@ -1128,6 +1147,7 @@ def test_combined_tmem_sfab_delays_commit_and_smem_release():
         ScheduleStage.ConsumerRelease,
     ]
 
+
 def test_runtime_config_preserves_plain_bf16_stages():
     cfg = make_config(
         bias_type=int(BiasType.M),
@@ -1152,6 +1172,7 @@ def test_runtime_config_preserves_plain_bf16_stages():
     assert normalized.num_stages_a == 5
     assert normalized.num_stages_b == 5
 
+
 def test_runtime_config_preserves_unsupported_mma_unroll_for_validation():
     cfg = make_config(
         dtype_a=int(DType.BF16),
@@ -1168,6 +1189,7 @@ def test_runtime_config_preserves_unsupported_mma_unroll_for_validation():
     assert normalized.use_unroll_loop_2x_for_mma == 1
     with pytest.raises(ValueError, match="use_unroll_loop_2x_for_mma"):
         validate_config(normalized)
+
 
 def test_runtime_config_preserves_scaled_fp4_stages():
     cfg = make_config(
@@ -1203,6 +1225,7 @@ def test_runtime_config_preserves_scaled_fp4_stages():
     assert normalized.num_stages_smem_sfa == 6
     assert normalized.num_stages_smem_sfb == 6
 
+
 def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     cfg = make_config(
         cluster_m=2,
@@ -1231,6 +1254,7 @@ def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     compact_pcfgs = _make_pipeline_configs(compact_cfg)
     assert compact_pcfgs["tmem_sfa"].pipeline_type == PipelineType.UmmaUmma
     assert compact_pcfgs["tmem_sfb"].pipeline_type == PipelineType.AsyncUmma
+
 
 def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
     proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(

@@ -41,6 +41,7 @@ _SUPPORTED_ACTIVATIONS = (
     ActivationType.Relu2,
 )
 
+
 @dataclass(frozen=True)
 class SupportResult:
     ok: bool
@@ -95,7 +96,10 @@ def _validate_fp4_block_major_k_alignment(runner: Any, kwargs: dict[str, Any]):
     }
     observed.discard(None)
     if len(observed) > 1:
-        return False, "BlockMajorK FP4 gemm1/gemm2 weights use different K-block byte sizes"
+        return (
+            False,
+            "BlockMajorK FP4 gemm1/gemm2 weights use different K-block byte sizes",
+        )
     block_bytes = next(iter(observed), None)
     if block_bytes is not None and block_bytes not in candidate_bytes:
         return (
@@ -187,9 +191,7 @@ def _merge_per_token_sf_dtype(
     if current is None:
         return int(candidate)
     if int(current) != int(candidate):
-        raise ValueError(
-            f"{current_name} and {candidate_name} must use the same dtype"
-        )
+        raise ValueError(f"{current_name} and {candidate_name} must use the same dtype")
     return int(current)
 
 
@@ -272,7 +274,9 @@ def is_prims_ts_bf16_supported(
         for routing in (RoutingMethodType.Sigmoid, RoutingMethodType.DeepSeekV3)
     ):
         return False, "Sigmoid and DeepSeekV3 routing are not supported"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     if not kwargs.get("use_shuffled_weight", runner.use_shuffled_weight):
         return False, "Prims-TS BF16 path expects shuffled weights"
@@ -338,7 +342,9 @@ def is_prims_ts_nvfp4_supported(
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
         return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     ok, reason = _validate_fp4_block_major_k_alignment(runner, kwargs)
     if not ok:
@@ -427,7 +433,9 @@ def is_prims_ts_mxfp4_mxfp8_supported(
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
         return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     ok, reason = _validate_fp4_block_major_k_alignment(runner, kwargs)
     if not ok:
@@ -508,7 +516,9 @@ def is_prims_ts_mxfp4_bf16_supported(
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
         return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     ok, reason = _validate_fp4_block_major_k_alignment(runner, kwargs)
     if not ok:
@@ -595,7 +605,9 @@ def is_prims_ts_fp8_per_tensor_supported(
         _is_gated_activation(activation_type)
     ):
         return False, "DeepSeekV3 routing requires a gated activation"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     if not kwargs.get("use_shuffled_weight", runner.use_shuffled_weight):
         return False, "Prims-TS FP8 per-tensor path expects shuffled weights"
@@ -733,7 +745,9 @@ def is_prims_ts_fp8_block_scale_supported(
         return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
     if is_deepseek and not _enum_eq(activation_type, ActivationType.Swiglu):
         return False, "DeepSeek FP8 Prims-TS integration currently exposes Swiglu only"
-    if not _is_supported_weight_layout(kwargs.get("weight_layout", runner.weight_layout)):
+    if not _is_supported_weight_layout(
+        kwargs.get("weight_layout", runner.weight_layout)
+    ):
         return False, "weight_layout must be MajorK or BlockMajorK"
     if not kwargs.get("use_shuffled_weight", runner.use_shuffled_weight):
         return False, "Prims-TS FP8 block-scale path expects shuffled weights"
@@ -760,7 +774,10 @@ def is_prims_ts_fp8_block_scale_supported(
     if is_deepseek:
         if moe_inputs.hidden_states_scale.dtype != torch.float32:
             return False, "DeepSeek FP8 hidden_states_scale must be float32"
-        if kwargs.get("gemm1_weights_scale") is None or kwargs.get("gemm2_weights_scale") is None:
+        if (
+            kwargs.get("gemm1_weights_scale") is None
+            or kwargs.get("gemm2_weights_scale") is None
+        ):
             return False, "DeepSeek FP8 weight scales are required"
         if kwargs["gemm1_weights_scale"].dtype != torch.float32:
             return False, "DeepSeek FP8 gemm1_weights_scale must be float32"
@@ -768,7 +785,10 @@ def is_prims_ts_fp8_block_scale_supported(
             return False, "DeepSeek FP8 gemm2_weights_scale must be float32"
         mapper_name = "map_trtllm_deepseek_fp8_moe_tactic"
     else:
-        if kwargs.get("gemm1_weights_scale") is None or kwargs.get("gemm2_weights_scale") is None:
+        if (
+            kwargs.get("gemm1_weights_scale") is None
+            or kwargs.get("gemm2_weights_scale") is None
+        ):
             return False, "MXFP8 weight scales are required"
         if moe_inputs.hidden_states_scale.dtype != torch.uint8:
             return False, "MXFP8 hidden_states_scale must be uint8"

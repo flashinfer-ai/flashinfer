@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -42,7 +42,7 @@ def create_trtllm_moe_runner_class(
 
     class MoERunner(TunableRunner):
         # Cache valid tactics to reduce the overhead of re-querying the kernel.
-        valid_tactics_dict = dict()
+        valid_tactics_dict = dict[Any, Any]()
 
         def __init__(
             self,
@@ -92,9 +92,7 @@ def create_trtllm_moe_runner_class(
                 fp8_quantization_type=self.fp8_quantization_type,
                 init_packed_topk_ids=topk_ids_initializer_factory(
                     self.num_experts,
-                    packed=(
-                        routing_input_mode != RoutingInputMode.UnpackedPrecomputed
-                    ),
+                    packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
                 ),
                 tune_max_num_tokens=tune_max_num_tokens,
                 **kwargs,

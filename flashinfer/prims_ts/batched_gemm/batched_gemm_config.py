@@ -944,9 +944,7 @@ class BatchedGemmConfig:
     def has_swiglu_oai_params(self) -> bool:
         """True when any runtime per-expert SwiGLU-OAI parameter is active."""
         return bool(
-            self.has_gemm1_alpha
-            or self.has_gemm1_beta
-            or self.has_gemm1_clamp_limit
+            self.has_gemm1_alpha or self.has_gemm1_beta or self.has_gemm1_clamp_limit
         )
 
     @property
@@ -2159,9 +2157,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                 cfg.num_load_b_warps = requested_load_b_warps
             elif cfg.is_fp8_mma and cfg.has_cluster:
                 cfg.num_load_b_warps = 8
-            elif cfg.tile_n == 8:
-                cfg.num_load_b_warps = 2
-            elif cfg.has_cluster and cfg.tile_n == 16:
+            elif cfg.tile_n == 8 or (cfg.has_cluster and cfg.tile_n == 16):
                 cfg.num_load_b_warps = 2
             elif cfg.tile_n == 256:
                 cfg.num_load_b_warps = 8
@@ -2378,11 +2374,7 @@ def _validate_pipeline_stage_counts(cfg: BatchedGemmConfig) -> None:
     if cfg.is_persistent:
         _validate_pipeline_stage_count(cfg, "num_stages_workid")
 
-    if (
-        cfg.has_gather
-        and cfg.has_cluster
-        and cfg.num_stages_a != cfg.num_stages_b
-    ):
+    if cfg.has_gather and cfg.has_cluster and cfg.num_stages_a != cfg.num_stages_b:
         raise ValueError(
             "2-CTA gather requires num_stages_a == num_stages_b, got "
             f"{cfg.num_stages_a} and {cfg.num_stages_b}"

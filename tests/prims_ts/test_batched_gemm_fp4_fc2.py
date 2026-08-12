@@ -39,7 +39,8 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required"),
     pytest.mark.skipif(
-        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))), reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+"
+        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))),
+        reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+",
     ),
 ]
 
@@ -69,6 +70,7 @@ FP4_FC2_LL = dict(
     batch_mode=int(BatchMode.BATCH_M),
     transpose_mma_output=0,
 )
+
 
 def _run_fp4_fc2(
     *,
@@ -127,10 +129,9 @@ def _run_fp4_fc2(
         f"scheduler={tile_scheduler}, cluster_m={cluster_m}"
     )
 
+
 class TestFp4Fc2Validation:
-
     def test_validate_tile8_k256(self):
-
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -204,6 +205,7 @@ class TestFp4Fc2Validation:
                 num_stages_tmem_acc=1,
                 **FP4_FC2_LL,
             )
+
 
 class TestFp4Fc2LLStatic:
     """FP4 FC2 LowLatency static scheduler (rows 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53)."""
@@ -344,9 +346,9 @@ class TestFp4Fc2LLStatic:
     def test_tile8_k256_s9(self):
         _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=9)
 
+
 class TestFp4Fc2LLPersistent:
     """FP4 FC2 LowLatency persistent (rows 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54)."""
-
 
     def test_tile8_k256_persistent(self):
         _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, tile_scheduler=1)
@@ -425,11 +427,13 @@ class TestFp4Fc2LLPersistent:
             cluster_m=2,
         )
 
+
 class TestFp4Fc2MultiExpert:
     """FP4 FC2 with multiple experts."""
 
     def test_4experts_tile16(self):
         _run_fp4_fc2(tile_n=16, tile_k=256, num_experts=4, num_tokens=512)
+
 
 class TestFp4Fc2HT:
     """FP4 FC2 HighThroughput: 2-CTA cluster (rows 55-58)."""
