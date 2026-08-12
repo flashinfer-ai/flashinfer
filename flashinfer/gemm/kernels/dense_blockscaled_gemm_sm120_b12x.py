@@ -292,6 +292,14 @@ class DenseGemmKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
+        elif self.sf_vec_size == 32:
+            # MXFP4 (sf_vec_size=32, E8M0 scale) requires the MmaMXF4Op
+            # warp-MMA; MmaMXF4NVF4Op is hard-coded to NVFP4 in cutlass-dsl.
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
         else:
             mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
                 self.a_dtype,
@@ -545,6 +553,41 @@ class DenseGemmKernel:
         )
         return
 
+    @staticmethod
+    def _align_sf_copy_ranks(src: cute.Tensor, dst: cute.Tensor):
+        """Normalize SF tensor ranks for a SMEM->RMEM ``cute.copy``.
+
+        ``cute.filter_zeros`` strips stride-0 (broadcast) modes. A scale factor
+        is shared by ``sf_vec_size`` data elements, so MXF4 (sf_vec_size=32) and
+        NVF4 (sf_vec_size=16) end up with a different number of broadcast modes,
+        and the SMEM and RMEM views can be left at different ranks (e.g. 3 vs 4).
+        Collapse the trailing modes of whichever side is deeper so that
+        ``cute.copy`` sees matching ranks.
+        """
+        src_rank = cute.rank(src)
+        dst_rank = cute.rank(dst)
+        if src_rank > dst_rank:
+            src = cute.group_modes(src, dst_rank - 1, src_rank)
+        elif dst_rank > src_rank:
+            dst = cute.group_modes(dst, src_rank - 1, dst_rank)
+        return src, dst
+
+    @staticmethod
+    def _collapse_to_vmk(partitioned_sf: cute.Tensor):
+        """Collapse a partitioned scale-factor view down to rank-3 ``(V, MN, K)``.
+
+        ``cute.flatten`` normalizes *nesting* but not the *number* of modes. The
+        SF SMEM layout carries a ``blk_sf // mma_nsf`` K sub-mode whose extent is
+        ``1`` for NVF4 (``mma_nsf == 4``) but ``2`` for MXF4 (``mma_nsf == 2``),
+        so MXF4 keeps one extra non-degenerate K mode and the view ends up at
+        rank 4. The mainloop indexes these fragments as ``t[None, tile, k_block]``,
+        which requires exactly rank 3, so fold the trailing K modes into one.
+        """
+        rank = cute.rank(partitioned_sf)
+        if rank > 3:
+            partitioned_sf = cute.group_modes(partitioned_sf, 2, rank)
+        return partitioned_sf
+
     def _partition_fragment_SFA(
         self,
         sfa_tensor: cute.Tensor,
@@ -557,6 +600,7 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
+        partitioned_sfa = self._collapse_to_vmk(partitioned_sfa)
         return cute.make_fragment_like(partitioned_sfa)
 
     def _partition_fragment_SFB(
@@ -572,6 +616,7 @@ class DenseGemmKernel:
         partitioned_sfb = thr_tensor[thr_vnk, (None, None)]
         partitioned_sfb = cute.group_modes(cute.flatten(partitioned_sfb), 0, 2)
         partitioned_sfb = cute.group_modes(partitioned_sfb, 1, 3)
+        partitioned_sfb = self._collapse_to_vmk(partitioned_sfb)
         return cute.make_fragment_like(partitioned_sfb)
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
@@ -1391,6 +1436,18 @@ class DenseGemmKernel:
                 tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
                 tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                 tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
+                (
+                    tCsSFA_p_filtered,
+                    tCrSFA_copy_view_filtered,
+                ) = self._align_sf_copy_ranks(
+                    tCsSFA_p_filtered, tCrSFA_copy_view_filtered
+                )
+                (
+                    tCsSFB_p_filtered,
+                    tCrSFB_copy_view_filtered,
+                ) = self._align_sf_copy_ranks(
+                    tCsSFB_p_filtered, tCrSFB_copy_view_filtered
+                )
 
                 # The fragments hold a full stage of scale factors, so copy
                 # them once per stage.
@@ -1475,6 +1532,18 @@ class DenseGemmKernel:
                             )
                             tCrSFB_copy_view_filtered = cute.filter_zeros(
                                 tCrSFB_tile_copy_view
+                            )
+                            (
+                                tCsSFA_p_filtered,
+                                tCrSFA_copy_view_filtered,
+                            ) = self._align_sf_copy_ranks(
+                                tCsSFA_p_filtered, tCrSFA_copy_view_filtered
+                            )
+                            (
+                                tCsSFB_p_filtered,
+                                tCrSFB_copy_view_filtered,
+                            ) = self._align_sf_copy_ranks(
+                                tCsSFB_p_filtered, tCrSFB_copy_view_filtered
                             )
                             cute.copy(
                                 smem_tiled_copy_SFA,
