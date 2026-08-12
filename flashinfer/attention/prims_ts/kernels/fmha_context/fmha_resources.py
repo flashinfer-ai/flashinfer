@@ -359,10 +359,7 @@ class FmhaConfig:
 
         Causal TAIL specialisation also gates on ``self.is_causal``.
         """
-        return (
-            not self.single_qkv_instance
-            and self.mma_order == MmaOrder.Qk0Pv0Qk1Pv1
-        )
+        return not self.single_qkv_instance and self.mma_order == MmaOrder.Qk0Pv0Qk1Pv1
 
     @property
     def uses_qk_pv_interleaved_causal_paired_schedule(self) -> bool:
