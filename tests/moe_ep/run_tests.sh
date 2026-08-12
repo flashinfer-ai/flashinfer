@@ -101,7 +101,17 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
     --ignore=tests/moe_ep/test_mega_cuda_graph.py \
-    -k "not multirank_roundtrip"
+    -k "not multirank_roundtrip" \
+    --deselect "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # Run the nvfp4 symm-buffer-sharing test in its own interpreter. In-suite it
+  # crashes the process (Fatal Python error: Aborted) inside the nvfp4 layer
+  # warmup's kernel-module imports — heap state left by the preceding ~200
+  # GPU tests, not a bug in the test or kernel: it passes 100% standalone,
+  # per-file, and in every subset tried (see moe_ep runbook "unit suite"
+  # notes; observed since 2026-07-22, deterministic by 2026-08-12).
+  "${PY}" -m pytest -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
 }
 
 run_multirank() {

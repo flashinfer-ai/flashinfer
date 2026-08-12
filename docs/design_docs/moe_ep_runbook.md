@@ -102,7 +102,14 @@ band, that is a real signal, not marginality.
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
 
-- **unit** — host-only pytest (mocks + single-GPU).
+- **unit** — host-only pytest (mocks + single-GPU). One test,
+  `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`, runs
+  in a second pytest process: inside the full ~200-test run it crashes the
+  interpreter (`Fatal Python error: Aborted`) during the nvfp4 layer warmup's
+  kernel-module imports — process-heap state from the preceding in-suite GPU
+  work, not a kernel or test bug (passes 100% standalone, per-file, and in
+  every subset tried; observed 2026-07-22 → deterministic 2026-08-12, B200,
+  dsl 4.6.1). If the isolated invocation ever fails, that is a real signal.
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
