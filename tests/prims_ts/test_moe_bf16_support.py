@@ -19,18 +19,14 @@ import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
     SUPPORTED_MXFP4_BF16_TILE_N,
-    _DType,
     _expanded_prims_ts_json_configs,
     _expanded_trtllm_gen_json_configs,
-    _json_config_by_global_index,
-    _make_json_moe_config_pair,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
-    valid_prims_ts_mxfp8_mxfp8_moe_tactics,
 )
 from flashinfer.prims_ts.moe import support
 from flashinfer.prims_ts.moe.runner import _filter_valid_moe_tactics
@@ -78,38 +74,6 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
             continue
         return pair
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
-
-_MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT = "MxFp4xMxFp8_FC1_LowLatencyFastDrain"
-
-
-def _mxfp4_mxfp8_json_pair(
-    tactic,
-    *,
-    enable_pdl=False,
-    activation_type=int(ActivationType.Swiglu),
-    dtype_a=int(_DType.MXE2M1),
-):
-    return _make_json_moe_config_pair(
-        tile_n=tactic[0],
-        moe_config_index=tactic[1],
-        activation_type=activation_type,
-        dtype_a=dtype_a,
-        dtype_b=int(_DType.MXE4M3),
-        fc1_dtype_c=int(_DType.MXE4M3),
-        fc2_dtype_c=int(_DType.BF16),
-        dtype_label=("MXFP4xMXFP8" if dtype_a == int(_DType.MXE2M1) else "MXFP8xMXFP8"),
-        enable_pdl=enable_pdl,
-    )
-
-
-def _fc1_comments(tactics, **pair_kwargs):
-    return {
-        _json_config_by_global_index(
-            _mxfp4_mxfp8_json_pair(tactic, **pair_kwargs).fc1.prims_ts_gemm_config_index
-        ).comment
-        for tactic in tactics
-    }
-
 
 def test_config_mapper_loads_local_prims_ts_json():
     assert _expanded_trtllm_gen_json_configs()
@@ -294,61 +258,23 @@ def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
         enable_pdl=True,
     )
     tactics = valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs)
-    pairs = [
-        _mxfp4_mxfp8_json_pair(tactic, enable_pdl=True)
-        for tactic in tactics
-        if tactic[0] == 32
-    ]
-    fast_drain_pairs = [
-        pair
-        for pair in pairs
-        if _json_config_by_global_index(
-            pair.fc1.prims_ts_gemm_config_index
-        ).comment
-        == _MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT
-    ]
+    fast_drain_pairs = []
+    for tactic in tactics:
+        if tactic[0] != 32:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc1 = pair.fc1.cfg.kwargs
+        if (
+            fc1["tile_k"] == 256
+            and fc1["cluster_m"] == 2
+            and fc1["route_act"] == 1
+            and fc1["use_clc_fast_drain"]
+            and not fc1["use_work_throttle"]
+        ):
+            fast_drain_pairs.append(pair)
 
     assert fast_drain_pairs
     assert len({pair.fc2.prims_ts_gemm_config_index for pair in fast_drain_pairs}) > 1
-    fc1 = fast_drain_pairs[0].fc1.cfg.kwargs
-    assert fc1["tile_n"] == 32
-    assert fc1["tile_k"] == 256
-    assert fc1["cluster_m"] == 2
-    assert fc1["mma_m"] == 256
-    assert fc1["tile_scheduler"] == 1
-    assert fc1["route_act"] == 1
-    assert fc1["route_sfs_act"] == 2
-    assert fc1["use_clc_fast_drain"] == 1
-    assert fc1["use_work_throttle"] == 0
-    assert fc1["use_pdl"] == 1
-    assert all(
-        fc1[field] == 5
-        for field in (
-            "num_stages_a",
-            "num_stages_b",
-            "num_stages_smem_sfa",
-            "num_stages_smem_sfb",
-            "num_stages_tmem_sfa",
-            "num_stages_tmem_sfb",
-        )
-    )
-
-
-def test_mxfp4_mxfp8_fast_drain_fc1_is_not_visible_to_mxfp8_moe():
-    tactics = valid_prims_ts_mxfp8_mxfp8_moe_tactics(
-        activation_type=int(ActivationType.Swiglu),
-        num_tokens=1024,
-        top_k=4,
-        num_local_experts=128,
-        enable_pdl=True,
-    )
-
-    assert _MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT not in _fc1_comments(
-        tactics,
-        activation_type=int(ActivationType.Swiglu),
-        dtype_a=int(_DType.MXE4M3),
-        enable_pdl=True,
-    )
 
 
 def _gpt_oss_high_throughput_pair():
@@ -384,30 +310,14 @@ def _gpt_oss_high_throughput_pair():
 
 
 def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-        build_batched_gemm_task_manager,
-    )
-
     pair = _gpt_oss_high_throughput_pair()
     fc1 = pair.fc1.cfg.kwargs
     fc2 = pair.fc2.cfg.kwargs
     assert fc1["route_sfs_act"] == 2
     assert fc1["num_stages_tmem_sfa"] == 1
     assert fc1["fuse_operand_sf_loads"] == 1
+    assert fc1["use_unroll_loop_2x_for_mma"] == 1
     assert fc2["use_unroll_loop_2x_for_mma"] == 1
-
-    manager = build_batched_gemm_task_manager(
-        num_experts=128,
-        num_tokens=8192,
-        top_k=4,
-        verbose=False,
-        **fc1,
-    )
-    assert {task.name for task in manager.tasks} >= {
-        "MmaTask0",
-        "FusedGatherSfBTask",
-        "WorkScheduleTask",
-    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")

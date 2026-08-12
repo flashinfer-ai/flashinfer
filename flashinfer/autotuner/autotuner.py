@@ -1284,6 +1284,10 @@ class AutoTuner:
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate.
         self._ranked_tactics_cache: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
+        # Keep measurement provenance separate from the runtime cache key.
+        # This lets a different profiling policy retune the same workload while
+        # keeping the selected tactic reachable after autotune() exits.
+        self._profiling_cache_policies: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
 
@@ -1510,6 +1514,8 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
+            requested_policy = self._profiling_policy(tuning_config)
+            default_policy = self._default_profiling_policy(tuning_config)
             # 1. In-memory cache (from live tuning). Keys are built lazily so
             #    the common warm path (hit here) pays for exactly one key per
             #    runner visited; a full miss leaves runner_keys complete for
@@ -1525,13 +1531,20 @@ class AutoTuner:
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in self.profiling_cache:
-                    tactic, stored_profile = self.profiling_cache[cache_key]
-                    return True, r_id, tactic, stored_profile
+                    cached_policy = self._profiling_cache_policies.get(
+                        cache_key, default_policy
+                    )
+                    if not self.is_tuning_mode or cached_policy == requested_policy:
+                        tactic, stored_profile = self.profiling_cache[cache_key]
+                        return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
+            use_file_config = not (
+                self.is_tuning_mode and requested_policy != default_policy
+            )
             for r_id, cache_key in runner_keys:
                 file_key = cache_key.file_key
-                if file_key in self._file_configs:
+                if use_file_config and file_key in self._file_configs:
                     runner_name, tactic = self._file_configs[file_key]
                     if runner_name != runners[r_id].__class__.__name__:
                         continue
@@ -1954,6 +1967,9 @@ class AutoTuner:
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
                             self.profiling_cache[cache_key] = (tactic, p)
+                            self._profiling_cache_policies[cache_key] = (
+                                self._profiling_policy(tuning_config)
+                            )
                             self._dirty = True
                             self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
@@ -2496,6 +2512,23 @@ class AutoTuner:
             extras=extras,
         )
 
+    @staticmethod
+    def _profiling_policy(tuning_config: TuningConfig) -> tuple:
+        """Return measurement provenance that can change tactic ranking."""
+        if not tuning_config.use_cuda_graph:
+            return ("cuda_graph_profile_replays", None)
+        return (
+            "cuda_graph_profile_replays",
+            int(tuning_config.cuda_graph_profile_replays),
+        )
+
+    @staticmethod
+    def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:
+        """Policy assumed for cache entries created before provenance tracking."""
+        if not tuning_config.use_cuda_graph:
+            return ("cuda_graph_profile_replays", None)
+        return ("cuda_graph_profile_replays", 1)
+
     def _create_tensor_like(
         self,
         origin_tensor: torch.Tensor,
@@ -2969,6 +3002,7 @@ class AutoTuner:
         with self._lock:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
+            self._profiling_cache_policies.clear()
             self._file_configs.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()

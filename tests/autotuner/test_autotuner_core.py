@@ -943,6 +943,42 @@ def test_autotune_context_overrides_cuda_graph_profile_replays(monkeypatch):
     assert seen_replays == [20]
 
 
+def test_cuda_graph_profile_replay_change_reprofiles(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128,),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        use_cuda_graph=True,
+    )
+    seen_replays = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_replays.append(tuning_config.cuda_graph_profile_replays)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, cuda_graph_profile_replays=1):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+
+    # Runtime lookup must keep using the tactic selected by the last tuning pass.
+    tuner.choose_one("profile_policy_test", [runner], config, inputs)
+
+    assert seen_replays == [1, 20]
+
+
 def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
     with (
         pytest.raises(ValueError, match="must be at least one"),
