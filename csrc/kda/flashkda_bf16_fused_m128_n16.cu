@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_534260023d.
-// Cake revision: 58e48fd0e62ff4922ac43740ef044e8aa874e12c; raw SHA-256: 4324be7ec3413d3c442e4e0733e52402acbb82c79d8fa28a249d63763968986e.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_49783300c3.
+// Cake revision: c11b197a0f728dcade7030d976c61be7b0b293d7; raw SHA-256: 6ab58b13f28a768a47ca652cab2554a4a00fef912c7cac5b4b130ab0da9430f1.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1964,7 +1964,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     if (prep_local_warp >= 2) {
                         int stage_f32_0 = prep_stage * 10496;
                         int restore_segment = lane & 15;
-                        float gate_rate_1 = smem_gate_rate_all[stage_f32_0];
                         float restore_scale[8];
                         #pragma unroll
                         for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
@@ -1974,8 +1973,46 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             restore_scale[restore_elem] = _exp2_3;
                         }
                         #pragma unroll 1
-                        for (int restore_pass = 0; restore_pass < 4; restore_pass++) {
-                            int restore_row = (prep_local_warp - 2) * 8 + restore_pass * 2 + (lane >> 4);
+                        for (int restore_qd_pass = 0; restore_qd_pass < 4; restore_qd_pass++) {
+                            int restore_qd_row = (prep_local_warp - 2) * 8 + restore_qd_pass * 2 + (lane >> 4);
+                            float restore_qd_values[8];
+                            unsigned int packed_2[4];
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 3]))
+                                : "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_qd_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_qd_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
+                            float packed_f32_1[8];
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&packed_f32_1[_pair * 2])[0]), "=f"((&packed_f32_1[_pair * 2])[1])
+                                    : "r"(packed_2[_pair]));
+                            }
+                            #pragma unroll
+                            for (int value_idx_2 = 0; value_idx_2 < 8; value_idx_2++) {
+                                restore_qd_values[value_idx_2] = packed_f32_1[value_idx_2];
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], reinterpret_cast<const float2*>(restore_scale)[_ls]);
+                            unsigned int packed_0_2[4];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 4; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_qd_values[_lp*2 + 0], restore_qd_values[_lp*2+1 + 0]));
+                                packed_0_2[_lp] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int word_3 = 0; word_3 < 4; word_3++) {
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_qd_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_qd_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_3 * 4)), "r"((packed_0_2[word_3])));
+                            }
+                        }
+                        float gate_rate_1 = smem_gate_rate_all[stage_f32_0];
+                        #pragma unroll 1
+                        for (int restore_k_pass = 0; restore_k_pass < 4; restore_k_pass++) {
+                            int restore_row = (prep_local_warp - 2) * 8 + restore_k_pass * 2 + (lane >> 4);
                             long long restore_token = bos_3 + (long long)(chunk_idx_2 * 16 + restore_row);
                             int restore_valid = ((restore_token < eos_3) ? 1 : 0);
                             long long restore_gmem_base = (restore_token * (long long)num_heads + (long long)head_idx_2) * 128 + (long long)(restore_segment * 8);
@@ -2029,28 +2066,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_k_raw)[_ls], _scale2_8);
-                            float restore_qd_values[8];
                             float restore_kd_values[8];
                             float restore_kr_values[8];
-                            unsigned int packed_2[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 3]))
-                                : "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
-                            float packed_f32_1[8];
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&packed_f32_1[_pair * 2])[0]), "=f"((&packed_f32_1[_pair * 2])[1])
-                                    : "r"(packed_2[_pair]));
-                            }
-                            #pragma unroll
-                            for (int value_idx_2 = 0; value_idx_2 < 8; value_idx_2++) {
-                                restore_qd_values[value_idx_2] = packed_f32_1[value_idx_2];
-                            }
                             #pragma unroll
                             for (int restore_elem_2 = 0; restore_elem_2 < 8; restore_elem_2++) {
                                 int restore_col_1 = restore_segment * 8 + restore_elem_2;
@@ -2081,42 +2098,29 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             }
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], reinterpret_cast<const float2*>(restore_scale)[_ls]);
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 4; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kd_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kr_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
-                            unsigned int packed_0_2[4];
-                            #pragma unroll
-                            for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_qd_values[_lp*2 + 0], restore_qd_values[_lp*2+1 + 0]));
-                                packed_0_2[_lp] = *(uint32_t*)&_bf2;
-                            }
-                            #pragma unroll
-                            for (int word_3 = 0; word_3 < 4; word_3++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_3 * 4)), "r"((packed_0_2[word_3])));
-                            }
-                            unsigned int packed_1_2[4];
+                            unsigned int packed_3[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_kd_values[_lp*2 + 0], restore_kd_values[_lp*2+1 + 0]));
-                                packed_1_2[_lp] = *(uint32_t*)&_bf2;
+                                packed_3[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int word_4 = 0; word_4 < 4; word_4++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_4 * 4)), "r"((packed_1_2[word_4])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_4 * 4)), "r"((packed_3[word_4])));
                             }
-                            unsigned int packed_2_1[4];
+                            unsigned int packed_0_3[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_kr_values[_lp*2 + 0], restore_kr_values[_lp*2+1 + 0]));
-                                packed_2_1[_lp] = *(uint32_t*)&_bf2;
+                                packed_0_3[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int word_5 = 0; word_5 < 4; word_5++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kr_trans_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_5 * 4)), "r"((packed_2_1[word_5])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kr_trans_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_5 * 4)), "r"((packed_0_3[word_5])));
                             }
                         }
                     }
@@ -2136,11 +2140,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         inv_row[6] = 0.0f;
                         inv_row[7] = 0.0f;
                         if (inverse_row < 16) {
-                            unsigned int packed_3[4];
+                            unsigned int packed_4[4];
                             int byte_off_1 = (int)prep_stage * 41984 + inverse_row * 128 + diag_block * 8 * 2;
                             int swizzled_off_1 = byte_off_1 ^ (byte_off_1 >> 7 & 7) << 4;
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_4[(0) + 3]))
                                 : "r"(smem_inv_work_addr + (unsigned int)swizzled_off_1));
                             float packed_f32_2[8];
                             #pragma unroll
@@ -2151,7 +2155,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                                     "and.b32 %1, %2, 0xffff0000;\n\t"
                                     "}\n"
                                     : "=f"((&packed_f32_2[_pair * 2])[0]), "=f"((&packed_f32_2[_pair * 2])[1])
-                                    : "r"(packed_3[_pair]));
+                                    : "r"(packed_4[_pair]));
                             }
                             #pragma unroll
                             for (int value_idx_3 = 0; value_idx_3 < 8; value_idx_3++) {
@@ -2185,17 +2189,17 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     }
                     {
                         if (inverse_row < 16) {
-                            unsigned int packed_4[4];
+                            unsigned int packed_5[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(inv_row[_lp*2 + 0], inv_row[_lp*2+1 + 0]));
-                                packed_4[_lp] = *(uint32_t*)&_bf2;
+                                packed_5[_lp] = *(uint32_t*)&_bf2;
                             }
                             int byte_off_2 = (int)prep_stage * 41984 + inverse_row * 128 + diag_block * 8 * 2;
                             int swizzled_off_2 = byte_off_2 ^ (byte_off_2 >> 7 & 7) << 4;
                             #pragma unroll
                             for (int word_6 = 0; word_6 < 4; word_6++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_inv_work_addr + (unsigned int)swizzled_off_2 + (unsigned int)(word_6 * 4)), "r"((packed_4[word_6])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_inv_work_addr + (unsigned int)swizzled_off_2 + (unsigned int)(word_6 * 4)), "r"((packed_5[word_6])));
                             }
                         }
                     }
