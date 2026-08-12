@@ -1776,10 +1776,10 @@ def create_softmax_task(
         else:
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
-        # Consume the pre-planted 128-arrive credit so iter 0's cross-alias
-        # handshake is primed before the first STTM(P_own). No-op when the
-        # schedule is not interleaved (sp._tp_ref is None).
-        sp.ordered_sequence_wait_if_paired()
+        # bar0 prime (peer0): same-tile handshake, so once per CTA outside the
+        # loop. bar1's is per-tile (below). No-op when not interleaved.
+        if cutlass.const_expr(index == 0):
+            sp.ordered_sequence_wait_if_paired()
         vec.init_store_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
             # Recompute per-tile SP/Vec TMEM state.
@@ -1789,6 +1789,11 @@ def create_softmax_task(
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
                 seqlen_k = sp.cache_seqlen_k()
+            # bar1 prime (peer1), per-tile: keeps its forward-skew credit off the
+            # loop-back edge -- the T>=2 deadlock. Peer0's closer (below) matches
+            # it; skip-wrapped so both drop together. No-op when not interleaved.
+            if cutlass.const_expr(index == 1):
+                sp.ordered_sequence_wait_if_paired()
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
@@ -2134,11 +2139,11 @@ def create_softmax_task(
                     final_stats=True,
                 )
                 vec.commit()
-        # Peer 0 posts one closing arrive so peer 1's final wait_if_paired
-        # does not deadlock (barrier[1] is one flip short after barrier[0]-only
-        # pre-plant; barrier[0] already balances without a peer-1 closer).
-        if cutlass.const_expr(index == 0):
-            sp.ordered_sequence_arrive_if_paired()
+            # bar1 closer (peer0): matches peer1's per-tile prime. After the tail
+            # chain so it follows peer0's last LDTM(S0) (P1 aliases S0, WAR).
+            # No-op when not interleaved.
+            if cutlass.const_expr(index == 0):
+                sp.ordered_sequence_arrive_if_paired()
 
     if p_pipeline_enabled:
 
