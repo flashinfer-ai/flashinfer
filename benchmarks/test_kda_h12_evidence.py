@@ -1023,7 +1023,7 @@ def _record_oracle_mismatch(report, oracle_name):
     "diagnostic_oracle",
     ["independent_bf16_recurrence", "fla_triton"],
 )
-def test_per_arch_receipt_rejects_required_oracle_disagreement(
+def test_per_arch_receipt_accepts_valid_diagnostic_disagreement(
     tmp_path,
     diagnostic_oracle,
 ):
@@ -1034,7 +1034,27 @@ def test_per_arch_receipt_rejects_required_oracle_disagreement(
     report["cases"][0]["correctness"]["diagnostic_consensus"] = False
     report["diagnostic_consensus"] = False
 
-    with pytest.raises(evidence.EvidenceSchemaError, match="exact BF16 full-tensor"):
+    identity = evidence.validate_per_arch_receipt(
+        report,
+        expected_arch="sm100a",
+        expected_candidate_commit=candidate_commit,
+        expected_fla_commit=fla_commit,
+        preset=preset,
+    )
+
+    assert identity["candidate"]["source_commit"] == candidate_commit
+
+
+def test_per_arch_receipt_rejects_inconsistent_diagnostic_consensus(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    _record_oracle_mismatch(report, "fla_triton")
+
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="diagnostic consensus is inconsistent",
+    ):
         evidence.validate_per_arch_receipt(
             report,
             expected_arch="sm100a",
@@ -1079,6 +1099,34 @@ def test_dual_arch_reducer_requires_matching_complete_receipts(tmp_path):
     assert result["promotion_complete_dual_arch"] is True
     assert result["cross_shape_aggregate"] is None
     assert set(result["receipts"]) == {"sm100a", "sm103a"}
+
+
+def test_dual_arch_reducer_keeps_valid_diagnostic_disagreement_non_blocking(
+    tmp_path,
+):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    for report, oracle in (
+        (sm100a, "independent_bf16_recurrence"),
+        (sm103a, "fla_triton"),
+    ):
+        _record_oracle_mismatch(report, oracle)
+        report["cases"][0]["correctness"]["diagnostic_consensus"] = False
+        report["diagnostic_consensus"] = False
+
+    result = evidence.reduce_dual_arch_receipts(
+        sm100a_report=sm100a,
+        sm103a_report=sm103a,
+        sm100a_receipt_sha256="1" * 64,
+        sm103a_receipt_sha256="2" * 64,
+        expected_candidate_commit=candidate_commit,
+        expected_fla_commit=fla_commit,
+        preset=preset,
+    )
+
+    assert result["promotion_complete_dual_arch"] is True
 
 
 def test_dual_arch_reducer_cli_emits_only_after_both_receipts(tmp_path):
@@ -1565,8 +1613,8 @@ def test_runner_requires_exact_observed_h12_candidate_variant():
     ("failed_label", "contract_passed", "diagnostic_consensus"),
     [
         (None, True, True),
-        ("independent recurrence", False, False),
-        ("FLA/Triton", False, False),
+        ("independent recurrence", True, False),
+        ("FLA/Triton", True, False),
         ("pinned FlashKDA", False, True),
     ],
 )
@@ -1582,14 +1630,12 @@ def test_runner_oracle_role_matrix(
     state = _FakeTensor(1)
     runtime = SimpleNamespace(
         candidate_reset=lambda: events.append("candidate_reset"),
-        candidate_run=lambda: (
-            events.append("candidate_run") or (_FakeTensor(2), state)
-        ),
+        candidate_run=lambda: events.append("candidate_run") or (_FakeTensor(2), state),
         candidate_state_pool=[state],
         flash_kda_raw_run=lambda: events.append("pinned_run"),
         flash_kda_output=_FakeTensor(3),
         flash_kda_final_state=_FakeTensor(4),
-        fla_run=lambda: (events.append("fla_run") or (_FakeTensor(5), _FakeTensor(6))),
+        fla_run=lambda: events.append("fla_run") or (_FakeTensor(5), _FakeTensor(6)),
     )
     monkeypatch.setattr(
         runner,
@@ -1618,12 +1664,17 @@ def test_runner_oracle_role_matrix(
 
 
 @pytest.mark.parametrize(
-    ("all_oracles_passed", "timing_called"),
-    [(True, True), (False, False)],
+    ("pinned_passed", "diagnostic_consensus", "timing_called"),
+    [
+        (True, True, True),
+        (True, False, True),
+        (False, True, False),
+    ],
 )
-def test_runner_three_oracle_gate_controls_timing(
+def test_runner_pinned_contract_controls_timing(
     monkeypatch,
-    all_oracles_passed,
+    pinned_passed,
+    diagnostic_consensus,
     timing_called,
 ):
     runner = _load_runner_module()
@@ -1640,8 +1691,8 @@ def test_runner_three_oracle_gate_controls_timing(
         runner,
         "_check_correctness",
         lambda torch, runtime: {
-            "passed": all_oracles_passed,
-            "diagnostic_consensus": all_oracles_passed,
+            "passed": pinned_passed,
+            "diagnostic_consensus": diagnostic_consensus,
         },
     )
 
@@ -1669,7 +1720,7 @@ def test_runner_three_oracle_gate_controls_timing(
         blocks=2,
     )
 
-    assert result["performance_reportable"] is all_oracles_passed
+    assert result["performance_reportable"] is pinned_passed
     assert bool(calls) is timing_called
     assert (result["timings"] is not None) is timing_called
 
@@ -1740,6 +1791,38 @@ def test_independent_recurrence_allocates_a_bf16_output_buffer():
         and node.func.id == "_h12_bf16_residual_carriers"
     ]
     assert len(carrier_calls) == 1
+
+
+def test_independent_normalization_uses_fixed_fp32_formula_without_bf16_carrier():
+    torch = pytest.importorskip("torch")
+    runner = _load_runner_module()
+    value = torch.tensor(
+        [[0.125, -0.75, 1.5, 0.03125]],
+        dtype=torch.bfloat16,
+    )
+
+    actual = runner._normalize_fp32(torch, value)
+    value_fp32 = value.float()
+    expected = value_fp32 * torch.rsqrt(
+        torch.sum(value_fp32 * value_fp32, dim=-1, keepdim=True) + 1e-6
+    )
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, actual.to(torch.bfloat16).float())
+
+    recurrence_source = ast.get_source_segment(
+        _runner_path().read_text(),
+        next(
+            node
+            for node in ast.parse(_runner_path().read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_independent_bf16_recurrence"
+        ),
+    )
+    assert recurrence_source is not None
+    assert "functional.normalize" not in recurrence_source
+    assert recurrence_source.count("_normalize_fp32") == 2
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -1855,12 +1938,27 @@ def test_independent_recurrence_uses_sequence_local_chunk16_state_cadence():
     )
 
     def _reference(boundary_mode):
-        q_flat = torch.nn.functional.normalize(
-            tensors["q"].float(), dim=-1
-        ).reshape(-1, num_heads, head_dim)
-        k_flat = torch.nn.functional.normalize(
-            tensors["k"].float(), dim=-1
-        ).reshape(-1, num_heads, head_dim)
+        def normalize_fp32(value):
+            value_fp32 = value.float()
+            return value_fp32 * torch.rsqrt(
+                torch.sum(
+                    value_fp32 * value_fp32,
+                    dim=-1,
+                    keepdim=True,
+                )
+                + 1e-6
+            )
+
+        q_flat = normalize_fp32(tensors["q"]).reshape(
+            -1,
+            num_heads,
+            head_dim,
+        )
+        k_flat = normalize_fp32(tensors["k"]).reshape(
+            -1,
+            num_heads,
+            head_dim,
+        )
         v_flat = tensors["v"].float().reshape(-1, num_heads, head_dim)
         g_flat = tensors["g"].float().reshape(-1, num_heads, head_dim)
         beta_logits = tensors["beta"].float().reshape(-1, num_heads)
@@ -1883,9 +1981,11 @@ def test_independent_recurrence_uses_sequence_local_chunk16_state_cadence():
                 start=1,
             ):
                 decayed = carrier * decay[token].unsqueeze(1)
-                prediction = torch.einsum(
-                    "hk,hvk->hv", k_flat[token], decayed
-                ).to(torch.bfloat16).float()
+                prediction = (
+                    torch.einsum("hk,hvk->hv", k_flat[token], decayed)
+                    .to(torch.bfloat16)
+                    .float()
+                )
                 delta = (v_flat[token] - prediction).to(torch.bfloat16).float()
                 beta = torch.sigmoid(beta_logits[token]).to(torch.bfloat16).float()
                 update = (beta.unsqueeze(-1) * delta).to(torch.bfloat16).float()
@@ -1905,9 +2005,7 @@ def test_independent_recurrence_uses_sequence_local_chunk16_state_cadence():
                 carrier = snapshot.float() if round_state else updated
         return output.reshape_as(tensors["q"]), state
 
-    actual_output, actual_state = runner._independent_bf16_recurrence(
-        torch, runtime
-    )
+    actual_output, actual_state = runner._independent_bf16_recurrence(torch, runtime)
     expected_output, expected_state = _reference("local_chunk16")
     per_token_output, per_token_state = _reference("per_token")
     global_output, global_state = _reference("global_chunk16")

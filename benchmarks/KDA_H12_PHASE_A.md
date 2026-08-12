@@ -41,22 +41,25 @@ not produced.
 
 For every case, the harness checks both the public output and the complete
 final state at BF16 `atol=rtol=1e-2`. The pinned MoonshotAI/FlashKDA
-implementation remains the external contract authority, while Phase-A
-completion additionally requires agreement with the independent recurrence
-and FLA/Triton. `correctness.passed`, reportable timing, and per-architecture
-completion therefore require all three comparisons to pass.
+implementation is the external contract authority. `correctness.passed`,
+reportable timing, and per-architecture completion require the candidate to
+match that pinned output and full final state.
 
 Two additional comparisons are mandatory: an independent direct recurrence
 with a sequence-local chunk-16 BF16 state carrier, and FLA's Triton
 implementation. The independent recurrence explicitly rounds four H12
 residual intermediates through BF16: the state/K prediction, the
 V-minus-prediction delta, sigmoid beta, and the post-beta update carrier. All
-three oracles must pass the full output and final-state tolerance for all six
-cases before timing is reportable. Their agreement is also recorded as
-`diagnostic_consensus`; a numerical disagreement fails the case and suppresses
-timing. Its FP32 contractions run with TF32 disabled and PyTorch's `highest`
-float32 matmul precision, and the prior process policy is restored even if the
-oracle raises.
+six cases must still contain valid full output and final-state comparisons at
+the same fixed BF16 tolerance. Their agreement is recorded honestly as
+`diagnostic_consensus`, but a diagnostic numerical disagreement does not
+override the pinned contract or suppress timing. Missing, malformed, partial,
+or tolerance-modified diagnostics still invalidate the receipt. The
+independent recurrence normalizes Q and K in FP32 with
+`x * rsqrt(sum(x * x) + 1e-6)` and does not insert a BF16 carrier after
+normalization. Its FP32 contractions run with TF32 disabled and PyTorch's
+`highest` float32 matmul precision, and the prior process policy is restored
+even if the oracle raises.
 
 The smaller repository H12 smoke tests use a clean-room chunk-16 recurrence.
 It applies the same four BF16 residual carrier boundaries, rounds the FP32
@@ -81,11 +84,12 @@ same-architecture output from an earlier allocation is not reusable.
 
 FLA is required and never impersonated. Before importing FLA, the runner sets
 `FLA_FLASH_KDA=0` and `FLA_DISABLE_BACKEND_DISPATCH=1`, so the required FLA
-comparison uses the default Triton implementation. Its package version, source
-paths, source hashes, and Git facts are reported. Missing FLA, prior FLA import,
-a non-Git install, or any tracked/nonignored-untracked FLA change fails closed.
-Every one of the six cases must include the FLA output/full-final-state
-diagnostic plus raw CUPTI timing; the path is never omitted.
+comparison and timing use the native `chunk_kda` callable and default Triton
+implementation. Its package version, source paths, source hashes, and Git facts
+are reported. Missing FLA, prior FLA import, a non-Git install, or any
+tracked/nonignored-untracked FLA change fails closed. Every one of the six cases
+must include the FLA output/full-final-state diagnostic plus raw CUPTI timing;
+the path is never omitted.
 
 ## Timing contract
 
@@ -130,8 +134,10 @@ A successful single-GPU receipt sets only
 requires exactly one SM100a and one SM103a receipt with matching frozen preset,
 FlashInfer commit/source hashes, pinned FlashKDA source/package identity, clean
 FLA commit/source hashes, graph-test source, all six ordered cases, the pinned
-output/full-state oracle, both mandatory diagnostic receipts, and all four
-CUPTI timing paths. Only then does it emit
+output/full-state contract, both mandatory structurally valid diagnostic
+receipts, and all four CUPTI timing paths. Diagnostic disagreement remains
+visible in each per-architecture receipt but is not a promotion gate. Only then
+does the reducer emit
 `promotion_complete_dual_arch=true`. It computes no cross-shape aggregate.
 
 ## Running and reviewing

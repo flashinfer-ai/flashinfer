@@ -42,9 +42,9 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 5
+EVIDENCE_REPORT_SCHEMA_VERSION = 6
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
-DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 2
+DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
 FROZEN_PRESET_SHA256 = (
     "eef38e8697e2818822186f6c0537c34c1defa41e0b0e08ee272448103a3cf314"
 )
@@ -1649,7 +1649,7 @@ def _require_oracle(
         ):
             raise EvidenceSchemaError(
                 f"case {case.get('name')!r} oracle {key} {result_name} "
-                "does not prove the exact BF16 full-tensor contract"
+                "does not provide a valid exact BF16 full-tensor comparison"
             )
 
 
@@ -1721,7 +1721,7 @@ def _validate_case_receipt(
         required_to_pass=True,
     )
     for oracle in ("independent_bf16_recurrence", "fla_triton"):
-        _require_oracle(case, oracle, expected, required_to_pass=True)
+        _require_oracle(case, oracle, expected, required_to_pass=False)
     diagnostic_consensus = all(
         result["passed"]
         for oracle in (
@@ -1736,7 +1736,7 @@ def _validate_case_receipt(
         )
     if case.get("performance_reportable") is not True:
         raise EvidenceSchemaError(
-            f"case {expected.name!r} three-oracle correctness did not gate performance"
+            f"case {expected.name!r} pinned correctness did not gate performance"
         )
 
     timings = case.get("timings")

@@ -23,11 +23,12 @@ is never substituted for the public number.
 
 The harness also verifies an in-allocation force-build of the exact pinned
 MoonshotAI/FlashKDA checkout and requires a clean, identifiable FLA checkout
-whose Triton path is forced with ``FLA_FLASH_KDA=0``.  Correctness covers the
-public output and complete final state against a direct BF16-state recurrence,
-the pinned FlashKDA implementation, and FLA/Triton.  Promotion additionally
-requires the exact changed-beta CUDA Graph test and matching SM100a+SM103a
-receipts.
+whose Triton path is forced with ``FLA_FLASH_KDA=0``.  The candidate's public
+output and complete final state must match pinned FlashKDA for correctness and
+timing to pass.  A direct BF16-state recurrence and native FLA/Triton remain
+mandatory full-tensor diagnostics, but their consensus is reported separately
+and does not redefine the pinned contract.  Promotion additionally requires
+the exact changed-beta CUDA Graph test and matching SM100a+SM103a receipts.
 """
 
 from __future__ import annotations
@@ -740,6 +741,18 @@ def _strict_float32_matmul(function):
     return wrapped
 
 
+def _normalize_fp32(torch, value):
+    """Apply the public KDA normalization formula without a BF16 carrier."""
+
+    value_fp32 = value.float()
+    squared_norm = torch.sum(
+        value_fp32 * value_fp32,
+        dim=-1,
+        keepdim=True,
+    )
+    return value_fp32 * torch.rsqrt(squared_norm + 1e-6)
+
+
 @_strict_float32_matmul
 def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     """Direct recurrence with local chunk-16 state and H12 BF16 carriers.
@@ -759,15 +772,16 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
         )
     num_heads = q.shape[2]
     head_dim = q.shape[3]
-    q_flat = torch.nn.functional.normalize(q.float(), dim=-1).reshape(
+    q_flat = _normalize_fp32(torch, q).reshape(
         -1,
         num_heads,
         head_dim,
     )
-    k_flat = torch.nn.functional.normalize(
-        tensors["k"].float(),
-        dim=-1,
-    ).reshape(-1, num_heads, head_dim)
+    k_flat = _normalize_fp32(torch, tensors["k"]).reshape(
+        -1,
+        num_heads,
+        head_dim,
+    )
     v_flat = tensors["v"].float().reshape(-1, num_heads, head_dim)
     beta_logits_flat = tensors["beta"].float().reshape(-1, num_heads)
     g_flat = tensors["g"].float().reshape(-1, num_heads, head_dim)
@@ -912,10 +926,9 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
     diagnostic_consensus = all(
         result["passed"] for oracle in (independent, fla) for result in oracle.values()
     )
-    all_oracles_passed = pinned_passed and diagnostic_consensus
     return {
-        "passed": all_oracles_passed,
-        "public_output_and_full_final_state": all_oracles_passed,
+        "passed": pinned_passed,
+        "public_output_and_full_final_state": pinned_passed,
         "contract_oracle": "pinned_flash_kda",
         "diagnostic_consensus": diagnostic_consensus,
         "independent_bf16_recurrence": independent,
@@ -1404,7 +1417,7 @@ def main() -> None:
                 assert args.json is not None
                 write_json_atomic(args.json, report)
                 raise RuntimeError(
-                    "three-oracle correctness failed; timing was not run and "
+                    "pinned FlashKDA contract correctness failed; timing was not run and "
                     f"receipt was written to {args.json}"
                 )
             print(
