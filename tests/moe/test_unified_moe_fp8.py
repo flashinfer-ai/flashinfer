@@ -1108,6 +1108,8 @@ def test_block_fp8_fused_shared_experts_cuda_graph_replay():
     from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
 
     runner = TrtllmFp8BlockRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
     inputs = runner.pack_inputs(pack, weights)
     eager = runner.forward(inputs).clone()
 
