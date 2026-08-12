@@ -881,8 +881,9 @@ A crash is never tolerated, only a wrong answer.
 abort is now root-caused: an async device-side assert from one config poisons
 the CUDA context, and the pending c10 error escaping a destructor at
 interpreter shutdown calls `std::terminate` — i.e. it is the natural downstream
-of an assert-class *finding*, not a separate Heisenbug (the currently open one
-is #3957, a silent OOB device write; its victim config passes in isolation).
+of an assert-class *finding*, not a separate Heisenbug. The historical #3957
+silent OOB write was fixed by #4186; the accumulated default-on sequence now
+serves as its regression coverage.
 CI runners execute each test file as its own pytest process, so an assert-class
 finding is contained to this file (other test files still run; the job reports
 the file in its failure list) — a loud red on a real bug is the
