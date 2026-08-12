@@ -13,8 +13,20 @@
 #define W4A8_DECODE_VECTOR 1
 #endif
 
+#ifndef W4A8_GENERIC_DECODE_LUT
+#define W4A8_GENERIC_DECODE_LUT 1
+#endif
+
 #if W4A8_DECODE_VECTOR != 0 && W4A8_DECODE_VECTOR != 1
 #error "W4A8_DECODE_VECTOR must be 0 or 1"
+#endif
+
+#if W4A8_GENERIC_DECODE_LUT != 0 && W4A8_GENERIC_DECODE_LUT != 1
+#error "W4A8_GENERIC_DECODE_LUT must be 0 or 1"
+#endif
+
+#if W4A8_GENERIC_DECODE_LUT && !W4A8_DECODE_VECTOR
+#error "W4A8_GENERIC_DECODE_LUT requires W4A8_DECODE_VECTOR"
 #endif
 
 namespace flashinfer {
@@ -137,6 +149,71 @@ decode_two_packed_bytes(uint16_t packed, typename ResidualDecoder<Scheme>::Stora
   return static_cast<uint32_t>(decoded0) | (static_cast<uint32_t>(decoded1) << 16);
 }
 
+#if W4A8_GENERIC_DECODE_LUT
+struct GenericDecodeLut {
+  uint32_t low;
+  uint32_t high;
+  uint32_t residual_sign;
+};
+
+__device__ __forceinline__ uint32_t pack_bytes(uint8_t byte0, uint8_t byte1, uint8_t byte2,
+                                               uint8_t byte3) {
+  return static_cast<uint32_t>(byte0) | (static_cast<uint32_t>(byte1) << 8) |
+         (static_cast<uint32_t>(byte2) << 16) | (static_cast<uint32_t>(byte3) << 24);
+}
+
+__device__ __forceinline__ GenericDecodeLut make_generic_decode_lut(__nv_bfloat16 residual) {
+  const uint16_t residual_bits = __bfloat16_as_ushort(residual);
+  const uint32_t residual_sign = (static_cast<uint32_t>(residual_bits) & 0x8000U) >> 8;
+  const float magnitude = fabsf(__bfloat162float(residual));
+  const uint32_t low =
+      pack_bytes(0, encode_e4m3fn_rne(__fmul_rn(magnitude, 0.5F)), encode_e4m3fn_rne(magnitude),
+                 encode_e4m3fn_rne(__fmul_rn(magnitude, 1.5F)));
+  const uint32_t high = pack_bytes(
+      encode_e4m3fn_rne(__fmul_rn(magnitude, 2.0F)), encode_e4m3fn_rne(__fmul_rn(magnitude, 3.0F)),
+      encode_e4m3fn_rne(__fmul_rn(magnitude, 4.0F)), encode_e4m3fn_rne(__fmul_rn(magnitude, 6.0F)));
+  return GenericDecodeLut{low, high, residual_sign * 0x01010101U};
+}
+
+__device__ __forceinline__ uint32_t prmt_lookup(uint32_t low, uint32_t high, uint32_t selectors) {
+  uint32_t result;
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(result) : "r"(low), "r"(high), "r"(selectors));
+  return result;
+}
+
+__device__ __forceinline__ uint32_t packed_sign_mask(uint16_t packed) {
+  const uint32_t value = static_cast<uint32_t>(packed);
+  return ((value & 0x0008U) << 4) | ((value & 0x0080U) << 8) | ((value & 0x0800U) << 12) |
+         ((value & 0x8000U) << 16);
+}
+
+__device__ __forceinline__ uint32_t decode_generic_lut_pair(uint16_t packed,
+                                                            const GenericDecodeLut& lut) {
+  const uint32_t magnitudes =
+      prmt_lookup(lut.low, lut.high, static_cast<uint32_t>(packed) & 0x7777U);
+  return magnitudes ^ packed_sign_mask(packed) ^ lut.residual_sign;
+}
+
+__device__ __forceinline__ uint4 decode_generic_lut_block(uint32_t packed0, uint32_t packed1,
+                                                          __nv_bfloat16 residual) {
+  const float residual_value = __bfloat162float(residual);
+  if (!isfinite(residual_value)) {
+    return uint4{
+        decode_two_packed_bytes<ResidualScheme::kGeneric>(static_cast<uint16_t>(packed0), residual),
+        decode_two_packed_bytes<ResidualScheme::kGeneric>(static_cast<uint16_t>(packed0 >> 16),
+                                                          residual),
+        decode_two_packed_bytes<ResidualScheme::kGeneric>(static_cast<uint16_t>(packed1), residual),
+        decode_two_packed_bytes<ResidualScheme::kGeneric>(static_cast<uint16_t>(packed1 >> 16),
+                                                          residual)};
+  }
+  const GenericDecodeLut lut = make_generic_decode_lut(residual);
+  return uint4{decode_generic_lut_pair(static_cast<uint16_t>(packed0), lut),
+               decode_generic_lut_pair(static_cast<uint16_t>(packed0 >> 16), lut),
+               decode_generic_lut_pair(static_cast<uint16_t>(packed1), lut),
+               decode_generic_lut_pair(static_cast<uint16_t>(packed1 >> 16), lut)};
+}
+#endif
+
 template <ResidualScheme Scheme>
 __device__ __forceinline__ void run_scalar_task(
     const uint8_t* raw_payload, uint8_t* decoded_weight,
@@ -157,6 +234,15 @@ __device__ __forceinline__ void run_vector_task(
     typename ResidualDecoder<Scheme>::Storage residual0,
     typename ResidualDecoder<Scheme>::Storage residual1) {
   const uint4 packed = *reinterpret_cast<const uint4*>(raw_payload);
+#if W4A8_GENERIC_DECODE_LUT
+  if constexpr (Scheme == ResidualScheme::kGeneric) {
+    const uint4 decoded0 = decode_generic_lut_block(packed.x, packed.y, residual0);
+    *reinterpret_cast<uint4*>(decoded_weight0) = decoded0;
+    const uint4 decoded1 = decode_generic_lut_block(packed.z, packed.w, residual1);
+    *reinterpret_cast<uint4*>(decoded_weight1) = decoded1;
+    return;
+  }
+#endif
   const uint4 decoded0{
       decode_two_packed_bytes<Scheme>(static_cast<uint16_t>(packed.x), residual0),
       decode_two_packed_bytes<Scheme>(static_cast<uint16_t>(packed.x >> 16), residual0),

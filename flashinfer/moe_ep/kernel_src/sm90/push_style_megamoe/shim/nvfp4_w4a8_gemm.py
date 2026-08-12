@@ -22,6 +22,7 @@ SUPPORTED_BLOCK_M = (64, 128)
 SUPPORTED_BLOCK_N = (64, 128)
 _KNOB_SPECS = (
     ("decode_vector", "dv", "W4A8_DECODE_VECTOR", 1),
+    ("generic_decode_lut", "dl", "W4A8_GENERIC_DECODE_LUT", 1),
     ("overlap", "ov", "W4A8_OVERLAP", 0),
     ("single_ready", "sr", "W4A8_SINGLE_READY", 0),
     ("residual_tma", "rt", "W4A8_RESIDUAL_TMA", 1),
@@ -76,6 +77,7 @@ _DEEP_GEMM_DEPENDENCIES = (
 @dataclass(frozen=True)
 class _OptimizationKnobs:
     decode_vector: int
+    generic_decode_lut: int
     overlap: int
     single_ready: int
     residual_tma: int
@@ -87,6 +89,7 @@ class _OptimizationKnobs:
 
 def _optimization_knobs(
     decode_vector: bool | None = None,
+    generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
@@ -97,6 +100,7 @@ def _optimization_knobs(
 ) -> _OptimizationKnobs:
     explicit = {
         "decode_vector": decode_vector,
+        "generic_decode_lut": generic_decode_lut,
         "overlap": overlap,
         "single_ready": single_ready,
         "residual_tma": residual_tma,
@@ -111,6 +115,7 @@ def _optimization_knobs(
     }
     knobs = _OptimizationKnobs(
         decode_vector=values["decode_vector"],
+        generic_decode_lut=values["generic_decode_lut"],
         overlap=values["overlap"],
         single_ready=values["single_ready"],
         residual_tma=values["residual_tma"],
@@ -121,6 +126,8 @@ def _optimization_knobs(
     )
     if knobs.single_partial and knobs.cross_stage_retire:
         raise ValueError("single_partial requires cross_stage_retire=0")
+    if knobs.generic_decode_lut and not knobs.decode_vector:
+        raise ValueError("generic_decode_lut requires decode_vector=True")
     return knobs
 
 
@@ -358,6 +365,7 @@ def _uri(knobs: _OptimizationKnobs, source_digest: str | None = None) -> str:
 def get_sm90_push_nvfp4_w4a8_gemm_uri(
     *,
     decode_vector: bool | None = None,
+    generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
@@ -367,14 +375,15 @@ def get_sm90_push_nvfp4_w4a8_gemm_uri(
     split_m64_tail: bool | None = None,
 ) -> str:
     knobs = _optimization_knobs(
-        decode_vector,
-        overlap,
-        single_ready,
-        residual_tma,
-        group_scale_tma,
-        cross_stage_retire,
-        single_partial,
-        split_m64_tail,
+        decode_vector=decode_vector,
+        generic_decode_lut=generic_decode_lut,
+        overlap=overlap,
+        single_ready=single_ready,
+        residual_tma=residual_tma,
+        group_scale_tma=group_scale_tma,
+        cross_stage_retire=cross_stage_retire,
+        single_partial=single_partial,
+        split_m64_tail=split_m64_tail,
     )
     return _uri(knobs)
 
@@ -406,6 +415,7 @@ def _make_jit_spec(
 def gen_sm90_push_nvfp4_w4a8_gemm_module(
     *,
     decode_vector: bool | None = None,
+    generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
@@ -415,14 +425,15 @@ def gen_sm90_push_nvfp4_w4a8_gemm_module(
     split_m64_tail: bool | None = None,
 ) -> JitSpec:
     knobs = _optimization_knobs(
-        decode_vector,
-        overlap,
-        single_ready,
-        residual_tma,
-        group_scale_tma,
-        cross_stage_retire,
-        single_partial,
-        split_m64_tail,
+        decode_vector=decode_vector,
+        generic_decode_lut=generic_decode_lut,
+        overlap=overlap,
+        single_ready=single_ready,
+        residual_tma=residual_tma,
+        group_scale_tma=group_scale_tma,
+        cross_stage_retire=cross_stage_retire,
+        single_partial=single_partial,
+        split_m64_tail=split_m64_tail,
     )
     return _make_jit_spec(knobs)
 
@@ -439,6 +450,7 @@ def _load_sm90_push_nvfp4_w4a8_gemm_module_cached(
 def load_sm90_push_nvfp4_w4a8_gemm_module(
     *,
     decode_vector: bool | None = None,
+    generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
@@ -448,14 +460,15 @@ def load_sm90_push_nvfp4_w4a8_gemm_module(
     split_m64_tail: bool | None = None,
 ):
     knobs = _optimization_knobs(
-        decode_vector,
-        overlap,
-        single_ready,
-        residual_tma,
-        group_scale_tma,
-        cross_stage_retire,
-        single_partial,
-        split_m64_tail,
+        decode_vector=decode_vector,
+        generic_decode_lut=generic_decode_lut,
+        overlap=overlap,
+        single_ready=single_ready,
+        residual_tma=residual_tma,
+        group_scale_tma=group_scale_tma,
+        cross_stage_retire=cross_stage_retire,
+        single_partial=single_partial,
+        split_m64_tail=split_m64_tail,
     )
     source_snapshot = _capture_source_snapshot()
     source_digest = _source_digest(source_snapshot, knobs=knobs)
@@ -491,6 +504,7 @@ class Sm90W4A8GroupedGemm:
         *,
         total_experts: Optional[int] = None,
         decode_vector: bool | None = None,
+        generic_decode_lut: bool | None = None,
         overlap: bool | None = None,
         single_ready: bool | None = None,
         residual_tma: bool | None = None,
@@ -539,14 +553,15 @@ class Sm90W4A8GroupedGemm:
         if shared_schedule_workspace is None and self.counter_bank != 0:
             raise ValueError("counter_bank 1 requires a shared schedule workspace")
         self.optimization_knobs = _optimization_knobs(
-            decode_vector,
-            overlap,
-            single_ready,
-            residual_tma,
-            group_scale_tma,
-            cross_stage_retire,
-            single_partial,
-            split_m64_tail,
+            decode_vector=decode_vector,
+            generic_decode_lut=generic_decode_lut,
+            overlap=overlap,
+            single_ready=single_ready,
+            residual_tma=residual_tma,
+            group_scale_tma=group_scale_tma,
+            cross_stage_retire=cross_stage_retire,
+            single_partial=single_partial,
+            split_m64_tail=split_m64_tail,
         )
         device = weight_view.packed_e2m1.device
         if device.type != "cuda":
@@ -765,6 +780,7 @@ def create_sm90_push_nvfp4_w4a8_gemm(
     *,
     total_experts: Optional[int] = None,
     decode_vector: bool | None = None,
+    generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
@@ -780,6 +796,7 @@ def create_sm90_push_nvfp4_w4a8_gemm(
         weight_view,
         total_experts=total_experts,
         decode_vector=decode_vector,
+        generic_decode_lut=generic_decode_lut,
         overlap=overlap,
         single_ready=single_ready,
         residual_tma=residual_tma,
