@@ -31,11 +31,22 @@ namespace flashinfer {
 /*!
  * \brief Paged key-value cache
  * \tparam layout The layout of last 3 dimensions in KV-Cache.
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
+ * \tparam DTypeK The data type of the key cache.
+ * \tparam IdType The index data type of the kv-cache.
+ * \tparam DTypeV The data type of the value cache (defaults to DTypeK for
+ *                symmetric caches; may differ for asymmetric K/V quantization
+ *                schemes such as FP16-K / FP8-V).
+ *
+ * Backward compatibility: existing `paged_kv_t<DType, IdType>` call sites
+ * continue to work because `DTypeV` defaults to `DTypeK`. Asymmetric callers
+ * supply all three template arguments.
  */
-template <typename DType, typename IdType>
+template <typename DTypeK, typename IdType, typename DTypeV = DTypeK>
 struct paged_kv_t {
+  // Backward-compat alias for callers that reference
+  // `paged_kv_t<...>::DType`. New code should use `DTypeK` / `DTypeV`.
+  using DType = DTypeK;
+
   uint_fastdiv page_size;
   uint32_t num_heads;
   uint32_t head_dim;
@@ -47,8 +58,11 @@ struct paged_kv_t {
   // Internal layout:
   // [max_num_pages, num_heads, page_size, head_dim] if layout == HND
   // [max_num_pages, page_size, num_heads, head_dim] if layout == NHD
-  DType* k_data;
-  DType* v_data;
+  //
+  // K and V may point at buffers of different element types. See class
+  // docstring above for the backward-compat rule.
+  DTypeK* k_data;
+  DTypeV* v_data;
   IdType* indices;
 
   // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
@@ -91,8 +105,8 @@ struct paged_kv_t {
    * \param rope_pos_offset The start position of each request in the batch.
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
-                                      DType* v_data, IdType* indices, IdType* indptr,
+                                      uint32_t batch_size, QKVLayout layout, DTypeK* k_data,
+                                      DTypeV* v_data, IdType* indices, IdType* indptr,
                                       IdType* last_page_len, IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
@@ -125,8 +139,8 @@ struct paged_kv_t {
    * \param rope_pos_offset The start position of each request in the batch.
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
-                                      DType* v_data, const int64_t* kv_strides, IdType* indices,
+                                      uint32_t batch_size, QKVLayout layout, DTypeK* k_data,
+                                      DTypeV* v_data, const int64_t* kv_strides, IdType* indices,
                                       IdType* indptr, IdType* last_page_len,
                                       IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
@@ -176,8 +190,8 @@ struct paged_kv_t {
     return head_idx * stride_h + entry_idx * stride_n + feat_idx;
   }
 
-  __device__ __forceinline__ DType* get_k_ptr(IdType page_iter, uint32_t head_idx,
-                                              uint32_t entry_idx, uint32_t feat_idx) const {
+  __device__ __forceinline__ DTypeK* get_k_ptr(IdType page_iter, uint32_t head_idx,
+                                               uint32_t entry_idx, uint32_t feat_idx) const {
     return k_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
   }
 
@@ -191,20 +205,20 @@ struct paged_kv_t {
     }
   }
 
-  __device__ __forceinline__ DType* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
-                                                         uint32_t entry_idx, uint32_t feat_idx,
-                                                         IdType last_indptr) const {
+  __device__ __forceinline__ DTypeK* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
+                                                          uint32_t entry_idx, uint32_t feat_idx,
+                                                          IdType last_indptr) const {
     return k_data + protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 
-  __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
-                                              uint32_t entry_idx, uint32_t feat_idx) const {
+  __device__ __forceinline__ DTypeV* get_v_ptr(IdType page_iter, uint32_t head_idx,
+                                               uint32_t entry_idx, uint32_t feat_idx) const {
     return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
   }
 
-  __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
-                                                         uint32_t entry_idx, uint32_t feat_idx,
-                                                         IdType last_indptr) const {
+  __device__ __forceinline__ DTypeV* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
+                                                          uint32_t entry_idx, uint32_t feat_idx,
+                                                          IdType last_indptr) const {
     return v_data + protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 };

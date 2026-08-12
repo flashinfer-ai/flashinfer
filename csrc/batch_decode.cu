@@ -188,10 +188,10 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
-        paged_kv_t<DTypeKV, IdType> paged_kv(
+        paged_kv_t<DTypeK, IdType, DTypeV> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_QK, batch_size, kv_layout,
-            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<DTypeK*>(paged_k_cache.data_ptr()),
+            static_cast<DTypeV*>(paged_v_cache.data_ptr()), kv_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
