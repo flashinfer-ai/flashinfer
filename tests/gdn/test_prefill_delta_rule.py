@@ -789,6 +789,7 @@ def _test_checkpoint(
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_cp=use_cp,
+        _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
     )
     torch.cuda.synchronize()
 
@@ -832,7 +833,8 @@ def _test_checkpoint(
                 True,
                 output=prefix_o,
                 output_state=prefix_state,
-                use_cp=False,
+                use_cp=use_cp,
+                _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
             )
             torch.cuda.synchronize()
 
@@ -840,14 +842,8 @@ def _test_checkpoint(
             actual_ckpt = state_checkpoints[ckpt_global_idx]
             expected_ckpt = prefix_state[0]
 
-            atol = 1e-2 if use_cp and dtype == torch.bfloat16 else 1e-3
-            rtol = 5e-3 if use_cp and dtype == torch.bfloat16 else 1e-4
-            torch.testing.assert_close(
-                actual_ckpt,
-                expected_ckpt,
-                atol=atol,
-                rtol=rtol,
-                msg=f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}",
+            assert torch.equal(actual_ckpt, expected_ckpt), (
+                f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}"
             )
 
 
