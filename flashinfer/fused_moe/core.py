@@ -4227,7 +4227,10 @@ def allocate_trtllm_moe_canonical_routing(
 ) -> TRTLLMCanonicalRouting:
     """Allocate stable real-router outputs and scratch without launching routing."""
     runtime = get_trtllm_moe_sm100_module()
-    tensors = list(runtime.allocate_canonical_routing(routing_logits, top_k, tile_n))
+    tensors = [
+        _torch_view_of_ffi_tensor(tensor)
+        for tensor in runtime.allocate_canonical_routing(routing_logits, top_k, tile_n)
+    ]
     if len(tensors) != 11:
         raise RuntimeError(
             "Native canonical routing allocation returned an invalid ABI"
@@ -4239,6 +4242,13 @@ def allocate_trtllm_moe_canonical_routing(
         scratch=tuple(tensors[3:]),
         tile_n=tile_n,
     )
+
+
+def _torch_view_of_ffi_tensor(tensor: Any) -> torch.Tensor:
+    """Return a zero-copy Torch view for one tensor crossing the TVM-FFI boundary."""
+    if isinstance(tensor, torch.Tensor):
+        return tensor
+    return torch.from_dlpack(tensor)
 
 
 def canonicalize_trtllm_moe_routing_(
@@ -4330,16 +4340,19 @@ def trtllm_moe_allocate_routing_metadata_multi_tile(
         raise ValueError("tile_ns must contain unique values")
     runtime = get_trtllm_moe_sm100_module()
     # Native code returns a flat repeated nine-tensor ABI at the TVM-FFI boundary.
-    flat = runtime.allocate_routing_metadata_multi_tile(
-        topk_ids,
-        num_experts,
-        top_k,
-        local_expert_offset,
-        num_local_experts,
-        list(canonical_tile_ns),
-        int(routing_input_mode),
-        topk_weights,
-    )
+    flat = [
+        _torch_view_of_ffi_tensor(tensor)
+        for tensor in runtime.allocate_routing_metadata_multi_tile(
+            topk_ids,
+            num_experts,
+            top_k,
+            local_expert_offset,
+            num_local_experts,
+            list(canonical_tile_ns),
+            int(routing_input_mode),
+            topk_weights,
+        )
+    ]
     tensors_per_slot = 9
     if len(flat) != tensors_per_slot * len(canonical_tile_ns):
         raise RuntimeError("Native routing metadata allocation returned an invalid ABI")
