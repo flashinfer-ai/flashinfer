@@ -286,10 +286,10 @@ jobs:
           # Read release notes from file
           NOTES=$(cat ${{ steps.release-notes.outputs.notes_file }})
 
-          # gh/the API never infer pre-release status from the tag name (that is
-          # web-UI only), so flag PEP 440 pre-release suffixes explicitly --
-          # otherwise an rc publishes as a full release and can take over
-          # "Latest". .postN is a real release and stays unflagged.
+          # The GitHub API never infers pre-release status from the tag name
+          # (that is web-UI only), so flag PEP 440 pre-release suffixes
+          # explicitly -- otherwise an rc publishes as a full release and can
+          # take over "Latest". .postN is a real release and stays unflagged.
           PRERELEASE_FLAG=""
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.?(a|b|rc|dev)[0-9]*$ ]]; then
             PRERELEASE_FLAG="--prerelease"
