@@ -1159,6 +1159,18 @@ inline ProblemDims CheckInputs(
   CheckCudaTensor(topk_weights, dl_float32, 2, /*contiguous=*/true, "topk_weights", "float32");
   CheckCudaTensor(out, dl_bfloat16, 2, /*contiguous=*/true, "out", "bfloat16");
 
+  TVM_FFI_ICHECK(hidden_states.stride(1) == 1)
+      << "hidden_states must have unit innermost stride, got " << hidden_states.stride(1);
+  TVM_FFI_ICHECK(hidden_states.stride(0) > 0 &&
+                 hidden_states.stride(0) >= hidden_states.size(1) &&
+                 hidden_states.stride(0) % 16 == 0)
+      << "hidden_states row stride must be positive, non-overlapping, and 16-byte aligned, got "
+      << hidden_states.stride(0) << " for row width " << hidden_states.size(1);
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(hidden_states.data_ptr()) % 16 == 0)
+      << "hidden_states data pointer must be 16-byte aligned for TMA";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0)
+      << "out data pointer must be 16-byte aligned for bulk reduction";
+
   const int device_id = hidden_states.device().device_id;
   const TensorView* views[] = {&hidden_states_scale, &gemm1_weights,
                                &gemm1_weights_scale, &gemm2_weights,

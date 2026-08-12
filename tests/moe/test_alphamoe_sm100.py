@@ -449,3 +449,49 @@ def test_alphamoe_sm100_accumulates_into_out():
     assert not torch.allclose(
         out.float(), contributions_only.float(), atol=0.1, rtol=0.1
     ), "out looks overwritten: initial accumulator value is missing"
+
+
+def test_alphamoe_sm100_validates_tma_and_output_alignment():
+    """Unsupported views fail synchronously, while an aligned row slice works."""
+    _skip_if_not_sm100_family()
+    _, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
+        CONTRACT_CASES[0]
+    )
+    case = _make_case(m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed)
+    original = case["x"]
+
+    bad_pitch_storage = torch.empty(
+        (m, k + 1), dtype=original.dtype, device=original.device
+    )
+    bad_pitch = bad_pitch_storage[:, :k]
+    bad_pitch.copy_(original)
+    case["x"] = bad_pitch
+    with pytest.raises(RuntimeError, match="row stride.*16-byte aligned"):
+        _launch(case)
+
+    bad_base_storage = torch.empty(
+        (m, k + 16), dtype=original.dtype, device=original.device
+    )
+    bad_base = bad_base_storage[:, 1 : k + 1]
+    bad_base.copy_(original)
+    case["x"] = bad_base
+    with pytest.raises(RuntimeError, match="data pointer must be 16-byte aligned"):
+        _launch(case)
+
+    case["x"] = original
+    out_storage = torch.zeros(m * k + 1, dtype=torch.bfloat16, device="cuda")
+    bad_out = out_storage[1:].view(m, k)
+    assert bad_out.is_contiguous()
+    with pytest.raises(RuntimeError, match="out data pointer must be 16-byte aligned"):
+        _launch(case, out=bad_out)
+
+    aligned_storage = torch.empty(
+        (m, k + 16), dtype=original.dtype, device=original.device
+    )
+    aligned = aligned_storage[:, :k]
+    aligned.copy_(original)
+    case["x"] = aligned
+    out = _launch(case)
+    torch.cuda.synchronize()
+    expected = _reference(case)
+    assert torch.equal(out, expected)

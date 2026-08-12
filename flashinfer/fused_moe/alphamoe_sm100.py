@@ -142,8 +142,11 @@ def alphamoe_fp8_block_scale_aligned_moe(
     ----------
     hidden_states: torch.Tensor
         ``(num_tokens, hidden_size)`` ``float8_e4m3fn`` activations,
-        quantized per token in groups of 128 along ``hidden_size``. Only the
-        innermost stride must be 1 (row-sliced activations are accepted).
+        quantized per token in groups of 128 along ``hidden_size``. The
+        innermost stride must be 1; the row stride must be positive,
+        non-overlapping, and divisible by 16 bytes; and the data pointer must
+        be 16-byte aligned. Row-sliced activations satisfying these conditions
+        are accepted.
     hidden_states_scale: torch.Tensor
         ``(num_tokens, hidden_size // 128)`` float32 per-token-group scales.
     gemm1_weights: torch.Tensor
@@ -180,7 +183,7 @@ def alphamoe_fp8_block_scale_aligned_moe(
         zeroed tensor is allocated and returned. When provided, the kernel
         **accumulates into it** (BF16 reduce-add); the caller is responsible
         for zeroing it (or seeding it with the intended initial values)
-        before the call.
+        before the call. Its data pointer must be 16-byte aligned.
 
     Returns
     -------
