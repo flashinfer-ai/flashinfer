@@ -389,6 +389,7 @@ def _fused_add_rmsnorm_quant_fake(
     pass
 
 
+@flashinfer_api
 @register_custom_op(
     "flashinfer::fused_add_rmsnorm_fp8_block_quant",
     mutates_args=("out", "block_scale", "normed_out", "residual"),
