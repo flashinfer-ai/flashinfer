@@ -612,6 +612,8 @@ void fmha_v2_run(
       if (maybe_block_tables.has_value()) {
         ffi::TensorView block_tables = maybe_block_tables.value();
         TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
+        TVM_FFI_ICHECK_EQ(block_tables.shape()[0], static_cast<int64_t>(batch_size))
+            << "block_tables batch dimension must match batch_size";
         if (block_tables.ndim() == 3) {
           // Pre-expanded [B, 2, M] K/V block offsets.
           TVM_FFI_ICHECK_EQ(block_tables.shape()[1], 2)
@@ -620,8 +622,7 @@ void fmha_v2_run(
           block_table_max_blocks = block_tables.shape()[2];
         } else {
           // Shared [B, M] logical page indices.
-          TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2)
-              << "block_tables must be [B, M] or [B, 2, M]";
+          TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2) << "block_tables must be [B, M] or [B, 2, M]";
           block_table_max_blocks = block_tables.shape()[1];
         }
         kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());

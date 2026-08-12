@@ -949,7 +949,9 @@ def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
     fused[0].copy_(paged[:, 0])
     fused[1].copy_(paged[:, 1])
     k_cache, v_cache = fused[0], fused[1]  # delta == num_pages
-    kv_tables = torch.stack([block_tables, block_tables + num_pages], dim=1).int() # [B, 2,]
+    kv_tables = torch.stack(
+        [block_tables, block_tables + num_pages], dim=1
+    ).int()  # [B, 2, M]
 
     out_separate = run((q, (k_cache, v_cache)), kv_tables)
 

@@ -5404,8 +5404,16 @@ def trtllm_fmha_v2_prefill(
     cum_seq_lens_kv
         The cumulative sequence lengths for KV cache, shape: ``[batch_size + 1]``.
     block_tables
-        The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
-        Required when using paged KV cache format.
+        The page table mapping each sequence to its KV cache pages. Required
+        for the paged KV layouts. Its expected shape depends on the form of
+        the paged KV data tensor passed in ``qkv``
+        - Stacked pool (single 5D ``paged_KV`` tensor): shape
+          ``[batch_size, max_num_pages_per_seq]`` of logical page indices,
+          each shared by K and V of that page.
+        - Separate ``(k_cache, v_cache)`` tensors: pre-expanded shape
+          ``[batch_size, 2, max_num_pages_per_seq]``, where ``[:, 0, :]``
+          holds K block offsets and ``[:, 1, :]`` holds V block offsets,
+          both relative to ``k_cache``'s base pointer in units of blocks.
     out
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
@@ -5466,6 +5474,17 @@ def trtllm_fmha_v2_prefill(
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
         _check_paged_block_tables(block_tables)
+        if block_tables is None:
+            # The kernel dereferences the block-offsets pointer unconditionally
+            # for paged layouts; there is no contiguous fallback.
+            raise ValueError(
+                f"block_tables is required for the {input_layout} input layout."
+            )
+        if block_tables.shape[0] != batch_size:
+            raise ValueError(
+                f"block_tables batch dimension ({block_tables.shape[0]}) does "
+                f"not match batch_size ({batch_size})."
+            )
         if isinstance(paged_kv, tuple):
             # Requires pre-expanded [B, 2, M] block_tables so the kernel can
             # address V's blocks relative to K's base pointer.
@@ -5485,10 +5504,6 @@ def trtllm_fmha_v2_prefill(
                     "offsets are only valid with separate (k_cache, v_cache)."
                 )
             k_cache, v_cache = paged_kv.unbind(dim=1)
-        if input_layout == "Q_PAGED_KV_HND" and block_tables is None:
-            raise ValueError(
-                "block_tables is required for Q_PAGED_KV_HND input layout."
-            )
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]
