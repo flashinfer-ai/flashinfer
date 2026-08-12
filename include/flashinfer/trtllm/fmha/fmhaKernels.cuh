@@ -227,12 +227,9 @@ class TllmGenFmhaKernel {
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
     // The selectKernelParams that might be updated.
     SelectKernelParams selectKernelParams{params};
-    // Match TensorRT-LLM 7801d34's native dispatcher: SageAttention kernels with P or V scaling
-    // use the static scheduler until the persistent cubins carrying the corresponding fix are
-    // refreshed.
-    if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0) {
-      selectKernelParams.mTileScheduler = TileScheduler::Static;
-    }
+    // Honor the scheduler requested by the caller.  Public pre-08e88a Sage cubins must remain
+    // excluded by their artifact identity; post-08e88a source-built persistent cubins carry the
+    // compact tail-scale initialization fix and require the persistent hash key here.
     // Select the kernel.
     selectKernel(params, selectKernelParams);
     // Hash the runner params.
@@ -243,10 +240,8 @@ class TllmGenFmhaKernel {
   // start here
   void run(RunnerParams const& params) const {
     SelectKernelParams selectKernelParams{params};
-    // Match TensorRT-LLM 7801d34's native dispatcher; see checkIfKernelExist() above.
-    if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0) {
-      selectKernelParams.mTileScheduler = TileScheduler::Static;
-    }
+    // Honor the exact scheduler requested by the native-ABI entrypoint.  Artifact validation is
+    // responsible for rejecting the unsafe pre-08e88a persistent Sage cubins.
     CtaLaunchParams ctaLaunchParams;
 
     // Kernel selection loop (bounded). Each pass may update selectKernelParams (e.g. switch
