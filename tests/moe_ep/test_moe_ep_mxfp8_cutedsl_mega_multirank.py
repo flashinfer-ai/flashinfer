@@ -672,87 +672,91 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             gate_up_clamp=problem["gate_up_clamp"],
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-            kind=problem["kind"],
-        )
-        # Snapshot exactly what the kernel consumes (this rank's shard).
-        x_local = symm_buffer.x[:n].clone()
-        x_sf_local = symm_buffer.x_sf[:n].clone()
-        idx_local = symm_buffer.topk_idx[:n].clone()
-        w_local = symm_buffer.topk_weights[:n].clone()
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x,
+                symm_buffer.x_sf,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+                kind=problem["kind"],
+            )
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
+            idx_local = symm_buffer.topk_idx[:n].clone()
+            w_local = symm_buffer.topk_weights[:n].clone()
 
-        transformed_l1, transformed_l2 = preprocess_mega_weights(
-            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
-            intermediate_size=problem["intermediate"],
-            hidden_size=problem["hidden"],
-            kind=problem["kind"],
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
+            transformed_l1, transformed_l2 = preprocess_mega_weights(
+                MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+                intermediate_size=problem["intermediate"],
+                hidden_size=problem["hidden"],
+                kind=problem["kind"],
+                gate_up_clamp=problem["gate_up_clamp"],
+            )
 
-        y_kernel = torch.empty(
-            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        mxfp8_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=n,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fast_math=problem["fast_math"],
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        symm_buffer.destroy()
+            y_kernel = torch.empty(
+                n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            mxfp8_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
 
-        # Reassemble the global problem from the operands each rank staged;
-        # the reference consumes (num_ranks, ...) stacks directly.
-        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
-        combine_ref = compute_megamoe_reference_mxfp8(
-            input_activation=_all_gather_stack(x_local),
-            input_activation_sf=_all_gather_stack(x_sf_local),
-            input_topk_idx=_all_gather_stack(idx_local),
-            input_topk_weights=_all_gather_stack(w_local),
-            fc1_weight=_all_gather_stack(fc1_plain),
-            fc1_weight_sf=_all_gather_stack(fc1_sf),
-            fc2_weight=_all_gather_stack(fc2_plain),
-            fc2_weight_sf=_all_gather_stack(fc2_sf),
-            ab_dtype=torch.float8_e4m3fn,
-            gate_up_clamp=problem["gate_up_clamp"],
-            apply_topk_in_fc1=True,
-        )
-        # The topk weight is already folded before the fc1-out round-trip, so
-        # the per-topk terms reduce with a plain sum; compare this rank's slice.
-        y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+            # Reassemble the global problem from the operands each rank staged;
+            # the reference consumes (num_ranks, ...) stacks directly.
+            fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
+            combine_ref = compute_megamoe_reference_mxfp8(
+                input_activation=_all_gather_stack(x_local),
+                input_activation_sf=_all_gather_stack(x_sf_local),
+                input_topk_idx=_all_gather_stack(idx_local),
+                input_topk_weights=_all_gather_stack(w_local),
+                fc1_weight=_all_gather_stack(fc1_plain),
+                fc1_weight_sf=_all_gather_stack(fc1_sf),
+                fc2_weight=_all_gather_stack(fc2_plain),
+                fc2_weight_sf=_all_gather_stack(fc2_sf),
+                ab_dtype=torch.float8_e4m3fn,
+                gate_up_clamp=problem["gate_up_clamp"],
+                apply_topk_in_fc1=True,
+            )
+            # The topk weight is already folded before the fc1-out round-trip, so
+            # the per-topk terms reduce with a plain sum; compare this rank's slice.
+            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
 
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
-        print(
-            f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
-            f"rel_l2={rel_l2.item():.4g} "
-            f"max|d|={(yk - y_ref).abs().max().item():.4g} "
-            f"amax(ref)={y_ref.abs().max().item():.4g}"
-        )
-        # Per-cell bf16 term-magnitude band (see
-        # _assert_mega_oracle_term_band_close): the old flat atol=8.0 was
-        # "1 bf16 ULP at |term|~2048" calibrated on GB200's rounding and
-        # tripped by one cell on B200; the band derives the bound from the
-        # oracle's own per-topk terms instead. The ikr coefficient absorbs
-        # the REDG nondeterministic reduce order (same bound as
-        # _assert_ikr_close).
-        _assert_mega_oracle_term_band_close(
-            yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
-        )
-        assert rel_l2.item() < (0.03 if in_kernel_fc2_reduce else 0.02)
-        return rank
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+            print(
+                f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
+                f"rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                f"amax(ref)={y_ref.abs().max().item():.4g}"
+            )
+            # Per-cell bf16 term-magnitude band (see
+            # _assert_mega_oracle_term_band_close): the old flat atol=8.0 was
+            # "1 bf16 ULP at |term|~2048" calibrated on GB200's rounding and
+            # tripped by one cell on B200; the band derives the bound from the
+            # oracle's own per-topk terms instead. The ikr coefficient absorbs
+            # the REDG nondeterministic reduce order (same bound as
+            # _assert_ikr_close).
+            _assert_mega_oracle_term_band_close(
+                yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
+            )
+            assert rel_l2.item() < (0.03 if in_kernel_fc2_reduce else 0.02)
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 

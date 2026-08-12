@@ -45,6 +45,11 @@ replace, what to audit) lives in `SKILL.md`.
   `host_utils` nowhere). The harness was validated green (3/3 cases, dsl
   4.6.1 + 4.7.0) with the newer `host_utils` before this was understood.
   Resolves at the next full re-sync once the tree moves past that commit.
+- `src/moe_nvfp4_swapab/runner_common.py` carries a local
+  `_check_triton_flat_index` guard (added for PR #4113 review) on the
+  int32-indexed Triton helpers (`_rcp_approx_kernel`, `_swiglu_pair_kernel`);
+  `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
+  the > 2**31-element combine round-trip. Send upstream on the next re-sync.
 
 ## Related trees
 

@@ -838,117 +838,125 @@ def _run_mega_torch_oracle(
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
         )
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x[:n],
-            symm_buffer.x_sf[:n],
-            symm_buffer.topk_idx[:n],
-            symm_buffer.topk_weights[:n],
-        )
-        # Snapshot exactly what the kernel consumes (this rank's shard).
-        x_local = symm_buffer.x[:n].clone()
-        x_sf_local = symm_buffer.x_sf[:n].clone()
-        idx_local = symm_buffer.topk_idx[:n].clone()
-        w_local = symm_buffer.topk_weights[:n].clone()
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x[:n],
+                symm_buffer.x_sf[:n],
+                symm_buffer.topk_idx[:n],
+                symm_buffer.topk_weights[:n],
+            )
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
+            idx_local = symm_buffer.topk_idx[:n].clone()
+            w_local = symm_buffer.topk_weights[:n].clone()
 
-        transformed_l1, transformed_l2 = preprocess_mega_weights(
-            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
-            intermediate_size=problem["intermediate"],
-            hidden_size=problem["hidden"],
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
-
-        y_kernel = torch.empty(
-            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        nvfp4_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=n,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fast_math=problem["fast_math"],
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        symm_buffer.destroy()
-
-        # Reassemble the global expert set from each rank's ACTUAL plain
-        # (pre-swizzle) quantized weight legs; (R, E_local, ...) → (E, ...)
-        # rank-major matches the global expert id convention.
-        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
-        fc1_w_g = _all_gather_stack(fc1_plain).flatten(0, 1)
-        fc1_sf_g = _all_gather_stack(fc1_sf).flatten(0, 1)
-        fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
-        fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
-
-        # Model the quantized combine wire in the reference: each per-topk fc2
-        # term goes bf16 → wire quantize → dequantize exactly as the device
-        # combine encoder + topk_reduce do.
-        term_transform = None
-        if combine_dtype != "bf16":
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-                CombineFormat,
-                combine_roundtrip_to_fp32,
+            transformed_l1, transformed_l2 = preprocess_mega_weights(
+                MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+                intermediate_size=problem["intermediate"],
+                hidden_size=problem["hidden"],
+                gate_up_clamp=problem["gate_up_clamp"],
             )
 
-            wire = CombineFormat.parse(
-                {"nvfp4": "16e2m1xbf16", "mxfp8": "32e4m3xe8m0"}[combine_dtype]
+            y_kernel = torch.empty(
+                n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            nvfp4_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # Reassemble the global expert set from each rank's ACTUAL plain
+            # (pre-swizzle) quantized weight legs; (R, E_local, ...) → (E, ...)
+            # rank-major matches the global expert id convention.
+            fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
+            fc1_w_g = _all_gather_stack(fc1_plain).flatten(0, 1)
+            fc1_sf_g = _all_gather_stack(fc1_sf).flatten(0, 1)
+            fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
+            fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
+
+            # Model the quantized combine wire in the reference: each per-topk fc2
+            # term goes bf16 → wire quantize → dequantize exactly as the device
+            # combine encoder + topk_reduce do.
+            term_transform = None
+            if combine_dtype != "bf16":
+                from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                    CombineFormat,
+                    combine_roundtrip_to_fp32,
+                )
+
+                wire = CombineFormat.parse(
+                    {"nvfp4": "16e2m1xbf16", "mxfp8": "32e4m3xe8m0"}[combine_dtype]
+                )
+
+                def term_transform(t):
+                    return combine_roundtrip_to_fp32(t.to(torch.bfloat16).float(), wire)
+
+            y_ref = _torch_nvfp4_mega_reference(
+                act_packed=x_local,
+                act_sf=x_sf_local,
+                topk_idx=idx_local,
+                topk_weights=w_local,
+                fc1_weight=fc1_w_g,
+                fc1_sf=fc1_sf_g,
+                fc2_weight=fc2_w_g,
+                fc2_sf=fc2_sf_g,
+                hidden=problem["hidden"],
+                intermediate=problem["intermediate"],
+                gate_up_clamp=problem["gate_up_clamp"],
+                term_transform=term_transform,
             )
 
-            def term_transform(t):
-                return combine_roundtrip_to_fp32(t.to(torch.bfloat16).float(), wire)
-
-        y_ref = _torch_nvfp4_mega_reference(
-            act_packed=x_local,
-            act_sf=x_sf_local,
-            topk_idx=idx_local,
-            topk_weights=w_local,
-            fc1_weight=fc1_w_g,
-            fc1_sf=fc1_sf_g,
-            fc2_weight=fc2_w_g,
-            fc2_sf=fc2_sf_g,
-            hidden=problem["hidden"],
-            intermediate=problem["intermediate"],
-            gate_up_clamp=problem["gate_up_clamp"],
-            term_transform=term_transform,
-        )
-
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        yr = y_ref.to(torch.float32)
-        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
-        print(
-            f"[nvfp4 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce} "
-            f"combine={combine_dtype}] rel_l2={rel_l2.item():.4g} "
-            f"max|d|={(yk - yr).abs().max().item():.4g} "
-            f"amax(ref)={yr.abs().max().item():.4g}"
-        )
-        # Single-GPU oracle tolerances: the residual is NVFP4 RTNE flips at
-        # fc1-out + accumulation-order noise; atol scales with the output
-        # range (random unscaled weights put |y|~1e4 here).
-        atol = 2e-3 * yr.abs().max().item()
-        if in_kernel_fc2_reduce:
-            # The REDG reduce accumulates the K per-topk bf16 terms in
-            # nondeterministic order vs the reference's fp32 sum; widen the
-            # quant band by the bf16 K-term accumulation band per row (same
-            # bound as _assert_ikr_close).
-            diff = (yk - yr).abs()
-            row_scale = torch.maximum(yk.abs(), yr.abs()).amax(dim=1, keepdim=True)
-            tol = atol + 0.05 * yr.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
-            worst = (diff - tol).max().item()
-            assert worst <= 0.0, (
-                f"ikr oracle output outside the widened band "
-                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            yr = y_ref.to(torch.float32)
+            rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+            print(
+                f"[nvfp4 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce} "
+                f"combine={combine_dtype}] rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - yr).abs().max().item():.4g} "
+                f"amax(ref)={yr.abs().max().item():.4g}"
             )
-            assert rel_l2.item() < 0.03
-        else:
-            torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
-            assert rel_l2.item() < 0.02
-        return rank
+            # Single-GPU oracle tolerances: the residual is NVFP4 RTNE flips at
+            # fc1-out + accumulation-order noise; atol scales with the output
+            # range (random unscaled weights put |y|~1e4 here).
+            atol = 2e-3 * yr.abs().max().item()
+            if in_kernel_fc2_reduce:
+                # The REDG reduce accumulates the K per-topk bf16 terms in
+                # nondeterministic order vs the reference's fp32 sum; widen the
+                # quant band by the bf16 K-term accumulation band per row (same
+                # bound as _assert_ikr_close).
+                diff = (yk - yr).abs()
+                row_scale = torch.maximum(yk.abs(), yr.abs()).amax(dim=1, keepdim=True)
+                tol = (
+                    atol
+                    + 0.05 * yr.abs()
+                    + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
+                )
+                worst = (diff - tol).max().item()
+                assert worst <= 0.0, (
+                    f"ikr oracle output outside the widened band "
+                    f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+                )
+                assert rel_l2.item() < 0.03
+            else:
+                torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+                assert rel_l2.item() < 0.02
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 
