@@ -18,12 +18,13 @@ from flashinfer.utils import get_compute_capability
 # Curated smoke set. Randomized breadth over {b,m,n,k} x backend (swizzled scales,
 # tight elementwise oracle, determinism, autotune-winner validation, and the tracked
 # #3604 b>1/M%128 ledger) lives in tests/gemm/test_unified_gemm_fuzz.py's bmm_mxfp8
-# adapter; keep swizzled + linear scale layouts and autotune on/off per backend.
+# adapter; keep autotune on/off per backend. Linear scale metadata cannot currently
+# be represented by the public 3D BMM API, so every executable row uses swizzled scales.
 _SMOKE_CASES = [
     # b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning
     (16, 128, 256, 1024, True, "cudnn", True),
-    (1, 512, 128, 256, False, "cudnn", False),
-    (16, 256, 512, 128, False, "cudnn", True),
+    (1, 512, 128, 256, True, "cudnn", False),
+    (16, 256, 512, 128, True, "cudnn", True),
     (16, 128, 128, 512, True, "cutlass", False),
     (1, 256, 512, 1024, True, "cutlass", True),
 ]

@@ -884,12 +884,16 @@ interpreter shutdown calls `std::terminate` — i.e. it is the natural downstrea
 of an assert-class *finding*, not a separate Heisenbug. The historical #3957
 silent OOB write was fixed by #4186; the accumulated default-on sequence now
 serves as its regression coverage.
-CI runners execute each test file as its own pytest process, so an assert-class
-finding is contained to this file (other test files still run; the job reports
-the file in its failure list) — a loud red on a real bug is the
-point of running the fuzzer. The gate is therefore flipped: the suite runs by
-default, and `FLASHINFER_UMOE_FUZZ=0` remains as an emergency waiver. On
-non-SM100+ arches every config skips at the no-wired-backend check.
+The node-level CI sharder can split one source file across pytest processes, so
+the parametrized accumulated sequence carries a `shard_group` marker that keeps
+all of its configurations in one pytest batch. An assert-class finding is
+therefore contained to that batch (other batches still run; the job reports the
+failure) — a loud red on a real bug is the point of running the fuzzer. The gate
+is therefore flipped: the suite runs by default, and
+`FLASHINFER_UMOE_FUZZ=0` remains as an emergency waiver. TRTLLM and CuTeDSL
+coverage is SM100-family-specific, while CUTLASS BF16 runs on its wider
+supported architecture set and CUTLASS W4A16 runs on SM90; unsupported
+configurations skip at the no-wired-backend check.
 
 **Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
 exercised end-to-end):

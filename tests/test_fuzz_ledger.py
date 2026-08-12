@@ -60,7 +60,7 @@ def test_fuzz_ledger_reports_accumulated_expected_failures_as_xfail():
     ledger = FuzzLedger("test", (finding,))
 
     ledger.report_expected_failures([], context="nothing failed")
-    with pytest.raises(pytest.xfail.Exception, match="broken.*#104"):
+    with pytest.raises(pytest.xfail.Exception, match=r"broken.*#104"):
         ledger.report_expected_failures(
             [(finding, "broken backend")],
             context="completed healthy backends",
