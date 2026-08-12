@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 7
+EVIDENCE_REPORT_SCHEMA_VERSION = 8
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
 FROZEN_PRESET_SHA256 = (
@@ -128,6 +128,10 @@ BF16_CORRECTNESS_ATOL = 1e-2
 BF16_CORRECTNESS_RTOL = 1e-2
 BETA_PACK_ACTIVITY_MARKER = "PackBetaForTmaKernel"
 RECURRENCE_ACTIVITY_MARKER = "kernel_flashkda_bf16_fused_m128"
+PINNED_FLASH_KDA_DIRECT_COPY_ACTIVITY_MARKER = "direct_copy_kernel_cuda"
+PINNED_FLASH_KDA_TILE_PREFIX_ACTIVITY_MARKER = "_flash_kda_build_tile_prefix"
+PINNED_FLASH_KDA_PREPARE_ACTIVITY_MARKER = "_flash_kda_fwd_prepare"
+PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER = "_flash_kda_fwd_recurrence"
 CUPTI_MEMCPY_KIND_DEVICE_TO_DEVICE = 8
 
 
@@ -1277,10 +1281,77 @@ def _validate_prepared_raw_sample(sample: object, *, label: str) -> None:
         raise EvidenceSchemaError(f"{label} interval metrics do not match raw activity")
 
 
+def _pinned_flash_kda_route_markers(layout: str) -> tuple[str, ...]:
+    if layout == "packed":
+        return (
+            PINNED_FLASH_KDA_DIRECT_COPY_ACTIVITY_MARKER,
+            PINNED_FLASH_KDA_TILE_PREFIX_ACTIVITY_MARKER,
+            PINNED_FLASH_KDA_PREPARE_ACTIVITY_MARKER,
+            PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER,
+        )
+    if layout == "fixed":
+        return (
+            PINNED_FLASH_KDA_DIRECT_COPY_ACTIVITY_MARKER,
+            PINNED_FLASH_KDA_PREPARE_ACTIVITY_MARKER,
+            PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER,
+        )
+    raise EvidenceSchemaError(f"unsupported pinned FlashKDA layout {layout!r}")
+
+
+def _validate_pinned_flash_kda_kernel_route(
+    kernel_records: Sequence[dict],
+    launches: Sequence[dict],
+    *,
+    layout: str,
+    label: str,
+) -> dict:
+    """Validate the complete ordered kernel route inside pinned ``_fwd_raw``.
+
+    The public binding materializes ``beta_2d.t().contiguous()`` before the
+    extension launch.  Packed calls then build the tile prefix; fixed calls do
+    not.  Both layouts finish with prepare and recurrence.  These activities
+    are part of the pinned raw baseline and therefore must remain inside its
+    measured CUPTI bracket.
+    """
+
+    expected_markers = _pinned_flash_kda_route_markers(layout)
+    if len(kernel_records) != len(expected_markers) or len(launches) != len(
+        expected_markers
+    ):
+        raise EvidenceSchemaError(
+            f"{label} is not the exact ordered pinned FlashKDA {layout} raw route"
+        )
+    if any(
+        marker not in record["name"]
+        for marker, record in zip(expected_markers, kernel_records, strict=True)
+    ):
+        raise EvidenceSchemaError(
+            f"{label} is not the exact ordered pinned FlashKDA {layout} raw route"
+        )
+    if any(
+        current["end_ns"] > following["start_ns"]
+        for current, following in zip(kernel_records, kernel_records[1:], strict=False)
+    ):
+        raise EvidenceSchemaError(
+            f"{label} pinned FlashKDA {layout} raw route overlaps or is reordered"
+        )
+    kernel_correlations = [record["correlation_id"] for record in kernel_records]
+    launch_correlations = [record["correlation_id"] for record in launches]
+    if kernel_correlations != launch_correlations or len(
+        set(kernel_correlations)
+    ) != len(kernel_correlations):
+        raise EvidenceSchemaError(
+            f"{label} pinned FlashKDA {layout} raw route is not launch-correlated "
+            "one-to-one"
+        )
+    return kernel_records[-1]
+
+
 def _validate_raw_sample(
     sample: object,
     *,
     path_name: str,
+    layout: str,
     block_index: int,
     order_index: int,
     sample_index: int,
@@ -1352,13 +1423,15 @@ def _validate_raw_sample(
         for record in activities
         if record["kind"] in {"memcpy", "memset"}
     ]
+    activity_correlations = [record["correlation_id"] for record in activities]
+    launch_correlations = [record["correlation_id"] for record in launches]
     if (
         kernel_names != sample["kernel_activity_names"]
         or len(kernel_names) != sample["kernel_activity_count"]
         or copy_names != sample["copy_activity_names"]
         or len(copy_names) != sample["copy_activity_count"]
-        or {record["correlation_id"] for record in activities}
-        != {record["correlation_id"] for record in launches}
+        or activity_correlations != launch_correlations
+        or len(set(activity_correlations)) != len(activity_correlations)
     ):
         raise EvidenceSchemaError(f"{label} activity counts/names are inconsistent")
     recomputed = _interval_metrics(
@@ -1379,7 +1452,7 @@ def _validate_raw_sample(
     copy_records = [
         record for record in activities if record["kind"] in {"memcpy", "memset"}
     ]
-    recurrence_records = [
+    candidate_recurrence_records = [
         record
         for record in kernel_records
         if RECURRENCE_ACTIVITY_MARKER in record["name"]
@@ -1395,8 +1468,9 @@ def _validate_raw_sample(
             or len(activities) != 2
             or copy_records
             or len(beta_pack_records) != 1
-            or len(recurrence_records) != 1
-            or beta_pack_records[0]["end_ns"] > recurrence_records[0]["start_ns"]
+            or len(candidate_recurrence_records) != 1
+            or beta_pack_records[0]["end_ns"]
+            > candidate_recurrence_records[0]["start_ns"]
         ):
             raise EvidenceSchemaError(
                 f"{label} is not the exact nonoverlapping pack-to-recurrence route"
@@ -1405,29 +1479,44 @@ def _validate_raw_sample(
             sample["prepared_recurrence"], label=f"{label} prepared recurrence"
         )
     elif path_name == "flash_kda_raw":
-        if (
-            len(activities) != 1
-            or len(kernel_records) != 1
-            or copy_records
-            or len(recurrence_records) != 1
-        ):
+        if len(activities) != len(kernel_records) or copy_records:
             raise EvidenceSchemaError(
-                f"{label} is not the exact pinned FlashKDA recurrence route"
+                f"{label} is not the exact ordered pinned FlashKDA raw route"
             )
+        _validate_pinned_flash_kda_kernel_route(
+            kernel_records,
+            launches,
+            layout=layout,
+            label=label,
+        )
     elif path_name == "flash_kda_public_semantics_adapted":
+        expected_kernel_count = len(_pinned_flash_kda_route_markers(layout))
         expected_copy_name = (
             "MEMCPY(copy_kind="
             f"{CUPTI_MEMCPY_KIND_DEVICE_TO_DEVICE},"
             f"bytes={expected_final_state_bytes})"
         )
         if (
-            len(activities) != 2
-            or len(kernel_records) != 1
-            or len(recurrence_records) != 1
+            len(activities) != expected_kernel_count + 1
+            or len(kernel_records) != expected_kernel_count
             or len(copy_records) != 1
+            or activities[:-1] != kernel_records
+            or activities[-1] != copy_records[0]
             or copy_records[0]["kind"] != "memcpy"
             or copy_records[0]["name"] != expected_copy_name
-            or copy_records[0]["start_ns"] < recurrence_records[0]["end_ns"]
+        ):
+            raise EvidenceSchemaError(
+                f"{label} lacks the exact post-recurrence full-state D2D copy-back"
+            )
+        pinned_recurrence = _validate_pinned_flash_kda_kernel_route(
+            kernel_records,
+            launches[:-1],
+            layout=layout,
+            label=label,
+        )
+        if (
+            copy_records[0]["start_ns"] < pinned_recurrence["end_ns"]
+            or copy_records[0]["correlation_id"] != launches[-1]["correlation_id"]
         ):
             raise EvidenceSchemaError(
                 f"{label} lacks the exact post-recurrence full-state D2D copy-back"
@@ -1443,6 +1532,7 @@ def _validate_timing_summary(
     timing: object,
     *,
     path_name: str,
+    layout: str,
     expected_sample_count: int,
     expected_final_state_bytes: int,
 ) -> None:
@@ -1491,6 +1581,7 @@ def _validate_timing_summary(
         _validate_raw_sample(
             sample,
             path_name=path_name,
+            layout=layout,
             block_index=block_index,
             order_index=order_index,
             sample_index=sample_index,
@@ -1748,6 +1839,7 @@ def _validate_case_receipt(
         _validate_timing_summary(
             timings[path_name],
             path_name=path_name,
+            layout=expected.layout,
             expected_sample_count=expected_sample_count,
             expected_final_state_bytes=(len(expected.seq_lens) * 12 * 128 * 128 * 2),
         )

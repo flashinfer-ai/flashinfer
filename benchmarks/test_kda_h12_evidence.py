@@ -694,7 +694,7 @@ def test_graph_receipt_canonicalizes_symlinked_venv_python(tmp_path, monkeypatch
     assert captured["kwargs"]["cwd"] == runner.REPOSITORY_ROOT
 
 
-def _timing_receipt(name, *, num_sequences):
+def _timing_receipt(name, *, layout, num_sequences):
     base_order = list(evidence.REQUIRED_TIMING_PATHS)
     raw_samples = []
     for block_index in range(evidence.PHASE_A_MEASUREMENT_CONTRACT["blocks"]):
@@ -704,25 +704,17 @@ def _timing_receipt(name, *, num_sequences):
             evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
         ):
             base = (block_index * 100 + sample_index) * 100_000
-            launches = [
-                evidence.LaunchActivity(
-                    start_ns=base + 1_000,
-                    end_ns=base + 1_100,
-                    correlation_id=1,
-                    kind="runtime",
-                    name="runtime:cbid=13",
-                )
-            ]
             if name == "flashinfer_public":
-                launches.append(
+                launches = [
                     evidence.LaunchActivity(
-                        start_ns=base + 2_000,
-                        end_ns=base + 2_100,
-                        correlation_id=2,
+                        start_ns=base + 1_000 + index * 200,
+                        end_ns=base + 1_100 + index * 200,
+                        correlation_id=index + 1,
                         kind="runtime",
                         name="runtime:cbid=13",
                     )
-                )
+                    for index in range(2)
+                ]
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
@@ -739,48 +731,64 @@ def _timing_receipt(name, *, num_sequences):
                         name="kernel_flashkda_bf16_fused_m128",
                     ),
                 ]
-            elif name == "flash_kda_public_semantics_adapted":
-                launches.append(
+            elif name in {
+                "flash_kda_raw",
+                "flash_kda_public_semantics_adapted",
+            }:
+                markers = evidence._pinned_flash_kda_route_markers(layout)
+                launches = [
                     evidence.LaunchActivity(
-                        start_ns=base + 2_000,
-                        end_ns=base + 2_100,
-                        correlation_id=2,
+                        start_ns=base + 1_000 + index * 200,
+                        end_ns=base + 1_100 + index * 200,
+                        correlation_id=index + 1,
                         kind="runtime",
-                        name="runtime:cbid=41",
+                        name="runtime:cbid=211",
                     )
-                )
-                activities = [
-                    evidence.GpuActivity(
-                        start_ns=base + 6_000,
-                        end_ns=base + 8_000,
-                        correlation_id=1,
-                        kind="kernel",
-                        name="kernel_flashkda_bf16_fused_m128",
-                    ),
-                    evidence.GpuActivity(
-                        start_ns=base + 8_200,
-                        end_ns=base + 8_700,
-                        correlation_id=2,
-                        kind="memcpy",
-                        name=(
-                            "MEMCPY(copy_kind=8,bytes="
-                            f"{num_sequences * 12 * 128 * 128 * 2})"
-                        ),
-                    ),
+                    for index in range(
+                        len(markers) + (name == "flash_kda_public_semantics_adapted")
+                    )
                 ]
+                activities = [
+                    evidence.GpuActivity(
+                        start_ns=base + 6_000 + index * 700,
+                        end_ns=base + 6_400 + index * 700,
+                        correlation_id=index + 1,
+                        kind="kernel",
+                        name=marker,
+                    )
+                    for index, marker in enumerate(markers)
+                ]
+                if name == "flash_kda_public_semantics_adapted":
+                    copy_index = len(markers)
+                    activities.append(
+                        evidence.GpuActivity(
+                            start_ns=base + 6_000 + copy_index * 700,
+                            end_ns=base + 6_400 + copy_index * 700,
+                            correlation_id=copy_index + 1,
+                            kind="memcpy",
+                            name=(
+                                "MEMCPY(copy_kind=8,bytes="
+                                f"{num_sequences * 12 * 128 * 128 * 2})"
+                            ),
+                        )
+                    )
             else:
-                kernel_name = (
-                    "kernel_flashkda_bf16_fused_m128"
-                    if name == "flash_kda_raw"
-                    else "triton_red_fused_kda"
-                )
+                launches = [
+                    evidence.LaunchActivity(
+                        start_ns=base + 1_000,
+                        end_ns=base + 1_100,
+                        correlation_id=1,
+                        kind="runtime",
+                        name="runtime:cbid=13",
+                    )
+                ]
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
                         end_ns=base + 8_000,
                         correlation_id=1,
                         kind="kernel",
-                        name=kernel_name,
+                        name="triton_red_fused_kda",
                     )
                 ]
             sample = evidence._correlated_sample(
@@ -842,7 +850,11 @@ def _complete_per_arch_report(tmp_path, arch):
             },
         }
         timings = {
-            name: _timing_receipt(name, num_sequences=len(case.seq_lens))
+            name: _timing_receipt(
+                name,
+                layout=case.layout,
+                num_sequences=len(case.seq_lens),
+            )
             for name in evidence.REQUIRED_TIMING_PATHS
         }
         base_order = list(evidence.REQUIRED_TIMING_PATHS)
@@ -1286,6 +1298,53 @@ def _rewrite_first_case_kernel(payload, path_name, kernel_name):
     _refresh_timing_summary_arrays(timing)
 
 
+def _swap_first_pinned_prepare_and_recurrence(payload, path_name):
+    timing = payload["cases"][0]["timings"][path_name]
+    for sample in timing["raw_samples"]:
+        prepare = next(
+            record
+            for record in sample["activity_order"]
+            if evidence.PINNED_FLASH_KDA_PREPARE_ACTIVITY_MARKER in record["name"]
+        )
+        recurrence = next(
+            record
+            for record in sample["activity_order"]
+            if evidence.PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER in record["name"]
+        )
+        prepare["name"], recurrence["name"] = recurrence["name"], prepare["name"]
+        sample["gpu_activity_names"] = [
+            record["name"] for record in sample["activity_order"]
+        ]
+        sample["kernel_activity_names"] = [
+            record["name"]
+            for record in sample["activity_order"]
+            if record["kind"] == "kernel"
+        ]
+    _refresh_timing_summary_arrays(timing)
+
+
+def _overlap_first_pinned_route(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    sample = timing["raw_samples"][0]
+    first, second = sample["activity_order"][:2]
+    first["end_ns"] = second["start_ns"] + 1
+    first["duration_ms"] = (first["end_ns"] - first["start_ns"]) / 1e6
+    metrics = evidence._interval_metrics(
+        [
+            evidence.GpuActivity(
+                start_ns=record["start_ns"],
+                end_ns=record["end_ns"],
+                correlation_id=record["correlation_id"],
+                kind=record["kind"],
+                name=record["name"],
+            )
+            for record in sample["activity_order"]
+        ]
+    )
+    sample.update(metrics)
+    _refresh_timing_summary_arrays(timing)
+
+
 def _rewrite_first_adapted_copy(payload, *, kind, name):
     timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
     for sample in timing["raw_samples"]:
@@ -1328,7 +1387,16 @@ def _overlap_first_public_pack_and_recurrence(payload):
 def _overlap_first_adapted_copy(payload):
     timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
     sample = timing["raw_samples"][0]
-    recurrence, copy = sample["activity_order"]
+    recurrence = next(
+        record
+        for record in sample["activity_order"]
+        if evidence.PINNED_FLASH_KDA_RECURRENCE_ACTIVITY_MARKER in record["name"]
+    )
+    copy = next(
+        record
+        for record in sample["activity_order"]
+        if record["kind"] in {"memcpy", "memset"}
+    )
     copy["start_ns"] = recurrence["end_ns"] - 1
     copy["duration_ms"] = (copy["end_ns"] - copy["start_ns"]) / 1e6
     metrics = evidence._interval_metrics(
@@ -1428,7 +1496,26 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
             "flash_kda_raw",
             "totally_unrelated_kernel",
         ),
-        "exact pinned FlashKDA recurrence",
+        "exact ordered pinned FlashKDA packed raw route",
+    )
+    reject(
+        lambda payload: _swap_first_pinned_prepare_and_recurrence(
+            payload,
+            "flash_kda_raw",
+        ),
+        "exact ordered pinned FlashKDA packed raw route",
+    )
+    reject(
+        _overlap_first_pinned_route,
+        "pinned FlashKDA packed raw route overlaps or is reordered",
+    )
+    reject(
+        lambda payload: _rewrite_first_case_kernel(
+            payload,
+            "flash_kda_public_semantics_adapted",
+            "totally_unrelated_kernel",
+        ),
+        "exact ordered pinned FlashKDA packed raw route",
     )
     reject(
         lambda payload: _rewrite_first_case_kernel(

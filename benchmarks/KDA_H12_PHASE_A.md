@@ -112,6 +112,17 @@ for the inclusive public metric. The pinned FlashKDA raw path, its explicit
 public-state-semantics adapter, and required FLA/Triton path are reported
 separately. Measurement blocks alternate forward and reverse path order.
 
+The pinned FlashKDA `_fwd_raw` metric is the complete public binding call, not
+a recurrence-only kernel metric. Its binding materializes
+`beta_2d.t().contiguous()` with one ATen direct-copy kernel. Packed layouts then
+launch `_flash_kda_build_tile_prefix`; fixed layouts omit that step. Both
+layouts launch `_flash_kda_fwd_prepare` followed by
+`_flash_kda_fwd_recurrence`. Schema v8 requires exactly that ordered,
+nonoverlapping, one-launch-per-activity route. The public-semantics adapter
+requires the identical raw route followed by exactly one full-final-state D2D
+copy with the expected byte count. This keeps all pinned work inside its CUPTI
+span and prevents a recurrence-only interpretation of the peer baseline.
+
 ## CUDA Graph and dual-architecture gates
 
 Every GPU evidence run invokes exactly:
