@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 8
+EVIDENCE_REPORT_SCHEMA_VERSION = 9
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 3
 FROZEN_PRESET_SHA256 = (
@@ -1216,6 +1216,52 @@ def _validate_activity_records(
     return records
 
 
+def _validate_activity_launch_correlations(
+    activities: Sequence[dict],
+    launches: Sequence[dict],
+    *,
+    label: str,
+) -> None:
+    """Bind each GPU activity to one logical runtime/driver launch.
+
+    CUPTI may emit both a runtime API record and a driver API record for one
+    logical launch.  They share one correlation ID and are both preserved in
+    raw evidence.  The GPU side remains one activity per logical correlation.
+    """
+
+    activity_by_correlation: dict[int, dict] = {}
+    for activity in activities:
+        correlation_id = activity["correlation_id"]
+        if correlation_id in activity_by_correlation:
+            raise EvidenceSchemaError(
+                f"{label} has multiple GPU activities for one logical launch"
+            )
+        activity_by_correlation[correlation_id] = activity
+
+    launches_by_correlation: dict[int, list[dict]] = {}
+    for launch in launches:
+        launches_by_correlation.setdefault(launch["correlation_id"], []).append(launch)
+    if set(activity_by_correlation) != set(launches_by_correlation):
+        raise EvidenceSchemaError(
+            f"{label} GPU activities and logical launch correlations disagree"
+        )
+    for correlation_id, activity in activity_by_correlation.items():
+        correlated_launches = launches_by_correlation[correlation_id]
+        launch_kinds = [launch["kind"] for launch in correlated_launches]
+        if (
+            not 1 <= len(correlated_launches) <= 2
+            or len(set(launch_kinds)) != len(launch_kinds)
+            or any(
+                launch["start_ns"] > activity["start_ns"]
+                for launch in correlated_launches
+            )
+        ):
+            raise EvidenceSchemaError(
+                f"{label} does not provide one timely logical launch correlation "
+                "per GPU activity"
+            )
+
+
 def _validate_prepared_raw_sample(sample: object, *, label: str) -> None:
     expected_keys = {
         *_PREPARED_NUMERIC_FIELDS,
@@ -1261,10 +1307,9 @@ def _validate_prepared_raw_sample(sample: object, *, label: str) -> None:
         or kernel_names != sample["kernel_activity_names"]
         or len(kernel_names) != 1
         or RECURRENCE_ACTIVITY_MARKER not in kernel_names[0]
-        or {record["correlation_id"] for record in activities}
-        != {record["correlation_id"] for record in launches}
     ):
         raise EvidenceSchemaError(f"{label} is not recurrence-only CUPTI evidence")
+    _validate_activity_launch_correlations(activities, launches, label=label)
     recomputed = _interval_metrics(
         [
             GpuActivity(
@@ -1300,7 +1345,6 @@ def _pinned_flash_kda_route_markers(layout: str) -> tuple[str, ...]:
 
 def _validate_pinned_flash_kda_kernel_route(
     kernel_records: Sequence[dict],
-    launches: Sequence[dict],
     *,
     layout: str,
     label: str,
@@ -1315,9 +1359,7 @@ def _validate_pinned_flash_kda_kernel_route(
     """
 
     expected_markers = _pinned_flash_kda_route_markers(layout)
-    if len(kernel_records) != len(expected_markers) or len(launches) != len(
-        expected_markers
-    ):
+    if len(kernel_records) != len(expected_markers):
         raise EvidenceSchemaError(
             f"{label} is not the exact ordered pinned FlashKDA {layout} raw route"
         )
@@ -1334,15 +1376,6 @@ def _validate_pinned_flash_kda_kernel_route(
     ):
         raise EvidenceSchemaError(
             f"{label} pinned FlashKDA {layout} raw route overlaps or is reordered"
-        )
-    kernel_correlations = [record["correlation_id"] for record in kernel_records]
-    launch_correlations = [record["correlation_id"] for record in launches]
-    if kernel_correlations != launch_correlations or len(
-        set(kernel_correlations)
-    ) != len(kernel_correlations):
-        raise EvidenceSchemaError(
-            f"{label} pinned FlashKDA {layout} raw route is not launch-correlated "
-            "one-to-one"
         )
     return kernel_records[-1]
 
@@ -1423,17 +1456,14 @@ def _validate_raw_sample(
         for record in activities
         if record["kind"] in {"memcpy", "memset"}
     ]
-    activity_correlations = [record["correlation_id"] for record in activities]
-    launch_correlations = [record["correlation_id"] for record in launches]
     if (
         kernel_names != sample["kernel_activity_names"]
         or len(kernel_names) != sample["kernel_activity_count"]
         or copy_names != sample["copy_activity_names"]
         or len(copy_names) != sample["copy_activity_count"]
-        or activity_correlations != launch_correlations
-        or len(set(activity_correlations)) != len(activity_correlations)
     ):
         raise EvidenceSchemaError(f"{label} activity counts/names are inconsistent")
+    _validate_activity_launch_correlations(activities, launches, label=label)
     recomputed = _interval_metrics(
         [
             GpuActivity(
@@ -1485,7 +1515,6 @@ def _validate_raw_sample(
             )
         _validate_pinned_flash_kda_kernel_route(
             kernel_records,
-            launches,
             layout=layout,
             label=label,
         )
@@ -1510,14 +1539,10 @@ def _validate_raw_sample(
             )
         pinned_recurrence = _validate_pinned_flash_kda_kernel_route(
             kernel_records,
-            launches[:-1],
             layout=layout,
             label=label,
         )
-        if (
-            copy_records[0]["start_ns"] < pinned_recurrence["end_ns"]
-            or copy_records[0]["correlation_id"] != launches[-1]["correlation_id"]
-        ):
+        if copy_records[0]["start_ns"] < pinned_recurrence["end_ns"]:
             raise EvidenceSchemaError(
                 f"{label} lacks the exact post-recurrence full-state D2D copy-back"
             )

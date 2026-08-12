@@ -695,6 +695,19 @@ def test_graph_receipt_canonicalizes_symlinked_venv_python(tmp_path, monkeypatch
 
 
 def _timing_receipt(name, *, layout, num_sequences):
+    def launch_records(count, *, cbid):
+        return [
+            evidence.LaunchActivity(
+                start_ns=base + 1_000 + index * 400 + kind_index * 100,
+                end_ns=base + 1_050 + index * 400 + kind_index * 100,
+                correlation_id=index + 1,
+                kind=kind,
+                name=f"{kind}:cbid={cbid}",
+            )
+            for index in range(count)
+            for kind_index, kind in enumerate(("runtime", "driver"))
+        ]
+
     base_order = list(evidence.REQUIRED_TIMING_PATHS)
     raw_samples = []
     for block_index in range(evidence.PHASE_A_MEASUREMENT_CONTRACT["blocks"]):
@@ -705,16 +718,7 @@ def _timing_receipt(name, *, layout, num_sequences):
         ):
             base = (block_index * 100 + sample_index) * 100_000
             if name == "flashinfer_public":
-                launches = [
-                    evidence.LaunchActivity(
-                        start_ns=base + 1_000 + index * 200,
-                        end_ns=base + 1_100 + index * 200,
-                        correlation_id=index + 1,
-                        kind="runtime",
-                        name="runtime:cbid=13",
-                    )
-                    for index in range(2)
-                ]
+                launches = launch_records(2, cbid=13)
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
@@ -736,18 +740,10 @@ def _timing_receipt(name, *, layout, num_sequences):
                 "flash_kda_public_semantics_adapted",
             }:
                 markers = evidence._pinned_flash_kda_route_markers(layout)
-                launches = [
-                    evidence.LaunchActivity(
-                        start_ns=base + 1_000 + index * 200,
-                        end_ns=base + 1_100 + index * 200,
-                        correlation_id=index + 1,
-                        kind="runtime",
-                        name="runtime:cbid=211",
-                    )
-                    for index in range(
-                        len(markers) + (name == "flash_kda_public_semantics_adapted")
-                    )
-                ]
+                launches = launch_records(
+                    len(markers) + (name == "flash_kda_public_semantics_adapted"),
+                    cbid=211,
+                )
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000 + index * 700,
@@ -773,15 +769,7 @@ def _timing_receipt(name, *, layout, num_sequences):
                         )
                     )
             else:
-                launches = [
-                    evidence.LaunchActivity(
-                        start_ns=base + 1_000,
-                        end_ns=base + 1_100,
-                        correlation_id=1,
-                        kind="runtime",
-                        name="runtime:cbid=13",
-                    )
-                ]
+                launches = launch_records(1, cbid=13)
                 activities = [
                     evidence.GpuActivity(
                         start_ns=base + 6_000,
@@ -1345,6 +1333,43 @@ def _overlap_first_pinned_route(payload):
     _refresh_timing_summary_arrays(timing)
 
 
+def _move_last_logical_launch_after_its_gpu_activity(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    sample = timing["raw_samples"][0]
+    activity = sample["activity_order"][-1]
+    correlated_launches = [
+        record
+        for record in sample["launch_activity_order"]
+        if record["correlation_id"] == activity["correlation_id"]
+    ]
+    for offset, launch in enumerate(correlated_launches, start=1):
+        launch["start_ns"] = activity["start_ns"] + offset
+        launch["end_ns"] = activity["start_ns"] + offset + 1
+        launch["duration_ms"] = 1 / 1e6
+    sample["launch_activity_names"] = [
+        record["name"] for record in sample["launch_activity_order"]
+    ]
+    _refresh_timing_summary_arrays(timing)
+
+
+def _duplicate_first_logical_launch_kind(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_raw"]
+    for sample in timing["raw_samples"]:
+        first_correlation = sample["activity_order"][0]["correlation_id"]
+        correlated_launches = [
+            record
+            for record in sample["launch_activity_order"]
+            if record["correlation_id"] == first_correlation
+        ]
+        assert len(correlated_launches) == 2
+        correlated_launches[1]["kind"] = "runtime"
+        correlated_launches[1]["name"] = "runtime:duplicate"
+        sample["launch_activity_names"] = [
+            record["name"] for record in sample["launch_activity_order"]
+        ]
+    _refresh_timing_summary_arrays(timing)
+
+
 def _rewrite_first_adapted_copy(payload, *, kind, name):
     timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
     for sample in timing["raw_samples"]:
@@ -1510,6 +1535,14 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
         "pinned FlashKDA packed raw route overlaps or is reordered",
     )
     reject(
+        _move_last_logical_launch_after_its_gpu_activity,
+        "one timely logical launch correlation per GPU activity",
+    )
+    reject(
+        _duplicate_first_logical_launch_kind,
+        "one timely logical launch correlation per GPU activity",
+    )
+    reject(
         lambda payload: _rewrite_first_case_kernel(
             payload,
             "flash_kda_public_semantics_adapted",
@@ -1553,7 +1586,7 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
         lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
             0
         ]["launch_activity_order"][0].__setitem__("correlation_id", 99),
-        "activity counts/names are inconsistent",
+        "GPU activities and logical launch correlations disagree",
     )
     reject(
         lambda payload: payload["cases"][0]["measurement_order"].reverse(),

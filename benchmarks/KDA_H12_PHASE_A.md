@@ -117,11 +117,15 @@ a recurrence-only kernel metric. Its binding materializes
 `beta_2d.t().contiguous()` with one ATen direct-copy kernel. Packed layouts then
 launch `_flash_kda_build_tile_prefix`; fixed layouts omit that step. Both
 layouts launch `_flash_kda_fwd_prepare` followed by
-`_flash_kda_fwd_recurrence`. Schema v8 requires exactly that ordered,
-nonoverlapping, one-launch-per-activity route. The public-semantics adapter
+`_flash_kda_fwd_recurrence`. Schema v9 requires exactly that ordered,
+nonoverlapping, one-logical-launch-per-activity route. The public-semantics adapter
 requires the identical raw route followed by exactly one full-final-state D2D
 copy with the expected byte count. This keeps all pinned work inside its CUPTI
 span and prevents a recurrence-only interpretation of the peer baseline.
+One logical launch correlation may preserve both CUPTI runtime and driver API
+records, but it must bind exactly one GPU activity and every contributing API
+record must start no later than that activity. Duplicate API kinds, orphan
+correlations, and GPU-before-API evidence fail closed.
 
 ## CUDA Graph and dual-architecture gates
 
