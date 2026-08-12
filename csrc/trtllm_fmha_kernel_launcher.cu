@@ -585,7 +585,8 @@ void trtllm_ragged_attention_launcher(
     double bmm1_scale, double bmm2_scale, const float* bmm1_scale_log2_ptr,
     const float* bmm2_scale_ptr, double o_sf_scale, int64_t batch_size, int64_t window_left,
     int64_t sm_count, bool enable_pdl, bool is_causal, bool use_static_scheduler,
-    int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
+    int64_t q_stride_tokens, int64_t q_stride_heads, int64_t k_stride_keys_values,
+    int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
     float skip_softmax_threshold_scale_factor, bool skips_softmax, int64_t workspace_size,
     const float* sage_attn_sfs_q,
@@ -601,7 +602,7 @@ void trtllm_ragged_attention_launcher(
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, k_data_type, v_data_type, o_data_type,
                                                  num_elts_sage_q, num_elts_sage_k, num_elts_sage_p,
                                                  num_elts_sage_v);
-  TllmGenFmhaRunnerParams runner_params;
+  TllmGenFmhaRunnerParams runner_params{};
 
   runner_params.qPtr = query;
   runner_params.kPtr = key;
@@ -620,6 +621,8 @@ void trtllm_ragged_attention_launcher(
   runner_params.mQkvLayout = QkvLayout::SeparateQkv;
   runner_params.mMultiProcessorCount = sm_count;
   runner_params.stream = stream;
+  runner_params.qStrideTokens = q_stride_tokens;
+  runner_params.qStrideHeads = q_stride_heads;
   // the scaleSoftmaxLog2Ptr and outputScalePtr have higher priority than the scaleSoftmaxLog2 and
   // outputScale. if they are not nullptr, then scaleSoftmaxLog2 and outputScale will be ignored
   runner_params.outputScale = bmm2_scale;
@@ -742,6 +745,8 @@ void trtllm_ragged_attention_with_scheduler(
   int sum_seq_kv = key.size(0);
   int head_dim_qk = query.size(2);
   int head_dim_v = value.size(2);
+  int q_stride_tokens = query.stride(0);
+  int q_stride_heads = query.stride(1);
   int k_stride_keys_values = key.stride(0);
   int k_stride_heads = key.stride(1);
   int k_stride_batch = key.numel();
@@ -796,8 +801,9 @@ void trtllm_ragged_attention_with_scheduler(
       max_kv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv,
       bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale,
       batch_size, window_left, sm_count, enable_pdl, is_causal, use_static_scheduler,
-      k_stride_keys_values, k_stride_heads, k_stride_batch, v_stride_keys_values, v_stride_heads,
-      v_stride_batch, skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size,
+      q_stride_tokens, q_stride_heads, k_stride_keys_values, k_stride_heads, k_stride_batch,
+      v_stride_keys_values, v_stride_heads, v_stride_batch,
+      skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size,
       sage_attn_sfs_q_ptr, sage_attn_sfs_k_ptr, sage_attn_sfs_p_ptr, sage_attn_sfs_v_ptr,
       static_cast<int>(num_elts_per_sage_attn_blk_q),
       static_cast<int>(num_elts_per_sage_attn_blk_k),
