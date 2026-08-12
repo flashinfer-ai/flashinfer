@@ -17,7 +17,7 @@ from flashinfer.comm.mapping import Mapping
 from flashinfer.api_logging import flashinfer_api
 
 from ..jit import gen_trtllm_mnnvl_comm_module
-from ..utils import register_custom_op
+from ..utils import register_custom_op, round_up
 from ..fp4_quantization import _compute_swizzled_layout_sf_size
 from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend, SymmDeviceMemory
 from .trtllm_ar import QuantizationSFLayout
@@ -125,6 +125,10 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 f"[MNNVL Allreduce] Using provided buffer size override in bytes: {buffer_size_in_bytes} bytes."
             )
 
+        # Two-shot splits each Lamport buffer into two 16B-aligned stages.
+        buffer_alignment = 2 * 16
+        buffer_size_in_bytes = round_up(buffer_size_in_bytes, buffer_alignment)
+
         if comm_backend is None:
             comm_backend = MPIBackend()
         if buffer_size_in_bytes > (2**32 - 1):
@@ -156,9 +160,11 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.ptrs = self.handle.mcast_device_memory.get_buffer_ptrs_host()
 
         allocated_size = self.handle.buf_size
-        # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
-            math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
+            allocated_size
+            // self.NUM_LAMPORT_BUFFERS
+            // buffer_alignment
+            * buffer_alignment
         )
         # This workspace size is used for checking the buffer. We need to set it to the actual size in use. The buffer free logic does not rely on this size.
         self.workspace_size_bytes = self.buffer_size_bytes * self.NUM_LAMPORT_BUFFERS
