@@ -484,21 +484,30 @@ struct MoeRunResultBuffers {
   // FFI[0] final or FC2 output.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   Tensor primary_output;
-  // Optional routing weights.
+  // FFI[1] routing weights; an undefined tensor preserves the borrowed-buffer slot.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
-  Optional<Tensor> expert_weights;
+  Tensor expert_weights;
   // Optional next FFI item, layout map.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   Optional<Tensor> expanded_to_permuted_indices;
   // Optional activation output.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   Optional<Tensor> activation_output;
+  // Whether FFI[0] is finalized output rather than an unfinalized FC2 buffer.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  bool is_finalized{true};
+
+  /** Construct a result whose stable FFI layout is fixed by its output mode. */
+  MoeRunResultBuffers(bool finalized, Tensor primary)
+      : primary_output(std::move(primary)), is_finalized(finalized) {}
 
   /** Encode the typed launch result in the existing public FFI tensor order. */
   Array<Tensor> to_ffi() const {
     Array<Tensor> tensors{primary_output};
-    if (expert_weights.has_value()) {
-      tensors.push_back(expert_weights.value());
+    // Unfinalized calls always reserve FFI[1] for expert weights. Some launchers borrow the
+    // caller's buffer, so the undefined tensor is intentional and Python substitutes its input.
+    if (!is_finalized) {
+      tensors.push_back(expert_weights);
     }
     if (expanded_to_permuted_indices.has_value()) {
       tensors.push_back(expanded_to_permuted_indices.value());
@@ -1496,11 +1505,8 @@ class FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result;
-    if (args->do_finalize) {
-      result.primary_output = output;
-    } else {
-      result.primary_output = gemm2_output;
+    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     // Always surface the permutation map when the caller gets any
@@ -2084,11 +2090,8 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result;
-    if (args->do_finalize) {
-      result.primary_output = output;
-    } else {
-      result.primary_output = gemm2_output;
+    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
@@ -2622,11 +2625,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result;
-    if (args->do_finalize) {
-      result.primary_output = output;
-    } else {
-      result.primary_output = gemm2_output;
+    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
@@ -3314,11 +3314,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result;
-    if (args->do_finalize) {
-      result.primary_output = output;
-    } else {
-      result.primary_output = gemm2_output;
+    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
