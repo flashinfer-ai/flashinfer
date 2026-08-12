@@ -22,10 +22,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-# Which tuning table to use. The distinction is the interconnect, not the GPU:
-# the same card behaves differently depending on whether its NUMA island
-# contains a PCIe switch, and the tuned block counts and crossovers differ by
-# substantially between the two.
+# Which fabric the group is on. The distinction is the interconnect, not the
+# GPU: the same card behaves differently depending on whether its NUMA island
+# contains a PCIe switch. It selects no kernel -- it keys the tune cache, so two
+# topologies on one machine do not read each other's measurements.
 PROFILE_ROOTCPLX = "rootcplx-noswitch"
 PROFILE_SWITCHPAIR = "pcieswitch-pairs"
 PCIE_IPC_PROFILES = (PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR)
@@ -136,13 +136,13 @@ def probe_pcie_ipc_rank_topology(
 def decide_pcie_ipc_profile(
     requested: Optional[str], topologies: List[PcieIpcRankTopology]
 ) -> PcieIpcProfileDecision:
-    """Pick the tuning table from the gathered probes. Pure function.
+    """Pick the fabric label from the gathered probes. Pure function.
 
     An explicit ``requested`` profile always wins. Otherwise the group is
     switch-paired only if some rank positively observed a switch-local peer;
-    anything unknown or unprobeable falls back to ``rootcplx-noswitch``,
-    because misapplying the switch-paired table on a switch-free machine has
-    been measured at up to 4.5x slower while the reverse only forgoes tuning.
+    anything unknown or unprobeable falls back to ``rootcplx-noswitch``.
+    Guessing wrong costs a tune cache keyed on the other fabric, so the label
+    that claims less is the safe default.
     """
     # The intra-node constraint is checked first: CUDA IPC cannot cross hosts,
     # so an explicit profile must not be able to wave it through.

@@ -13,26 +13,23 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Measured launch configurations for the PCIe IPC all-reduce.
+Launch configurations for the PCIe IPC all-reduce.
 
-Two tables, keyed on the interconnect rather than the GPU:
+Two layers, with very different standing.
 
-``rootcplx-noswitch``
-    Every peer transfer crosses the CPU root complex. Two properties of that
-    fabric drive the whole table: all-to-all peer writes collapse relative to
-    neighbour writes, and the collapse worsens the more blocks write
-    concurrently -- hence block counts of 1-2 where a switch-paired machine
-    wants 8-96. Barriers are also far more expensive, which is why the
-    barrier-free path keeps the small-batch TP8 range.
+**Admission** (:func:`_admits`) is a capability question: which shapes the
+kernels can run at all. It is not a performance judgement, and tuning cannot
+change it.
 
-``pcieswitch-pairs``
-    NUMA islands contain PCIe switch pairs, so some peers talk without
-    reaching the host bridge. Inherited from the machine the kernels were
-    originally tuned on.
+**The seed** (:func:`_seed`) is a *default*, not a measurement. It picks the
+one side of the one crossover that ports between machines -- push straight to
+every peer while the payload is small, reduce-scatter/all-gather once it is
+not -- and nothing finer.
 
-Shapes outside the tables return ``None``: the caller must fall back rather
-than run an untuned configuration, because the untuned default (max blocks,
-no staging) is the worst direction on a switch-free fabric.
+Thresholds fitted per batch on one machine do not survive the trip to another,
+so only the shape of the answer lives here; the numbers come from
+:meth:`~flashinfer.comm.PcieIpcAllReduceWorkspace.tune`, which measures them
+where they will run. Running untuned is warned about once per workspace.
 """
 
 from dataclasses import dataclass, replace
@@ -40,7 +37,6 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
-from .pcie_ipc_topology import PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR
 
 # Block counts above this are never useful on either fabric and the workspace
 # is sized for it.
@@ -68,92 +64,75 @@ class IpcLaunchConfig:
     variant: IpcVariant
 
 
-def _tp2(batch: int) -> Optional[IpcLaunchConfig]:
-    # Shared by both profiles: two ranks push straight to their only peer, so
-    # there is no all-to-all pattern to fix and the switch makes no difference.
-    # At large batch this already sits at the link ceiling.
-    if batch <= 1:
-        return IpcLaunchConfig(32, 64, IpcVariant.UNSTAGED)
-    if batch <= 2:
-        return IpcLaunchConfig(128, 64, IpcVariant.UNSTAGED)
-    if batch <= 4:
-        return IpcLaunchConfig(64, 128, IpcVariant.STAGED)
-    if batch <= 8:
-        return IpcLaunchConfig(96, 64, IpcVariant.STAGED)
-    if batch <= 12:
-        return IpcLaunchConfig(16, 64, IpcVariant.UNSTAGED)
-    if batch <= 16:
-        return IpcLaunchConfig(64, 128, IpcVariant.UNSTAGED)
-    if batch <= 28:
-        return IpcLaunchConfig(16, 64, IpcVariant.UNSTAGED)
-    if batch <= 32:
-        return IpcLaunchConfig(64, 64, IpcVariant.STAGED)
-    if batch <= 44:
-        return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
-    if batch <= 48:
-        return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
-    return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
+# Payload above which reduce-scatter/all-gather beats pushing to every peer.
+# Keyed on bytes, not tokens: the crossover trades bytes moved against barrier
+# latency, and only that ratio ports between fabrics.
+_SEED_STAGE_BYTES = 32 * 1024
+
+# The neighbour-ordered kernel has one outbound stream per rank whatever the
+# grid, so extra blocks pay only once there are bytes enough to keep the link
+# busy. Capped low: with no switch-local peer, concurrent transfers collapse
+# rather than add.
+_SEED_RING_BYTES_PER_BLOCK = 256 * 1024
+_SEED_RING_MAX_BLOCKS = 4
 
 
-def _rootcplx(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
-    if world_size == 4 and hidden == 4096:
-        # Staged reduce-scatter/all-gather wins at every batch here, not only
-        # above 20 as on the switch-paired machine.
-        if batch <= 4:
-            # Too little payload to amortise the staged kernel's 2*(N-1)
-            # barriers, so keep the unstaged push.
-            return IpcLaunchConfig(1, 128, IpcVariant.STAGED)
-        # Neighbour-ordered staging trades all-to-all writes for neighbour
-        # writes; with the contention gone, more blocks start to pay again.
-        if batch <= 8:
-            return IpcLaunchConfig(1, 256, IpcVariant.STAGED_RING)
-        if batch <= 64:
-            return IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
-        return IpcLaunchConfig(4, 256, IpcVariant.STAGED_RING)
-    if world_size == 8 and hidden >= 6144:
-        if batch <= 1:
-            # Barrier-free pack kernel; below this the staged kernel's six
-            # island barriers cost more than the traffic they save.
-            return IpcLaunchConfig(32, 128, IpcVariant.UNSTAGED)
-        if batch <= 3:
-            # Ownership follows the data index, so a single CTA spans one or
-            # two adjacent owners: the pushes stage without the six island
-            # barriers the topology kernels pay for the same effect. Above this
-            # a CTA spans enough owners that the staging stops happening and
-            # the explicit barriers win instead.
-            return IpcLaunchConfig(1, 128, IpcVariant.FLAT_STAGED)
-        # Staged intra-island push, which beats the block kernel because that
-        # one pushes to all three island peers at once instead of one at a
-        # time. Staging also lifts the blocks % 4 constraint, and the low block
-        # counts that frees up are most of the win.
-        if batch <= 4:
-            return IpcLaunchConfig(1, 128, IpcVariant.STAGED_RING)
-        if batch <= 44:
-            return IpcLaunchConfig(1, 256, IpcVariant.STAGED_RING)
-        return IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
-    return None
+def _admits(world_size: int, numel: int, elem_size: int) -> bool:
+    """Whether the kernels can run this shape at all.
+
+    Independent of which kernel is chosen: tuning launches every variant on
+    whatever shape is admitted, so a precondition that held only for the
+    variant the seed happens to pick would still deadlock the group under
+    :meth:`~flashinfer.comm.PcieIpcAllReduceWorkspace.tune`.
+    """
+    if world_size not in (2, 4, 8):
+        return False
+    pack_elems = 16 // elem_size
+    # Matches the launcher's own check; the kernels address whole 16-byte packs.
+    if numel % pack_elems != 0:
+        return False
+    # Reduce-scatter gives each rank num_packs // world_size packs. Below one
+    # pack per rank that split degenerates onto a single owner: correct, but it
+    # leaves the other ranks idle, and a payload that small is better served by
+    # another backend than by an IPC collective.
+    return numel >= pack_elems * world_size
 
 
-def _switchpair(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
-    if world_size == 4 and hidden == 4096:
-        if batch <= 1:
-            return IpcLaunchConfig(8, 128, IpcVariant.UNSTAGED)
-        if batch <= 4:
-            return IpcLaunchConfig(64, 128, IpcVariant.UNSTAGED)
-        if batch <= 8:
-            return IpcLaunchConfig(96, 128, IpcVariant.UNSTAGED)
-        if batch <= 16:
-            return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
-        if batch <= 40:
-            return IpcLaunchConfig(16, 128, IpcVariant.STAGED)
-        return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
-    if world_size == 8 and hidden >= 6144:
-        if batch <= 4:
-            return IpcLaunchConfig(12, 256, IpcVariant.UNSTAGED)
-        if batch <= 32:
-            return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
-        return IpcLaunchConfig(8, 512, IpcVariant.STAGED)
-    return None
+def _seed(
+    world_size: int, numel: int, elem_size: int, max_blocks: int
+) -> IpcLaunchConfig:
+    """Default configuration for a shape nothing has measured yet."""
+    payload = numel * elem_size
+
+    if world_size == 2:
+        # Staging moves the same bytes it would have pushed, so there is no
+        # crossover here and no second branch to justify.
+        return IpcLaunchConfig(min(16, max_blocks), 128, IpcVariant.UNSTAGED)
+
+    if payload >= _SEED_STAGE_BYTES:
+        # Neighbour-ordered rather than all-to-all: with no switch-local peer,
+        # simultaneous writes to every peer collapse, and the penalty grows with
+        # the payload. Picking wrong on this arm is unbounded rather than merely
+        # slow, which is why the threshold sits low.
+        blocks = max(
+            1,
+            min(
+                _SEED_RING_MAX_BLOCKS,
+                payload // _SEED_RING_BYTES_PER_BLOCK,
+                max_blocks,
+            ),
+        )
+        return IpcLaunchConfig(blocks, 256, IpcVariant.STAGED_RING)
+
+    if world_size == 4:
+        # Staging always cuts egress at four ranks and the all-to-all form pays
+        # only two barriers, so the one-shot push is never the answer. One
+        # block, because its grid multiplies the concurrency that collapses.
+        return IpcLaunchConfig(1, 256, IpcVariant.STAGED)
+
+    # Eight ranks below the crossover: the island-partitioned push has no
+    # barriers, which is what the staged path's six island barriers must beat.
+    return IpcLaunchConfig(min(16, max_blocks), 256, IpcVariant.UNSTAGED)
 
 
 def _is_launchable(world_size: int, config: IpcLaunchConfig, max_blocks: int) -> bool:
@@ -188,28 +167,22 @@ def _is_launchable(world_size: int, config: IpcLaunchConfig, max_blocks: int) ->
 
 @lru_cache(maxsize=None)
 def get_pcie_ipc_launch_config(
-    profile: str,
     world_size: int,
-    hidden: int,
-    batch: int,
+    numel: int,
+    elem_size: int,
     max_blocks: int = MAX_BLOCKS,
 ) -> Optional[IpcLaunchConfig]:
-    """Launch configuration for one shape, or ``None`` when untuned.
+    """Launch configuration for one shape, or ``None`` when unsupported.
+
+    ``None`` means the kernels cannot run the shape, so the caller must use
+    another backend. It never means "untuned": an untuned shape gets the seed.
 
     Depends only on its arguments, so every rank in a group reaches the same
     answer -- a prerequisite, since a rank that opts out while its peers opt in
     deadlocks the collective.
     """
-    if world_size == 2:
-        config = _tp2(batch) if hidden <= 2048 else None
-    elif profile == PROFILE_ROOTCPLX:
-        config = _rootcplx(world_size, hidden, batch)
-    elif profile == PROFILE_SWITCHPAIR:
-        config = _switchpair(world_size, hidden, batch)
-    else:
-        raise ValueError(f"unknown profile {profile!r}")
-
-    if config is None:
+    if not _admits(world_size, numel, elem_size):
         return None
+    config = _seed(world_size, numel, elem_size, max_blocks)
     config = replace(config, blocks=min(config.blocks, max_blocks))
     return config if _is_launchable(world_size, config, max_blocks) else None

@@ -146,9 +146,10 @@ vLLM AllReduce
 PCIe IPC AllReduce
 ------------------
 
-Custom all-reduce for intra-node PCIe machines without NVLink. The launch
-configuration comes from a tuning table keyed on the interconnect, so shapes
-outside the table report unsupported and the caller falls back.
+Custom all-reduce for intra-node PCIe machines without NVLink. Admission is a
+capability check — world size, dtype, workspace capacity, and enough payload
+for every rank to own a share — and shapes it rejects fall back to the caller's
+own collective.
 
 .. code-block:: python
 
@@ -163,16 +164,24 @@ outside the table report unsupported and the caller falls back.
             y = ws.all_reduce(x)              # out-of-place
         else:
             y = x.clone()
-            dist.all_reduce(y, group=group)   # untuned shape: fall back
+            dist.all_reduce(y, group=group)   # unsupported shape: fall back
 
     ws.destroy()                              # collective; all ranks together
 
 ``supports()`` is a pure function of shape and dtype, so every rank reaches the
-same answer without agreeing on one at runtime. The kernels spin on peer flags
-with no timeout, so ranks that disagree on shape, dtype or call order hang
-rather than raise. One workspace serves one CUDA stream; use
-:meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after ordering the two if a
-move is genuinely needed.
+same answer without agreeing on one at runtime. It says nothing about speed: a
+supported shape runs a seed launch configuration — one crossover keyed on the
+payload in bytes, no per-machine constants — and warns once per workspace until
+:meth:`~PcieIpcAllReduceWorkspace.tune` has measured the real one and persisted
+it, since the crossovers depend on the fabric.
+:func:`get_pcie_ipc_launch_config` exposes that seed for a
+``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
+the kernels cannot run.
+
+The kernels spin on peer flags with no timeout, so ranks that disagree on
+shape, dtype or call order hang rather than raise. One workspace serves one
+CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
+ordering the two if a move is genuinely needed.
 
 .. autosummary::
     :toctree: ../generated

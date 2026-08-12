@@ -113,9 +113,9 @@ void pcie_ipc_dispose(fptr_t handle) { delete reinterpret_cast<PcieIpcHandle*>(h
 /*!
  * \brief Out-of-place all-reduce over the shared workspace.
  *
- * \param blocks,threads,variant Launch configuration chosen by the caller's
- *        tuning table; \c variant is a fi::Variant and the (world_size,
- *        variant) pairs that dispatch are listed in pcie_ipc_all_reduce.cuh.
+ * \param blocks,threads,variant Launch configuration chosen by the caller;
+ *        \c variant is a fi::Variant and the (world_size, variant) pairs that
+ *        dispatch are listed in pcie_ipc_all_reduce.cuh.
  */
 void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t blocks,
                          int64_t threads, int64_t variant, bool enable_pdl) {
@@ -189,9 +189,8 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
           static_cast<int>(threads), algo, enable_pdl, stream);
       break;
     default:
-      // The kernels are dtype-generic but the tuning table is not keyed on
-      // dtype, so a 4-byte dtype would run with parameters chosen for half the
-      // traffic. Keep the callable surface equal to the tuned one.
+      // The kernel templates carry a generic path, but only the two 2-byte
+      // dtypes are instantiated and measured.
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "pcie ipc all-reduce supports bfloat16 and float16 only";
   }

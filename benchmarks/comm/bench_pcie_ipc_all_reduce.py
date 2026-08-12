@@ -16,7 +16,7 @@
 
 Intended for intra-node PCIe machines without NVLink, which is what the kernel
 is tuned for. NCCL is the baseline because it is what the caller falls back to
-when a shape is not in the tuning table.
+on a shape the kernels cannot run.
 
 One run covers ONE world size. The world size comes from the launcher and the
 collective uses ``dist.group.WORLD`` throughout -- there is no subgroup logic --
@@ -30,7 +30,9 @@ so a 2/4/8-rank comparison needs three launches:
             benchmarks/comm/bench_pcie_ipc_all_reduce.py --json bench_tp$n.json
     done
 
-Hidden size follows the world size unless overridden, so no other flag is needed.
+Hidden size follows the world size unless overridden, so no other flag is
+needed. The defaults are a sweep choice, not a restriction -- --hidden takes
+any size the kernels admit.
 
 To measure what a protocol fix costs, rather than how it compares to NCCL:
 
@@ -50,21 +52,23 @@ at 8 ranks differs between the pack and staged kernels. Naming a switch
 explicitly is still allowed, and rows it does not historically fit are marked
 SYNTHETIC.
 
-To measure the launch configuration rather than read it from the table:
+To measure the launch configuration rather than take the policy's seed default:
 
     torchrun --standalone --nproc_per_node=8 \\
         benchmarks/comm/bench_pcie_ipc_all_reduce.py --tune --json bench_tuned.json
 
-Rows whose configuration tuning changed are annotated with what the table would
+Rows whose configuration tuning changed are annotated with what the seed would
 have chosen. The result is persisted, so a later run without --tune reuses it.
+Without a persisted result the library warns once that it is running seed
+configurations, which are workable rather than fast.
 
 Options:
     --hidden N        Hidden size (default: 6144 at 8 ranks, 4096 at 4, 2048 at 2)
     --batches a,b,c   Batch sizes to sweep
     --dtype           bfloat16 (default) or float16
     --json FILE       Write results to JSON
-    --tune            Measure the launch configuration instead of reading it
-    --tune-cache FILE Where --tune persists its result
+    --tune            Measure the launch configuration instead of taking the seed
+    --tune-cache FILE Where tuned configurations are read from and written to
 """
 
 import argparse
@@ -160,8 +164,8 @@ def _parse_args() -> argparse.Namespace:
         "--tune",
         action="store_true",
         help=(
-            "Measure the launch configuration instead of reading it from the "
-            "table, then report against NCCL. Collective and slow (a few "
+            "Measure the launch configuration instead of taking the policy "
+            "seed, then report against NCCL. Collective and slow (a few "
             "seconds per batch bucket); pin clocks first."
         ),
     )
@@ -169,7 +173,11 @@ def _parse_args() -> argparse.Namespace:
         "--tune-cache",
         type=str,
         default=None,
-        help="Where --tune persists its result. Defaults to the workspace dir.",
+        help=(
+            "Where tuned configurations are read from and, under --tune, "
+            "written to. Defaults to the workspace dir. Reading happens "
+            "with or without --tune, so a later run reuses the result."
+        ),
     )
     p.add_argument(
         "--protocol-ab",
@@ -197,12 +205,14 @@ def _parse_args() -> argparse.Namespace:
 def _historical_switch(world_size, config):
     """Which A/B switch actually rebuilds what this shape used to run.
 
-    The kernels do not share one history. TP2 and TP4 always double-buffered by
-    per-block parity, so ``per-block-epoch`` restores their past. The two
-    topology-staged TP8 kernels never had an epoch at all -- their scratch was
-    pinned to half 0 and reused across calls, which is what ``no-block-epoch``
-    rebuilds. The TP8 pack kernel did have per-block parity, like TP2/TP4, and
-    so does ``FLAT_STAGED``: it is the same generic template TP4 runs.
+    Keys on the kernel ``config`` names -- ``(world_size, config.variant)``
+    alone -- not on the shape that reached it. The kernels do not share one
+    history: TP2 and TP4 always double-buffered by per-block parity, so
+    ``per-block-epoch`` restores their past. The two topology-staged TP8 kernels
+    never had an epoch at all -- their scratch was pinned to half 0 and reused
+    across calls, which is what ``no-block-epoch`` rebuilds. The TP8 pack kernel
+    did have per-block parity, like TP2/TP4, and so does ``FLAT_STAGED``: it is
+    the same generic template TP4 runs.
 
     Running the other switch is not wrong, it just measures a protocol that
     never shipped, so rows are labelled rather than refused.
@@ -229,6 +239,10 @@ def _is_historical(world_size, config, switch):
 def _protocol_ab_plan(world_size, shape_config, mode):
     """Which batches each A/B leg should actually run.
 
+    ``shape_config`` is ``{batch: IpcLaunchConfig}`` for the configurations this
+    run will really launch -- read off the workspace, not looked up anywhere --
+    so the split follows the kernels being benchmarked.
+
     Returns ``{switch: [batch, ...]}``. In ``auto`` this partitions the shapes by
     the protocol they used to run, and that partition is the executable plan, not
     just a labelling rule: a leg that runs a shape it does not own executes a
@@ -236,8 +250,13 @@ def _protocol_ab_plan(world_size, shape_config, mode):
     kernel that always double-buffered -- wedges its sentinel loop outright. A
     row discarded at reporting time has already run by then.
 
+    How many legs come back depends on the sweep. One leg is the normal result,
+    not a degenerate one: world sizes 2 and 4 have a single history, so only a
+    world-size-8 sweep whose shapes reach both the pack and the topology-staged
+    kernels partitions into two.
+
     With an explicit switch the caller has asked for exactly that comparison, so
-    every tuned shape runs and the mismatched ones are reported as SYNTHETIC.
+    every admitted shape runs and the mismatched ones are reported as SYNTHETIC.
     """
     if mode != "auto":
         return {mode: sorted(shape_config)} if shape_config else {}
@@ -352,8 +371,8 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
 
     ``auto`` runs one sweep per switch and keeps, for each shape, only the sweep
     whose switch matches that shape's actual history. At 8 ranks that is the
-    only way to get a complete historically faithful table, because the pack and
-    staged kernels came from different protocols.
+    only way to get a complete historically faithful set of rows, because the
+    pack and staged kernels came from different protocols.
     """
     # (no_block_epoch, per_block_epoch, no_barrier_entry_sync)
     _SWITCH = {
@@ -366,7 +385,9 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
     # auto mode can run only the switches some shape actually needs. Running a
     # switch nothing needs is not merely wasted time: 'no-block-epoch' at 2 or 4
     # ranks removes the double buffer from a kernel that has always had one, and
-    # that wedges the sentinel loop outright.
+    # that wedges the sentinel loop outright. The probe reads the same seed
+    # configurations the timed legs below will launch, so the plan describes
+    # what runs.
     probe = comm.PcieIpcAllReduceWorkspace(
         group=group, max_numel=hidden * max(batches), dtype=dtype
     )
@@ -384,7 +405,7 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
     plan = _protocol_ab_plan(world_size, shape_config, args.protocol_ab)
     if not plan:
         if rank == 0:
-            print("no tuned shape in this batch list; nothing to compare")
+            print("no supported shape in this batch list; nothing to compare")
         return
 
     def measure(broken_switch, leg_batches):
@@ -558,20 +579,23 @@ def main() -> None:
         return
 
     workspace = comm.PcieIpcAllReduceWorkspace(
-        group=group, max_numel=hidden * max(batches), dtype=dtype
+        group=group,
+        max_numel=hidden * max(batches),
+        dtype=dtype,
+        tune_cache=args.tune_cache,
     )
-    table_configs = {}
+    seed_configs = {}
     if args.tune:
-        # Record what the table would have chosen before overwriting it, so the
+        # Record what the seed would have chosen before overwriting it, so the
         # report shows what tuning actually changed rather than just the result.
         for batch in batches:
             probe = torch.empty(batch, hidden, dtype=dtype, device=device)
-            table_configs[batch] = workspace.launch_config(probe)
+            seed_configs[batch] = workspace.launch_config(probe)
         if rank == 0:
             print(f"tuning {len(batches)} batch buckets at hidden {hidden} ...")
         torch.cuda.synchronize()
         workspace.rebind_stream()
-        workspace.tune([hidden], dtype=dtype, cache=args.tune_cache)
+        workspace.tune([hidden], dtype=dtype)
     if rank == 0:
         print(f"world_size={world_size} hidden={hidden} dtype={args.dtype}")
         print(f"profile={workspace.profile} ({workspace.profile_reason})")
@@ -583,10 +607,13 @@ def main() -> None:
         # The tuned answer, so the reported configuration is the one the timed
         # call below actually runs.
         config = workspace.tuned_launch_config(inp)
+        # None is a capability answer, never "nobody measured this": an
+        # unmeasured shape still gets the seed.
         if config is None:
             if rank == 0:
                 print(
-                    f"{batch:>7} {'-':>10} {'-':>10} {'-':>9}  untuned, would fall back"
+                    f"{batch:>7} {'-':>10} {'-':>10} {'-':>9}  "
+                    "unsupported, would fall back"
                 )
             continue
         out = torch.empty_like(inp)
@@ -599,7 +626,7 @@ def main() -> None:
         # A collective finishes when its slowest rank does, and which rank that
         # is can change from iteration to iteration -- so the max is taken per
         # sample and the median after, not the other way round. The local
-        # medians stay in the JSON so an older table can still be lined up
+        # medians stay in the JSON so an older result set can still be lined up
         # against a newer one.
         ours_samples = bench_gpu_time(
             lambda: workspace.all_reduce(inp, out=out), **_BENCH_KWARGS
@@ -636,8 +663,8 @@ def main() -> None:
                 f"threads={config.threads} variant={config.variant.name}"
                 + (
                     ""
-                    if not args.tune or table_configs.get(batch) == config
-                    else f"  (table: {table_configs[batch]})"
+                    if not args.tune or seed_configs.get(batch) == config
+                    else f"  (seed: {seed_configs[batch]})"
                 )
             )
 

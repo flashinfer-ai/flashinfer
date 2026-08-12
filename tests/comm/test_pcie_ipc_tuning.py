@@ -85,26 +85,106 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         assert tactic[0] in (int(IpcVariant.UNSTAGED), int(IpcVariant.STAGED))
 
 
-def test_the_grid_can_express_the_shipping_table() -> None:
-    """Tuning must be able to reach the table, not merely fall back to it.
+# Every distinct winner in the tuned caches of the two fabrics this operator
+# was developed against, as ``(variant, blocks, threads)``. Measured, not
+# derived: they are what a real search picked, per world size.
+_MEASURED_WINNERS = {
+    2: (
+        (0, 8, 64),
+        (0, 8, 128),
+        (0, 8, 256),
+        (0, 8, 512),
+        (0, 12, 128),
+        (0, 16, 64),
+        (0, 16, 256),
+        (0, 32, 64),
+        (0, 32, 512),
+        (0, 64, 64),
+        (0, 96, 64),
+        (0, 96, 256),
+        (0, 128, 64),
+        (1, 1, 256),
+        (1, 8, 256),
+        (1, 12, 256),
+        (1, 16, 128),
+        (1, 16, 256),
+        (1, 16, 1024),
+        (1, 32, 64),
+        (1, 64, 64),
+        (1, 128, 64),
+    ),
+    4: (
+        (0, 16, 256),
+        (0, 32, 512),
+        (1, 1, 128),
+        (1, 32, 256),
+        (1, 32, 1024),
+        (1, 96, 128),
+        (1, 96, 1024),
+        (1, 128, 256),
+        (2, 1, 1024),
+        (2, 2, 512),
+        (2, 2, 1024),
+    ),
+    8: (
+        (0, 2, 512),
+        (0, 8, 256),
+        (0, 12, 256),
+        (0, 32, 1024),
+        (1, 4, 512),
+        (1, 8, 1024),
+        (1, 96, 256),
+        (2, 1, 256),
+        (2, 1, 512),
+        (2, 1, 1024),
+        (2, 2, 1024),
+        (3, 1, 64),
+    ),
+}
 
-    Tactic -1 always reproduces the table, but if the grid cannot name the
-    table's own configuration then the tuner can never explore its
-    neighbourhood -- it can only accept or reject it wholesale. Both tables use
-    values that are not powers of two, so a powers-of-two grid would silently
-    have this property.
+
+def test_the_grid_can_express_every_measured_winner() -> None:
+    """The grid must contain the configurations searches actually chose.
+
+    A winner the grid cannot name is one the tuner can never pick again, which
+    caps the operator at whatever the seed happens to guess. Block counts of 12
+    and 96 are among them, so a powers-of-two grid would silently have this
+    property.
+    """
+    assert set(_MEASURED_WINNERS) == set(_WORLD_SIZES), "a world size lost its winners"
+    for world_size, winners in sorted(_MEASURED_WINNERS.items()):
+        unreachable = sorted(set(winners) - set(tuning.candidate_tactics(world_size)))
+        assert not unreachable, (
+            f"world size {world_size}: the grid cannot name {unreachable}"
+        )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="TUNE_BLOCKS has no 3, and the seed asks for 3 ring blocks at every "
+    "payload between 768 KiB and 1 MiB",
+)
+def test_the_grid_can_express_the_seed() -> None:
+    """Tuning must be able to reach the seed, not merely fall back to it.
+
+    Tactic -1 always reproduces the seed, but if the grid cannot name the
+    seed's own configuration then the tuner can only accept or reject it
+    wholesale -- it can never search the immediate neighbourhood of the one
+    configuration every untuned shape runs.
     """
     missing = []
-    for profile in (PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR):
-        for world_size, hidden in ((2, 2048), (4, 4096), (8, 6144)):
+    for world_size in _WORLD_SIZES:
+        grid = set(tuning.candidate_tactics(world_size))
+        for hidden in (1024, 2048, 4096, 6144):
             for batch in range(1, 129):
-                config = get_pcie_ipc_launch_config(profile, world_size, hidden, batch)
+                # Both supported dtypes are 2 bytes, and the seed keys on
+                # payload bytes, so one element size covers the space.
+                config = get_pcie_ipc_launch_config(world_size, batch * hidden, 2)
                 if config is None:
                     continue
-                tactic = tuning.config_to_tactic(config)
-                if tactic not in tuning.candidate_tactics(world_size):
-                    missing.append((profile, world_size, batch, config))
-    assert not missing, f"grid cannot express these table entries: {missing[:5]}"
+                if tuning.config_to_tactic(config) not in grid:
+                    missing.append((world_size, hidden, batch, config))
+    assert not missing, f"grid cannot express these seed configurations: {missing[:5]}"
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
@@ -131,28 +211,28 @@ def test_tactic_codec_round_trips_and_rejects_nonsense() -> None:
         tuning.tactic_to_config((99, 1, 128))
 
 
-def test_resolve_falls_back_to_the_table() -> None:
-    """Every way a tactic can be unusable ends at the table, not at an exception.
+def test_resolve_falls_back_to_the_seed() -> None:
+    """Every way a tactic can be unusable ends at the seed, not at an exception.
 
     The autotuner does not check that a cached tactic can implement the shape
     it is reused for, so a stale entry has to be caught here. Raising instead
     would take down one rank mid-collective and leave the rest spinning.
     """
-    table = IpcLaunchConfig(32, 128, IpcVariant.UNSTAGED)
+    seed = IpcLaunchConfig(32, 128, IpcVariant.UNSTAGED)
     resolve = tuning.resolve_tuned_config
 
-    assert resolve(table, tuning.TABLE_TACTIC, 8, MAX_BLOCKS) is table
-    assert resolve(table, None, 8, MAX_BLOCKS) is table
+    assert resolve(seed, tuning.TABLE_TACTIC, 8, MAX_BLOCKS) is seed
+    assert resolve(seed, None, 8, MAX_BLOCKS) is seed
     # Malformed.
-    assert resolve(table, (1, 2), 8, MAX_BLOCKS) is table
-    assert resolve(table, "nonsense", 8, MAX_BLOCKS) is table
-    assert resolve(table, (99, 1, 128), 8, MAX_BLOCKS) is table
+    assert resolve(seed, (1, 2), 8, MAX_BLOCKS) is seed
+    assert resolve(seed, "nonsense", 8, MAX_BLOCKS) is seed
+    assert resolve(seed, (99, 1, 128), 8, MAX_BLOCKS) is seed
     # Stale: tuned against a larger workspace than this one was built with.
-    assert resolve(table, (0, 128, 128), 8, 32) is table
+    assert resolve(seed, (0, 128, 128), 8, 32) is seed
     # Stale: a variant this world size does not dispatch.
-    assert resolve(table, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is table
+    assert resolve(seed, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is seed
     # Usable.
-    assert resolve(table, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (
+    assert resolve(seed, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (
         IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
     )
 

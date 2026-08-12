@@ -46,10 +46,10 @@ from .pcie_ipc_tuning import (
 )
 
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
-# float32 is deliberately absent. The kernels handle it, but the tuning tables
-# carry no dtype dimension while the crossovers depend on payload *bytes*, so a
-# 4-byte dtype would run with a configuration chosen for half the traffic.
-# Re-tune before re-enabling.
+# Mirrors the launcher, which hard-checks a 2-byte element size: the kernels
+# address whole 16-byte packs and are instantiated for half and nv_bfloat16
+# only. Rejecting here turns that into an unsupported shape rather than an
+# ICHECK partway through a collective.
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
@@ -146,14 +146,21 @@ class PcieIpcAllReduceWorkspace:
         Upper bound on the block count any launch may request. Sizes the
         barrier and epoch slots.
     profile : str, optional
-        Force a tuning table (``"rootcplx"`` or ``"pcieswitch"``) instead of
-        probing the interconnect. Probing is collective and runs before any
-        allocation.
+        Force the interconnect label (``"rootcplx"`` or ``"pcieswitch"``)
+        instead of probing for it. The label does not pick a kernel; it
+        partitions the tune cache so two topologies do not read each other's
+        measurements. Probing is collective and runs before any allocation.
+    tune_cache : str, optional
+        Where tuned configurations are read from at construction and written by
+        :meth:`tune`. Defaults to ``FLASHINFER_AUTOTUNE_DIR`` (or the workspace
+        directory). Give the same path to both, or a tuned result will not be
+        found by the next process.
 
-    Launch configurations come from a table measured on one machine. To measure
-    them on this one instead, tune once and the result is persisted; later
-    processes pick it up when the workspace is built. Tuning never changes which
-    shapes are supported, only which kernel a supported shape runs.
+    Launch configurations start from a seed default that is workable rather
+    than fast (see :mod:`~flashinfer.comm.pcie_ipc_policy`). Tune once to
+    replace it with measurements from this machine; the result is persisted and
+    later processes pick it up when the workspace is built. Tuning never changes
+    which shapes are supported, only which kernel a supported shape runs.
 
     Examples
     --------
@@ -175,6 +182,7 @@ class PcieIpcAllReduceWorkspace:
         max_blocks: int = 128,
         profile: Optional[str] = None,
         tune_batches: Sequence[int] = TUNE_BATCHES,
+        tune_cache: Optional[str] = None,
     ) -> None:
         # Construction is a staged transaction. Every rank must execute the same
         # sequence of collectives, so a rank that finds a problem does NOT raise
@@ -201,6 +209,9 @@ class PcieIpcAllReduceWorkspace:
         self._runner: Optional[PcieIpcAllReduceRunner] = None
         self._tune_group: Optional[ProcessGroup] = None
         self._tune_batches = tuple(int(b) for b in tune_batches)
+        self._tune_cache = tune_cache or default_cache_path(self.world_size)
+        self._tuned_configs_loaded = False
+        self._warned_untuned = False
 
         # --- stage 1: local validation, encoded rather than raised -----------
         error: Optional[str] = None
@@ -237,6 +248,7 @@ class PcieIpcAllReduceWorkspace:
             # Buckets pick which shape a tuned entry is reused for, so ranks
             # that disagree would resolve different configurations.
             "tune_batches": self._tune_batches,
+            "tune_cache": self._tune_cache,
         }
         self._joint_check(local, "validating arguments")
 
@@ -371,7 +383,11 @@ class PcieIpcAllReduceWorkspace:
         self._stream = None
 
     def launch_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
-        """Tuned launch configuration for ``inp``, or ``None`` when untuned.
+        """Seed launch configuration for ``inp``, or ``None`` if unsupported.
+
+        The seed is a default, not a measurement -- see
+        :mod:`~flashinfer.comm.pcie_ipc_policy`. :meth:`tuned_launch_config`
+        is what returns a measured answer once :meth:`tune` has run.
 
         Depends only on shape, dtype and the workspace's own immutable
         attributes, never on rank-local state: every rank must reach the same
@@ -401,46 +417,72 @@ class PcieIpcAllReduceWorkspace:
         if not inp.is_contiguous() or inp.dim() == 0:
             return None
         numel = inp.numel()
-        if numel > self.max_numel or (numel * self.elem_size) % 16 != 0:
-            return None
-        hidden = inp.shape[-1]
-        if hidden <= 0 or numel % hidden != 0:
+        if numel > self.max_numel:
             return None
         return get_pcie_ipc_launch_config(
-            self.profile, self.world_size, hidden, numel // hidden, self.max_blocks
+            self.world_size, numel, self.elem_size, self.max_blocks
         )
 
     def supports(self, inp: torch.Tensor) -> bool:
-        """Whether this workspace has a tuned configuration for ``inp``.
+        """Whether the kernels can run ``inp`` at all.
 
-        An untuned shape is reported unsupported rather than run with default
-        launch parameters: on a switch-free fabric the untuned default (max
-        blocks, no staging) is the worst direction, so falling back to another
-        backend is strictly better.
+        A capability question -- dtype, contiguity, workspace capacity, and
+        enough payload for the reduce-scatter to give every rank a share. It
+        does not mean the shape has been measured on this machine; call
+        :meth:`tune` for that.
 
         Raises the same way :meth:`launch_config` does on a device mismatch --
-        that is a caller bug, not an untuned shape.
+        that is a caller bug, not an unsupported shape.
 
         Autotuning never changes this answer: it only picks a faster
-        configuration for a shape the table already claims.
+        configuration for a shape that is already supported.
         """
         return self.launch_config(inp) is not None
 
     def _init_tuning(self) -> None:
         """Build the runner and load any persisted configurations. Collective."""
         self._runner = PcieIpcAllReduceRunner(self)
-        path = default_cache_path(self.world_size)
+        path = self._tune_cache
         exists = os.path.isfile(path)
         # Whether the file is there has to be a group fact before anyone acts
         # on it: half a group running tuned configurations and half running the
-        # table is a hang, not a slowdown.
+        # seed is a hang, not a slowdown.
         self._joint_check({"error": None, "cache": exists}, "checking the tune cache")
+        self._tuned_configs_loaded = exists
         if exists:
             from ..autotuner import AutoTuner
 
             AutoTuner.get().load_configs(path)
         self._joint_check(
             {"error": None, "digest": self._cache_digest()}, "loading the tune cache"
+        )
+
+    def _warn_if_untuned(self) -> None:
+        """Say once that no tuned configurations were found for this machine.
+
+        Keyed on the cache file found at construction, not on whether a given
+        shape fell back -- an entry can be missing for one shape while the file
+        holds plenty of others, and that is a normal miss rather than an untuned
+        machine.
+
+        On the cold path only, so the steady state is untouched: a serving loop
+        reaches this at most once per distinct shape, and the flag makes it once
+        per workspace. Warning here rather than in ``__init__`` keeps it tied to
+        actually using the kernels, not to building a workspace the caller may
+        never route to.
+        """
+        if self._tuned_configs_loaded or self._warned_untuned:
+            return
+        self._warned_untuned = True
+        warnings.warn(
+            "PCIe IPC all-reduce is running seed launch configurations: "
+            f"nothing has been tuned for {self.world_size} ranks on this "
+            f"machine ({self._tune_cache} does not exist). The seed picks a "
+            "workable kernel, not a fast one. Call workspace.tune([hidden]) "
+            "once per machine; the result is persisted and later processes "
+            "pick it up.",
+            UserWarning,
+            stacklevel=4,
         )
 
     def _cache_digest(self) -> str:
@@ -464,14 +506,14 @@ class PcieIpcAllReduceWorkspace:
     def tuned_launch_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
         """Launch configuration for ``inp``, measured if one has been persisted.
 
-        The table is asked first and its answer is final on admission: a shape
-        it declines returns ``None`` here too, whatever the cache holds.
+        Admission is asked first and is final: a shape the kernels cannot run
+        returns ``None`` here too, whatever the cache holds.
 
         Inside an ``autotune(True)`` context this runs the search; outside one
         it is a lookup. Same split as the other tunable ops in this library.
         """
-        table = self.launch_config(inp)
-        if table is None:
+        seed = self.launch_config(inp)
+        if seed is None:
             return None
         from ..autotuner import AutoTuner
 
@@ -483,12 +525,12 @@ class PcieIpcAllReduceWorkspace:
             cached = self._tuned.get(key)
             if cached is not None:
                 return cached
-        config = self._resolve_tuned(inp, table, tuner)
+        config = self._resolve_tuned(inp, seed, tuner)
         self._tuned[key] = config
         return config
 
     def _resolve_tuned(
-        self, inp: torch.Tensor, table: IpcLaunchConfig, tuner
+        self, inp: torch.Tensor, seed: IpcLaunchConfig, tuner
     ) -> IpcLaunchConfig:
         """Cold path: search or look up, then make the group agree."""
         hidden = inp.shape[-1]
@@ -506,9 +548,9 @@ class PcieIpcAllReduceWorkspace:
                 tuning_config,
                 inputs=[inp],
             )
-        config = resolve_tuned_config(table, tactic, self.world_size, self.max_blocks)
+        config = resolve_tuned_config(seed, tactic, self.world_size, self.max_blocks)
 
-        # Unconditional, even when the cache missed and `config is table`. The
+        # Unconditional, even when the cache missed and `config is seed`. The
         # ranks would otherwise have to agree on whether to run this collective
         # before running it, and disagreeing about that is the hang it exists
         # to prevent. It costs one small reduction per distinct shape.
@@ -516,17 +558,19 @@ class PcieIpcAllReduceWorkspace:
         bounds = torch.tensor([packed, -packed], dtype=torch.int64, device=self.device)
         dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=self.group)
         if int(bounds[0]) != -int(bounds[1]):
-            # Fall back rather than raise: the table is a pure function, so it
+            # Fall back rather than raise: the seed is a pure function, so it
             # is agreed by construction and the group stays alive.
             warnings.warn(
                 "ranks resolved different tuned configurations for shape "
-                f"{tuple(inp.shape)}; falling back to the tuning table. The "
-                "tune cache is inconsistent across ranks -- delete "
-                f"{default_cache_path(self.world_size)} and re-tune.",
+                f"{tuple(inp.shape)}; falling back to the seed configuration. "
+                "The tune cache is inconsistent across ranks -- delete "
+                f"{self._tune_cache} and re-tune.",
                 RuntimeWarning,
                 stacklevel=3,
             )
-            return table
+            return seed
+        if not tuner.is_tuning_mode:
+            self._warn_if_untuned()
         return config
 
     @flashinfer_api(trace=pcie_ipc_all_reduce_trace)
@@ -547,9 +591,9 @@ class PcieIpcAllReduceWorkspace:
         out : torch.Tensor, optional
             Destination. Allocated when omitted.
         config : IpcLaunchConfig, optional
-            Launch geometry and kernel selection. Taken from the tuning table
-            when omitted; pass one explicitly only to benchmark or to test a
-            configuration the table does not choose. Ranks that disagree on it
+            Launch geometry and kernel selection. Resolved from the tune cache
+            or the seed when omitted; pass one explicitly only to benchmark or
+            to reach a kernel neither would choose. Ranks that disagree on it
             hang -- see the collective contract in the class docstring.
         enable_pdl : bool
             Programmatic dependent launch. **Currently rejected.** The TP8
@@ -565,16 +609,15 @@ class PcieIpcAllReduceWorkspace:
         Raises
         ------
         ValueError
-            If no tuned configuration exists for this shape. Check
-            :meth:`supports` first and fall back to another backend.
+            If the kernels cannot run this shape. Check :meth:`supports` first
+            and fall back to another backend.
         """
         if config is None:
             config = self.tuned_launch_config(inp)
             if config is None:
                 raise ValueError(
-                    f"no tuned configuration for shape {tuple(inp.shape)} "
-                    f"dtype {inp.dtype} at {self.world_size} ranks "
-                    f"(profile {self.profile}); check supports() first"
+                    f"unsupported shape {tuple(inp.shape)} dtype {inp.dtype} "
+                    f"at {self.world_size} ranks; check supports() first"
                 )
         self._check_stream()
         # Raise rather than fall back: a device mismatch is a caller bug, and
@@ -650,9 +693,9 @@ class PcieIpcAllReduceWorkspace:
         ----------
         hiddens : Sequence[int]
             Hidden sizes to tune -- the ones this job will actually run. There
-            is no default: the tables claim open-ended ranges (8 ranks covers
-            every hidden from 6144 up), so there is no finite set to enumerate,
-            and guessing would quietly tune a shape nobody uses.
+            is no default: admission does not constrain the hidden size, so
+            there is no finite set to enumerate, and guessing would quietly tune
+            a shape nobody uses.
 
             The **batch** dimension is not here. It comes from ``tune_batches``
             on the constructor, because the buckets have to be the same on the
@@ -662,8 +705,8 @@ class PcieIpcAllReduceWorkspace:
             Which of the two supported dtypes to measure. Both are 2 bytes so
             the traffic is identical, but they take different conversion paths.
         cache : str, optional
-            Where to persist results. Defaults to
-            ``FLASHINFER_AUTOTUNE_DIR``/``FLASHINFER_WORKSPACE_DIR``.
+            Where to persist results. Defaults to the workspace's
+            ``tune_cache``, which is also where the next process reads them.
         tune_group : ProcessGroup, optional
             Group used to reduce per-candidate timings so every rank picks the
             same winner. Built here as a gloo subgroup when the workspace spans
@@ -684,8 +727,8 @@ class PcieIpcAllReduceWorkspace:
         Raises
         ------
         ValueError
-            If none of ``hiddens`` is a shape the table claims -- otherwise the
-            call is a silent no-op.
+            If none of ``hiddens`` yields a shape the kernels admit -- otherwise
+            the call is a silent no-op.
         """
         from ..autotuner import (
             AutoTuner,
@@ -695,7 +738,7 @@ class PcieIpcAllReduceWorkspace:
         )
 
         hiddens = tuple(int(h) for h in hiddens)
-        path = cache or default_cache_path(self.world_size)
+        path = cache or self._tune_cache
         # Everything the collective profiling contract requires to match, in
         # one gather. A blocklist set on one rank alone silently shortens that
         # rank's candidate list, and the timing reduction then deadlocks on the
@@ -776,17 +819,17 @@ class PcieIpcAllReduceWorkspace:
         if skipped:
             message = (
                 f"tune() measured nothing for hidden {skipped} at "
-                f"{self.world_size} ranks (profile {self.profile}): the table "
-                "does not claim those shapes, and tuning does not widen what "
-                "is supported."
+                f"{self.world_size} ranks: the kernels do not support those "
+                "shapes, and tuning does not widen what is supported."
             )
             if not covered:
                 raise ValueError(message)
             warnings.warn(message, RuntimeWarning, stacklevel=2)
 
         # Winners live in the in-memory cache now, so drop anything this
-        # workspace resolved from the older table.
+        # workspace resolved from the seed.
         self._tuned.clear()
+        self._tuned_configs_loaded = True
         dist.barrier(group=self.group)
         if self.rank == 0:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

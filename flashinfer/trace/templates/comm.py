@@ -335,9 +335,9 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     name_prefix="pcie_ipc_all_reduce",
     description=(
         "Custom all-reduce for intra-node PCIe machines without NVLink. The "
-        "launch configuration comes from a tuning table keyed on the "
-        "interconnect rather than from a runtime threshold, so the traced "
-        "axes are the ones that select it."
+        "launch configuration follows the payload in bytes -- a seed default "
+        "until the workspace is tuned on the machine it runs on -- so the "
+        "traced axes are the ones that select it."
     ),
     axes={
         "num_tokens": Var(description="Token count along dim 0."),

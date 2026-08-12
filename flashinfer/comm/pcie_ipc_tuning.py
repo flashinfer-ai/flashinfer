@@ -15,9 +15,10 @@ limitations under the License.
 
 Autotuning for the PCIe IPC all-reduce.
 
-The hand-written table in :mod:`~flashinfer.comm.pcie_ipc_policy` fits one
-machine. This module measures the same choice instead, over the launch
-configurations the dispatch can actually reach.
+The seed in :mod:`~flashinfer.comm.pcie_ipc_policy` is a default, not a
+measurement: one crossover, and no constants fitted to any machine. This module
+measures the same choice, over the launch configurations the dispatch can
+actually reach.
 
 Two properties of the surrounding code shape everything here:
 
@@ -32,8 +33,9 @@ than raise. So the candidate list is a pure function of group-identical
 arguments, the verification verdict is reduced before it is used, and the
 resolved configuration is checked for group agreement before it is cached.
 
-The table keeps three jobs: it decides which shapes are supported at all, it is
-tactic ``-1``, and it is the fallback whenever a tuned answer cannot be used.
+The policy module keeps three jobs here: admission decides which shapes are
+supported at all, and the seed is both tactic ``-1`` and the fallback whenever a
+tuned answer cannot be used.
 """
 
 import os
@@ -67,9 +69,9 @@ PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 # the FlashInfer version.
 PCIE_IPC_TUNE_VERSION = 1
 
-# Must be able to name every configuration the shipping tables produce, or
-# tuning could only reach the table through tactic -1 rather than explore around
-# it -- hence the entries that are not powers of two.
+# Not all powers of two: the extra entries are block counts the search selected
+# on real hardware, and it cannot converge on a configuration its own grid
+# cannot name.
 TUNE_BLOCKS: Tuple[int, ...] = (1, 2, 4, 8, 12, 16, 32, 64, 96, 128)
 TUNE_THREADS: Tuple[int, ...] = (64, 128, 256, 512, 1024)
 
@@ -83,7 +85,7 @@ TUNE_WARMUP = 10
 TUNE_REPEAT = 50
 
 # Reference tactic. The autotuner reserves -1 for "the fallback that implements
-# any shape"; here that is the hand-written table's own answer.
+# any shape"; here that is the policy module's seed configuration.
 TABLE_TACTIC = -1
 
 # Inputs are drawn from [0, INIT_MAX_VALUE) so the group sum stays integral and
@@ -148,7 +150,7 @@ def resolve_tuned_config(
     world_size: int,
     max_blocks: int,
 ) -> IpcLaunchConfig:
-    """Turn a tactic into a configuration, falling back to the table.
+    """Turn a tactic into a configuration, falling back to the seed.
 
     The autotuner does not check that a cached tactic can implement the shape
     it is being reused for, so a cache written against a larger ``max_blocks``
@@ -192,8 +194,8 @@ def pcie_ipc_tuning_config(batches: Tuple[int, ...] = TUNE_BATCHES) -> TuningCon
     autotuner's profile lookup degenerates.
 
     Only the batch dimension is dynamic. Hidden stays static so it lands
-    verbatim in the cache key -- the table is keyed on an exact hidden size and
-    a bucketed one would silently reuse another shape's answer.
+    verbatim in the cache key -- the configuration follows the payload in bytes,
+    and a bucketed hidden would silently reuse another payload's answer.
     """
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -382,8 +384,8 @@ class PcieIpcAllReduceRunner(TunableRunner):
         ws = self._ws
         table_config = self._table_config(inp)
         if table_config is None:
-            # The autotuner is being asked about a shape the table does not
-            # claim. Nothing to choose between; the caller falls back.
+            # The autotuner is being asked about a shape the kernels cannot run
+            # at all. Nothing to choose between; the caller falls back.
             return [TABLE_TACTIC]
 
         if not self._searchable(inp.device):
@@ -391,7 +393,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
             # caller that only meant to tune its GEMMs. Without a reduction
             # over the candidate timings the ranks would argmin independently
             # and pick different kernels, which this protocol does not survive.
-            # Offering only the table degrades that into a no-op.
+            # Offering only the seed degrades that into a no-op.
             warnings.warn(
                 "PCIe IPC all-reduce skipped autotuning: no matching "
                 "autotune process group is installed on every rank. Call "
@@ -421,12 +423,12 @@ class PcieIpcAllReduceRunner(TunableRunner):
 
         verdict = wrong.tolist()
         if verdict[0]:
-            # The table's own configuration computing the wrong answer is not
-            # something to route around: it is what every untuned shape and
-            # every cache miss falls back to. The verdict is group-wide, so
+            # The seed computing the wrong answer is not something to route
+            # around: it is what every untuned shape and every cache miss falls
+            # back to. The verdict is group-wide, so
             # every rank raises together and the group unwinds cleanly.
             raise RuntimeError(
-                "the tuning table's own configuration for shape "
+                "the seed configuration for shape "
                 f"{tuple(inp.shape)} ({table_config}) does not match a "
                 "reference all-reduce; refusing to tune on top of it"
             )
@@ -445,7 +447,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
         table_config = self._table_config(inp)
         if table_config is None:
             raise RuntimeError(
-                f"shape {tuple(inp.shape)} is not in the tuning table; "
+                f"shape {tuple(inp.shape)} is not one the kernels support; "
                 "the tuner must not have been asked about it"
             )
         config = resolve_tuned_config(

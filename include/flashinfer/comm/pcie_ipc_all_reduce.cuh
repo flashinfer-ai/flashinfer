@@ -449,7 +449,7 @@ __device__ __forceinline__ int flag_offset(int block, int max_blocks, int world_
 // ONE PAIR PER SCRATCH REGION. The hard constraint runs one way only:
 //
 // **Kernels writing the same region MUST share a counter.** TP4 alternates
-// ipc_rsag_push and ipc_rsag_ring with the batch and both write the block
+// ipc_rsag_push and ipc_rsag_ring with the payload and both write the block
 // region at the same addresses, so private counters would let a ring call on
 // half 0 be followed immediately by a push call that also reads 0 -- back to
 // back, with nothing in between to drain the first.
@@ -909,9 +909,13 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
   pdl_grid_release_const<UsePdl>();
 }
 
+// Owner of a pack under the reduce-scatter split. Must agree with the explicit
+// chunk ranges the same kernels walk, which give the remainder to the last rank
+// -- so `part == 0` (fewer packs than ranks) gives it the whole payload too.
+// Writing to one owner and polling another spins forever: no timeout here.
 template <int WorldSize>
 __device__ __forceinline__ int rsag_owner_for_pack(int idx, int part) {
-  int owner = part > 0 ? idx / part : 0;
+  int owner = part > 0 ? idx / part : WorldSize - 1;
   return owner < WorldSize ? owner : WorldSize - 1;
 }
 
@@ -932,8 +936,7 @@ __device__ __forceinline__ int rsag_owner_for_pack(int idx, int part) {
 // without it they drift and the passes overlap back into all-to-all.
 //
 // The cost is 2*(WorldSize-1) barriers per collective, which is why the policy
-// only selects this variant once the payload is large enough to pay for them;
-// below that the unstaged kernel wins.
+// only selects this variant once the payload is large enough to pay for them.
 // Keep the established phase numbering for this kernel. Epoch slots and
 // barrier phases have separate ranges in the signal region (see
 // phase_offset), so phase 1 is no longer needed for alias avoidance.
@@ -1724,6 +1727,8 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_block_param_kernel(
                                self_signal + flag_offset(blockIdx.x, params.max_blocks, 8))) +
                            1u);
 
+  // The caller's `blocks % 4 == 0` check is what keeps `blocks_per_chunk`
+  // non-zero; a zero stride below never advances the grid-stride loops.
   int chunk = blockIdx.x & 3;
   int chunk_block = blockIdx.x >> 2;
   int blocks_per_chunk = gridDim.x >> 2;
@@ -1738,8 +1743,8 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_block_param_kernel(
   // Call-level double buffer, for the same reason as the ring kernel: the
   // phase 4 ack only covers this island, so nothing orders this rank's cross
   // read against the paired owner's next-call cross write. Both TP8 kernels
-  // share this counter on purpose -- the tuning table switches between them by
-  // batch, and a counter advanced by only one of them would let a call land on
+  // share this counter on purpose -- which one runs changes with the payload,
+  // and a counter advanced by only one of them would let a call land on
   // a half two calls old.
   int32_t* scratch_state = params.scratch_state;
   int32_t* epoch_slot =
@@ -2117,9 +2122,9 @@ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t str
   return cudaGetLastError();
 }
 
-// Kernel selection. `variant` comes from the caller's tuning table rather than
-// from a threshold here, because the crossovers depend on the fabric and are
-// measured per machine.
+// Kernel selection. `variant` is picked by the caller rather than by a
+// threshold here, because the crossovers depend on the fabric and are measured
+// per machine.
 //
 //   world  variant       kernel
 //     2    kUnstaged     ipc_tp2_remote_push_kernel<false>     (block scratch)
