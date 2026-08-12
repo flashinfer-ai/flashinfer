@@ -5244,18 +5244,27 @@ def _compiled_cuda_library(compiled):
     only have the ``.to(None).jit_module.cuda_library`` chain, kept so a
     caller passing explicit ``options`` is not broken.
     """
-    # TODO: verify on sm12x hardware. The attribute surface was confirmed on a
-    # T4 (a --enable-tvm-ffi compile exposes `.library`, and the old
-    # `.to(None).jit_module` is None there), but the full
-    # cudaLibraryGetKernel + cuKernelGetAttribute round-trip has not been run
-    # against a real direct-micro compile on SM120/SM121.
-    # ``.library`` raises rather than returning None when the compile produced
-    # no gpu.module, so the legacy chain has to be reached through except, not
-    # through a getattr default.
+    # A --enable-tvm-ffi compile never populates ``jit_module``: launches go
+    # through the TVM-FFI entry rather than ``CudaDialectJitModule``, so both
+    # the ``.library`` property and the legacy chain below come up empty even
+    # though ``has_gpu_module`` is True and ``kernel_info`` is populated
+    # (measured on an H100). ``_load_cuda_library()`` is how the DSL itself
+    # materializes the library in that state -- it reads the engine's
+    # ``cuda_init`` / ``cuda_load_to_device`` symbols directly and does not
+    # touch ``jit_module``.
+    if getattr(compiled, "has_gpu_module", False):
+        loader = getattr(compiled, "_load_cuda_library", None)
+        if loader is not None:
+            libraries = loader()
+            if libraries:
+                return libraries[0]
+
+    # Non-TVM-FFI compiles: the public property, which lazily materializes the
+    # library and raises (rather than returning None) for a host-only compile.
     try:
         library = compiled.library
     except AttributeError:
-        library = None  # pre-TVM-FFI object: no such property
+        library = None  # older object: no such property
     except RuntimeError:
         return None  # compiled, but genuinely has no device module
     if library is not None:
