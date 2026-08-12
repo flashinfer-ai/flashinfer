@@ -73,6 +73,7 @@ NVFP4_NAME_BASELINE = {
     "silu_and_mul": False,
     "nvfp4_4over6_config": None,
     "global_scale_is_tensor": True,
+    "fold_out_scale": False,
 }
 NVFP4_NAME_PERTURBED = {
     "variant": "linear",
@@ -84,6 +85,7 @@ NVFP4_NAME_PERTURBED = {
     "silu_and_mul": True,
     "nvfp4_4over6_config": NVFP44Over6Config(),
     "global_scale_is_tensor": False,
+    "fold_out_scale": True,
 }
 
 

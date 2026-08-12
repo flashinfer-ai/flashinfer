@@ -1469,6 +1469,7 @@ def _nvfp4_kernel_name(
     silu_and_mul: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     global_scale_is_tensor: bool = True,
+    fold_out_scale: bool = False,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
@@ -1484,6 +1485,8 @@ def _nvfp4_kernel_name(
         cfg = nvfp4_4over6_config
         err_mode = getattr(cfg.err_mode, "name", cfg.err_mode)
         name += f"_4over6_{cfg.e4m3_max}_{err_mode}_{int(cfg.err_use_fast_math)}"
+    if fold_out_scale:
+        name += "_folded"
     return name
 
 
@@ -1679,7 +1682,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         _nvfp4_kernel_name(
-            "per_token_folded" if fold_out_scale else "per_token",
+            "per_token",
             dtype_key,
             K,
             sf_layout,
@@ -1687,6 +1690,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             disable_fp4_quant_fast_math,
             silu_and_mul=False,
             nvfp4_4over6_config=nvfp4_4over6_config,
+            fold_out_scale=fold_out_scale,
         ),
         lambda: cute.compile(
             kernel_obj,
