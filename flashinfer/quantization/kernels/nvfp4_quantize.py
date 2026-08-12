@@ -39,7 +39,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import torch
-from cutlass import Float32, Int32, Uint8
+from cutlass import Float32, Int32, Int64, Uint8
 
 from ...api_logging import flashinfer_api
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -786,7 +786,35 @@ class NVFP4QuantizePerTokenKernel:
         row_idx = bidx
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
-        row_input = mInput[row_idx, None]
+        # Build the row views from 64-bit byte addresses. Slicing with
+        # mInput[row_idx, None] computes the row offset row_idx * K in
+        # Int32, which wraps once row_idx * K exceeds 2**31 - 1 (reached by
+        # the MoE per-token intermediate, e.g. M=851456 x K=2688) and makes
+        # the loads fault.
+        input_row_addr = get_ptr_as_int64(mInput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K * (mInput.element_type.width // 8)
+        )
+        row_input = cute.make_tensor(
+            cute.make_ptr(
+                mInput.element_type,
+                input_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            cute.make_layout((self.K,)),
+        )
+        output_row_addr = get_ptr_as_int64(mOutput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K // 2
+        )
+        row_output = cute.make_tensor(
+            cute.make_ptr(
+                mOutput.element_type,
+                output_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=8,
+            ),
+            cute.make_layout((self.K // 2,)),
+        )
 
         local_amax = Float32(0.0)
         sf_col_idx = tidx
@@ -840,7 +868,6 @@ class NVFP4QuantizePerTokenKernel:
             sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
             mScales[sf_offset] = scale_fp8
 
-            row_output = mOutput[row_idx, None]
             out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
             out_ptr = get_ptr_as_int64(row_output, out_base)
             st_global_u64(out_ptr, packed64)
@@ -1038,13 +1065,12 @@ class NVFP4QuantizeTMAKernel:
         global_scale: Union[Float32, cute.Tensor],
         stream,
     ):
-        # 3D global tensor: [padded_M, K/64, 64] so each warp's 64-col
-        # stripe is the contiguous innermost dimension, matching the CUDA
-        # TMA kernel's 3D tensor map.
+        # TMA zero-fills rows beyond the physical input extent while the kernel
+        # visits padded_M rows required by the scale layout.
         gInput = cute.make_tensor(
             mInput.iterator,
             cute.make_layout(
-                (padded_M, self.K // _TMA_COL_TILE, _TMA_COL_TILE),
+                (M, self.K // _TMA_COL_TILE, _TMA_COL_TILE),
                 stride=(self.K, _TMA_COL_TILE, 1),
             ),
         )
@@ -1694,10 +1720,9 @@ def _get_compiled_kernel_nvfp4_tma(
     )
 
     sym_m = cute.sym_int()
-    sym_padded_m = cute.sym_int()
 
     input_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype, (sym_padded_m, K), stride_order=(1, 0), assumed_align=16
+        cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
@@ -1874,20 +1899,13 @@ def nvfp4_quantize_cute_dsl(
             (padded_m + rows_per_block - 1) // rows_per_block, tma_target_grid
         )
 
-        input_padded = input
-        if padded_m > m:
-            input_padded = torch.zeros(
-                padded_m, k, dtype=input.dtype, device=input.device
-            )
-            input_padded[:m, :] = input
-
         fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
         scale_output = torch.empty(
             scale_output_size, dtype=torch.uint8, device=input.device
         )
 
         kernel_fn(
-            input_padded,
+            input,
             fp4_output,
             scale_output,
             m,

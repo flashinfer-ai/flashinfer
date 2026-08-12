@@ -78,11 +78,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeBias = dtypeBias;
     routingData.mRouteScale = routedScalingFactor;
     // Floor the renorm denominator. ScaledSumNormalizePostprocess computes
-    // sigmoid * routeScale / (sum + mSumEpsilon). If a token's top-K selected experts all have
-    // strongly negative pre-bias logits, their sigmoids underflow to exactly 0.0 (bf16) so sum ==
-    // 0, and mSumEpsilon's 0.0f default makes this 0/0 = NaN across the token's whole output row.
-    // 1e-20f matches DeepSeek-V3's reference gate (modeling_deepseek.py: sum + 1e-20) and the
-    // MiniMax2 branch.
+    // sigmoid(raw) * routeScale / (sum + mSumEpsilon). If every selected
+    // expert contributes a zero sigmoid after underflow, the 0.0f default
+    // makes this 0/0 = NaN across the token's output row. 1e-20f matches the
+    // adjacent MiniMax2 path and prevents that zero-denominator case.
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
@@ -719,6 +718,14 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 
+  // SwiGLU OAI controls. The fused-epilogue paths get these through the FC1 GEMM instead; this
+  // kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry them.
+  activationData.gatedActAlphaPtr = args.gemm1_alpha;
+  activationData.gatedActBetaPtr = args.gemm1_beta;
+  activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
+  activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
+  activationData.tileTokensDim = workspace.ProjUpTileN;
+
   // Setup finalize data
   if (args.do_finalize) {
     // Setup finalize data
@@ -841,22 +848,28 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   int32_t* permutedIdxToBiasRowIdx = args.gemm1_bias_type == batchedGemm::gemm::BiasType::Mn
                                          ? workspace.permuted_idx_to_expanded_idx
                                          : nullptr;
+  // DeepSeek FP8 activates in a separate kernel (see below), which owns the SwiGLU OAI controls.
+  // Keep them out of the FC1 GEMM there so they can only ever be applied once.
+  bool const useUnfusedActivation = args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8;
+  float* const gemm1Alpha = useUnfusedActivation ? nullptr : args.gemm1_alpha;
+  float* const gemm1Beta = useUnfusedActivation ? nullptr : args.gemm1_beta;
+  float* const gemm1ClampLimit = useUnfusedActivation ? nullptr : args.gemm1_clamp_limit;
   mPermuteGemm1.run(
       args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
       workspace.token_scales, /* perChannelScales */ nullptr, args.output1_scales_scalar,
-      args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
-      args.gemm1_clamp_limit, permutedIdxToBiasRowIdx, workspace.gemm1_output,
-      workspace.gemm1_output_scale, totalExpertsPerToken, args.hidden_size, args.intermediate_size,
-      totalLocalExperts, args.num_tokens, workspace.permuted_idx_to_token_idx,
-      workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
-      workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-      args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
+      args.output1_scales_gate_scalar, args.gemm1_bias, gemm1Alpha, gemm1Beta, gemm1ClampLimit,
+      permutedIdxToBiasRowIdx, workspace.gemm1_output, workspace.gemm1_output_scale,
+      totalExpertsPerToken, args.hidden_size, args.intermediate_size, totalLocalExperts,
+      args.num_tokens, workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
+      workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+      workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace, args.mUseRoutingScalesOnInput,
+      device, stream, config.gemm1Config, enable_pdl);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
   void* gemm2_input_scale = workspace.gemm1_output_scale;
   // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
-  if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8) {
+  if (useUnfusedActivation) {
     // Run activation
     moe::dev::activation::run(activationData, stream);
     gemm2_input = workspace.activation_output;

@@ -40,8 +40,10 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 from .utils import (
     check_accuracy,
     compute_reference_moe_fp4,
+    compute_reference_moe_mxfp4_w4a4,
     compute_reference_moe_relu2,
     create_b12x_moe_tensors as create_moe_tensors,
+    create_b12x_mxfp4_moe_tensors,
     create_relu2_moe_tensors,
     quant_dequant_fp4_reference,
 )
@@ -102,6 +104,95 @@ def _clear_static_cutover_env(monkeypatch):
 # =============================================================================
 # Unit regressions for SM120 dispatch decisions
 # =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, True),
+        ({"activation": "relu2"}, False),
+        ({"sf_vec_size": 8}, False),
+        ({"mma_tiler_mn": (64, 128)}, False),
+        ({"hidden_size": 16384}, True),
+        ({"hidden_size": 16385}, False),
+        ({"intermediate_size": 512}, True),
+        ({"intermediate_size": 640}, False),
+        ({"num_topk": 16}, True),
+        ({"num_topk": 17}, False),
+        ({"num_topk": 32, "share_input_across_experts": True}, True),
+        ({"num_topk": 33, "share_input_across_experts": True}, False),
+    ],
+)
+def test_gated_dynamic_optimized_capability_bounds(overrides, expected):
+    """Unsafe Q0/Q1 and route-cache shapes must use the generic fallback."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+        _can_use_gated_optimized_kernel,
+    )
+
+    kwargs = dict(
+        activation="silu",
+        sf_vec_size=16,
+        mma_tiler_mn=(128, 128),
+        hidden_size=4096,
+        intermediate_size=512,
+        num_topk=10,
+        share_input_across_experts=False,
+    )
+    kwargs.update(overrides)
+
+    assert _can_use_gated_optimized_kernel(**kwargs) is expected
+
+
+@cute_dsl_available
+def test_gated_dynamic_constructor_rejects_unsupported_geometry():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
+        MoEGatedDynamicKernel,
+    )
+
+    with pytest.raises(ValueError, match="16-element scale blocks"):
+        MoEGatedDynamicKernel(sf_vec_size=8, mma_tiler_mn=(128, 128))
+    with pytest.raises(ValueError, match="M128xN128"):
+        MoEGatedDynamicKernel(sf_vec_size=16, mma_tiler_mn=(256, 128))
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "overrides,expected_gated",
+    [
+        ({}, True),
+        ({"hidden_size": 16512}, False),
+        ({"intermediate_size": 640}, False),
+        ({"num_topk": 17}, False),
+        ({"num_topk": 32, "share_input_across_experts": True}, True),
+        ({"num_topk": 33, "share_input_across_experts": True}, False),
+    ],
+)
+def test_dynamic_kernel_factory_falls_back_for_unsupported_gated_shapes(
+    overrides, expected_gated
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
+        MoEGatedDynamicKernel,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+        MoEDynamicKernel,
+    )
+
+    kwargs = dict(
+        sf_vec_size=16,
+        mma_tiler_mn=(128, 128),
+        activation="silu",
+        hidden_size=4096,
+        intermediate_size=512,
+        num_topk=10,
+        share_input_across_experts=False,
+    )
+    kwargs.update(overrides)
+
+    kernel = MoEDynamicKernel(**kwargs)
+    assert isinstance(kernel, MoEGatedDynamicKernel) is expected_gated
+    if kwargs["num_topk"] > 32:
+        assert kernel.share_input_across_experts is False
 
 
 @cute_dsl_available
@@ -300,6 +391,7 @@ def test_w4a16_direct_micro_shape_guard_rejects_cached_wide_shape(monkeypatch):
     ) = moe_dispatch._w4a16_workspace_geometry(
         routed_rows=routed_rows,
         route_num_experts=32,
+        num_topk=8,
         k=4096,
         n=4096,
         is_gated=True,
@@ -625,6 +717,187 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
 @cuda_13_required
 class TestB12xFunctional:
     """Tests for the functional API: b12x_fused_moe."""
+
+    def test_mxfp4_static_functional_accuracy(self):
+        """Native block-32 MXFP4 must cover the normal static dispatch path."""
+        from flashinfer import b12x_fused_moe
+
+        # One expert forces more than one physical M tile and guards the
+        # block-32 scale-factor tile stride as well as the common static path.
+        num_tokens = 256
+        hidden_size = intermediate_size = 256
+        num_experts, top_k = 1, 1
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        actual = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            quant_mode="mxfp4",
+        )
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"MXFP4 static: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    def test_mxfp4_intermediate_padding_accuracy(self):
+        """MXFP4 weight scales must remain valid across gate/up tile padding."""
+        from flashinfer import b12x_fused_moe
+
+        num_tokens = 32
+        hidden_size, intermediate_size = 256, 192
+        num_experts, top_k = 4, 2
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=2028,
+        )
+        actual = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=None,
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            quant_mode="mxfp4",
+        )
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"MXFP4 padded: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "num_experts", "expected_backend", "expected_tile_m"),
+        [
+            (4, 8, "static", None),
+            (321, 64, "dynamic", 16),
+            (321, 32, "dynamic", 32),
+            (321, 8, "dynamic", 64),
+            (321, 4, "dynamic", 128),
+        ],
+    )
+    def test_mxfp4_micro_and_dynamic_accuracy(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        expected_backend: str,
+        expected_tile_m: int | None,
+        monkeypatch,
+    ):
+        """MXFP4 covers MMA micro and every dynamic tile-M variant."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        def reject_direct_micro(*args, **kwargs):
+            raise AssertionError("MXFP4 must not enter the NVFP4 direct-micro path")
+
+        monkeypatch.setattr(
+            moe_dispatch, "_get_direct_micro_kernel", reject_direct_micro
+        )
+        select_sm120_moe_backend = moe_dispatch.select_sm120_moe_backend
+
+        hidden_size = intermediate_size = 256
+        top_k = 2
+        assert (
+            select_sm120_moe_backend(
+                num_tokens=num_tokens, num_topk=top_k, quant_mode="mxfp4"
+            )
+            == expected_backend
+        )
+        if expected_tile_m is not None:
+            assert (
+                moe_dispatch._select_dynamic_tile_m(num_tokens * top_k, num_experts)
+                == expected_tile_m
+            )
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=43 + num_tokens,
+        )
+
+        actual = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            quant_mode="mxfp4",
+        )
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"MXFP4 {expected_backend}: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
 
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
@@ -1273,6 +1546,84 @@ class TestB12xFunctional:
             f"a16={a16_mse.item():.6f}, a4={a4_mse.item():.6f}"
         )
 
+    def test_dynamic_tile_ladder_reengages_after_large_call(self, monkeypatch):
+        """A cached large dynamic workspace must not pin later small calls to
+        the 128 M-tile: each tile band keeps its own cached workspace, and the
+        kernel build reads the tile from the workspace it runs with."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "dynamic")
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 8, 2
+        # routed_rows = 1024 >= 96 * 8 selects the 128 tile; 16 < 15 * 8
+        # selects the 16 tile.
+        large_tokens, small_tokens = 512, 8
+
+        def run(num_tokens: int) -> None:
+            tensors = create_moe_tensors(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            result = b12x_fused_moe(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+            ref_output = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"].float().cuda(),
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+            )
+            passed, percent_within, atol = check_accuracy(result, ref_output)
+            assert passed, (
+                f"Dynamic tile ladder: {percent_within * 100:.2f}% within "
+                f"tolerance (atol={atol:.4f}, tokens={num_tokens})"
+            )
+
+        def cached_workspace(num_tokens: int):
+            return moe_dispatch._get_cached_workspace(
+                backend="dynamic",
+                state_E=num_experts,
+                weight_E=num_experts,
+                routed_rows=num_tokens * top_k,
+                k=hidden_size,
+                n=intermediate_size,
+                num_topk=top_k,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+
+        run(large_tokens)
+        ws_large = cached_workspace(large_tokens)
+        assert ws_large.tile_m == 128
+
+        run(small_tokens)
+        ws_small = cached_workspace(small_tokens)
+        assert ws_small is not ws_large
+        assert ws_small.tile_m == 16
+
 
 # =============================================================================
 # Test Class: Wrapper API (B12xMoEWrapper)
@@ -1284,6 +1635,68 @@ class TestB12xFunctional:
 @cuda_13_required
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
+
+    def test_mxfp4_wrapper_cuda_graph_accuracy(self):
+        """MXFP4 dynamic workspace must be capture-safe and replay accurately."""
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens = 321
+        hidden_size = intermediate_size = 256
+        num_experts, top_k = 8, 2
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=2027,
+        )
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            quant_mode="mxfp4",
+        )
+        kwargs = {
+            "x": tensors["x_bf16"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": None,
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+        }
+
+        moe.run(**kwargs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = moe.run(**kwargs)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"MXFP4 CUDA Graph: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
 
     @pytest.mark.parametrize(
         "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
@@ -1782,6 +2195,91 @@ class TestMicroKernel:
         assert passed, (
             f"Micro wrapper: {percent_within * 100:.2f}% within tolerance "
             f"(atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        "activation,num_tokens,top_k",
+        [
+            ("silu", 1, 2),
+            ("silu", 2, 2),
+            ("silu", 8, 2),
+            ("silu", 1, 8),
+            ("silu", 2, 8),
+            ("silu", 8, 8),
+            ("gelu_tanh", 1, 2),
+            ("gelu_tanh", 8, 2),
+            ("swigluoai_uninterleave", 1, 2),
+            ("swigluoai_uninterleave", 8, 2),
+        ],
+    )
+    def test_direct_micro_forced_accuracy(
+        self, monkeypatch, activation: str, num_tokens: int, top_k: int
+    ):
+        """Accuracy of the forced direct micro backend on tiny decode shapes.
+
+        The forced hook raises instead of falling back, so a pass means the
+        direct micro kernel produced the result.
+        """
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "direct_micro")
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 256
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Direct micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, act={activation}, tokens={num_tokens}, "
+            f"top_k={top_k})"
         )
 
     @pytest.mark.parametrize("num_tokens", [1, 2, 4])
@@ -2377,6 +2875,125 @@ class TestRelu2Activation:
         assert passed, (
             f"ReLU2 micro: {percent_within * 100:.2f}% within tolerance "
             f"(atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("num_tokens", [1, 4])
+    def test_relu2_direct_micro_forced_accuracy(self, monkeypatch, num_tokens: int):
+        """Forced direct micro backend with the non-gated ReLU2 activation."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "direct_micro")
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation="relu2",
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 direct micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
+    def test_relu2_direct_micro_ignores_swiglu_limit(self, monkeypatch):
+        """A caller-supplied swiglu_limit must be accepted and ignored for
+        relu2 on the direct micro path, like on the MMA kernels."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "direct_micro")
+
+        num_tokens, hidden_size, intermediate_size = 2, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation="relu2",
+            swiglu_limit=7.0,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 with ignored swiglu_limit: {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f})"
         )
 
     def test_relu2_w4a16_direct_micro_accuracy(self):
