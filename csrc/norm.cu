@@ -218,7 +218,13 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
   TVM_FFI_ICHECK_EQ(normed_out.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(block_scale.size(0), hidden_size / 128);
   TVM_FFI_ICHECK_EQ(block_scale.size(1), m_pad);
-  TVM_FFI_ICHECK_EQ(hidden_size % 128, 0);
+  // Kernel covers each row single-wave with no per-thread bounds guard: hidden_size must be a whole
+  // number of warps of vectors -> <= 16384 and a multiple of 32*vec_size (256 for <=8192, 512
+  // above).
+  unsigned int vec_size = hidden_size <= 8192 ? 8 : 16;
+  TVM_FFI_ICHECK(hidden_size <= 16384 && hidden_size % (32 * vec_size) == 0)
+      << "fused_add_rmsnorm_fp8_block_quant: hidden_size " << hidden_size
+      << " unsupported (must be <= 16384 and a multiple of " << (32 * vec_size) << ")";
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 
@@ -230,7 +236,7 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
         static_cast<c_type*>(weight.data_ptr()), static_cast<__nv_fp8_e4m3*>(output.data_ptr()),
         static_cast<float*>(block_scale.data_ptr()), static_cast<c_type*>(normed_out.data_ptr()),
         batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0),
-        block_scale.stride(0), eps, enable_pdl, stream);
+        normed_out.stride(0), block_scale.stride(0), eps, enable_pdl, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "FusedAddRMSNormFP8BlockQuant failed with error code " << cudaGetErrorString(status);
     return true;

@@ -691,7 +691,7 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
     T* __restrict__ input, T* __restrict__ residual, T* __restrict__ weight, O* __restrict__ output,
     float* __restrict__ block_scale, T* __restrict__ normed_out, const uint32_t d,
     const uint32_t stride_input, const uint32_t stride_residual, const uint32_t stride_output,
-    const uint32_t scale_stride_m, float eps) {
+    const uint32_t stride_normed, const uint32_t scale_stride_m, float eps) {
   constexpr uint32_t kQuantBlock = 128;
   constexpr uint32_t kLanesPerBlock = kQuantBlock / VEC_SIZE;  // threads covering one 1x128 block
   const uint32_t bx = blockIdx.x;                              // token row m
@@ -748,7 +748,7 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
     normed_vec[j] = nb;
     lamax = fmaxf(lamax, fabsf(normed[j]));
   }
-  normed_vec.store(normed_out + bx * stride_output + col);
+  normed_vec.store(normed_out + bx * stride_normed + col);
 
   // amax over the 1x128 block: kLanesPerBlock consecutive lanes reduce within their warp subgroup.
 #pragma unroll
@@ -771,17 +771,21 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
 }
 
 // Host launcher. VEC_SIZE is chosen by d so num_threads = d/VEC_SIZE <= 1024 (single wave), with
-// 128 % VEC_SIZE == 0 for the block reduction. Caller must ensure d % (32*VEC_SIZE) == 0 and
-// d % 128 == 0 (VEC_SIZE=8 for d<=8192 -> d%256==0; VEC_SIZE=16 for d<=16384 -> d%512==0).
-// scale_stride_m = round_up(batch_size, 4) (the block_scale column stride, elements).
+// 128 % VEC_SIZE == 0 for the block reduction. The kernel has no per-thread bounds guard, so d must
+// be a whole number of warps of vectors: d <= 16384 and d % (32*VEC_SIZE) == 0 (VEC_SIZE=8 for
+// d<=8192 -> d%256==0; VEC_SIZE=16 for d<=16384 -> d%512==0). Returns cudaErrorInvalidValue
+// otherwise. scale_stride_m = round_up(batch_size, 4) (the block_scale column stride, elements).
 template <typename T, typename O>
 cudaError_t FusedAddRMSNormFP8BlockQuant(T* input, T* residual, T* weight, O* output,
                                          float* block_scale, T* normed_out, uint32_t batch_size,
                                          uint32_t d, uint32_t stride_input,
                                          uint32_t stride_residual, uint32_t stride_output,
-                                         uint32_t scale_stride_m, float eps = 1e-5,
-                                         bool enable_pdl = false, cudaStream_t stream = 0) {
+                                         uint32_t stride_normed, uint32_t scale_stride_m,
+                                         float eps = 1e-5, bool enable_pdl = false,
+                                         cudaStream_t stream = 0) {
   const uint32_t vec_size = (d <= 8192) ? 8 : 16;  // num_threads = d/vec_size <= 1024
+  if (d == 0 || d > 16384 || d % (32 * vec_size) != 0)
+    return cudaErrorInvalidValue;  // kernel covers the row single-wave with no bounds guard
   const uint32_t num_threads = d / vec_size;
   const uint32_t num_warps = ceil_div(num_threads, 32);
   dim3 nblks(batch_size);
@@ -801,9 +805,9 @@ cudaError_t FusedAddRMSNormFP8BlockQuant(T* input, T* residual, T* weight, O* ou
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormFP8BlockQuantKernel<VEC_SIZE, T, O>;
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, output,
-                                            block_scale, normed_out, d, stride_input,
-                                            stride_residual, stride_output, scale_stride_m, eps));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &config, kernel, input, residual, weight, output, block_scale, normed_out, d, stride_input,
+        stride_residual, stride_output, stride_normed, scale_stride_m, eps));
   });
   return cudaSuccess;
 }
