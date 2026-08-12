@@ -5249,7 +5249,15 @@ def _compiled_cuda_library(compiled):
     # `.to(None).jit_module` is None there), but the full
     # cudaLibraryGetKernel + cuKernelGetAttribute round-trip has not been run
     # against a real direct-micro compile on SM120/SM121.
-    library = getattr(compiled, "library", None)
+    # ``.library`` raises rather than returning None when the compile produced
+    # no gpu.module, so the legacy chain has to be reached through except, not
+    # through a getattr default.
+    try:
+        library = compiled.library
+    except AttributeError:
+        library = None  # pre-TVM-FFI object: no such property
+    except RuntimeError:
+        return None  # compiled, but genuinely has no device module
     if library is not None:
         return library
 
