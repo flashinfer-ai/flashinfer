@@ -828,9 +828,8 @@ class TestBuiltInRunnerLifecycle:
             def __init__(self, **kwargs):
                 events.append(("build", kwargs))
                 self.tuning_config = tuning_config
-
-            def __hash__(self):
-                return 0
+                self.use_fused_finalize = kwargs["use_fused_finalize"]
+                self.enable_pdl = kwargs["enable_pdl"]
 
         monkeypatch.setattr(tuner, "CuteDslFusedMoENvfp4Runner", Inner)
         monkeypatch.setattr(fused_moe, "_cute_dsl_fused_moe_nvfp4_impl", object())
@@ -849,7 +848,7 @@ class TestBuiltInRunnerLifecycle:
         assert len(events) == 1
         assert runner._built
         assert runner.tuning_config is tuning_config
-        assert hash(runner) == hash(("cute_dsl_nvfp4", 0))
+        assert hash(runner) == hash(runner.get_cache_key_extras([]))
 
 
 # ---------------------------------------------------------------------------

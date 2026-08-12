@@ -339,10 +339,10 @@ class _CutlassRunnerBase(MoERunner):
     _use_w4_group_scaling: ClassVar[bool]
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
-    # Keep top-k tactics per GEMM stage, then return their Cartesian product as
-    # compound candidates for the outer end-to-end autotuner. k=1 preserves the
-    # legacy independent-winner behavior.
-    _stage_tactic_top_k: ClassVar[int] = 2
+    # Keep the best N tactics per GEMM stage, then return their Cartesian
+    # product as compound candidates for the outer end-to-end autotuner. N=1
+    # preserves the legacy independent-winner behavior.
+    _num_top_tactics_per_stage: ClassVar[int] = 2
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -448,14 +448,14 @@ class _CutlassRunnerBase(MoERunner):
         self._require_built()
         self._validate_input_count(inputs)
         # The two GEMMs have independent tactic spaces. Preserve the legacy
-        # O(n1+n2) stage search, keep the top-k tactics per stage, then let the
-        # outer unified tuner profile only the k² compound pairs end-to-end.
+        # O(n1+n2) stage search, keep the best N tactics per stage, then let the
+        # outer unified tuner profile only the N² compound pairs end-to-end.
         # FIXME: Prefer a first-class factorized/multi-stage autotuner API so
         # runners do not need to nest stage ranking inside get_valid_tactics().
         tuner = AutoTuner.get()
         profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
         stage_tuning_config = TuningConfig()
-        top_k = self._stage_tactic_top_k
+        num_top_tactics = self._num_top_tactics_per_stage
         try:
             self._inner.gemm_idx_for_tuning = 1
             gemm1_tactics = tuner.rank_tactics(
@@ -463,7 +463,7 @@ class _CutlassRunnerBase(MoERunner):
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
-                k=top_k,
+                k=num_top_tactics,
                 gemm_idx=1,
             )
             self._inner.gemm_idx_for_tuning = 2
@@ -472,7 +472,7 @@ class _CutlassRunnerBase(MoERunner):
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
-                k=top_k,
+                k=num_top_tactics,
                 gemm_idx=2,
             )
         finally:
@@ -1000,6 +1000,7 @@ class CuteDslNvfp4Runner(MoERunner):
                 "CuteDslNvfp4Runner activation inputs must match W4A4, "
                 "W4A4 per-token, or W4A16"
             )
+
 
 # ---------------------------------------------------------------------------
 # TRTLLM runners — shared module lifecycle, shape-specific inner runners
