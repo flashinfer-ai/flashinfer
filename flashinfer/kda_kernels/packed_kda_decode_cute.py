@@ -2138,7 +2138,6 @@ def _use_packed_fma() -> bool:
 # tile_v thresholds on work_units = B * H: bigger tiles amortise the q/k/gate
 # staging and CTA overheads, smaller tiles add CTAs so small batches still
 # fill the SMs. Tuned on B200 (see benchmarks/bench_packed_kda_decode.py).
-_TILE_V_OVERRIDE = os.environ.get("FLASHINFER_PACKED_KDA_TILE_V")
 
 
 # Benchmark-override schedules: the best-known (ilp, groups, stages, evict)
@@ -2182,8 +2181,10 @@ def _select_config(
         cfg = (128, 2, 8, 5, False)
 
     tile_v, ilp_rows, num_groups, stages, evict = cfg
-    if _TILE_V_OVERRIDE:
-        tile_v = int(_TILE_V_OVERRIDE)
+    # Looked up per call, like every other tuning override below.
+    tile_v_env = os.environ.get("FLASHINFER_PACKED_KDA_TILE_V")
+    if tile_v_env:
+        tile_v = int(tile_v_env)
         ilp_rows = max(1, min(4, tile_v // _NUM_GROUPS))
         num_groups = _NUM_GROUPS
     ilp_env = os.environ.get("FLASHINFER_PACKED_KDA_ILP")
