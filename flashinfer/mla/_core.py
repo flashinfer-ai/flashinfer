@@ -2520,7 +2520,10 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     "ckv_scale_arr is only valid when kv_data_type is FP8."
                 )
-            expected_scale_shape = ckv_cache.shape[:-1] + (self._head_dim_ckv // 128,)
+            expected_scale_shape = (
+                *ckv_cache.shape[:-1],
+                self._head_dim_ckv // 128,
+            )
             check_shape_dtype_device(
                 ckv_scale_arr,
                 expected_scale_shape,

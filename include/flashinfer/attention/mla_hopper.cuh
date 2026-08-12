@@ -389,14 +389,12 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(
                                                                                           col)];
     alignas(16) DTypeQ conv[16];
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
-    float scale = ckv_scale;
     if (ckv_scale_arr) {
       uint32_t page, off;
       block_size.divmod(row_base + row, page, off);
       uint32_t phys = (row_base + row) < packed_kv_bound ? kv_indices[page] * block_size + off : 0;
-      scale = ckv_scale_arr[phys * (HEAD_DIM_CKV / 128) + col / (128 / upcast_size<DTypeKV>())];
-    }
-    if (ckv_scale_arr) {
+      float scale =
+          ckv_scale_arr[phys * (HEAD_DIM_CKV / 128) + col / (128 / upcast_size<DTypeKV>())];
 #pragma unroll
       for (uint32_t k = 0; k < 16; ++k) {
         conv[k] = static_cast<DTypeQ>(static_cast<float>(conv[k]) * scale);

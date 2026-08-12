@@ -1283,7 +1283,8 @@ def test_batch_mla_fp8_kv_zero_kv_gives_zero_output():
     assert o.abs().max().item() == 0.0, f"non-zero output: {o.abs().max().item()}"
 
 
-def test_fp8_kv_kpe_dominant_no_row_aliasing():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_fp8_kv_kpe_dominant_no_row_aliasing(backend):
     """Deterministic regression for the FP8 KPE shmem swizzle aliasing bug.
 
     With HEAD_DIM_KPE=64 on the FP8 path, the raw KPE buffer has 4 b128
@@ -1327,7 +1328,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
     kv_indices = torch.arange(0, nps, dtype=torch.int32, device=device)
 
     o_bf16 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_ref,
@@ -1344,7 +1345,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
         kv_dtype=torch.bfloat16,
     )
     o_fp8 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,

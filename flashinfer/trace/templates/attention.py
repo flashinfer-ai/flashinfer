@@ -1425,6 +1425,7 @@ def _mla_paged_decode_init(
     num_pages_per_seq: int = 4,
     len_indptr: int = 0,
     num_kv_indices: int = 0,
+    ckv_scale_groups: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1433,7 +1434,7 @@ def _mla_paged_decode_init(
     Sourced from ``tests/trace/example.py`` MLA section. Default
     ``num_qo_heads=16`` matches DeepSeek-V3 TP=8.
     """
-    del num_pages, len_indptr, num_kv_indices
+    del num_pages, len_indptr, num_kv_indices, ckv_scale_groups
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
@@ -1504,6 +1505,7 @@ mla_paged_decode_trace = TraceTemplate(
         "head_dim_ckv": Const(abbrev="ckv"),
         "head_dim_kpe": Const(abbrev="kpe"),
         "page_size": Const(abbrev="ps"),
+        "ckv_scale_groups": Var(description="Number of 128-channel CKV scale groups."),
         "num_pages": Var(
             description="Total number of allocated pages in the KV cache."
         ),
@@ -1551,7 +1553,7 @@ mla_paged_decode_trace = TraceTemplate(
             description=(
                 "Per-tensor dequantization scale for the compressed-KV cache when "
                 "kv_data_type is FP8 (real = quantized * ckv_scale). Required "
-                "together with kpe_scale for the FP8 KV cache path on the fa3 "
+                "together with kpe_scale for the FP8 KV cache path on the fa2/fa3 "
                 "backend. Set during run(), not plan()."
             ),
         ),
@@ -1561,8 +1563,17 @@ mla_paged_decode_trace = TraceTemplate(
             description=(
                 "Per-tensor dequantization scale for the rope-K cache when "
                 "kv_data_type is FP8 (real = quantized * kpe_scale). Required "
-                "together with ckv_scale for the FP8 KV cache path on the fa3 "
+                "together with ckv_scale for the FP8 KV cache path on the fa2/fa3 "
                 "backend. Set during run(), not plan()."
+            ),
+        ),
+        "ckv_scale_arr": Tensor(
+            ["num_pages", "page_size", "ckv_scale_groups"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Optional per-token, per-128-channel CKV dequantization scales "
+                "for the FP8 KV cache path."
             ),
         ),
         "return_lse": Scalar(
