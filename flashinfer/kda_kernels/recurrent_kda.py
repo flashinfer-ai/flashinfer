@@ -90,7 +90,22 @@ _T1_FAST_PATH_HEAD_DIM = 128
 _T1_FAST_PATH_LOWER_BOUND = -5.0
 
 
-def _t1_fast_path_eligible(
+@functools.cache
+def _t1_fast_path_dummy_params(device_index: int):
+    """Placeholder A_log/dt_bias for the pre-computed gate convention (the
+    kernel signature keeps them; the precomputed variant never reads them)."""
+    device = torch.device("cuda", device_index)
+    return (
+        torch.zeros(_T1_FAST_PATH_HEADS, dtype=torch.float32, device=device),
+        torch.zeros(
+            _T1_FAST_PATH_HEADS * _T1_FAST_PATH_HEAD_DIM,
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+
+
+def _t1_fast_path_mode(
     q,
     k,
     v,
@@ -111,42 +126,53 @@ def _t1_fast_path_eligible(
     output,
     initial_state_source,
     beta_is_logit,
-) -> bool:
+):
+    """Return "raw", "precomputed", or None when not eligible."""
     H = _T1_FAST_PATH_HEADS
     K = _T1_FAST_PATH_HEAD_DIM
     if os.environ.get("FLASHINFER_KDA_T1_FAST_PATH", "1") != "1":
-        return False
-    if not (
+        return None
+    if not use_qk_l2norm_in_kernel or output_final_state:
+        return None
+    if (
         use_gate_in_kernel
         and beta_is_logit
-        and use_qk_l2norm_in_kernel
         and lower_bound == _T1_FAST_PATH_LOWER_BOUND
         and A_log is not None
         and dt_bias is not None
-        and not output_final_state
     ):
-        return False
+        mode = "raw"
+    elif (
+        not use_gate_in_kernel
+        and not beta_is_logit
+        and lower_bound is None
+        and dt_bias is None
+    ):
+        # g is the pre-computed log-space decay; beta is pre-sigmoided.
+        mode = "precomputed"
+    else:
+        return None
     if (
         cu_seqlens is not None
         or num_spec_tokens is not None
         or num_accepted_tokens is not None
         or initial_state_source is not None
     ):
-        return False
+        return None
     if scale is not None and abs(scale - K**-0.5) > 1e-9:
-        return False
+        return None
     if q.shape[1] != 1 or q.shape[2] != H or q.shape[3] != K:
-        return False
+        return None
     if v.shape[2] != H or v.shape[3] != K:
-        return False
+        return None
     B = q.shape[0]
     # The kernel reads each row as one contiguous [H, K] block (any row
     # stride), and needs the pool + a 1-D slot map it can index in-kernel.
     for t in (q, k, v, g):
         if t.stride(3) != 1 or t.stride(2) != K:
-            return False
+            return None
     if beta.stride(2) != 1:
-        return False
+        return None
     if (
         initial_state is None
         or initial_state.dtype != torch.bfloat16
@@ -155,7 +181,7 @@ def _t1_fast_path_eligible(
         or tuple(initial_state.stride()[1:]) != (K * K, K, 1)
         or initial_state.stride(0) < H * K * K
     ):
-        return False
+        return None
     if (
         ssm_state_indices is None
         or ssm_state_indices.ndim != 1
@@ -163,20 +189,23 @@ def _t1_fast_path_eligible(
         or ssm_state_indices.shape[0] != B
         or not ssm_state_indices.is_contiguous()
     ):
-        return False
-    if A_log.shape != (H,) or not A_log.is_contiguous():
-        return False
-    if dt_bias.numel() != H * K or not dt_bias.is_contiguous():
-        return False
+        return None
+    if mode == "raw":
+        if A_log.shape != (H,) or not A_log.is_contiguous():
+            return None
+        if dt_bias.numel() != H * K or not dt_bias.is_contiguous():
+            return None
     if output is not None and (
         output.dtype != torch.bfloat16
         or output.shape != (B, 1, H, K)
         or not output.is_contiguous()
     ):
-        return False
+        return None
     if get_compute_capability(q.device) != (10, 0):
-        return False
-    return is_cuda_version_at_least("12.8")
+        return None
+    if not is_cuda_version_at_least("12.8"):
+        return None
+    return mode
 
 
 # ==============================================================================
@@ -1794,41 +1823,49 @@ def run_recurrent_kda(
         and K == _T1_FAST_PATH_HEAD_DIM
         and backend == "cute-dsl"
         and initial_state_indices is None
-        and _t1_fast_path_eligible(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            A_log,
-            dt_bias,
-            scale,
-            initial_state,
-            output_final_state,
-            use_qk_l2norm_in_kernel,
-            use_gate_in_kernel,
-            lower_bound,
-            cu_seqlens,
-            ssm_state_indices,
-            num_spec_tokens,
-            num_accepted_tokens,
-            output,
-            initial_state_source,
-            beta_is_logit,
+        and (
+            fast_path_mode := _t1_fast_path_mode(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                output_final_state,
+                use_qk_l2norm_in_kernel,
+                use_gate_in_kernel,
+                lower_bound,
+                cu_seqlens,
+                ssm_state_indices,
+                num_spec_tokens,
+                num_accepted_tokens,
+                output,
+                initial_state_source,
+                beta_is_logit,
+            )
         )
+        is not None
     ):
         o = output if output is not None else q.new_empty((B, 1, H, V))
+        if fast_path_mode == "raw":
+            fp_a_log, fp_dt_bias = A_log, dt_bias.view(-1)
+        else:
+            fp_a_log, fp_dt_bias = _t1_fast_path_dummy_params(q.device.index)
         launch_unpacked_kda_decode_cute(
             q[:, 0],
             k[:, 0],
             v[:, 0],
             g[:, 0],
             beta[:, 0],
-            A_log,
-            dt_bias.view(-1),
+            fp_a_log,
+            fp_dt_bias,
             initial_state,
             ssm_state_indices,
             o.view(B, H, V),
+            precomputed_gate=(fast_path_mode == "precomputed"),
         )
         return o, None
 

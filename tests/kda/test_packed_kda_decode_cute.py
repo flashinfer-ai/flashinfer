@@ -852,3 +852,75 @@ def test_recurrent_kda_t1_ineligible_calls_fall_back(
     torch.cuda.synchronize(packed_kda_cute_device)
     _assert_close(out, reference_output)
     _assert_close(case["state"], reference_state)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("batch", [8, 64])
+def test_recurrent_kda_t1_fast_path_precomputed_gate(
+    packed_kda_cute_device, monkeypatch, batch
+):
+    """The pre-computed convention (log-space g, sigmoided beta) is also
+    routed to the fast path and matches an fp32 reference and the generic
+    path."""
+    from flashinfer import recurrent_kda
+
+    device = packed_kda_cute_device
+    generator = torch.Generator(device=device).manual_seed(20262000 + batch)
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, dtype=dtype, device=device, generator=generator)
+
+    q = randn(batch, 1, _HEADS, _HEAD_DIM).mul_(0.5)
+    k = randn(batch, 1, _HEADS, _HEAD_DIM).mul_(0.5)
+    v = randn(batch, 1, _HEADS, _HEAD_DIM).mul_(0.5)
+    g = torch.nn.functional.logsigmoid(
+        randn(batch, 1, _HEADS, _HEAD_DIM, dtype=torch.float32)
+    ).to(torch.bfloat16)
+    beta = torch.sigmoid(randn(batch, 1, _HEADS).float()).to(torch.bfloat16)
+    slots = batch + 3
+    state = randn(slots, _HEADS, _HEAD_DIM, _HEAD_DIM).mul_(0.05)
+    indices = torch.arange(batch, 0, -1, dtype=torch.int32, device=device)
+
+    # fp32 reference: decay = exp(g), beta used as-is
+    qf = q.float().squeeze(1)
+    kf = k.float().squeeze(1)
+    vf = v.float().squeeze(1)
+    decay = torch.exp(g.float().squeeze(1))
+    qn = qf * torch.rsqrt((qf * qf).sum(-1, keepdim=True) + 1e-6) * _HEAD_DIM**-0.5
+    kn = kf * torch.rsqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)
+    bt = beta.float().squeeze(1)
+    h = state.float().index_select(0, indices.long())
+    hd = h * decay[:, :, None, :]
+    pred = torch.einsum("bhvk,bhk->bhv", hd, kn)
+    delta = (vf - pred) * bt[:, :, None]
+    hn = hd + torch.einsum("bhv,bhk->bhvk", delta, kn)
+    ref_out = torch.einsum("bhvk,bhk->bhv", hn, qn).unsqueeze(1)
+
+    state_before = state.clone()
+
+    def call():
+        out, _ = recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=state,
+            ssm_state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out
+
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "1")
+    fast_out = call()
+    torch.cuda.synchronize(device)
+    _assert_close(fast_out.view(batch, 1, _HEADS, _HEAD_DIM), ref_out)
+    _assert_close(state.float().index_select(0, indices.long()), hn)
+    fast_state = state.clone()
+
+    state.copy_(state_before)
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "0")
+    slow_out = call()
+    torch.cuda.synchronize(device)
+    _assert_close(slow_out.view(batch, 1, _HEADS, _HEAD_DIM), ref_out)
+    _assert_close(state, fast_state)

@@ -416,7 +416,8 @@ def _kda_packed_t1_kernel(
     state_indices: cute.Tensor,  # [B] i32
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
-    lb_log2e: cutlass.Constexpr[float],  # lower_bound * log2(e)
+    lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],  # lower_bound * log2(e)
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -566,11 +567,16 @@ def _kda_packed_t1_kernel(
         cute.autovec_copy(g_tile, g_bf16)
         cute.autovec_copy(dtb_tile, dtb_f32)
 
-        a_exp = cute.exp(cutlass.Float32(A_log[i_h]), fastmath=True)
-        b_logit = cutlass.Float32(beta[(i_n, i_h)])
-        r_beta = cute.rcp(
-            cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
-        )
+        if cutlass.const_expr(precomputed):
+            # Pre-computed convention: beta arrives already sigmoided.
+            a_exp = cutlass.Float32(0.0)
+            r_beta = cutlass.Float32(beta[(i_n, i_h)])
+        else:
+            a_exp = cute.exp(cutlass.Float32(A_log[i_h]), fastmath=True)
+            b_logit = cutlass.Float32(beta[(i_n, i_h)])
+            r_beta = cute.rcp(
+                cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
+            )
 
         sum_q = cutlass.Float32(0.0)
         sum_k = cutlass.Float32(0.0)
@@ -581,13 +587,19 @@ def _kda_packed_t1_kernel(
             k_src[i] = k_val
             sum_q += q_val * q_val
             sum_k += k_val * k_val
-            gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
-            sig = cute.rcp(
-                cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
-                approx=True,
-                ftz=True,
-            )
-            d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
+            if cutlass.const_expr(precomputed):
+                # g is the log-space decay: d = exp(g).
+                d_src[i] = cute.exp2(
+                    cutlass.Float32(g_bf16[i]) * _LOG2_E, fastmath=True
+                )
+            else:
+                gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
+                sig = cute.rcp(
+                    cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
+                    approx=True,
+                    ftz=True,
+                )
+                d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
 
         for offset in [16, 8, 4, 2, 1]:
             sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=0xFFFFFFFF)
@@ -740,6 +752,7 @@ def _kda_packed_t1_smem_kernel(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -970,11 +983,16 @@ def _kda_packed_t1_smem_kernel(
                     cute.autovec_copy(g_tile, g_bf16)
                     cute.autovec_copy(dtb_tile, dtb_f32)
 
-                a_exp = cute.exp(cutlass.Float32(A_log[i_hh]), fastmath=True)
-                b_logit = cutlass.Float32(beta[(i_n, i_hh)])
-                r_beta = cute.rcp(
-                    cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
-                )
+                if cutlass.const_expr(precomputed):
+                    # Pre-computed convention: beta arrives already sigmoided.
+                    a_exp = cutlass.Float32(0.0)
+                    r_beta = cutlass.Float32(beta[(i_n, i_hh)])
+                else:
+                    a_exp = cute.exp(cutlass.Float32(A_log[i_hh]), fastmath=True)
+                    b_logit = cutlass.Float32(beta[(i_n, i_hh)])
+                    r_beta = cute.rcp(
+                        cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
+                    )
 
                 sum_q = cutlass.Float32(0.0)
                 sum_k = cutlass.Float32(0.0)
@@ -985,13 +1003,19 @@ def _kda_packed_t1_smem_kernel(
                     k_src[i] = k_val
                     sum_q += q_val * q_val
                     sum_k += k_val * k_val
-                    gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
-                    sig = cute.rcp(
-                        cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
-                        approx=True,
-                        ftz=True,
-                    )
-                    d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
+                    if cutlass.const_expr(precomputed):
+                        # g is the log-space decay: d = exp(g).
+                        d_src[i] = cute.exp2(
+                            cutlass.Float32(g_bf16[i]) * _LOG2_E, fastmath=True
+                        )
+                    else:
+                        gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
+                        sig = cute.rcp(
+                            cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
+                            approx=True,
+                            ftz=True,
+                        )
+                        d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
 
                 for offset in [16, 8, 4, 2, 1]:
                     sum_q += cute.arch.shuffle_sync_bfly(
@@ -1330,6 +1354,7 @@ def _kda_packed_t1_persist_kernel(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1480,11 +1505,16 @@ def _kda_packed_t1_persist_kernel(
             cute.autovec_copy(g_tile, g_bf16)
             cute.autovec_copy(dtb_tile, dtb_f32)
 
-        a_exp = cute.exp(cutlass.Float32(A_log[i_h_cur]), fastmath=True)
-        b_logit = cutlass.Float32(beta[(i_n_cur, i_h_cur)])
-        r_beta = cute.rcp(
-            cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
-        )
+        if cutlass.const_expr(precomputed):
+            # Pre-computed convention: beta arrives already sigmoided.
+            a_exp = cutlass.Float32(0.0)
+            r_beta = cutlass.Float32(beta[(i_n_cur, i_h_cur)])
+        else:
+            a_exp = cute.exp(cutlass.Float32(A_log[i_h_cur]), fastmath=True)
+            b_logit = cutlass.Float32(beta[(i_n_cur, i_h_cur)])
+            r_beta = cute.rcp(
+                cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
+            )
 
         sum_q = cutlass.Float32(0.0)
         sum_k = cutlass.Float32(0.0)
@@ -1495,13 +1525,19 @@ def _kda_packed_t1_persist_kernel(
             k_src[i] = k_val
             sum_q += q_val * q_val
             sum_k += k_val * k_val
-            gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
-            sig = cute.rcp(
-                cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
-                approx=True,
-                ftz=True,
-            )
-            d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
+            if cutlass.const_expr(precomputed):
+                # g is the log-space decay: d = exp(g).
+                d_src[i] = cute.exp2(
+                    cutlass.Float32(g_bf16[i]) * _LOG2_E, fastmath=True
+                )
+            else:
+                gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
+                sig = cute.rcp(
+                    cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
+                    approx=True,
+                    ftz=True,
+                )
+                d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
 
         kq_p = cutlass.Float32(0.0)
         for i in VALSI:
@@ -1736,6 +1772,7 @@ def _kda_packed_t1_persist_launch(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1758,6 +1795,7 @@ def _kda_packed_t1_persist_launch(
         scale,
         eps,
         lb_log2e,
+        precomputed,
         H,
         K,
         V,
@@ -1788,6 +1826,7 @@ def _kda_packed_t1_smem_launch(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1822,6 +1861,7 @@ def _kda_packed_t1_smem_launch(
         scale,
         eps,
         lb_log2e,
+        precomputed,
         H,
         K,
         V,
@@ -1867,6 +1907,7 @@ def _kda_packed_t1_launch(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     lb_log2e: cutlass.Constexpr[float],
+    precomputed: cutlass.Constexpr[bool],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1893,6 +1934,7 @@ def _kda_packed_t1_launch(
         scale,
         eps,
         lb_log2e,
+        precomputed,
         H,
         K,
         V,
@@ -2014,6 +2056,7 @@ def _get_compiled(
     l2_policy_mode: int = 0,
     private_ring: bool = False,
     min_blocks: int = 0,
+    precomputed: bool = False,
 ):
     options = "--enable-tvm-ffi --generate-line-info --opt-level 3"
     if maxrreg:
@@ -2027,6 +2070,7 @@ def _get_compiled(
             _SCALE,
             _EPS,
             _LOWER_BOUND * _LOG2_E,
+            precomputed,
             _HEADS,
             _HEAD_DIM,
             _HEAD_DIM,
@@ -2043,6 +2087,7 @@ def _get_compiled(
             _SCALE,
             _EPS,
             _LOWER_BOUND * _LOG2_E,
+            precomputed,
             _HEADS,
             _HEAD_DIM,
             _HEAD_DIM,
@@ -2066,6 +2111,7 @@ def _get_compiled(
         _SCALE,
         _EPS,
         _LOWER_BOUND * _LOG2_E,
+        precomputed,
         _HEADS,
         _HEAD_DIM,
         _HEAD_DIM,
@@ -2243,8 +2289,13 @@ def launch_unpacked_kda_decode_cute(
     state_indices: torch.Tensor,
     output_view: torch.Tensor,
     forced_tile_v: Optional[int] = None,
+    precomputed_gate: bool = False,
 ) -> None:
     """Launch the same T=1 kernel on separately allocated q/k/v/g tensors.
+
+    ``precomputed_gate=True`` selects the pre-computed convention: ``g`` is
+    the log-space decay (``d = exp(g)``) and ``beta`` is already sigmoided;
+    ``A_log``/``dt_bias`` are ignored (pass any valid tensors).
 
     ``q``/``k``/``v``/``g`` are ``[B, H, K]`` bf16 views with contiguous
     inner ``[H, K]`` (any row stride); ``beta`` is ``[B, H]`` raw logits.
@@ -2268,6 +2319,7 @@ def launch_unpacked_kda_decode_cute(
         forced_tile_v,
         qkv_div,
         gate_div,
+        precomputed_gate,
     )
 
 
@@ -2285,6 +2337,7 @@ def _launch_from_views(
     forced_tile_v,
     qkv_div,
     gate_div,
+    precomputed_gate=False,
 ):
     batch = q.shape[0]
     tile_v, ilp_rows, num_groups, n_stages, evict = _select_config(batch, forced_tile_v)
@@ -2383,6 +2436,7 @@ def _launch_from_views(
         int(os.environ.get("FLASHINFER_PACKED_KDA_L2POL", "0")),
         private_ring,
         int(os.environ.get("FLASHINFER_PACKED_KDA_MINBLOCKS", "0")),
+        precomputed_gate,
     )
     if persistent:
         sms = torch.cuda.get_device_properties(q.device).multi_processor_count
