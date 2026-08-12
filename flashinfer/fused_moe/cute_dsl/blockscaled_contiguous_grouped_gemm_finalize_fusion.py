@@ -36,7 +36,7 @@ Key features:
 - Deterministic mode writes unique expanded rows for a fixed-order moe_unpermute
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
-- Support for SM100 (Blackwell) architecture
+- SM100 fallback and SM103-native 3xFP4 (MMA K=96) paths
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -158,6 +158,34 @@ def create_finalize_fusion_tensors(
 _finalize_kernel_cache: Dict[Tuple, Any] = {}
 
 
+def _sm103_3x_mma_config_fits(
+    compute_capability: Tuple[int, int],
+    ab_dtype: str,
+    sf_dtype: str,
+    out_dtype: str,
+    sf_vec_size: int,
+    mma_tiler_mn: Tuple[int, int],
+) -> bool:
+    """Return whether the public configuration safely fits the SM103 path.
+
+    The SM103 mainloop simultaneously addresses three circular AB stages.  The
+    stage-capacity calculation gives only one or two AB stages for FP32 output
+    with an N=256 tile, while every other public NVFP4 output/tile combination
+    gives at least three.  Keep those non-fitting configurations on the SM100
+    implementation, which remains supported on SM103 devices.
+    """
+    return (
+        compute_capability == (10, 3)
+        and ab_dtype == "float4_e2m1fn"
+        and sf_dtype == "float8_e4m3fn"
+        and out_dtype in {"float16", "bfloat16", "float32"}
+        and sf_vec_size == 16
+        and mma_tiler_mn[0] in (128, 256)
+        and mma_tiler_mn[1] in (128, 256)
+        and not (out_dtype == "float32" and mma_tiler_mn[1] == 256)
+    )
+
+
 def _get_compiled_finalize_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
     seq_len: int,
@@ -181,7 +209,12 @@ def _get_compiled_finalize_kernel(
     a_per_token_scale_ptr,
     max_active_clusters: int,
     stream,
+    compute_capability: Tuple[int, int],
     # Tactic parameters (compile-time - IN cache key)
+    ab_dtype: str,
+    sf_dtype: str,
+    out_dtype: str,
+    enable_3x_mma: bool,
     sf_vec_size: int,
     tile_size: int,
     mma_tiler_mn: Tuple[int, int],
@@ -193,7 +226,8 @@ def _get_compiled_finalize_kernel(
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    This function caches compiled kernels by target architecture, data types,
+    and tactic parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
@@ -202,12 +236,18 @@ def _get_compiled_finalize_kernel(
     """
     global _finalize_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
+    # Cache key includes compilation choices, but not runtime problem dimensions.
     cache_key = (
+        compute_capability,
+        ab_dtype,
+        sf_dtype,
+        out_dtype,
+        enable_3x_mma,
         sf_vec_size,
         tile_size,
         mma_tiler_mn,
         cluster_shape_mn,
+        max_active_clusters,
         raster_along_m,
         enable_pdl,
         use_a_per_token_scale,
@@ -224,6 +264,17 @@ def _get_compiled_finalize_kernel(
             enable_pdl=enable_pdl,
             use_a_per_token_scale=use_a_per_token_scale,
             use_fused_finalize=use_fused_finalize,
+            enable_3x_mma=(
+                enable_3x_mma
+                and _sm103_3x_mma_config_fits(
+                    compute_capability,
+                    ab_dtype,
+                    sf_dtype,
+                    out_dtype,
+                    sf_vec_size,
+                    mma_tiler_mn,
+                )
+            ),
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -289,6 +340,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    enable_3x_mma: bool = True,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -324,6 +376,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         sm_count: Number of SMs to use. Default: max available.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        enable_3x_mma: Enable the native SM103 K=96 mainloop when the data type
+             and tile configuration support it. Default: True.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -540,7 +594,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
+        compute_capability=(major, minor),
         # Tactic parameters (compile-time, cached)
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        enable_3x_mma=enable_3x_mma,
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
         mma_tiler_mn=mma_tiler_mn,
