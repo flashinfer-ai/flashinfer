@@ -417,6 +417,128 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
+    """rank_tactics should return best-first shortlist and cache the winner."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=2)
+        cached_ranking = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=3)
+
+    assert ranked == [1, 2]
+    assert cached_ranking == [1, 2, 0]
+    assert profile_calls == [0, 1, 2]
+    _, tactic = tuner.choose_one("dummy_rank", [runner], config, inputs)
+    assert tactic == 1
+
+
+def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_winner_only", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (0, None)
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_winner_only", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+
+
+def test_rank_tactics_rebuilds_shortlist_from_file_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_file_cache", runner, (inputs[0].shape,), config
+    )
+    tuner._file_configs[key.file_key] = ("DummyRunner", 0)
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_file_cache", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+    assert profile_calls == [0, 1, 2]
+
+
+def test_rank_tactics_uses_mapped_dynamic_profile(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((12, 4), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=lambda x: 8 if x <= 8 else 16,
+            ),
+        )
+    )
+    profiled_shapes = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profiled_shapes.append(tuple(prof_inputs[0].shape))
+        return float(tactic)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank_dynamic", [runner], config, inputs, k=2)
+
+    assert ranked == [0, 1]
+    assert profiled_shapes == [(16, 4), (16, 4)]
+
+
+def test_rank_tactics_outside_tuning_returns_single_cached_or_fallback():
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [-1]
+
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_infer", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (2, None)
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [2]
+
+
 def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     """Profiles apply constraints, dynamic inputs are recreated, static inputs are reused."""
     tuner = reset_autotuner()
