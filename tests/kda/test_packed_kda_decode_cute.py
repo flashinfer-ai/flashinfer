@@ -697,3 +697,158 @@ def _run_packed_kda_512_step_fp64_diagnostic(device):
 @pytest.mark.long_running
 def test_packed_kda_cute_512_step_fp64_diagnostic(packed_kda_cute_device):
     _run_packed_kda_512_step_fp64_diagnostic(packed_kda_cute_device)
+
+
+# ---------------------------------------------------------------------------
+# recurrent_kda T=1 fast path (FLASHINFER_KDA_T1_FAST_PATH, default on)
+# ---------------------------------------------------------------------------
+
+
+def _recurrent_kda_views(case, batch):
+    """Unpacked [B,1,H,K] views over the packed case tensors."""
+    mixed = case["mixed_qkv"]
+    width = _HEADS * _HEAD_DIM
+    q = mixed[:, :width].view(batch, 1, _HEADS, _HEAD_DIM)
+    k = mixed[:, width : 2 * width].view(batch, 1, _HEADS, _HEAD_DIM)
+    v = mixed[:, 2 * width :].view(batch, 1, _HEADS, _HEAD_DIM)
+    g = case["raw_gate"].view(batch, 1, _HEADS, _HEAD_DIM)
+    beta = case["raw_beta"].view(batch, 1, _HEADS)
+    return q, k, v, g, beta
+
+
+def _call_recurrent_kda(case, batch, contiguous=False):
+    from flashinfer import recurrent_kda
+
+    q, k, v, g, beta = _recurrent_kda_views(case, batch)
+    if contiguous:
+        # The pre-existing grouped-CTA path silently misreads q/k/v/g views
+        # whose row stride exceeds the logical row (observed on main); feed
+        # it compact copies. The fast path reads the strided views directly.
+        q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    out, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=case["A_log"],
+        dt_bias=case["dt_bias"],
+        initial_state=case["state"],
+        ssm_state_indices=case["state_indices"],
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        beta_is_logit=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    return out
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("batch", [8, 64])
+def test_recurrent_kda_t1_fast_path_matches_reference(
+    packed_kda_cute_device, monkeypatch, batch
+):
+    """Eligible recurrent_kda decode calls route to the packed kernel."""
+    # inactive=False: the generic path defines no semantics for -1 rows
+    # (the fast path's -1 handling is covered by the packed-kernel tests).
+    case = _make_case(
+        batch,
+        packed_kda_cute_device,
+        seed=20261700 + batch,
+        state_padding=0,
+        inactive=False,
+    )
+    _, reference_state = _clone_padded_state(case)
+    reference_output = _reference_step(
+        case["mixed_qkv"],
+        case["raw_gate"],
+        case["raw_beta"],
+        case["A_log"],
+        case["dt_bias"],
+        reference_state,
+        case["state_indices"],
+    )
+
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "1")
+    fast_out = _call_recurrent_kda(case, batch)
+    torch.cuda.synchronize(packed_kda_cute_device)
+    _assert_close(fast_out, reference_output)
+    _assert_close(case["state"], reference_state)
+
+    # The generic path must agree on the same inputs.
+    case2 = _make_case(
+        batch,
+        packed_kda_cute_device,
+        seed=20261700 + batch,
+        state_padding=0,
+        inactive=False,
+    )
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "0")
+    slow_out = _call_recurrent_kda(case2, batch, contiguous=True)
+    torch.cuda.synchronize(packed_kda_cute_device)
+    _assert_close(slow_out, reference_output)
+    _assert_close(case2["state"], reference_state)
+
+
+@pytest.mark.arch_blackwell
+def test_recurrent_kda_t1_fast_path_toggle(packed_kda_cute_device, monkeypatch):
+    """The env toggle switches dispatch: the fast path accepts a padded state
+    pool that the generic path rejects, which proves which path ran."""
+    case = _make_case(8, packed_kda_cute_device, seed=20261800, inactive=False)
+
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "1")
+    _call_recurrent_kda(case, 8)
+    torch.cuda.synchronize(packed_kda_cute_device)
+
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "0")
+    with pytest.raises(ValueError, match="non-contiguous initial_state"):
+        _call_recurrent_kda(case, 8)
+
+
+@pytest.mark.arch_blackwell
+def test_recurrent_kda_t1_ineligible_calls_fall_back(
+    packed_kda_cute_device, monkeypatch
+):
+    """A pre-sigmoided-beta call is ineligible and must still work."""
+    from flashinfer import recurrent_kda
+
+    batch = 8
+    case = _make_case(
+        batch,
+        packed_kda_cute_device,
+        seed=20261900,
+        state_padding=0,
+        inactive=False,
+    )
+    _, reference_state = _clone_padded_state(case)
+    reference_output = _reference_step(
+        case["mixed_qkv"],
+        case["raw_gate"],
+        case["raw_beta"],
+        case["A_log"],
+        case["dt_bias"],
+        reference_state,
+        case["state_indices"],
+    )
+
+    monkeypatch.setenv("FLASHINFER_KDA_T1_FAST_PATH", "1")
+    q, k, v, g, beta = _recurrent_kda_views(case, batch)
+    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    out, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        torch.sigmoid(beta.float()).to(torch.bfloat16),
+        A_log=case["A_log"],
+        dt_bias=case["dt_bias"],
+        initial_state=case["state"],
+        ssm_state_indices=case["state_indices"],
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        beta_is_logit=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+    torch.cuda.synchronize(packed_kda_cute_device)
+    _assert_close(out, reference_output)
+    _assert_close(case["state"], reference_state)

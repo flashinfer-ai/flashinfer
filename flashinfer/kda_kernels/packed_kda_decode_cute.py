@@ -2212,9 +2212,82 @@ def launch_packed_kda_decode_cute(
     )
     dtb = dt_bias.view(_HEADS, _HEAD_DIM)
 
-    tile_v, ilp_rows, num_groups, n_stages, evict = _select_config(batch, forced_tile_v)
     qkv_div = _div_class(mixed_stride, mixed_qkv.data_ptr())
     gate_div = _div_class(raw_gate.stride(0), raw_gate.data_ptr())
+    _launch_from_views(
+        q,
+        k,
+        v,
+        g,
+        raw_beta,
+        A_log,
+        dtb,
+        state,
+        state_indices,
+        output_view,
+        forced_tile_v,
+        qkv_div,
+        gate_div,
+    )
+
+
+def launch_unpacked_kda_decode_cute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_view: torch.Tensor,
+    forced_tile_v: Optional[int] = None,
+) -> None:
+    """Launch the same T=1 kernel on separately allocated q/k/v/g tensors.
+
+    ``q``/``k``/``v``/``g`` are ``[B, H, K]`` bf16 views with contiguous
+    inner ``[H, K]`` (any row stride); ``beta`` is ``[B, H]`` raw logits.
+    The compiled kernel takes the five tensors independently, so this is the
+    identical cubin the packed entry point launches -- the packed layout only
+    ever existed in the view construction above.
+    """
+    qkv_div = min(_div_class(t.stride(0), t.data_ptr()) for t in (q, k, v))
+    gate_div = _div_class(g.stride(0), g.data_ptr())
+    _launch_from_views(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias.view(_HEADS, _HEAD_DIM),
+        state,
+        state_indices,
+        output_view,
+        forced_tile_v,
+        qkv_div,
+        gate_div,
+    )
+
+
+def _launch_from_views(
+    q,
+    k,
+    v,
+    g,
+    raw_beta,
+    A_log,
+    dtb,
+    state,
+    state_indices,
+    output_view,
+    forced_tile_v,
+    qkv_div,
+    gate_div,
+):
+    batch = q.shape[0]
+    tile_v, ilp_rows, num_groups, n_stages, evict = _select_config(batch, forced_tile_v)
     pool_div = _div_class(state.stride(0), state.data_ptr())
 
     # The cp.async pipeline requires a 16 B-aligned pool and at least two
@@ -2281,7 +2354,7 @@ def launch_packed_kda_decode_cute(
         and not tma_read
         and not bulk_store
     )
-    aux_aligned = dt_bias.data_ptr() % 16 == 0 and output_view.data_ptr() % 16 == 0
+    aux_aligned = dtb.data_ptr() % 16 == 0 and output_view.data_ptr() % 16 == 0
     compiled = _get_compiled(
         tile_v,
         ilp_rows,
@@ -2312,7 +2385,7 @@ def launch_packed_kda_decode_cute(
         int(os.environ.get("FLASHINFER_PACKED_KDA_MINBLOCKS", "0")),
     )
     if persistent:
-        sms = torch.cuda.get_device_properties(mixed_qkv.device).multi_processor_count
+        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         # Balanced grid: the largest divisor of the item count that fits the
         # resident capacity gives every CTA the same item count (no tail).
         items = batch * _HEADS
@@ -2474,5 +2547,6 @@ def run_packed_kda_decode_cute(
 
 __all__ = [
     "launch_packed_kda_decode_cute",
+    "launch_unpacked_kda_decode_cute",
     "run_packed_kda_decode_cute",
 ]
