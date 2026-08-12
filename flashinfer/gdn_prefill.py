@@ -30,7 +30,10 @@ from .gdn_kernels import (
     cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
 )
-from .gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
+from .gdn_kernels.delta_rule_dsl.varlen_helper import (
+    is_integer_dtype,
+    should_use_cp_host,
+)
 
 
 _SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
@@ -106,12 +109,6 @@ def _cp_delta_rule_rejection_reason(
     if initial_state is not None:
         if state_indices is None and not initial_state.is_contiguous():
             return "CP delta rule requires initial_state to be contiguous"
-        if state_indices is not None and initial_state.stride()[1:] != (
-            initial_state.shape[2] * initial_state.shape[3],
-            initial_state.shape[3],
-            1,
-        ):
-            return "CP delta rule requires initial_state to be contiguous in [H, V, K]"
     return None
 
 
@@ -134,6 +131,7 @@ def chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
+    _cp_chunk_len: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -288,6 +286,10 @@ def chunk_gated_delta_rule(
         )
 
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
+    if not is_integer_dtype(cu_seqlens.dtype):
+        raise ValueError(
+            f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
@@ -314,9 +316,10 @@ def chunk_gated_delta_rule(
                 f"[total_checkpoints, num_sab_heads, head_size, head_size], "
                 f"got {state_checkpoints.ndim}D"
             )
-        if checkpoint_cu_starts.dtype != torch.int64:
+        if not is_integer_dtype(checkpoint_cu_starts.dtype):
             raise ValueError(
-                f"checkpoint_cu_starts must be int64, got {checkpoint_cu_starts.dtype}"
+                "checkpoint_cu_starts must have an integer dtype, "
+                f"got {checkpoint_cu_starts.dtype}"
             )
         if checkpoint_cu_starts.ndim != 1:
             raise ValueError(
@@ -365,6 +368,15 @@ def chunk_gated_delta_rule(
     )
     will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
     if state_indices is not None:
+        if not is_integer_dtype(state_indices.dtype):
+            raise ValueError(
+                f"state_indices must have an integer dtype, got {state_indices.dtype}"
+            )
+        if state_indices.shape != (num_seqs,):
+            raise ValueError(
+                f"state_indices must have shape {(num_seqs,)}, "
+                f"got {tuple(state_indices.shape)}"
+            )
         # Reject unsupported dispatch paths rather than silently reading/writing
         # the state in packed, sequence-ordered layout.
         if _arch_major not in (9, 10, 12):
@@ -456,10 +468,11 @@ def chunk_gated_delta_rule(
                 v,
                 _g,
                 _beta,
-                cu_seqlens.to(torch.int64) if _arch_major in (9, 12) else cu_seqlens,
+                cu_seqlens,
                 _scale,
                 initial_state=initial_state,
                 max_seqlen=total_seq_len,
+                cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
             )
@@ -504,11 +517,6 @@ def chunk_gated_delta_rule(
             )
         )
 
-        # Convert checkpoint_cu_starts from int64 cu_starts to int32 cu_checkpoints
-        _cu_checkpoints = None
-        if checkpoint_every_n_tokens > 0 and checkpoint_cu_starts is not None:
-            _cu_checkpoints = checkpoint_cu_starts.to(torch.int32)
-
         chunk_gated_delta_rule_sm100(
             q,
             k,
@@ -516,12 +524,12 @@ def chunk_gated_delta_rule(
             _g,
             _beta,
             output,
-            cu_seqlens.to(torch.int32),
+            cu_seqlens,
             initial_state,
             output_state,
             _scale,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            cu_checkpoints=_cu_checkpoints,
+            cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
         )
@@ -547,12 +555,10 @@ def chunk_gated_delta_rule(
             initial_state,
             g,
             beta,
-            cu_seqlens.to(torch.int64),
+            cu_seqlens,
             _scale,
             state_checkpoints,
-            checkpoint_cu_starts.to(torch.int64)
-            if checkpoint_cu_starts is not None
-            else None,
+            checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
         )
@@ -577,12 +583,10 @@ def chunk_gated_delta_rule(
             initial_state,
             g,
             beta,
-            cu_seqlens.to(torch.int64),
+            cu_seqlens,
             _scale,
             state_checkpoints,
-            checkpoint_cu_starts.to(torch.int64)
-            if checkpoint_cu_starts is not None
-            else None,
+            checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
         )

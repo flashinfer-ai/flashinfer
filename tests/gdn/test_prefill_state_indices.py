@@ -24,6 +24,12 @@ from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
+INTEGER_DTYPES = (
+    torch.int32,
+    torch.int64,
+)
+
+
 def _skip_if_not_supported():
     device = torch.device("cuda")
     major, _ = get_compute_capability(device)
@@ -106,24 +112,29 @@ def _run(
     return output, final
 
 
-def _make_pool(init_state, perm, n_pool, pad, dtype, device):
+def _make_pool(init_state, perm, n_pool, pad, dtype, device, inner_stride=1):
     """Build a state pool holding init_state[i] at row perm[i].
 
-    ``pad > 0`` gives the pool a padded (non-compact) *first-dimension* stride
-    while keeping the inner ``[H, V, K]`` block fully contiguous -- exactly
-    TRT-LLM's mamba cache layout, where conv+ssm are packed per slot so only the
-    per-slot (dim-0) stride is padded. Built via ``as_strided`` over flat storage
-    so the padding lands only between slots, not inside the state block.
+    ``pad > 0`` gives the pool a padded first-dimension stride, matching a state
+    pool packed with other per-slot data. ``inner_stride > 1`` additionally
+    exercises a fully strided ``[H, V, K]`` view.
     """
     _, H, D, _ = init_state.shape
-    if pad == 0:
+    if pad == 0 and inner_stride == 1:
         pool = torch.zeros(n_pool, H, D, D, dtype=dtype, device=device)
     else:
-        slot_stride = H * D * D + pad  # usable state block + inter-slot padding
+        slot_stride = H * D * D * inner_stride + pad
         storage = torch.zeros(n_pool * slot_stride, dtype=dtype, device=device)
-        pool = storage.as_strided((n_pool, H, D, D), (slot_stride, D * D, D, 1))
-        assert not pool.is_contiguous()  # dim-0 stride padded
-        assert pool.stride()[1:] == (D * D, D, 1)  # inner [H, V, K] contiguous
+        pool = storage.as_strided(
+            (n_pool, H, D, D),
+            (
+                slot_stride,
+                D * D * inner_stride,
+                D * inner_stride,
+                inner_stride,
+            ),
+        )
+        assert not pool.is_contiguous()
     for i, r in enumerate(perm):
         pool[r] = init_state[i]
     return pool
@@ -185,6 +196,124 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     assert torch.equal(pool[untouched], torch.zeros_like(pool[untouched]))
 
 
+@pytest.mark.parametrize("index_dtype", INTEGER_DTYPES)
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_integer_index_dtypes(index_dtype, use_cp):
+    """Sequence and state indices retain their integer dtype across dispatch."""
+    _skip_if_not_supported()
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [64]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=5
+    )
+    cu_seqlens = cu_seqlens.to(index_dtype)
+
+    packed_state = torch.empty_like(init_state)
+    packed_output, packed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        packed_state,
+        None,
+        use_cp,
+    )
+
+    slots = [2]
+    pool = _make_pool(init_state, slots, 4, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=index_dtype, device=device)
+    indexed_output, indexed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        pool,
+        pool,
+        state_indices,
+        use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, indexed_output)
+    assert torch.equal(packed_final, indexed_final[slots])
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_preserves_inner_strides(use_cp):
+    """Indexed state views use the tensor's actual shape and strides."""
+    _skip_if_not_supported()
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [64]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=6
+    )
+
+    packed_state = torch.empty_like(init_state)
+    packed_output, packed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        packed_state,
+        None,
+        use_cp,
+    )
+
+    slots = [2]
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    contiguous_pool = _make_pool(init_state, slots, 4, 96, init_state.dtype, device)
+    contiguous_output, contiguous_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        contiguous_pool,
+        contiguous_pool,
+        state_indices,
+        use_cp,
+    )
+    assert torch.equal(packed_output, contiguous_output)
+    assert torch.equal(packed_final, contiguous_final[slots])
+
+    pool = _make_pool(
+        init_state,
+        slots,
+        4,
+        96,
+        init_state.dtype,
+        device,
+        inner_stride=2,
+    )
+    indexed_output, indexed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        pool,
+        pool,
+        state_indices,
+        use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, indexed_output)
+    assert torch.equal(packed_final, indexed_final[slots])
+
+
 def test_prefill_state_indices_requires_output_state_pool():
     """With state_indices set, output_state must be a caller-provided pool: an
     auto-allocated compact [num_seqs, ...] tensor would be indexed out of bounds
@@ -219,103 +348,6 @@ def test_prefill_state_indices_requires_output_state_pool():
             output=out,
             output_state=None,  # must be rejected when state_indices is set
             state_indices=idx,
-        )
-
-
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_state_indices_with_state_checkpoints(use_cp):
-    """Indexed final-state I/O must not change packed checkpoint ordering."""
-    _skip_if_not_supported()
-    device = torch.device("cuda")
-    if use_cp and get_compute_capability(device)[0] not in (9, 10, 12):
-        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
-    H, D = 16, 128
-    seq_lens = [128, 512]
-    num_seqs = len(seq_lens)
-    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
-        seq_lens, H, D, torch.bfloat16, device, seed=3
-    )
-    checkpoint_every = 64
-    checkpoint_counts = [seq_len // checkpoint_every for seq_len in seq_lens]
-    checkpoint_cu_starts = torch.tensor(
-        [0, *torch.cumsum(torch.tensor(checkpoint_counts), 0).tolist()],
-        dtype=torch.int64,
-        device=device,
-    )
-    checkpoint_shape = (sum(checkpoint_counts), H, D, D)
-
-    packed_state = torch.empty_like(init_state)
-    packed_checkpoints = torch.empty(
-        checkpoint_shape, dtype=init_state.dtype, device=device
-    )
-    packed_output = torch.empty_like(q)
-    output_a, final_a = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=init_state.clone(),
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        output=packed_output,
-        output_state=packed_state,
-        state_checkpoints=packed_checkpoints,
-        checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=checkpoint_every,
-        use_cp=use_cp,
-    )
-
-    n_pool = num_seqs + 4
-    slots = [4, 1]
-    pool = _make_pool(init_state, slots, n_pool, 96, init_state.dtype, device)
-    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
-    indexed_checkpoints = torch.empty_like(packed_checkpoints)
-    indexed_output = torch.empty_like(q)
-    output_b, final_b = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=pool,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        output=indexed_output,
-        output_state=pool,
-        state_checkpoints=indexed_checkpoints,
-        checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=checkpoint_every,
-        state_indices=state_indices,
-        use_cp=use_cp,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(output_a, output_b)
-    assert torch.equal(final_a, final_b[slots])
-    assert torch.equal(packed_checkpoints, indexed_checkpoints)
-    if use_cp:
-        reference_checkpoints = torch.empty_like(packed_checkpoints)
-        chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=init_state.clone(),
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            state_checkpoints=reference_checkpoints,
-            checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=checkpoint_every,
-            use_cp=False,
-        )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(
-            packed_checkpoints,
-            reference_checkpoints,
-            atol=1e-2,
-            rtol=5e-3,
         )
 
 

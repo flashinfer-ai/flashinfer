@@ -19,6 +19,26 @@ CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_GDDR_PARALLELISM_THRESHOLD_DENOMINATOR = 3
 
 
+_INTEGER_DTYPES = (
+    torch.int32,
+    torch.int64,
+)
+
+
+def is_integer_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _INTEGER_DTYPES
+
+
+def integer_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
+    try:
+        return {
+            torch.int32: cutlass.Int32,
+            torch.int64: cutlass.Int64,
+        }[dtype]
+    except KeyError as err:
+        raise RuntimeError(f"expected an integer dtype, got {dtype}") from err
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 

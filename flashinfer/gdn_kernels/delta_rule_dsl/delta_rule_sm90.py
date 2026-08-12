@@ -12,6 +12,7 @@ from .custom_compile_cache import KeyedCompileMixin, cached_compile
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM90, round_down, select_tensor_10
 from .schedule import WorkDesc
+from .varlen_helper import is_integer_dtype
 
 
 # ─── Named-barrier IDs used by the compute kernel ────────────────────────────
@@ -126,6 +127,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
+        cu_seqlens_dtype: torch.dtype = torch.int64,
+        state_indices_dtype: torch.dtype | None = None,
+        checkpoint_cu_starts_dtype: torch.dtype | None = None,
+        state_inner_strides: tuple[int, ...] | None = None,
+        init_state_inner_strides: tuple[int, ...] | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -134,6 +140,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.use_state_indices = use_state_indices
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.state_indices_dtype = state_indices_dtype
+        self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
+        self.state_inner_strides = state_inner_strides
+        self.init_state_inner_strides = init_state_inner_strides
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -153,6 +164,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             "dtype",
             "acc_dtype",
             "use_state_indices",
+            "cu_seqlens_dtype",
+            "state_indices_dtype",
+            "checkpoint_cu_starts_dtype",
+            "state_inner_strides",
+            "init_state_inner_strides",
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
@@ -1201,34 +1217,27 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         packed_state_layout = cute.make_ordered_layout(
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
+        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
+        state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
+        indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
         state_idx = work_desc.seq_idx
         if cutlass.const_expr(self.use_state_indices):
             state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])
-            state_layout = cute.make_layout(
-                (self.D, self.D, num_sab_heads, g_state.shape[0]),
-                stride=(
-                    g_state.stride[3],
-                    g_state.stride[2],
-                    g_state.stride[1],
-                    g_state.stride[0],
-                ),
-            )
+            state_layout = indexed_state_layout
         else:
             state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
         gStateKV = mState[None, None, o_head_idx, state_idx]
         if cutlass.const_expr(self.needs_init_state):
+            init_state_ref_layout = cute.make_layout(
+                state_ref_shape, stride=g_init_state.stride
+            )
+            indexed_init_state_layout = cute.select(
+                init_state_ref_layout, mode=[3, 2, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                init_state_layout = cute.make_layout(
-                    (self.D, self.D, num_sab_heads, g_init_state.shape[0]),
-                    stride=(
-                        g_init_state.stride[3],
-                        g_init_state.stride[2],
-                        g_init_state.stride[1],
-                        g_init_state.stride[0],
-                    ),
-                )
+                init_state_layout = indexed_init_state_layout
             else:
                 init_state_layout = packed_state_layout
             mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)
@@ -2380,9 +2389,9 @@ def delta_rule_prefill_dsl_sm90(
         )
     if state.dtype != torch.float32:
         raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
-    if cu_seqlens.dtype != torch.int64:
+    if not is_integer_dtype(cu_seqlens.dtype):
         raise RuntimeError(
-            f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+            f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
         )
 
     expected_state_tail = (num_sab_heads, D, D)
@@ -2398,10 +2407,10 @@ def delta_rule_prefill_dsl_sm90(
                 f"got {tuple(tensor.shape)}"
             )
     if use_state_indices and (
-        state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+        not is_integer_dtype(state_indices.dtype) or state_indices.shape != (num_seqs,)
     ):
         raise RuntimeError(
-            f"state_indices must have shape {(num_seqs,)} and dtype int32"
+            f"state_indices must have shape {(num_seqs,)} and an integer dtype"
         )
 
     for name, tensor in (
@@ -2423,12 +2432,7 @@ def delta_rule_prefill_dsl_sm90(
     for name, tensor in (("state", state), ("init_state", init_state)):
         if tensor is None:
             continue
-        if use_state_indices:
-            if tensor.stride()[1:] != (D * D, D, 1):
-                raise RuntimeError(
-                    f"{name} inner dimensions must be contiguous when state_indices is used"
-                )
-        elif not tensor.is_contiguous():
+        if not use_state_indices and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
 
     total_seqlen = q.shape[0]
@@ -2511,6 +2515,17 @@ def delta_rule_prefill_dsl_sm90(
         needs_checkpointing,
         kernel_dtype,
         use_state_indices=use_state_indices,
+        cu_seqlens_dtype=cu_seqlens.dtype,
+        state_indices_dtype=state_indices.dtype if use_state_indices else None,
+        checkpoint_cu_starts_dtype=(
+            checkpoint_cu_starts.dtype if needs_checkpointing else None
+        ),
+        state_inner_strides=(tuple(state.stride()[1:]) if use_state_indices else None),
+        init_state_inner_strides=(
+            tuple(init_state.stride()[1:])
+            if use_state_indices and needs_init_state
+            else None
+        ),
     )
 
     kernel_args = (
