@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import inspect
 import math
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 import warnings
 
 import pytest
@@ -33,7 +33,7 @@ pytest.importorskip(
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float8E4M3FN, Int32
+from cutlass import BFloat16, Float16, Float4E2M1FN, Float8E4M3FN, Int32
 from cutlass.cute.runtime import make_ptr
 from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -631,6 +631,204 @@ def _make_decode_case(
     )
 
 
+def _dequantize_nvfp4_cache(
+    packed: torch.Tensor,
+    scale_factors: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Decode packed E2M1 values using their per-16-value E4M3 scales."""
+
+    lut = torch.tensor(
+        (
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ),
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    nibbles = torch.stack((low, high), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    values = lut[nibbles.long()]
+    scales = scale_factors.float().repeat_interleave(16, dim=-1)
+    return (values * scales).to(output_dtype)
+
+
+def _make_mixed_precision_decode_case(
+    *,
+    batch_size: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    seq_len_q: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    device: str | torch.device,
+    seed: int,
+) -> tuple[_DecodeCase, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    """Build a nonzero mixed-Q/KV case and its independent reference."""
+
+    pages_per_request = (seq_len_kv + page_size - 1) // page_size
+    num_referenced_pages = batch_size * pages_per_request
+    num_physical_pages = num_referenced_pages + 3
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    page_ids = torch.randperm(num_physical_pages, generator=generator)[
+        :num_referenced_pages
+    ]
+    if torch.equal(page_ids, torch.arange(num_referenced_pages)):
+        page_ids = torch.roll(page_ids, 1)
+
+    q_shape = (
+        (batch_size, num_qo_heads, head_dim)
+        if seq_len_q == 1
+        else (batch_size, seq_len_q, num_qo_heads, head_dim)
+    )
+    q = torch.randn(q_shape, generator=generator).to(q_dtype).to(device)
+    cache_shape = (
+        num_physical_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
+    kv_scale_factors: Optional[tuple[torch.Tensor, torch.Tensor]]
+    if kv_dtype == _FP8:
+        k_cache = torch.randn(cache_shape, generator=generator).to(_FP8).to(device)
+        v_cache = torch.randn(cache_shape, generator=generator).to(_FP8).to(device)
+        k_reference = k_cache
+        v_reference = v_cache
+        kv_scale_factors = None
+    elif kv_dtype == torch.uint8:
+        packed_shape = (*cache_shape[:-1], head_dim // 2)
+        scale_shape = (*cache_shape[:-1], head_dim // 16)
+        k_cache = torch.randint(
+            0,
+            256,
+            packed_shape,
+            generator=generator,
+            dtype=torch.uint8,
+        ).to(device)
+        v_cache = torch.randint(
+            0,
+            256,
+            packed_shape,
+            generator=generator,
+            dtype=torch.uint8,
+        ).to(device)
+        k_scale = (
+            (torch.randn(scale_shape, generator=generator, dtype=torch.float32) * 0.5)
+            .to(_FP8)
+            .to(device)
+        )
+        v_scale = (
+            (torch.randn(scale_shape, generator=generator, dtype=torch.float32) * 0.5)
+            .to(_FP8)
+            .to(device)
+        )
+        k_reference = _dequantize_nvfp4_cache(k_cache, k_scale, q_dtype)
+        v_reference = _dequantize_nvfp4_cache(v_cache, v_scale, q_dtype)
+        v_scale_interleaved = (
+            v_scale.reshape(
+                num_physical_pages,
+                num_kv_heads,
+                page_size // 4,
+                4,
+                4,
+                head_dim // 64,
+            )
+            .permute(0, 1, 2, 4, 5, 3)
+            .reshape(scale_shape)
+            .contiguous()
+        )
+        kv_scale_factors = (k_scale, v_scale_interleaved)
+    else:
+        raise ValueError("mixed-precision tests require FP8 or NVFP4 K/V")
+
+    indptr = torch.arange(
+        0,
+        num_referenced_pages + 1,
+        pages_per_request,
+        dtype=torch.int32,
+        device=device,
+    )
+    indices = page_ids.to(dtype=torch.int32, device=device)
+    last_page_len = torch.full(
+        (batch_size,),
+        (seq_len_kv - 1) % page_size + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    bmm1_scale = 1.0 / math.sqrt(head_dim)
+    if q_dtype == _FP8:
+        reference = _fp8_decode_reference(
+            q,
+            k_reference,
+            v_reference,
+            indptr,
+            indices,
+            last_page_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            output_dtype=output_dtype,
+            o_scale=1.0,
+            mask_type="dense",
+        )
+    else:
+        reference = _decode_reference(
+            q,
+            k_reference,
+            v_reference,
+            indptr,
+            indices,
+            last_page_len,
+            sm_scale=bmm1_scale,
+            q_scale=1.0,
+            k_scale=1.0,
+            v_scale=1.0,
+            mask_type="dense",
+        )
+    reference = reference.to(output_dtype).float()
+    return (
+        _DecodeCase(
+            q=q,
+            paged_kv_cache=(k_cache, v_cache),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            paged_kv_indptr=indptr,
+            paged_kv_indices=indices,
+            paged_kv_last_page_len=last_page_len,
+            reference_real=reference,
+            output_dtype=output_dtype,
+            mask_type="dense",
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            q_scale=1.0,
+            k_scale=1.0,
+            v_scale=1.0,
+            o_scale=1.0,
+        ),
+        kv_scale_factors,
+    )
+
+
 def _ragged_lengths(
     batch_size: int, max_seq_len: int, page_size: int
 ) -> tuple[int, ...]:
@@ -1125,7 +1323,17 @@ def _assert_case_correct(output, case):
     assert output.shape == case.q.shape
     assert output.dtype == case.output_dtype
     assert torch.isfinite(actual).all()
-    if case.output_dtype == _FP8:
+    if case.k_cache.dtype == torch.uint8 and case.output_dtype == _FP8:
+        # Use relatively loose tolenrences for fp8o-nvfp4kv.
+        rtol, atol = 1e-2, 0.125
+        close = torch.isclose(actual, expected, atol=atol, rtol=rtol)
+        match_ratio = close.float().mean()
+        threshold = 0.95
+        assert match_ratio > threshold, (
+            f"match ratio {match_ratio} is below {threshold}"
+        )
+        return
+    elif case.output_dtype == _FP8:
         rtol, atol = 5e-2, 2e-3
     elif case.q.dtype == _FP8:
         rtol, atol = 1e-3, 2.5e-4
@@ -1350,6 +1558,8 @@ def _decode_runtime_for_aliasing() -> _DecodeRuntime:
         q=torch.empty(8),
         k_cache=torch.empty(8),
         v_cache=torch.empty(8),
+        k_sf_cache=torch.empty(8),
+        v_sf_cache=torch.empty(8),
         out=torch.empty(8),
         num_physical_pages=1,
         k_page_stride=8,
@@ -1992,6 +2202,228 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
     assert p.offset + p.num_columns <= s.offset + s.num_columns
     assert cfg.tmem_total_cols <= tmem_allocator.total_tmem_columns <= 512
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+    nvfp4_q = torch.empty((1, 8, 64), dtype=torch.bfloat16)
+    nvfp4_cache = torch.empty((2, 2, 1, 64, 32), dtype=torch.uint8)
+    nvfp4_sf = torch.empty((2, 1, 64, 4), dtype=torch.float8_e4m3fn)
+    nvfp4_trace = batch_decode_with_paged_kv_cache.fi_trace(
+        q=nvfp4_q,
+        paged_kv_cache=nvfp4_cache,
+        paged_kv_indptr=torch.tensor([0, 2], dtype=torch.int32),
+        paged_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([64], dtype=torch.int32),
+        kv_scale_factors=(nvfp4_sf, nvfp4_sf),
+    )
+    assert nvfp4_trace["axes"]["head_dim"]["value"] == 64
+    assert nvfp4_trace["axes"]["kv_storage_head_dim"]["value"] == 32
+    assert nvfp4_trace["inputs"]["k_sf_cache"]["dtype"] == "float8_e4m3fn"
+
+
+@pytest.mark.parametrize("headdim", (128, 256))
+def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
+    headdim: int,
+) -> None:
+    """FP8-Q/NVFP4 decode stores dequantized values in TMEM when H128/H256."""
+
+    cfg = make_decode_config(
+        headdim=headdim,
+        seq_len_q=1,
+        seq_len_kv=256,
+        batch_size=1,
+        num_heads_q=8,
+        num_heads_kv=1,
+        qkv_dtype=Float8E4M3FN,
+        kv_dtype=Float4E2M1FN,
+        o_dtype=Float16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=32,
+        auto_tuner=False,
+    )
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+
+    assert cfg.store_transformed_kv_in_tmem
+    assert cfg.head_dim_kv_stage == 128
+    assert cfg.smem_kv_storage_tile_bytes == 2 * cfg.smem_kv_tile_bytes
+    assert "tmemTransformedKv" in resources
+    assert "smemTransformedKv" not in resources
+    transformed = resources["tmemTransformedKv"]
+    assert transformed._alloc.num_columns == (
+        cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
+    )
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype", "output_dtype"),
+    (
+        (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
+        (torch.bfloat16, torch.uint8, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
+    ),
+)
+def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    decode_module._validate_dtype_pair(q_dtype, kv_dtype, output_dtype)
+
+
+def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    with pytest.raises(NotImplementedError, match="BF16 Q with FP8 K/V"):
+        decode_module._validate_dtype_pair(
+            torch.float16,
+            torch.float8_e4m3fn,
+            torch.float16,
+        )
+
+
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
+def test_attention_ts_decode_paged_mixed_matches_o_stages_to_kv_insts(head_dim):
+    # When using paged KV, the transform task needs to take whole WG1.
+    # num_insts_kv will be forced to 1.
+    cfg = make_decode_config(
+        headdim=head_dim,
+        args={"use_keeps_mma_ab": False},
+        seq_len_q=1,
+        seq_len_kv=384,
+        batch_size=2,
+        num_heads_q=8,
+        num_heads_kv=1,
+        qkv_dtype=BFloat16,
+        kv_dtype=Float8E4M3FN,
+        o_dtype=BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=32,
+        split_kv_mode="disabled",
+        auto_tuner=False,
+    )
+
+    assert cfg.num_insts_kv == 1
+    assert cfg.o_stages == 1
+
+
+def test_attention_ts_decode_rejects_mismatched_o_stages_and_kv_insts():
+    with pytest.raises(ValueError, match="o_stages == num_insts_kv"):
+        make_decode_config(
+            headdim=64,
+            args={
+                "use_keeps_mma_ab": False,
+                "num_insts_kv": 1,
+                "o_stages": 2,
+            },
+            seq_len_kv=384,
+            batch_size=1,
+            num_heads_q=8,
+            num_heads_kv=1,
+            auto_tuner=False,
+        )
+
+
+def test_attention_ts_nvfp4_cache_contract():
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    packed = torch.empty((2, 1, 64, 32), dtype=torch.uint8)
+    scales = torch.empty((2, 1, 64, 4), dtype=torch.float8_e4m3fn)
+    normalized = decode_module._normalize_paged_kv_cache(
+        (packed, packed),
+        expected_device=packed.device,
+        logical_head_dim=64,
+    )
+    assert normalized[5] == 64
+    k_sf, v_sf = decode_module._normalize_paged_kv_scale_factors(
+        (scales, scales),
+        k_cache=packed,
+        logical_head_dim=64,
+    )
+    assert k_sf is scales
+    assert v_sf is scales
+    with pytest.raises(ValueError, match="requires kv_scale_factors"):
+        decode_module._normalize_paged_kv_scale_factors(
+            None,
+            k_cache=packed,
+            logical_head_dim=64,
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
+@pytest.mark.parametrize("seq_len_kv", [128, 1024], ids=lambda value: f"kv{value}")
+@pytest.mark.parametrize(
+    "seq_len_q",
+    [1],
+    ids=lambda value: f"q{value}",
+)
+@pytest.mark.parametrize("head_dim", [128, 256], ids=lambda value: f"d{value}")
+@pytest.mark.parametrize(
+    ("num_qo_heads", "num_kv_heads"),
+    [(32, 4)],
+    ids=["gqa32x4"],
+)
+@pytest.mark.parametrize(
+    "page_size",
+    [64],
+    ids=lambda value: f"p{value}",
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    ["bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv"],
+)
+def test_attention_ts_decode_mixed_precision(
+    batch_size: int,
+    seq_len_kv: int,
+    seq_len_q: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    qkv_dtype: Literal["bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv"],
+):
+    dtype_dict = {
+        "bf16q-fp8kv": (torch.bfloat16, _FP8, torch.bfloat16),
+        "bf16q-nvfp4kv": (torch.bfloat16, torch.uint8, torch.bfloat16),
+        "fp8q-nvfp4kv": (_FP8, torch.uint8, _FP8),
+    }
+    q_dtype, kv_dtype, output_dtype = dtype_dict[qkv_dtype]
+    case, kv_scale_factors = _make_mixed_precision_decode_case(
+        batch_size=batch_size,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        output_dtype=output_dtype,
+        device="cuda",
+        seed=20260721,
+    )
+    wrapper = _plan_case(case, max_kv_len=seq_len_kv)
+    output = wrapper.run(
+        case.q,
+        case.paged_kv_cache,
+        kv_scale_factors=kv_scale_factors,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+    )
+    _assert_case_correct(output, case)
+
+    one_shot = batch_decode_with_paged_kv_cache(
+        case.q,
+        case.paged_kv_cache,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        kv_scale_factors=kv_scale_factors,
+        seq_len_q=seq_len_q,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        out_dtype=case.output_dtype,
+    )
+    _assert_case_correct(one_shot, case)
 
 
 @pytest.mark.parametrize(

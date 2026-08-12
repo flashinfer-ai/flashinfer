@@ -285,6 +285,12 @@ def _fmha_q_schema(q_mode: str):
 
 
 def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
+    axes["kv_storage_head_dim"] = Const(
+        abbrev="kd", description="Stored K/V width; D/2 for packed NVFP4."
+    )
+    axes["kv_scale_groups"] = Var(
+        description="NVFP4 scale groups; one per 16 logical values."
+    )
     if combined:
         axes["kv_planes"] = Const(
             abbrev="", description="K/V plane count; required to be 2."
@@ -295,17 +301,17 @@ def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
                 "kv_planes",
                 "num_kv_heads",
                 "page_size",
-                "head_dim",
+                "kv_storage_head_dim",
             ]
         )
         return
     inputs["k_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", "page_size", "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=0,
     )
     inputs["v_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", "page_size", "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=1,
     )
@@ -370,6 +376,18 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "seq_len_q": Scalar("int32", optional=True),
             "max_seq_len_q": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
@@ -383,6 +401,8 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
         "len_indptr == batch_size + 1",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
@@ -458,6 +478,12 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
+        "kv_storage_head_dim": Const(
+            abbrev="kd", description="Stored K/V width; D/2 for packed NVFP4."
+        ),
+        "kv_scale_groups": Var(
+            description="NVFP4 scale groups; one per 16 logical values."
+        ),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
         "workspace_size": Var(description="Caller workspace size in bytes."),
@@ -484,6 +510,18 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
             "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
             "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
             "seq_lens": Tensor(["batch_size"], dtype="int32"),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "max_seq_len": Scalar("int32"),
             "seq_len_q": Scalar("int32", optional=True),
             "qo_indptr": Tensor(
@@ -501,6 +539,9 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
+        "max_seq_len <= 16384",
         "len_indptr == batch_size + 1",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
@@ -600,6 +641,18 @@ def _make_prims_ts_decode_wrapper_trace(
                 description="Cumulative Q offsets retained by plan().",
             ),
             "max_seq_len_q": Scalar("int32", optional=True),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "kv_scale_groups"],
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "mask_type": Scalar("string", optional=True),
             "window_left": Scalar("int32", optional=True),
             "bmm1_scale": Scalar("float32", optional=True),
@@ -609,6 +662,8 @@ def _make_prims_ts_decode_wrapper_trace(
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",

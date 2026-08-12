@@ -26,7 +26,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental import primitives as prims
-
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import SmemAllocation, TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
@@ -36,13 +35,13 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_constants import KV_INST0
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import KV_INST0
 from .helpers_common import (
+    _TASK_CACHE_TMEM_BASE_OFFSET,
     Constexpr,
     DecodeGenResourceBase,
     DescriptorValue,
-    _TASK_CACHE_TMEM_BASE_OFFSET,
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
     _mma_k_step,
@@ -59,6 +58,9 @@ def _pv_mma_operand_contract_for_config(
     )
     if cfg.use_keeps_mma_ab:
         return True, cfg.tile_size_q, active_head_dim, 0, 1
+    if cfg.store_transformed_kv_in_tmem:
+        # Transposed TMEM V is operand A in K-major layout; P remains SMEM B.
+        return False, active_head_dim, cfg.tile_size_q, 0, 0
     return False, active_head_dim, cfg.tile_size_q, 1, 0
 
 
@@ -210,7 +212,10 @@ class TmemOResource(DecodeGenResourceBase):
             v_desc = v_desc_1
             p_desc = p_desc_1
             p_tmem_addr = p_tmem_addr_1
-        v_desc = _freeze_smem_descriptor(v_desc)
+        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            v_operand = prims.make_tmem_ptr(v_desc, Int32)
+        else:
+            v_operand = _freeze_smem_descriptor(v_desc)
         if cutlass.const_expr(not cfg.uses_tmem_p):
             p_desc = _freeze_smem_descriptor(p_desc)
         task_cache = _decode_gen_task_cache(stage_info)
@@ -258,9 +263,9 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         p_operand = p_desc
                     if cutlass.const_expr(p_is_a):
-                        a_desc, b_desc = p_operand, v_desc
+                        a_desc, b_desc = p_operand, v_operand
                     else:
-                        a_desc, b_desc = v_desc, p_operand
+                        a_desc, b_desc = v_operand, p_operand
                     prims.tcgen05_mma(
                         _mma_kind_for_qkv(cfg),
                         prims.CTAGroup.CTA_1,
@@ -277,12 +282,18 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P descriptors to the next MMA-K
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
-                        v_desc = v_desc + Int32(
-                            (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
-                        )
+                        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            v_operand = prims.make_tmem_ptr(
+                                v_desc + Int32((ki + 1) * _mma_k_step(cfg) // 4),
+                                Int32,
+                            )
+                        else:
+                            v_operand = v_operand + Int32(
+                                (cfg.headdim * 2) if cfg.use_fp8_q else 128
+                            )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_fp8_q
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
@@ -334,9 +345,9 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         p_operand = p_desc
                     if cutlass.const_expr(p_is_a):
-                        a_desc, b_desc = p_operand, v_desc
+                        a_desc, b_desc = p_operand, v_operand
                     else:
-                        a_desc, b_desc = v_desc, p_operand
+                        a_desc, b_desc = v_operand, p_operand
                     prims.tcgen05_mma(
                         _mma_kind_for_qkv(cfg),
                         prims.CTAGroup.CTA_1,
@@ -352,12 +363,18 @@ class TmemOResource(DecodeGenResourceBase):
                     ):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
-                        v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_qkv else 128
-                        )
+                        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            v_operand = prims.make_tmem_ptr(
+                                v_desc + Int32((ki + 1) * _mma_k_step(cfg) // 4),
+                                Int32,
+                            )
+                        else:
+                            v_operand = v_operand + Int32(
+                                (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_q else 128
+                            )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_fp8_q
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):

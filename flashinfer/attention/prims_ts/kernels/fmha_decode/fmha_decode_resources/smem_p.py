@@ -271,7 +271,7 @@ class SmemPResource(DecodeGenResourceBase):
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
         neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_q):
             neg_scaled_max += _fp8_log2_quant_scale()
 
         # Preserve four independent modulo-4 sum chains as two packed pairs,
@@ -286,7 +286,7 @@ class SmemPResource(DecodeGenResourceBase):
         for block_idx in cutlass.range_constexpr(num_vector_blocks):
             s_base = block_idx * vector_elements
             packed_base = block_idx * 4 if cfg.uses_two_inst_tmem_p else 0
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_fp8_q):
                 for packed_idx in cutlass.range_constexpr(4):
                     val_base = packed_idx * 4
                     scaled_pair_01 = ffma2(
@@ -342,7 +342,7 @@ class SmemPResource(DecodeGenResourceBase):
                         local_sum_pair_01 = fadd2(local_sum_pair_01, p_pair)
                     else:
                         local_sum_pair_23 = fadd2(local_sum_pair_23, p_pair)
-                    if cutlass.const_expr(cfg.use_bf16_qkv):
+                    if cutlass.const_expr(cfg.use_bf16_q):
                         packed_p[packed_base + packed_idx] = _pack_float2_to_bf16(
                             p_pair[0], p_pair[1]
                         )
@@ -381,7 +381,7 @@ class SmemPResource(DecodeGenResourceBase):
             # slices to limit Softmax register pressure, producing two/four
             # stores. Every slice targets this instance's consumed S region.
             assert cfg.num_packed_p_regs in (16, 32, 64)
-            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
+            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_q else 16
             assert cfg.num_packed_p_regs % regs_per_store == 0
             for store_idx in cutlass.range_constexpr(
                 cfg.num_packed_p_regs // regs_per_store
@@ -456,7 +456,7 @@ class SmemPResource(DecodeGenResourceBase):
         # warp/lane ownership for SMEM offsets and STSM swizzles.
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_q):
             # Tile-Q=32 FP8 fast path: compute E4M3 P registers in the
             # same order consumed by the STSM helper, while also capturing
             # one local denominator sum per softmax scale group.
@@ -555,7 +555,7 @@ class SmemPResource(DecodeGenResourceBase):
             prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
             return
 
-        if cutlass.const_expr(cfg.tile_size_q == 16 and cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.tile_size_q == 16 and cfg.use_fp8_q):
             # Tile-Q=16 FP8 fast path: each helper call handles two softmax
             # scale groups and returns the low/high K halves already packed for
             # STSM. This avoids keeping all 16 FP32 P values live and packing
@@ -649,7 +649,7 @@ class SmemPResource(DecodeGenResourceBase):
                 if safe_new_max == _neg_max_f32():
                     safe_new_max = Float32(0.0)
                 neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-                if cutlass.const_expr(cfg.use_fp8_qkv):
+                if cutlass.const_expr(cfg.use_fp8_q):
                     neg_scaled_max += _fp8_log2_quant_scale()
                 if new_max != _neg_max_f32():
                     repeat_idx = scale_idx // 2
@@ -673,7 +673,7 @@ class SmemPResource(DecodeGenResourceBase):
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 self.tmem_s_ref.store_p_local_sum(scale_idx, local_sums[scale_idx])
 
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_fp8_q):
                 # FP8 P is packed four values per register and stored with
                 # transposed 8-bit helpers so BMM2 sees the tcgen05 layout.
                 packed_p = cutlass.Array(
@@ -710,7 +710,7 @@ class SmemPResource(DecodeGenResourceBase):
             )
             for pair_idx in cutlass.range_constexpr(cfg.num_packed_p_regs):
                 val_base = pair_idx * 2
-                if cutlass.const_expr(cfg.use_bf16_qkv):
+                if cutlass.const_expr(cfg.use_bf16_q):
                     regs_p[pair_idx] = _pack_float2_to_bf16(
                         p_vals[val_base], p_vals[val_base + 1]
                     )
@@ -736,7 +736,7 @@ class SmemPResource(DecodeGenResourceBase):
             cute.arch.fence_view_async_shared()
             return
 
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_q):
             # Tile-Q=8 FP8 path: compute packed P and local sums directly
             # from the eight S registers owned by this lane.
             packed_p = cutlass.Array(
@@ -898,7 +898,7 @@ class SmemPResource(DecodeGenResourceBase):
             regs_p = cutlass.Array(
                 Int32, cfg.num_packed_p_regs, space=cutlass.AddressSpace.rmem
             )
-            if cutlass.const_expr(cfg.use_bf16_qkv):
+            if cutlass.const_expr(cfg.use_bf16_q):
                 for reg_idx in cutlass.range_constexpr(cfg.num_packed_p_regs):
                     val_base = reg_idx * 2
                     regs_p[reg_idx] = _pack_float2_to_bf16(
@@ -938,7 +938,7 @@ class SmemPResource(DecodeGenResourceBase):
                 shape=prims.StoreShape.M8N8,
             )
         cute.arch.fence_view_async_shared()
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_q):
             # FP8 P uses inline STSM stores. Synchronize the producer
             # warpgroup before the UMMA-consumer pipeline is committed so
             # BMM2 cannot observe a partially written P tile.
