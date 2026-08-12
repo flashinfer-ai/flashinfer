@@ -60,6 +60,8 @@ class MNNVLQuantType:
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     NUM_LAMPORT_BUFFERS = 3
+    TWOSHOT_NUM_STAGES = 2
+    PACKED_ALIGNMENT_BYTES = 16
 
     def __init__(
         self,
@@ -125,8 +127,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 f"[MNNVL Allreduce] Using provided buffer size override in bytes: {buffer_size_in_bytes} bytes."
             )
 
-        # Two-shot splits each Lamport buffer into two 16B-aligned stages.
-        buffer_alignment = 2 * 16
+        buffer_alignment = self.TWOSHOT_NUM_STAGES * self.PACKED_ALIGNMENT_BYTES
         buffer_size_in_bytes = round_up(buffer_size_in_bytes, buffer_alignment)
 
         if comm_backend is None:
