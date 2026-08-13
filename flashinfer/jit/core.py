@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import sysconfig
+import tempfile
 from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -616,7 +617,9 @@ class JitSpecNvcc(JitSpec):
         Returns ``True`` when the directory was actually removed (so the
         caller knows to regenerate the ninja file). Missing or corrupt metadata
         is a mismatch: an existing artifact without a committed fingerprint is
-        never safe to reuse.
+        never safe to reuse. Generated input sources may live below the build
+        directory, so their top-level trees are staged outside it while stale
+        compiler outputs are removed.
         """
         if self.build_dir.exists() and not self._meta_matches(expected):
             logger.info(
@@ -626,7 +629,44 @@ class JitSpecNvcc(JitSpec):
             # A failed wipe must abort: continuing would compile into a
             # directory that still holds stale objects and then "bless" them
             # with a fresh meta.json.
-            shutil.rmtree(self.build_dir)
+            build_dir = Path(os.path.abspath(self.build_dir))
+            source_roots = set()
+            for source in self.sources:
+                source_abs = Path(os.path.abspath(source))
+                try:
+                    if os.path.commonpath((build_dir, source_abs)) != str(build_dir):
+                        continue
+                except ValueError:
+                    continue
+                relative = source_abs.relative_to(build_dir)
+                if relative.parts:
+                    source_roots.add(build_dir / relative.parts[0])
+
+            existing_roots = sorted(
+                (path for path in source_roots if path.exists() or path.is_symlink()),
+                key=str,
+            )
+            if not existing_roots:
+                shutil.rmtree(self.build_dir)
+                return True
+
+            staging_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{self.name}.sources.", dir=self.build_dir.parent
+                )
+            )
+            staged = []
+            try:
+                for source_root in existing_roots:
+                    staged_root = staging_dir / source_root.name
+                    source_root.replace(staged_root)
+                    staged.append((staged_root, source_root))
+                shutil.rmtree(self.build_dir)
+            finally:
+                self.build_dir.mkdir(parents=True, exist_ok=True)
+                for staged_root, source_root in staged:
+                    staged_root.replace(source_root)
+                staging_dir.rmdir()
             return True
         return False
 

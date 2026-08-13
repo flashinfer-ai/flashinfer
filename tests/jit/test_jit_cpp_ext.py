@@ -452,6 +452,31 @@ def test_missing_meta_triggers_rebuild(monkeypatch, tmp_path):
     assert core._read_meta(spec.meta_path) == spec.expected_meta
 
 
+def test_invalidation_preserves_generated_sources_in_build_dir(monkeypatch, tmp_path):
+    """Generated source trees are build inputs, not stale build outputs."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    generated_dir = spec.build_dir / "generated"
+    generated_dir.mkdir(parents=True)
+    generated_source = generated_dir / "kernel.cu"
+    generated_source.write_text("__global__ void generated() {}")
+    generated_helper = generated_dir / "kernel_config.inc"
+    generated_helper.write_text("// generated helper")
+    spec.sources = [generated_source]
+
+    stale_artifact = spec.build_dir / "stale-without-meta"
+    stale_artifact.write_text("old build output")
+    spec.jit_library_path.write_bytes(b"old shared library")
+
+    spec.build(verbose=False, need_lock=False)
+
+    assert calls["builds"] == 1
+    assert generated_source.read_text() == "__global__ void generated() {}"
+    assert generated_helper.read_text() == "// generated helper"
+    assert not stale_artifact.exists()
+    assert spec.jit_library_path.read_bytes() == b"\x7fELF"
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
 def test_corrupt_meta_triggers_rebuild(monkeypatch, tmp_path):
     spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
     spec.build(verbose=False, need_lock=False)
