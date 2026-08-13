@@ -9312,7 +9312,7 @@ def _check_bmm_mxfp8_problem_size(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
     # Check input tensors
     if A.ndim != 3 or B.ndim != 3:
@@ -9322,6 +9322,30 @@ def _check_bmm_mxfp8_problem_size(
         raise ValueError(
             f"K dimension (last dim of A) mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
         )
+    if A.shape[0] != B.shape[0]:
+        raise ValueError(
+            f"Batch dimension mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
+        )
+
+    supported_input_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if A.dtype not in supported_input_dtypes:
+        raise ValueError(
+            f"A must be a float8_e4m3fn or float8_e5m2 tensor, got A.dtype={A.dtype}."
+        )
+    if B.dtype not in supported_input_dtypes:
+        raise ValueError(
+            f"B must be a float8_e4m3fn or float8_e5m2 tensor, got B.dtype={B.dtype}."
+        )
+    if A_scale.dtype != torch.uint8:
+        raise ValueError(f"A_scale must be a uint8 tensor, got {A_scale.dtype=}.")
+    if B_scale.dtype != torch.uint8:
+        raise ValueError(f"B_scale must be a uint8 tensor, got {B_scale.dtype=}.")
+
+    for name, tensor in (("B", B), ("A_scale", A_scale), ("B_scale", B_scale)):
+        if tensor.device != A.device:
+            raise ValueError(
+                f"{name} device mismatch. Expected {A.device}, got {tensor.device}."
+            )
 
     # mxfp8 GEMM needs n,k >= 128 (smaller dims can produce NaN/Inf garbage). mm_mxfp8 enforces this
     # in its common check (_check_mm_mxfp8_problem_size) but bmm_mxfp8 historically did not, so the
@@ -9342,6 +9366,22 @@ def _check_bmm_mxfp8_problem_size(
             f"got A_scale.ndim={A_scale.ndim}, B_scale.ndim={B_scale.ndim}."
         )
     _validate_mxfp8_output_dtype(dtype)
+
+    if out is not None:
+        expected_shape = (A.shape[0], A.shape[1], B.shape[2])
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
+            )
+        if out.device != A.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {A.device}, got {out.device}."
+            )
+        if out.dtype != dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {dtype}, got {out.dtype}."
+            )
+
     return True
 
 
@@ -9407,11 +9447,20 @@ def _cutlass_bmm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
+    if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
+        raise ValueError("e5m2 is not supported for bmm_mxfp8 with CUTLASS backend")
+    max_kernel_dim = torch.iinfo(torch.int32).max
+    if any(dim > max_kernel_dim for dim in (*A.shape, B.shape[2])):
+        raise ValueError(
+            f"CUTLASS bmm_mxfp8 dimensions must not exceed {max_kernel_dim}"
+        )
     # SM120/121 CUTLASS MXFP8 supports flattened or rank-preserving swizzled scales.
     if A_scale.ndim not in (1, 3) or B_scale.ndim not in (1, 3):
         return False
     if A.shape[2] % 32 != 0 or B.shape[2] % 32 != 0:
         return False
+    if out is not None and not out.is_contiguous():
+        raise ValueError("CUTLASS bmm_mxfp8 requires a contiguous output tensor")
     return True
 
 
@@ -9457,10 +9506,12 @@ def bmm_mxfp8(
     Parameters
     ----------
     A: torch.Tensor
-        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2. The CUTLASS
+        backend supports e4m3 only.
 
     B: torch.Tensor
         Mat2 tensor, shape (b, k, n), must be column major, fp8 e4m3 or fp8 e5m2.
+        The CUTLASS backend supports e4m3 only.
         Quantize the contiguous [b, n, k] weight (so the 32-element scale blocks
         run along k, the reduction dim) and pass the transpose of the quantized
         tensor, e.g. ``B = mxfp8_quantize(weight)[0].transpose(-2, -1)``
@@ -9469,12 +9520,16 @@ def bmm_mxfp8(
     A_scale: torch.Tensor
         Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
         layout. The CUTLASS backend accepts flattened or rank-preserving scales
-        padded independently for each batch item.
+        padded independently for each batch item. For a non-128-aligned row
+        count whose flattened layout is ambiguous, pass the rank-preserving
+        scale with shape ``[b, pad(rows, 128), pad(ceil(k / 32), 4)]``.
 
     B_scale: torch.Tensor
         Scale tensor for B, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
         layout. The CUTLASS backend accepts flattened or rank-preserving scales
-        padded independently for each batch item.
+        padded independently for each batch item. For a non-128-aligned row
+        count whose flattened layout is ambiguous, pass the rank-preserving
+        scale with shape ``[b, pad(rows, 128), pad(ceil(k / 32), 4)]``.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.

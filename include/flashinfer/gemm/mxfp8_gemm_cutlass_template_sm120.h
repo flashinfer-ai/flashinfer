@@ -17,6 +17,8 @@
 #ifndef FLASHINFER_MXFP8_GEMM_CUTLASS_TEMPLATE_SM120_H_
 #define FLASHINFER_MXFP8_GEMM_CUTLASS_TEMPLATE_SM120_H_
 
+#include <mutex>
+
 #ifndef _WIN32
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
@@ -114,6 +116,8 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
       }
     };
     static std::unordered_map<MNK, size_t, MNKHash> workspace_hashmap;
+    static std::mutex workspace_mutex;
+    const std::lock_guard<std::mutex> lock(workspace_mutex);
     if (workspace_hashmap.find(std::make_tuple(m, n, k, batch_count)) == workspace_hashmap.end()) {
       size_t workspace_size = 0;
       for (auto const& gemmConfig : getConfigs()) {

@@ -173,6 +173,108 @@ def test_bmm_mxfp8_common_check_accepts_rank_preserving_scales():
     )
 
 
+def _valid_cpu_bmm_mxfp8_inputs():
+    a = torch.empty((2, 128, 128), dtype=torch.float8_e4m3fn)
+    b = torch.empty((2, 128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((2, 128, 4), dtype=torch.uint8)
+    return a, b, scale
+
+
+def test_bmm_mxfp8_common_check_rejects_batch_mismatch():
+    a, b, scale = _valid_cpu_bmm_mxfp8_inputs()
+    b = torch.empty((3, 128, 128), dtype=b.dtype)
+
+    with pytest.raises(ValueError, match="Batch dimension mismatch"):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            a, b, scale, scale, torch.bfloat16, backend="cutlass"
+        )
+
+
+def test_bmm_mxfp8_common_check_rejects_input_and_scale_dtypes():
+    a, b, scale = _valid_cpu_bmm_mxfp8_inputs()
+    invalid_a = torch.empty(a.shape, dtype=torch.float16)
+    invalid_scale = torch.empty(scale.shape, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="A must be a float8"):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            invalid_a, b, scale, scale, torch.bfloat16, backend="cutlass"
+        )
+    with pytest.raises(ValueError, match="A_scale must be a uint8"):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            a, b, invalid_scale, scale, torch.bfloat16, backend="cutlass"
+        )
+
+
+def test_bmm_mxfp8_common_check_rejects_device_mismatch():
+    a, b, scale = _valid_cpu_bmm_mxfp8_inputs()
+    scale_on_other_device = torch.empty(scale.shape, dtype=torch.uint8, device="meta")
+
+    with pytest.raises(ValueError, match="A_scale device mismatch"):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            scale_on_other_device,
+            scale,
+            torch.bfloat16,
+            backend="cutlass",
+        )
+
+
+@pytest.mark.parametrize(
+    ("out_shape", "out_dtype", "error"),
+    [
+        ((2, 127, 128), torch.bfloat16, "Output shape mismatch"),
+        ((2, 128, 128), torch.float16, "Output dtype mismatch"),
+    ],
+)
+def test_bmm_mxfp8_common_check_rejects_invalid_output(out_shape, out_dtype, error):
+    a, b, scale = _valid_cpu_bmm_mxfp8_inputs()
+    out = torch.empty(out_shape, dtype=out_dtype)
+
+    with pytest.raises(ValueError, match=error):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            a, b, scale, scale, torch.bfloat16, out=out, backend="cutlass"
+        )
+
+
+def test_bmm_mxfp8_cutlass_rejects_e5m2():
+    a = torch.empty((2, 128, 128), dtype=torch.float8_e5m2)
+    b = torch.empty((2, 128, 128), dtype=torch.float8_e5m2)
+    scale = torch.empty((2, 128, 4), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="e5m2 is not supported"):
+        gemm_base._cutlass_bmm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
+            a, b, scale, scale, torch.bfloat16, backend="cutlass"
+        )
+
+
+def test_bmm_mxfp8_cutlass_rejects_noncontiguous_output():
+    a, b, scale = _valid_cpu_bmm_mxfp8_inputs()
+    out = torch.empty((2, 128, 256), dtype=torch.bfloat16)[..., ::2]
+
+    with pytest.raises(ValueError, match="contiguous output"):
+        gemm_base._cutlass_bmm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            scale,
+            scale,
+            torch.bfloat16,
+            out=out,
+            backend="cutlass",
+        )
+
+
+def test_bmm_mxfp8_cutlass_rejects_dimensions_that_overflow_kernel_ints():
+    a = torch.empty((0, 2**31, 128), dtype=torch.float8_e4m3fn)
+    b = torch.empty((0, 128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((0,), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="dimensions must not exceed"):
+        gemm_base._cutlass_bmm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
+            a, b, scale, scale, torch.bfloat16, backend="cutlass"
+        )
+
+
 @pytest.mark.parametrize(("m", "legacy_len"), [(17, 512), (100, 1024)])
 def test_bmm_mxfp8_cutlass_rejects_legacy_flattened_scales(m, legacy_len):
     legacy_scale = torch.empty((legacy_len,), dtype=torch.uint8)
@@ -222,13 +324,16 @@ def test_bmm_mxfp8_cudnn_dynamic_m(m: int):
     assert cos_sim > 0.99
 
 
-@pytest.mark.parametrize("m", [17, 100])
-def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(m):
+@pytest.mark.parametrize(
+    ("b", "m", "n", "k"),
+    [(2, 17, 128, 128), (3, 100, 160, 160), (2, 129, 256, 160)],
+)
+@pytest.mark.parametrize("backend", ["cutlass", "auto"])
+def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(b, m, n, k, backend):
     """Verify CUTLASS BMM works with per-batch scales for non-128-aligned M."""
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
 
-    b, n, k = 2, 128, 128
     input_dtype = torch.bfloat16
     out_dtype = torch.bfloat16
 
@@ -248,7 +353,7 @@ def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(m):
         input_scale,
         mat2_scale,
         out_dtype,
-        backend="cutlass",
+        backend=backend,
     )
 
     min_cos_sim = 0.9
