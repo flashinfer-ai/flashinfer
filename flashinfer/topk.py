@@ -412,12 +412,56 @@ def get_topk_module():
     ) -> torch.Tensor:
         return out
 
+    @register_custom_op(
+        "flashinfer::cub_topk_ragged_transform",
+        mutates_args=("workspace_buffer", "output_indices"),
+    )
+    def cub_topk_ragged_transform(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        offsets: torch.Tensor,
+        lengths: torch.Tensor,
+        workspace_buffer: Optional[torch.Tensor],
+        top_k: int,
+        tie_break: int,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> None:
+        # The binding leaves short rows' output tails untouched; pre-fill with -1
+        # so the padding contract matches the native fused transforms. The fill
+        # kernel is issued here so it is captured with the call under CUDA graphs.
+        output_indices.fill_(-1)
+        module.cub_topk_ragged_transform(
+            input,
+            output_indices,
+            offsets,
+            lengths,
+            workspace_buffer,
+            top_k,
+            tie_break,
+            row_starts,
+        )
+
+    @register_fake_op("flashinfer::cub_topk_ragged_transform")
+    def _fake_cub_topk_ragged_transform(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        offsets: torch.Tensor,
+        lengths: torch.Tensor,
+        workspace_buffer: Optional[torch.Tensor],
+        top_k: int,
+        tie_break: int,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> None:
+        pass
+
     return SimpleNamespace(
         radix_topk=radix_topk,
         radix_topk_page_table_transform=radix_topk_page_table_transform,
         radix_topk_ragged_transform=radix_topk_ragged_transform,
         cub_topk_page_table_transform=cub_topk_page_table_transform,
         cub_topk_page_table_transform_workspace_size=module.cub_topk_page_table_transform_workspace_size,
+        cub_topk_ragged_transform=cub_topk_ragged_transform,
+        cub_topk_ragged_transform_workspace_size=module.cub_topk_ragged_transform_workspace_size,
         can_implement_filtered_topk=module.can_implement_filtered_topk,
         fast_topk_clusters_exact=_fast_topk_clusters_exact,
         fast_topk_clusters_exact_page_table_transform=_fast_topk_clusters_exact_page_table_transform,
@@ -1063,6 +1107,30 @@ def top_k_ragged_transform(
     """
     device = input.device
     num_rows = input.size(0)
+
+    if can_use_cub_topk(input, tie_break) and not deterministic:
+        topk_module = get_topk_module()
+        # Host-side size query (launches nothing); the workspace is cached per device
+        # so repeated calls (including under CUDA graph capture) reuse a stable
+        # allocation.
+        workspace_bytes = topk_module.cub_topk_ragged_transform_workspace_size(
+            input, lengths, k, int(tie_break)
+        )
+        workspace_buffer: torch.Tensor = _get_cache_buf(
+            f"cub_topk_workspace_{device}", workspace_bytes, device
+        )
+        output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+        topk_module.cub_topk_ragged_transform(
+            input,
+            output_indices,
+            offsets,
+            lengths,
+            workspace_buffer,
+            k,
+            int(tie_break),
+            row_starts,
+        )
+        return output_indices
 
     if (
         can_use_clusters_topk(

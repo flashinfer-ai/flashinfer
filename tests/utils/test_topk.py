@@ -1656,7 +1656,7 @@ def test_page_table_transform_algorithms(
     )
 
 
-@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
 @pytest.mark.parametrize("num_rows", [1, 8])
 @pytest.mark.parametrize("max_len", [4096, 8192])
 @pytest.mark.parametrize("k", [256, 512])
@@ -3192,24 +3192,30 @@ def _require_cub_tie_break_support():
         pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
 
 
-def test_cub_page_table_transform_nonpositive_lengths(set_topk_algo):
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_cub_transform_nonpositive_lengths(transform_mode, set_topk_algo):
     """lengths[i] <= 0 is a valid empty row for the CUB backend (all -1 outputs).
 
     The lengths bounds declared to CUB span the full int32 range, so zero and negative
     values clamp to an empty segment instead of being undefined behavior. Forced to the
     CUB backend: negative lengths are UB for the native kernels, so there is no native
-    reference to compare against.
+    reference to compare against. Both transform entries share the CUB lengths machinery;
+    only the output mapping differs.
     """
     set_topk_algo("cub")
     torch.manual_seed(3)
     num_rows, d, k = 6, 4096, 256
     scores = torch.randn(num_rows, d, device="cuda")
-    pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
     lengths = torch.tensor(
         [d, 0, 100, -1, -(2**31), 1], dtype=torch.int32, device="cuda"
     )
 
-    out = flashinfer.top_k_page_table_transform(scores, pt, lengths, k)
+    if transform_mode == "page_table":
+        pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
+        out = flashinfer.top_k_page_table_transform(scores, pt, lengths, k)
+    else:
+        offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
+        out = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
     torch.cuda.synchronize()
 
     for i, length in enumerate(lengths.tolist()):
@@ -3219,7 +3225,10 @@ def test_cub_page_table_transform_nonpositive_lengths(set_topk_algo):
         )
         if valid > 0:
             _, ref_idx = torch.topk(scores[i, :length], valid)
-            ref = pt[i][ref_idx]
+            if transform_mode == "page_table":
+                ref = pt[i][ref_idx]
+            else:
+                ref = ref_idx.int() + offsets[i]
             assert sorted(out[i, :valid].tolist()) == sorted(ref.tolist())
 
 
@@ -3263,12 +3272,13 @@ def test_cub_page_table_transform_tie_break(tie_break, set_topk_algo):
         assert set(out[i].tolist()) == expected, f"row {i}: tie set mismatch"
 
 
-def test_cub_page_table_transform_workspace_paths(set_topk_algo):
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_cub_transform_workspace_paths(transform_mode):
     """No workspace falls back to internal allocation; a too-small one raises.
 
     Deliberately binding-level: the dispatcher always passes the cached workspace, so
     nothing else exercises the launcher's cudaMallocAsync fallback or its workspace-size
-    ICHECK.
+    ICHECK. Parametrized over the transform entries, which share the workspace machinery.
     """
     from flashinfer.jit.topk import gen_topk_module
 
@@ -3276,31 +3286,52 @@ def test_cub_page_table_transform_workspace_paths(set_topk_algo):
     torch.manual_seed(9)
     num_rows, d, k = 8, 4096, 256
     scores = torch.randn(num_rows, d, device="cuda")
-    pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
     lengths = torch.full((num_rows,), d, dtype=torch.int32, device="cuda")
     out = torch.full((num_rows, k), -1, dtype=torch.int32, device="cuda")
 
+    if transform_mode == "page_table":
+        pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
+
+        def run(workspace):
+            module.cub_topk_page_table_transform(
+                scores, out, pt, lengths, None, workspace, k, 0, 1, None, None, None
+            )
+
+        def expected_row(i, ref_idx):
+            return pt[i][ref_idx].tolist()
+
+        needed = int(
+            module.cub_topk_page_table_transform_workspace_size(
+                scores, lengths, k, 0, False
+            )
+        )
+    else:
+        offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
+
+        def run(workspace):
+            module.cub_topk_ragged_transform(
+                scores, out, offsets, lengths, workspace, k, 0, None
+            )
+
+        def expected_row(i, ref_idx):
+            return (ref_idx.int() + offsets[i]).tolist()
+
+        needed = int(
+            module.cub_topk_ragged_transform_workspace_size(scores, lengths, k, 0)
+        )
+
     # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
-    module.cub_topk_page_table_transform(
-        scores, out, pt, lengths, None, None, k, 0, 1, None, None, None
-    )
+    run(None)
     torch.cuda.synchronize()
     _, ref_idx = torch.topk(scores, k)
     for i in range(num_rows):
-        assert sorted(out[i].tolist()) == sorted(pt[i][ref_idx[i]].tolist())
+        assert sorted(out[i].tolist()) == sorted(expected_row(i, ref_idx[i]))
 
     # A too-small workspace must raise, not corrupt.
-    needed = int(
-        module.cub_topk_page_table_transform_workspace_size(
-            scores, lengths, k, 0, False
-        )
-    )
     if needed > 1:
         tiny = torch.empty(1, dtype=torch.uint8, device="cuda")
         with pytest.raises(RuntimeError, match="workspace too small"):
-            module.cub_topk_page_table_transform(
-                scores, out, pt, lengths, None, tiny, k, 0, 1, None, None, None
-            )
+            run(tiny)
 
 
 if __name__ == "__main__":
