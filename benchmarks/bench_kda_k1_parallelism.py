@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark B200 CAKE K1 parallelism against the M64/M128 oracle.
+"""Benchmark SM100-family CAKE K1 parallelism against the M64/M128 oracle.
 
 Every implementation is invoked through ``flashinfer.kda.recurrent_kda``.
 The script first requires bitwise-identical output and recurrent state, then
@@ -44,7 +44,7 @@ def _parse_forced_config(value: str) -> tuple[int, int]:
     try:
         cluster_size_text, mailbox_depth_text = value.split(":", 1)
         cluster_size = int(cluster_size_text)
-        mailbox_depth_cap = int(mailbox_depth_text)
+        mailbox_depth = int(mailbox_depth_text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(
             f"expected CLUSTER_SIZE:MAILBOX_DEPTH, got {value!r}"
@@ -52,12 +52,12 @@ def _parse_forced_config(value: str) -> tuple[int, int]:
     if cluster_size not in (4, 8):
         raise argparse.ArgumentTypeError("forced cluster size must be 4 or 8")
     producer_instances = (cluster_size - 1) * 5
-    if mailbox_depth_cap <= 0 or mailbox_depth_cap % producer_instances != 0:
+    if mailbox_depth <= 0 or mailbox_depth % producer_instances != 0:
         raise argparse.ArgumentTypeError(
             "forced mailbox depth must be a positive multiple of "
             f"{producer_instances} for C{cluster_size}"
         )
-    return cluster_size, mailbox_depth_cap
+    return cluster_size, mailbox_depth
 
 
 def _parse_varlen_profile(value: str) -> tuple[int, ...]:
@@ -95,8 +95,8 @@ def _measure(
     enable_cupti: bool,
     warmup_ms: int,
     bench_ms: int,
-) -> tuple[float, list[float]]:
-    samples = [
+) -> list[float]:
+    return [
         float(value)
         for value in bench_gpu_time(
             run,
@@ -107,7 +107,6 @@ def _measure(
             repeat_time_ms=bench_ms,
         )
     ]
-    return float(np.median(samples)), samples
 
 
 def _run_case(
@@ -167,12 +166,12 @@ def _run_case(
         else None
     )
     forced_routes = {
-        f"c{cluster_size}_d{mailbox_depth_cap}": (
+        f"c{cluster_size}_d{mailbox_depth}": (
             "m128_k1_parallel",
             cluster_size,
-            mailbox_depth_cap,
+            mailbox_depth,
         )
-        for cluster_size, mailbox_depth_cap in forced_configs
+        for cluster_size, mailbox_depth in forced_configs
     }
     routes = {
         "m64": ("m64", 0, 0),
@@ -243,7 +242,7 @@ def _run_case(
             state_cursor = 0
             torch.cuda.synchronize()
             with _physical_route(route):
-                _, round_samples = _measure(
+                round_samples = _measure(
                     lambda name=name: launch(name, timed=True),
                     enable_cupti=enable_cupti,
                     warmup_ms=warmup_ms,
@@ -258,11 +257,6 @@ def _run_case(
     forced_results = {
         name: {
             "cluster_size": route[1],
-            "mailbox_depth_cap": next(
-                cap
-                for cluster_size, cap in forced_configs
-                if name == f"c{cluster_size}_d{cap}"
-            ),
             "mailbox_depth": route[2],
             "latency_ms": timings[name],
             "speedup_vs_oracle": oracle_ms / timings[name],
@@ -330,7 +324,7 @@ def main() -> None:
         default=[],
         metavar="C:D",
         help=(
-            "force additional cluster-size/mailbox-depth-cap routes, for "
+            "force additional cluster-size/mailbox-depth routes, for "
             "example: --forced-configs 4:15 4:30 8:35"
         ),
     )
@@ -396,7 +390,7 @@ def main() -> None:
             )
             for name, forced in result["forced_results"].items():
                 print(
-                    f"  {name} actual_depth={forced['mailbox_depth']:2d} "
+                    f"  {name} depth={forced['mailbox_depth']:2d} "
                     f"latency={forced['latency_ms']:.6f} ms "
                     f"speedup={forced['speedup_vs_oracle']:.3f}x",
                     flush=True,

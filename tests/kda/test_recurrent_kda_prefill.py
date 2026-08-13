@@ -538,7 +538,7 @@ def test_k1_parallel_rejects_unsafe_mailbox_depth(
     )
     inputs = _make_inputs(seq_lens=[2048], num_heads=8, packed=False)
 
-    with pytest.raises(Exception, match="multiple of the helper producer count"):
+    with pytest.raises(RuntimeError, match="multiple of the helper producer count"):
         recurrent_kda(**_strict_prefill_kwargs(inputs))
 
 

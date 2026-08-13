@@ -261,15 +261,9 @@ def _select_flash_kda_prefill_variant(
 
     compute_capability = get_compute_capability(device)
     if compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
-        return (
-            ("m64", 0, 0)
-            if num_sequences == 1 and num_heads == 64
-            else (
-                "m128",
-                0,
-                0,
-            )
-        )
+        if fixed_layout and num_sequences == 1 and num_heads == 64:
+            return "m64", 0, 0
+        return "m128", 0, 0
 
     task_count = num_sequences * num_heads
     average_sequence_length = (
@@ -289,9 +283,9 @@ def _select_flash_kda_prefill_variant(
             if compute_capability == (10, 0)
             else ((8, 30), (32, 45))
         )
-        for max_tasks, depth_cap in depth_schedule:
+        for max_tasks, mailbox_depth in depth_schedule:
             if task_count <= max_tasks:
-                return "m128_k1_parallel", 4, depth_cap
+                return "m128_k1_parallel", 4, mailbox_depth
     if not fixed_layout:
         return "m128", 0, 0
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count

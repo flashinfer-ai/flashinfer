@@ -1399,7 +1399,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                 if (load_stage == 5) { load_stage = 0; _phase_v_free ^= 1; _phase_qk_full_2 ^= 1; }
             }
         }
-    // ---- Role: persistent owner DSM ingress coordinator ----
+    // ---- Role: persistent owner mailbox ingress coordinator ----
     } else if (cta_rank == 0 && warp == 12) {
         int task_idx_4 = bid;
         int seq_idx_4 = seq_order[task_idx_4 / num_heads];
@@ -2704,7 +2704,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
     __syncthreads();
     cluster_sync();
 
-    // Cleanup
 }
 
 } // extern "C"
