@@ -20,7 +20,7 @@
 # The shim/ layers next to them are ours and stay checked.
 # The Cake selective-state CUDA/host trees are byte-faithful generated exports;
 # their SHA-256 digests are checked by the JIT manifest and must not be rewritten.
-exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks

@@ -104,9 +104,7 @@ def _quantize_mxfp8_weight_k_major(
     )
 
     data_dtype = _mxfp8_data_dtype(kind)
-    return mxfp8_quantize_per_block_32_row(
-        weight_k_major.to(torch.float32), data_dtype
-    )
+    return mxfp8_quantize_per_block_32_row(weight_k_major.to(torch.float32), data_dtype)
 
 
 def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Sm120Mxfp8Kind) -> bool:
