@@ -199,7 +199,10 @@ def cub_topk_metrics(
 def append_cub_header(header: str, tie_break_enabled: bool) -> str:
     header += f" {'CUB':>12} {'CUBvsFI':>10}"
     if tie_break_enabled:
-        header += f" {'CUB(tie-small)':>15} {'CUB(tie-large)':>15}"
+        header += (
+            f" {'CUB(tie-small)':>15} {'CUBvsFI(tie-s)':>15}"
+            f" {'CUB(tie-large)':>15} {'CUBvsFI(tie-l)':>15}"
+        )
     return header
 
 
@@ -214,6 +217,14 @@ def append_cub_columns(line: str, result: dict, tie_break_enabled: bool) -> str:
         for suffix in ("small", "large"):
             cub_tie = result.get(f"cub_tie_{suffix}_us")
             line += f" {cub_tie:>13.2f}us" if cub_tie is not None else f" {'n/a':>15}"
+            # Native tie time / CUB tie time (>= 1.0x means CUB wins); n/a when either
+            # side is missing (CUB declined, or the native tie path errored, e.g.
+            # UNSUPPORTED at k=4096).
+            fi_tie = result.get(f"flashinfer_tie_{suffix}_us")
+            if cub_tie is not None and fi_tie is not None:
+                line += f" {fi_tie / cub_tie:>14.2f}x"
+            else:
+                line += f" {'n/a':>15}"
     return line
 
 
