@@ -8,10 +8,12 @@ records *provenance and sync state* only.
 - **Repo**: flashinfer-ai/flashinfer — PR
   [#4069](https://github.com/flashinfer-ai/flashinfer/pull/4069)
   (`sm90_push_fp8`: push-style FP8 whole-layer EP MoE backend for Hopper).
-- **Vendored commit**: `301f8ce3dd42646bb12707251f50db619fb5c653` (PR head;
-  the PR was still **open** when taken — re-diff against the merged SHA when
-  it lands and absorb any post-review deltas).
-- **Last synced**: 2026-08-12.
+- **Vendored commit**: `301f8ce3dd42646bb12707251f50db619fb5c653` (PR head).
+  The PR **merged** to main on 2026-08-12 as squash commit
+  `f9b13ef11472d994ec02210e7a6fe62df3254636`; re-diffed 2026-08-13 — this
+  tree is byte-for-byte identical to the merged SHA (no post-review deltas
+  between the PR head and the merge). Future syncs diff against main.
+- **Last synced**: 2026-08-12 (re-diffed vs merged SHA 2026-08-13).
 - **Vendored subset**: the whole
   `flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe/` tree byte-for-byte
   (`src/{a2a,fp8_gemm}/` CUDA sources, `shim/`, `__init__.py`,
