@@ -19,7 +19,6 @@ Python orchestrator for the Prims-TS BF16 MoE path.
 from __future__ import annotations
 
 import contextlib
-import math
 import os
 from typing import Any, List, Optional
 
@@ -31,8 +30,10 @@ from flashinfer.autotuner import (
     TuningConfig,
 )
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
-from flashinfer.fused_moe.shared.tuning import make_moe_tuning_config
-from flashinfer.fused_moe.utils import make_random_topk_ids
+from flashinfer.fused_moe.shared.tuning import (
+    make_moe_tuning_config,
+    moe_topk_ids_init,
+)
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -345,7 +346,7 @@ def _quantize_nvfp4_fc1_output_for_fc2(
 
     get_fp4_quantization_module(
         f"{major * 10 + minor}"
-    ).raw_module.nvfp4_quant_and_per_token_scale(
+    ).nvfp4_quant_and_per_token_scale_out_sm100(
         input_view,
         _nvfp4_per_token_global_scale_inv(),
         activation_output,
@@ -502,24 +503,12 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -778,24 +767,12 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1107,24 +1084,12 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1528,24 +1493,12 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1787,24 +1740,12 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -2128,24 +2069,12 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         tune_max_num_tokens: int = 8192,
         **kwargs,
     ) -> TuningConfig:
-        def _init_packed_topk_ids(shapes, dtype, device):
-            expert_ids = make_random_topk_ids(
-                num_experts=self.num_experts,
-                num_tokens=math.prod(shapes[:-1]),
-                top_k=shapes[-1],
-                device=device,
-            ).view(shapes)
-            expert_weights = torch.ones(
-                shapes, dtype=torch.bfloat16, device=device
-            ).view(torch.int16)
-            return (expert_ids << 16) | expert_weights
-
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_init_packed_topk_ids,
+            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )

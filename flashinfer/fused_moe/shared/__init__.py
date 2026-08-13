@@ -17,17 +17,18 @@
 from .inputs import (
     MoEInputs,
     MoeRunnerInputs,
-    RoutingInputMode,
     alloc_trtllm_moe_output,
     unpack_trtllm_moe_output,
 )
-from .tuning import make_moe_tuning_config
+from .tuning import make_moe_tuning_config, moe_topk_ids_init
+from .validation import validate_bf16_gemm1_activation_params
 
 __all__ = [
     "MoEInputs",
     "MoeRunnerInputs",
-    "RoutingInputMode",
     "alloc_trtllm_moe_output",
     "make_moe_tuning_config",
+    "moe_topk_ids_init",
     "unpack_trtllm_moe_output",
+    "validate_bf16_gemm1_activation_params",
 ]

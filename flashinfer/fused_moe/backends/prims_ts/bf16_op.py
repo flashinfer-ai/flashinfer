@@ -22,13 +22,13 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
-from flashinfer.fused_moe.backends.trtllm.validation import (
-    validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
-)
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     alloc_trtllm_moe_output,
     unpack_trtllm_moe_output,
+)
+from flashinfer.fused_moe.shared.validation import (
+    validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
 from flashinfer.prims_ts.moe.runner import PrimsTsBf16MoERunner
 from flashinfer.prims_ts.moe.support import is_prims_ts_bf16_supported

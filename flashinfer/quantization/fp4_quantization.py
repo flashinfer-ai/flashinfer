@@ -489,6 +489,41 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::nvfp4_quant_and_per_token_scale_out_sm100",
+        mutates_args=("output", "output_scale", "output_per_token_scale"),
+    )
+    def nvfp4_quant_and_per_token_scale_out_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        output_per_token_scale: torch.Tensor,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> None:
+        module.nvfp4_quant_and_per_token_scale(
+            input,
+            scale_inv,
+            output,
+            output_scale,
+            output_per_token_scale,
+            expanded_idx_to_permuted_idx,
+            sf_layout,
+        )
+
+    @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_out_sm100")
+    def _fake_nvfp4_quant_and_per_token_scale_out_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        output_per_token_scale: torch.Tensor,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> None:
+        pass
+
+    @register_custom_op(
         "flashinfer::nvfp4_quant_and_per_token_scale_sm100",
         mutates_args=(""),
     )
@@ -517,7 +552,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             (out_scale_rows, out_scale_cols), dtype=torch.uint8
         )
         output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
-        module.nvfp4_quant_and_per_token_scale(
+        nvfp4_quant_and_per_token_scale_out_sm100(
             input,
             scale_inv,
             output,
@@ -802,13 +837,13 @@ def get_fp4_quantization_module(backend: str = "100"):
 
     # Register the module
     return SimpleNamespace(
-        raw_module=module,
         fp4_quantize_sm100=fp4_quantize_sm100,
         block_scale_interleave_sm100=block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
         nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
+        nvfp4_quant_and_per_token_scale_out_sm100=nvfp4_quant_and_per_token_scale_out_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
     )

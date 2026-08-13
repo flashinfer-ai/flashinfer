@@ -8,7 +8,8 @@ import torch
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
-from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+from flashinfer.fused_moe.shared.tuning import moe_topk_ids_init
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -1351,19 +1352,19 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     must collapse to a single cache entry.
     """
     # The factory must return the identical object for the same expert count.
-    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+    assert moe_topk_ids_init(128) is moe_topk_ids_init(128)
 
     AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     AutoTuner._find_nearest_profile(
-        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        shapes, _build_moe_style_tuning_config(moe_topk_ids_init(128))
     )
     cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     N = 1_000
     for _ in range(N):
-        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        config = _build_moe_style_tuning_config(moe_topk_ids_init(128))
         AutoTuner._find_nearest_profile(shapes, config)
 
     cache_growth = (
@@ -1401,9 +1402,10 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             ),
             patch.object(core_mod, "setup_cubin_loader"),
         ):
-            MoERunner = fn(enable_rubin=False).MoERunner
+            trtllm_module = fn(enable_rubin=False)
 
-        runner = MoERunner(
+        runner = trtllm_module.MoERunner(
+            trtllm_module.moe_op,
             top_k=8,
             num_local_experts=128,
             dtype_act=DtypeTrtllmGen.Bfloat16,
@@ -1437,11 +1439,11 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
 
         assert init_a is init_b, (
             "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must reuse _moe_topk_ids_init(num_experts) so an "
+            "on each call. It must reuse moe_topk_ids_init(num_experts) so an "
             "equivalent config reuses one initializer object instead of allocating "
             "a fresh closure on every call."
         )
-        assert init_a is _moe_topk_ids_init(128, packed=packed)
+        assert init_a is moe_topk_ids_init(128, packed=packed)
 
         initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
         if packed:

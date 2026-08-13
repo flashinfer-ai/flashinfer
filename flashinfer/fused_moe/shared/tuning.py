@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import functools
+import math
 from typing import Any, Callable, Optional
 
 import torch
@@ -29,12 +31,46 @@ from ...autotuner.initializers import (
     autotuner_initializer_zeros,
 )
 from ...tllm_enums import Fp8QuantizationType
-from ..utils import get_hybrid_num_tokens_buckets, make_hybrid_bucket_mapper
+from ..utils import (
+    get_hybrid_num_tokens_buckets,
+    make_hybrid_bucket_mapper,
+    make_random_topk_ids,
+)
 from .inputs import MoeRunnerInputs
 
 
 def _has_payload(tensor: Optional[torch.Tensor]) -> bool:
     return tensor is not None and tensor.numel() > 0
+
+
+@functools.cache
+def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
+    """Return a top-k-id initializer for a given expert count.
+
+    ``PackedPrecomputed`` profiling needs ``(expert_id << 16) | bf16(weight)``,
+    while ``UnpackedPrecomputed`` profiling needs plain expert IDs. Cache the
+    closure for object identity preservation in rebuilt tuning configs.
+    """
+
+    def _init(
+        shapes: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        expert_ids = make_random_topk_ids(
+            num_experts=num_experts,
+            num_tokens=math.prod(shapes[:-1]),
+            top_k=shapes[-1],
+            device=device,
+        ).view(shapes)
+        if not packed:
+            return expert_ids
+        expert_weights = torch.ones(shapes, dtype=torch.bfloat16, device=device).view(
+            torch.int16
+        )
+        return (expert_ids << 16) | expert_weights
+
+    return _init
 
 
 def make_moe_tuning_config(

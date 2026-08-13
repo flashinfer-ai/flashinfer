@@ -14,12 +14,8 @@
 
 """TRT-LLM cubin MoE backend."""
 
-from .bf16_op import register_trtllm_bf16_moe_op
-from .sm100_runner import create_trtllm_moe_runner_class
-from .validation import validate_bf16_gemm1_activation_params
+from .sm100_runner import MoERunner
 
 __all__ = [
-    "create_trtllm_moe_runner_class",
-    "register_trtllm_bf16_moe_op",
-    "validate_bf16_gemm1_activation_params",
+    "MoERunner",
 ]
