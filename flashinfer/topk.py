@@ -454,6 +454,40 @@ def get_topk_module():
     ) -> None:
         pass
 
+    @register_custom_op(
+        "flashinfer::cub_topk",
+        mutates_args=("workspace_buffer", "output_indices", "output_values"),
+    )
+    def cub_topk(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        output_values: torch.Tensor,
+        workspace_buffer: Optional[torch.Tensor],
+        top_k: int,
+        tie_break: int,
+    ) -> None:
+        # No -1 prefill: plain top_k has no lengths window, every output slot is
+        # written by the kernel.
+        module.cub_topk(
+            input,
+            output_indices,
+            output_values,
+            workspace_buffer,
+            top_k,
+            tie_break,
+        )
+
+    @register_fake_op("flashinfer::cub_topk")
+    def _fake_cub_topk(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        output_values: torch.Tensor,
+        workspace_buffer: Optional[torch.Tensor],
+        top_k: int,
+        tie_break: int,
+    ) -> None:
+        pass
+
     return SimpleNamespace(
         radix_topk=radix_topk,
         radix_topk_page_table_transform=radix_topk_page_table_transform,
@@ -462,6 +496,8 @@ def get_topk_module():
         cub_topk_page_table_transform_workspace_size=module.cub_topk_page_table_transform_workspace_size,
         cub_topk_ragged_transform=cub_topk_ragged_transform,
         cub_topk_ragged_transform_workspace_size=module.cub_topk_ragged_transform_workspace_size,
+        cub_topk=cub_topk,
+        cub_topk_workspace_size=module.cub_topk_workspace_size,
         can_implement_filtered_topk=module.can_implement_filtered_topk,
         fast_topk_clusters_exact=_fast_topk_clusters_exact,
         fast_topk_clusters_exact_page_table_transform=_fast_topk_clusters_exact_page_table_transform,
@@ -739,6 +775,32 @@ def top_k(
     """
     batch_size = input.size(0)
     device = input.device
+
+    # The CUB backend returns unsorted results and has no reproducible-ordering
+    # mode, so sorted / deterministic calls fall through to the native backends.
+    # dsa_graph_safe is honored by serving the call: CUB's kernel selection depends
+    # only on shape (static under a graph), so it is graph-safe by construction.
+    if not sorted and not deterministic and can_use_cub_topk(input, tie_break):
+        topk_module = get_topk_module()
+        # Host-side size query (launches nothing); the workspace is cached per device
+        # so repeated calls (including under CUDA graph capture) reuse a stable
+        # allocation.
+        workspace_bytes = topk_module.cub_topk_workspace_size(input, k, int(tie_break))
+        workspace_buffer: torch.Tensor = _get_cache_buf(
+            f"cub_topk_workspace_{device}", workspace_bytes, device
+        )
+        output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
+        indices_int32 = torch.empty(batch_size, k, dtype=torch.int32, device=device)
+        topk_module.cub_topk(
+            input,
+            indices_int32,
+            output_values,
+            workspace_buffer,
+            k,
+            int(tie_break),
+        )
+        # int64 indices are the documented torch.topk drop-in contract.
+        return output_values, indices_int32.long()
 
     if can_use_clusters_topk(input.device, deterministic, tie_break, dsa_graph_safe):
         indices, output_values = topk_clusters_exact(

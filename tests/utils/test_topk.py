@@ -1573,13 +1573,13 @@ def test_compare_with_sglang_style_prefill_mode(num_rows, max_len, k):
 # ===================== Algorithm-specific Tests =====================
 
 
-@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
 @pytest.mark.parametrize("batch_size", [1, 8])
 @pytest.mark.parametrize("vocab_size", [4096, 32000])
 @pytest.mark.parametrize("k", [256, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_top_k_algorithms(algo, batch_size, vocab_size, k, dtype, set_topk_algo):
-    """Test top_k with different algorithms (auto, multi_cta, filtered)."""
+    """Test top_k with different algorithms (auto, multi_cta, filtered, cub)."""
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
@@ -3272,13 +3272,13 @@ def test_cub_page_table_transform_tie_break(tie_break, set_topk_algo):
         assert set(out[i].tolist()) == expected, f"row {i}: tie set mismatch"
 
 
-@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged", "top_k"])
 def test_cub_transform_workspace_paths(transform_mode):
     """No workspace falls back to internal allocation; a too-small one raises.
 
     Deliberately binding-level: the dispatcher always passes the cached workspace, so
     nothing else exercises the launcher's cudaMallocAsync fallback or its workspace-size
-    ICHECK. Parametrized over the transform entries, which share the workspace machinery.
+    ICHECK. Parametrized over all CUB entries, which share the workspace machinery.
     """
     from flashinfer.jit.topk import gen_topk_module
 
@@ -3305,7 +3305,7 @@ def test_cub_transform_workspace_paths(transform_mode):
                 scores, lengths, k, 0, False
             )
         )
-    else:
+    elif transform_mode == "ragged":
         offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
 
         def run(workspace):
@@ -3319,6 +3319,16 @@ def test_cub_transform_workspace_paths(transform_mode):
         needed = int(
             module.cub_topk_ragged_transform_workspace_size(scores, lengths, k, 0)
         )
+    else:
+        out_values = torch.empty(num_rows, k, dtype=scores.dtype, device="cuda")
+
+        def run(workspace):
+            module.cub_topk(scores, out, out_values, workspace, k, 0)
+
+        def expected_row(i, ref_idx):
+            return ref_idx.int().tolist()
+
+        needed = int(module.cub_topk_workspace_size(scores, k, 0))
 
     # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
     run(None)
@@ -3326,6 +3336,10 @@ def test_cub_transform_workspace_paths(transform_mode):
     _, ref_idx = torch.topk(scores, k)
     for i in range(num_rows):
         assert sorted(out[i].tolist()) == sorted(expected_row(i, ref_idx[i]))
+    if transform_mode == "top_k":
+        # The plain entry also returns the scores; they must match the indices.
+        gathered = torch.gather(scores, dim=-1, index=out.long())
+        torch.testing.assert_close(out_values, gathered)
 
     # A too-small workspace must raise, not corrupt.
     if needed > 1:
