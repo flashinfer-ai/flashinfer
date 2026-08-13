@@ -37,6 +37,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.cute_dsl.utils import get_num_sm
 
+from ..device_target import gdn_compile_options, gdn_device_target
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 
 
@@ -49,6 +50,8 @@ from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 # the key because the tile scheduler and GQA reshape logic bake them in.
 @functools.cache
 def _get_compiled_cache(
+    arch: str,
+    num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
     HQ: int,
@@ -188,7 +191,11 @@ def chunk_gated_delta_rule_sm100(
     use_state_indices = state_indices is not None
     _state_indices = state_indices if use_state_indices else None
 
+    # num_sm is baked into the kernel's tile scheduler, so it belongs in the key.
+    target = gdn_device_target(q.device)
     cache = _get_compiled_cache(
+        target.arch,
+        get_num_sm(q.device),
         str(q.dtype),
         str(state_torch_dtype),
         HQ,
@@ -290,7 +297,9 @@ def chunk_gated_delta_rule_sm100(
 
         stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
-        compiled = cute.compile(
+        compiled = cute.compile[
+            gdn_compile_options(q.device, cute.EnableTVMFFI(True), cute.OptLevel(3))
+        ](
             gdn,
             q_cute,
             k_cute,
@@ -308,7 +317,6 @@ def chunk_gated_delta_rule_sm100(
             scale,
             workspace_cute,
             stream,
-            options="--enable-tvm-ffi --opt-level 3",
         )
 
         cache["compiled"] = compiled

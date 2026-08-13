@@ -125,8 +125,8 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from .device_target import gdn_compile_options
 
-device = torch.device("cuda:0")
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
 T = 16
@@ -3706,7 +3706,7 @@ def gated_delta_rule_mtp_ucache_flush(
     ]
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
+        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](
             GdnDecodeUCacheFlushKernel(
                 disable_state_update=True,
                 min_blocks_per_mp=mbp,

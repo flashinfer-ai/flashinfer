@@ -47,10 +47,9 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from .device_target import gdn_compile_options
 from .dtype_compat import as_bf16
 
-
-device = torch.device("cuda:0")
 
 # Fixed dims matching Triton v5
 T = 16
@@ -1947,8 +1946,7 @@ _CACHE: dict = {}
 
 
 def _compile_options(device: torch.device) -> tuple:
-    major, minor = torch.cuda.get_device_capability(device)
-    return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
+    return gdn_compile_options(device)
 
 
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
@@ -2332,12 +2330,7 @@ def gated_delta_rule_mtp(
             qkv_row_stride=_qkv_rs,
             ab_native=_ab_native_flag,
         )
-        options = _compile_options(device)
-        _CACHE[cache_key] = (
-            cute.compile[options](kernel, *args)
-            if options
-            else cute.compile(kernel, *args)
-        )
+        _CACHE[cache_key] = cute.compile[_compile_options(device)](kernel, *args)
     _CACHE[cache_key](*args)
 
     if output is None:
