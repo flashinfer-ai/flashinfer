@@ -614,8 +614,8 @@ class CuteDslConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 — tighten when CuteDSL adds more targets
-        return arch in (100, 103)
+        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(

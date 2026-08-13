@@ -14,7 +14,7 @@ from tests.utils_fp8 import to_float8
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
+@pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "cute-dsl", "auto"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
     compute_capability = get_compute_capability(torch.device("cuda"))
@@ -22,7 +22,26 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
         pytest.skip(
             "bmm_fp8 with cutlass backend is only supported on SM100, SM110, and SM120/121 GPUs."
         )
-    if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
+    # cute-dsl backend requirements
+    if backend == "cute-dsl":
+        if compute_capability[0] != 10:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend is only supported on SM100, SM103 or SM107 GPUs."
+            )
+        if m % 16 != 0 or n % 16 != 0 or k % 16 != 0:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires m, n, k to be multiples of 16."
+            )
+        # Blackwell/Rubin kernel requires A and B to have the same dtype
+        if input_dtype != mat2_dtype:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires A and B to have the same dtype."
+            )
+    if (
+        input_dtype == torch.float8_e5m2
+        and mat2_dtype == torch.float8_e5m2
+        and backend != "cute-dsl"
+    ):
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
     if input_dtype == torch.float8_e5m2 or mat2_dtype == torch.float8_e5m2:
         if backend == "cutlass":
@@ -37,6 +56,11 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
         pytest.skip(
             "Invalid combination: only cutlass supports SM110 which does not support e5m2"
         )
+    if auto_tuning and backend not in ["cutlass", "cute-dsl"]:
+        pytest.skip(
+            "Invalid combination: auto_tuning only supported for cutlass and cute-dsl"
+        )
+
     input = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
     input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)
 

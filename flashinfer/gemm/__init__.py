@@ -47,15 +47,21 @@ try:
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
     if is_cute_dsl_available():
-        from .kernels.grouped_gemm_masked_blackwell import (
+        from .kernels.grouped_gemm_masked_wrapper import (
             grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+        )
+        from .kernels.grouped_gemm_masked_blackwell import (
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
+        )
+        from .kernels.grouped_gemm_masked_rubin import (
+            Sm107BlockScaledPersistentDenseGemmKernel as Sm107BlockScaledPersistentDenseGemmKernel,
         )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
+            "Sm107BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
         ]
 except ImportError:

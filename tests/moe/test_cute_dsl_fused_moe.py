@@ -59,14 +59,32 @@ from .utils import (
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103).
+    """Check for the SM100 family: Blackwell SM100/SM103 and Rubin SM107.
 
-    CuteDSL MoE NVFP4 does not target Rubin SM107.
+    Upstream narrows this to SM100/SM103 on the grounds that "CuteDSL MoE
+    NVFP4 does not target Rubin SM107"; on feat_sm107 we keep SM107 in the
+    family. SM107 is compute capability 10.7 and the JIT compiles it against
+    the sm100f family target (``map_sm107_to_100f``), and the rest of the MoE
+    /GEMM suite already spells the family ``((10, 0), (10, 3), (10, 7))`` -
+    see ``_sm100_family`` in tests/moe/test_unified_moe_mxfp4.py. Deliberate
+    divergence from main; see pluh/scripts/MERGE_RULES.md.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return (props.major, props.minor) in ((10, 0), (10, 3))
+    return (props.major, props.minor) in ((10, 0), (10, 3), (10, 7))
+
+
+def is_sm107():
+    """Check for Rubin (SM107)."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 10 and props.minor == 7
+
+
+# feat_sm107 tests below still reference the older ``is_sm10x`` spelling.
+is_sm10x = is_sm100_family
 
 
 # Skip decorators
@@ -75,8 +93,9 @@ cute_dsl_available = pytest.mark.skipif(
 )
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
-    reason="Requires CuteDSL MoE target SM100 or SM103",
+    reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
+sm10x_required = sm100_required
 
 
 _MOE_QUANT_MODES = ("w4a4", "w4a16")
@@ -299,7 +318,7 @@ class TestTacticEnumeration:
     These tests run without a GPU. They exercise the enumeration
     functions directly to enforce invariants that the end-to-end
     accuracy tests can fail to detect when a tile size is gated out of
-    ALL_MOE_TACTICS as a workaround.
+    ALL_BLACKWELL_MOE_TACTICS as a workaround.
 
     The MoE pipeline runs gemm1 (gather + SwiGLU) followed by gemm2
     (finalize fusion) back-to-back on the same padded token sequence.
@@ -313,10 +332,10 @@ class TestTacticEnumeration:
         cluster_shape[0] == tile_size // 128 (1-CTA at tile=128, 2-CTA
         at tile=256)."""
         from flashinfer.fused_moe.cute_dsl.tuner import (
-            get_gemm1_valid_tactics,
+            get_blackwell_gemm1_valid_tactics,
         )
 
-        tactics = get_gemm1_valid_tactics(tile_size)
+        tactics = get_blackwell_gemm1_valid_tactics(tile_size)
         assert len(tactics) > 0, f"no gemm1 tactics returned at tile_size={tile_size}"
         expected_cluster_m = tile_size // 128
         for mma_tiler_mn, cluster_shape_mn, _ in tactics:
@@ -338,10 +357,10 @@ class TestTacticEnumeration:
         tactic at tile_size=256 cannot consume a 2-CTA gemm1 output
         and produces incorrect results (regression for #3067)."""
         from flashinfer.fused_moe.cute_dsl.tuner import (
-            get_gemm2_valid_tactics,
+            get_blackwell_gemm2_valid_tactics,
         )
 
-        tactics = get_gemm2_valid_tactics(tile_size)
+        tactics = get_blackwell_gemm2_valid_tactics(tile_size)
         assert len(tactics) > 0, f"no gemm2 tactics returned at tile_size={tile_size}"
         expected_cluster_m = tile_size // 128
         for mma_tiler_mn, cluster_shape_mn, _ in tactics:
@@ -357,27 +376,27 @@ class TestTacticEnumeration:
 
     def test_all_moe_tactics_pair_gemm1_and_gemm2_consistently(self):
         """Every (tile_size, gemm1_tactic, gemm2_tactic) tuple in
-        ALL_MOE_TACTICS must have gemm1 and gemm2 share both
+        ALL_BLACKWELL_MOE_TACTICS must have gemm1 and gemm2 share both
         mma_tiler[0] and cluster_shape[0] (the M dimensions). This
         catches a class of bug where the product loop in
         get_moe_valid_tactics accidentally pairs incompatible
         gemm1/gemm2 tactics, even if each individual enumeration is
         internally consistent."""
-        from flashinfer.fused_moe.cute_dsl.tuner import ALL_MOE_TACTICS
+        from flashinfer.fused_moe.cute_dsl.tuner import ALL_BLACKWELL_MOE_TACTICS
 
-        assert len(ALL_MOE_TACTICS) > 0
-        for tile_size, gemm1_tactic, gemm2_tactic in ALL_MOE_TACTICS:
+        assert len(ALL_BLACKWELL_MOE_TACTICS) > 0
+        for tile_size, gemm1_tactic, gemm2_tactic in ALL_BLACKWELL_MOE_TACTICS:
             gemm1_mma_m = gemm1_tactic[0][0]
             gemm1_cluster_m = gemm1_tactic[1][0]
             gemm2_mma_m = gemm2_tactic[0][0]
             gemm2_cluster_m = gemm2_tactic[1][0]
             assert gemm1_mma_m == gemm2_mma_m == tile_size, (
-                f"gemm1/gemm2 mma_m mismatch in ALL_MOE_TACTICS at "
+                f"gemm1/gemm2 mma_m mismatch in ALL_BLACKWELL_MOE_TACTICS at "
                 f"tile_size={tile_size}: gemm1_mma_m={gemm1_mma_m}, "
                 f"gemm2_mma_m={gemm2_mma_m}"
             )
             assert gemm1_cluster_m == gemm2_cluster_m == tile_size // 128, (
-                f"gemm1/gemm2 cluster_m mismatch in ALL_MOE_TACTICS at "
+                f"gemm1/gemm2 cluster_m mismatch in ALL_BLACKWELL_MOE_TACTICS at "
                 f"tile_size={tile_size}: gemm1_cluster_m={gemm1_cluster_m}, "
                 f"gemm2_cluster_m={gemm2_cluster_m}"
             )
@@ -1358,7 +1377,7 @@ class TestCuteDslMoeW4A16:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestCuteDslFusedMoeFunctional:
     """Tests for the functional API: cute_dsl_fused_moe_nvfp4."""
 
@@ -1537,6 +1556,12 @@ class TestCuteDslFusedMoeFunctional:
         use_fused_finalize: bool,
     ):
         from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        if activation_type == ActivationType.Relu2 and is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
+                "(SwiGLU) activation path"
+            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -1781,6 +1806,11 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_with_autotune(self, quant_mode: str):
         """Test functional API with autotune context."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
+                "SwiGLU constants (swiglu_alpha/beta/limit)"
+            )
         from flashinfer import autotune
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
@@ -1823,6 +1853,11 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for the OAI SwiGLU epilogue variant."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
+                "SwiGLU constants (swiglu_alpha/beta/limit)"
+            )
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -1886,7 +1921,7 @@ class TestCuteDslFusedMoeFunctional:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
@@ -1972,6 +2007,11 @@ class TestCuteDslMoEWrapper:
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_wrapper_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for wrapper API with OAI SwiGLU."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
+                "SwiGLU constants (swiglu_alpha/beta/limit)"
+            )
         from flashinfer import CuteDslMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -2049,6 +2089,11 @@ class TestCuteDslMoEWrapper:
         use_fused_finalize: bool,
     ):
         """Test wrapper API with CUDA graph capture and replay."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
+                "SwiGLU constants (swiglu_alpha/beta/limit)"
+            )
         from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
@@ -2191,6 +2236,12 @@ class TestCuteDslMoEWrapper:
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
+
+        if activation_type == ActivationType.Relu2 and is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
+                "(SwiGLU) activation path"
+            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
@@ -2342,6 +2393,11 @@ class TestCuteDslMoEWrapper:
     def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
+                "SwiGLU constants (swiglu_alpha/beta/limit)"
+            )
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
         from flashinfer.autotuner import AutoTuner
@@ -2422,7 +2478,7 @@ class TestCuteDslMoEWrapper:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
@@ -2503,7 +2559,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
@@ -2676,7 +2732,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestMoeSortBufferInitPoisoned:
     """Validate the invariant that the routing kernel writes every
     output entry that downstream code reads, by pre-poisoning the
@@ -2898,7 +2954,7 @@ class TestMoeSortBufferInitPoisoned:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 
@@ -3036,7 +3092,7 @@ class TestAllValidTactics:
 
 
 @cute_dsl_available
-@sm100_required
+@sm10x_required
 class TestMoeOutputMemsetInplace:
     """Correctness + stream-handling tests for the dense memset wrapper."""
 

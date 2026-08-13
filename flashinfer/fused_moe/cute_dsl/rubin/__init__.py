@@ -11,31 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
-CuteDSL-based Fused MoE Kernels for NVFP4 on Blackwell and Rubin GPUs.
+Rubin (SM107) CuteDSL Kernels
+==============================
+
+This module contains CuteDSL kernels optimized for NVIDIA Rubin architecture.
+These kernels are adapted from TensorRT-LLM.
 """
 
-from ...cute_dsl.utils import is_cute_dsl_available
-
-# Conditionally import CuTe-DSL kernels
-if is_cute_dsl_available():
-    from .fused_moe import (
-        cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper,
-    )
-    from .b12x_moe import (
-        b12x_fused_moe,
-        B12xMoEWrapper,
-    )
-
-__all__ = [
-    "is_cute_dsl_available",
-]
-
-if is_cute_dsl_available():
-    __all__ += [
-        "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMoEWrapper",
-        "b12x_fused_moe",
-        "B12xMoEWrapper",
-    ]
+from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
+    Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
+)
+from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+    Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+)
+from .utils import (
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)

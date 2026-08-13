@@ -3563,6 +3563,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             (arch >= Arch.sm_101 and arch <= Arch.sm_101f)
             or (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
             or (arch >= Arch.sm_110 and arch <= Arch.sm_110f)
+            or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)
         ):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(

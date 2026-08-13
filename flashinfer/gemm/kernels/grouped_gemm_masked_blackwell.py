@@ -55,8 +55,6 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from flashinfer.utils import get_compute_capability
-from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -658,7 +656,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
-        supported_sm_versions = ["sm_100", "sm_103"]
+        supported_sm_versions = ["sm_100", "sm_103", "sm_107"]
         assert sm_version in supported_sm_versions, (
             f"{supported_sm_versions} are the only supported SM versions for cute-dsl backend, but encountered {sm_version}"
         )
@@ -3505,8 +3503,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
-@flashinfer_api(trace=grouped_gemm_nt_masked_trace)
-def grouped_gemm_nt_masked(
+def _grouped_gemm_nt_masked_sm100(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
@@ -3529,7 +3526,11 @@ def grouped_gemm_nt_masked(
     is_swap_ab: bool = False,
     **kwargs,
 ):
-    r"""Masked, batched, block-scaled GEMM on Blackwell SM100.
+    """
+    SM100/SM103 (Blackwell) implementation of masked grouped GEMM.
+
+    This is the arch-specific implementation; use ``grouped_gemm_nt_masked``
+    from ``grouped_gemm_masked_wrapper`` as the public entry point.
 
     Executes a masked, batched matrix multiplication with scale factors and
     optional per-batch alpha scaling on the output.  ``alpha`` is currently

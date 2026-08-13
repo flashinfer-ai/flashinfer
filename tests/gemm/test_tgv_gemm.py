@@ -19,8 +19,8 @@ def test_tgv_gemm_sm100(m, n, k, dtype):
     B = torch.randn(n, k, device="cuda", dtype=dtype).t()  # column major
     bias = torch.randn(n, device="cuda", dtype=dtype)
 
-    if not _match_sm_version(A.device, ["100", "103"]):
-        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
+    if not _match_sm_version(A.device, ["100", "103", "107"]):
+        pytest.skip("TGV GEMM requires SM100, SM103, SM107 architecture")
 
     print(
         f"Input tensors: A {A.shape}, B {B.shape}, bias {bias.shape}, dtype: {A.dtype}",
