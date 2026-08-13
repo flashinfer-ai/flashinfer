@@ -67,9 +67,7 @@ def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path
     try:
         module, attr = _LAZY[name]
     except KeyError:
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r}"
-        ) from None
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
     return getattr(importlib.import_module(module), attr)
 
 
