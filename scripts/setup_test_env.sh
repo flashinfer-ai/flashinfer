@@ -59,7 +59,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "Overriding nvidia-cutlass-dsl with: ${CUTLASS_DSL_PKG}"
   echo "========================================"
   # Clean uninstall old packages first (recommended by NVIDIA docs)
-  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
+  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
   pip install "${CUTLASS_DSL_PKG}"
   echo "nvidia-cutlass-dsl override complete."
   echo ""

@@ -77,6 +77,40 @@ jobs:
           python -m build
           ls -lh dist/
 
+      - name: Verify published CUTLASS DSL dependency
+        run: |
+          python - <<'PY'
+          from email.parser import BytesParser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
+
+          expected = "==4.6.2"
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one flashinfer-python wheel, found {wheels}")
+          with ZipFile(wheels[0]) as wheel:
+              metadata_paths = [name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(f"expected one METADATA file, found {metadata_paths}")
+              metadata = BytesParser().parsebytes(wheel.read(metadata_paths[0]))
+          requirements = [Requirement(raw) for raw in metadata.get_all("Requires-Dist", [])]
+          dsl_requirements = [
+              requirement
+              for requirement in requirements
+              if canonicalize_name(requirement.name) == "nvidia-cutlass-dsl"
+          ]
+          if not dsl_requirements or any(
+              str(requirement.specifier) != expected for requirement in dsl_requirements
+          ):
+              raise SystemExit(
+                  f"CUTLASS DSL wheel requirements are {dsl_requirements}, expected {expected}"
+              )
+          print(f"CUTLASS DSL wheel metadata check passed: {expected}")
+          PY
+
       - name: Upload flashinfer-python artifact
         uses: actions/upload-artifact@v4
         with:

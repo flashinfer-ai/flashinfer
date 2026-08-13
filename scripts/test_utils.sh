@@ -291,11 +291,10 @@ install_and_verify() {
         pip install -r requirements-test.txt
         python -c "import pytest_timeout"
 
-        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.
-        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
-        fi
+        # Source-based CI validates PrimTS and forward compatibility on 4.7.0
+        # after installing the package's default 4.6.2 dependency.
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup_ci_test_env.sh"
 
         # Install local python sources
         pip install -e . -v --no-deps

@@ -5,7 +5,7 @@ set -x
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-# Source test environment setup (handles package overrides like TVM-FFI)
+# Source the pre-install guards and optional dependency overrides.
 source "${SCRIPT_DIR}/setup_test_env.sh"
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
@@ -197,6 +197,9 @@ run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
     exit 1
 }
 echo "✓ Flashinfer package installed successfully"
+# Apply the source-test dependency policy after the editable install.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup_ci_test_env.sh"
 
 # Set up sccache for compiler caching with S3 backend.
 # Uses read-write mode when AWS credentials are available (nightly/release builds),

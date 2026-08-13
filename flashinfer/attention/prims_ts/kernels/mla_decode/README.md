@@ -6,6 +6,10 @@ paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
 layout: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
 
+This kernel requires `nvidia-cutlass-dsl>=4.7.0`; see the shared
+[CUTLASS DSL version policy](../../README.md#cutlass-dsl-version-policy) for
+the package-default and CI behavior.
+
 FlashInfer selects the 1-CTA throughput/latency family or the 2-CTA throughput
 family automatically. Query grouping, persistent scheduling, split-KV, and
 local versus separate reduction are implementation decisions. Unsupported
