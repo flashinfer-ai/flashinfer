@@ -27,6 +27,8 @@ import pytest
 import torch
 
 from flashinfer.autotuner import _json_to_tactic, _tactic_to_json, make_bucket_mapper
+from flashinfer.comm import pcie_ipc_tuning as tuning
+from flashinfer.comm.pcie_ipc_ar import PcieIpcAllReduceWorkspace
 from flashinfer.comm.pcie_ipc_policy import (
     MAX_BLOCKS,
     IpcLaunchConfig,
@@ -35,7 +37,6 @@ from flashinfer.comm.pcie_ipc_policy import (
     get_pcie_ipc_launch_config,
 )
 from flashinfer.comm.pcie_ipc_topology import PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR
-from flashinfer.comm import pcie_ipc_tuning as tuning
 
 _WORLD_SIZES = (2, 4, 8)
 
@@ -452,3 +453,59 @@ def test_pack_config_is_injective_over_the_candidate_space() -> None:
             config = tuning.tactic_to_config(tactic)
             key = tuning.pack_config(config)
             assert packed.setdefault(key, config) == config
+
+
+def test_unrelated_autotune_context_preserves_workspace_cache(monkeypatch) -> None:
+    """Global tuning without a matching group must look up, not profile.
+
+    A caller may wrap model warmup in an autotune context that replaces the
+    singleton tuner's file cache without installing the process group required
+    to profile a collective safely. The workspace must restore its explicit
+    cache instead of resolving and retaining the seed tactic.
+    """
+
+    class Runner:
+        def can_profile(self, device) -> bool:
+            return False
+
+    class Tuner:
+        is_tuning_mode = True
+
+        def __init__(self) -> None:
+            self.loaded = []
+            self.lookups = 0
+
+        def load_configs(self, path: str) -> None:
+            self.loaded.append(path)
+
+        def search_cache(self, *args, **kwargs):
+            self.lookups += 1
+            return True, 0, (int(IpcVariant.STAGED), 16, 256), None
+
+        def choose_one(self, *args, **kwargs):
+            raise AssertionError(
+                "collective profiling must not run without a tune group"
+            )
+
+    workspace = PcieIpcAllReduceWorkspace.__new__(PcieIpcAllReduceWorkspace)
+    workspace._runner = Runner()
+    workspace._tune_batches = tuning.TUNE_BATCHES
+    workspace._tune_cache = "/tmp/pcie-ipc-tuned.json"
+    workspace._tune_cache_exists = True
+    workspace._tuned_configs_loaded = True
+    workspace._warned_untuned = False
+    workspace.world_size = 2
+    workspace.max_blocks = MAX_BLOCKS
+    workspace.group = object()
+    workspace.device = torch.device("cpu")
+
+    monkeypatch.setattr(
+        "flashinfer.comm.pcie_ipc_ar.dist.all_reduce", lambda *a, **k: None
+    )
+    tuner = Tuner()
+    seed = IpcLaunchConfig(8, 64, IpcVariant.UNSTAGED)
+    result = workspace._resolve_tuned(torch.empty(4, 4096), seed, tuner)
+
+    assert tuner.loaded == [workspace._tune_cache]
+    assert tuner.lookups == 1
+    assert result == IpcLaunchConfig(16, 256, IpcVariant.STAGED)

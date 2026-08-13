@@ -385,7 +385,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
     def _table_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
         return self._ws.launch_config(inp)
 
-    def _searchable(self, device) -> bool:
+    def can_profile(self, device) -> bool:
         """Whether a real search is safe, as a group decision.
 
         Reduced rather than read locally because the answer decides how many
@@ -425,7 +425,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
             # at all. Nothing to choose between; the caller falls back.
             return [TABLE_TACTIC]
 
-        if not self._searchable(inp.device):
+        if not self.can_profile(inp.device):
             # Tuning mode is process-global, so this op can be swept by a
             # caller that only meant to tune its GEMMs. Without a reduction
             # over the candidate timings the ranks would argmin independently

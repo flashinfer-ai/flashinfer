@@ -574,11 +574,19 @@ class PcieIpcAllReduceWorkspace:
         hidden = inp.shape[-1]
         batch = inp.numel() // hidden
         tuning_config = pcie_ipc_tuning_config(self._tune_batches)
-        if tuner.is_tuning_mode:
+        can_profile = tuner.is_tuning_mode and self._runner.can_profile(inp.device)
+        if can_profile:
             _, tactic = tuner.choose_one(
                 PCIE_IPC_CUSTOM_OP, [self._runner], tuning_config, [inp]
             )
         else:
+            # An enclosing autotune context may belong to another operator and
+            # may have replaced the global file cache. Without a matching
+            # distributed tune group, profiling this collective is unsafe.
+            # Restore the workspace's explicit tune cache and perform a lookup
+            # with its own bucket policy instead of retaining the seed tactic.
+            if tuner.is_tuning_mode and self._tune_cache_exists:
+                tuner.load_configs(self._tune_cache)
             _, _, tactic, _ = tuner.search_cache(
                 PCIE_IPC_CUSTOM_OP,
                 [self._runner],
@@ -607,7 +615,7 @@ class PcieIpcAllReduceWorkspace:
                 stacklevel=3,
             )
             return seed
-        if not tuner.is_tuning_mode:
+        if not can_profile:
             self._warn_if_untuned()
         return config
 
