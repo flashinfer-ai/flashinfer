@@ -232,7 +232,10 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
     import deep_gemm
     import torch.distributed as dist
 
-    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+        preprocess_mega_weights,
+    )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )

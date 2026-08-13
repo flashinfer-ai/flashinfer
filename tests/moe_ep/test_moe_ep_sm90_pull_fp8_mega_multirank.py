@@ -535,7 +535,9 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_swap_ab_matches_reference():
         fp8_scale_mode="per_tensor",
         swap_ab=True,
     )
-    print(f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference")
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference"
+    )
 
 
 @pytest.mark.gpu_4

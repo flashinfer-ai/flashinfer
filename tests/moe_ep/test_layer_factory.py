@@ -79,11 +79,15 @@ def _mega_config(*, preprocess_weights: bool = False):
 
     if preprocess_weights:
         return MegaConfig(
-            megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+            megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                intermediate_size=128, top_k=2
+            ),
             preprocess_weights=True,
         )
     return MegaConfig(
-        megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+        megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        ),
         preprocess_weights=False,
         transformed_weights=_fake_deep_gemm_transformed(),
     )
@@ -277,14 +281,20 @@ def test_split_layer_init_rejects_process_group_without_dist():
 
 
 def test_factory_rejects_raw_mega_kernel_config():
-    from flashinfer.moe_ep import BootstrapConfig, Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, MoEEpLayer
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+        MoEEpLayer,
+    )
 
     with pytest.raises(TypeError, match="MegaConfig"):
         MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=_split_fleet_params(),
             weights=_split_weights(),
-            backend=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+            backend=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                intermediate_size=128, top_k=2
+            ),
         )
 
 

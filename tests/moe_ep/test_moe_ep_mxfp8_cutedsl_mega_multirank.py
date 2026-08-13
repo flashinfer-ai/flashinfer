@@ -779,7 +779,6 @@ def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     )
 
 
-
 @pytest.mark.arch_blackwell
 def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     _require_cuda()

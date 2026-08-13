@@ -77,6 +77,7 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
 )
+
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
 # These WILL BE REMOVED in a future release, together with the matching

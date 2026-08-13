@@ -580,7 +580,9 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -596,7 +598,9 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (prestaged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (prestaged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -616,7 +620,9 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     rank = _run_mega_layer(
         rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
     )
-    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (large tokens) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (large tokens) matches reference"
+    )
 
 
 @pytest.mark.gpu_4

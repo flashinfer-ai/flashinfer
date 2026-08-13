@@ -38,7 +38,9 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(
+    config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
