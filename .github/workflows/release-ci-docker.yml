@@ -6,6 +6,7 @@ on:
     branches:
       - main
     paths:
+      - '.python-version'
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'
@@ -13,6 +14,7 @@ on:
     branches:
       - main
     paths:
+      - '.python-version'
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'

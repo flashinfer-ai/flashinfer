@@ -9,7 +9,7 @@ Reusable primitives (pipeline-unaware, for composing new kernel variants):
 - alloc_tmem(): TMEM allocation with barrier sync
 - dealloc_tmem(): TMEM deallocation after barrier wait
 
-Orchestration (prefill-specific, uses raw CuTe ops for JIT compatibility):
+Orchestration (prefill-specific):
 - run(): double-buffered interleaved QK/PV with S0/S1 and O0/O1
 
 Inner kphase loops in ``gemm_qk`` / ``gemm_pv`` use ``cutlass.range_constexpr``
@@ -126,11 +126,6 @@ class MmaRole:
 
     # =========================================================================
     #  Reusable primitives — no pipeline awareness, for composing new kernels
-    #
-    #  All primitives below are SAFE to call from run() and other @cute.jit
-    #  methods. They are void (no return values) and only use compile-time
-    #  indexing (unrolled kphase loops), avoiding the CuTe DSL JIT
-    #  limitations with runtime tensor views and return values.
     # =========================================================================
 
     @cute.jit

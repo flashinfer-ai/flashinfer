@@ -16,6 +16,7 @@
 name = "flashinfer-python"
 dynamic = ["version", "dependencies"]
 description = "FlashInfer: Kernel Library for LLM Serving"
+# Keep the lower bound in sync with .python-version.
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
@@ -24,8 +25,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
+cu12 = ["nvidia-cutlass-dsl==4.7.0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.7.0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -80,6 +81,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.hpp",
   "instantiations/*.cu",
 ]
+"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+  "*.md",
+  "src/a2a/*.cu",
+  "src/a2a/*.cuh",
+  "src/fp8_gemm/*.cu",
+  "src/fp8_gemm/*.cuh",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
@@ -93,6 +101,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.mypy]
 files = ["flashinfer"]
+# Keep this literal in sync with .python-version.
+python_version = "3.10"
 ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
@@ -102,6 +112,8 @@ strict_optional = false
 exclude = [
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
+  # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
+  "flashinfer/attention/prims_ts/kernels/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
@@ -111,7 +123,6 @@ exclude = [
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "build/",
 ]
-
 
 # CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
 # cutedsl_megamoe/src kernels are maintained upstream and re-dropped
@@ -124,6 +135,7 @@ exclude = [
 # `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
 # `x == a or x == b` produces).
 [tool.ruff]
+# Ruff infers the target from project.requires-python.
 extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
