@@ -318,7 +318,9 @@ run_ft() {
       tests/moe_ep/smoke_ft_ep.py --backend "${backend}" 2>&1)" || true
     echo "${out}"
     local ok
-    ok="$(printf '%s' "${out}" | grep -c 'SMOKE_RESULT:' || true)"
+    # Count occurrences, not lines: the survivors' prints go through
+    # torchrun's stdout multiplexing and can interleave onto a single line.
+    ok="$(printf '%s' "${out}" | grep -o 'SMOKE_RESULT:' | wc -l)"
     if [ "${ok}" -ne "${expected_ok}" ]; then
       echo "FT smoke (${backend}): expected ${expected_ok} SMOKE_RESULT lines, got ${ok}" >&2
       rc=1

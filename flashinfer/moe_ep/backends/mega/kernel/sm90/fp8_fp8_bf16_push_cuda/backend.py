@@ -208,7 +208,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
             Sm90PushPayload,
             Sm90PushPipe,
         )
-        from ......comm.mnnvl import TorchDistBackend
+        from .......comm.mnnvl import TorchDistBackend
 
         transformed_weights = self._transformed_weights
         if transformed_weights is None:
