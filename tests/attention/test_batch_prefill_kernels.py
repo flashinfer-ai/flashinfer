@@ -53,9 +53,10 @@ def _accumulate_mismatch_count(mismatch_counts, out, ref, rtol, atol):
     keeps a single sync per test, with request-sized (not batch-sized)
     comparison temporaries.
     """
-    close = torch.isclose(
-        out.float(), ref.float(), rtol=rtol, atol=atol, equal_nan=True
-    )
+    # Shape check up front: isclose broadcasts, assert_close would not.
+    assert out.shape == ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}"
+    # equal_nan=False matches torch.testing.assert_close's default strictness.
+    close = torch.isclose(out.float(), ref.float(), rtol=rtol, atol=atol)
     mismatch_counts.append((~close).sum())
 
 

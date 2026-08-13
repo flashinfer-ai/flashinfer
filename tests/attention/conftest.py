@@ -16,11 +16,16 @@ per-module ninja dependency scan entirely.
 import contextlib
 import logging
 import os
+import time
 
 import pytest
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Set when a prebuild ran; pytest_sessionfinish uses it to flag collector
+# drift (modules that still compiled serially at test time).
+_prebuild_end_time = None
 
 _DT = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp8": torch.float8_e4m3fn}
 
@@ -251,7 +256,7 @@ def _batch_prefill_specs(items):
     def sp(*args, **kwargs):
         add(gen_single_prefill_module(*args, **kwargs))
 
-    fns = {it.name.split("[")[0] for it in items if getattr(it, "callspec", True)}
+    fns = {it.name.split("[")[0] for it in items}
 
     main_grid_fns = {
         "test_batch_prefill_with_paged_kv_cache",
@@ -407,10 +412,12 @@ def pytest_collection_modifyitems(session, config, items):
 
     reporter = config.pluginmanager.getplugin("terminalreporter")
 
+    prebuilt_any = False
     for fname, collect_specs in _PREBUILD_SPEC_COLLECTORS.items():
         file_items = [it for it in items if it.nodeid.split("::")[0].endswith(fname)]
         if not file_items:
             continue
+        prebuilt_any = True
 
         # The whole prebuild is a best-effort optimization. Any failure here
         # must not abort collection for the entire suite.
@@ -442,3 +449,46 @@ def pytest_collection_modifyitems(session, config, items):
                 f"[jit-prebuild] {fname}: staged {staged} kernels into AOT dir; "
                 "tests will load-only."
             )
+
+    if prebuilt_any:
+        # Arm the collector-drift check in pytest_sessionfinish: anything
+        # nvcc-compiled after this point compiled serially at test time.
+        global _prebuild_end_time
+        _prebuild_end_time = time.time()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """Collector-drift alarm.
+
+    If a registered file's dispatch logic changes (new dtype/layout/head_dim
+    -> new module URI) without its conftest collector being updated, the new
+    module silently compiles serially at test time and the file gets slow
+    again with no signal. Flag any nvcc module whose .so appeared after the
+    prebuild stage so the drift shows up as a one-line warning in the log.
+    """
+    if _prebuild_end_time is None:
+        return
+    try:
+        import flashinfer.jit.env as jit_env
+
+        late = sorted(
+            so.parent.name
+            for so in jit_env.FLASHINFER_JIT_DIR.rglob("*.so")
+            if so.stat().st_mtime > _prebuild_end_time
+        )
+        if not late:
+            return
+        reporter = session.config.pluginmanager.getplugin("terminalreporter")
+        if reporter:
+            shown = ", ".join(late[:5]) + (" ..." if len(late) > 5 else "")
+            reporter.write_line(
+                f"[jit-prebuild] WARNING: {len(late)} module(s) JIT-compiled "
+                f"after the prebuild stage: {shown}. If they belong to a "
+                "registered test file, its collector in "
+                "tests/attention/conftest.py has drifted from the test's "
+                "dispatch logic and should be updated.",
+                yellow=True,
+            )
+    except Exception:  # pragma: no cover - diagnostics must never fail the run
+        pass

@@ -13,7 +13,13 @@ from flashinfer.utils import is_sm90a_supported
 @functools.lru_cache(maxsize=2)
 def _workspace_buffer(size_mb: int = 128) -> torch.Tensor:
     """Shared workspace buffer: allocating (and zeroing) 128 MB per test adds
-    up over thousands of parametrizations; the wrappers treat it as scratch."""
+    up over thousands of parametrizations; the wrappers treat it as scratch.
+
+    INVARIANT for callers: when two wrappers share this buffer, fully finish
+    plan()+run() on one wrapper before calling plan() on the other. plan()
+    stores metadata in the workspace that the wrapper's run() reads, so an
+    interleaving like plan_a -> plan_b -> run_a would corrupt run_a.
+    """
     return torch.zeros(size_mb * 1024 * 1024, dtype=torch.uint8, device="cuda")
 
 
