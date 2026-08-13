@@ -53,7 +53,9 @@ def load_blk64_ext():
         "-Wno-deprecated-declarations",
         "--threads=4",
         "-DCUDA_CTA_RECONFIG_ACTIVATED=1",
+        # Build a fatbin for both Blackwell datacenter targets.
         "-gencode=arch=compute_100a,code=sm_100a",
+        "-gencode=arch=compute_103a,code=sm_103a",
         f"-I{_THIS_DIR}",
         *(f"-I{p}" for p in jit_env.CUTLASS_INCLUDE_DIRS),
     ]

@@ -91,7 +91,11 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, (
+        assert (
+            Arch.sm_100 <= self.arch <= Arch.sm_100f
+            or Arch.sm_103 <= self.arch <= Arch.sm_103f
+            or Arch.sm_110 <= self.arch <= Arch.sm_110f
+        ), (
             "Only SM 10.x and 11.x are supported"
         )
 
