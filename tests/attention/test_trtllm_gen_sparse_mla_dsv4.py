@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla._core import get_trtllm_gen_fmha_module
 from flashinfer.utils import get_compute_capability
 
 
@@ -871,6 +872,95 @@ def _skip_unless_sm100_or_sm103() -> None:
         pytest.skip(
             "TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
+        )
+
+
+def _strided_validation_pool(page_size: int, padding: int) -> torch.Tensor:
+    num_pages = 2
+    page_stride = page_size * DSV4_HEAD_DIM + padding
+    backing = torch.empty(
+        (num_pages - 1) * page_stride + page_size * DSV4_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    return torch.as_strided(
+        backing,
+        (num_pages, 1, page_size, DSV4_HEAD_DIM),
+        (page_stride, page_size * DSV4_HEAD_DIM, DSV4_HEAD_DIM, 1),
+    )
+
+
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_rejects_remap_buffer_on_other_device() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TRTLLM-GEN FFI validation")
+
+    query = torch.empty((1, 8, DSV4_HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    sparse_indices = torch.zeros((1, DSV4_SWA_TOPK), dtype=torch.int32, device="cuda")
+    op = get_trtllm_gen_fmha_module()
+    with pytest.raises(RuntimeError, match="same device as query"):
+        op.trtllm_paged_attention_decode_sparse_mla_dsv4(
+            torch.empty_like(query),
+            query,
+            _strided_validation_pool(C4_PAGE_SIZE, 1024),
+            _strided_validation_pool(SWA_PAGE_SIZE, 512),
+            torch.empty(1, dtype=torch.uint8, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            sparse_indices,
+            torch.empty(sparse_indices.shape, dtype=torch.int32, device="cpu"),
+            False,
+            torch.tensor([SWA_PAGE_SIZE], dtype=torch.int32, device="cuda"),
+            torch.tensor([DSV4_SWA_TOPK], dtype=torch.int32, device="cuda"),
+            1.0,
+            1.0,
+            1,
+            1,
+            1,
+            False,
+            1,
+            None,
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    "remap_storage_offset", (0, 1), ids=("exact-alias", "shifted-overlap")
+)
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_rejects_aliasing_remap_buffer(
+    monkeypatch, remap_storage_offset: int
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TRTLLM-GEN input validation")
+    monkeypatch.setattr(
+        "flashinfer.mla._core.get_compute_capability", lambda _device: (10, 0)
+    )
+
+    index_storage = torch.zeros(
+        DSV4_SWA_TOPK + remap_storage_offset, dtype=torch.int32, device="cuda"
+    )
+    sparse_indices = index_storage[:DSV4_SWA_TOPK].view(1, DSV4_SWA_TOPK)
+    remapped_sparse_indices = index_storage[
+        remap_storage_offset : remap_storage_offset + DSV4_SWA_TOPK
+    ].view(1, DSV4_SWA_TOPK)
+    with pytest.raises(ValueError, match="must not share storage"):
+        trtllm_batch_decode_sparse_mla_dsv4(
+            query=torch.empty(
+                (1, 1, 8, DSV4_HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+            ),
+            swa_kv_cache=_strided_validation_pool(SWA_PAGE_SIZE, 512),
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=_strided_validation_pool(C4_PAGE_SIZE, 1024),
+            sparse_topk_lens=torch.tensor(
+                [DSV4_SWA_TOPK], dtype=torch.int32, device="cuda"
+            ),
+            seq_lens=torch.tensor([SWA_PAGE_SIZE], dtype=torch.int32, device="cuda"),
+            bmm1_scale=1.0,
+            bmm2_scale=1.0,
+            backend="trtllm-gen",
+            remapped_sparse_indices_buffer=remapped_sparse_indices,
+            sparse_indices_are_storage_offsets=False,
         )
 
 

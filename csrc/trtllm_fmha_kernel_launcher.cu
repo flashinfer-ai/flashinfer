@@ -1046,6 +1046,10 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       << "remapped_sparse_indices must be int32";
   TVM_FFI_ICHECK(remapped_sparse_indices.IsContiguous())
       << "remapped_sparse_indices must be contiguous";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.device().device_type, query.device().device_type)
+      << "remapped_sparse_indices must be on the same device as query";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.device().device_id, query.device().device_id)
+      << "remapped_sparse_indices must be on the same device as query";
   TVM_FFI_ICHECK_EQ(primary_kv_cache.stride(-1), 1)
       << "primary_kv_cache head dimension must be contiguous";
   TVM_FFI_ICHECK_EQ(sliding_window_kv_cache.stride(-1), 1)
