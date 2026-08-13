@@ -89,31 +89,21 @@ def _run_case(
     shape = (batch_size, sequence_length, num_heads, 128)
 
     def randn(dims: tuple[int, ...]) -> torch.Tensor:
-        return torch.randn(dims, generator=generator, device="cuda").to(
-            torch.bfloat16
-        )
+        return torch.randn(dims, generator=generator, device="cuda").to(torch.bfloat16)
 
     q, k, v, g = (randn(shape) for _ in range(4))
     beta = randn((batch_size, sequence_length, num_heads))
     A_log = torch.rand((num_heads,), generator=generator, device="cuda")
-    dt_bias = torch.rand(
-        (num_heads, 128), generator=generator, device="cuda"
-    )
+    dt_bias = torch.rand((num_heads, 128), generator=generator, device="cuda")
     initial = randn((batch_size, num_heads, 128, 128))
-    outputs = {
-        name: torch.empty_like(q) for name in ("m64", "m128", "k1_parallel")
-    }
+    outputs = {name: torch.empty_like(q) for name in ("m64", "m128", "k1_parallel")}
     states = {name: initial.clone() for name in outputs}
     state_pools = {
-        name: initial.unsqueeze(0)
-        .expand(state_rotations, *initial.shape)
-        .clone()
+        name: initial.unsqueeze(0).expand(state_rotations, *initial.shape).clone()
         for name in outputs
     }
     state_cursors = {name: 0 for name in outputs}
-    workspaces = {
-        name: RecurrentKDAPrefillWorkspace(q.device) for name in outputs
-    }
+    workspaces = {name: RecurrentKDAPrefillWorkspace(q.device) for name in outputs}
 
     def launch(name: str, *, timed: bool = False) -> object:
         state = states[name]

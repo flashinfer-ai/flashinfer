@@ -366,14 +366,15 @@ def test_frozen_route_and_ffi_abi(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
-        (1, 8, 1024, ("m128_k1_parallel", 8, 32)),
+        (1, 8, 1024, ("m64", 0, 0)),
+        (1, 8, 2048, ("m128_k1_parallel", 8, 35)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
         (1, 48, 4096, ("m64", 0, 0)),
         (1, 64, 8192, ("m64", 0, 0)),
         (1, 64, 4096, ("m64", 0, 0)),
         (1, 72, 8192, ("m64", 0, 0)),
         (1, 80, 8192, ("m128", 0, 0)),
-        (2, 16, 1024, ("m128_k1_parallel", 4, 30)),
+        (2, 16, 2048, ("m128_k1_parallel", 4, 30)),
     ],
 )
 def test_k1_parallel_b200_oracle(
@@ -449,7 +450,7 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
         return module
 
     monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
-    inputs = _make_inputs(seq_lens=[1024], num_heads=8, packed=False)
+    inputs = _make_inputs(seq_lens=[2048], num_heads=8, packed=False)
     recurrent_kda(**_strict_prefill_kwargs(inputs))
 
     assert routes == [("m128_k1_parallel", "sm100f")]
@@ -457,9 +458,9 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
     assert len(args) == 24
     assert args[13].shape == (768,)
     assert args[14].dtype == torch.uint8
-    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 32)
+    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 35)
     assert args[15] == 1
-    assert args[16:21] == (8, 0, 0, 8, 32)
+    assert args[16:21] == (8, 0, 0, 8, 35)
     assert math.isclose(args[21], 128**-0.5)
     assert args[22] == -5.0
     assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
@@ -997,7 +998,7 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     )
 
 
-@pytest.mark.parametrize(("seq_len", "num_heads"), [(1024, 8), (1024, 16)])
+@pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 8), (2048, 16)])
 def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_heads):
     if get_compute_capability(flash_kda_device) != (10, 0):
         pytest.skip("K1 owner/helper prefill is tuned for B200/GB200")

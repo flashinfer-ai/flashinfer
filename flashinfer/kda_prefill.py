@@ -273,10 +273,10 @@ def _select_flash_kda_prefill_variant(
     mailbox_depth = 0
     if num_heads >= 8 and num_heads % 8 == 0:
         num_chunks = (sequence_length + 31) // 32
-        if task_count <= 8 and sequence_length >= 1024:
+        if task_count <= 8 and sequence_length >= 2048:
             cluster_size = 8
             mailbox_depth = min(num_chunks, 35)
-        elif task_count <= 32 and sequence_length >= 1024:
+        elif task_count <= 32 and sequence_length >= 2048:
             cluster_size = 4
             mailbox_depth = min(num_chunks, 30)
     if cluster_size:

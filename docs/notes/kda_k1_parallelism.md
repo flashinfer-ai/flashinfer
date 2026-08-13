@@ -13,8 +13,8 @@ M128 kernel outside measured profitable regions.
 
 | Batch-head tasks | Route | K1 parallelism | Minimum length |
 | ---: | --- | ---: | ---: |
-| 1-8 | C8 owner/helper | 1 owner + 7 helpers | 1024 |
-| 9-32 | C4 owner/helper | 1 owner + 3 helpers | 1024 |
+| 1-8 | C8 owner/helper | 1 owner + 7 helpers | 2048 |
+| 9-32 | C4 owner/helper | 1 owner + 3 helpers | 2048 |
 | other | exact M64/M128 oracle fallback | unchanged | N/A |
 
 M64 is selected while `2 * batch * heads <= SM count`; otherwise M128 is the
