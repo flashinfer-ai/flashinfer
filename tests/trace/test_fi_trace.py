@@ -27,7 +27,12 @@ import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
-from flashinfer.trace.templates.gemm import bmm_mxfp8_trace, mm_mxfp8_trace
+from flashinfer.trace.templates.gemm import (
+    bmm_mxfp8_flat_trace,
+    bmm_mxfp8_trace,
+    bmm_mxfp8_trace_dispatch,
+    mm_mxfp8_trace,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +367,8 @@ def test_mxfp8_trace_uses_physical_scale_buffer_shapes():
 
     batched_a = a.unsqueeze(0).expand(batch_size, -1, -1)
     batched_weight = weight.unsqueeze(0).expand(batch_size, -1, -1)
-    batched_a_scale = a_descale.repeat(batch_size)
-    batched_b_scale = b_descale.repeat(batch_size)
+    batched_a_scale = a_descale.reshape(1, 128, 4).repeat(batch_size, 1, 1)
+    batched_b_scale = b_descale.reshape(1, 128, 4).repeat(batch_size, 1, 1)
     bmm_defn = bmm_mxfp8_trace.build_fi_trace_fn("flashinfer.gemm.bmm_mxfp8")(
         A=batched_a,
         B=batched_weight.transpose(-2, -1),
@@ -372,10 +377,74 @@ def test_mxfp8_trace_uses_physical_scale_buffer_shapes():
         dtype=torch.bfloat16,
     )
 
-    assert bmm_defn["inputs"]["A_scale"]["shape"] == ["A_scale_size"]
-    assert bmm_defn["inputs"]["B_scale"]["shape"] == ["B_scale_size"]
-    assert bmm_defn["axes"]["A_scale_size"]["type"] == "var"
-    assert bmm_defn["axes"]["B_scale_size"]["type"] == "var"
+    assert bmm_defn["inputs"]["A_scale"]["shape"] == [
+        "batch_size",
+        "A_scale_rows",
+        "scale_cols",
+    ]
+    assert bmm_defn["inputs"]["B_scale"]["shape"] == [
+        "batch_size",
+        "B_scale_rows",
+        "scale_cols",
+    ]
+    assert bmm_defn["axes"]["A_scale_rows"]["type"] == "var"
+    assert bmm_defn["axes"]["B_scale_rows"]["type"] == "var"
+    assert bmm_defn["axes"]["scale_cols"]["type"] == "var"
+
+
+def test_bmm_mxfp8_trace_dispatch_preserves_scale_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    flat_scale = torch.empty((1024,), dtype=torch.uint8)
+    per_batch_scale = torch.empty((2, 128, 4), dtype=torch.uint8)
+
+    assert (
+        bmm_mxfp8_trace_dispatch(A_scale=flat_scale, B_scale=flat_scale)
+        is bmm_mxfp8_flat_trace
+    )
+    assert (
+        bmm_mxfp8_trace_dispatch(A_scale=per_batch_scale, B_scale=per_batch_scale)
+        is bmm_mxfp8_trace
+    )
+    with pytest.raises(ValueError, match="ranks to match"):
+        bmm_mxfp8_trace_dispatch(A_scale=flat_scale, B_scale=per_batch_scale)
+    invalid_scale = torch.empty((32, 32), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="1D or 3D"):
+        bmm_mxfp8_trace_dispatch(A_scale=invalid_scale, B_scale=invalid_scale)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    assert bmm_mxfp8_trace_dispatch(device="cuda") is bmm_mxfp8_flat_trace
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    assert bmm_mxfp8_trace_dispatch(device="cuda") is bmm_mxfp8_trace
+
+
+def test_bmm_mxfp8_trace_references_match_for_aligned_rows():
+    batch_size, m, n, k = 2, 128, 128, 32
+    a = torch.ones((batch_size, m, k), dtype=torch.float8_e4m3fn)
+    weight = torch.ones((batch_size, n, k), dtype=torch.float8_e4m3fn)
+    per_batch_scale = (
+        torch.arange(batch_size * 128 * 4, dtype=torch.int32) % 5 + 125
+    ).to(torch.uint8)
+    per_batch_scale = per_batch_scale.reshape(batch_size, 128, 4)
+    flat_scale = per_batch_scale.reshape(-1)
+
+    rank_preserving_result = bmm_mxfp8_trace.reference(
+        a,
+        weight.transpose(-2, -1),
+        per_batch_scale,
+        per_batch_scale,
+        torch.bfloat16,
+    )
+    flat_result = bmm_mxfp8_flat_trace.reference(
+        a,
+        weight.transpose(-2, -1),
+        flat_scale,
+        flat_scale,
+        torch.bfloat16,
+    )
+
+    torch.testing.assert_close(flat_result, rank_preserving_result)
 
 
 def test_mxfp8_trace_references_are_self_contained():
@@ -400,7 +469,7 @@ def test_mxfp8_trace_references_are_self_contained():
     batch_size = 2
     batched_a = a.unsqueeze(0).expand(batch_size, -1, -1)
     batched_weight = weight.unsqueeze(0).expand(batch_size, -1, -1)
-    batched_scale = scale.repeat(batch_size)
+    batched_scale = scale.reshape(1, 128, 4).repeat(batch_size, 1, 1)
     bmm_defn = bmm_mxfp8_trace.build_fi_trace_fn("flashinfer.gemm.bmm_mxfp8")(
         A=batched_a,
         B=batched_weight.transpose(-2, -1),
@@ -418,6 +487,28 @@ def test_mxfp8_trace_references_are_self_contained():
         batched_weight.transpose(-2, -1),
         batched_scale,
         batched_scale,
+        torch.bfloat16,
+    ).shape == (batch_size, m, n)
+
+    flat_scale_size = _mxfp8_scale_buffer_size(batch_size * m, k)
+    flat_scale = torch.full((flat_scale_size,), 127, dtype=torch.uint8)
+    flat_defn = bmm_mxfp8_flat_trace.build_fi_trace_fn("flashinfer.gemm.bmm_mxfp8")(
+        A=batched_a,
+        B=batched_weight.transpose(-2, -1),
+        A_scale=flat_scale,
+        B_scale=flat_scale,
+        dtype=torch.bfloat16,
+    )
+    flat_namespace: dict[str, object] = {}
+    exec(flat_defn["reference"], flat_namespace)
+    flat_reference = cast(
+        Callable[..., torch.Tensor], flat_namespace["_bmm_mxfp8_reference"]
+    )
+    assert flat_reference(
+        batched_a,
+        batched_weight.transpose(-2, -1),
+        flat_scale,
+        flat_scale,
         torch.bfloat16,
     ).shape == (batch_size, m, n)
 
@@ -445,16 +536,74 @@ def test_bmm_mxfp8_trace_init_quantizes_each_batch(
         M=3,
         N=5,
         K=32,
+        A_scale_rows=0,
+        B_scale_rows=0,
+        scale_cols=0,
+        device="cpu",
+    )
+
+    assert tuple(calls) == ((3, 32), (3, 32), (5, 32), (5, 32))
+    assert cast(torch.Tensor, inputs["A_scale"]).shape == (2, 128, 4)
+    assert cast(torch.Tensor, inputs["B_scale"]).shape == (2, 128, 4)
+    assert cast(torch.Tensor, inputs["B"]).stride(-2) == 1
+    assert inputs["dtype"] is torch.bfloat16
+
+
+def test_bmm_mxfp8_flat_trace_init_quantizes_combined_batch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[int, ...]] = []
+
+    def fake_mxfp8_quantize(
+        input: torch.Tensor,
+        is_sf_swizzled_layout: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert is_sf_swizzled_layout
+        calls.append(tuple(input.shape))
+        batch, rows, cols = input.shape
+        scale_size = _mxfp8_scale_buffer_size(batch * rows, cols)
+        value = torch.zeros(input.shape, dtype=torch.float8_e4m3fn)
+        scale = torch.full((scale_size,), 127, dtype=torch.uint8)
+        return value, scale
+
+    monkeypatch.setattr(flashinfer, "mxfp8_quantize", fake_mxfp8_quantize)
+    init = cast(Callable[..., dict[str, object]], bmm_mxfp8_flat_trace.init)
+    inputs = init(
+        batch_size=2,
+        M=3,
+        N=5,
+        K=32,
         A_scale_size=0,
         B_scale_size=0,
         device="cpu",
     )
 
-    assert tuple(calls) == ((3, 32), (3, 32), (5, 32), (5, 32))
-    assert cast(torch.Tensor, inputs["A_scale"]).shape == (1024,)
-    assert cast(torch.Tensor, inputs["B_scale"]).shape == (1024,)
+    assert tuple(calls) == ((2, 3, 32), (2, 5, 32))
+    assert cast(torch.Tensor, inputs["A_scale"]).shape == (512,)
+    assert cast(torch.Tensor, inputs["B_scale"]).shape == (512,)
     assert cast(torch.Tensor, inputs["B"]).stride(-2) == 1
     assert inputs["dtype"] is torch.bfloat16
+
+
+def test_bmm_mxfp8_trace_init_runs_cutlass_for_ambiguous_shape():
+    if not flashinfer.utils.is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("bmm_mxfp8 CUTLASS trace requires SM12x.")
+
+    init = cast(Callable[..., dict[str, object]], bmm_mxfp8_trace.init)
+    inputs = init(
+        batch_size=2,
+        M=100,
+        N=160,
+        K=160,
+        A_scale_rows=0,
+        B_scale_rows=0,
+        scale_cols=0,
+        device="cuda",
+    )
+    reference = bmm_mxfp8_trace.reference(**inputs)
+    actual = flashinfer.bmm_mxfp8(**inputs, backend="cutlass")
+
+    assert bmm_mxfp8_trace.check([reference], [actual])
 
 
 # ---------------------------------------------------------------------------
