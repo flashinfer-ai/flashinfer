@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, ove
 import torch
 
 from ...api_logging import flashinfer_api
-from ...trace.templates.attention import mla_paged_decode_trace
+from ...trace.templates.attention import mla_paged_decode_trace_dispatch
 from ...utils import determine_mla_backend, get_compute_capability
 from ._backends._capabilities import MLAPlanCapabilities
 from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
@@ -72,6 +72,23 @@ _MIRRORED_BACKEND_ATTRS = (
     "_int_workspace_buffer",
     "_pin_memory_int_workspace_buffer",
 )
+
+
+def _query_plan_characteristics(
+    query_indptr: torch.Tensor,
+) -> tuple[bool, Optional[int]]:
+    """Return whether every request has one query and the total query count."""
+
+    values = query_indptr.to(device="cpu", dtype=torch.int64)
+    if values.numel() == 0:
+        return False, None
+    query_lengths = values[1:] - values[:-1]
+    all_query_lengths_one = bool(
+        query_lengths.numel() > 0
+        and values[0].item() == 0
+        and (query_lengths == 1).all().item()
+    )
+    return all_query_lengths_one, int(values[-1].item())
 
 
 def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
@@ -266,6 +283,8 @@ class BatchMLAPagedAttentionWrapper:
         self._input_contract: Optional[MLAInputContract] = None
         self._planned_query_layout: Optional[Literal["packed", "split"]] = None
         self._planned_kv_cache_layout: Optional[Literal["packed", "split"]] = None
+        self._all_query_lengths_one: Optional[bool] = None
+        self._planned_total_q: Optional[int] = None
         self._warned_positional_arguments = False
         self._warned_legacy_tensor_arguments = False
         self._legacy_flat_csr_plan = False
@@ -633,6 +652,16 @@ class BatchMLAPagedAttentionWrapper:
                 ].copy_(graph_workspace_snapshot)
             raise
 
+        query_indptr = (
+            plan_metadata.qo_indptr
+            if plan_metadata.qo_indptr is not None
+            else plan_metadata.cum_seq_lens_q
+        )
+        assert query_indptr is not None
+        all_query_lengths_one, planned_total_q = _query_plan_characteristics(
+            query_indptr
+        )
+
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
@@ -640,6 +669,8 @@ class BatchMLAPagedAttentionWrapper:
         self._input_contract = input_contract
         self._planned_query_layout = planned_query_layout
         self._planned_kv_cache_layout = planned_kv_cache_layout
+        self._all_query_lengths_one = all_query_lengths_one
+        self._planned_total_q = planned_total_q
         self._publish_backend_mirrors(planned_backend)
         self._legacy_flat_csr_plan = legacy_flat_csr
         self._qo_indptr_buf = getattr(
@@ -752,7 +783,7 @@ class BatchMLAPagedAttentionWrapper:
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @_warn_on_positional_mla_arguments
-    @flashinfer_api(trace=mla_paged_decode_trace)
+    @flashinfer_api(trace=mla_paged_decode_trace_dispatch)
     def run(
         self,
         q_nope: Optional[torch.Tensor] = None,
