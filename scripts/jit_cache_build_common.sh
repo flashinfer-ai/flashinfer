@@ -115,7 +115,7 @@ install_sccache() {
 #   $1 - Cache key prefix tag (e.g. "cuda128-x86_64").
 #   $2 - Source root directory for SCCACHE_BASEDIRS.
 #
-# Reads (optional): SCCACHE_REGION, SCCACHE_DIAGNOSTICS_DIR,
+# Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
 setup_sccache() {
@@ -147,15 +147,6 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
-    mkdir -p "${SCCACHE_DIAGNOSTICS_DIR}"
-    export SCCACHE_ERROR_LOG="${SCCACHE_DIAGNOSTICS_DIR}/sccache-debug.log"
-    # Keep this below trace: trace-level compile requests include the full
-    # compiler environment, which contains the S3 credentials in write jobs.
-    export SCCACHE_LOG="sccache=debug"
-    export SCCACHE_LOG_MILLIS=1
-  fi
-
   sccache --start-server
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
@@ -165,7 +156,8 @@ setup_sccache() {
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
 
-  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
+  if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
+    mkdir -p "${SCCACHE_STATS_DIR}"
     local git_commit
     git_commit=$(git -C "${source_root}" rev-parse HEAD 2>/dev/null || true)
     {
@@ -180,45 +172,40 @@ setup_sccache() {
       printf 'machine_arch=%s\n' "${sccache_arch}"
       printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
       printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
-    } > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-metadata.txt"
+    } > "${SCCACHE_STATS_DIR}/sccache-metadata.txt"
   fi
 }
 
-# Print final stats and, when SCCACHE_DIAGNOSTICS_DIR is configured, retain
-# text/JSON stats plus the server debug log for artifact upload. This helper is
-# intended for EXIT traps; callers should ignore failures so diagnostics never
-# mask the build result.
-collect_sccache_diagnostics() {
+# When SCCACHE_STATS_DIR is configured, retain text/JSON stats for a dedicated
+# workflow log step and artifact upload. Otherwise, print the stats directly.
+# This helper is intended for EXIT traps; callers should ignore failures so
+# stats collection never masks the build result.
+collect_sccache_stats() {
   if [ "${FLASHINFER_SCCACHE_ACTIVE:-false}" != "true" ] || \
-     [ "${FLASHINFER_SCCACHE_DIAGNOSTICS_COLLECTED:-false}" = "true" ] || \
+     [ "${FLASHINFER_SCCACHE_STATS_COLLECTED:-false}" = "true" ] || \
      ! command -v sccache >/dev/null 2>&1; then
     return 0
   fi
-  export FLASHINFER_SCCACHE_DIAGNOSTICS_COLLECTED=true
+  export FLASHINFER_SCCACHE_STATS_COLLECTED=true
 
-  echo "::group::sccache stats"
-  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
-    mkdir -p "${SCCACHE_DIAGNOSTICS_DIR}"
-    if ! sccache --show-stats > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.txt"; then
+  if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
+    mkdir -p "${SCCACHE_STATS_DIR}"
+    if ! sccache --show-stats > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
       echo "WARNING: Failed to collect text sccache stats" >&2
     fi
-    cat "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.txt" 2>/dev/null || true
     if ! sccache --show-stats --stats-format=json \
-        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.json"; then
+        > "${SCCACHE_STATS_DIR}/sccache-stats.json"; then
       echo "WARNING: Failed to collect JSON sccache stats" >&2
     fi
     if ! sccache --show-adv-stats --stats-format=json \
-        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-advanced-stats.json"; then
+        > "${SCCACHE_STATS_DIR}/sccache-advanced-stats.json"; then
       echo "WARNING: Failed to collect advanced JSON sccache stats" >&2
     fi
-    if ! sccache --stop-server \
-        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stop-server.txt" 2>&1; then
-      echo "WARNING: Failed to stop the sccache server" >&2
-    fi
   else
+    echo "::group::sccache stats"
     sccache --show-stats || true
-    sccache --stop-server >/dev/null 2>&1 || true
+    echo "::endgroup::"
   fi
+  sccache --stop-server >/dev/null 2>&1 || true
   export FLASHINFER_SCCACHE_ACTIVE=false
-  echo "::endgroup::"
 }

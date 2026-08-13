@@ -8,13 +8,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
-finish_sccache_diagnostics() {
+finish_sccache_stats() {
   local exit_code=$?
-  collect_sccache_diagnostics || true
+  collect_sccache_stats || true
   return "${exit_code}"
 }
 
-trap finish_sccache_diagnostics EXIT
+trap finish_sccache_stats EXIT
 
 PYTHON_VERSION_FILE="${SCRIPT_DIR}/../.python-version"
 PYTHON_VERSION="$(tr -d '[:space:]' < "${PYTHON_VERSION_FILE}")"
