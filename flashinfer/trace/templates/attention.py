@@ -1374,14 +1374,36 @@ gqa_ragged_prefill_trace = TraceTemplate(
 
 @torch.no_grad()
 def _mla_paged_decode_reference(
-    q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
+    q_nope,
+    q_pe,
+    ckv_cache,
+    kpe_cache,
+    kv_indptr,
+    kv_indices,
+    sm_scale,
+    ckv_scale=None,
+    kpe_scale=None,
+    ckv_scale_arr=None,
+    return_lse=False,
 ):
+    del return_lse
     batch_size, num_qo_heads, head_dim_ckv = q_nope.shape
     _, _, head_dim_kpe = q_pe.shape
 
     # [num_pages, page_size, head_dim_*] — keep the page dim; flatten after gather.
     Kc_all = ckv_cache.to(torch.float32)
     Kp_all = kpe_cache.to(torch.float32)
+    if ckv_cache.dtype == torch.float8_e4m3fn:
+        if ckv_scale is None or kpe_scale is None:
+            raise ValueError("ckv_scale and kpe_scale are required for FP8 KV cache")
+        if ckv_scale_arr is not None:
+            Kc_all = (
+                Kc_all.reshape(*Kc_all.shape[:-1], head_dim_ckv // 128, 128)
+                * ckv_scale_arr.unsqueeze(-1)
+            ).reshape_as(Kc_all)
+        else:
+            Kc_all *= float(ckv_scale)
+        Kp_all *= float(kpe_scale)
 
     output = torch.zeros(
         (batch_size, num_qo_heads, head_dim_ckv),

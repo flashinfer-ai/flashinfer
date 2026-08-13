@@ -678,15 +678,23 @@ def test_mla_paged_fi_trace():
 
     q_nope = torch.randn(batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16)
     q_pe = torch.randn(batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16)
-    ckv_cache = torch.randn(num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16)
-    ckv_scale_arr = torch.randn(num_pages, page_size, head_dim_ckv // 128)
+    ckv_cache = torch.zeros(
+        num_pages, page_size, head_dim_ckv, dtype=torch.float8_e4m3fn
+    )
+    kpe_cache = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn
+    )
+    ckv_scale_arr = torch.ones(
+        num_pages, page_size, head_dim_ckv // 128, dtype=torch.float32
+    )
 
     defn = BatchMLAPagedAttentionWrapper.run.fi_trace(
         q_nope=q_nope,
         q_pe=q_pe,
         ckv_cache=ckv_cache,
         kpe_cache=kpe_cache,
+        ckv_scale=1.0,
+        kpe_scale=1.0,
         ckv_scale_arr=ckv_scale_arr,
     )
     _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
@@ -696,11 +704,14 @@ def test_mla_paged_fi_trace():
     assert axes["head_dim_kpe"]["value"] == head_dim_kpe
     assert axes["page_size"]["value"] == page_size
     assert axes["ckv_scale_groups"]["type"] == "var"
-    assert defn["inputs"]["ckv_scale_arr"]["shape"] == [
+    ckv_scale_arr_defn = defn["inputs"]["ckv_scale_arr"]
+    assert ckv_scale_arr_defn["shape"] == [
         "num_pages",
         "page_size",
         "ckv_scale_groups",
     ]
+    assert ckv_scale_arr_defn["dtype"] == "float32"
+    assert ckv_scale_arr_defn["optional"] is True
 
 
 # ---------------------------------------------------------------------------
