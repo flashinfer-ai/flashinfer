@@ -11,41 +11,69 @@ from flashinfer.utils import is_sm90a_supported
 
 
 @functools.lru_cache(maxsize=2)
+def _workspace_buffer_on(device_index: int, size_mb: int) -> torch.Tensor:
+    return torch.zeros(
+        size_mb * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{device_index}"
+    )
+
+
 def _workspace_buffer(size_mb: int = 128) -> torch.Tensor:
     """Shared workspace buffer: allocating (and zeroing) 128 MB per test adds
     up over thousands of parametrizations; the wrappers treat it as scratch.
+    Cached per current CUDA device.
 
     INVARIANT for callers: when two wrappers share this buffer, fully finish
     plan()+run() on one wrapper before calling plan() on the other. plan()
     stores metadata in the workspace that the wrapper's run() reads, so an
     interleaving like plan_a -> plan_b -> run_a would corrupt run_a.
     """
-    return torch.zeros(size_mb * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    return _workspace_buffer_on(torch.cuda.current_device(), size_mb)
 
 
+# Unbounded on purpose: pytest's parametrize execution order interleaves the
+# (M, N, R, C) patterns, so a small LRU thrashes (measured: full file 37s with
+# maxsize=8 vs 16s unbounded). All 144 patterns total ~430 MiB on an
+# SM90A-only file (80+ GB GPUs); the module-teardown fixture below releases
+# them as soon as the file finishes instead of holding them to process exit.
 @functools.lru_cache(maxsize=None)
+def _block_sparse_pattern_on(
+    device_index: int, M: int, N: int, R: int, C: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = f"cuda:{device_index}"
+    MB = M // R
+    NB = N // C
+    rng = np.random.default_rng(seed=0)
+    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
+    indptr = torch.from_numpy(S.indptr).to(device)
+    indices = torch.from_numpy(S.indices).to(device)
+    data_mask = torch.ones((S.nnz, R, C), dtype=torch.bool, device=device)
+    bsr = sp.sparse.bsr_matrix(
+        (np.ones((S.nnz, R, C), dtype=bool), S.indices, S.indptr), shape=(M, N)
+    )
+    dense_mask = torch.from_numpy(bsr.toarray()).to(device=device, dtype=torch.bool)
+    return indptr, indices, data_mask, dense_mask
+
+
 def _block_sparse_pattern(
     M: int, N: int, R: int, C: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cached BSR pattern + dense mask for (M, N, R, C).
+    """Cached BSR pattern + dense mask for (M, N, R, C) on the current device.
 
     The pattern is seeded (rng seed 0), so it depends only on the block-grid
     shape; the same pattern is reused across num_heads/head_dim/dtype
     parametrizations (24x reuse), avoiding a per-test scipy build and a dense
     M x N numpy round-trip + H2D copy.
     """
-    MB = M // R
-    NB = N // C
-    rng = np.random.default_rng(seed=0)
-    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
-    indptr = torch.from_numpy(S.indptr).cuda()
-    indices = torch.from_numpy(S.indices).cuda()
-    data_mask = torch.ones((S.nnz, R, C), dtype=torch.bool, device="cuda")
-    bsr = sp.sparse.bsr_matrix(
-        (np.ones((S.nnz, R, C), dtype=bool), S.indices, S.indptr), shape=(M, N)
-    )
-    dense_mask = torch.from_numpy(bsr.toarray()).to(device="cuda", dtype=torch.bool)
-    return indptr, indices, data_mask, dense_mask
+    return _block_sparse_pattern_on(torch.cuda.current_device(), M, N, R, C)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_cached_gpu_buffers():
+    """Release the cached patterns/workspace when this module finishes so a
+    multi-file pytest session doesn't hold their GPU memory to process exit."""
+    yield
+    _block_sparse_pattern_on.cache_clear()
+    _workspace_buffer_on.cache_clear()
 
 
 def get_fp8_dtype_minmax(dtype: torch.dtype) -> Tuple[float, float]:
