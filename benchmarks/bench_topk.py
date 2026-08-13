@@ -94,6 +94,13 @@ TIE_BREAK_VARIANTS: tuple[tuple[str, TopKTieBreak], ...] = (
 def bench_tie_break_variants(
     run_flashinfer_with_tie_break, baseline_ms: float
 ) -> dict[str, float]:
+    """Time the native tie-break path (FlashInfer(tie-*) columns).
+
+    Callers must set_topk_algo("default") immediately before calling: under "auto" the
+    dispatcher routes non-deterministic tie-break calls to the CUB backend, which would
+    silently turn these columns into a second CUB measurement (the CUB tie timings have
+    their own columns via cub_topk_metrics).
+    """
     metrics: dict[str, float] = {}
     for suffix, tie_break in TIE_BREAK_VARIANTS:
         try:
@@ -254,6 +261,7 @@ def bench_top_k_from_scores(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k(
@@ -265,6 +273,7 @@ def bench_top_k_from_scores(
                 baseline_ms,
             )
         )
+        set_topk_algo("auto")
 
     if compare_torch_deterministic and not deterministic:
         with torch_deterministic_algorithms(True):
@@ -571,6 +580,7 @@ def bench_page_table_transform(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_page_table_transform(
@@ -584,6 +594,7 @@ def bench_page_table_transform(
                 baseline_ms,
             )
         )
+        set_topk_algo("auto")
 
     # The same fused call forced to the CUB backend (uniform lengths == seq_len).
     result.update(
@@ -665,6 +676,7 @@ def bench_ragged_transform(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_ragged_transform(
@@ -678,6 +690,7 @@ def bench_ragged_transform(
                 baseline_ms,
             )
         )
+        set_topk_algo("auto")
 
     # The same fused call forced to the CUB backend (uniform lengths == seq_len).
     result.update(
@@ -1016,12 +1029,14 @@ def bench_varlen_transform(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: run(deterministic, tie_break),
                 baseline_ms,
             )
         )
+        set_topk_algo("auto")
 
     # torch reference operates on a pre-masked tensor (mask built outside timing) so
     # we compare selection cost against the length-aware kernel.
