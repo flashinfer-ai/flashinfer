@@ -80,8 +80,8 @@ int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
 
 void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, TensorView v,
                       TensorView q_scale, TensorView k_scale, TensorView v_scale,
-                      TensorView qk_correction, TensorView out, TensorView lse, float sm_scale,
-                      bool causal, bool per_block_mean) {
+                      TensorView qk_correction, TensorView out, ffi::Optional<TensorView> maybe_lse,
+                      float sm_scale, bool causal, bool per_block_mean) {
   params = {};
 
   const int batch = static_cast<int>(q.size(0));
@@ -131,7 +131,8 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.cu_seqlens_k = nullptr;
   params.seqused_k = nullptr;
   params.p_ptr = nullptr;
-  params.softmax_lse_ptr = lse.data_ptr();
+  params.softmax_lse_ptr =
+      maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
 
   params.b = batch;
   params.h = num_heads;
@@ -168,25 +169,31 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.tile_count_semaphore = nullptr;
 }
 
-template <bool IsBF16>
+template <bool ReturnLSE, bool IsBF16>
 void run_mha_fwd_dispatch_dtype(Flash_fwd_params& params, cudaStream_t stream) {
   using OType = std::conditional_t<IsBF16, cutlass::bfloat16_t, cutlass::half_t>;
   if (params.d == 64) {
-    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 64, OType>(params,
-                                                                                            stream);
+    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 64, OType,
+                                    ReturnLSE>(params, stream);
   } else if (params.d == 128) {
-    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 128, OType>(
-        params, stream);
+    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 128, OType,
+                                    ReturnLSE>(params, stream);
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported head dimension " << params.d;
   }
 }
 
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream) {
-  if (params.is_bf16) {
-    run_mha_fwd_dispatch_dtype<true>(params, stream);
+  if (params.softmax_lse_ptr != nullptr) {
+    if (params.is_bf16) {
+      run_mha_fwd_dispatch_dtype<true, true>(params, stream);
+    } else {
+      run_mha_fwd_dispatch_dtype<true, false>(params, stream);
+    }
+  } else if (params.is_bf16) {
+    run_mha_fwd_dispatch_dtype<false, true>(params, stream);
   } else {
-    run_mha_fwd_dispatch_dtype<false>(params, stream);
+    run_mha_fwd_dispatch_dtype<false, false>(params, stream);
   }
 }
 
@@ -194,7 +201,7 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
 void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_scale,
          TensorView k_scale, TensorView v_scale_t, TensorView qk_correction, TensorView out,
-         TensorView lse, double sm_scale, bool causal, bool per_block_mean) {
+         ffi::Optional<TensorView> maybe_lse, double sm_scale, bool causal, bool per_block_mean) {
   CHECK_INPUT(q_fp4);
   CHECK_INPUT(k_fp4);
   CHECK_INPUT(v_fp4_t);
@@ -203,7 +210,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   CHECK_INPUT(v_scale_t);
   CHECK_INPUT(qk_correction);
   CHECK_INPUT(out);
-  CHECK_INPUT(lse);
+  if (maybe_lse.has_value()) {
+    CHECK_INPUT(maybe_lse.value());
+  }
 
   CHECK_DIM(4, q_fp4);
   CHECK_DIM(4, k_fp4);
@@ -213,7 +222,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   CHECK_DIM(4, v_scale_t);
   CHECK_DIM(4, qk_correction);
   CHECK_DIM(4, out);
-  CHECK_DIM(3, lse);
+  if (maybe_lse.has_value()) {
+    CHECK_DIM(3, maybe_lse.value());
+  }
 
   TVM_FFI_ICHECK_EQ(q_fp4.dtype(), dl_uint8) << "q_fp4 must be uint8 packed FP4";
   TVM_FFI_ICHECK_EQ(k_fp4.dtype(), dl_uint8) << "k_fp4 must be uint8 packed FP4";
@@ -222,7 +233,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(k_scale.dtype(), dl_float8_e4m3fn) << "k_scale must be float8_e4m3fn";
   TVM_FFI_ICHECK_EQ(v_scale_t.dtype(), dl_float8_e4m3fn) << "v_scale_t must be float8_e4m3fn";
   TVM_FFI_ICHECK_EQ(qk_correction.dtype(), dl_float32) << "qk_correction must be float32";
-  TVM_FFI_ICHECK_EQ(lse.dtype(), dl_float32) << "lse must be float32";
+  if (maybe_lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().dtype(), dl_float32) << "lse must be float32";
+  }
   TVM_FFI_ICHECK(out.dtype() == dl_bfloat16 || out.dtype() == dl_float16)
       << "out must be bfloat16 or float16";
 
@@ -277,9 +290,11 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(out.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(out.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(out.size(3), head_dim);
-  TVM_FFI_ICHECK_EQ(lse.size(0), batch);
-  TVM_FFI_ICHECK_EQ(lse.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(lse.size(2), seq_len);
+  if (maybe_lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(0), batch);
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(1), num_heads);
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(2), seq_len);
+  }
 
   check_same_device(q_fp4, k_fp4, "k_fp4");
   check_same_device(q_fp4, v_fp4_t, "v_fp4_t");
@@ -288,7 +303,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   check_same_device(q_fp4, v_scale_t, "v_scale_t");
   check_same_device(q_fp4, qk_correction, "qk_correction");
   check_same_device(q_fp4, out, "out");
-  check_same_device(q_fp4, lse, "lse");
+  if (maybe_lse.has_value()) {
+    check_same_device(q_fp4, maybe_lse.value(), "lse");
+  }
 
   cudaStream_t stream = get_stream(q_fp4.device());
 
@@ -296,25 +313,27 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
     status = cudaMemsetAsync(out.data_ptr(), 0, numel(out) * get_element_size(out), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaMemsetAsync(out) failed: " << cudaGetErrorString(status);
-    status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+    if (maybe_lse.has_value()) {
+      auto lse = maybe_lse.value();
+      status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+    }
     return;
   }
 
-  // lse is allocated uninitialized by the caller (torch.empty). The fwd kernel
-  // writes `out` for every query row but does not guarantee writing every
-  // (batch, head, seq) entry of lse, so reading it back can surface whatever
-  // garbage the allocator handed out (observed as flaky NaNs in lse under a
-  // dirty allocator, depending on test/run ordering). Zero it first, mirroring
-  // the seq_len==0 branch above, so unwritten entries are a defined 0.
-  status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+  if (maybe_lse.has_value()) {
+    // LSE may be allocated uninitialized by the caller. Zero it first so any
+    // entries not written by the kernel have a defined value.
+    auto lse = maybe_lse.value();
+    status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+  }
 
   Flash_fwd_params params;
   set_params_fprop(params, q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction, out,
-                   lse, static_cast<float>(sm_scale), causal, per_block_mean);
+                   maybe_lse, static_cast<float>(sm_scale), causal, per_block_mean);
   run_mha_fwd(params, stream);
 }
 

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -323,7 +323,8 @@ def nvfp4_attention_sm120_fwd(
     lse: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     softmax_scale: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run SM120 NVFP4 attention on pre-quantized Q/K/V tensors.
 
     The packed tensors should be produced by
@@ -354,11 +355,15 @@ def nvfp4_attention_sm120_fwd(
         Output dtype used when ``out`` is not provided.
     softmax_scale : Optional[float], optional
         Deprecated alias for ``sm_scale``.
+    return_lse : bool, optional
+        Whether to compute and return the log-sum-exp tensor. Defaults to
+        ``False``.
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor]
-        Attention output and log-sum-exp tensor.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        The attention output when ``return_lse`` is ``False``; otherwise, the
+        attention output and log-sum-exp tensor.
     """
     per_block_mean = bool(per_block_mean)
     batch, num_heads, seq_len, head_dim = _check_inputs(
@@ -398,19 +403,24 @@ def nvfp4_attention_sm120_fwd(
                 f"out must have dtype torch.float16 or torch.bfloat16, got {out.dtype}"
             )
 
-    if lse is None:
-        lse = torch.empty(
-            (batch, num_heads, seq_len), device=q_fp4.device, dtype=torch.float32
-        )
-    else:
-        _check_cuda_contiguous("lse", lse)
-        _check_same_device("lse", lse, "q_fp4", q_fp4)
-        if tuple(lse.shape) != (batch, num_heads, seq_len):
-            raise ValueError(
-                f"lse shape {tuple(lse.shape)} must be {(batch, num_heads, seq_len)}"
+    if not return_lse and lse is not None:
+        raise ValueError("lse can only be provided when return_lse=True")
+    if return_lse:
+        if lse is None:
+            lse = torch.empty(
+                (batch, num_heads, seq_len),
+                device=q_fp4.device,
+                dtype=torch.float32,
             )
-        if lse.dtype != torch.float32:
-            raise ValueError(f"lse must have dtype torch.float32, got {lse.dtype}")
+        else:
+            _check_cuda_contiguous("lse", lse)
+            _check_same_device("lse", lse, "q_fp4", q_fp4)
+            if tuple(lse.shape) != (batch, num_heads, seq_len):
+                raise ValueError(
+                    f"lse shape {tuple(lse.shape)} must be {(batch, num_heads, seq_len)}"
+                )
+            if lse.dtype != torch.float32:
+                raise ValueError(f"lse must have dtype torch.float32, got {lse.dtype}")
 
     get_nvfp4_attention_sm120_module().fwd(
         q_fp4,
@@ -426,4 +436,4 @@ def nvfp4_attention_sm120_fwd(
         bool(causal),
         per_block_mean,
     )
-    return out, lse
+    return (out, lse) if return_lse else out

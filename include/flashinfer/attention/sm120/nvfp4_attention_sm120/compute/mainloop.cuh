@@ -509,14 +509,14 @@ struct CollectiveMainloopFwd {
   };
 
   template <typename SharedStorage, typename FrgTensorO, typename SoftmaxFused,
-            typename MathOrderBarrier, typename TmaRefill = NoOpRefill>
+            typename TmaRefill = NoOpRefill>
   CUTLASS_DEVICE void mma(Params const& mainloop_params, MainloopPipelineQ pipeline_q,
                           MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
                           PipelineStateQ& smem_pipe_read_q, PipelineState& smem_pipe_read_k,
                           PipelineState& smem_pipe_read_v, FrgTensorO& tOrO_store,
                           SoftmaxFused& softmax_fused, int n_block_count, int thread_idx,
                           int work_idx, int m_block, int wg_id, SharedStorage& shared_storage,
-                          MathOrderBarrier& math_order, TmaRefill tma_refill = {}) {
+                          TmaRefill tma_refill = {}) {
     static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -613,6 +613,14 @@ struct CollectiveMainloopFwd {
       copy(smem_tiled_copy_SFK, tSsSFK_stage(_, _, block_id), tSrSFK_copy_view(_, _, block_id));
     };
 
+    auto copy_k_group = [&](auto group_id) {
+      auto tSsK_stage = tSsK(_, _, _, smem_pipe_read_k.index());
+      auto tSsSFK_stage = tSsSFK(_, _, _, smem_pipe_read_k.index());
+      copy(smem_tiled_copy_K, tSsK_stage(_, group_id, _0{}), tSrK_copy_view(_, group_id, _0{}));
+      copy(smem_tiled_copy_SFK, tSsSFK_stage(_, group_id, _0{}),
+           tSrSFK_copy_view(_, group_id, _0{}));
+    };
+
     auto copy_v_block = [&](auto block_id) {
       auto tOsVt_stage = tOsVt(_, _, _, smem_pipe_read_v.index());
       auto tOsSFVt_stage = tOsSFVt(_, _, _, smem_pipe_read_v.index());
@@ -620,26 +628,33 @@ struct CollectiveMainloopFwd {
       copy(smem_tiled_copy_SFV, tOsSFVt_stage(_, _, block_id), tOrSFVt_copy_view(_, _, block_id));
     };
 
-    auto add_delta_s = [&](auto& acc) {
+    auto add_delta_s_slot = [&](auto& acc, auto score_slot) {
       auto acc_float4 = recast<float4>(acc);
+      constexpr int ScoreSlot = decltype(score_slot)::value;
+      constexpr int MmaNPerScoreSlot = 2;
+      constexpr int FirstMmaN = ScoreSlot * MmaNPerScoreSlot;
       int quad_id = (thread_idx % 4) * 2;
       if constexpr (std::is_same_v<ElementDS, float>) {
         auto tSsDS_stage = recast<float4>(sDS(_, _, smem_pipe_read_k.index()));
-        for (int i = 0; i < 4; i++) {
-          auto num = quad_id + i * 8;
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_i = 0; local_i < MmaNPerScoreSlot; ++local_i) {
+          int const global_i = FirstMmaN + local_i;
+          auto num = quad_id + global_i * 8;
           float4 delta_s_0 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num, _0{}));
           float4 delta_s_1 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num + 1, _0{}));
-          acc_float4(make_coord(make_coord(_0{}, _0{}), _0{}), _0{}, i) = delta_s_0;
-          acc_float4(make_coord(make_coord(_0{}, _0{}), _1{}), _0{}, i) = delta_s_0;
-          acc_float4(make_coord(make_coord(_0{}, _1{}), _0{}), _0{}, i) = delta_s_1;
-          acc_float4(make_coord(make_coord(_0{}, _1{}), _1{}), _0{}, i) = delta_s_1;
+          acc_float4(make_coord(make_coord(_0{}, _0{}), _0{}), _0{}, global_i) = delta_s_0;
+          acc_float4(make_coord(make_coord(_0{}, _0{}), _1{}), _0{}, global_i) = delta_s_0;
+          acc_float4(make_coord(make_coord(_0{}, _1{}), _0{}), _0{}, global_i) = delta_s_1;
+          acc_float4(make_coord(make_coord(_0{}, _1{}), _1{}), _0{}, global_i) = delta_s_1;
         }
       } else {
         using ElementDSVec = cutlass::Array<ElementDS, 4>;
         auto tSsDS_stage = recast<ElementDSVec>(sDS(_, _, smem_pipe_read_k.index()));
         cutlass::NumericConverter<float, ElementDS> convert;
-        for (int i = 0; i < 4; i++) {
-          auto num = quad_id + i * 8;
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_i = 0; local_i < MmaNPerScoreSlot; ++local_i) {
+          int const global_i = FirstMmaN + local_i;
+          auto num = quad_id + global_i * 8;
           ElementDSVec ds0 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num, _0{}));
           ElementDSVec ds1 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num + 1, _0{}));
           float4 delta_s_0;
@@ -652,26 +667,65 @@ struct CollectiveMainloopFwd {
           delta_s_1.y = convert(ds1[1]);
           delta_s_1.z = convert(ds1[2]);
           delta_s_1.w = convert(ds1[3]);
-          acc_float4(make_coord(make_coord(_0{}, _0{}), _0{}), _0{}, i) = delta_s_0;
-          acc_float4(make_coord(make_coord(_0{}, _0{}), _1{}), _0{}, i) = delta_s_0;
-          acc_float4(make_coord(make_coord(_0{}, _1{}), _0{}), _0{}, i) = delta_s_1;
-          acc_float4(make_coord(make_coord(_0{}, _1{}), _1{}), _0{}, i) = delta_s_1;
+          acc_float4(make_coord(make_coord(_0{}, _0{}), _0{}), _0{}, global_i) = delta_s_0;
+          acc_float4(make_coord(make_coord(_0{}, _0{}), _1{}), _0{}, global_i) = delta_s_0;
+          acc_float4(make_coord(make_coord(_0{}, _1{}), _0{}), _0{}, global_i) = delta_s_1;
+          acc_float4(make_coord(make_coord(_0{}, _1{}), _1{}), _0{}, global_i) = delta_s_1;
         }
       }
     };
 
+    constexpr int NumScoreSlots = 2;
     Tensor tSrS =
         partition_fragment_C(tiled_mma_qk, make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
-    Tensor tSrS_converion_view =
+    Tensor tSrS_conversion_view =
         make_tensor(tSrS.data(), nvfp4_attention::convert_to_conversion_layout(tSrS.layout()));
     Tensor AbsMaxP = make_tensor_like<float>(make_layout(
-        shape(group<1, 4>(flatten(tSrS_converion_view.layout()(make_coord(_0{}, _), _, _))))));
+        shape(group<1, 4>(flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+
+    static_assert(kBlockN == 128, "N64 score-slot reuse requires an N128 attention tile");
+    static_assert(decltype(size<2>(tSrS))::value == 4,
+                  "The N128 score tile must contain four N32 MMA repeats");
+    static_assert(decltype(size<2>(tSrS_conversion_view))::value == NumScoreSlots,
+                  "The N128 score allocation must expose two N64 conversion slots");
+    static_assert(decltype(size<2>(tOrP))::value == NumScoreSlots,
+                  "Each score slot must map to one PV block");
+
+    auto refill_score_slot = [&](auto score_slot) {
+      constexpr int ScoreSlot = decltype(score_slot)::value;
+      static_assert(ScoreSlot == 0 || ScoreSlot == 1, "N64 score slot must be 0 or 1");
+      constexpr int FirstMmaN = ScoreSlot * 2;
+      copy_k_group(Int<FirstMmaN>{});
+      copy_k_group(Int<FirstMmaN + 1>{});
+      CUTLASS_PRAGMA_UNROLL
+      for (int k_block = 0; k_block < size<2>(tSrQ); ++k_block) {
+        if constexpr (ScoreSlot == 0) {
+          cute::gemm(tiled_mma_qk,
+                     make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block))(_, _0{}),
+                     make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block))(_, _0{}),
+                     tSrS(_, _0{}, _0{}));
+          cute::gemm(tiled_mma_qk,
+                     make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block))(_, _0{}),
+                     make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block))(_, _1{}),
+                     tSrS(_, _0{}, _1{}));
+        } else {
+          cute::gemm(tiled_mma_qk,
+                     make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block))(_, _0{}),
+                     make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block))(_, _2{}),
+                     tSrS(_, _0{}, _2{}));
+          cute::gemm(tiled_mma_qk,
+                     make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block))(_, _0{}),
+                     make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block))(_, _3{}),
+                     tSrS(_, _0{}, _3{}));
+        }
+      }
+    };
 
     auto col_limit_causal = [&](int row, int n_block) {
       return row + wg_m_offset + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
     };
 
-    auto apply_mask = [&](auto& tSrS_local, int n_block_local) {
+    auto apply_mask = [&](auto& scores, int n_block_local) {
       int const valid_cols = int(unpadded_seqlen_k - n_block_local * kBlockN);
       if constexpr (!Is_causal) {
         if (valid_cols >= kBlockN) {
@@ -683,27 +737,30 @@ struct CollectiveMainloopFwd {
         }
       }
 
-      Tensor cS = cute::make_identity_tensor(make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
-      Tensor tScS = thread_mma_qk.partition_C(cS);
+      // The flattened QK accumulator advances by one N32 repeat every 16
+      // entries. Within a repeat, lane and entry bits give the logical
+      // row/column without keeping an identity tensor live.
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(tSrS_local); ++i) {
-        int const col = nvfp4_attention::qk_acc_col_to_k_col(int(get<1>(tScS(i))));
+      for (int i = 0; i < size(scores); ++i) {
+        int const lane = thread_idx & 31;
+        int const col = ((i >> 4) << 5) + ((lane & 3) << 3) + (i & 7);
         if constexpr (!Is_causal) {
           if (col >= int(unpadded_seqlen_k - n_block_local * kBlockN)) {
-            tSrS_local(i) = -INFINITY;
+            scores(i) = -INFINITY;
           }
         } else {
-          if (col >= std::min(seqlen_k - n_block_local * kBlockN,
-                              col_limit_causal(int(get<0>(tScS(i))), n_block_local))) {
-            tSrS_local(i) = -INFINITY;
+          int const row = (thread_idx >> 5) * 16 + ((i & 8) != 0 ? 8 : 0) + (lane >> 2);
+          if (col >=
+              std::min(seqlen_k - n_block_local * kBlockN, col_limit_causal(row, n_block_local))) {
+            scores(i) = -INFINITY;
           }
         }
       }
     };
 
-    auto quantize = [&](auto mma_k, auto acc_conversion_view) {
+    auto quantize = [&](auto mma_k) {
       Tensor AbsMaxP_stagek = AbsMaxP(_, make_coord(_, _, mma_k));
-      Tensor acc_conversion_stagek = acc_conversion_view(_, _, mma_k);
+      Tensor acc_conversion_stagek = tSrS_conversion_view(_, _, mma_k);
       Tensor SFP = make_tensor_like<cutlass::float_ue4m3_t>(AbsMaxP_stagek.layout());
       Tensor SFP_uint32_view = recast<uint32_t>(SFP);
       CUTLASS_PRAGMA_UNROLL
@@ -745,85 +802,103 @@ struct CollectiveMainloopFwd {
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
     pipeline_q.consumer_release(smem_pipe_read_q);
     ++smem_pipe_read_q;
+    clear(tOrO_store);
 
-    bool is_first_compute = true;
+    // Prologue: build the first complete N128 score tile. The steady-state loop
+    // below consumes it one N64 half at a time while constructing the next tile
+    // in the just-retired score registers.
+    consumer_wait(pipeline_k, smem_pipe_read_k);
+    add_delta_s_slot(tSrS, _0{});
+    add_delta_s_slot(tSrS, _1{});
 
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tSrK); ++k_block) {
+      copy_k_block(k_block);
+      cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block)),
+                 make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block)), tSrS);
+    }
+    pipeline_k.consumer_release(smem_pipe_read_k);
+    ++smem_pipe_read_k;
+
+    int const first_n_block = n_block_count - 1;
+    // The quantized fixed-length binding pads K to N128 and exposes no
+    // separate unpadded length, so noncausal tiles are always fully valid.
+    // Compile the mask machinery out of that hot specialization entirely.
+    if constexpr (Is_causal) {
+      apply_mask(tSrS, first_n_block);
+    }
+    softmax_fused.template prepare_online_softmax_n128<true, Is_causal>(
+        tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
+
+    // Steady state. This loop always has a following K tile, which keeps the
+    // refill and pipeline-control path branch-free. The final tile is drained
+    // separately below.
 #pragma unroll 1
-    for (int tile_idx = 0; tile_idx < n_block_count; ++tile_idx) {
-      int n_block = n_block_count - 1 - tile_idx;
+    for (int tile_idx = 0; tile_idx < n_block_count - 1; ++tile_idx) {
+      softmax_fused.template softmax_quantize_n64<0, Is_causal>(tSrS, AbsMaxP,
+                                                                mainloop_params.softmax_scale_log2);
+      // Keep one convergence point while score registers transition from
+      // softmax input to packed P and then back to the next QK tile.
+      __syncwarp();
+      quantize(_0{});
 
       consumer_wait(pipeline_k, smem_pipe_read_k);
+      add_delta_s_slot(tSrS, _0{});
+      refill_score_slot(_0{});
 
-      Tensor tSrS_local =
-          partition_fragment_C(tiled_mma_qk, make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
-      Tensor tSrS_local_cv = make_tensor(
-          tSrS_local.data(), nvfp4_attention::convert_to_conversion_layout(tSrS_local.layout()));
+      consumer_wait(pipeline_v, smem_pipe_read_v);
+      copy_v_block(_0{});
+      cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _0{}), tOrSFP(_, _, _0{})),
+                 make_zip_tensor(tOrVt(_, _, _0{}), tOrSFVt(_, _, _0{})), tOrO_store);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tSrK); ++k_block) {
-        copy_k_block(k_block);
-      }
-      add_delta_s(tSrS_local);
+      softmax_fused.template softmax_quantize_n64<1, Is_causal>(tSrS, AbsMaxP,
+                                                                mainloop_params.softmax_scale_log2);
+      quantize(_1{});
+
+      add_delta_s_slot(tSrS, _1{});
+      refill_score_slot(_1{});
       pipeline_k.consumer_release(smem_pipe_read_k);
       ++smem_pipe_read_k;
 
-      if constexpr (!Is_causal) {
-        math_order.arrive();
-      }
+      copy_v_block(_1{});
+      cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _1{}), tOrSFP(_, _, _1{})),
+                 make_zip_tensor(tOrVt(_, _, _1{}), tOrSFVt(_, _, _1{})), tOrO_store);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tSrQ); ++k_block) {
-        cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block)),
-                   make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block)), tSrS_local);
-      }
-
-      apply_mask(tSrS_local, n_block);
-      if (is_first_compute) {
-        softmax_fused.template online_softmax_with_quant<true, Is_causal>(
-            tSrS_local, AbsMaxP, mainloop_params.softmax_scale_log2);
-      } else {
-        softmax_fused.template online_softmax_with_quant<false, Is_causal>(
-            tSrS_local, AbsMaxP, mainloop_params.softmax_scale_log2);
-      }
-
-      auto quantize_score = [&](auto mma_k) { quantize(mma_k, tSrS_local_cv); };
-
-      math_order.wait();
-      consumer_wait(pipeline_v, smem_pipe_read_v);
-      copy_v_block(_0{});
-      quantize_score(_0{});
-
-      if (is_first_compute) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-          cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)),
-                     make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)), tOrO_store);
-          if (v_block < size<2>(tOrP) - 1) {
-            copy_v_block(v_block + 1);
-            quantize_score(v_block + 1);
-          }
-        }
-        is_first_compute = false;
-      } else {
-        Tensor tOrO = make_fragment_like(tOrO_store);
-        CUTLASS_PRAGMA_UNROLL
-        for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-          cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)),
-                     make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)), tOrO);
-          if (v_block < size<2>(tOrP) - 1) {
-            copy_v_block(v_block + 1);
-            quantize_score(v_block + 1);
-          }
-        }
-        softmax_fused.rescale_o(tOrO_store, tOrO);
-      }
-
-      math_order.arrive();
       pipeline_v.consumer_release(smem_pipe_read_v);
       ++smem_pipe_read_v;
-
       tma_refill.refill_v(tile_idx);
+
+      // N blocks are consumed from high to low. Only the prologue tile can
+      // intersect the causal diagonal or the unpadded K tail; every
+      // subsequent tile is fully valid.
+      softmax_fused.template prepare_online_softmax_n128<false, Is_causal>(
+          tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
+      softmax_fused.rescale_o_inplace(tOrO_store);
     }
+
+    // Drain the final score tile without carrying a per-iteration
+    // has-next-tile predicate through the hot loop.
+    softmax_fused.template softmax_quantize_n64<0, Is_causal>(tSrS, AbsMaxP,
+                                                              mainloop_params.softmax_scale_log2);
+    __syncwarp();
+    quantize(_0{});
+
+    consumer_wait(pipeline_v, smem_pipe_read_v);
+    copy_v_block(_0{});
+    cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _0{}), tOrSFP(_, _, _0{})),
+               make_zip_tensor(tOrVt(_, _, _0{}), tOrSFVt(_, _, _0{})), tOrO_store);
+
+    softmax_fused.template softmax_quantize_n64<1, Is_causal>(tSrS, AbsMaxP,
+                                                              mainloop_params.softmax_scale_log2);
+    quantize(_1{});
+
+    copy_v_block(_1{});
+    cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _1{}), tOrSFP(_, _, _1{})),
+               make_zip_tensor(tOrVt(_, _, _1{}), tOrSFVt(_, _, _1{})), tOrO_store);
+
+    pipeline_v.consumer_release(smem_pipe_read_v);
+    ++smem_pipe_read_v;
+    tma_refill.refill_v(n_block_count - 1);
 
     softmax_fused.finalize(tOrO_store);
     return;

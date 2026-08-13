@@ -36,6 +36,7 @@ CSV_FIELDS = (
     "seq_len",
     "head_dim",
     "causal",
+    "return_lse",
     "dtype",
     "attention_only_ms",
     "attention_only_tflops",
@@ -125,6 +126,11 @@ def parse_args() -> argparse.Namespace:
         choices=("float16", "bfloat16"),
         default="bfloat16",
         help="Input/output dtype before NVFP4 quantization.",
+    )
+    parser.add_argument(
+        "--return-lse",
+        action="store_true",
+        help="Compute log-sum-exp in addition to the attention output.",
     )
     parser.add_argument(
         "--warmup",
@@ -308,6 +314,7 @@ def bench_config(
     warmup: int,
     repeat: int,
     attention_cuda_graph: bool,
+    return_lse: bool,
 ) -> dict[str, object]:
     _patch_cutlass_dsl_operand_major_mode()
     import flashinfer
@@ -328,13 +335,15 @@ def bench_config(
 
     sm_scale = 1.0 / math.sqrt(config.head_dim)
     out = torch.empty_like(q)
-    lse = torch.empty(
-        config.batch_size,
-        config.num_heads,
-        config.seq_len,
-        dtype=torch.float32,
-        device="cuda",
-    )
+    lse = None
+    if return_lse:
+        lse = torch.empty(
+            config.batch_size,
+            config.num_heads,
+            config.seq_len,
+            dtype=torch.float32,
+            device="cuda",
+        )
 
     quantized_qkv = flashinfer.nvfp4_attention_sm120_quantize_qkv(
         q, k, v, per_block_mean=PER_BLOCK_MEAN
@@ -347,6 +356,7 @@ def bench_config(
         out=out,
         lse=lse,
         out_dtype=dtype,
+        return_lse=return_lse,
     )
     torch.cuda.synchronize()
 
@@ -359,6 +369,7 @@ def bench_config(
             out=out,
             lse=lse,
             out_dtype=dtype,
+            return_lse=return_lse,
         )
 
     def end_to_end():
@@ -373,6 +384,7 @@ def bench_config(
             out=out,
             lse=lse,
             out_dtype=dtype,
+            return_lse=return_lse,
         )
 
     attention_only_ms = median_gpu_ms(
@@ -435,6 +447,7 @@ def bench_config(
         "nvfp4_attention_sm120 "
         f"B={config.batch_size} H={config.num_heads} S={config.seq_len} "
         f"D={config.head_dim} causal={config.causal} dtype={dtype}: "
+        f"return_lse={return_lse}, "
         f"attention_only={attention_only_ms:.3f} ms "
         f"({attention_only_tflops:.3f} TFLOPs/s, "
         f"cuda_graph={attention_cuda_graph}), "
@@ -456,6 +469,7 @@ def bench_config(
         "seq_len": config.seq_len,
         "head_dim": config.head_dim,
         "causal": config.causal,
+        "return_lse": return_lse,
         "dtype": dtype_label(dtype),
         "attention_only_ms": attention_only_ms,
         "attention_only_tflops": attention_only_tflops,
@@ -498,6 +512,7 @@ def main() -> None:
                 args.warmup,
                 args.repeat,
                 attention_cuda_graph=not args.no_attention_cuda_graph,
+                return_lse=args.return_lse,
             )
         )
 

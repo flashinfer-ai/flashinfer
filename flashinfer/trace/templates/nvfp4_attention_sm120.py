@@ -83,10 +83,17 @@ nvfp4_attention_sm120_fwd_trace = TraceTemplate(
         "sm_scale": Scalar("float32"),
         "causal": Scalar("bool"),
         "per_block_mean": Scalar("bool"),
+        "return_lse": Scalar(
+            "bool", optional=True, description="Bool: also compute and return LSE."
+        ),
     },
     outputs={
         "out": Tensor(["batch_size", "num_heads", "seq_len", "head_dim"]),
-        "lse": Tensor(["batch_size", "num_heads", "seq_len"]),
+        "lse": Tensor(
+            ["batch_size", "num_heads", "seq_len"],
+            dtype="float32",
+            optional=True,
+        ),
     },
     tags=["sm120", "nvfp4"],
 )

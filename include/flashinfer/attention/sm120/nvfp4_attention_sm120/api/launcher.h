@@ -34,7 +34,7 @@
 
 namespace nvfp4_attention {
 
-template <typename Kernel_traits, bool Is_causal>
+template <typename Kernel_traits, bool Is_causal, bool ReturnLSE>
 void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   using Element = typename Kernel_traits::Element;
   using ElementSF = typename Kernel_traits::ElementSF;
@@ -93,7 +93,8 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
                                                   params.is_causal};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
-  void* kernel = (void*)nvfp4_attention::attention_kernel_ws<Kernel_traits, Is_causal, Scheduler>;
+  void* kernel =
+      (void*)nvfp4_attention::attention_kernel_ws<Kernel_traits, Is_causal, ReturnLSE, Scheduler>;
 
   int smem_size = sizeof(typename Kernel_traits::SharedStorage);
   if (smem_size >= 48 * 1024) {
@@ -124,7 +125,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   FLASHINFER_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename T, int Headdim, typename O = cutlass::bfloat16_t>
+template <typename T, int Headdim, typename O = cutlass::bfloat16_t, bool ReturnLSE = true>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
   using DeltaSType = float;
 
@@ -135,7 +136,7 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
         static constexpr int kBlockN = 128;
         run_flash_fwd<
             Flash_fwd_kernel_traits<Headdim, 128, kBlockN, kStages, 1, per_block, T, O, DeltaSType>,
-            Is_causal>(params, stream);
+            Is_causal, ReturnLSE>(params, stream);
       } else {
         static_assert(Headdim == 64 || Headdim == 128, "Unsupported Headdim");
       }
