@@ -230,25 +230,48 @@ def _resolve_entry(value: Any) -> _Entry:
 # ---------------------------------------------------------------------------
 
 
+def _select_template(
+    templates: list, dispatcher: Callable | None, namespace: dict[str, Any]
+) -> Any | None:
+    """Resolve the trace template for one live invocation.
+
+    Static APIs retain their sole/first registered template. Dispatch APIs use
+    the exact resolver installed by ``@flashinfer_api(trace=...)``. A dispatcher
+    must return one of its advertised ``.templates`` so extraction and output
+    adaptation were prepared before CUDA graph capture.
+    """
+    if not templates:
+        return None
+    if dispatcher is None:
+        return templates[0]
+    selected = dispatcher(save_dir=None, name=None, **namespace)
+    if selected is None:
+        return None
+    if not any(selected is template for template in templates):
+        raise ValueError("trace dispatcher returned an unregistered template")
+    return selected
+
+
 def _make_wrapper(
     *,
     fi_api: str,
     original: Callable,
     build_namespace: Callable[[tuple, dict], dict[str, Any]],
-    extractor_maps: list,
-    template: Any,
-    dests: dict,
+    templates: list,
+    dispatcher: Callable | None,
+    extractor_maps: dict[int, list],
+    dests: dict[int, dict],
     is_inplace: bool,
     solutions_by_name: dict[str, Any],
 ) -> Callable:
     """Wrapper that routes a call to a registered solution by *definition name*.
 
-    Per call: build the namespace, extract the const axes, compute this
-    template's definition name (``name_prefix`` + const-axis abbrevs — the same
-    logic the trace collector uses), and look it up in ``solutions_by_name``. The
-    per-name decision (resolved entry or miss) is cached, so later calls for the
-    same shape are a dict lookup. Inside CUDA-graph capture only the cached path
-    runs (eager warmup populates the cache before capture)."""
+    Per call: build the namespace, resolve the invocation's template using the
+    same dispatcher as ``fi_trace``, extract its const axes, compute its
+    definition name, and look it up in ``solutions_by_name``. The per-name
+    decision (resolved entry or miss) is cached, so later calls for the same
+    shape are a dict lookup. Inside CUDA-graph capture only the cached path runs
+    (eager warmup populates the cache before capture)."""
     cache_lock = Lock()
     by_name: dict[str, _Entry | None] = {}
 
@@ -256,7 +279,11 @@ def _make_wrapper(
     def wrapper(*args, **kwargs):
         try:
             namespace = build_namespace(args, kwargs)
-            axes = extract_axes(extractor_maps, namespace)
+            template = _select_template(templates, dispatcher, namespace)
+            if template is None:
+                bump_stat(fi_api, "fallback_no_template")
+                return original(*args, **kwargs)
+            axes = extract_axes(extractor_maps[id(template)], namespace)
             name = template.definition_name(axes)
         except Exception:  # noqa: BLE001 — never let extraction break the engine
             return original(*args, **kwargs)
@@ -289,7 +316,7 @@ def _make_wrapper(
                 namespace=namespace,
                 dps=dps,
                 is_inplace=is_inplace,
-                dests=dests,
+                dests=dests[id(template)],
                 positional=positional,
             )
         except Exception:
@@ -366,12 +393,17 @@ def _stateless_namespace_builder(
 
 
 def _stateful_namespace_builder(
-    bind_target: Callable, template: Any, adapter
+    bind_target: Callable, templates: Any, adapter
 ) -> Callable[[tuple, dict], dict]:
+    if not isinstance(templates, (list, tuple)):
+        templates = [templates]
+
     def build(args: tuple, kwargs: dict) -> dict:
         ns = bind_namespace(bind_target, args, kwargs)
         self_obj = args[0] if args else None
-        return plan_capture.augment_namespace(adapter, template, ns, self_obj)
+        for template in templates:
+            plan_capture.augment_namespace(adapter, template, ns, self_obj)
+        return ns
 
     return build
 
@@ -499,6 +531,15 @@ def _registry_by_fi_api() -> dict[str, tuple[Callable, list]]:
     return out
 
 
+def _dispatcher_for(original: Callable) -> Callable | None:
+    """Return the trace-time template resolver attached to ``original``."""
+    try:
+        from flashinfer.api_logging import _TRACE_DISPATCHERS  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    return _TRACE_DISPATCHERS.get(original)
+
+
 # ---------------------------------------------------------------------------
 # Install / state
 # ---------------------------------------------------------------------------
@@ -596,10 +637,14 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
         wrapped = 0
         matched_apis = 0
         for fi_api, (original, templates) in registry.items():
-            template0 = templates[0] if templates else None
-            if template0 is None:
+            if not templates:
                 continue
-            if not _template_matches_any(template0, sol_map):
+            matching_templates = [
+                template
+                for template in templates
+                if _template_matches_any(template, sol_map)
+            ]
+            if not matching_templates:
                 continue  # skip-wrap: no registered solution can target this API
             resolved = _resolve_target(fi_api)
             if resolved is None:
@@ -611,10 +656,16 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
                 continue
 
             matched_apis += 1
-            extractor_maps = build_extractor_maps(templates)
-            dests = _derive_output_dests(template0, original)
+            dispatcher = _dispatcher_for(original)
+            extractor_maps = {
+                id(template): build_extractor_maps([template]) for template in templates
+            }
+            dests = {
+                id(template): _derive_output_dests(template, original)
+                for template in templates
+            }
             is_inplace = _is_inplace_api(original)
-            if is_inplace and not dests:
+            if is_inplace and any(not dests[id(t)] for t in matching_templates):
                 _log.warning(
                     "Trace Apply: %s is in-place but has no output destination map; "
                     "skipping to avoid silent corruption.",
@@ -624,7 +675,7 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
 
             if plan_capture.is_stateful(fi_api):
                 adapter = plan_capture.adapter_for(fi_api)
-                build_ns = _stateful_namespace_builder(original, template0, adapter)
+                build_ns = _stateful_namespace_builder(original, templates, adapter)
                 if hasattr(owner, adapter.plan_attr):
                     plan_current = getattr(owner, adapter.plan_attr)
                     if not getattr(plan_current, "_trace_apply", False):
@@ -645,8 +696,9 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
                 fi_api=fi_api,
                 original=current,
                 build_namespace=build_ns,
+                templates=templates,
+                dispatcher=dispatcher,
                 extractor_maps=extractor_maps,
-                template=template0,
                 dests=dests,
                 is_inplace=is_inplace,
                 solutions_by_name=sol_map,
