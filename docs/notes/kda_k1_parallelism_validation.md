@@ -45,6 +45,7 @@ Focused C8 and C4 runs of the retained implementation passed both tools:
 | --- | --- | --- |
 | C8, one owner plus seven helpers | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
 | C4, one owner plus three helpers | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
+| C4, packed varlen 2304/1792 | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
 
 The commands used `--report-api-errors no` because CuTe DSL capability probing
 calls `cuGetProcAddress_v2`; those API-probe diagnostics are unrelated to the
@@ -123,10 +124,9 @@ was `79208f48a7164f317b3e98e3fb348bf0de955a27e41e5f0cfcbd911e36e7cb51`.
 Packed B300 input remains on the pre-existing M128 route. That is a validation
 boundary, not a claim that the technique is B200-specific.
 
-The B200 container used for this packed-varlen sweep did not include the
-`compute-sanitizer` executable. The retained fixed-layout C4/C8 kernel had
-already passed memcheck and synccheck on CC 10.0, but the packed-varlen profile
-must be rerun under both tools before opening the upstream PR.
+The packed-varlen bitwise test for sequence lengths 2304/1792 also passed
+memcheck and synccheck with Compute Sanitizer 2025.3.1 from the CUDA 13.0.85
+sanitizer package. Both runs reported `ERROR SUMMARY: 0 errors`.
 
 ## Cluster-size tuning sweep
 
