@@ -1577,3 +1577,117 @@ def test_situ_mxfp4_mxfp8_logits_match_pre_routed(alpha_value, beta_value, clamp
             )
         ),
     )
+
+
+def test_nvfp4_routed_unpacked_lora_delta_compensation():
+    """Hit the Flat pre-routed LoRA compensation path for NVFP4 + UnpackedPrecomputed.
+
+    ``trtllm_fp4_block_scale_routed_moe`` pre-divides ``gemm1_lora_delta`` by
+    ``output1_scale_gate_scalar`` when hidden states are packed uint8 NVFP4.
+    The UnpackedPrecomputed branch indexes experts from plain int32 ids (not
+    packed ``expert<<16|weight``). This is separate from the packed routing path.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    num_tokens, hidden_size, intermediate_size = 8, 256, 256
+    num_experts, top_k = 8, 2
+
+    hidden_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    hidden_states, hidden_states_scale = fp4_quantize(
+        hidden_bf16,
+        torch.tensor([448.0 * 6.0], device=device),
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        num_tokens, -1
+    )
+    assert hidden_states.dtype == torch.uint8
+
+    w13 = (
+        torch.randn(num_experts, intermediate_size * 2, hidden_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    w2 = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    gs = torch.tensor([448.0 * 6.0], device=device)
+    w13, w13_scale = fp4_quantize(w13, gs, sf_vec_size=16, sf_use_ue8m0=False)
+    w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
+        num_experts, intermediate_size * 2, -1
+    )
+    w2, w2_scale = fp4_quantize(w2, gs, sf_vec_size=16, sf_use_ue8m0=False)
+    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
+
+    inv = 1.0 / 448.0 / 6.0
+    output1_scale_scalar = torch.full(
+        (num_experts,), inv * inv, device=device, dtype=torch.float32
+    )
+    output1_scale_gate_scalar = output1_scale_scalar.clone()
+    output2_scale_scalar = output1_scale_scalar.clone()
+
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, top_k), device=device, dtype=torch.int32
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device=device, dtype=torch.bfloat16)
+    routing_input = (topk_ids, topk_weights)
+
+    zero_delta = torch.zeros(
+        num_tokens, top_k, 2 * intermediate_size, device=device, dtype=torch.bfloat16
+    )
+    nonzero_delta = torch.full_like(zero_delta, 0.25)
+
+    def _run(delta):
+        return trtllm_fp4_block_scale_routed_moe(
+            routing_input,
+            None,
+            hidden_states,
+            hidden_states_scale,
+            w13,
+            w13_scale,
+            None,
+            None,
+            None,
+            None,
+            w2,
+            w2_scale,
+            None,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            0,
+            num_experts,
+            None,
+            RoutingMethodType.Renormalize.value,
+            True,
+            enable_pdl,
+            ActivationType.Swiglu.value,
+            None,
+            None,
+            8192,
+            gemm1_lora_delta=delta,
+        )[0]
+
+    out_zero = _run(zero_delta)
+    out_delta = _run(nonzero_delta.clone())
+    assert out_zero.isfinite().all()
+    assert out_delta.isfinite().all()
+    assert (out_delta.float() - out_zero.float()).abs().max().item() > 0
