@@ -460,7 +460,7 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
     assert args[14].dtype == torch.uint8
     assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 32)
     assert args[15] == 1
-    assert args[16:21] == (8, 0, 0, 8, 35)
+    assert args[16:21] == (8, 0, 0, 8, 32)
     assert math.isclose(args[21], 128**-0.5)
     assert args[22] == -5.0
     assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
