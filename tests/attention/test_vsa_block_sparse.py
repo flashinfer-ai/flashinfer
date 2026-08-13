@@ -25,16 +25,28 @@ import torch
 import flashinfer
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+)
 
 # ---------------------------------------------------------------------------
 # Hardware / dependency gates
 # ---------------------------------------------------------------------------
 
 _HAS_QUACK = importlib.util.find_spec("quack") is not None
-_requires_sm100 = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="vsa_sm100_blk64 requires SM100 (Blackwell)",
+
+
+def _is_vsa_sm100_or_sm103_supported(device: torch.device) -> bool:
+    return get_compute_capability(device) in ((10, 0), (10, 3)) and is_sm100a_supported(
+        device
+    )
+
+
+_requires_sm100_or_sm103 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
+    reason="vsa_sm100_blk64 requires SM100 or SM103",
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
@@ -42,11 +54,8 @@ from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available()
-        or not (
-            is_sm100a_supported(torch.device("cuda"))
-            or is_sm110a_supported(torch.device("cuda"))
-        ),
-        reason="VSA SM100 backend requires SM100 or SM110 (Blackwell GPU)",
+        or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
+        reason="VSA blk128 backend requires SM100 or SM103",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,
@@ -686,7 +695,7 @@ def _make_wrapper_blk64(workspace):
     return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 def test_vsa_blk64_rejects_empty_rows(workspace):
     """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
     device = torch.device("cuda")
@@ -733,7 +742,7 @@ def test_vsa_blk64_rejects_empty_rows(workspace):
         )
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "density,num_blocks,num_heads",
     [
@@ -774,7 +783,7 @@ def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "seqlen,topk_frac",
     [
@@ -823,7 +832,7 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
 # ---------------------------------------------------------------------------
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 @pytest.mark.skipif(
     not os.environ.get("FLASHINFER_TEST_PERF"),
     reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
@@ -1157,7 +1166,7 @@ def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
 # ---------------------------------------------------------------------------
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "MB64,NB64,density",
     [
@@ -1258,7 +1267,7 @@ def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
 # ---------------------------------------------------------------------------
 
 
-@_requires_sm100
+@_requires_sm100_or_sm103
 def test_vsa_blk64_return_lse(workspace):
     """blk64 return_lse=True must produce finite LSE values matching PyTorch reference."""
     device = torch.device("cuda")

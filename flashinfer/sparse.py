@@ -527,13 +527,13 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
-        # ---- VSA SM100 blk128 backend (BSA blk128 CuTe-DSL kernel, SM100/SM110) ----
+        # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if arch // 10 not in (10, 11):
+            if cc not in ((10, 0), (10, 3)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk128 backend requires SM100/SM110 (Blackwell), "
+                    f"vsa_sm100_blk128 backend requires SM100/SM103, "
                     f"current device is SM{arch}"
                 )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
@@ -621,13 +621,13 @@ class BlockSparseAttentionWrapper:
             self._sm_scale = sm_scale
             return
 
-        # ---- VSA SM100 blk64 backend (BSA blk64 C++ kernel, SM100 only) -----------
+        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
         if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if arch // 10 != 10:
+            if cc not in ((10, 0), (10, 3)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk64 backend requires SM100 (Blackwell), "
+                    f"vsa_sm100_blk64 backend requires SM100/SM103, "
                     f"current device is SM{arch}"
                 )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
@@ -1023,7 +1023,7 @@ class BlockSparseAttentionWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
 
-        # ---- VSA SM100 blk128 backend (BSA blk128 CuTe-DSL kernel, SM100/SM110) ----
+        # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
             from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import (
                 bsa_attn_sm100_blk128_fwd,
@@ -1042,7 +1042,7 @@ class BlockSparseAttentionWrapper:
                 return_lse,
             )
 
-        # ---- VSA SM100 blk64 backend (BSA blk64 C++ kernel, SM100 only) -----------
+        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
         if self._backend == "vsa_sm100_blk64":
             from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
                 bsa_attn_sm100_blk64_fwd,

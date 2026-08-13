@@ -94,10 +94,7 @@ class FlashAttentionForwardSm100:
         assert (
             Arch.sm_100 <= self.arch <= Arch.sm_100f
             or Arch.sm_103 <= self.arch <= Arch.sm_103f
-            or Arch.sm_110 <= self.arch <= Arch.sm_110f
-        ), (
-            "Only SM 10.x and 11.x are supported"
-        )
+        ), "Only SM100 and SM103 are supported"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape

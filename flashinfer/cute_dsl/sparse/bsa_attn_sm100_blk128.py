@@ -77,7 +77,9 @@ def bsa_attn_sm100_blk128_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Forward pass for BSA block-sparse attention using the sm100_blk128 CuTe-DSL kernel (SM100/SM110 only).
+    """Forward pass for BSA block-sparse attention using the blk128 CuTe-DSL kernel.
+
+    Supports SM100 and SM103.
 
     Args:
         q: Query tensor (batch, seqlen_q, num_heads, head_dim)
@@ -111,8 +113,8 @@ def bsa_attn_sm100_blk128_fwd(
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
-    assert arch // 10 in [10, 11], (
-        f"bsa_attn_sm100_blk128_fwd (sm100_blk128) only supports SM100/SM110, got SM{arch}"
+    assert arch in (100, 103), (
+        f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103, got SM{arch}"
     )
     assert num_head % num_head_kv == 0
 
