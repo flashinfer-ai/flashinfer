@@ -145,7 +145,7 @@ def cub_backend_supported(
 ) -> bool:
     """Whether the dispatcher's CUB backend would serve this page-table transform call.
 
-    Mirrors flashinfer.topk.can_use_cub_topk. A forced-cub measurement where the rung
+    Mirrors flashinfer.topk.can_use_cub_topk. A forced-cub measurement where the backend
     declines would silently time the radix path relabeled, so gate host-side.
     """
     if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
@@ -160,17 +160,18 @@ def cub_backend_supported(
     return True
 
 
-def cub_page_table_metrics(
+def cub_topk_metrics(
     run,
     scores: torch.Tensor,
     deterministic: bool,
     compare_tie_break: bool,
     fi_ms: float,
 ) -> dict:
-    """Time the same fused page-table transform call forced to the CUB backend.
+    """Time the same top-k call forced to the CUB backend.
 
-    ``run(tie_break)`` must invoke ``flashinfer.top_k_page_table_transform``. Skipped
-    for deterministic mode (the CUB rung declines it) and unsupported configurations.
+    ``run(tie_break)`` must invoke one of the CUB-backed public APIs (``top_k``,
+    ``top_k_page_table_transform``, or ``top_k_ragged_transform``). Skipped for
+    deterministic mode (the CUB backend declines it) and unsupported configurations.
     """
     metrics: dict[str, float] = {}
     if deterministic or not cub_backend_supported(scores):
@@ -290,6 +291,17 @@ def bench_top_k_from_scores(
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
+
+    # The same call forced to the CUB backend
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k(scores, k, tie_break=tie_break),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+        )
+    )
 
     return result
 
@@ -575,7 +587,7 @@ def bench_page_table_transform(
 
     # The same fused call forced to the CUB backend (uniform lengths == seq_len).
     result.update(
-        cub_page_table_metrics(
+        cub_topk_metrics(
             lambda tie_break: flashinfer.top_k_page_table_transform(
                 scores, src_page_table, lengths, k, tie_break=tie_break
             ),
@@ -666,6 +678,19 @@ def bench_ragged_transform(
                 baseline_ms,
             )
         )
+
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k_ragged_transform(
+                scores, offsets, lengths, k, tie_break=tie_break
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+        )
+    )
 
     return result
 
@@ -1006,19 +1031,18 @@ def bench_varlen_transform(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
-    # The same fused call forced to the CUB backend. Only page_table rows without
-    # row_to_batch: the ragged transform has no CUB rung, and the rung declines
-    # row_to_batch (a forced-cub call it declines would time radix relabeled).
-    if transform == "page_table" and row_to_batch is None:
-        result.update(
-            cub_page_table_metrics(
-                lambda tie_break: run(False, tie_break),
-                scores,
-                deterministic,
-                compare_tie_break,
-                fi_ms,
-            )
+    # The same fused call forced to the CUB backend. Both transforms are CUB-backed
+    # (page_table including row_to_batch rows, and ragged), so every varlen row gets
+    # a CUB column; cub_topk_metrics itself skips unsupported configurations.
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: run(False, tie_break),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
         )
+    )
 
     return result
 
@@ -1149,8 +1173,8 @@ def main():
         args.compare_sglang = False
 
     # Test configurations
-    batch_sizes = [1, 16, 64, 256]
-    seq_lens = [256, 512, 1024, 2048, 4096, 16384, 65536, 131072, 262144, 524288]
+    batch_sizes = [1, 16, 32, 64, 256]
+    seq_lens = [256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 131072, 262144, 524288]
     k_values = [256, 512, 1024, 2048, 4096]
     top_k_cases = build_top_k_cases(
         batch_sizes=batch_sizes,
@@ -1275,6 +1299,7 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1338,6 +1363,7 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
+                line = append_cub_columns(line, result, args.tie_break)
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1395,6 +1421,7 @@ def main():
             )
         if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1470,6 +1497,7 @@ def main():
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
                     )
+                line = append_cub_columns(line, result, args.tie_break)
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1502,12 +1530,6 @@ def main():
                 f"NOTE: tie-break columns use deterministic={args.deterministic}; "
                 "slowdowns use the non-deterministic baseline"
             )
-        print(
-            "NOTE: CUB = the same fused call forced to the CUB backend "
-            "(cub::DeviceBatchedTopK with the page-table translation fused into its "
-            "output iterators). n/a when the CUB rung would decline: deterministic "
-            "mode, seq_len > 8192 or tie-break on pre-SM90 devices, seq_len > 2^21."
-        )
         print("=" * 100)
 
         if show_det_or_tie:
@@ -1627,6 +1649,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1689,6 +1712,7 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
+                        line = append_cub_columns(line, result, args.tie_break)
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1764,13 +1788,6 @@ def main():
                 "NOTE: clusters path requires SM100 (Blackwell); omitting Clusters "
                 f"column on this device (SM{cap[0]}{cap[1]})"
             )
-        print(
-            "NOTE: CUB = the same fused call forced to the CUB backend (page-table "
-            "translation fused into its output iterators). Only page_table rows: the "
-            "ragged transform has no CUB backend. n/a also when the rung would "
-            "decline: deterministic mode, max_len > 8192 or tie-break on pre-SM90 "
-            "devices, max_len > 2^21."
-        )
         print("=" * 100)
 
         base_header = (
