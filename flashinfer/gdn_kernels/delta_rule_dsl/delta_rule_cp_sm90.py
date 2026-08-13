@@ -28,6 +28,7 @@ from .helpers import (
     load_tensor_as_a,
     round_down,
     select_tensor_10,
+    state_dtype_to_cutlass,
 )
 from .varlen_helper import (
     CP_CHUNK_LEN_GRANULARITY,
@@ -1837,12 +1838,14 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
     def __init__(
         self,
         needs_initial_state: bool = False,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
         cu_seqlens_dtype: torch.dtype = torch.int64,
         state_indices_dtype: torch.dtype | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
     ):
         self.needs_initial_state = needs_initial_state
+        self.initial_state_dtype = initial_state_dtype
         self.use_state_indices = use_state_indices
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.state_indices_dtype = state_indices_dtype
@@ -1866,6 +1869,7 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
         self.use_3xtf32 = False
         self.manual_cache_key(
             "needs_initial_state",
+            "initial_state_dtype",
             "use_state_indices",
             "cu_seqlens_dtype",
             "state_indices_dtype",
@@ -2037,7 +2041,11 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
             start = cutlass.Int32(0)
 
             # init tSMrState from initial_state
-            cute.autovec_copy(tSMgInitialState, tSMrState_cv)
+            tSMrInitialState = cute.make_rmem_tensor_like(
+                tSMrState_cv, self.initial_state_dtype
+            )
+            cute.autovec_copy(tSMgInitialState, tSMrInitialState)
+            tSMrState_cv.store(tSMrInitialState.load().to(cutlass.Float32))
 
         for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
             TF32.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)
@@ -2352,6 +2360,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
     def __init__(
         self,
         needs_initial_state: bool = False,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         rows_per_cta: int = 4,
         use_state_indices: bool = False,
         cu_seqlens_dtype: torch.dtype = torch.int64,
@@ -2359,6 +2368,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         initial_state_inner_strides: tuple[int, ...] | None = None,
     ):
         self.needs_initial_state = needs_initial_state
+        self.initial_state_dtype = initial_state_dtype
         self.use_state_indices = use_state_indices
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.state_indices_dtype = state_indices_dtype
@@ -2372,6 +2382,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         self.registers_per_thread = 256
         self.manual_cache_key(
             "needs_initial_state",
+            "initial_state_dtype",
             "use_state_indices",
             "cu_seqlens_dtype",
             "state_indices_dtype",
@@ -2397,7 +2408,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         start = cutlass.Int32(0)
         if cutlass.const_expr(self.needs_initial_state):
             for i in cutlass.range_constexpr(self.rows_per_cta):
-                sState[i, col] = gInitialState[i, col]
+                sState[i, col] = gInitialState[i, col].to(cutlass.Float32)
         else:
             start = cutlass.Int32(1)
             for i in cutlass.range_constexpr(self.rows_per_cta):
@@ -2689,6 +2700,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
 @functools.cache
 def _get_fixup_kernel(
     needs_initial_state,
+    initial_state_dtype,
     kernel_kind,
     use_state_indices,
     cu_seqlens_dtype,
@@ -2698,6 +2710,7 @@ def _get_fixup_kernel(
     if kernel_kind == "simt_row4":
         return CPDeltaRuleFixupSimtSm90(
             needs_initial_state=needs_initial_state,
+            initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
             rows_per_cta=4,
             use_state_indices=use_state_indices,
             cu_seqlens_dtype=cu_seqlens_dtype,
@@ -2707,6 +2720,7 @@ def _get_fixup_kernel(
     if kernel_kind == "simt_row8":
         return CPDeltaRuleFixupSimtSm90(
             needs_initial_state=needs_initial_state,
+            initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
             rows_per_cta=8,
             use_state_indices=use_state_indices,
             cu_seqlens_dtype=cu_seqlens_dtype,
@@ -2716,6 +2730,7 @@ def _get_fixup_kernel(
     if kernel_kind == "hmma":
         return CPDeltaRuleFixupHmmaSm90(
             needs_initial_state=needs_initial_state,
+            initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
             use_state_indices=use_state_indices,
             cu_seqlens_dtype=cu_seqlens_dtype,
             state_indices_dtype=state_indices_dtype,
@@ -2781,10 +2796,7 @@ def cp_delta_rule_fixup_dsl_sm90(
                     f"{('[N_pool]' if use_state_indices else f'[{cu_seqlens.shape[0] - 1}]')} "
                     f"+ {expected_tail}, got {tuple(initial_state.shape)}"
                 )
-            if initial_state.dtype != torch.float32:
-                raise RuntimeError(
-                    f"initial_state must have dtype torch.float32, got {initial_state.dtype}"
-                )
+            state_dtype_to_cutlass(initial_state.dtype)
         if use_state_indices and (
             not is_integer_dtype(state_indices.dtype)
             or state_indices.shape != (cu_seqlens.shape[0] - 1,)
@@ -2856,6 +2868,7 @@ def cp_delta_rule_fixup_dsl_sm90(
             _kernel_kind = "hmma"
     kernel = _get_fixup_kernel(
         needs_initial_state,
+        initial_state.dtype if needs_initial_state else torch.float32,
         _kernel_kind,
         use_state_indices,
         cu_seqlens.dtype,
@@ -2926,6 +2939,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         needs_initial_state: bool = False,
         store_final_state: bool = True,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        checkpoint_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
         needs_checkpointing: bool = False,
         cu_seqlens_dtype: torch.dtype = torch.int64,
@@ -2950,6 +2966,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         )
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.checkpoint_state_dtype = checkpoint_state_dtype
         self.t_stage = 2
         self.manual_cache_key(
             "needs_alpha",
@@ -2958,6 +2977,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             "needs_checkpointing",
             "needs_initial_state",
             "store_final_state",
+            "initial_state_dtype",
+            "state_dtype",
+            "checkpoint_state_dtype",
             "use_state_indices",
             "cu_seqlens_dtype",
             "state_indices_dtype",
@@ -4244,6 +4266,9 @@ def _get_prefill_kernel(
     kernel_dtype,
     needs_initial_state,
     store_final_state,
+    initial_state_dtype,
+    state_dtype,
+    checkpoint_state_dtype,
     use_state_indices,
     needs_checkpointing,
     cu_seqlens_dtype,
@@ -4256,6 +4281,9 @@ def _get_prefill_kernel(
         kernel_dtype,
         needs_initial_state=needs_initial_state,
         store_final_state=store_final_state,
+        initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
+        state_dtype=state_dtype_to_cutlass(state_dtype),
+        checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
         use_state_indices=use_state_indices,
         needs_checkpointing=needs_checkpointing,
         cu_seqlens_dtype=cu_seqlens_dtype,
@@ -4443,17 +4471,16 @@ def cp_delta_rule_prefill_dsl_sm90(
             raise RuntimeError(
                 f"alpha must have dtype torch.float32, got {alpha.dtype}"
             )
-        if initial_state is not None and initial_state.dtype != torch.float32:
-            raise RuntimeError(
-                f"initial_state must have dtype torch.float32, got {initial_state.dtype}"
-            )
+        if initial_state is not None:
+            state_dtype_to_cutlass(initial_state.dtype)
+        if state is not None:
+            state_dtype_to_cutlass(state.dtype)
         if needs_checkpointing:
-            if state_checkpoints.dtype != torch.float32 or tuple(
-                state_checkpoints.shape[1:]
-            ) != (num_sab_heads, d, d):
+            state_dtype_to_cutlass(state_checkpoints.dtype)
+            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
                 raise RuntimeError(
                     "state_checkpoints must have shape "
-                    f"[*, {num_sab_heads}, {d}, {d}] and dtype float32"
+                    f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
                 )
             if not is_integer_dtype(
                 checkpoint_cu_starts.dtype
@@ -4531,6 +4558,13 @@ def cp_delta_rule_prefill_dsl_sm90(
         kernel_dtype,
         needs_initial_state=needs_initial_state,
         store_final_state=store_final_state,
+        initial_state_dtype=(
+            initial_state.dtype if needs_initial_state else torch.float32
+        ),
+        state_dtype=state.dtype if store_final_state else torch.float32,
+        checkpoint_state_dtype=(
+            state_checkpoints.dtype if needs_checkpointing else torch.float32
+        ),
         use_state_indices=use_state_indices,
         needs_checkpointing=needs_checkpointing,
         cu_seqlens_dtype=cu_seqlens.dtype,
@@ -4803,17 +4837,16 @@ def cp_delta_rule_dsl_sm90(
         raise RuntimeError(
             f"alpha/beta must have dtype torch.float32, got {alpha.dtype} and {beta.dtype}"
         )
-    if initial_state is not None and initial_state.dtype != torch.float32:
-        raise RuntimeError(
-            f"initial_state must have dtype torch.float32, got {initial_state.dtype}"
-        )
+    if initial_state is not None:
+        state_dtype_to_cutlass(initial_state.dtype)
+    if state is not None:
+        state_dtype_to_cutlass(state.dtype)
     if needs_checkpointing:
-        if state_checkpoints.dtype != torch.float32 or tuple(
-            state_checkpoints.shape[1:]
-        ) != (num_sab_heads, d, d):
+        state_dtype_to_cutlass(state_checkpoints.dtype)
+        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
             raise RuntimeError(
                 "state_checkpoints must have shape "
-                f"[*, {num_sab_heads}, {d}, {d}] and dtype float32"
+                f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
             )
         if not is_integer_dtype(
             checkpoint_cu_starts.dtype

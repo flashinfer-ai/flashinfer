@@ -36,7 +36,7 @@ from .gdn_kernels.delta_rule_dsl.varlen_helper import (
 )
 
 
-_SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
+_STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float32,
     torch.bfloat16,
     torch.float16,
@@ -163,8 +163,7 @@ def chunk_gated_delta_rule(
     initial_state : torch.Tensor, optional
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
-        float32 on SM90/SM120.  The SM100 path also accepts bfloat16,
-        float16, float8_e4m3fn, and float8_e5m2.  Starts from zero state
+        float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
         when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
@@ -189,9 +188,8 @@ def chunk_gated_delta_rule(
         ``None``.
     output_state : torch.Tensor, optional
         Pre-allocated output state tensor. Packed, sequence-ordered shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be float32
-        on SM90/SM120.  The SM100 path also accepts bfloat16, float16,
-        float8_e4m3fn, and float8_e5m2.  Required when
+        ``[num_seqs, num_sab_heads, head_size, head_size]``. May be float32,
+        bfloat16, float16, float8_e4m3fn, or float8_e5m2. Required when
         ``output_final_state=True``.  When ``state_indices`` is given it is
         instead the output state **pool** ``[N_pool, ...]`` and sequence
         ``i``'s final state is written to row ``state_indices[i]`` (in place
@@ -200,9 +198,8 @@ def chunk_gated_delta_rule(
         buffer would be indexed out of bounds by the pool slot ids).
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
-        num_sab_heads, head_size, head_size]``.  Must be float32 on
-        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
-        float8_e4m3fn, and float8_e5m2.  Required when
+        num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
+        float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
         currently supported on SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
@@ -301,13 +298,10 @@ def chunk_gated_delta_rule(
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
-        state_checkpoint_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
-        if q.is_cuda and get_compute_capability(q.device)[0] == 10:
-            state_checkpoint_dtypes = _SM100_STATE_DTYPES
-        if state_checkpoints.dtype not in state_checkpoint_dtypes:
+        if state_checkpoints.dtype not in _STATE_DTYPES:
             raise ValueError(
                 "state_checkpoints must have dtype "
-                f"{_format_dtype_list(state_checkpoint_dtypes)}, "
+                f"{_format_dtype_list(_STATE_DTYPES)}, "
                 f"got {state_checkpoints.dtype}"
             )
         if state_checkpoints.ndim != 4:

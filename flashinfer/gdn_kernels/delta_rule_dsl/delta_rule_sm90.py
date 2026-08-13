@@ -10,7 +10,7 @@ from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile
 from .collective_inverse_hmma import CollectiveInverse
-from .helpers import SM90, round_down, select_tensor_10
+from .helpers import SM90, round_down, select_tensor_10, state_dtype_to_cutlass
 from .schedule import WorkDesc
 from .varlen_helper import is_integer_dtype
 
@@ -126,6 +126,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         needs_checkpointing: bool,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        checkpoint_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
         cu_seqlens_dtype: torch.dtype = torch.int64,
         state_indices_dtype: torch.dtype | None = None,
@@ -139,6 +142,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.needs_checkpointing = needs_checkpointing
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.checkpoint_state_dtype = checkpoint_state_dtype
         self.use_state_indices = use_state_indices
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.state_indices_dtype = state_indices_dtype
@@ -163,6 +169,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             "needs_checkpointing",
             "dtype",
             "acc_dtype",
+            "initial_state_dtype",
+            "state_dtype",
+            "checkpoint_state_dtype",
             "use_state_indices",
             "cu_seqlens_dtype",
             "state_indices_dtype",
@@ -640,7 +649,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_S(select_tensor_10(gKV))
-        cute.copy(tiled_copy_kv, tKVgKV, tKVrKV)
+        tKVrKV_storage = cute.make_rmem_tensor_like(tKVrKV, gKV.element_type)
+        cute.copy(tiled_copy_kv, tKVgKV, tKVrKV_storage)
+        tKVrKV.store(tKVrKV_storage.load().to(self.acc_dtype))
 
     @cute.jit
     def kv_store(
@@ -656,7 +667,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_D(select_tensor_10(gKV))
-        cute.copy(tiled_copy_kv, tKVrKV, tKVgKV)
+        tKVrKV_storage = cute.make_rmem_tensor_like(tKVrKV, gKV.element_type)
+        tKVrKV_storage.store(tKVrKV.load().to(gKV.element_type))
+        cute.copy(tiled_copy_kv, tKVrKV_storage, tKVgKV)
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -2383,12 +2396,11 @@ def delta_rule_prefill_dsl_sm90(
         raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
     if beta is not None and beta.dtype != torch.float32:
         raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
-    if init_state is not None and init_state.dtype != torch.float32:
-        raise RuntimeError(
-            f"init_state must have dtype torch.float32, got {init_state.dtype}"
-        )
-    if state.dtype != torch.float32:
-        raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
+    if init_state is not None:
+        state_dtype_to_cutlass(init_state.dtype)
+    state_dtype_to_cutlass(state.dtype)
+    if state_checkpoints is not None:
+        state_dtype_to_cutlass(state_checkpoints.dtype)
     if not is_integer_dtype(cu_seqlens.dtype):
         raise RuntimeError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
@@ -2514,6 +2526,13 @@ def delta_rule_prefill_dsl_sm90(
         needs_init_state,
         needs_checkpointing,
         kernel_dtype,
+        initial_state_dtype=state_dtype_to_cutlass(
+            init_state.dtype if needs_init_state else torch.float32
+        ),
+        state_dtype=state_dtype_to_cutlass(state.dtype),
+        checkpoint_state_dtype=state_dtype_to_cutlass(
+            state_checkpoints.dtype if needs_checkpointing else torch.float32
+        ),
         use_state_indices=use_state_indices,
         cu_seqlens_dtype=cu_seqlens.dtype,
         state_indices_dtype=state_indices.dtype if use_state_indices else None,

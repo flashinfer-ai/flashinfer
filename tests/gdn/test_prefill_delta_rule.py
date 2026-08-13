@@ -1057,7 +1057,7 @@ def test_checkpoint_wrong_cu_starts_size(qkv_factory):
 
 
 # ---------------------------------------------------------------------------
-# State dtype tests (SM100 only)
+# State dtype tests
 # ---------------------------------------------------------------------------
 
 
@@ -1071,9 +1071,12 @@ def _test_prefill_kernel_state_dtype(
     head_size: int,
     seq_lens: list[int],
     scale: float,
+    use_cp: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm100()
+    _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -1130,7 +1133,7 @@ def _test_prefill_kernel_state_dtype(
         True,
         output=our_o,
         output_state=our_state,
-        use_cp=False,
+        use_cp=use_cp,
     )
 
     torch.cuda.synchronize()
@@ -1178,6 +1181,7 @@ def _test_prefill_kernel_state_dtype(
     "state_dtype",
     [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
 )
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_kernel_state_dtype(
     qkv_factory,
     dtype: str,
@@ -1188,6 +1192,7 @@ def test_prefill_kernel_state_dtype(
     seq_lens: list[int],
     scale: float | str,
     state_dtype: torch.dtype,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -1201,5 +1206,6 @@ def test_prefill_kernel_state_dtype(
         head_size,
         seq_lens,
         scale,
+        use_cp,
         seed=seed,
     )
