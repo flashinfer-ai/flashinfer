@@ -53,8 +53,9 @@ introspects their shapes / dtypes and returns the definition dict.
     import json
     print(json.dumps(defn, indent=2))
 
-For class-method APIs use the unbound (class-level) form, or the module-level
-helper:
+For class-method APIs whose trace schema depends only on call arguments, use
+the unbound (class-level) form. For stateful wrappers whose schema also depends
+on ``plan()`` state, pass the live bound method to the module-level helper:
 
 .. code-block:: python
 
@@ -64,8 +65,10 @@ helper:
     defn = BatchDecodeWithPagedKVCacheWrapper.run.fi_trace(
         q=q_tensor, paged_kv_cache=(k_cache, v_cache)
     )
-    # or with a live instance:
-    defn = fi_trace(wrapper.run, q=q_tensor, paged_kv_cache=(k, v))
+
+    # BatchDecodePagedTSWrapper retains packed-query mode and output dtype in
+    # plan state, so its live instance is required.
+    defn = fi_trace(ts_wrapper.run, q=q_tensor, paged_kv_cache=(k, v))
 
 Both modes support an optional ``save_dir`` argument / env-var to control
 where the JSON file is written.  Explicit ``save_dir`` always writes; the
@@ -267,13 +270,18 @@ def fi_trace(
 
         defn = fi_trace(wrapper.run, q=q_tensor, paged_kv_cache=(k, v))
 
-    Class-level (unbound)::
+    Class-level (unbound, for schemas independent of instance state)::
 
         defn = fi_trace(
             flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run,
             q=q_tensor, paged_kv_cache=(k, v),
         )
+
+    Stateful wrapper methods must use the bound-method form. Calling their
+    ``wrapper.run.fi_trace(...)`` attribute cannot bind ``wrapper`` and raises
+    a diagnostic instead of guessing a potentially incorrect schema.
     """
+    bound_instance = getattr(func_or_method, "__self__", None)
     actual_func = getattr(func_or_method, "__func__", func_or_method)
     trace_fn = getattr(actual_func, "fi_trace", None)
     if trace_fn is None:
@@ -282,4 +290,8 @@ def fi_trace(
             f"No fi_trace spec is registered for '{qualname}'. "
             "Only @flashinfer_api(trace=...)-decorated functions support fi_trace."
         )
+    if bound_instance is not None:
+        # Bound-method semantics are authoritative: a caller-supplied
+        # ``self`` must not replace the instance whose method was requested.
+        kwargs["self"] = bound_instance
     return trace_fn(save_dir=save_dir, **kwargs)

@@ -86,7 +86,7 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
@@ -104,7 +104,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -243,16 +243,28 @@ def gen_cutlass_fused_moe_module(
     )
 
 
-def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
-    include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+    bmm_path = (
+        ArtifactPath.TRTLLM_GEN_BMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_BMM
+    )
+    bmm_checksum = (
+        CheckSumHash.TRTLLM_GEN_BMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_BMM
+    )
+    module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{bmm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
+    checksum_path = f"{bmm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, bmm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -269,23 +281,24 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
+    # Per-module export-header root: the Blackwell and Rubin variants must not
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
+    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
     symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
+        gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
 
-    # currently only support Blackwell
+    # currently only support Blackwell (SM107 compiles as sm100f)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[10, 12],
+        map_sm107_to_100f=True,
     )
 
     return gen_jit_spec(
-        "fused_moe_trtllm_sm100",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
@@ -310,15 +323,17 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[
+            gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,

@@ -16,6 +16,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import importlib
 import random
 
 import pytest
@@ -24,6 +25,16 @@ import torch
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.utils import get_compute_capability
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+if torch.cuda.is_available() and not is_cute_dsl_arch_supported(
+    *torch.cuda.get_device_capability()
+):
+    pytest.skip(
+        "installed CuTe DSL does not support this GPU architecture",
+        allow_module_level=True,
+    )
+
 
 def _skip_if_not_sm90_or_later() -> None:
     if not torch.cuda.is_available():
@@ -31,6 +42,13 @@ def _skip_if_not_sm90_or_later() -> None:
     cc = get_compute_capability(torch.device("cuda"))
     if cc[0] not in [9, 10, 11, 12]:
         pytest.skip(f"GDN decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")
+
+
+def _load_pretranspose_module():
+    try:
+        return importlib.import_module("flashinfer.gdn_kernels.gdn_decode_pretranspose")
+    except ImportError as exc:
+        pytest.skip(f"CuTe DSL pretranspose kernel is unavailable: {exc}")
 
 
 @pytest.mark.parametrize("page_gap", [2, 3])
@@ -113,6 +131,156 @@ def test_decode_pretranspose_pool_noncontiguous_state(page_gap: int) -> None:
     torch.testing.assert_close(
         pool_under_test[untouched], pool_source[untouched], atol=0.0, rtol=0.0
     )
+
+
+def test_decode_pretranspose_pool_reuses_compile_across_outer_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool capacity and leading stride reuse one compiled specialization."""
+    _skip_if_not_sm90_or_later()
+
+    B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
+    device = torch.device("cuda")
+    qkv_dtype = torch.bfloat16
+
+    with device:
+        q = torch.randn(B, T, H, K, dtype=qkv_dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, K, dtype=qkv_dtype), p=2.0, dim=-1
+        )
+        v = torch.randn(B, T, HV, V, dtype=qkv_dtype)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        a = torch.randn(B, T, HV, dtype=qkv_dtype) * 0.1
+        b = torch.randn(B, T, HV, dtype=qkv_dtype)
+        indices = torch.arange(B, dtype=torch.int32)
+
+    pretranspose_module = _load_pretranspose_module()
+    pool_compile_calls = 0
+    original_compile = pretranspose_module.cute.compile
+
+    def counted_compile(*args, **kwargs):
+        nonlocal pool_compile_calls
+        if kwargs.get("use_pool_indexing", False):
+            pool_compile_calls += 1
+        return original_compile(*args, **kwargs)
+
+    pretranspose_module._get_compiled_decode_kernel.cache_clear()
+    monkeypatch.setattr(pretranspose_module.cute, "compile", counted_compile)
+
+    try:
+        inner_strides = None
+        for pool_size, page_gap in ((B * 2, 2), (B * 3, 2), (B * 3, 3)):
+            with device:
+                storage = torch.randn(
+                    pool_size, page_gap, HV, V, K, dtype=torch.float32
+                )
+                pool = storage[:, page_gap - 1]
+                gathered_state = pool[indices].clone()
+                if inner_strides is None:
+                    inner_strides = pool.stride()[1:]
+                else:
+                    assert pool.stride()[1:] == inner_strides
+
+                pool_output, _ = gated_delta_rule_decode_pretranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=None,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=1.0,
+                    use_qk_l2norm=True,
+                    initial_state=pool,
+                    initial_state_indices=indices,
+                )
+                direct_output, direct_state = gated_delta_rule_decode_pretranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=gathered_state,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=1.0,
+                    use_qk_l2norm=True,
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    pool_output, direct_output, atol=5e-3, rtol=5e-3
+                )
+                torch.testing.assert_close(
+                    pool[indices], direct_state, atol=5e-3, rtol=5e-3
+                )
+
+        assert pool_compile_calls == 1
+    finally:
+        pretranspose_module._get_compiled_decode_kernel.cache_clear()
+
+
+def test_decode_pretranspose_pool_cache_keeps_inner_strides_static() -> None:
+    """Layouts with different inner strides must keep separate cache entries."""
+    pretranspose_module = _load_pretranspose_module()
+    common = dict(
+        T=1,
+        H=16,
+        HV=32,
+        K=128,
+        V=128,
+        dtype=torch.bfloat16,
+        scale=1.0,
+        use_qk_l2norm=True,
+        use_pool_indexing=True,
+        stride2=128,
+        stride3=1,
+    )
+
+    pretranspose_module._get_compiled_decode_kernel.cache_clear()
+    try:
+        compact = pretranspose_module._get_compiled_decode_kernel(
+            stride1=128 * 128, **common
+        )
+        padded_inner = pretranspose_module._get_compiled_decode_kernel(
+            stride1=129 * 128, **common
+        )
+        assert compact is not padded_inner
+    finally:
+        pretranspose_module._get_compiled_decode_kernel.cache_clear()
+
+
+def test_decode_pretranspose_pool_rejects_misaligned_slot_stride() -> None:
+    """Each pool slot must preserve the alignment required by 128-bit copies."""
+    pretranspose_module = _load_pretranspose_module()
+    pool = torch.empty_strided((2, 1, 1, 1), (5, 1, 1, 1))
+    dummy = torch.empty(0)
+
+    with pytest.raises(
+        AssertionError,
+        match=r"stride\(0\) must be a multiple of 4 FP32 elements",
+    ):
+        pretranspose_module.run_pretranspose_decode(
+            h0_source=pool,
+            A_log=dummy,
+            a=dummy,
+            dt_bias=dummy,
+            q=dummy,
+            k=dummy,
+            v=dummy,
+            b=dummy,
+            output=dummy,
+            B=1,
+            T=1,
+            H=1,
+            HV=1,
+            K=1,
+            V=1,
+            scale=1.0,
+            use_qk_l2norm=False,
+            use_pool_indexing=True,
+        )
 
 
 # ============================================================================

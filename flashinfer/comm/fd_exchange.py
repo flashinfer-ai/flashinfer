@@ -25,6 +25,10 @@ plus the low-level SCM_RIGHTS send/recv primitives shared by connectionless
 (SOCK_DGRAM) callers.
 """
 
+# PEP 563: ``_fd_ancillary`` annotates ``array.array[int]``, which is only
+# subscriptable on Python 3.12+; lazy annotations keep 3.10/3.11 importable.
+from __future__ import annotations
+
 import array
 import contextlib
 import logging

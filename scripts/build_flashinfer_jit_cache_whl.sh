@@ -8,6 +8,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
+PYTHON_VERSION_FILE="${SCRIPT_DIR}/../.python-version"
+PYTHON_VERSION="$(tr -d '[:space:]' < "${PYTHON_VERSION_FILE}")"
+if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
+  echo "Invalid Python version in ${PYTHON_VERSION_FILE}: ${PYTHON_VERSION}" >&2
+  exit 2
+fi
+PYTHON_ABI="cp${PYTHON_VERSION//./}"
+
 echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
@@ -39,7 +47,7 @@ mkdir -p "$CONDA_pkgs_dirs" "$XDG_CACHE_HOME"
 export HOME=/tmp/home
 mkdir -p $HOME
 export PATH="$HOME/.local/bin:$PATH"
-export PATH="/opt/python/cp312-cp312/bin:$PATH"
+export PATH="/opt/python/${PYTHON_ABI}-${PYTHON_ABI}/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
 echo "::group::Install build system"

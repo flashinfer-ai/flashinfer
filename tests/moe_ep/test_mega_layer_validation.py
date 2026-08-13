@@ -139,6 +139,46 @@ def test_mega_layer_forward_accepts_partial_batch():
     assert out.shape == (16, 128)
 
 
+def test_mega_layer_allocates_output_before_staging_round():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer()
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+    )
+    events: list[str] = []
+    real_empty = torch.empty
+
+    def allocate_output(*args, **kwargs):
+        events.append("allocate")
+        return real_empty(*args, **kwargs)
+
+    def stage_inputs(*args, **kwargs):
+        events.append("stage")
+
+    def compute(*args, output, **kwargs):
+        events.append("compute")
+        return output
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.modes.mega_layer.torch.empty",
+            side_effect=allocate_output,
+        ),
+        mock.patch.object(layer._kernel, "stage_inputs", side_effect=stage_inputs),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
+    ):
+        out = layer.forward(t)
+
+    assert events == ["allocate", "stage", "compute"]
+    assert out.shape == (8, 128)
+
+
 def test_mega_layer_forward_rejects_topk_mismatch():
     import torch
 
@@ -238,7 +278,7 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
         _mega_layer()
 
 
-def test_mega_layer_forward_passes_quantize_input_to_kernel():
+def test_mega_layer_forward_passes_staging_context_to_kernel():
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
@@ -251,13 +291,20 @@ def test_mega_layer_forward_passes_quantize_input_to_kernel():
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
         topk_weights=torch.zeros(8, 2),
     )
+
+    def compute(*args, output, **kwargs):
+        return output
+
     with (
-        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
         mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
     ):
-        layer.forward(t)
+        out = layer.forward(t)
         stage_mock.assert_called_once()
         assert stage_mock.call_args.kwargs["quantize_input"] is True
+        assert "transformed_weights" not in stage_mock.call_args.kwargs
+        assert "output" not in stage_mock.call_args.kwargs
+        assert out.shape == (8, 128)
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -511,3 +558,148 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
         world_size=1,
         num_experts=num_experts,
     )
+
+
+def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
+    """Source pack must not be stored when transformed weights are provided."""
+    import gc
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEWeightPack,
+    )
+
+    pack = MoEWeightPack(
+        w13=torch.zeros(1, 256, 128),
+        w2=torch.zeros(1, 128, 128),
+    )
+    ref = weakref.ref(pack)
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+    ):
+        layer = MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=pack,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=False,
+                transformed_weights=_fake_deep_gemm_transformed(),
+            ),
+        )
+    assert layer._weights is None
+    del pack
+    gc.collect()
+    assert ref() is None, "layer retained the source weight pack"
+    assert layer._transformed is not None
+
+
+def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
+    """Source pack must be released once preprocess_weights() has run."""
+    import gc
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEWeightPack,
+    )
+
+    pack = MoEWeightPack(
+        w13=torch.zeros(1, 256, 128),
+        w2=torch.zeros(1, 128, 128),
+    )
+    ref = weakref.ref(pack)
+    sentinel = _fake_deep_gemm_transformed()
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        ),
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend."
+            "DeepGemmMegaKernelBackend.preprocess_weights",
+            return_value=sentinel,
+        ),
+    ):
+        layer = MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=pack,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=True,
+            ),
+        )
+    assert layer._weights is None
+    assert layer._transformed is sentinel
+    del pack
+    gc.collect()
+    assert ref() is None, "layer retained the source weight pack after preprocess"
+
+
+def test_mega_layer_workspace_alloc_raises_during_capture():
+    """Lazy workspace alloc must fail loudly inside CUDA graph capture."""
+    import torch
+
+    from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
+
+    layer = _mega_layer()  # transformed supplied; workspace still lazy
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(4, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(4, 2),
+    )
+    with (
+        mock.patch("torch.cuda.is_available", return_value=True),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        pytest.raises(MoEEpConfigError, match="warmup"),
+    ):
+        layer.forward(t)
+
+
+def test_shim_capture_guard_raises_when_capturing():
+    """ensure_not_capturing raises with a warmup hint during capture."""
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
+        ensure_not_capturing,
+    )
+
+    with (
+        mock.patch("torch.cuda.is_available", return_value=True),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        pytest.raises(RuntimeError, match="warmup"),
+    ):
+        ensure_not_capturing("unit-test path")
+    # Not capturing: a plain no-op.
+    with mock.patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        ensure_not_capturing("unit-test path")
+
+
+def test_mega_layer_warmup_requires_tensors_when_prestaged():
+    """warmup() cannot fabricate a pre-quantized batch (quantize_input=False)."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer(quantize_input=False)
+    with pytest.raises(MoEEpConfigError, match="quantize_input=False"):
+        layer.warmup()

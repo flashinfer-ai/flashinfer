@@ -46,6 +46,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from .dtype_compat import as_bf16
+
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
@@ -2511,6 +2513,7 @@ def _get_compiled_mtp_kernel(
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2535,6 +2538,7 @@ def _get_compiled_mtp_kernel_inline(
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2605,6 +2609,14 @@ def run_mtp_decode(
             initial_state_indices. Negative entries skip the writeback for
             that batch slot (matching the read-side padding skip semantics).
     """
+    # Kernel is bf16-only for q/k/v/a/b/output; stage non-bf16 caller output for writeback.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    output_writeback = None
+    if output.dtype != torch.bfloat16:
+        output_writeback = output
+        # Keep padding rows (negative indices); do not use empty scratch.
+        output = output_writeback.to(torch.bfloat16)
+
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
@@ -2613,15 +2625,18 @@ def run_mtp_decode(
 
     per_token_pool_scatter = ssm_state_indices is not None
 
-    # `cute.compile` bakes h0_source strides into the produced binary. When
-    # `use_pool_indexing=True` callers can legitimately pass 4D pools with
-    # different stride patterns (e.g., differently-paged pools), so we must
-    # include the strides in the cache key. For the flat path strides are
-    # always (V*K, K, 1) and don't need to be keyed.
+    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:
         pool_strides_key = tuple(h0_source.stride())
     else:
         pool_strides_key = None
+
+    # Polymorphic dtypes baked into the compile signature (q/k/v/a/b/output are pinned).
+    dtype_key = (
+        A_log.dtype,
+        dt_bias.dtype,
+        initial_state_indices.dtype,
+    )
 
     if use_inline_kernel:
         inline_cache_key = (
@@ -2638,6 +2653,7 @@ def run_mtp_decode(
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
@@ -2659,6 +2675,7 @@ def run_mtp_decode(
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
@@ -2858,3 +2875,6 @@ def run_mtp_decode(
         cache_intermediate_states,
         stream,
     )
+
+    if output_writeback is not None:
+        output_writeback.copy_(output)

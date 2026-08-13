@@ -27,6 +27,10 @@ set -euo pipefail
 CUDA_MAJOR="${CUDA_MAJOR:-$(python -c 'import torch; v = torch.version.cuda or ""; print(v.split(".")[0])' 2>/dev/null || true)}"
 : "${CUDA_MAJOR:?could not detect CUDA major from torch.version.cuda; set CUDA_MAJOR explicitly}"
 CU="cu${CUDA_MAJOR}"
+CUTLASS_DSL_SPEC="nvidia-cutlass-dsl>=4.6.0"
+if [[ "${CUDA_MAJOR}" == "13" ]]; then
+    CUTLASS_DSL_SPEC="nvidia-cutlass-dsl[cu13]>=4.6.0"
+fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
@@ -61,7 +65,7 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
     pytest \
     "nvidia-nvshmem-${CU}" \
     filelock \
-    "nvidia-cutlass-dsl[${CU}]==4.5.0"
+    "${CUTLASS_DSL_SPEC}"
 (
     if [ ! -d "${DEEPGEMM_SRC}/.git" ]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "${DEEPGEMM_SRC}"
@@ -81,7 +85,7 @@ echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
 cd "${FI_SRC}"
 # --no-build-isolation makes pyproject's [build-system] requires OUR job:
 # setuptools>=77 (PEP 639 SPDX `license = "Apache-2.0"`), packaging>=24, and
-# apache-tvm-ffi. The flashinfer-ci conda py312 image ships an older
+# apache-tvm-ffi. The flashinfer-ci Conda environment ships an older
 # setuptools that fails metadata generation on the SPDX license string
 # without this upgrade.
 PIP_CONSTRAINT="" pip install --no-cache-dir -U \

@@ -38,6 +38,21 @@ from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
 from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
+from .ulysses import UlyssesCommunicator as UlyssesCommunicator
+from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
+from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
+from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
+from .ulysses import init_ulysses_a2a as init_ulysses_a2a
+from .ulysses import ulysses_a2a as ulysses_a2a
+from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
+from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
+from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
+from .ulysses_topology import UlyssesRankTopology as UlyssesRankTopology
+from .ulysses_topology import decide_ulysses_backend as decide_ulysses_backend
+from .ulysses_topology import (
+    probe_ulysses_rank_topology as probe_ulysses_rank_topology,
+)
+from .ulysses_topology import resolve_ulysses_backend as resolve_ulysses_backend
 
 # Unified AllReduce Fusion API
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace

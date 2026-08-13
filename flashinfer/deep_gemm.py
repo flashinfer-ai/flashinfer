@@ -203,11 +203,11 @@ def transform_sf_into_required_layout(
     should_skip_transform = (
         sf.dtype == torch.int
         and gran == (1, 128)
-        and get_device_arch() in ("100a", "103a")
+        and get_device_arch() in ("100a", "103a", "107a")
     ) or (
         sf.dtype == torch.int
         and gran == (128, 128)
-        and get_device_arch() in ("100a", "103a")
+        and get_device_arch() in ("100a", "103a", "107a")
     )
 
     if not should_skip_transform:
@@ -222,7 +222,7 @@ def transform_sf_into_required_layout(
     if (
         sf.dtype == torch.float
         and gran == (1, 128)
-        and get_device_arch() in ("100a", "103a")
+        and get_device_arch() in ("100a", "103a", "107a")
     ):
         sf = get_col_major_tma_aligned_packed_tensor(sf)
         return check_sf_layout(
@@ -243,7 +243,7 @@ def transform_sf_into_required_layout(
     if (
         sf.dtype == torch.float
         and gran == (128, 128)
-        and get_device_arch() in ("100a", "103a")
+        and get_device_arch() in ("100a", "103a", "107a")
     ):
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
         sf = get_col_major_tma_aligned_packed_tensor(sf)
@@ -281,6 +281,16 @@ def get_device_arch():
     return f"{major * 10 + minor}{suffix}"
 
 
+def is_rubin_arch() -> bool:
+    # Rubin (sm_107, cc 10.7) ships its own deep-gemm cubins in a separate
+    # artifact directory; every other arch uses the default DEEPGEMM path.
+    return get_device_arch() == "107a"
+
+
+def get_deepgemm_artifact_path() -> str:
+    return ArtifactPath.DEEPGEMM_RUBIN if is_rubin_arch() else ArtifactPath.DEEPGEMM
+
+
 def hash_to_hex(s: str) -> str:
     md5 = hashlib.md5()
     md5.update(s.encode("utf-8"))
@@ -293,6 +303,7 @@ def must_be_k_major() -> bool:
         "90a": True,
         "100a": False,
         "103a": False,
+        "107a": False,
     }[get_device_arch()]
 
 
@@ -307,6 +318,8 @@ def get_default_recipe(
         ("100a", torch.int): (1, 1, 128),
         ("103a", torch.float): (1, 128, 128),
         ("103a", torch.int): (1, 1, 128),
+        ("107a", torch.float): (1, 128, 128),
+        ("107a", torch.int): (1, 1, 128),
     }[(get_device_arch(), sfb_dtype)]
 
 
@@ -945,8 +958,9 @@ def load_all():
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
         cubin_name = cubin_name + ".cubin"
-        get_artifact(ArtifactPath.DEEPGEMM + "/" + cubin_name, sha256)
-        path = FLASHINFER_CUBIN_DIR / ArtifactPath.DEEPGEMM / cubin_name
+        artifact_path = get_deepgemm_artifact_path()
+        get_artifact(artifact_path + "/" + cubin_name, sha256)
+        path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
         assert path.exists()
         RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
 
@@ -960,8 +974,9 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
     cubin_name = cubin_name + ".cubin"
-    get_artifact(ArtifactPath.DEEPGEMM + "/" + cubin_name, sha256)
-    path = FLASHINFER_CUBIN_DIR / ArtifactPath.DEEPGEMM / cubin_name
+    artifact_path = get_deepgemm_artifact_path()
+    get_artifact(artifact_path + "/" + cubin_name, sha256)
+    path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
     assert path.exists()
     RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
     return RUNTIME_CACHE[cubin_name]
@@ -1368,7 +1383,7 @@ def m_grouped_fp8_gemm_nt_masked_sm10x(
     runtime(**all_kwargs)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_group_deepgemm_fp8_nt_contiguous_problem_size(
     a_fp8: Tuple[torch.Tensor, torch.Tensor],
     b_fp8: Tuple[torch.Tensor, torch.Tensor],
@@ -1465,11 +1480,17 @@ def m_grouped_fp8_gemm_nt_contiguous(
             major_b=major_b,
             compiled_dims=compiled_dims,
         ),
+        "107a": functools.partial(
+            m_grouped_fp8_gemm_nt_contiguous_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, m_indices)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_m_grouped_fp8_gemm_nt_masked_problem_size(
     a_fp8: Tuple[torch.Tensor, torch.Tensor],
     b_fp8: Tuple[torch.Tensor, torch.Tensor],
@@ -1580,20 +1601,35 @@ def m_grouped_fp8_gemm_nt_masked(
             major_b=major_b,
             compiled_dims=compiled_dims,
         ),
+        "107a": functools.partial(
+            m_grouped_fp8_gemm_nt_masked_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, masked_m, expected_m)
 
 
 class KernelMap:
-    # Hash for kernel_map.json, updated when deepgemm cubins are republished
+    # Hash for kernel_map.json, updated when deepgemm cubins are republished.
+    # The Rubin (sm_107) cubins ship a separate kernel_map.json, so it has its
+    # own hash selected by arch in init_indices().
     KERNEL_MAP_HASH = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
+    KERNEL_MAP_HASH_RUBIN = (
+        "f8bf2b1bc943170559a9f18cfdcec2c30d84ba872d13f66dd52b9be3f3a36e27"
+    )
 
     def __init__(self):
         self.indice = None
 
     def init_indices(self):
-        indice_path = ArtifactPath.DEEPGEMM + "/" + "kernel_map.json"
-        assert get_artifact(indice_path, self.KERNEL_MAP_HASH), (
+        artifact_path = get_deepgemm_artifact_path()
+        map_hash = (
+            self.KERNEL_MAP_HASH_RUBIN if is_rubin_arch() else self.KERNEL_MAP_HASH
+        )
+        indice_path = artifact_path + "/" + "kernel_map.json"
+        assert get_artifact(indice_path, map_hash), (
             "cubin kernel map file not found, nor downloaded with matched sha256"
         )
         path = FLASHINFER_CUBIN_DIR / indice_path

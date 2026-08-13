@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 Unified AllReduce Fusion API
 
 This module provides a unified interface for AllReduce + RMSNorm fusion operations
-across different backends (TensorRT-LLM, MNNVL).
+across different backends (TensorRT-LLM, MNNVL, MNNVL CuTe DSL).
 
 Example usage:
     >>> # Auto-select best backend based on topology
@@ -60,6 +60,7 @@ from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
+from flashinfer.utils import is_confidential_compute
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
@@ -95,6 +96,7 @@ from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
 # Workspace classes wrap the underlying backend workspace implementations:
 # - TRTLLMAllReduceFusionWorkspace: Wraps trtllm_create_ipc_workspace_for_all_reduce_fusion
 # - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (see trtllm_mnnvl_ar.py)
+# - MNNVLCuteDSLAllReduceFusionWorkspace: Shared LL/BT/HT backend workspace
 #
 # Each workspace:
 # 1. Calls the backend-specific workspace creation function in __init__
@@ -131,7 +133,9 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """
         super().__init__(tp_size, tp_rank)
 
-        # Call the actual workspace creation function
+        # NVIDIA Confidential Computing requires multicast-free IPC workspaces so needs to disable symmetric device memory
+        use_symm_dev_mem = not is_confidential_compute()
+
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -141,19 +145,32 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
-            use_symm_dev_mem=True,
+            use_symm_dev_mem=use_symm_dev_mem,
         )
 
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
-        workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
-            self._internal_workspace,
-        )
-        self.ipc_handles = workspace_tuple[0]
-        self.workspace_tensor = workspace_tuple[1]
-        self.mem_handles = workspace_tuple[2]
-        self.metadata = workspace_tuple[3]
+        if use_symm_dev_mem:
+            # use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles, metadata)
+            symm_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = symm_workspace_tuple[0]
+            self.workspace_tensor = symm_workspace_tuple[1]
+            self.mem_handles = symm_workspace_tuple[2]
+            self.metadata = symm_workspace_tuple[3]
+        else:
+            # use_symm_dev_mem=False: (ipc_handles, workspace_tensor, metadata)
+            ipc_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = ipc_workspace_tuple[0]
+            self.workspace_tensor = ipc_workspace_tuple[1]
+            self.metadata = ipc_workspace_tuple[2]
+            # No symmetric-memory handles for the multicast-free IPC path.
+            self.mem_handles = []
 
     @property
     def backend(self) -> str:
@@ -486,6 +503,12 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
+        if is_confidential_compute():
+            raise ValueError(
+                "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
+                "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
+                "Use backend='trtllm' instead."
+            )
         mapping = Mapping(
             world_size=world_size,
             rank=rank,
@@ -585,8 +608,8 @@ def allreduce_fusion(
         ``[num_permuted_rows, hidden_dim]``; the token output shape is
         determined by ``residual_in``.
     workspace : AllReduceFusionWorkspace
-        Workspace object created by :func:`create_allreduce_fusion_workspace`.
-        Its concrete type (TRT-LLM vs MNNVL) determines the backend.
+        Workspace object created by the generic factory or a backend-specific
+        constructor. Its concrete type determines the backend.
     pattern : int
         Fusion pattern (``AllReduceFusionPattern`` constant):
 
@@ -597,23 +620,21 @@ def allreduce_fusion(
         * ``kARResidualRMSNormOutFP8Quant = 4``
         * ``kARResidualRMSNormOutFP4Quant = 5``
         * ``kMoEReductionARResidualRMSNorm = 6`` (TRT-LLM only)
-        * ``kMoEFinalizeARResidualRMSNorm = 7`` (TRT-LLM only)
+        * ``kMoEFinalizeARResidualRMSNorm = 7``
         * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8`` (TRT-LLM only)
         * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
 
         MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
-        dynamic FP8 patterns (10-11). MoE and packed group quant patterns
-        remain TRT-LLM only.
+        dynamic FP8 patterns (10-11). Packed group quant patterns remain
+        TRT-LLM only.
 
-        ``kMoEFinalizeARResidualRMSNorm`` is an explicit TRT-LLM fused
-        implementation of MoE finalize + AllReduce + RMSNorm and does not
-        use the MNNVL backend. Fusion is not always the fastest path for every
-        workload; benchmark this pattern on the target hardware, model,
-        tensor-parallel size, and serving mode before enabling it by default.
+        ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM and
+        the explicit MNNVL CuTe DSL backend.
     launch_with_pdl : bool
-        Use Programmatic Dependent Launch.
+        Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
+        their compiled PDL mode and warn when it differs from this value.
     trigger_completion_at_end : bool
         TRT-LLM only. Controls when PDL completion is signaled. ``True``
         (default) signals after the kernel finishes (safe, no overlap).
@@ -996,6 +1017,42 @@ def allreduce_fusion(
         else:
             return output
 
+    elif workspace.backend == "mnnvl-cutedsl":
+        from .mnnvl_cutedsl_ar import (
+            MNNVLCuteDSLAllReduceFusionWorkspace,
+            _mnnvl_cutedsl_allreduce_fusion,
+        )
+
+        if not isinstance(workspace, MNNVLCuteDSLAllReduceFusionWorkspace):
+            raise TypeError("Invalid MNNVLCuteDSLAllReduceFusionWorkspace")
+        return _mnnvl_cutedsl_allreduce_fusion(
+            input=input,
+            workspace=workspace,
+            pattern=pattern,
+            launch_with_pdl=launch_with_pdl,
+            output=output,
+            residual_in=residual_in,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            rms_gamma=rms_gamma,
+            rms_eps=rms_eps,
+            scale_factor=scale_factor,
+            layout_code=layout_code,
+            use_oneshot=use_oneshot,
+            fp32_acc=fp32_acc,
+            moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+            moe_reduction_scale_input=moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+            moe_reduction_token_input=moe_reduction_token_input,
+            weight_bias=weight_bias,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            expert_scale_factor=expert_scale_factor,
+            shared_expert_output=shared_expert_output,
+            block_quant_group_size=block_quant_group_size,
+        )
+
     elif isinstance(workspace, MNNVLAllReduceFusionWorkspace):
         strategy = (
             MNNVLAllreduceFusionStrategy.AUTO
@@ -1154,5 +1211,7 @@ def allreduce_fusion(
     else:
         raise TypeError(
             f"Unknown workspace type: {type(workspace)}. "
-            f"Expected TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace"
+            "Expected TRTLLMAllReduceFusionWorkspace, "
+            "MNNVLAllReduceFusionWorkspace, or "
+            "MNNVLCuteDSLAllReduceFusionWorkspace"
         )
