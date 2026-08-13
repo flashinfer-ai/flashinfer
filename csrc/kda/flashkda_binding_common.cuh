@@ -452,8 +452,7 @@ inline CUtensorMap EncodeOutputTma(const TensorView& tensor) {
   constexpr uint32_t value_splits = ValueRows / 64;
   TVM_FFI_ICHECK(global_dim[0] >= 64 && global_dim[1] > 0 && global_dim[2] >= 1 &&
                  global_dim[3] >= value_splits)
-      << "out cannot encode the (64, " << ChunkTokens << ", 1, " << value_splits
-      << ") TMA box";
+      << "out cannot encode the (64, " << ChunkTokens << ", 1, " << value_splits << ") TMA box";
   uint64_t global_strides[3] = {static_cast<uint64_t>(d2 * d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
@@ -505,9 +504,9 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
            "this exact workspace and tensor signature before capture";
 
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
-        EncodeQkTma<ChunkTokens>(q, "q"), EncodeQkTma<ChunkTokens>(k, "k"),
+        EncodeQkTma<ChunkTokens>(q, "q"),          EncodeQkTma<ChunkTokens>(k, "k"),
         EncodeValueTma<ValueRows, ChunkTokens>(v), EncodeGateTma<ChunkTokens>(g),
-        EncodeBetaTma<ChunkTokens>(beta_tma), EncodeOutputTma<ValueRows, ChunkTokens>(out),
+        EncodeBetaTma<ChunkTokens>(beta_tma),      EncodeOutputTma<ValueRows, ChunkTokens>(out),
     };
     static_assert(sizeof(host_maps) == kDescriptorStorageBytes);
     TensorMapWords words{};

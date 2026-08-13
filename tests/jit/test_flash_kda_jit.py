@@ -53,7 +53,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
             "0b546eae3224d8518ab7b08894a8cf213aee8700c25444272b939ed8b9ef3461",
-            "bdaf822f2b82cb408e418cc6b65812af7a565eec6dd3e03993c4c29bea27c1b2",
+            "ff04754e8cd75c4519f58e81bd867942f4f62242612964621fcf4315b656f10e",
             "flashkda_bf16_fused_m128_d28b3f23fc",
             162308,
             219136,
@@ -63,7 +63,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n32": (
             "flashkda_bf16_fused_m128.cu",
             "b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
-            "e938d3fc7f079909e8a784ea937712c63863706cc17f46cc2065ee24008805d1",
+            "f481e643f6eb52d1f81791a4d4fc3ff83702e6bda8c17bfa31e5557b2ef5c982",
             "flashkda_bf16_fused_m128_9e356f6c5c",
             161055,
             227328,

@@ -215,9 +215,9 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
 
     provenance = (
         "// Frozen Cake export; do not edit by hand.\n"
-        "// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; "
-        f"module {variant.module_ident}.\n"
-        f"// Cake revision: {variant.cake_revision}; raw SHA-256: {variant.raw_sha256}.\n"
+        "// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module\n"
+        f"// {variant.module_ident}. Cake revision: {variant.cake_revision}; raw\n"
+        f"// SHA-256: {variant.raw_sha256}.\n"
     )
     return (
         LICENSE_HEADER

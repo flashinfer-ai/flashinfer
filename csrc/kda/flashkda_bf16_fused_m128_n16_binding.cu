@@ -74,9 +74,8 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(THREADS, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out,
-                                                     descriptor_storage, prepare_descriptors,
-                                                     stream);
+  const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
+                                                     prepare_descriptors, stream);
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
