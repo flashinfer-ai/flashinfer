@@ -131,6 +131,29 @@ struct CUBMakePageTableRowOut {
   }
 };
 
+// Ragged transform epilogue. Write functor: shifts one winning window-local index into the
+// caller's global coordinates by the row's offset as CUB stores it — no epilogue kernel,
+// mirroring the page-table path. (row_starts shifts the read window only and does NOT add
+// into the output, matching the native ragged kernel.)
+struct CUBRaggedTranslate {
+  int32_t offset;
+  __device__ int32_t operator()(int32_t idx) const { return idx + offset; }
+};
+
+// Outer functor for the ragged transform: dereferenced on the device once per segment,
+// builds row `i`'s writer with the row's offset folded in (offsets[row] is read on the
+// device at outer dereference, like the deferred lengths). Single output mode — the ragged
+// API returns indices only.
+struct CUBMakeRaggedRowOut {
+  int32_t* out_base;
+  const int32_t* offsets;
+  int64_t top_k;
+  __host__ __device__ auto operator()(int64_t row) const {
+    return cuda::make_transform_output_iterator(out_base + row * top_k,
+                                                CUBRaggedTranslate{offsets[row]});
+  }
+};
+
 // Per-segment input rows with a per-row window start: d_keys_in[row] points at
 // input[row, row_starts[row]:] (row_starts read on the device at outer dereference, like the
 // deferred lengths). Used only when row_starts is present; the whole-row case uses a plain
@@ -295,16 +318,17 @@ cudaError_t CUBBatchedTopKDispatch(KeysInItT d_keys_in, KeysOutItItT d_keys_out,
   }
 }
 
-// Top of the page-table transform chain: builds the bound-independent data iterators and
-// picks the keys-in shape. d_keys_in[i] yields a pointer to row i's selection window in the
-// dense (num_rows, max_len) input; the common whole-row case keeps the plain strided
+// Top of the transform chain, shared by the page-table and ragged entries (their identity
+// lives in the values-out iterator they pass): builds the bound-independent data iterators
+// and picks the keys-in shape. d_keys_in[i] yields a pointer to row i's selection window in
+// the dense (num_rows, max_len) input; the common whole-row case keeps the plain strided
 // iterator (pure pointer arithmetic), only windowed calls pay the per-row device read.
 template <typename DType, typename ValuesOutItItT>
-cudaError_t CUBPageTableTransform(const DType* input, int64_t row_stride, const int32_t* row_starts,
-                                  ValuesOutItItT d_values_out, const int32_t* lengths,
-                                  Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
-                                  int64_t max_len, int64_t top_k, int64_t tie_break,
-                                  size_t* query_bytes_out, cudaStream_t stream) {
+cudaError_t CUBTopKTransform(const DType* input, int64_t row_stride, const int32_t* row_starts,
+                             ValuesOutItItT d_values_out, const int32_t* lengths,
+                             Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
+                             int64_t max_len, int64_t top_k, int64_t tie_break,
+                             size_t* query_bytes_out, cudaStream_t stream) {
   // The keys (score values) are not returned by the transform API: every segment gets the
   // same discard iterator (the outer constant level satisfies the iterator-of-iterators
   // contract; a bare discard_iterator's reference is not an iterator and does not compile).
@@ -327,7 +351,7 @@ cudaError_t CUBPageTableTransform(const DType* input, int64_t row_stride, const 
                                 query_bytes_out, stream);
 }
 
-// Validation shared by the transform entry and its workspace-size query.
+// Validation shared by the transform entries and their workspace-size queries.
 void CheckCUBTopKArgs(const TensorView& input, const TensorView& lengths, int64_t top_k,
                       int64_t tie_break) {
   // Rows only need to be individually contiguous: the row pitch is threaded through as
@@ -424,10 +448,10 @@ void cub_topk_page_table_transform(
     auto d_values_out =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-      status = CUBPageTableTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                                     row_starts_ptr, d_values_out, lengths_ptr,
-                                     maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
-                                     /*query_bytes_out=*/nullptr, stream);
+      status = CUBTopKTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                                row_starts_ptr, d_values_out, lengths_ptr, maybe_workspace_buffer,
+                                num_rows, max_len, top_k, tie_break,
+                                /*query_bytes_out=*/nullptr, stream);
       return true;
     });
   };
@@ -470,8 +494,7 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
     auto d_values_out =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-      status =
-          CUBPageTableTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+      status = CUBTopKTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
                                 /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace,
                                 num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
       return true;
@@ -487,6 +510,113 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cub_topk_page_table_transform workspace-size query failed with error code "
+      << cudaGetErrorString(status);
+  return static_cast<int64_t>(workspace_bytes);
+}
+
+// CUB-backed fused top-k + ragged index transform. For each row i, the top-k is selected
+// over input[i, 0:lengths[i]] (shifted right by row_starts[i] when given) and each winning
+// window-local index idx is written as idx + offsets[i] — the shift into the caller's
+// global coordinates happens inside CUB's own kernel via the output iterators, no epilogue
+// launch. row_starts moves the read window only and does not add into the output (matching
+// the native ragged kernel). Rows with lengths[i] < top_k leave the output tail untouched;
+// the Python wrapper pre-fills it with -1 (matching the native kernels, which write -1
+// in-kernel).
+void cub_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
+                               TensorView lengths, Optional<TensorView> maybe_workspace_buffer,
+                               int64_t top_k, int64_t tie_break,
+                               Optional<TensorView> maybe_row_starts) {
+  CheckCUBTopKArgs(input, lengths, top_k, tie_break);
+  const int64_t num_rows = input.size(0);
+  const int64_t max_len = input.size(1);
+  TVM_FFI_ICHECK_GE(input.stride(0), max_len) << "input rows must not overlap";
+
+  CHECK_INPUT_AND_TYPE(output_indices, dl_int32);
+  CHECK_DEVICE(output_indices, input);
+  CHECK_DIM(2, output_indices);  // output_indices: (num_rows, top_k)
+  TVM_FFI_ICHECK_EQ(output_indices.size(0), num_rows)
+      << "output_indices must have shape (num_rows, top_k)";
+  TVM_FFI_ICHECK_EQ(output_indices.size(1), top_k)
+      << "output_indices must have shape (num_rows, top_k)";
+
+  CHECK_INPUT_AND_TYPE(offsets, dl_int32);
+  CHECK_DEVICE(offsets, input);
+  CHECK_DIM(1, offsets);  // offsets: (num_rows,)
+  TVM_FFI_ICHECK_EQ(offsets.size(0), num_rows) << "offsets must have one entry per row: expected "
+                                               << num_rows << ", got " << offsets.size(0);
+
+  if (maybe_row_starts.has_value()) {
+    const auto& row_starts = maybe_row_starts.value();
+    CHECK_INPUT_AND_TYPE(row_starts, dl_int32);
+    CHECK_DEVICE(row_starts, input);
+    CHECK_DIM(1, row_starts);  // row_starts: (num_rows,)
+    TVM_FFI_ICHECK_EQ(row_starts.size(0), num_rows)
+        << "row_starts must have one entry per row: expected " << num_rows << ", got "
+        << row_starts.size(0);
+  }
+
+  if (num_rows == 0) {
+    return;
+  }
+
+  const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
+  const auto* offsets_ptr = static_cast<const int32_t*>(offsets.data_ptr());
+  const auto* row_starts_ptr =
+      maybe_row_starts.has_value()
+          ? static_cast<const int32_t*>(maybe_row_starts.value().data_ptr())
+          : nullptr;
+  auto* out_ptr = static_cast<int32_t*>(output_indices.data_ptr());
+
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  auto stream = get_stream(input.device());
+
+  auto d_values_out = cuda::make_transform_iterator(
+      cuda::make_counting_iterator(int64_t{0}), CUBMakeRaggedRowOut{out_ptr, offsets_ptr, top_k});
+  cudaError_t status = cudaErrorInvalidValue;
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
+    status = CUBTopKTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                              row_starts_ptr, d_values_out, lengths_ptr, maybe_workspace_buffer,
+                              num_rows, max_len, top_k, tie_break,
+                              /*query_bytes_out=*/nullptr, stream);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk_ragged_transform failed with error code " << cudaGetErrorString(status);
+}
+
+// Workspace query for the ragged variant. Must instantiate the same dispatch (same iterator
+// types) as the run so the byte count matches the kernel that will execute; the ragged API
+// has a single output mode, so no mode flag is needed.
+int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView lengths,
+                                                 int64_t top_k, int64_t tie_break) {
+  CheckCUBTopKArgs(input, lengths, top_k, tie_break);
+  const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
+
+  const int64_t num_rows = input.size(0);
+  const int64_t max_len = input.size(1);
+  if (num_rows == 0) {
+    return 0;
+  }
+
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  auto stream = get_stream(input.device());
+
+  // Types-only query: iterator bases are never dereferenced.
+  Optional<TensorView> no_workspace;
+  size_t workspace_bytes = 0;
+  cudaError_t status = cudaErrorInvalidValue;
+  auto d_values_out = cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
+                                                    CUBMakeRaggedRowOut{nullptr, nullptr, top_k});
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
+    status = CUBTopKTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                              /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace,
+                              num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk_ragged_transform workspace-size query failed with error code "
       << cudaGetErrorString(status);
   return static_cast<int64_t>(workspace_bytes);
 }
