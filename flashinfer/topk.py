@@ -789,18 +789,19 @@ def top_k(
         workspace_buffer: torch.Tensor = _get_cache_buf(
             f"cub_topk_workspace_{device}", workspace_bytes, device
         )
+
         output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
-        indices_int32 = torch.empty(batch_size, k, dtype=torch.int32, device=device)
+        indices = torch.empty(batch_size, k, dtype=torch.int64, device=device)
         topk_module.cub_topk(
             input,
-            indices_int32,
+            indices,
             output_values,
             workspace_buffer,
             k,
             int(tie_break),
         )
-        # int64 indices are the documented torch.topk drop-in contract.
-        return output_values, indices_int32.long()
+
+        return output_values, indices
 
     if can_use_clusters_topk(input.device, deterministic, tie_break, dsa_graph_safe):
         indices, output_values = topk_clusters_exact(

@@ -366,12 +366,22 @@ cudaError_t CUBBatchedTopKVarLenTransform(const DType* input, int64_t row_stride
                                 query_bytes_out, stream);
 }
 
+// Widening store for the plain top_k indices: the API's contract is int64 (torch.topk
+// drop-in), but the value pipeline stays int32 end-to-end inside CUB — only the final
+// store casts. Carrying int64 values through the selection instead would double the value
+// payload in registers/shared memory and could shrink the single-block tier's bound.
+struct CUBCastIndexToInt64 {
+  __device__ int64_t operator()(int32_t idx) const { return idx; }
+};
+
 // Top of the plain batched top-k chain: full-width rows (no lengths window, no row_starts) with
 // both results returned — real strided writers for keys (the scores) and values (the
-// indices) instead of the transform entries' discard/translate stacks.
+// indices) instead of the transform entries' discard/translate stacks. The cast is
+// row-independent, so no per-row maker functor: the flat casting iterator composes with
+// counting/strided exactly like a raw pointer.
 template <typename DType>
 cudaError_t CUBBatchedTopK(const DType* input, int64_t row_stride, DType* output_values,
-                           int32_t* output_indices, Optional<TensorView>& maybe_workspace_buffer,
+                           int64_t* output_indices, Optional<TensorView>& maybe_workspace_buffer,
                            int64_t num_rows, int64_t max_len, int64_t top_k, int64_t tie_break,
                            size_t* query_bytes_out, cudaStream_t stream) {
   auto d_keys_in = cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride);
@@ -379,8 +389,10 @@ cudaError_t CUBBatchedTopK(const DType* input, int64_t row_stride, DType* output
   // The "values" carried alongside each key are the per-segment item indices [0, max_len),
   // synthesized by a counting iterator; d_values_out then receives the top-k source indices.
   auto d_values_in = cuda::make_constant_iterator(cuda::make_counting_iterator(int32_t{0}));
+  auto flat_indices_out =
+      cuda::make_transform_output_iterator(output_indices, CUBCastIndexToInt64{});
   auto d_values_out =
-      cuda::make_strided_iterator(cuda::make_counting_iterator(output_indices), top_k);
+      cuda::make_strided_iterator(cuda::make_counting_iterator(flat_indices_out), top_k);
   return CUBBatchedTopKDispatch(d_keys_in, d_keys_out, d_values_in, d_values_out,
                                 /*lengths=*/nullptr, maybe_workspace_buffer, num_rows, max_len,
                                 top_k, tie_break, query_bytes_out, stream);
@@ -664,8 +676,9 @@ int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView le
 // CUB-backed plain batched top-k (torch.topk-style): for each row i of the dense
 // (num_rows, d) input, the top_k largest (value, index) pairs are written to
 // output_values[i] / output_indices[i], unsorted. Every row is full width — there is no
-// lengths window and no -1 padding; every output slot is written. Indices are int32; the
-// Python wrapper converts to int64 for the torch.topk drop-in contract.
+// lengths window and no -1 padding; every output slot is written. Indices are written as
+// int64 directly (torch.topk drop-in contract) via a widening output iterator — no
+// conversion kernel at the Python boundary.
 void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
               Optional<TensorView> maybe_workspace_buffer, int64_t top_k, int64_t tie_break) {
   CheckCUBTopKInput(input, top_k, tie_break);
@@ -673,7 +686,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
   const int64_t max_len = input.size(1);
   TVM_FFI_ICHECK_GE(input.stride(0), max_len) << "input rows must not overlap";
 
-  CHECK_INPUT_AND_TYPE(output_indices, dl_int32);
+  CHECK_INPUT_AND_TYPE(output_indices, dl_int64);
   CHECK_DEVICE(output_indices, input);
   CHECK_DIM(2, output_indices);  // output_indices: (num_rows, top_k)
   TVM_FFI_ICHECK_EQ(output_indices.size(0), num_rows)
@@ -695,7 +708,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
-  auto* indices_ptr = static_cast<int32_t*>(output_indices.data_ptr());
+  auto* indices_ptr = static_cast<int64_t*>(output_indices.data_ptr());
   cudaError_t status = cudaErrorInvalidValue;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     status = CUBBatchedTopK(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
@@ -730,7 +743,7 @@ int64_t cub_topk_workspace_size(TensorView input, int64_t top_k, int64_t tie_bre
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     status =
         CUBBatchedTopK(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                       static_cast<c_type*>(nullptr), static_cast<int32_t*>(nullptr), no_workspace,
+                       static_cast<c_type*>(nullptr), static_cast<int64_t*>(nullptr), no_workspace,
                        num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
     return true;
   });

@@ -3320,13 +3320,14 @@ def test_cub_transform_workspace_paths(transform_mode):
             module.cub_topk_ragged_transform_workspace_size(scores, lengths, k, 0)
         )
     else:
+        out = torch.full((num_rows, k), -1, dtype=torch.int64, device="cuda")
         out_values = torch.empty(num_rows, k, dtype=scores.dtype, device="cuda")
 
         def run(workspace):
             module.cub_topk(scores, out, out_values, workspace, k, 0)
 
         def expected_row(i, ref_idx):
-            return ref_idx.int().tolist()
+            return ref_idx.tolist()
 
         needed = int(module.cub_topk_workspace_size(scores, k, 0))
 
@@ -3338,7 +3339,7 @@ def test_cub_transform_workspace_paths(transform_mode):
         assert sorted(out[i].tolist()) == sorted(expected_row(i, ref_idx[i]))
     if transform_mode == "top_k":
         # The plain entry also returns the scores; they must match the indices.
-        gathered = torch.gather(scores, dim=-1, index=out.long())
+        gathered = torch.gather(scores, dim=-1, index=out)
         torch.testing.assert_close(out_values, gathered)
 
     # A too-small workspace must raise, not corrupt.
