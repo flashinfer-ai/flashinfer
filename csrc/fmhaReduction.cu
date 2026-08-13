@@ -66,9 +66,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
   // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
-  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr
-                               ? batchIdx * params.mMaxSeqLenQ
-                               : params.ptrCumSeqLensQ[batchIdx]};
+  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
+                                                            : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
   int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
                             ? params.mMaxSeqLenQ
