@@ -275,32 +275,26 @@ def _select_flash_kda_prefill_variant(
     average_sequence_length = (
         sequence_length if fixed_layout else sequence_length // num_sequences
     )
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    cluster_size = 0
-    mailbox_depth = 0
-    varlen_helpers_supported = fixed_layout or compute_capability == (10, 0)
-    if varlen_helpers_supported and num_heads >= 8 and num_heads % 8 == 0:
-        average_num_chunks = (average_sequence_length + 31) // 32
-        if average_sequence_length >= 2048:
-            # Architecture-specific cold-L2 forced-route sweeps are recorded
-            # in docs/notes/kda_k1_parallelism_validation.md.
-            if compute_capability == (10, 0):
-                if task_count <= 8:
-                    cluster_size = 4
-                    mailbox_depth = min(average_num_chunks, 15)
-                elif task_count <= 32:
-                    cluster_size = 4
-                    mailbox_depth = min(average_num_chunks, 30)
-            elif task_count <= 8:
-                cluster_size = 4
-                mailbox_depth = min(average_num_chunks, 30)
-            elif task_count <= 32:
-                cluster_size = 4
-                mailbox_depth = min(average_num_chunks, 45)
-    if cluster_size:
-        return "m128_k1_parallel", cluster_size, mailbox_depth
+    helpers_supported = fixed_layout or compute_capability == (10, 0)
+    if (
+        helpers_supported
+        and num_heads >= 8
+        and num_heads % 8 == 0
+        and average_sequence_length >= 2048
+    ):
+        # Architecture-specific cold-L2 forced-route sweeps are recorded in
+        # docs/notes/kda_k1_parallelism_validation.md.
+        depth_schedule = (
+            ((8, 15), (32, 30))
+            if compute_capability == (10, 0)
+            else ((8, 30), (32, 45))
+        )
+        for max_tasks, depth_cap in depth_schedule:
+            if task_count <= max_tasks:
+                return "m128_k1_parallel", 4, depth_cap
     if not fixed_layout:
         return "m128", 0, 0
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     if num_heads >= 8 and num_heads % 8 == 0 and 2 * task_count <= sm_count:
         return "m64", 0, 0
     return "m128", 0, 0

@@ -527,6 +527,21 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
     assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
 
 
+@pytest.mark.parametrize(("cluster_size", "mailbox_depth"), [(4, 16), (8, 36)])
+def test_k1_parallel_rejects_unsafe_mailbox_depth(
+    flash_kda_device, monkeypatch, cluster_size, mailbox_depth
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128_k1_parallel", cluster_size, mailbox_depth),
+    )
+    inputs = _make_inputs(seq_lens=[2048], num_heads=8, packed=False)
+
+    with pytest.raises(Exception, match="multiple of the helper producer count"):
+        recurrent_kda(**_strict_prefill_kwargs(inputs))
+
+
 def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)

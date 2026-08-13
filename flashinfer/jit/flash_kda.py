@@ -119,7 +119,7 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
 
 
 def gen_flash_kda_m64_module(target: FlashKDATarget) -> JitSpec:
-    """Generate the fixed N=1, H=64 two-CTA M64 module."""
+    """Generate the two-CTA-per-task M64 module."""
 
     return gen_flash_kda_module("m64", target)
 
@@ -146,7 +146,7 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
 
 
 def load_flash_kda_m64_module(target: FlashKDATarget):
-    """Load the fixed N=1, H=64 two-CTA M64 module."""
+    """Load the two-CTA-per-task M64 module."""
 
     return load_flash_kda_module("m64", target)
 

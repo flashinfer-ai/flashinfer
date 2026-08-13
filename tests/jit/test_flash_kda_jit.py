@@ -226,7 +226,7 @@ def test_flash_kda_k1_parallel_jit_spec(monkeypatch, target):
     source = spec.sources[0].parent / "flashkda_bf16_fused_m128_k1_parallel.cu"
     text = source.read_text()
     assert hashlib.sha256(text.encode()).hexdigest() == (
-        "abf34e30e28776826e7b151128526d2d35784f65cc3136f69fb6c5beb0579e0a"
+        "c8476f6d3f339cc612d4c07d7c03b4646675a5c1bc47d0531ad991875a0996a2"
     )
     assert "bounded global-mailbox packets" in text
     assert "constexpr int kK1PacketBytes = 31520;" in text
@@ -234,8 +234,10 @@ def test_flash_kda_k1_parallel_jit_spec(monkeypatch, target):
 
     binding_text = spec.sources[0].read_text()
     assert "cluster_size == 4 || cluster_size == 8" in binding_text
+    assert "mailbox_depth % producer_instances == 0" in binding_text
     assert "major == 10 && (minor == 0 || minor == 3)" in binding_text
     assert "cluster_size < 0" not in binding_text
+    assert "global_pool" not in text
     assert "cluster_size" in text
 
 

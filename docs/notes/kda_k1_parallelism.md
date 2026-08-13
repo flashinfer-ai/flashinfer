@@ -38,7 +38,9 @@ can expose 35 helper instances, but cold-L2 B200 and B300 sweeps found that its
 larger grid costs more than the extra K1 capacity saves. C8 remains a supported
 forced benchmark configuration, not a public dispatch choice. Ordered K2
 recurrence and the 31,520-byte packet handoff remain serial or bandwidth
-limits.
+limits. Mailbox depth is constrained to a multiple of the helper instance
+count (15 for C4 and 35 for C8), so a ring slot cannot be reassigned to a
+different producer generation before its current packet is consumed.
 
 ## Validation required before an upstream PR
 

@@ -26,7 +26,7 @@ capability, not that product string.
 
 | Gate | Result |
 | --- | --- |
-| Targeted JIT and recurrent-KDA tests, B200 | 95 passed, 3 warnings |
+| Targeted JIT and recurrent-KDA tests, B200 | 97 passed, 3 warnings |
 | Targeted JIT and recurrent-KDA tests, B300 | 86 passed |
 | C8 and C4 output versus FP32 reference | Passed |
 | C8 and C4 recurrent state versus FP32 reference | Passed |
@@ -127,6 +127,12 @@ boundary, not a claim that the technique is B200-specific.
 The packed-varlen bitwise test for sequence lengths 2304/1792 also passed
 memcheck and synccheck with Compute Sanitizer 2025.3.1 from the CUDA 13.0.85
 sanitizer package. Both runs reported `ERROR SUMMARY: 0 errors`.
+
+After removing the unreachable global-pool/C2 code paths, the same B200 test
+set passed again. A two-round cold-L2 confirmation measured 1.203x for profile
+8192 and 1.131x for profile 4096/3072/2048/1024 versus the per-shape M64/M128
+oracle. The cleaned kernel also passed the packed-varlen memcheck and synccheck
+runs above.
 
 ## Cluster-size tuning sweep
 

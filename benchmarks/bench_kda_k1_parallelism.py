@@ -51,8 +51,12 @@ def _parse_forced_config(value: str) -> tuple[int, int]:
         ) from error
     if cluster_size not in (4, 8):
         raise argparse.ArgumentTypeError("forced cluster size must be 4 or 8")
-    if mailbox_depth_cap <= 0:
-        raise argparse.ArgumentTypeError("forced mailbox depth must be positive")
+    producer_instances = (cluster_size - 1) * 5
+    if mailbox_depth_cap <= 0 or mailbox_depth_cap % producer_instances != 0:
+        raise argparse.ArgumentTypeError(
+            "forced mailbox depth must be a positive multiple of "
+            f"{producer_instances} for C{cluster_size}"
+        )
     return cluster_size, mailbox_depth_cap
 
 
@@ -162,12 +166,11 @@ def _run_case(
         if packed
         else None
     )
-    max_num_chunks = (max(sequence_lengths) + 31) // 32
     forced_routes = {
         f"c{cluster_size}_d{mailbox_depth_cap}": (
             "m128_k1_parallel",
             cluster_size,
-            min(max_num_chunks, mailbox_depth_cap),
+            mailbox_depth_cap,
         )
         for cluster_size, mailbox_depth_cap in forced_configs
     }
@@ -179,23 +182,22 @@ def _run_case(
     }
     outputs = {name: torch.empty_like(q) for name in routes}
     states = {name: initial.clone() for name in outputs}
-    state_pools = {
-        name: initial.unsqueeze(0).expand(state_rotations, *initial.shape).clone()
-        for name in outputs
-    }
-    state_cursors = {name: 0 for name in outputs}
+    timed_state_pool = (
+        initial.unsqueeze(0).expand(state_rotations, *initial.shape).clone()
+    )
+    state_cursor = 0
     workspaces = {name: RecurrentKDAPrefillWorkspace(q.device) for name in outputs}
 
     def launch(name: str, *, timed: bool = False) -> object:
+        nonlocal state_cursor
         state = states[name]
         if timed:
-            state_index = state_cursors[name]
-            if state_index >= state_rotations:
+            if state_cursor >= state_rotations:
                 raise RuntimeError(
                     f"{name} exhausted {state_rotations} preinitialized state slots"
                 )
-            state_cursors[name] += 1
-            state = state_pools[name][state_index]
+            state = timed_state_pool[state_cursor]
+            state_cursor += 1
         return recurrent_kda(
             q=q,
             k=k,
@@ -228,6 +230,7 @@ def _run_case(
         torch.testing.assert_close(states[name], states["m64"], atol=0, rtol=0)
 
     samples = {name: [] for name in routes}
+    state_slots_used = {name: [] for name in routes}
     route_orders = []
     order_generator = random.Random(seed)
     for _ in range(measurement_rounds):
@@ -236,6 +239,8 @@ def _run_case(
         route_orders.append(route_order)
         for name in route_order:
             route = routes[name]
+            timed_state_pool.copy_(initial.unsqueeze(0))
+            state_cursor = 0
             torch.cuda.synchronize()
             with _physical_route(route):
                 _, round_samples = _measure(
@@ -244,6 +249,7 @@ def _run_case(
                     warmup_ms=warmup_ms,
                     bench_ms=bench_ms,
                 )
+            state_slots_used[name].append(state_cursor)
             samples[name].extend(round_samples)
 
     timings = {name: float(np.median(values)) for name, values in samples.items()}
@@ -284,7 +290,7 @@ def _run_case(
         "cold_l2": True,
         "cuda_graph": False,
         "same_initial_state_per_timed_call": True,
-        "state_slots_used": state_cursors,
+        "state_slots_used_per_round": state_slots_used,
         "measurement_rounds": measurement_rounds,
         "route_orders": route_orders,
     }

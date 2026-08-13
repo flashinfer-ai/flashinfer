@@ -524,70 +524,9 @@ __device__ __forceinline__ int cluster_rank() {
     return static_cast<int>(rank);
 }
 
-__device__ __forceinline__ uint32_t map_shared_rank(uint32_t addr, int rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(addr), "r"(rank));
-    return remote;
-}
-
 __device__ __forceinline__ void cluster_sync() {
     asm volatile("barrier.cluster.arrive.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_remote(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void publish_k1_to_owner(
-    uint32_t local_stage, uint32_t local_qk_barrier, int prep_tid) {
-    constexpr int kOperandBytes = 28672;
-    constexpr int kInverseGateOffset = 28672;
-    constexpr int kInverseGateBytes = 2688;
-    constexpr int kBetaTailOffset = 41472;
-    constexpr int kBetaTailBytes = 160;
-    constexpr int kPublishedBytes =
-        kOperandBytes + kInverseGateBytes + kBetaTailBytes;
-    constexpr int kBulkBytes = 16384;
-    if (prep_tid == 0) {
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        if (cluster_rank() == 0) {
-            mbarrier_arrive(local_qk_barrier);
-            return;
-        }
-        const uint32_t remote_stage = map_shared_rank(local_stage, 0);
-        const uint32_t remote_barrier = map_shared_rank(local_qk_barrier, 0);
-        asm volatile(
-            "mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;"
-            :: "r"(remote_barrier), "r"(kPublishedBytes) : "memory");
-        asm volatile(
-            "cp.async.bulk.shared::cluster.shared::cta."
-            "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-            :: "r"(remote_stage), "r"(local_stage), "r"(kBulkBytes),
-               "r"(remote_barrier) : "memory");
-        asm volatile(
-            "cp.async.bulk.shared::cluster.shared::cta."
-            "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-            :: "r"(remote_stage + kBulkBytes),
-               "r"(local_stage + kBulkBytes),
-               "r"(kOperandBytes - kBulkBytes), "r"(remote_barrier)
-            : "memory");
-        asm volatile(
-            "cp.async.bulk.shared::cluster.shared::cta."
-            "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-            :: "r"(remote_stage + kInverseGateOffset),
-               "r"(local_stage + kInverseGateOffset),
-               "r"(kInverseGateBytes), "r"(remote_barrier) : "memory");
-        asm volatile(
-            "cp.async.bulk.shared::cluster.shared::cta."
-            "mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-            :: "r"(remote_stage + kBetaTailOffset),
-               "r"(local_stage + kBetaTailOffset),
-               "r"(kBetaTailBytes), "r"(remote_barrier) : "memory");
-    }
 }
 
 constexpr int kK1PacketBytes = 31520;
@@ -656,7 +595,7 @@ extern "C" {
 
 __global__ __launch_bounds__(1024) void
 // FLASHINFER INTEGRATION BEGIN: allow exact state alias
-kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, __nv_bfloat16* final_state, unsigned char* k1_workspace, unsigned int* k1_flags, int mailbox_depth, int cluster_size, int num_tasks, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
+kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, __nv_bfloat16* final_state, unsigned char* k1_workspace, unsigned int* k1_flags, int mailbox_depth, int cluster_size, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
 // FLASHINFER INTEGRATION END: allow exact state alias
 {
     // FLASHINFER INTEGRATION BEGIN: acquire global tensor maps
@@ -680,27 +619,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
-    const bool global_pool = cluster_size < 0;
-    const int kClusterSize = global_pool ? 1 : cluster_size;
+    const int kClusterSize = cluster_size;
     constexpr int kProducerFirstRank = 1;
     const int kProducerCount = kClusterSize - 1;
 
-    const int num_bids = global_pool ? num_tasks : int(gridDim.x) / kClusterSize;
-    int cta_rank;
-    int bid;
-    if (global_pool) {
-        if (int(blockIdx.x) < num_bids) {
-            cta_rank = 0;
-            bid = int(blockIdx.x);
-        } else {
-            const int helper_idx = int(blockIdx.x) - num_bids;
-            cta_rank = kProducerFirstRank;
-            bid = helper_idx % num_bids;
-        }
-    } else {
-        cta_rank = cluster_rank();
-        bid = int(blockIdx.x) / kClusterSize;
-    }
+    const int cta_rank = cluster_rank();
+    const int bid = int(blockIdx.x) / kClusterSize;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -853,12 +777,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
         mbarrier_init_pred(smem + 592, 2, leader);
         mbarrier_init_pred(smem + 600, 2, leader);
         mbarrier_init_pred(smem + 608, 2, leader);
-        // publish_ready: the owner releases each ordered producer stage
-        mbarrier_init_pred(smem + 616, 1, leader);
-        mbarrier_init_pred(smem + 624, 1, leader);
-        mbarrier_init_pred(smem + 632, 1, leader);
-        mbarrier_init_pred(smem + 640, 1, leader);
-        mbarrier_init_pred(smem + 648, 1, leader);
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
 
@@ -897,7 +815,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
     #define tmem_dealloc_ready_addr (mbar_base + 528)
     #define prep_diag_ready_addr (mbar_base + 536)
     #define prep_inv16_ready_addr (mbar_base + 576)
-    #define publish_ready_addr (mbar_base + 616)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -1255,16 +1172,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                     }
                 }
                 if (epilogue_local_warp == 0 && elect_sync()) {
-                    if (global_pool || kClusterSize != 2) {
-                        long long packet_idx =
-                            (long long)task_idx_1 * mailbox_depth +
-                            chunk_idx_1 % mailbox_depth;
-                        const unsigned int free_value = global_pool
-                            ? 2 * (chunk_idx_1 / mailbox_depth + 1)
-                            : 0;
-                        store_k1_global_flag(
-                            k1_flags + packet_idx, free_value);
-                    }
+                    long long packet_idx =
+                        (long long)task_idx_1 * mailbox_depth +
+                        chunk_idx_1 % mailbox_depth;
+                    store_k1_global_flag(k1_flags + packet_idx, 0);
                     mbarrier_arrive(
                         raw_inputs_free_addr + epilogue_stage * 8);
                     mbarrier_arrive(smem_free_addr + epilogue_stage * 8);
@@ -1494,88 +1405,30 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
         int seq_idx_4 = seq_order[task_idx_4 / num_heads];
         int seq_len_4 = int(cu_seqlens[seq_idx_4 + 1] - cu_seqlens[seq_idx_4]);
         int num_chunks_4 = (seq_len_4 + 31) / 32;
-        if (!global_pool && kClusterSize == 2) {
-            unsigned int ingress_stage = 0;
-            unsigned int raw_phase = 1;
-            unsigned int smem_phase = 1;
-            for (int chunk_idx_3 = 0; chunk_idx_3 < num_chunks_4;
-                 ++chunk_idx_3) {
-                mbarrier_wait(
-                    raw_inputs_free_addr + ingress_stage * 8, raw_phase);
-                mbarrier_wait(
-                    smem_free_addr + ingress_stage * 8, smem_phase);
-                if (chunk_idx_3 >= 5) {
-                    const int retired_chunk = chunk_idx_3 - 5;
-                    mbarrier_wait_cluster(
-                        qk_full_addr + ingress_stage * 8,
-                        (retired_chunk / 5) & 1);
-                    if (elect_sync()) {
-                        const uint32_t producer_raw_free = map_shared_rank(
-                            raw_inputs_free_addr + ingress_stage * 8, 1);
-                        const uint32_t producer_smem_free = map_shared_rank(
-                            smem_free_addr + ingress_stage * 8, 1);
-                        mbarrier_arrive_remote(producer_raw_free);
-                        mbarrier_arrive_remote(producer_smem_free);
-                    }
-                }
-                if (elect_sync()) {
-                    const uint32_t producer_publish_ready = map_shared_rank(
-                        publish_ready_addr + ingress_stage * 8, 1);
-                    mbarrier_arrive_remote(producer_publish_ready);
-                }
-                ingress_stage += 1;
-                if (ingress_stage == 5) {
-                    ingress_stage = 0;
-                    raw_phase ^= 1;
-                    smem_phase ^= 1;
-                }
+        unsigned int mailbox_stage = 0;
+        unsigned int raw_phase = 1;
+        unsigned int smem_phase = 1;
+        for (int chunk_idx_3 = 0; chunk_idx_3 < num_chunks_4;
+             ++chunk_idx_3) {
+            mbarrier_wait(
+                raw_inputs_free_addr + mailbox_stage * 8, raw_phase);
+            mbarrier_wait(
+                smem_free_addr + mailbox_stage * 8, smem_phase);
+            long long packet_idx =
+                (long long)task_idx_4 * mailbox_depth +
+                chunk_idx_3 % mailbox_depth;
+            wait_k1_global_flag(k1_flags + packet_idx, 1);
+            if (elect_sync()) {
+                load_k1_from_global(
+                    smem_qd_addr + mailbox_stage * 41984,
+                    qk_full_addr + mailbox_stage * 8,
+                    k1_workspace + packet_idx * kK1PacketBytes);
             }
-            const int drain_begin = num_chunks_4 > 5 ? num_chunks_4 - 5 : 0;
-            for (int chunk_idx_3 = drain_begin; chunk_idx_3 < num_chunks_4;
-                 ++chunk_idx_3) {
-                const int drain_stage = chunk_idx_3 % 5;
-                mbarrier_wait_cluster(
-                    qk_full_addr + drain_stage * 8,
-                    (chunk_idx_3 / 5) & 1);
-                if (elect_sync()) {
-                    const uint32_t producer_raw_free = map_shared_rank(
-                        raw_inputs_free_addr + drain_stage * 8, 1);
-                    const uint32_t producer_smem_free = map_shared_rank(
-                        smem_free_addr + drain_stage * 8, 1);
-                    mbarrier_arrive_remote(producer_raw_free);
-                    mbarrier_arrive_remote(producer_smem_free);
-                }
-            }
-        } else {
-            unsigned int mailbox_stage = 0;
-            unsigned int raw_phase = 1;
-            unsigned int smem_phase = 1;
-            for (int chunk_idx_3 = 0; chunk_idx_3 < num_chunks_4;
-                 ++chunk_idx_3) {
-                mbarrier_wait(
-                    raw_inputs_free_addr + mailbox_stage * 8, raw_phase);
-                mbarrier_wait(
-                    smem_free_addr + mailbox_stage * 8, smem_phase);
-                long long packet_idx =
-                    (long long)task_idx_4 * mailbox_depth +
-                    chunk_idx_3 % mailbox_depth;
-                const unsigned int ready_value = global_pool
-                    ? 2 * (chunk_idx_3 / mailbox_depth) + 1
-                    : 1;
-                wait_k1_global_flag(
-                    k1_flags + packet_idx, ready_value);
-                if (elect_sync()) {
-                    load_k1_from_global(
-                        smem_qd_addr + mailbox_stage * 41984,
-                        qk_full_addr + mailbox_stage * 8,
-                        k1_workspace + packet_idx * kK1PacketBytes);
-                }
-                mailbox_stage += 1;
-                if (mailbox_stage == 5) {
-                    mailbox_stage = 0;
-                    raw_phase ^= 1;
-                    smem_phase ^= 1;
-                }
+            mailbox_stage += 1;
+            if (mailbox_stage == 5) {
+                mailbox_stage = 0;
+                raw_phase ^= 1;
+                smem_phase ^= 1;
             }
         }
     // ---- Role: prep ----
@@ -1594,25 +1447,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
             int warp_id_in_role_2 = (warp - 12);
             int prep_local_warp = warp_id_in_role_2 - prep_instance * 4;
             int prep_tid = prep_local_warp * 32 + lane;
-            const int helper_idx = int(blockIdx.x) - num_bids;
-            const int producer_instance = helper_idx * 5 + prep_instance;
-            const int producer_instance_count =
-                (int(gridDim.x) - num_bids) * 5;
-            if (global_pool) {
-                task_idx_4 = producer_instance % num_bids;
-                seq_idx_4 = seq_order[task_idx_4 / num_heads];
-                head_idx_3 = task_idx_4 % num_heads;
-                bos_4 = cu_seqlens[seq_idx_4];
-                eos_4 = cu_seqlens[seq_idx_4 + 1];
-                seq_len_4 = (int)(eos_4 - bos_4);
-                num_chunks_4 = (seq_len_4 + 32 - 1) / 32;
-            }
-            const int first_work = global_pool
-                ? producer_instance / num_bids
-                : (cta_rank - kProducerFirstRank) * 5 + prep_instance;
-            const int producer_stride = global_pool
-                ? (producer_instance_count - 1 - task_idx_4) / num_bids + 1
-                : kProducerCount * 5;
+            const int first_work =
+                (cta_rank - kProducerFirstRank) * 5 + prep_instance;
+            const int producer_stride = kProducerCount * 5;
             const int total_work = num_chunks_4;
             int num_prep_iters = first_work < total_work
                 ? (total_work - 1 - first_work) / producer_stride + 1
@@ -1642,7 +1479,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
             unsigned int _phase_qk_raw_full = 0;
             unsigned int _phase_prep_diag_ready = 0;
             unsigned int _phase_prep_inv16_ready = 0;
-            unsigned int _phase_publish_ready = 0;
             #pragma unroll 1
             for (int prep_iter = 0; prep_iter < num_prep_iters; prep_iter++) {
                 const int work_idx = prep_iter * producer_stride + first_work;
@@ -2842,42 +2678,24 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                         asm volatile("barrier.sync 15, 128;" ::: "memory");
                     }
                 }
-                if (!global_pool && kClusterSize == 2) {
-                    if (prep_tid == 0) {
-                        mbarrier_wait_cluster(
-                            publish_ready_addr + prep_stage * 8,
-                            _phase_publish_ready);
-                    }
-                    publish_k1_to_owner(
-                        smem_qd_addr + prep_stage * 41984,
-                        qk_full_addr + prep_stage * 8,
-                        prep_tid);
-                } else {
-                    long long packet_idx =
-                        (long long)task_idx_4 * mailbox_depth +
-                        chunk_idx_3 % mailbox_depth;
-                    const unsigned int free_value = global_pool
-                        ? 2 * (chunk_idx_3 / mailbox_depth)
-                        : 0;
-                    const unsigned int ready_value = free_value + 1;
-                    if (prep_tid == 0) {
-                        wait_k1_global_flag(
-                            k1_flags + packet_idx, free_value);
-                    }
-                    publish_k1_to_global(
-                        smem_qd_addr + prep_stage * 41984,
-                        k1_workspace + packet_idx * kK1PacketBytes,
-                        k1_flags + packet_idx,
-                        ready_value, prep_tid);
-                    if (prep_tid == 0) {
-                        mbarrier_arrive(
-                            raw_inputs_free_addr + prep_stage * 8);
-                        mbarrier_arrive(smem_free_addr + prep_stage * 8);
-                    }
+                long long packet_idx =
+                    (long long)task_idx_4 * mailbox_depth +
+                    chunk_idx_3 % mailbox_depth;
+                if (prep_tid == 0) {
+                    wait_k1_global_flag(k1_flags + packet_idx, 0);
+                }
+                publish_k1_to_global(
+                    smem_qd_addr + prep_stage * 41984,
+                    k1_workspace + packet_idx * kK1PacketBytes,
+                    k1_flags + packet_idx, 1, prep_tid);
+                if (prep_tid == 0) {
+                    mbarrier_arrive(
+                        raw_inputs_free_addr + prep_stage * 8);
+                    mbarrier_arrive(smem_free_addr + prep_stage * 8);
                 }
                 for (int _advance = 0; _advance < 5; _advance++) {
                     prep_stage += 1;
-                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_smem_free ^= 1; _phase_gate_raw_full ^= 1; _phase_qk_raw_full ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; _phase_publish_ready ^= 1; }
+                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_smem_free ^= 1; _phase_gate_raw_full ^= 1; _phase_qk_raw_full ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; }
                 }
             }
         }

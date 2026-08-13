@@ -28,6 +28,9 @@ namespace flashinfer {
 namespace flash_kda {
 
 constexpr int64_t kK1ParallelPacketBytes = 31520;
+static_assert(kK1ParallelPacketBytes == kK1PacketBytes);
+static_assert(THREADS == 1024);
+static_assert(SMEM_TOTAL == 227328);
 
 void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
                        TensorView beta_tma, TensorView A_log, TensorView dt_bias,
@@ -83,6 +86,10 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   TVM_FFI_ICHECK(cluster_size == 4 || cluster_size == 8) << "cluster_size must be C4 or C8";
   TVM_FFI_ICHECK(mailbox_depth > 0 && mailbox_depth <= std::numeric_limits<int32_t>::max())
       << "mailbox_depth must be in the positive int32 range";
+  const int64_t producer_instances = (cluster_size - 1) * 5;
+  TVM_FFI_ICHECK(mailbox_depth >= producer_instances && mailbox_depth % producer_instances == 0)
+      << "mailbox_depth must be a positive multiple of the helper producer count "
+      << producer_instances << " for C" << cluster_size << "; got " << mailbox_depth;
   TVM_FFI_ICHECK(num_heads >= 8 && num_heads % 8 == 0)
       << "K1-parallel FlashKDA requires H >= 8 and H divisible by 8";
 
@@ -148,9 +155,9 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tma.out,
           reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), workspace_bytes, flags,
           static_cast<int32_t>(mailbox_depth), static_cast<int32_t>(cluster_size),
-          static_cast<int32_t>(num_tasks), static_cast<int32_t>(num_heads),
-          static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
-          static_cast<float>(scale), static_cast<float>(lower_bound)),
+          static_cast<int32_t>(num_heads), static_cast<int32_t>(use_initial_state),
+          static_cast<int32_t>(store_final_state), static_cast<float>(scale),
+          static_cast<float>(lower_bound)),
       "kernel_flashkda_bf16_fused_m128_k1_parallel launch");
 }
 
