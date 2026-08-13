@@ -56,6 +56,11 @@ void cub_topk_ragged_transform(TensorView input, TensorView output_indices, Tens
 int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView lengths,
                                                  int64_t top_k, int64_t tie_break);
 
+void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
+              Optional<TensorView> maybe_workspace_buffer, int64_t top_k, int64_t tie_break);
+
+int64_t cub_topk_workspace_size(TensorView input, int64_t top_k, int64_t tie_break);
+
 // Radix-based Top-K selection
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk, radix_topk);
 
@@ -75,3 +80,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_page_table_transform_workspace_size,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform, cub_topk_ragged_transform);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform_workspace_size,
                               cub_topk_ragged_transform_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);
