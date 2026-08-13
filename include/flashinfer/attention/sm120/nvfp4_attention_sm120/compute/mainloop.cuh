@@ -28,6 +28,7 @@
 #include "../utils/layout.cuh"
 #include "../utils/math.cuh"
 #include "cute/tensor.hpp"
+#include "cutlass/fast_math.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 namespace nvfp4_attention {
@@ -157,6 +158,7 @@ struct CollectiveMainloopFwd {
     ElementDS const* ptr_ds;
     ShapeQKV const shape_ds;
     StrideQKV const stride_ds;
+    cutlass::FastDivmod const group_size_fastdiv;
     float const softmax_scale_log2;
   };
 
@@ -176,6 +178,7 @@ struct CollectiveMainloopFwd {
     TMA_Vt tma_load_Vt;
     TMA_SFVt tma_load_SFVt;
     TMA_DS tma_load_DS;
+    cutlass::FastDivmod const group_size_fastdiv;
     float const softmax_scale_log2;
   };
 
@@ -215,7 +218,8 @@ struct CollectiveMainloopFwd {
     return {args.shape_Q, layout_sfq,    args.shape_K, args.unpadded_shape_K,
             layout_sfk,   args.shape_Vt, layout_sfvt,  layout_ds,
             tma_load_Q,   tma_load_sfq,  tma_load_K,   tma_load_sfk,
-            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.softmax_scale_log2};
+            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.group_size_fastdiv,
+            args.softmax_scale_log2};
   }
 
   CUTLASS_DEVICE
@@ -363,6 +367,7 @@ struct CollectiveMainloopFwd {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
     auto [m_block, bidh, bidb] = work_tile_info.get_block_coord(scheduler_params);
+    int const kv_head = mainloop_params.group_size_fastdiv.divide(bidh);
 
     int n_block_max = get_n_block_max(mainloop_params, m_block);
 
@@ -388,8 +393,8 @@ struct CollectiveMainloopFwd {
     Tensor gQ =
         local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
     Tensor gK =
-        local_tile(mK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-    Tensor gVt = local_tile(mVt(_, _, bidh, bidb),
+        local_tile(mK(_, _, kv_head, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    Tensor gVt = local_tile(mVt(_, _, kv_head, bidb),
                             make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                             make_coord(_0{}, _));
     Tensor gDS = [&] {
@@ -404,8 +409,8 @@ struct CollectiveMainloopFwd {
     Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}),
                              make_coord(m_block, _0{}));
     Tensor gSFK =
-        local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-    Tensor gSFVt = local_tile(mSFVt(_, _, bidh, bidb),
+        local_tile(mSFK(_, _, kv_head, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    Tensor gSFVt = local_tile(mSFVt(_, _, kv_head, bidb),
                               make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                               make_coord(_0{}, _));
     auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});

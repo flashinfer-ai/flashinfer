@@ -87,6 +87,24 @@ def _reference_attention(q, k, v, causal):
     return torch.matmul(probs, v.float()).to(q.dtype)
 
 
+def _expand_quantized_kv_to_qo_heads(quantized):
+    q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction = quantized
+    num_qo_heads = q_fp4.shape[1]
+    num_kv_heads = k_fp4.shape[1]
+    kv_indices = torch.arange(num_qo_heads, device=q_fp4.device) // (
+        num_qo_heads // num_kv_heads
+    )
+    return (
+        q_fp4,
+        k_fp4.index_select(1, kv_indices).contiguous(),
+        v_fp4_t.index_select(1, kv_indices).contiguous(),
+        q_scale,
+        k_scale.index_select(1, kv_indices).contiguous(),
+        v_scale_t.index_select(1, kv_indices).contiguous(),
+        qk_correction,
+    )
+
+
 def _run_nvfp4_attention_sm120_accuracy_case(
     batch,
     num_heads,
@@ -182,6 +200,110 @@ def test_nvfp4_attention_sm120_accuracy(
         cos_threshold,
         mean_abs_err_threshold,
     )
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "num_kv_heads", "seq_len", "head_dim", "causal", "per_block_mean"),
+    [
+        pytest.param(8, 4, 256, 64, False, True, id="gqa2-d64"),
+        pytest.param(8, 2, 384, 128, True, True, id="gqa4-d128-causal"),
+        pytest.param(8, 1, 256, 128, False, False, id="mqa-d128-global-mean"),
+    ],
+)
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_gqa_matches_expanded_packed_oracle(
+    num_qo_heads,
+    num_kv_heads,
+    seq_len,
+    head_dim,
+    causal,
+    per_block_mean,
+):
+    _require_sm120()
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        (1, num_qo_heads, seq_len, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (1, num_kv_heads, seq_len, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+
+    quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(
+        q, k, v, per_block_mean=per_block_mean
+    )
+    q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, correction = quantized
+    num_q_blocks = seq_len // 128 if per_block_mean else 1
+    assert q_fp4.shape == (1, num_qo_heads, seq_len, head_dim // 2)
+    assert k_fp4.shape == (1, num_kv_heads, seq_len, head_dim // 2)
+    assert v_fp4_t.shape == (1, num_kv_heads, head_dim, seq_len // 2)
+    assert q_scale.shape == (1, num_qo_heads, seq_len, head_dim // 16)
+    assert k_scale.shape == (1, num_kv_heads, seq_len, head_dim // 16)
+    assert v_scale_t.shape == (1, num_kv_heads, head_dim, seq_len // 16)
+    assert correction.shape == (1, num_qo_heads, num_q_blocks, seq_len)
+
+    out_gqa, lse_gqa = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized,
+        causal=causal,
+        per_block_mean=per_block_mean,
+        return_lse=True,
+    )
+    out_expanded, lse_expanded = flashinfer.nvfp4_attention_sm120_fwd(
+        *_expand_quantized_kv_to_qo_heads(quantized),
+        causal=causal,
+        per_block_mean=per_block_mean,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_gqa, out_expanded, rtol=0, atol=0)
+    torch.testing.assert_close(lse_gqa, lse_expanded, rtol=0, atol=0)
+
+    kv_indices = torch.arange(num_qo_heads, device=q.device) // (
+        num_qo_heads // num_kv_heads
+    )
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.index_select(1, kv_indices).float(),
+        v.index_select(1, kv_indices).float(),
+        is_causal=causal,
+        scale=head_dim**-0.5,
+    )
+    cos_sim = F.cosine_similarity(
+        out_gqa.float().reshape(1, -1), ref.reshape(1, -1)
+    ).item()
+    assert cos_sim >= 0.94
+
+
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_rejects_nonuniform_gqa_ratio():
+    _require_sm120()
+
+    q = torch.randn((1, 6, 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 4, 128, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    with pytest.raises(ValueError, match="num_qo_heads"):
+        flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
+
+
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_rejects_kv_head_correction():
+    _require_sm120()
+
+    q = torch.randn((1, 8, 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, 128, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    quantized = list(flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v))
+    quantized[6] = quantized[6][:, :2].contiguous()
+
+    with pytest.raises(ValueError, match="qk_correction"):
+        flashinfer.nvfp4_attention_sm120_fwd(*quantized)
 
 
 @pytest.mark.parametrize("per_block_mean", [True, False])

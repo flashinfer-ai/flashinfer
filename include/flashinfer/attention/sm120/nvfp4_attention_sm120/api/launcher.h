@@ -70,9 +70,10 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
        {params.d, params.seqlen_k, params.h_k, params.b},
 
        static_cast<ElementDS const*>(params.delta_s_ptr),
-       {params.seqlen_s, params.seqlen_k, params.h_k, params.b},
+       {params.seqlen_s, params.seqlen_k, params.h, params.b},
        {params.ds_row_stride, _1{}, params.ds_head_stride, params.ds_batch_stride},
 
+       cutlass::FastDivmod(params.h_h_k_ratio),
        params.scale_softmax_log2});
 
   typename CollectiveEpilogue::Params epilogue_params =

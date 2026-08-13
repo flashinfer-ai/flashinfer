@@ -26,13 +26,14 @@ import torch
 
 
 DEFAULT_CONFIGS = (
-    (4, 8, 4096, 128, False),
-    (1, 8, 32768, 128, False),
+    (4, 8, 8, 4096, 128, False),
+    (1, 8, 8, 32768, 128, False),
 )
 PER_BLOCK_MEAN = True
 CSV_FIELDS = (
     "batch_size",
-    "num_heads",
+    "num_qo_heads",
+    "num_kv_heads",
     "seq_len",
     "head_dim",
     "causal",
@@ -64,7 +65,8 @@ def _patch_cutlass_dsl_operand_major_mode() -> None:
 @dataclass(frozen=True)
 class BenchConfig:
     batch_size: int
-    num_heads: int
+    num_qo_heads: int
+    num_kv_heads: int
     seq_len: int
     head_dim: int
     causal: bool
@@ -88,7 +90,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Number of attention heads.",
+        help="Legacy alias that sets equal query/output and KV head counts.",
+    )
+    parser.add_argument(
+        "--num-qo-heads",
+        "--num_qo_heads",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Number of query/output attention heads.",
+    )
+    parser.add_argument(
+        "--num-kv-heads",
+        "--num_kv_heads",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Number of key/value attention heads.",
     )
     parser.add_argument(
         "--seq-len",
@@ -208,26 +226,43 @@ def broadcast_shape_lists(values: dict[str, list[int]]) -> dict[str, list[int]]:
 
 
 def build_configs(args: argparse.Namespace) -> list[BenchConfig]:
+    if args.num_heads is not None and (
+        args.num_qo_heads is not None or args.num_kv_heads is not None
+    ):
+        raise ValueError(
+            "--num-heads cannot be combined with --num-qo-heads or --num-kv-heads"
+        )
+
+    num_qo_heads = args.num_heads if args.num_heads is not None else args.num_qo_heads
+    num_kv_heads = args.num_heads if args.num_heads is not None else args.num_kv_heads
     has_custom_shape = any(
         arg is not None
-        for arg in (args.batch_size, args.num_heads, args.seq_len, args.head_dim)
+        for arg in (
+            args.batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            args.seq_len,
+            args.head_dim,
+        )
     )
     if not has_custom_shape:
         return [
             BenchConfig(
                 batch_size=batch_size,
-                num_heads=num_heads,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
                 seq_len=seq_len,
                 head_dim=head_dim,
                 causal=args.causal if args.causal is not None else causal,
             )
-            for batch_size, num_heads, seq_len, head_dim, causal in DEFAULT_CONFIGS
+            for batch_size, num_qo_heads, num_kv_heads, seq_len, head_dim, causal in DEFAULT_CONFIGS
         ]
 
     values = broadcast_shape_lists(
         {
             "batch_size": expand_values("batch_size", args.batch_size, 4),
-            "num_heads": expand_values("num_heads", args.num_heads, 8),
+            "num_qo_heads": expand_values("num_qo_heads", num_qo_heads, 8),
+            "num_kv_heads": expand_values("num_kv_heads", num_kv_heads, 8),
             "seq_len": expand_values("seq_len", args.seq_len, 4096),
             "head_dim": expand_values("head_dim", args.head_dim, 128),
         }
@@ -236,7 +271,8 @@ def build_configs(args: argparse.Namespace) -> list[BenchConfig]:
     return [
         BenchConfig(
             batch_size=values["batch_size"][idx],
-            num_heads=values["num_heads"][idx],
+            num_qo_heads=values["num_qo_heads"][idx],
+            num_kv_heads=values["num_kv_heads"][idx],
             seq_len=values["seq_len"][idx],
             head_dim=values["head_dim"][idx],
             causal=causal,
@@ -248,8 +284,19 @@ def build_configs(args: argparse.Namespace) -> list[BenchConfig]:
 def validate_config(config: BenchConfig) -> None:
     if config.batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {config.batch_size}")
-    if config.num_heads <= 0:
-        raise ValueError(f"num_heads must be positive, got {config.num_heads}")
+    if config.num_qo_heads <= 0 or config.num_kv_heads <= 0:
+        raise ValueError(
+            "num_qo_heads and num_kv_heads must be positive, "
+            f"got {config.num_qo_heads} and {config.num_kv_heads}"
+        )
+    if (
+        config.num_qo_heads < config.num_kv_heads
+        or config.num_qo_heads % config.num_kv_heads != 0
+    ):
+        raise ValueError(
+            "num_qo_heads must be greater than or equal to and divisible by "
+            f"num_kv_heads, got {config.num_qo_heads} and {config.num_kv_heads}"
+        )
     if config.seq_len <= 0 or config.seq_len % 128 != 0:
         raise ValueError(
             f"seq_len must be positive and divisible by 128, got {config.seq_len}"
@@ -263,7 +310,7 @@ def attention_flops(config: BenchConfig) -> float:
     return (
         factor
         * config.batch_size
-        * config.num_heads
+        * config.num_qo_heads
         * config.seq_len
         * config.seq_len
         * config.head_dim
@@ -324,14 +371,21 @@ def bench_config(
 
     q = torch.randn(
         config.batch_size,
-        config.num_heads,
+        config.num_qo_heads,
         config.seq_len,
         config.head_dim,
         dtype=dtype,
         device="cuda",
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    k = torch.randn(
+        config.batch_size,
+        config.num_kv_heads,
+        config.seq_len,
+        config.head_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    v = torch.randn_like(k)
 
     sm_scale = 1.0 / math.sqrt(config.head_dim)
     out = torch.empty_like(q)
@@ -339,7 +393,7 @@ def bench_config(
     if return_lse:
         lse = torch.empty(
             config.batch_size,
-            config.num_heads,
+            config.num_qo_heads,
             config.seq_len,
             dtype=torch.float32,
             device="cuda",
@@ -445,7 +499,8 @@ def bench_config(
 
     print(
         "nvfp4_attention_sm120 "
-        f"B={config.batch_size} H={config.num_heads} S={config.seq_len} "
+        f"B={config.batch_size} Hq={config.num_qo_heads} "
+        f"Hkv={config.num_kv_heads} S={config.seq_len} "
         f"D={config.head_dim} causal={config.causal} dtype={dtype}: "
         f"return_lse={return_lse}, "
         f"attention_only={attention_only_ms:.3f} ms "
@@ -465,7 +520,8 @@ def bench_config(
     )
     return {
         "batch_size": config.batch_size,
-        "num_heads": config.num_heads,
+        "num_qo_heads": config.num_qo_heads,
+        "num_kv_heads": config.num_kv_heads,
         "seq_len": config.seq_len,
         "head_dim": config.head_dim,
         "causal": config.causal,
