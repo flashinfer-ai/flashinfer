@@ -207,6 +207,30 @@ def test_flash_kda_descriptor_workspace_contract():
     )
 
 
+@pytest.mark.parametrize("target", ["sm100a", "sm100f"])
+def test_flash_kda_k1_parallel_jit_spec(monkeypatch, target):
+    target_arch = (10, "0a") if target == "sm100a" else (10, "0f")
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {target_arch},
+    )
+    flash_kda.gen_flash_kda_module.cache_clear()
+
+    spec = flash_kda.gen_flash_kda_m128_k1_parallel_module(target)
+
+    assert spec.name == f"flash_kda_bf16_fused_m128_k1_parallel_{target}"
+    assert [source.name for source in spec.sources] == [
+        "flashkda_bf16_fused_m128_k1_parallel_binding.cu"
+    ]
+    source = spec.sources[0].parent / "flashkda_bf16_fused_m128_k1_parallel.cu"
+    text = source.read_text()
+    assert "bounded global-mailbox packets" in text
+    assert "constexpr int kK1PacketBytes = 31520;" in text
+    assert "wait_k1_global_flag" in text
+    assert "cluster_size" in text
+
+
 def test_flash_kda_variant_validation_and_public_getter(monkeypatch):
     with pytest.raises(ValueError, match="unsupported FlashKDA variant"):
         flash_kda.get_flash_kda_uri("m32", "sm100f")
@@ -292,7 +316,7 @@ def test_aot_detects_flash_kda_target_matrix(
         ({"flash_kda_prefill_sm100f": True}, "sm100f"),
     ],
 )
-def test_aot_registers_two_flash_kda_modules(
+def test_aot_registers_three_flash_kda_modules(
     monkeypatch, capabilities, expected_target
 ):
     from flashinfer import aot
@@ -312,6 +336,11 @@ def test_aot_registers_two_flash_kda_modules(
         aot,
         "gen_flash_kda_m128_module",
         lambda target: fake_flash_kda("m128", target),
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_flash_kda_m128_k1_parallel_module",
+        lambda target: fake_flash_kda("m128_k1_parallel", target),
     )
     monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
@@ -341,10 +370,12 @@ def test_aot_registers_two_flash_kda_modules(
     assert calls == [
         ("m64", expected_target),
         ("m128", expected_target),
+        ("m128_k1_parallel", expected_target),
     ]
     assert [spec.name for spec in specs] == [
         "spdlog",
         f"flash_kda_m64_{expected_target}",
         f"flash_kda_m128_{expected_target}",
+        f"flash_kda_m128_k1_parallel_{expected_target}",
         "cudnn",
     ]

@@ -38,6 +38,7 @@ _FLASH_KDA_HEAD_DIM = 128
 _FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
+_FLASH_KDA_K1_PACKET_BYTES = 31_520
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
@@ -53,13 +54,14 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._lock = threading.Lock()
         self._state_scratch: Optional[torch.Tensor] = None
         self._beta_padding: Optional[torch.Tensor] = None
+        self._k1_mailbox: Optional[torch.Tensor] = None
         self._descriptor_storages = {
             variant: torch.empty(
                 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128")
+            for variant in ("m64", "m128", "m128_k1_parallel")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
         self._bound_stream_ptr: Optional[int] = None
@@ -74,8 +76,8 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial
-    state, beta padding, and M64/M128 TMA descriptor storage for the lifetime
-    of the graph.
+    state, beta padding, K1 owner/helper mailbox storage, and M64/M128 TMA
+    descriptor storage for the lifetime of the graph.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -243,11 +245,70 @@ def _flash_kda_prefill_is_eligible(
 
 
 def _select_flash_kda_prefill_variant(
-    *, fixed_layout: bool, num_sequences: int, num_heads: int
-) -> "FlashKDAVariant":
-    if fixed_layout and num_sequences == 1 and num_heads == 64:
-        return "m64"
-    return "m128"
+    *,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    sequence_length: int,
+    device: torch.device,
+) -> tuple["FlashKDAVariant", int, int]:
+    """Select the measured B200 oracle and optional K1-helper schedule."""
+
+    if not fixed_layout or get_compute_capability(device) != (10, 0):
+        return "m128", 0, 0
+
+    task_count = num_sequences * num_heads
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    cluster_size = 0
+    mailbox_depth = 0
+    if num_heads >= 8 and num_heads % 8 == 0:
+        num_chunks = (sequence_length + 31) // 32
+        if task_count <= 8 and sequence_length >= 1024:
+            cluster_size = 8
+            mailbox_depth = min(num_chunks, 35)
+        elif task_count <= 32 and sequence_length >= 1024:
+            cluster_size = 4
+            mailbox_depth = min(num_chunks, 30)
+        elif (
+            33 <= task_count <= 56
+            and sequence_length >= 4096
+            and 2 * task_count <= sm_count
+        ) or (
+            57 <= task_count <= 64
+            and sequence_length >= 8192
+            and 2 * task_count <= sm_count
+        ):
+            cluster_size = -sm_count
+            mailbox_depth = min(num_chunks, 20)
+    if cluster_size:
+        return "m128_k1_parallel", cluster_size, mailbox_depth
+    if num_heads >= 8 and num_heads % 8 == 0 and 2 * task_count <= sm_count:
+        return "m64", 0, 0
+    return "m128", 0, 0
+
+
+def _k1_mailbox_bytes(task_count: int, mailbox_depth: int) -> int:
+    packet_count = task_count * mailbox_depth
+    flag_offset = (packet_count * _FLASH_KDA_K1_PACKET_BYTES + 255) & ~255
+    return flag_offset + packet_count * 4
+
+
+def _k1_mailbox_workspace(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    device: torch.device,
+    required_bytes: int,
+) -> torch.Tensor:
+    mailbox = workspace._k1_mailbox
+    if mailbox is None or mailbox.numel() < required_bytes:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "recurrent_kda K1 mailbox is not large enough for CUDA graph "
+                "capture; warm the largest owner/helper shape first"
+            )
+        mailbox = torch.empty(required_bytes, dtype=torch.uint8, device=device)
+        workspace._k1_mailbox = mailbox
+    return mailbox[:required_bytes]
 
 
 def _cached_tensor(
@@ -665,10 +726,12 @@ def _run_flash_kda_prefill(
     )
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    variant = _select_flash_kda_prefill_variant(
+    variant, cluster_size, mailbox_depth = _select_flash_kda_prefill_variant(
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
         num_heads=num_heads,
+        sequence_length=seq_len,
+        device=q.device,
     )
     target = _select_flash_kda_prefill_target(q.device)
     stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
@@ -720,7 +783,7 @@ def _run_flash_kda_prefill(
         descriptor_storage = workspace._descriptor_storages[variant]
         module = _get_flash_kda_prefill_module(variant, target)
         try:
-            module.run(
+            common_args = (
                 q,
                 k,
                 v,
@@ -735,14 +798,39 @@ def _run_flash_kda_prefill(
                 out_buf,
                 final_state_arg,
                 descriptor_storage,
-                prepare_descriptors,
-                num_heads,
-                int(use_initial_state),
-                int(store_final_state),
-                scale_value,
-                float(lower_bound),
-                stream_ptr,
             )
+            if variant == "m128_k1_parallel":
+                k1_mailbox = _k1_mailbox_workspace(
+                    workspace=workspace,
+                    device=q.device,
+                    required_bytes=_k1_mailbox_bytes(
+                        num_sequences * num_heads, mailbox_depth
+                    ),
+                )
+                module.run(
+                    *common_args,
+                    k1_mailbox,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    cluster_size,
+                    mailbox_depth,
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            else:
+                module.run(
+                    *common_args,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
         except Exception:
             if prepare_descriptors:
                 workspace._descriptor_signatures.pop(variant, None)

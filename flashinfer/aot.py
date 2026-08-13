@@ -65,6 +65,7 @@ from .jit.flash_kda import (
     FlashKDATarget,
     gen_flash_kda_m64_module,
     gen_flash_kda_m128_module,
+    gen_flash_kda_m128_k1_parallel_module,
 )
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
@@ -559,6 +560,7 @@ def gen_all_modules(
                 [
                     gen_flash_kda_m64_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
+                    gen_flash_kda_m128_k1_parallel_module(flash_kda_target),
                 ]
             )
 

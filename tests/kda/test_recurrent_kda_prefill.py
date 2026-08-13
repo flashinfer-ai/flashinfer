@@ -14,6 +14,7 @@
 
 import importlib
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -360,6 +361,109 @@ def test_frozen_route_and_ffi_abi(
     assert args[20] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("num_sequences", "num_heads", "sequence_length", "expected"),
+    [
+        (1, 8, 1024, ("m128_k1_parallel", 8, 35)),
+        (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
+        (1, 48, 4096, ("m128_k1_parallel", -148, 20)),
+        (1, 64, 8192, ("m128_k1_parallel", -148, 20)),
+        (1, 64, 4096, ("m64", 0, 0)),
+        (1, 72, 8192, ("m64", 0, 0)),
+        (1, 80, 8192, ("m128", 0, 0)),
+        (2, 16, 1024, ("m128_k1_parallel", 4, 30)),
+    ],
+)
+def test_k1_parallel_b200_oracle(
+    monkeypatch, num_sequences, num_heads, sequence_length, expected
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148),
+    )
+
+    actual = kda_prefill_api._select_flash_kda_prefill_variant(
+        fixed_layout=True,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=sequence_length,
+        device=torch.device("cuda:0"),
+    )
+
+    assert actual == expected
+
+
+def test_k1_parallel_is_b200_fixed_layout_only(monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 3)
+    )
+    assert kda_prefill_api._select_flash_kda_prefill_variant(
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=8,
+        sequence_length=8192,
+        device=torch.device("cuda:0"),
+    ) == ("m128", 0, 0)
+
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    assert kda_prefill_api._select_flash_kda_prefill_variant(
+        fixed_layout=False,
+        num_sequences=1,
+        num_heads=8,
+        sequence_length=8192,
+        device=torch.device("cuda:0"),
+    ) == ("m128", 0, 0)
+
+
+def test_k1_mailbox_size_is_bounded():
+    assert kda_prefill_api._k1_mailbox_bytes(8, 35) < 9_000_000
+    assert kda_prefill_api._k1_mailbox_bytes(32, 30) < 31_000_000
+    assert kda_prefill_api._k1_mailbox_bytes(64, 20) < 41_000_000
+
+
+def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148),
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(seq_lens=[1024], num_heads=8, packed=False)
+    recurrent_kda(**_strict_prefill_kwargs(inputs))
+
+    assert routes == [("m128_k1_parallel", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 24
+    assert args[13].shape == (768,)
+    assert args[14].dtype == torch.uint8
+    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 35)
+    assert args[15] == 1
+    assert args[16:21] == (8, 0, 0, 8, 35)
+    assert math.isclose(args[21], 128**-0.5)
+    assert args[22] == -5.0
+    assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
 
 
 def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
