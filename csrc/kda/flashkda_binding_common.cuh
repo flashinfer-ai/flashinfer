@@ -48,6 +48,10 @@ inline int64_t RoundUpBetaTmaHeads(int64_t num_heads) {
          kBetaTmaHeadsPerBox;
 }
 
+inline bool SupportsBetaTmaHeadCount(int64_t num_heads) {
+  return num_heads == 4 || (num_heads >= 8 && num_heads % kBetaTmaHeadsPerBox == 0);
+}
+
 static __global__ void PackBetaForTmaKernel(const __nv_bfloat16* beta, __nv_bfloat16* beta_tma,
                                             int64_t token_count, int64_t padded_elements,
                                             int64_t num_heads, int64_t padded_num_heads) {

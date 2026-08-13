@@ -81,8 +81,8 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   TVM_FFI_ICHECK(mailbox_depth >= producer_instances && mailbox_depth % producer_instances == 0)
       << "mailbox_depth must be a positive multiple of the helper producer count "
       << producer_instances << " for C" << cluster_size << "; got " << mailbox_depth;
-  TVM_FFI_ICHECK(num_heads >= 8 && num_heads % 8 == 0)
-      << "K1-parallel FlashKDA requires H >= 8 and H divisible by 8";
+  TVM_FFI_ICHECK(SupportsBetaTmaHeadCount(num_heads))
+      << "K1-parallel FlashKDA requires H == 4 or H >= 8 and divisible by 8";
 
   const int64_t num_tasks = num_seqs * num_heads;
   const int64_t packet_count = num_tasks * mailbox_depth;

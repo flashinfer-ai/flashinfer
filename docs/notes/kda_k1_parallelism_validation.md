@@ -26,11 +26,11 @@ capability, not that product string.
 
 | Gate | Result |
 | --- | --- |
-| Targeted JIT and recurrent-KDA tests, B200 | 97 passed, 3 warnings |
+| Targeted JIT and recurrent-KDA tests, B200 | 109 passed, 3 warnings |
 | Targeted JIT and recurrent-KDA tests, B300 | 86 passed |
 | C8 and C4 output versus FP32 reference | Passed |
 | C8 and C4 recurrent state versus FP32 reference | Passed |
-| Benchmark output/state versus CAKE-M64 | Bitwise identical for all measured shapes |
+| Owner/helper output/state versus CAKE-M128 | Bitwise identical for all measured shapes |
 | CUDA graph capture/replay | Passed |
 | Pre-commit, all files | Passed |
 
@@ -84,6 +84,32 @@ The router therefore keeps T=1024 on the exact M64/M128 fallback and enables
 owner/helper execution only from T=2048. Across the enabled table above, the
 measured range is 1.049x to 1.196x over the per-shape oracle.
 
+### Four-head support
+
+Four-head inputs reuse the generated eight-head beta TMA box by padding only
+the beta staging tensor; task indexing, the owner/helper grid, output, and
+recurrent state retain the real head count of four. Fixed and packed-varlen
+H=4 owner/helper routes are bitwise identical to CAKE-M128 for output and
+final recurrent state. Both M64 and M128 also pass the FP32-reference checks.
+The targeted FlashKDA JIT and recurrent-KDA suite passed 109 tests on B200.
+Focused H=4 C4/D15 runs passed Compute Sanitizer 2025.3.1 memcheck and
+synccheck with `ERROR SUMMARY: 0 errors`.
+
+A two-round cold-L2 B200 sweep used the same benchmark method with C4/D15 and
+C4/D30 forced routes:
+
+| T | Automatic route | Speedup vs `min(M64, M128)` |
+| ---: | --- | ---: |
+| 1024 | M64 fallback | 1.001x |
+| 2048 | C4/D15 | 1.066x |
+| 4096 | C4/D15 | 1.145x |
+| 8192 | C4/D15 | 1.185x |
+
+At T=1024, forced C4/D15 reached only 0.973x of the oracle, confirming that
+the existing average-length threshold of 2048 remains appropriate for H=4.
+The result JSON SHA256 was
+`445d619caf5d0c3711060ae6503f8e9f1b0e0453e6d62c8b82efb4027465fff7`.
+
 ## B200 packed-varlen validation
 
 Packed-varlen dispatch was enabled only after an independent B200 sweep. The
@@ -103,8 +129,9 @@ python benchmarks/bench_kda_k1_parallelism.py \
   --json k1_b200_varlen_sweep.json
 ```
 
-Every automatic and forced route was bitwise identical to CAKE-M64 for output
-and final recurrent state before timing. Results use cold-L2 CUDA-event timing
+Every automatic and forced owner/helper route was bitwise identical to
+CAKE-M128 for output and final recurrent state before timing. Results use
+cold-L2 CUDA-event timing
 and report against `min(CAKE-M64, CAKE-M128)`:
 
 | Sequence lengths | Tasks | Average T | Auto route | Speedup |
@@ -152,8 +179,8 @@ python benchmarks/bench_kda_k1_parallelism.py \
 
 The full 16-shape result JSON SHA256 was
 `97d6a4836a82de3ef712da94e2da6cce2aa554ba429c79dfdd05c3b343d938bf`.
-All forced routes were bitwise identical to CAKE-M64 for output and recurrent
-state before timing.
+All forced owner/helper routes were bitwise identical to CAKE-M128 for output
+and recurrent state before timing.
 
 For the only region previously assigned to C8, C4/D15 was faster at every
 enabled sequence length:
@@ -199,8 +226,9 @@ by the remote platform under the NVIDIA L20D product string:
 - SM count: 148
 
 The same cold-L2, four-round shuffled benchmark compared C4/D15, C4/D30,
-C4/D45, and C8/D35 against both frozen CAKE baselines. Every forced route was
-bitwise identical to CAKE-M64 for output and recurrent state before timing.
+C4/D45, and C8/D35 against both frozen CAKE baselines. Every forced
+owner/helper route was bitwise identical to CAKE-M128 for output and recurrent
+state before timing.
 The selected B300 policy is C4/D30 through eight batch-head tasks and C4/D45
 for 9-32 tasks:
 

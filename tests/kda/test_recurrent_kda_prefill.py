@@ -282,6 +282,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
+        (False, 4, "m64"),
         (False, 64, "m64"),
         (True, 64, "m128"),
         (True, 2, "m128"),
@@ -366,6 +367,8 @@ def test_frozen_route_and_ffi_abi(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
+        (1, 4, 1024, ("m64", 0, 0)),
+        (1, 4, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 8, 1024, ("m64", 0, 0)),
         (1, 8, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
@@ -403,6 +406,8 @@ def test_k1_parallel_b200_oracle(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
+        (1, 4, 1024, ("m64", 0, 0)),
+        (1, 4, 2048, ("m128_k1_parallel", 4, 30)),
         (1, 8, 1024, ("m64", 0, 0)),
         (1, 8, 2048, ("m128_k1_parallel", 4, 30)),
         (1, 16, 4096, ("m128_k1_parallel", 4, 45)),
@@ -432,6 +437,8 @@ def test_k1_parallel_b300_oracle(
 @pytest.mark.parametrize(
     ("compute_capability", "num_sequences", "num_heads", "total_tokens", "expected"),
     [
+        ((10, 0), 1, 4, 8192, ("m128_k1_parallel", 4, 15)),
+        ((10, 3), 1, 4, 8192, ("m128", 0, 0)),
         ((10, 0), 1, 8, 8192, ("m128_k1_parallel", 4, 15)),
         ((10, 0), 2, 8, 4096, ("m128_k1_parallel", 4, 30)),
         ((10, 3), 1, 8, 8192, ("m128", 0, 0)),
@@ -539,6 +546,18 @@ def test_k1_parallel_rejects_unsafe_mailbox_depth(
     inputs = _make_inputs(seq_lens=[2048], num_heads=8, packed=False)
 
     with pytest.raises(RuntimeError, match="multiple of the helper producer count"):
+        recurrent_kda(**_strict_prefill_kwargs(inputs))
+
+
+def test_k1_parallel_rejects_unsupported_head_count(flash_kda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128_k1_parallel", 4, 15),
+    )
+    inputs = _make_inputs(seq_lens=[2048], num_heads=5, packed=False)
+
+    with pytest.raises(RuntimeError, match="requires H == 4"):
         recurrent_kda(**_strict_prefill_kwargs(inputs))
 
 
@@ -1074,7 +1093,7 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     )
 
 
-@pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 8), (2048, 16)])
+@pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 4), (2048, 8), (2048, 16)])
 def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_heads):
     inputs = _make_inputs(
         seq_lens=[seq_len],
@@ -1104,17 +1123,51 @@ def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_he
     )
 
 
-def test_k1_parallel_varlen_matches_m128_bitwise(cuda_device, monkeypatch):
+def test_k1_parallel_h4_matches_m128_bitwise(cuda_device, monkeypatch):
+    if get_compute_capability(cuda_device) not in ((10, 0), (10, 3)):
+        pytest.skip("FlashKDA H4 requires an SM100-family GPU")
+
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        seed=9040,
+    )
+    initial_state = inputs["initial_state"].clone()
+    helper_output, helper_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128", 0, 0),
+    )
+    baseline_output, baseline_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(helper_output, baseline_output, atol=0, rtol=0)
+    torch.testing.assert_close(helper_state, baseline_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_heads", [4, 8])
+def test_k1_parallel_varlen_matches_m128_bitwise(cuda_device, monkeypatch, num_heads):
     if get_compute_capability(cuda_device) != (10, 0):
         pytest.skip("packed-varlen K1 helpers are currently enabled only on B200")
 
     seq_lens = [2304, 1792]
     inputs = _make_inputs(
         seq_lens=seq_lens,
-        num_heads=8,
+        num_heads=num_heads,
         packed=True,
         initial_state=True,
-        seed=9017,
+        seed=9017 + num_heads,
     )
     initial_state = inputs["initial_state"].clone()
     seq_order = torch.tensor([0, 1], dtype=torch.int32, device=cuda_device)

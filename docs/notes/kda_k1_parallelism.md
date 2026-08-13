@@ -28,13 +28,14 @@ copies `cu_seqlens` to the CPU.
 This deliberately conservative rule can leave a highly skewed, low-average
 batch on M128, but it cannot introduce a device-to-host synchronization or
 make graph capture depend on device data. Packed B300 remains on M128 until it
-is independently tuned and validated. The helper implementation also requires
-at least eight heads and a head count divisible by eight because of the
-generated beta TMA layout.
+is independently tuned and validated. The helper implementation supports four
+heads or a head count of at least eight divisible by eight. Four-head beta
+tiles are padded to the generated eight-head TMA box.
 
-Each helper CTA contains five K1 preparation instances. C4 therefore exposes
-15 concurrent helper instances in addition to the owner's original five. C8
-can expose 35 helper instances, but cold-L2 B200 and B300 sweeps found that its
+Each helper CTA contains five K1 preparation instances while the owner focuses
+on mailbox ingress and ordered K2. C4 therefore exposes 15 concurrent K1
+instances instead of the baseline M128 CTA's five. C8 can expose 35, but
+cold-L2 B200 and B300 sweeps found that its
 larger grid costs more than the extra K1 capacity saves. C8 remains a supported
 forced benchmark configuration, not a public dispatch choice. Ordered K2
 recurrence and the 31,520-byte packet handoff remain serial or bandwidth

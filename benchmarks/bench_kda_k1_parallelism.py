@@ -15,10 +15,11 @@
 """Benchmark SM100-family CAKE K1 parallelism against the M64/M128 oracle.
 
 Every implementation is invoked through ``flashinfer.kda.recurrent_kda``.
-The script first requires bitwise-identical output and recurrent state, then
-measures physical routes with cold L2. Speedup is always reported against
-``min(CAKE-M64, CAKE-M128)`` for the same shape. Optional forced C4/C8 and
-mailbox-depth configurations preserve the evidence used to tune dispatch.
+The script first requires every owner/helper route to be bitwise-identical to
+CAKE-M128 for output and recurrent state, then measures physical routes with
+cold L2. Speedup is always reported against ``min(CAKE-M64, CAKE-M128)`` for
+the same shape. Optional forced C4/C8 and mailbox-depth configurations preserve
+the evidence used to tune dispatch.
 """
 
 import argparse
@@ -222,11 +223,21 @@ def _run_case(
         with _physical_route(route):
             launch(name)
     torch.cuda.synchronize()
-    for name in routes:
-        if name == "m64":
+    helper_routes = [*forced_routes, "k1_parallel"]
+    auto_route = kda_prefill._select_flash_kda_prefill_variant(
+        fixed_layout=not packed,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=total_tokens if packed else sequence_length,
+        device=q.device,
+    )
+    if auto_route[0] != "m128_k1_parallel":
+        helper_routes.remove("k1_parallel")
+    for name in helper_routes:
+        if name not in outputs:
             continue
-        torch.testing.assert_close(outputs[name], outputs["m64"], atol=0, rtol=0)
-        torch.testing.assert_close(states[name], states["m64"], atol=0, rtol=0)
+        torch.testing.assert_close(outputs[name], outputs["m128"], atol=0, rtol=0)
+        torch.testing.assert_close(states[name], states["m128"], atol=0, rtol=0)
 
     samples = {name: [] for name in routes}
     state_slots_used = {name: [] for name in routes}
@@ -279,7 +290,7 @@ def _run_case(
         "speedup_vs_oracle": oracle_ms / timings["k1_parallel"],
         "forced_results": forced_results,
         "samples_ms": samples,
-        "correctness": "bitwise output and state",
+        "correctness": "owner/helper routes bitwise output and state versus M128",
         "timing_backend": "cupti" if enable_cupti else "cuda_event",
         "cold_l2": True,
         "cuda_graph": False,
@@ -307,7 +318,7 @@ def main() -> None:
             "example: --varlen-profiles 8192 4096,3072,2048,1024"
         ),
     )
-    parser.add_argument("--num-heads", type=int, nargs="+", default=[8, 16, 24, 32])
+    parser.add_argument("--num-heads", type=int, nargs="+", default=[4, 8, 16, 24, 32])
     parser.add_argument("--warmup-ms", type=int, default=20)
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument("--state-rotations", type=int, default=2048)

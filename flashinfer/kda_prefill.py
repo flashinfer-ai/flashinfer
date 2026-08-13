@@ -43,6 +43,10 @@ _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
 
+def _flash_kda_head_count_supports_tma(num_heads: int) -> bool:
+    return num_heads == 4 or (num_heads >= 8 and num_heads % 8 == 0)
+
+
 class _RecurrentKDAPrefillWorkspaceBase:
     def __init__(self, device: torch.device | str) -> None:
         normalized_device = torch.device(device)
@@ -272,8 +276,7 @@ def _select_flash_kda_prefill_variant(
     helpers_supported = fixed_layout or compute_capability == (10, 0)
     if (
         helpers_supported
-        and num_heads >= 8
-        and num_heads % 8 == 0
+        and _flash_kda_head_count_supports_tma(num_heads)
         and average_sequence_length >= 2048
     ):
         # Architecture-specific cold-L2 forced-route sweeps are recorded in
@@ -289,7 +292,7 @@ def _select_flash_kda_prefill_variant(
     if not fixed_layout:
         return "m128", 0, 0
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    if num_heads >= 8 and num_heads % 8 == 0 and 2 * task_count <= sm_count:
+    if _flash_kda_head_count_supports_tma(num_heads) and 2 * task_count <= sm_count:
         return "m64", 0, 0
     return "m128", 0, 0
 
