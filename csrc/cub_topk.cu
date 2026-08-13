@@ -41,8 +41,9 @@ namespace {
 
 // cub::DeviceBatchedTopK requires a compile-time upper bound on the segment size, so the
 // runtime max_len is dispatched over a small ladder of bounds (see
-// CUBBatchedTopKDispatchBound). Every tier multiplies kernel instantiations (tiers x dtypes x
-// requirement configs), so the ladder is kept minimal: one tier per capability class.
+// CUBBatchedTopKDispatch). Every tier multiplies kernel instantiations (tiers x
+// dtypes x requirement configs), so the ladder is kept minimal: one tier per capability
+// class.
 //
 // 2^21 is DeviceBatchedTopK's own per-segment limit — it static_asserts on anything larger
 // ("larger segments are future work" per the CUB docs). So this is both our top tier and the
@@ -145,14 +146,165 @@ struct CUBMakeRowIn {
   }
 };
 
+// One cub::DeviceBatchedTopK::MaxPairs invocation with the two-phase workspace flow (CUB's
+// "temporary storage"): size query first, then the run against the provided (or
+// stream-allocated) workspace. Fully generic in the data iterators and size arguments —
+// everything API-specific is prepared by the caller.
 // When query_bytes_out is non-null, only the workspace-size query runs (nothing is
 // launched); the result is written there and the outputs/workspace are not touched.
-template <int64_t MAX_LEN_BOUND, typename DType, typename ValuesOutItItT, typename RequirementsT>
-cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, const int32_t* row_starts,
-                              ValuesOutItItT d_values_out, const int32_t* lengths,
-                              Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
-                              int64_t max_len, int64_t top_k, const RequirementsT& requirements,
-                              size_t* query_bytes_out, cudaStream_t stream) {
+template <typename KeysInItT, typename KeysOutItItT, typename ValuesInItItT,
+          typename ValuesOutItItT, typename SegmentSizesT, typename KArgT, typename NumSegsT,
+          typename RequirementsT>
+cudaError_t CUBBatchedTopKInvoke(KeysInItT d_keys_in, KeysOutItItT d_keys_out,
+                                 ValuesInItItT d_values_in, ValuesOutItItT d_values_out,
+                                 SegmentSizesT segment_sizes, KArgT k_arg, NumSegsT num_segs,
+                                 RequirementsT requirements,
+                                 Optional<TensorView>& maybe_workspace_buffer,
+                                 size_t* query_bytes_out, cudaStream_t stream) {
+  auto env = cuda::std::execution::env{requirements, cuda::stream_ref{stream}};
+
+  size_t workspace_bytes = 0;
+  if (const auto error = cub::DeviceBatchedTopK::MaxPairs(nullptr, workspace_bytes, d_keys_in,
+                                                          d_keys_out, d_values_in, d_values_out,
+                                                          segment_sizes, k_arg, num_segs, env)) {
+    return error;
+  }
+  if (query_bytes_out != nullptr) {
+    *query_bytes_out = workspace_bytes;
+    return cudaSuccess;
+  }
+
+  void* d_workspace = nullptr;
+  bool owned = false;
+  if (maybe_workspace_buffer.has_value()) {
+    const auto& workspace = maybe_workspace_buffer.value();
+    const size_t provided_bytes =
+        static_cast<size_t>(workspace.numel()) * get_element_size(workspace);
+    TVM_FFI_ICHECK(provided_bytes >= workspace_bytes)
+        << "cub_topk workspace too small: need " << workspace_bytes << " bytes, have "
+        << provided_bytes;
+    d_workspace = workspace.data_ptr();
+  } else {
+    if (const auto error = cudaMallocAsync(&d_workspace, workspace_bytes, stream)) {
+      return error;
+    }
+    owned = true;
+  }
+
+  // No early return below this point: the owned workspace must be freed on every path.
+  cudaError_t status = cub::DeviceBatchedTopK::MaxPairs(d_workspace, workspace_bytes, d_keys_in,
+                                                        d_keys_out, d_values_in, d_values_out,
+                                                        segment_sizes, k_arg, num_segs, env);
+
+  if (owned) {
+    if (const auto free_error = cudaFreeAsync(d_workspace, stream)) {
+      // Prefer the MaxPairs error over the free error when both fail.
+      return status == cudaSuccess ? free_error : status;
+    }
+  }
+  return status;
+}
+
+// Bottom of the dispatch chain: builds the two arguments whose types embed the compile-time
+// segment-size bound (k_arg and segment_sizes) and invokes. Not API-specific — the segment
+// sizes come from a device-side per-row lengths array, a contract every lengths-carrying
+// entry point shares; the API's identity lives entirely in the iterator types passed
+// through. query_bytes_out non-null selects query-only, see CUBBatchedTopKInvoke.
+template <int64_t MAX_LEN_BOUND, typename KeysInItT, typename KeysOutItItT, typename ValuesInItItT,
+          typename ValuesOutItItT, typename RequirementsT>
+cudaError_t CUBBatchedTopKDispatchBounds(KeysInItT d_keys_in, KeysOutItItT d_keys_out,
+                                         ValuesInItItT d_values_in, ValuesOutItItT d_values_out,
+                                         const int32_t* lengths,
+                                         Optional<TensorView>& maybe_workspace_buffer,
+                                         int64_t num_rows, int64_t max_len, int64_t top_k,
+                                         RequirementsT requirements, size_t* query_bytes_out,
+                                         cudaStream_t stream) {
+  auto k_arg = cuda::args::immediate{top_k, cuda::args::bounds<int64_t{1}, MAX_LEN_BOUND>()};
+  auto num_segs = cuda::args::immediate{num_rows};
+
+  // Per-row segment sizes, read on device in stream order. The second, *runtime* bound is a
+  // perf lever, not decoration: the host cannot read the device-side lengths when sizing
+  // the launch, so without it CUB would size the cluster launch from the static bound-tier
+  // ceiling, failing single-CTA eligibility and forcing the wide multi-CTA path for every
+  // segment. Passing max_len as the runtime ceiling keeps small-row launches on the cheap
+  // single-CTA shape.
+  // The lower bound spans the full int32 range so no lengths value can violate the bounds
+  // contract (out-of-bounds values are UB): under a negative statically-known lower bound,
+  // CUB clamps any negative runtime size to an empty segment (size 0), and a zero-length
+  // row is a valid empty segment — CUB selects nothing for it, so with the caller's -1
+  // prefill the whole output row reads as padding. The lower bound plays no role in launch
+  // sizing (only the upper bound does), so this costs nothing.
+  constexpr int32_t k_lengths_floor = cuda::std::numeric_limits<int32_t>::min();
+  const auto segment_sizes = cuda::args::deferred_sequence{
+      lengths, cuda::args::bounds<k_lengths_floor, int32_t{MAX_LEN_BOUND}>(),
+      cuda::args::bounds(k_lengths_floor, static_cast<int32_t>(max_len))};
+
+  return CUBBatchedTopKInvoke(d_keys_in, d_keys_out, d_values_in, d_values_out, segment_sizes,
+                              k_arg, num_segs, requirements, maybe_workspace_buffer,
+                              query_bytes_out, stream);
+}
+
+// Fans the runtime tie_break flag out into its compile-time requirement configuration and
+// picks the compile-time segment-size bound tier from the runtime max_len. Each require(...)
+// call has a distinct type, so the three calls cannot share one requirements variable; the
+// generic run_bound lambda factors the otherwise-identical bound branch.
+template <typename KeysInItT, typename KeysOutItItT, typename ValuesInItItT,
+          typename ValuesOutItItT>
+cudaError_t CUBBatchedTopKDispatch(KeysInItT d_keys_in, KeysOutItItT d_keys_out,
+                                   ValuesInItItT d_values_in, ValuesOutItItT d_values_out,
+                                   const int32_t* lengths,
+                                   Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
+                                   int64_t max_len, int64_t top_k, int64_t tie_break,
+                                   size_t* query_bytes_out, cudaStream_t stream) {
+  namespace exec = cuda::execution;
+
+  auto run_bound = [&](auto requirements) {
+    // CUB picks its backend from the compile-time bound: up to 8192 it can use the
+    // single-block backend, which runs on any architecture. Anything larger needs the cluster
+    // backend and therefore SM90+, so without this tier pre-SM90 GPUs couldn't run cub_topk
+    // at all. 8192 is the largest bound the single-block backend accepts for our key/value
+    // types.
+    if (max_len <= 8192) {
+      return CUBBatchedTopKDispatchBounds<int64_t{8192}>(
+          d_keys_in, d_keys_out, d_values_in, d_values_out, lengths, maybe_workspace_buffer,
+          num_rows, max_len, top_k, requirements, query_bytes_out, stream);
+    } else {
+      // Cluster backend, SM90+ only. On an older device this doesn't crash or fall back — the
+      // CUB dispatch notices at runtime and returns cudaErrorNotSupported (see the
+      // CUB_DISABLE_TOPK_UNSUPPORTED_ARCH_ASSERT define at the top of this file), which the
+      // entry point turns into an exception. The Python dispatcher is expected to route these
+      // calls to the radix backend instead, so reaching this branch pre-SM90 means someone
+      // forced the CUB backend explicitly.
+      return CUBBatchedTopKDispatchBounds<CUB_TOPK_MAX_LEN>(
+          d_keys_in, d_keys_out, d_values_in, d_values_out, lengths, maybe_workspace_buffer,
+          num_rows, max_len, top_k, requirements, query_bytes_out, stream);
+    }
+  };
+
+  if (tie_break == 1) {
+    return run_bound(exec::require(exec::determinism::gpu_to_gpu,
+                                   exec::tie_break::prefer_smaller_index,
+                                   exec::output_ordering::unsorted));
+  } else if (tie_break == 2) {
+    return run_bound(exec::require(exec::determinism::gpu_to_gpu,
+                                   exec::tie_break::prefer_larger_index,
+                                   exec::output_ordering::unsorted));
+  } else {
+    return run_bound(exec::require(exec::determinism::not_guaranteed, exec::tie_break::unspecified,
+                                   exec::output_ordering::unsorted));
+  }
+}
+
+// Top of the page-table transform chain: builds the bound-independent data iterators and
+// picks the keys-in shape. d_keys_in[i] yields a pointer to row i's selection window in the
+// dense (num_rows, max_len) input; the common whole-row case keeps the plain strided
+// iterator (pure pointer arithmetic), only windowed calls pay the per-row device read.
+template <typename DType, typename ValuesOutItItT>
+cudaError_t CUBPageTableTransform(const DType* input, int64_t row_stride, const int32_t* row_starts,
+                                  ValuesOutItItT d_values_out, const int32_t* lengths,
+                                  Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
+                                  int64_t max_len, int64_t top_k, int64_t tie_break,
+                                  size_t* query_bytes_out, cudaStream_t stream) {
   // The keys (score values) are not returned by the transform API: every segment gets the
   // same discard iterator (the outer constant level satisfies the iterator-of-iterators
   // contract; a bare discard_iterator's reference is not an iterator and does not compile).
@@ -161,143 +313,18 @@ cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, const int3
   // synthesized by a counting iterator; d_values_out then receives the top-k source indices.
   auto d_values_in = cuda::make_constant_iterator(cuda::make_counting_iterator(int32_t{0}));
 
-  auto k_arg = cuda::args::immediate{top_k, cuda::args::bounds<int64_t{1}, MAX_LEN_BOUND>()};
-  auto num_segs = cuda::args::immediate{num_rows};
-
-  auto env = cuda::std::execution::env{requirements, cuda::stream_ref{stream}};
-
-  // Two-phase workspace flow (CUB's "temporary storage"): size query, then run. Generic in
-  // the keys-in iterator: the plain path uses a strided iterator, the row_starts path a
-  // per-row windowed one (see the branch at the bottom); each gets its own instantiation.
-  auto run_with = [&](auto d_keys_in, auto segment_sizes) -> cudaError_t {
-    size_t workspace_bytes = 0;
-    if (const auto error = cub::DeviceBatchedTopK::MaxPairs(nullptr, workspace_bytes, d_keys_in,
-                                                            d_keys_out, d_values_in, d_values_out,
-                                                            segment_sizes, k_arg, num_segs, env)) {
-      return error;
-    }
-    if (query_bytes_out != nullptr) {
-      *query_bytes_out = workspace_bytes;
-      return cudaSuccess;
-    }
-
-    void* d_workspace = nullptr;
-    bool owned = false;
-    if (maybe_workspace_buffer.has_value()) {
-      const auto& workspace = maybe_workspace_buffer.value();
-      const size_t provided_bytes =
-          static_cast<size_t>(workspace.numel()) * get_element_size(workspace);
-      TVM_FFI_ICHECK(provided_bytes >= workspace_bytes)
-          << "cub_topk workspace too small: need " << workspace_bytes << " bytes, have "
-          << provided_bytes;
-      d_workspace = workspace.data_ptr();
-    } else {
-      if (const auto error = cudaMallocAsync(&d_workspace, workspace_bytes, stream)) {
-        return error;
-      }
-      owned = true;
-    }
-
-    // No early return below this point: the owned workspace must be freed on every path.
-    cudaError_t status = cub::DeviceBatchedTopK::MaxPairs(d_workspace, workspace_bytes, d_keys_in,
-                                                          d_keys_out, d_values_in, d_values_out,
-                                                          segment_sizes, k_arg, num_segs, env);
-
-    if (owned) {
-      if (const auto free_error = cudaFreeAsync(d_workspace, stream)) {
-        // Prefer the MaxPairs error over the free error when both fail.
-        return status == cudaSuccess ? free_error : status;
-      }
-    }
-    return status;
-  };
-
-  // Per-row segment sizes, read on device in stream order. The second, *runtime* bound is a
-  // perf lever, not decoration: the host cannot read the device-side lengths when sizing the
-  // launch, so without it CUB would size the cluster launch from the static MAX_LEN_BOUND
-  // ceiling, failing single-CTA eligibility and forcing the wide multi-CTA path for every
-  // segment. Passing max_len as the runtime ceiling keeps small-row launches on the cheap
-  // single-CTA shape.
-  // The lower bound spans the full int32 range so no lengths value can violate the bounds
-  // contract (out-of-bounds values are UB): under a negative statically-known lower bound,
-  // CUB clamps any negative runtime size to an empty segment (size 0), and a zero-length row
-  // is a valid empty segment — CUB selects nothing for it, so with the caller's -1 prefill
-  // the whole output row reads as padding. The lower bound plays no role in launch sizing
-  // (only the upper bound does), so this costs nothing.
-  constexpr int32_t k_lengths_floor = cuda::std::numeric_limits<int32_t>::min();
-  const auto segment_sizes = cuda::args::deferred_sequence{
-      lengths, cuda::args::bounds<k_lengths_floor, int32_t{MAX_LEN_BOUND}>(),
-      cuda::args::bounds(k_lengths_floor, static_cast<int32_t>(max_len))};
-
-  // Per-segment iterator over the dense (num_rows, max_len) input: d_keys_in[i] yields a
-  // pointer to row i's selection window. The common whole-row case keeps the plain strided
-  // iterator (pure pointer arithmetic); only windowed calls pay the per-row device read.
   if (row_starts != nullptr) {
-    return run_with(
+    auto d_keys_in =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
-                                      CUBMakeRowIn<DType>{input, row_stride, row_starts}),
-        segment_sizes);
+                                      CUBMakeRowIn<DType>{input, row_stride, row_starts});
+    return CUBBatchedTopKDispatch(d_keys_in, d_keys_out, d_values_in, d_values_out, lengths,
+                                  maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
+                                  query_bytes_out, stream);
   }
-  return run_with(cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride),
-                  segment_sizes);
-}
-
-template <typename DType, typename ValuesOutItItT, typename RequirementsT>
-cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
-                                        const int32_t* row_starts, ValuesOutItItT d_values_out,
-                                        const int32_t* lengths,
-                                        Optional<TensorView>& maybe_workspace_buffer,
-                                        int64_t num_rows, int64_t max_len, int64_t top_k,
-                                        const RequirementsT& requirements, size_t* query_bytes_out,
-                                        cudaStream_t stream) {
-  // CUB picks its backend from the compile-time bound: up to 8192 it can use the single-block
-  // backend, which runs on any architecture. Anything larger needs the cluster backend and
-  // therefore SM90+, so without this tier pre-SM90 GPUs couldn't run cub_topk at all. 8192 is
-  // the largest bound the single-block backend accepts for our key/value types.
-  if (max_len <= 8192) {
-    return CUBBatchedTopKRun<int64_t{8192}>(input, row_stride, row_starts, d_values_out, lengths,
-                                            maybe_workspace_buffer, num_rows, max_len, top_k,
-                                            requirements, query_bytes_out, stream);
-  } else {
-    // Cluster backend, SM90+ only. On an older device this doesn't crash or fall back — the
-    // CUB dispatch notices at runtime and returns cudaErrorNotSupported (see the
-    // CUB_DISABLE_TOPK_UNSUPPORTED_ARCH_ASSERT define at the top of this file), which
-    // cub_topk() turns into an exception. The Python dispatcher is expected to route these
-    // calls to the radix backend instead, so reaching this branch pre-SM90 means someone
-    // forced the CUB backend explicitly.
-    return CUBBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, row_starts, d_values_out, lengths,
-                                               maybe_workspace_buffer, num_rows, max_len, top_k,
-                                               requirements, query_bytes_out, stream);
-  }
-}
-
-template <typename DType, typename ValuesOutItItT>
-cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
-                                   const int32_t* row_starts, ValuesOutItItT d_values_out,
-                                   const int32_t* lengths,
-                                   Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
-                                   int64_t max_len, int64_t top_k, int64_t tie_break,
-                                   size_t* query_bytes_out, cudaStream_t stream) {
-  namespace exec = cuda::execution;
-  // Each require(...) call has a distinct type (requirements are encoded at compile time), so
-  // the runtime flag must fan out into separate branches; the generic lambda factors out the
-  // otherwise-identical call.
-  auto run = [&](auto requirements) {
-    return CUBBatchedTopKDispatchBound(input, row_stride, row_starts, d_values_out, lengths,
-                                       maybe_workspace_buffer, num_rows, max_len, top_k,
-                                       requirements, query_bytes_out, stream);
-  };
-
-  if (tie_break == 1) {
-    return run(exec::require(exec::determinism::gpu_to_gpu, exec::tie_break::prefer_smaller_index,
-                             exec::output_ordering::unsorted));
-  } else if (tie_break == 2) {
-    return run(exec::require(exec::determinism::gpu_to_gpu, exec::tie_break::prefer_larger_index,
-                             exec::output_ordering::unsorted));
-  } else {
-    return run(exec::require(exec::determinism::not_guaranteed, exec::tie_break::unspecified,
-                             exec::output_ordering::unsorted));
-  }
+  auto d_keys_in = cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride);
+  return CUBBatchedTopKDispatch(d_keys_in, d_keys_out, d_values_in, d_values_out, lengths,
+                                maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
+                                query_bytes_out, stream);
 }
 
 // Validation shared by the transform entry and its workspace-size query.
@@ -397,10 +424,10 @@ void cub_topk_page_table_transform(
     auto d_values_out =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-      status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                                      row_starts_ptr, d_values_out, lengths_ptr,
-                                      maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
-                                      /*query_bytes_out=*/nullptr, stream);
+      status = CUBPageTableTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                                     row_starts_ptr, d_values_out, lengths_ptr,
+                                     maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
+                                     /*query_bytes_out=*/nullptr, stream);
       return true;
     });
   };
@@ -444,9 +471,9 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
       status =
-          CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                                 /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace,
-                                 num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
+          CUBPageTableTransform(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                                /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace,
+                                num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
       return true;
     });
   };
