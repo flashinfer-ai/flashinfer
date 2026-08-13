@@ -303,6 +303,10 @@ def _make_nvcc_spec(monkeypatch, tmp_path, name="test_fp_module", mtime_shift=No
     separate (later-hashed) tree whose mtimes can be backdated."""
     monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "_get_compiler_identity", lambda: "nvcc=mock;cxx=mock")
+    # Deterministic fingerprints regardless of the host toolchain.
+    monkeypatch.setattr(core, "_get_wheel_record_hash", lambda: "mock-record")
+    monkeypatch.setattr(core, "_get_tvm_ffi_version", lambda: "mock-tvmffi")
 
     src_dir = tmp_path / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
@@ -327,7 +331,10 @@ def _make_nvcc_spec(monkeypatch, tmp_path, name="test_fp_module", mtime_shift=No
         (spec.build_dir / "build.ninja").write_text("ninja_required_version = 1.3\n")
 
     def fake_run_ninja(*_args, **_kwargs):
+        spec.build_dir.mkdir(parents=True, exist_ok=True)
         (spec.build_dir / f"{spec.name}.so").write_bytes(b"\x7fELF")
+        # Sentinel proving the directory was freshly rebuilt from scratch.
+        (spec.build_dir / "built.marker").write_text("1")
         calls["builds"] = calls.get("builds", 0) + 1
 
     monkeypatch.setattr(spec, "write_ninja", fake_write_ninja)
@@ -367,6 +374,7 @@ def test_stale_source_rewrites_same_mtime_still_invalidates(monkeypatch, tmp_pat
     # think everything is fresh. Meta still commits.
     spec.build(verbose=False, need_lock=False)
     assert (spec.build_dir / f"{spec.name}.so").exists()
+    assert (spec.build_dir / "built.marker").exists()
 
     # Change the source content, keep its mtime unchanged.
     src = spec.sources[0]
@@ -377,6 +385,9 @@ def test_stale_source_rewrites_same_mtime_still_invalidates(monkeypatch, tmp_pat
 
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 2
+    # The stale directory was actually wiped and rebuilt (marker refreshed).
+    assert (spec.build_dir / "built.marker").exists()
+    assert (spec.build_dir / "built.marker").read_text() == "1"
     assert (spec.build_dir / f"{spec.name}.so").exists()
     assert core._read_meta(spec.meta_path) == spec.expected_meta
 
@@ -389,6 +400,8 @@ def test_compile_flags_change_invalidates(monkeypatch, tmp_path):
     spec.extra_cuda_cflags = ["-O3", "-gencode=arch=compute_90a,code=sm_90a"]
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 2
+    assert (spec.build_dir / "built.marker").exists()
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
 
 
 def test_matching_meta_keeps_build_dir_and_ninja_incremental(monkeypatch, tmp_path):
@@ -464,3 +477,125 @@ def test_meta_is_json_serializable(monkeypatch, tmp_path):
     # numpy scalars or Path objects must not leak into the fingerprint.
     for v in spec.expected_meta.values():
         assert not isinstance(v, Path)
+
+
+def test_module_source_hash_independent_of_include_tree(monkeypatch, tmp_path):
+    """A change to the module's own source file invalidates even when the
+    include tree hash is unchanged."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+
+    # Mutate the module source (in spec.sources, not the include tree).
+    src = spec.sources[0]
+    old_mtime = src.stat().st_mtime
+    src.write_text(src.read_text() + "\n// module-source change")
+    os.utime(src, (old_mtime, old_mtime))
+
+    meta_before = core._read_meta(spec.meta_path)
+    assert meta_before["sources_sha256"] != spec.expected_meta["sources_sha256"]
+
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_include_tree_change_invalidates_without_source_change(monkeypatch, tmp_path):
+    """A change under the include tree invalidates even when the module's
+    own sources are untouched."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    # Redirect the include-tree hash at a controlled directory.
+    include_dir = tmp_path / "include_tree"
+    include_dir.mkdir(parents=True, exist_ok=True)
+    (include_dir / "helper.cuh").write_text("// v1")
+    monkeypatch.setattr(spec, "extra_include_dirs", [include_dir])
+
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+
+    # Mutate a file inside the include tree only.
+    (include_dir / "helper.cuh").write_text("// v2")
+
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_build_jit_specs_applies_fingerprint_and_commits_meta(monkeypatch, tmp_path):
+    """The batch precompile path must run the same fingerprint gate and commit
+    meta.json for every module it builds (no stale-artifact reuse)."""
+    spec1, calls1 = _make_nvcc_spec(
+        monkeypatch, tmp_path, name="batch_a", mtime_shift=1_700_000_000
+    )
+    spec2, calls2 = _make_nvcc_spec(
+        monkeypatch, tmp_path, name="batch_b", mtime_shift=1_700_000_000
+    )
+
+    # A batch ninja run "compiles" every subninja module under the JIT dir.
+    def batch_run_ninja(*_args, **_kwargs):
+        jit_root = core.jit_env.FLASHINFER_JIT_DIR
+        for child in jit_root.iterdir():
+            if not child.is_dir():
+                continue
+            so = child / f"{child.name}.so"
+            so.write_bytes(b"\x7fELF")
+            (child / "built.marker").write_text("1")
+            for name_, calls_ in ((spec1, calls1), (spec2, calls2)):
+                if name_.build_dir == child:
+                    calls_["builds"] = calls_.get("builds", 0) + 1
+
+    monkeypatch.setattr(core, "run_ninja", batch_run_ninja)
+
+    # Build both via the batch entry point.
+    core.build_jit_specs([spec1, spec2], verbose=False, skip_prebuilt=False)
+    assert calls1["builds"] == 1 and calls2["builds"] == 1
+    assert spec1.meta_path.exists() and spec2.meta_path.exists()
+    assert core._read_meta(spec1.meta_path) == spec1.expected_meta
+    assert core._read_meta(spec2.meta_path) == spec2.expected_meta
+
+    # Same-mtime source change to batch_a must invalidate and rebuild it,
+    # while batch_b (unchanged) is preserved.
+    src = spec1.sources[0]
+    old_mtime = src.stat().st_mtime
+    src.write_text(src.read_text() + "\n// changed")
+    os.utime(src, (old_mtime, old_mtime))
+
+    core.build_jit_specs([spec1, spec2], verbose=False, skip_prebuilt=False)
+    assert calls1["builds"] == 2
+    assert calls2["builds"] == 2  # run_ninja invoked for both (ninja decides)
+    assert core._read_meta(spec1.meta_path) == spec1.expected_meta
+    assert core._read_meta(spec2.meta_path) == spec2.expected_meta
+
+
+def test_wipe_failure_aborts_build(monkeypatch, tmp_path):
+    """A failed stale-directory wipe must abort instead of blessing residual
+    objects with a fresh meta.json."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+
+    # Make the fingerprint mismatch, then force rmtree to fail.
+    spec.extra_cuda_cflags = ["-O3", "-gencode=arch=compute_90a,code=sm_90a"]
+
+    def failing_rmtree(*_a, **_k):
+        raise OSError("cannot remove")
+
+    monkeypatch.setattr(core.shutil, "rmtree", failing_rmtree)
+    meta_before = core._read_meta(spec.meta_path)
+    with pytest.raises(OSError, match="cannot remove"):
+        spec.build(verbose=False, need_lock=False)
+    # The failed build must not refresh the fingerprint to bless residual
+    # objects compiled from the old source.
+    assert core._read_meta(spec.meta_path) == meta_before
+    assert not spec.is_compiled
+
+
+def test_is_compiled_requires_valid_meta(monkeypatch, tmp_path):
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path)
+    assert not spec.is_compiled
+    spec.build(verbose=False, need_lock=False)
+    assert spec.is_compiled
+    # Corrupt the committed meta: .so still exists but the module is not
+    # considered compiled anymore.
+    spec.meta_path.write_text("{ broken")
+    assert not spec.is_compiled

@@ -10,7 +10,7 @@ import sysconfig
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Hashable
+from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -156,25 +156,23 @@ def _hash_file_sha256(path: Path) -> str:
         return None
 
 
-@functools.lru_cache(maxsize=1)
-def _hash_source_tree_cached(include_dirs: Tuple[Path, ...]) -> str:
-    return _hash_source_tree_uncached(include_dirs)
-
-
-def _hash_source_tree_uncached(include_dirs: Sequence[Path]) -> str:
+def _hash_source_tree(include_dirs: Sequence[Path]) -> str:
     """Hash the flashinfer C++/CUDA source tree under ``include_dirs``.
 
-    Each directory is walked independently; files are keyed by their absolute
-    path so overlapping roots (e.g. ``data/csrc`` and the repository ``csrc``)
-    are all covered without double-counting. Digest is stable regardless of
-    directory enumeration order.
+    Recalculated on every call so a source edit under an editable install is
+    always observed (no process-wide cache that can go stale). Each directory
+    is walked independently; files are keyed by their absolute path so
+    overlapping roots (e.g. ``data/csrc`` and the repository ``csrc``) are all
+    covered without double-counting. Directories and files are walked in
+    sorted order for a deterministic digest.
     """
     sha = hashlib.sha256()
     seen = set()
     for base in include_dirs:
         if base is None or not Path(base).is_dir():
             continue
-        for root, _dirs, files in os.walk(Path(base)):
+        for root, dirs, files in os.walk(Path(base)):
+            dirs.sort()
             for fname in sorted(files):
                 fpath = Path(root) / fname
                 if fpath in seen:
@@ -187,17 +185,14 @@ def _hash_source_tree_uncached(include_dirs: Sequence[Path]) -> str:
     return sha.hexdigest()
 
 
-def _hash_source_tree(include_dirs: Sequence[Path]) -> str:
-    return _hash_source_tree_cached(tuple(Path(p) for p in include_dirs))
-
-
 @functools.lru_cache(maxsize=1)
 def _get_wheel_record_hash() -> Optional[str]:
-    """Hash the wheel RECORD entries for files under ``flashinfer/``.
+    """Hash the content digests of wheel RECORD entries under ``flashinfer/``.
 
-    A wheel reinstall with different byte content (even at the same version)
-    changes this digest, so stale nvcc artifacts built from the previous
-    install are invalidated. Returns ``None`` when not installed from a wheel.
+    Hashes the full RECORD row (path + ``sha256=...`` + size) rather than just
+    the path, so a same-version reinstall with different bytes invalidates
+    stale artifacts even when file paths are unchanged. Returns ``None`` when
+    not installed from a wheel.
     """
     try:
         import importlib.metadata as _md
@@ -210,9 +205,8 @@ def _get_wheel_record_hash() -> Optional[str]:
         return None
     sha = hashlib.sha256()
     for line in record.splitlines():
-        entry = line.split(",", 1)[0]
-        if entry.startswith("flashinfer/"):
-            sha.update(entry.encode())
+        if line.startswith("flashinfer/"):
+            sha.update(line.encode())
     return sha.hexdigest()
 
 
@@ -238,9 +232,44 @@ def _get_tvm_ffi_version() -> str:
     try:
         import importlib.metadata as _md
 
-        return _md.version("tvm-ffi")
+        # The PyPI distribution is ``apache-tvm-ffi``.
+        return _md.version("apache-tvm-ffi")
     except Exception:
         return "unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def _get_compiler_identity() -> str:
+    """Identify the nvcc and host C++ toolchains used by the build.
+
+    ``torch.version.cuda`` reflects the bundled toolkit, not necessarily the
+    system ``nvcc``/``CXX`` the JIT build invokes, so capture the actual
+    compiler versions. The result is cached: the toolchain does not change
+    within a process.
+    """
+    import subprocess
+
+    def _version_of(binary: str) -> str:
+        try:
+            out = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            first = (out.stdout or out.stderr).strip().splitlines()
+            return first[0][:200] if first else "unknown"
+        except Exception:
+            return "unknown"
+
+    nvcc = os.environ.get("FLASHINFER_NVCC", shutil.which("nvcc") or "nvcc")
+    cxx = os.environ.get("CXX", shutil.which("c++") or "c++")
+    return (
+        f"nvcc={_version_of(nvcc)};cxx={_version_of(cxx)};"
+        f"nvcc_launcher={os.environ.get('FLASHINFER_NVCC_LAUNCHER', '')};"
+        f"cxx_launcher={os.environ.get('FLASHINFER_CXX_LAUNCHER', '')}"
+    )
 
 
 def _read_meta(meta_path: Path) -> Optional[dict]:
@@ -253,9 +282,13 @@ def _read_meta(meta_path: Path) -> Optional[dict]:
 
 
 def _write_meta_atomic(meta_path: Path, meta: dict) -> None:
-    """Atomically write ``meta.json`` via a temp file + ``os.replace``."""
+    """Atomically write ``meta.json`` via a unique temp file + ``os.replace``.
+
+    Uses a process-unique temp name so concurrent unlocked ``build()`` calls
+    never race on a shared temp path.
+    """
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = meta_path.with_suffix(".json.tmp")
+    tmp = meta_path.parent / f".{meta_path.name}.{os.getpid()}.{id(meta):x}.tmp"
     try:
         with open(tmp, "w") as f:
             json.dump(meta, f, indent=2, sort_keys=True)
@@ -494,7 +527,11 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def is_compiled(self) -> bool:
-        return self.get_library_path().exists()
+        # AOT artifacts are valid by construction; JIT artifacts require the
+        # build fingerprint to match, otherwise a stale .so counts as missing.
+        if self.is_aot:
+            return self.get_library_path().exists()
+        return self.get_library_path().exists() and self._meta_matches()
 
     @property
     def lock_path(self) -> Path:
@@ -541,25 +578,41 @@ class JitSpecNvcc(JitSpec):
             "python_soabi": _get_python_soabi(),
             "torch_build_identity": _get_torch_build_identity(),
             "tvm_ffi_version": _get_tvm_ffi_version(),
+            "compiler_identity": _get_compiler_identity(),
             "source_sha256": _hash_source_tree(tuple(include_dirs)),
+            "sources_sha256": {
+                str(src): _hash_file_sha256(src) for src in self.sources
+            },
             "ninja_content_sha256": _hash_file_sha256(self.ninja_path),
             "cflags": self.extra_cflags,
             "cuda_cflags": self.extra_cuda_cflags,
             "ldflags": self.extra_ldflags,
         }
 
-    def _meta_matches(self) -> bool:
+    def _meta_matches(self, expected: Optional[dict] = None) -> bool:
         if not self.meta_path.exists():
             return False
-        return _read_meta(self.meta_path) == self.expected_meta
+        expected = self.expected_meta if expected is None else expected
+        return _read_meta(self.meta_path) == expected
 
-    def _invalidate_stale_build(self) -> None:
-        if self.build_dir.exists() and not self._meta_matches():
+    def _invalidate_stale_build(self) -> bool:
+        """Wipe the build dir when the committed fingerprint no longer matches.
+
+        Returns ``True`` when the directory was actually removed (so the
+        caller knows to regenerate the ninja file). A directory without
+        ``meta.json`` is a fresh or in-progress build and is left alone.
+        """
+        if self.meta_path.exists() and not self._meta_matches():
             logger.info(
                 f"Invalidating stale nvcc module {self.name} "
                 "(build fingerprint mismatch)"
             )
-            shutil.rmtree(self.build_dir, ignore_errors=True)
+            # A failed wipe must abort: continuing would compile into a
+            # directory that still holds stale objects and then "bless" them
+            # with a fresh meta.json.
+            shutil.rmtree(self.build_dir)
+            return True
+        return False
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
@@ -609,11 +662,20 @@ class JitSpecNvcc(JitSpec):
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
-            self._invalidate_stale_build()
             self.write_ninja()
+            # A stale wipe removes the build dir (and its ninja file); regen it
+            # so the snapshot below matches what ninja will actually run.
+            if self._invalidate_stale_build():
+                self.write_ninja()
+            # Snapshot the fingerprint before building: if sources change
+            # mid-build, the committed metadata still describes the inputs
+            # this build started from, and the next build (whose depfile now
+            # differs) will recompile. Never bless objects with a fingerprint
+            # computed after the fact.
+            expected = self.expected_meta
             run_ninja(self.build_dir, self.ninja_path, verbose)
             if self.jit_library_path.exists():
-                _write_meta_atomic(self.meta_path, self.expected_meta)
+                _write_meta_atomic(self.meta_path, expected)
 
     def load(self, so_path: Optional[Path] = None):
         return tvm_ffi.load_module(str(so_path or self.jit_library_path))
@@ -798,6 +860,7 @@ def build_jit_specs(
     skip_prebuilt: bool = True,
 ) -> None:
     lines: List[str] = []
+    built_specs: List[tuple] = []
     for spec in specs:
         if not isinstance(spec, JitSpecNvcc):
             raise TypeError(
@@ -806,9 +869,15 @@ def build_jit_specs(
             )
         if skip_prebuilt and spec.aot_path.exists():
             continue
-        lines.append(f"subninja {spec.ninja_path}")
         with FileLock(spec.lock_path, thread_local=False):
+            # Same fingerprint gate as JitSpecNvcc.build(): wipe stale build
+            # dirs before the shared ninja run so a batch build can never
+            # copy artifacts built from older sources.
             spec.write_ninja()
+            if spec._invalidate_stale_build():
+                spec.write_ninja()
+            built_specs.append((spec, spec.expected_meta))
+        lines.append(f"subninja {spec.ninja_path}")
     if not lines:
         return
 
@@ -819,3 +888,6 @@ def build_jit_specs(
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
         run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+        for spec, expected in built_specs:
+            if spec.jit_library_path.exists():
+                _write_meta_atomic(spec.meta_path, expected)
