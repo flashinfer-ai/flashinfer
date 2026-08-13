@@ -19,9 +19,9 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A small shared ledger (``tests/test_helpers/fuzz_ledger.py``) xfails already-filed bugs (e.g. the since-fixed trtllm EP
-offset>0 all-zero bug, gh #3547): the case is still *run* so the suite stays green on a tracked bug
-yet flags loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
+A shared ledger (``tests/test_helpers/fuzz_ledger.py``) manages tracked
+wrong-answer and crash-class findings. It is currently empty because gh #3547
+and #3957 are fixed and covered by regressions.
 
 Verification model (single mode, uniform -- every config that runs gets the same checks):
   1. **no crash / no NaN-Inf** where the reference is finite.
@@ -81,11 +81,8 @@ CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
 dispatch to capable TRTLLM runners. MxInt4 covers packed and BF16-FromLogits
 routing.
 
-ENABLED BY DEFAULT: this suite runs like any other test. TRTLLM and CuteDSL coverage is
-SM100-family-specific, while CUTLASS BF16 also runs on its supported pre-Blackwell and later
-architectures and CUTLASS W4A16 runs on SM90. Unsupported configurations skip at the
-no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver (see the
-pytestmark below for the history of the original opt-in gate).
+ENABLED BY DEFAULT: this suite runs like any other test. Unsupported configurations skip at the
+no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver.
 Run it explicitly:
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> pytest tests/moe/test_unified_moe_fuzz.py
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
@@ -157,9 +154,10 @@ OUT OF SCOPE for this single-GPU correctness harness (must live elsewhere, do NO
 POINTERS for future agents (point me at this file and I know the rest):
   * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
     project auto-memory ``flashinfer_quality_fuzzers.md``.
-  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- tracked in the
-    ledger below until fixed) and
-    gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
+  * Bugs THIS fuzzer found + filed:
+    - fixed gh #3547 (trtllm EP offset>0 all-zero).
+    - fixed gh #3957 (cumulative corruption).
+    - open gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
   * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
   * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
     (branch ``yanxu/unified-moe-api-fuzzer``).
@@ -1520,8 +1518,8 @@ _CURATED = [
             num_fused_shared_experts=num_shared,
         )
         for variant, num_shared, seed in (
-            ("nvfp4", 1, 900_042),
-            ("mxfp4", 2, 900_043),
+            ("nvfp4", 1, 900_045),
+            ("mxfp4", 2, 900_046),
             ("w4a16", 1, 900_044),
         )
     ],

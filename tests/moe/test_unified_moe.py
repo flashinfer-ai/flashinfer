@@ -45,12 +45,12 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     RoutingInputMode,
+    TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
 )
 from flashinfer.fused_moe.runners import (
     CuteDslNvfp4Runner,
     MoERunner,
-    TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
