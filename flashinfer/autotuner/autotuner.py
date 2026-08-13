@@ -571,6 +571,10 @@ class TunableRunner(ABC):
         autotuner would synthesize for the same profile (i.e., depend only
         on dtype, is-None flags, or scalar-argument values -- not on
         per-tensor content).
+
+        Persisted keys stringify ``extras`` and omit ``runner_hash``. Use
+        cross-process-stable values and include every configuration the file
+        cache must distinguish.
         """
         return ()
 
