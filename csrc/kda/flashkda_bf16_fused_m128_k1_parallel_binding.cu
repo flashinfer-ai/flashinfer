@@ -29,14 +29,14 @@ namespace flash_kda {
 
 constexpr int64_t kK1ParallelPacketBytes = 31520;
 
-void RunM128K1Parallel(
-    TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
-    TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
-    TensorView seq_order, TensorView initial_state, TensorView out, TensorView final_state,
-    TensorView descriptor_storage, TensorView k1_workspace, int64_t prepare_descriptors,
-    int64_t num_heads, int64_t use_initial_state, int64_t store_final_state,
-    int64_t cluster_size, int64_t mailbox_depth, double scale, double lower_bound,
-    int64_t cuda_stream) {
+void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
+                       TensorView beta_tma, TensorView A_log, TensorView dt_bias,
+                       TensorView cu_seqlens, TensorView seq_order, TensorView initial_state,
+                       TensorView out, TensorView final_state, TensorView descriptor_storage,
+                       TensorView k1_workspace, int64_t prepare_descriptors, int64_t num_heads,
+                       int64_t use_initial_state, int64_t store_final_state, int64_t cluster_size,
+                       int64_t mailbox_depth, double scale, double lower_bound,
+                       int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -70,8 +70,7 @@ void RunM128K1Parallel(
            std::pair<const TensorView*, const char*>(&cu_seqlens, "cu_seqlens"),
            std::pair<const TensorView*, const char*>(&seq_order, "seq_order"),
            std::pair<const TensorView*, const char*>(&out, "out"),
-           std::pair<const TensorView*, const char*>(&descriptor_storage,
-                                                     "descriptor_storage"),
+           std::pair<const TensorView*, const char*>(&descriptor_storage, "descriptor_storage"),
        }) {
     CheckNoOverlap(k1_workspace, "k1_workspace", *named.first, named.second);
   }
@@ -95,15 +94,13 @@ void RunM128K1Parallel(
       << "K1 mailbox packet count is out of range";
   const int64_t flag_offset =
       (packet_count * kK1ParallelPacketBytes + int64_t{255}) & ~int64_t{255};
-  TVM_FFI_ICHECK(
-      packet_count <= (std::numeric_limits<int64_t>::max() - flag_offset) /
-                          static_cast<int64_t>(sizeof(uint32_t)))
+  TVM_FFI_ICHECK(packet_count <= (std::numeric_limits<int64_t>::max() - flag_offset) /
+                                     static_cast<int64_t>(sizeof(uint32_t)))
       << "K1 mailbox flag size is out of range";
   const int64_t required_bytes =
       flag_offset + packet_count * static_cast<int64_t>(sizeof(uint32_t));
   TVM_FFI_ICHECK(k1_workspace.numel() >= required_bytes)
-      << "k1_workspace requires " << required_bytes << " bytes, got "
-      << k1_workspace.numel();
+      << "k1_workspace requires " << required_bytes << " bytes, got " << k1_workspace.numel();
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(k1_workspace.data_ptr()) % 256 == 0)
       << "k1_workspace must be 256-byte aligned";
 
@@ -113,10 +110,9 @@ void RunM128K1Parallel(
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
             "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128_k1_parallel)");
 
-  const cudaStream_t stream =
-      reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128>(q, k, v, g, beta_tma, out,
-                                                 descriptor_storage, prepare_descriptors, stream);
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
+  const TmaPointers tma = EncodeTmaPointers<128>(q, k, v, g, beta_tma, out, descriptor_storage,
+                                                 prepare_descriptors, stream);
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);
 
   auto* workspace_bytes = static_cast<unsigned char*>(k1_workspace.data_ptr());
@@ -131,8 +127,7 @@ void RunM128K1Parallel(
 
   cudaLaunchAttribute attribute{};
   attribute.id = cudaLaunchAttributeClusterDimension;
-  attribute.val.clusterDim =
-      {global_pool ? 1u : static_cast<uint32_t>(cluster_size), 1u, 1u};
+  attribute.val.clusterDim = {global_pool ? 1u : static_cast<uint32_t>(cluster_size), 1u, 1u};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<uint32_t>(grid_x_i64), 1, 1);
   config.blockDim = dim3(THREADS, 1, 1);
@@ -143,14 +138,12 @@ void RunM128K1Parallel(
 
   CheckCuda(
       cudaLaunchKernelEx(
-          &config, kernel_flashkda_bf16_fused_m128,
-          reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), tma.q,
-          reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
+          &config, kernel_flashkda_bf16_fused_m128, reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
+          tma.q, reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
           reinterpret_cast<__nv_bfloat16*>(v.data_ptr()), tma.v,
           reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), tma.g,
           reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), tma.beta,
-          reinterpret_cast<float*>(A_log.data_ptr()),
-          reinterpret_cast<float*>(dt_bias.data_ptr()),
+          reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
           reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
           reinterpret_cast<int*>(seq_order.data_ptr()),
           reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),

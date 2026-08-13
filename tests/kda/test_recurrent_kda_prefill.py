@@ -366,7 +366,7 @@ def test_frozen_route_and_ffi_abi(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
-        (1, 8, 1024, ("m128_k1_parallel", 8, 35)),
+        (1, 8, 1024, ("m128_k1_parallel", 8, 32)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
         (1, 48, 4096, ("m128_k1_parallel", -148, 20)),
         (1, 64, 8192, ("m128_k1_parallel", -148, 20)),
@@ -458,7 +458,7 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
     assert len(args) == 24
     assert args[13].shape == (768,)
     assert args[14].dtype == torch.uint8
-    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 35)
+    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 32)
     assert args[15] == 1
     assert args[16:21] == (8, 0, 0, 8, 35)
     assert math.isclose(args[21], 128**-0.5)

@@ -254,8 +254,18 @@ def _select_flash_kda_prefill_variant(
 ) -> tuple["FlashKDAVariant", int, int]:
     """Select the measured B200 oracle and optional K1-helper schedule."""
 
-    if not fixed_layout or get_compute_capability(device) != (10, 0):
+    if not fixed_layout:
         return "m128", 0, 0
+    if get_compute_capability(device) != (10, 0):
+        return (
+            ("m64", 0, 0)
+            if num_sequences == 1 and num_heads == 64
+            else (
+                "m128",
+                0,
+                0,
+            )
+        )
 
     task_count = num_sequences * num_heads
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
