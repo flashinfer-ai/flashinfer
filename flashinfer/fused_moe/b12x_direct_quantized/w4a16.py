@@ -148,6 +148,7 @@ def prepare_b12x_direct_w4a16_scales(
     )
 
     source_global_scales = global_scales
+    source_format = source_format.lower()
     if cols % 16:
         raise ValueError(f"cols must be divisible by 16, got {cols}")
     num_experts = int(global_scales.numel())
@@ -161,9 +162,9 @@ def prepare_b12x_direct_w4a16_scales(
     )
     scales = unswizzle_expert_scales(normalized, rows=rows, cols=cols).float()
     global_scales = global_scales.to(device=scales.device, dtype=torch.float32)
-    if source_format.lower() == "compressed_tensors":
+    if source_format == "compressed_tensors":
         global_scales = global_scales.reciprocal()
-    elif source_format.lower() != "modelopt":
+    elif source_format != "modelopt":
         raise ValueError("source_format must be 'modelopt' or 'compressed_tensors'")
     direct_scales = (
         (scales * global_scales.reshape(-1, 1, 1)).to(torch.bfloat16).contiguous()
@@ -212,25 +213,73 @@ def _recommended_launch(
 
 
 @functools.cache
+def _require_cuda_129() -> None:
+    """Fail before JIT compilation when SM12x normalization is unavailable."""
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    if not is_cuda_version_at_least("12.9"):
+        raise RuntimeError(
+            "b12x_direct_w4a16_fused_moe requires CUDA 12.9 or newer on SM12x"
+        )
+
+
 def _get_tc_workspace(
-    device_index: int,
+    workspace: torch.Tensor,
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
     topk: int,
 ):
-    device = torch.device("cuda", int(device_index))
-    return _allocate_sm120_w4a16_workspace(
-        state_E=int(num_experts),
-        weight_E=int(num_experts),
-        routed_rows=int(num_tokens) * int(topk),
-        k=int(hidden_size),
-        n=int(intermediate_size),
-        num_topk=int(topk),
-        device=device,
-        activation="silu",
+    """Return TC scratch owned by the caller's intermediate workspace.
+
+    The public Direct API is functional and must not retain model-sized GPU
+    allocations in a process-global cache.  Views are common in CUDA Graph
+    callers, so attach the per-shape CuTe workspace to the ultimate base
+    tensor; all views of one caller-owned workspace then share its lifetime.
+    """
+    owner = workspace
+    while isinstance(getattr(owner, "_base", None), torch.Tensor):
+        owner = owner._base
+    cache = getattr(owner, "_flashinfer_b12x_tc_workspace_cache", None)
+    if cache is None:
+        cache = {}
+        owner._flashinfer_b12x_tc_workspace_cache = cache  # type: ignore[attr-defined]
+    device = workspace.device
+    key = (
+        int(num_tokens),
+        int(hidden_size),
+        int(intermediate_size),
+        int(num_experts),
+        int(topk),
     )
+    prepared = cache.get(key)
+    if prepared is None:
+        prepared = _allocate_sm120_w4a16_workspace(
+            state_E=int(num_experts),
+            weight_E=int(num_experts),
+            routed_rows=int(num_tokens) * int(topk),
+            k=int(hidden_size),
+            n=int(intermediate_size),
+            num_topk=int(topk),
+            device=device,
+            activation="silu",
+        )
+        # The public route-pack helper requires capacity for the expert table
+        # even when a tiny decode batch activates only a few blocks.  The
+        # generic workspace allocator intentionally sizes this table to the
+        # active route count, so grow this Direct TC-owned view to the fixed
+        # 64-expert contract before passing it to the helper.
+        if prepared.block_expert_ids.numel() < int(num_experts):
+            prepared.block_expert_ids = torch.empty(
+                (int(num_experts),), dtype=torch.int32, device=device
+            )
+        cache[key] = prepared
+    # ``workspace`` is the public intermediate buffer ([M * topk, N]).  Reuse
+    # it for the TC pipeline's activated FC1 output instead of silently
+    # allocating a second tensor with the same logical contract.
+    prepared.intermediate_cache2 = workspace
+    return prepared
 
 
 @functools.cache
@@ -288,9 +337,10 @@ def _try_run_tc_w4a16(
     gemm1_scales: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gemm2_scales: torch.Tensor,
+    workspace: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Run the cached CuTe tensor-core decode path when provenance is known."""
+    """Run the caller-owned CuTe tensor-core decode path when provenance is known."""
     num_tokens, hidden_size = hidden_states.shape
     intermediate_size = int(gemm2_weights.shape[2]) * 2
     launch_spec = _TC_LAUNCHES.get((hidden_size, intermediate_size), {}).get(num_tokens)
@@ -322,11 +372,8 @@ def _try_run_tc_w4a16(
         params_dtype=torch.bfloat16,
         source_format=source1.source_format,
     )
-    device_index = hidden_states.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    workspace = _get_tc_workspace(
-        int(device_index),
+    tc_workspace = _get_tc_workspace(
+        workspace,
         num_tokens,
         hidden_size,
         intermediate_size,
@@ -337,8 +384,11 @@ def _try_run_tc_w4a16(
     max_m_blocks = (
         num_tokens * topk
         if direct_topk_routes
-        else int(workspace.block_expert_ids.numel())
+        else int(tc_workspace.block_expert_ids.numel())
     )
+    device_index = hidden_states.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
     fused = _get_tc_launch(
         int(device_index),
         num_tokens,
@@ -356,9 +406,9 @@ def _try_run_tc_w4a16(
     if not direct_topk_routes:
         run_w4a16_route_pack(
             topk_ids,
-            workspace.packed_route_indices,
-            workspace.block_expert_ids,
-            workspace.packed_route_count,
+            tc_workspace.packed_route_indices,
+            tc_workspace.block_expert_ids,
+            tc_workspace.packed_route_count,
             output,
             prepared.workspace,
             num_experts=num_experts,
@@ -373,15 +423,15 @@ def _try_run_tc_w4a16(
         topk_weights,
         topk_ids,
         activation="silu",
-        intermediate_cache13=workspace.intermediate_cache13,
-        intermediate_cache2=workspace.intermediate_cache2,
+        intermediate_cache13=tc_workspace.intermediate_cache13,
+        intermediate_cache2=tc_workspace.intermediate_cache2,
         output=output,
-        fc1_c_tmp=workspace.fc1_c_tmp,
-        fc2_c_tmp=workspace.fc2_c_tmp,
-        packed_route_indices=workspace.packed_route_indices,
-        block_expert_ids=workspace.block_expert_ids,
-        packed_route_count=workspace.packed_route_count,
-        expert_offsets=workspace.expert_offsets,
+        fc1_c_tmp=tc_workspace.fc1_c_tmp,
+        fc2_c_tmp=tc_workspace.fc2_c_tmp,
+        packed_route_indices=tc_workspace.packed_route_indices,
+        block_expert_ids=tc_workspace.block_expert_ids,
+        packed_route_count=tc_workspace.packed_route_count,
+        expert_offsets=tc_workspace.expert_offsets,
         fused_launch=fused,
         routes_prepacked=not direct_topk_routes,
     )
@@ -420,13 +470,11 @@ def _validate(
     outputs_per_warp: Optional[int],
     num_threads: Optional[int],
 ) -> None:
-    if not hidden_states.is_cuda or torch.cuda.get_device_capability(
-        hidden_states.device
-    ) != (
-        12,
-        0,
+    if (
+        not hidden_states.is_cuda
+        or torch.cuda.get_device_capability(hidden_states.device)[0] != 12
     ):
-        raise ValueError("b12x_direct_w4a16_fused_moe requires an SM120 CUDA tensor")
+        raise ValueError("b12x_direct_w4a16_fused_moe requires an SM12x CUDA tensor")
     device = hidden_states.device
     _check_tensor(
         "hidden_states", hidden_states, ndim=2, dtype=torch.bfloat16, device=device
@@ -618,7 +666,12 @@ def b12x_direct_w4a16_fused_moe(
     FP4 weights are B12x-compatible row-major E2M1 pairs. Scale tensors are
     model-load-time prepared row-major BF16 dequant multipliers, one per K/16
     block. Public activations, intermediate values, and output remain BF16.
+    Pass a caller-owned ``workspace`` to select the tensor-core decode path and
+    keep its scratch allocations stable for CUDA Graph capture; omitting it
+    uses the scalar fallback.
     """
+    if hidden_states.is_cuda:
+        _require_cuda_129()
     if not skip_check:
         _validate(
             hidden_states,
@@ -637,10 +690,25 @@ def b12x_direct_w4a16_fused_moe(
     num_tokens, hidden_size = hidden_states.shape
     topk = int(topk_ids.shape[1])
     intermediate_size = int(gemm2_weights.shape[2]) * 2
+    if workspace is not None:
+        # The tensor-core path aliases this caller-owned buffer as the
+        # activated FC1 output.  Keep this contract enforced even when the
+        # fast ``skip_check`` mode is used; otherwise a smaller view could
+        # turn the subsequent kernel launch into an out-of-bounds write.
+        _check_tensor(
+            "workspace",
+            workspace,
+            ndim=2,
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        if tuple(workspace.shape) != (num_tokens * topk, intermediate_size):
+            raise ValueError("workspace has an incompatible shape")
     if output is None:
         output = torch.empty_like(hidden_states)
     if (
-        outputs_per_warp is None
+        workspace is not None
+        and outputs_per_warp is None
         and num_threads is None
         and (expert_map is None or expert_map.numel() == 0)
         and _try_run_tc_w4a16(
@@ -651,6 +719,7 @@ def b12x_direct_w4a16_fused_moe(
             gemm1_scales,
             gemm2_weights,
             gemm2_scales,
+            workspace,
             output,
         )
     ):

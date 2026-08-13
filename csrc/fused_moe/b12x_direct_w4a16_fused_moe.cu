@@ -102,6 +102,7 @@ void B12xDirectPackRoutes(TensorView topk_ids, TensorView packed_route_indices,
   TVM_FFI_ICHECK_GE(packed_route_indices.numel(), max_active_experts * block_size);
   TVM_FFI_ICHECK_GE(block_expert_ids.numel(), max_active_experts);
   TVM_FFI_ICHECK_GE(packed_route_count.numel(), 1);
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   auto stream = reinterpret_cast<cudaStream_t>(stream_int);
   B12xDirectPackRoutesKernel<<<1, 64, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
@@ -193,14 +194,15 @@ void B12xDirectW4A16FusedMoe(TensorView hidden_states, TensorView topk_ids, Tens
   TVM_FFI_ICHECK(expert_map_items == 0 || expert_map_items >= num_local_experts)
       << "expert_map must be empty or a global-to-local map";
 
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   int device = 0;
   cudaError_t status = cudaGetDevice(&device);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
   cudaDeviceProp properties{};
   status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(properties.major == 12 && properties.minor == 0)
-      << "b12x_direct_w4a16_fused_moe requires compute capability 12.0";
+  TVM_FFI_ICHECK(properties.major == 12)
+      << "b12x_direct_w4a16_fused_moe requires an SM12x device";
 
   B12xDirectW4A16FusedMoeParams params{
       static_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),

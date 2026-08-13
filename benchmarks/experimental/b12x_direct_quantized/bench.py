@@ -52,6 +52,12 @@ def _bench(fn: Callable[[], torch.Tensor], warmup: int, iterations: int) -> floa
     return latency_us
 
 
+def _probe(fn: Callable[[], torch.Tensor]) -> None:
+    """Run a candidate eagerly before creating a CUDA Graph for it."""
+    fn()
+    torch.cuda.synchronize()
+
+
 def _quantize_weight(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -122,8 +128,10 @@ def _direct_latency(
     best: tuple[float, int | None, int | None] = (float("inf"), None, None)
     for outputs, threads in candidates:
         try:
+            candidate = fn_factory(outputs, threads)
+            _probe(candidate)
             latency = _bench(
-                fn_factory(outputs, threads),
+                candidate,
                 min(warmup, 30) if tune else warmup,
                 min(iterations, 200) if tune else iterations,
             )
@@ -135,7 +143,9 @@ def _direct_latency(
     if best[0] == float("inf"):
         raise RuntimeError("no valid Direct launch configuration")
     if tune:
-        latency = _bench(fn_factory(best[1], best[2]), warmup, iterations)
+        candidate = fn_factory(best[1], best[2])
+        _probe(candidate)
+        latency = _bench(candidate, warmup, iterations)
         best = (latency, best[1], best[2])
     return best
 
@@ -164,8 +174,10 @@ def _nvfp4_latency(
     best: tuple[float, int | None, int | None] = (float("inf"), None, None)
     for outputs, threads in candidates:
         try:
+            candidate = fn_factory(outputs, threads)
+            _probe(candidate)
             latency = _bench(
-                fn_factory(outputs, threads),
+                candidate,
                 min(warmup, 30) if tune else warmup,
                 min(iterations, 200) if tune else iterations,
             )
@@ -176,8 +188,10 @@ def _nvfp4_latency(
     if best[0] == float("inf"):
         raise RuntimeError("no valid Direct NVFP4 launch configuration")
     if tune:
+        candidate = fn_factory(best[1], best[2])
+        _probe(candidate)
         best = (
-            _bench(fn_factory(best[1], best[2]), warmup, iterations),
+            _bench(candidate, warmup, iterations),
             best[1],
             best[2],
         )

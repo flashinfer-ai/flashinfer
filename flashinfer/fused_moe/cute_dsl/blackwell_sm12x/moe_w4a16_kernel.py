@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cache
 from typing import Any, Callable
 
 import cuda.bindings.driver as cuda
@@ -542,6 +543,7 @@ class W4A16FusedMoeCompileResult:
     scale_format: str = "e4m3_k16"
     tc_decode_fused_sum: bool = False
     tc_pair_activation: bool = False
+    tc_packed_pipeline: bool = False
     tc_zero_output: bool = True
     direct_group_routes: bool = False
     inline_route_pack: bool = False
@@ -570,6 +572,7 @@ class W4A16GemmKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
+        fast_math: bool = True,
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
         scale_format: str = "e4m3_k16",
@@ -662,6 +665,7 @@ class W4A16GemmKernel:
         self.moe_block_size = int(moe_block_size)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
+        self.fast_math = bool(fast_math)
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
         self.weight_layout_nf3 = weight_layout == "nf3_2p1"
@@ -824,6 +828,7 @@ class W4A16GemmKernel:
             self.cta_threads,
             self.moe_block_size,
             self.element_dtype,
+            self.fast_math,
             self.epilogue_relu2,
             self.weight_layout,
             self.scale_format,
@@ -1384,7 +1389,10 @@ class W4A16GemmKernel:
                 up = fc1_bf16_flat[row_base + Int32(self.size_n // 2) + logical_col].to(
                     cutlass.Float32
                 )
-                exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                if cutlass.const_expr(self.fast_math):
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                else:
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
                 silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
                 activated_bf16_flat[
                     route_index * Int32(self.size_n // 2) + logical_col
@@ -4495,6 +4503,7 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
+            fast_math=fast_math,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
             scale_format=scale_format,
@@ -4518,6 +4527,7 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
+            fast_math=fast_math,
             weight_layout=weight_layout,
             scale_format=scale_format,
             w13_layout=w13_layout,
@@ -5614,20 +5624,27 @@ class W4A16RoutePackKernel:
             layout=cute.make_layout((577,), stride=(1,)),
         )
         if cta == Int32(0):
-            if tid < Int32(self.num_experts):
-                shared[tid] = Int32(0)
+            # All 64 lanes participate in the ballots below.  Initialize the
+            # full counter bank even when the model has fewer than 64 experts.
+            shared[tid] = Int32(0)
             cute.arch.sync_threads()
 
             if tid < routed_rows:
                 route_expert = topk_ids_flat[tid].to(Int32)
-                slot = atomic_add_shared_i32(
-                    smem_base + route_expert * Int32(4),
-                    Int32(1),
-                )
-                shared[Int32(64) + route_expert * Int32(self.block_size) + slot] = tid
+                if route_expert >= Int32(0) and route_expert < Int32(self.num_experts):
+                    slot = atomic_add_shared_i32(
+                        smem_base + route_expert * Int32(4),
+                        Int32(1),
+                    )
+                    if slot < Int32(self.block_size):
+                        shared[
+                            Int32(64) + route_expert * Int32(self.block_size) + slot
+                        ] = tid
             cute.arch.sync_threads()
 
             matches = shared[tid].to(Int32)
+            if matches > Int32(self.block_size):
+                matches = Int32(self.block_size)
             present = (matches > Int32(0)).to(Int32)
             lane = tid & Int32(31)
             warp = tid >> Int32(5)
@@ -6487,6 +6504,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
         tc_pair_activation=bool(tc_pair_activation),
+        tc_packed_pipeline=bool(kernel.tc_packed_pipeline),
         tc_zero_output=bool(tc_zero_output),
         direct_group_routes=bool(kernel.direct_group_routes),
         inline_route_pack=bool(kernel.inline_route_pack),
@@ -6669,6 +6687,9 @@ def compile_w4a16_route_pack(
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (max(clear_lock_words, 1),), assumed_align=16
     )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
     compiled = cached_compile(
         kernel,
         topk_fake,
@@ -6714,6 +6735,77 @@ def run_w4a16_route_pack(
     clear_lock_words: int = 0,
     stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not 1 <= int(num_experts) <= 64:
+        raise ValueError("num_experts must be in [1, 64]")
+    if int(block_size) != 8:
+        raise ValueError("route packing requires block_size=8")
+    if topk_ids.ndim != 2 or topk_ids.dtype != torch.int32:
+        raise TypeError("topk_ids must be a 2D torch.int32 tensor")
+    if topk_ids.numel() < 1 or topk_ids.numel() > 64:
+        raise ValueError("topk_ids must contain between 1 and 64 route ids")
+    if output.ndim != 2 or output.shape[0] > int(block_size):
+        raise ValueError("route-pack output must be 2D with at most block_size rows")
+    if output.dtype != torch.bfloat16:
+        raise TypeError("route-pack output must be torch.bfloat16")
+    tensors = {
+        "topk_ids": topk_ids,
+        "packed_route_indices": packed_route_indices,
+        "block_expert_ids": block_expert_ids,
+        "packed_route_count": packed_route_count,
+        "output": output,
+        "locks": locks,
+    }
+    device = topk_ids.device
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    for name in (
+        "packed_route_indices",
+        "block_expert_ids",
+        "packed_route_count",
+        "locks",
+    ):
+        if tensors[name].dtype != torch.int32:
+            raise TypeError(f"{name} must be torch.int32")
+    if int(topk_ids.shape[0]) != int(output.shape[0]):
+        raise ValueError("topk_ids and output must have the same token count")
+    if int(packed_route_indices.numel()) < int(num_experts) * int(block_size):
+        raise ValueError(
+            "packed_route_indices is smaller than num_experts * block_size"
+        )
+    if int(block_expert_ids.numel()) < int(num_experts):
+        raise ValueError("block_expert_ids is smaller than num_experts")
+    if int(packed_route_count.numel()) < 1:
+        raise ValueError("packed_route_count must hold at least one element")
+    if int(clear_lock_words) < 0:
+        raise ValueError("clear_lock_words must be non-negative")
+    if clear_output and int(locks.numel()) < int(clear_lock_words):
+        raise ValueError(
+            "locks is smaller than clear_lock_words: "
+            f"{int(locks.numel())} < {int(clear_lock_words)}"
+        )
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        route_values = topk_ids.view(-1)
+        min_route = int(route_values.min().item())
+        max_route = int(route_values.max().item())
+        if min_route < 0 or max_route >= int(num_experts):
+            raise ValueError(
+                f"topk_ids must be in [0, {int(num_experts) - 1}], "
+                f"got [{min_route}, {max_route}]"
+            )
+        counts = torch.bincount(route_values, minlength=int(num_experts))
+        if int(counts.max().item()) > int(block_size):
+            raise ValueError(
+                "an expert receives more routes than route-pack block_size="
+                f"{int(block_size)}"
+            )
+    if stream is not None and int(stream) != int(current_cuda_stream()):
+        raise ValueError("route packing requires the current CUDA stream")
     route_pack = compile_w4a16_route_pack(
         num_experts=num_experts,
         block_size=block_size,
@@ -6872,6 +6964,19 @@ def _w4a16_fused_moe_launch_flat(
     )
 
 
+@cache
+def _best_whole_tile_grid(fc1_mn_tiles: int, fc2_mn_tiles: int, cap: int) -> int:
+    """Cache the cooperative-grid search for a fixed tile geometry."""
+
+    def critical_path(grid: int) -> int:
+        return -(-int(fc1_mn_tiles) // grid) + -(-int(fc2_mn_tiles) // grid)
+
+    return min(
+        range(1, int(cap) + 1),
+        key=lambda grid: (critical_path(grid), grid),
+    )
+
+
 def _w4a16_fused_persistent_grid_x(
     *,
     fused: W4A16FusedMoeCompileResult,
@@ -6922,17 +7027,11 @@ def _w4a16_fused_persistent_grid_x(
             return max(cap, 1)
         fc2_mn_tiles = route_blocks * (hidden // fc2_tile_n)
 
-        def whole_tile_critical_path(grid: int) -> int:
-            return -(-fc1_mn_tiles // grid) + -(-fc2_mn_tiles // grid)
-
         # Search every legal cooperative-grid size.  The old two-candidate
         # heuristic missed the common asymmetric case (for example FC1=96,
         # FC2=128, cap=188): 128 CTAs keep both phases single-wave while
         # avoiding 60 idle participants in the software grid barrier.
-        return min(
-            range(1, int(cap) + 1),
-            key=lambda grid: (whole_tile_critical_path(grid), grid),
-        )
+        return _best_whole_tile_grid(int(fc1_mn_tiles), int(fc2_mn_tiles), int(cap))
     waves = (fc1_mn_tiles + cap - 1) // cap
     if waves <= 0:
         return max(cap, 1)
@@ -7929,6 +8028,12 @@ def run_w4a16_moe(
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
+    if routes_prepacked and bool(getattr(fused, "tc_packed_pipeline", False)):
+        # The route-pack prologue normally clears this lock workspace.  A
+        # caller that supplies prepacked routes bypasses that kernel, so reset
+        # all counters before the current FC1/FC2 pipeline (and capture this
+        # reset when the caller is building a CUDA Graph).
+        prepared.workspace.zero_()
     if weight_layout == "nf3_2p1":
         prepared_tiles = (
             int(getattr(prepared, "fc1_tile_n", 0)),

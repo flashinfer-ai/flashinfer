@@ -5090,7 +5090,13 @@ class MoEDirectMicroKernel:
                         topk_weights,
                         scatter_output,
                     )
-                elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
+                elif cutlass.const_expr(
+                    self.scale_format_bf16_k16 or cfg.fc2_n_chunks > 1
+                ):
+                    # BF16 K/16 scales pair with the row-major FP4
+                    # intermediate.  The narrow path below assumes packed
+                    # FP4 intermediates and E4M3 byte scales, so even the
+                    # single-N-chunk BF16 case must use the wide decoder.
                     self._m2_fc2_rowquad_wide(
                         fc2_task,
                         warp_id,

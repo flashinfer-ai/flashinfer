@@ -19,6 +19,10 @@
 #include <cuda_fp4.h>
 #include <cuda_runtime.h>
 
+#if defined(CUDART_VERSION) && CUDART_VERSION < 12090
+#error "B12x Direct W4A16 requires CUDA 12.9 or newer"
+#endif
+
 #include <cstdint>
 
 namespace flashinfer::fused_moe {

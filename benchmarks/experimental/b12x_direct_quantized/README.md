@@ -14,6 +14,10 @@ shapes and retains the scalar Direct kernel as a safe fallback. Both precision
 paths consume precomputed routes directly and are CUDA Graph safe after
 warm-up.
 
+The Direct SM12x path requires CUDA 12.9 or newer. Other FlashInfer kernels may
+support CUDA 12.8, but this path is gated because its SM12x JIT normalization
+and CUDA FP4 conversion types require the newer toolkit.
+
 Run a CUDA Graph benchmark with warm-up:
 
 ```bash

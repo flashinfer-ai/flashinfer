@@ -123,6 +123,7 @@ void B12xDirectNVFP4FusedMoe(TensorView hidden_states, TensorView topk_ids, Tens
   TVM_FFI_ICHECK(expert_map_items == 0 || expert_map_items >= num_local_experts)
       << "expert_map must be empty or a global-to-local map";
 
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   int device = 0;
   cudaError_t status = cudaGetDevice(&device);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);

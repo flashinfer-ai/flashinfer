@@ -52,8 +52,11 @@ kernel reports.
 | racecheck | W4A16 | 1 | FOLLOW-UP | 612 shared-memory WAR hazards in the CuteDSL W4A16 kernel; one hazard class is reported as an error between a read by thread 31 and a write by thread 0. |
 | synccheck | W4A16/NVFP4 | 1 | FOLLOW-UP | The first W4A16 warm-up causes the target process to return `cudaErrorIllegalAddress`; sanitizer itself reports `ERROR SUMMARY: 0 errors`. |
 
-Disabling async-copy race tracking increases the W4A16 report to 100 displayed
-hazards (192 errors, 200 warnings), so the warning is tied to the kernel's
+The normal W4A16 racecheck run lists 612 shared-memory WAR hazards. With
+async-copy race tracking disabled, the log displays 100 hazard records (192
+errors and 200 warnings in that report); these are different
+display/classification totals, not evidence that the underlying shared-memory
+hazard disappeared. The warning is tied to the kernel's
 warp-level asynchronous pipeline. The W4A16 racecheck result should remain a
 follow-up item rather than being treated as a clean sanitizer pass. Eager and
 CUDA Graph correctness checks, as well as memcheck, pass for the same shape.

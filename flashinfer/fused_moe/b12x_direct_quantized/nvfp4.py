@@ -81,8 +81,15 @@ def b12x_direct_nvfp4_fused_moe_workspace(
         raise ValueError(f"num_tokens must be in [1, 8], got {num_tokens}")
     if not 1 <= topk <= 8:
         raise ValueError(f"topk must be in [1, 8], got {topk}")
-    if hidden_size % 16 or intermediate_size % 16:
-        raise ValueError("hidden_size and intermediate_size must be divisible by 16")
+    if (
+        hidden_size < 16
+        or intermediate_size < 16
+        or hidden_size % 16
+        or intermediate_size % 16
+    ):
+        raise ValueError(
+            "hidden_size and intermediate_size must be positive multiples of 16"
+        )
     routed_rows = num_tokens * topk
     return B12xDirectNVFP4Workspace(
         intermediate_quantized=torch.empty(
@@ -104,6 +111,45 @@ def _recommended_launch(
     return _TUNED_LAUNCHES.get((hidden_size, intermediate_size), {}).get(
         num_tokens, (2, 256)
     )
+
+
+@functools.cache
+def _require_cuda_129() -> None:
+    """Fail before JIT compilation when SM12x normalization is unavailable."""
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    if not is_cuda_version_at_least("12.9"):
+        raise RuntimeError(
+            "b12x_direct_nvfp4_fused_moe requires CUDA 12.9 or newer on SM120"
+        )
+
+
+def _resolve_hybrid_launch(
+    hidden_states: torch.Tensor,
+    expert_map: Optional[torch.Tensor],
+    intermediate_size: int,
+    outputs_per_warp: Optional[int],
+    num_threads: Optional[int],
+) -> tuple[int, int] | None:
+    """Resolve the launch pair used by the hybrid gate before validation."""
+    if hidden_states.ndim != 2:
+        return None
+    num_tokens, hidden_size = hidden_states.shape
+    if (
+        num_tokens < 2
+        or (expert_map is not None and expert_map.numel() != 0)
+        or num_tokens
+        not in _HYBRID_GATE_LAUNCHES.get((int(hidden_size), int(intermediate_size)), {})
+    ):
+        return None
+    gate_outputs, gate_threads = _HYBRID_GATE_LAUNCHES[
+        (int(hidden_size), int(intermediate_size))
+    ][int(num_tokens)]
+    if outputs_per_warp is not None:
+        gate_outputs = int(outputs_per_warp)
+    if num_threads is not None:
+        gate_threads = int(num_threads)
+    return int(gate_outputs), int(gate_threads)
 
 
 @functools.cache
@@ -270,6 +316,7 @@ def _validate(
     workspace: Optional[B12xDirectNVFP4Workspace],
     outputs_per_warp: Optional[int],
     num_threads: Optional[int],
+    launch_override: tuple[int, int] | None = None,
 ) -> None:
     if not hidden_states.is_cuda or torch.cuda.get_device_capability(
         hidden_states.device
@@ -295,7 +342,14 @@ def _validate(
     if gemm1_scales.dtype != torch.bfloat16 or gemm2_scales.dtype != torch.bfloat16:
         raise ValueError("Direct dequant scales must be BF16")
     experts = int(gemm1_weights.shape[0])
-    intermediate_size = int(gemm2_weights.shape[2]) * 2
+    intermediate_size = (
+        int(gemm2_weights.shape[2]) * 2 if gemm2_weights.ndim >= 3 else 0
+    )
+    if intermediate_size < 16 or intermediate_size % 16:
+        raise ValueError(
+            "gemm2_weights must provide an intermediate_size that is a positive "
+            "multiple of 16"
+        )
     expected_shapes = (
         (experts, 2 * intermediate_size, hidden_size // 2),
         (experts, 2 * intermediate_size, hidden_size // 16),
@@ -351,9 +405,12 @@ def _validate(
                 raise ValueError(
                     f"workspace.{name} must be contiguous and on the input device"
                 )
-    default_outputs, default_threads = _recommended_launch(
-        num_tokens, hidden_size, intermediate_size
-    )
+    if launch_override is None:
+        default_outputs, default_threads = _recommended_launch(
+            num_tokens, hidden_size, intermediate_size
+        )
+    else:
+        default_outputs, default_threads = launch_override
     launch_outputs = default_outputs if outputs_per_warp is None else outputs_per_warp
     launch_threads = default_threads if num_threads is None else num_threads
     if launch_outputs not in (1, 2, 4, 8):
@@ -399,6 +456,23 @@ def b12x_direct_nvfp4_fused_moe(
     back out before GEMM; callers may replace the conservative defaults with
     calibrated model scales.
     """
+    if hidden_states.is_cuda:
+        _require_cuda_129()
+    intermediate_size = (
+        int(gemm2_weights.shape[2]) * 2 if gemm2_weights.ndim >= 3 else 0
+    )
+    if intermediate_size < 16 or intermediate_size % 16:
+        raise ValueError(
+            "gemm2_weights must provide an intermediate_size that is a positive "
+            "multiple of 16"
+        )
+    hybrid_launch = _resolve_hybrid_launch(
+        hidden_states,
+        expert_map,
+        intermediate_size,
+        outputs_per_warp,
+        num_threads,
+    )
     if not skip_check:
         _validate(
             hidden_states,
@@ -413,10 +487,10 @@ def b12x_direct_nvfp4_fused_moe(
             workspace,
             outputs_per_warp,
             num_threads,
+            launch_override=hybrid_launch,
         )
     num_tokens, hidden_size = hidden_states.shape
     topk = int(topk_ids.shape[1])
-    intermediate_size = int(gemm2_weights.shape[2]) * 2
     if output is None:
         output = torch.empty_like(hidden_states)
     if hidden_global_encode_scale <= 0 or intermediate_global_encode_scale <= 0:
@@ -447,18 +521,9 @@ def b12x_direct_nvfp4_fused_moe(
         sf_vec_size=16,
         is_sf_swizzled_layout=False,
     )
-    shape_key = (hidden_size, intermediate_size)
-    use_hybrid = (
-        num_tokens >= 2
-        and expert_map.numel() == 0
-        and num_tokens in _HYBRID_GATE_LAUNCHES.get(shape_key, {})
-    )
+    use_hybrid = hybrid_launch is not None and expert_map.numel() == 0
     if use_hybrid:
-        gate_outputs, gate_threads = _HYBRID_GATE_LAUNCHES[shape_key][num_tokens]
-        if outputs_per_warp is not None:
-            gate_outputs = outputs_per_warp
-        if num_threads is not None:
-            gate_threads = num_threads
+        gate_outputs, gate_threads = hybrid_launch
         _get_module().run_gate(
             hidden_states,
             topk_ids,

@@ -13,9 +13,9 @@ from .w4a16 import (
 
 __all__ = [
     "B12xDirectNVFP4Workspace",
-    "prepare_b12x_direct_w4a16_scales",
     "b12x_direct_nvfp4_fused_moe",
     "b12x_direct_nvfp4_fused_moe_workspace",
     "b12x_direct_w4a16_fused_moe",
     "b12x_direct_w4a16_fused_moe_workspace",
+    "prepare_b12x_direct_w4a16_scales",
 ]
