@@ -282,6 +282,22 @@ def gen_some_module(dtype_in, dtype_out, ...):
 
 The generated `build.ninja` file uses nvcc to compile .cu → .cuda.o → .so, then loads via TVM-FFI.
 
+#### NVCC JIT Cache Fingerprints
+
+Every `JitSpecNvcc` build directory contains a committed `meta.json` alongside
+its `.so`. The metadata fingerprints the module sources and include tree, the
+currently rendered Ninja configuration and flags, the FlashInfer wheel/git
+identity, Python/Torch/TVM-FFI ABI, and the nvcc/C++ toolchain. A JIT artifact is
+valid only when the `.so` exists and this fingerprint matches.
+
+Missing, corrupt, or mismatched metadata invalidates the whole module build
+directory before Ninja runs; never preserve an unverified `.o` or `.so`. Write
+`meta.json` atomically only after Ninja succeeds, using the exact pre-build
+snapshot associated with that invocation. `build_jit_specs()` applies the same
+contract and holds every selected module lock, in deterministic order, through
+the shared Ninja run and all metadata commits. AOT artifacts are prevalidated
+by packaging and do not use this JIT metadata gate.
+
 ### Jinja Templates (Optional)
 
 **Note: Jinja templates are NOT required.** You can write C++ code directly without templating.

@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import sysconfig
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
@@ -543,6 +543,9 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def expected_meta(self) -> dict:
+        return self._expected_meta(self._render_ninja())
+
+    def _expected_meta(self, ninja_content: str) -> dict:
         """Build fingerprint for this module.
 
         Every entry participates in cache invalidation: if any of them
@@ -583,7 +586,7 @@ class JitSpecNvcc(JitSpec):
             "sources_sha256": {
                 str(src): _hash_file_sha256(src) for src in self.sources
             },
-            "ninja_content_sha256": _hash_file_sha256(self.ninja_path),
+            "ninja_content_sha256": hashlib.sha256(ninja_content.encode()).hexdigest(),
             "cflags": self.extra_cflags,
             "cuda_cflags": self.extra_cuda_cflags,
             "ldflags": self.extra_ldflags,
@@ -595,14 +598,15 @@ class JitSpecNvcc(JitSpec):
         expected = self.expected_meta if expected is None else expected
         return _read_meta(self.meta_path) == expected
 
-    def _invalidate_stale_build(self) -> bool:
+    def _invalidate_stale_build(self, expected: Optional[dict] = None) -> bool:
         """Wipe the build dir when the committed fingerprint no longer matches.
 
         Returns ``True`` when the directory was actually removed (so the
-        caller knows to regenerate the ninja file). A directory without
-        ``meta.json`` is a fresh or in-progress build and is left alone.
+        caller knows to regenerate the ninja file). Missing or corrupt metadata
+        is a mismatch: an existing artifact without a committed fingerprint is
+        never safe to reuse.
         """
-        if self.meta_path.exists() and not self._meta_matches():
+        if self.build_dir.exists() and not self._meta_matches(expected):
             logger.info(
                 f"Invalidating stale nvcc module {self.name} "
                 "(build fingerprint mismatch)"
@@ -614,10 +618,9 @@ class JitSpecNvcc(JitSpec):
             return True
         return False
 
-    def write_ninja(self) -> None:
-        ninja_path = self.ninja_path
-        self.build_dir.mkdir(parents=True, exist_ok=True)
-        content = generate_ninja_build_for_op(
+    def _render_ninja(self) -> str:
+        """Render the Ninja configuration used by both metadata and build."""
+        return generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
             extra_cflags=self.extra_cflags,
@@ -626,6 +629,11 @@ class JitSpecNvcc(JitSpec):
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
         )
+
+    def write_ninja(self, content: Optional[str] = None) -> None:
+        ninja_path = self.ninja_path
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        content = self._render_ninja() if content is None else content
         write_if_different(ninja_path, content)
 
     @property
@@ -662,17 +670,17 @@ class JitSpecNvcc(JitSpec):
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
-            self.write_ninja()
-            # A stale wipe removes the build dir (and its ninja file); regen it
-            # so the snapshot below matches what ninja will actually run.
-            if self._invalidate_stale_build():
-                self.write_ninja()
-            # Snapshot the fingerprint before building: if sources change
+            # Render once so the metadata snapshot describes exactly the Ninja
+            # configuration that this build writes and executes.
+            ninja_content = self._render_ninja()
+            expected = self._expected_meta(ninja_content)
+            self._invalidate_stale_build(expected)
+            self.write_ninja(ninja_content)
+            # Snapshot the remaining inputs before building: if sources change
             # mid-build, the committed metadata still describes the inputs
             # this build started from, and the next build (whose depfile now
             # differs) will recompile. Never bless objects with a fingerprint
             # computed after the fact.
-            expected = self.expected_meta
             run_ninja(self.build_dir, self.ninja_path, verbose)
             if self.jit_library_path.exists():
                 _write_meta_atomic(self.meta_path, expected)
@@ -859,8 +867,7 @@ def build_jit_specs(
     verbose: bool = False,
     skip_prebuilt: bool = True,
 ) -> None:
-    lines: List[str] = []
-    built_specs: List[tuple] = []
+    selected_specs: List[JitSpecNvcc] = []
     for spec in specs:
         if not isinstance(spec, JitSpecNvcc):
             raise TypeError(
@@ -869,25 +876,37 @@ def build_jit_specs(
             )
         if skip_prebuilt and spec.aot_path.exists():
             continue
-        with FileLock(spec.lock_path, thread_local=False):
+        selected_specs.append(spec)
+    if not selected_specs:
+        return
+
+    # Hold every module lock from invalidation through metadata commit. Sorting
+    # lock paths gives concurrent batch builders one acquisition order and
+    # prevents deadlocks when their module sets overlap.
+    with ExitStack() as stack:
+        for lock_path in sorted({spec.lock_path for spec in selected_specs}, key=str):
+            stack.enter_context(FileLock(lock_path, thread_local=False))
+
+        lines: List[str] = []
+        built_specs: List[tuple[JitSpecNvcc, dict]] = []
+        for spec in selected_specs:
             # Same fingerprint gate as JitSpecNvcc.build(): wipe stale build
             # dirs before the shared ninja run so a batch build can never
             # copy artifacts built from older sources.
-            spec.write_ninja()
-            if spec._invalidate_stale_build():
-                spec.write_ninja()
-            built_specs.append((spec, spec.expected_meta))
-        lines.append(f"subninja {spec.ninja_path}")
-    if not lines:
-        return
+            ninja_content = spec._render_ninja()
+            expected = spec._expected_meta(ninja_content)
+            spec._invalidate_stale_build(expected)
+            spec.write_ninja(ninja_content)
+            built_specs.append((spec, expected))
+            lines.append(f"subninja {spec.ninja_path}")
 
-    lines = ["ninja_required_version = 1.3"] + lines + [""]
+        lines = ["ninja_required_version = 1.3"] + lines + [""]
 
-    tmpdir = get_tmpdir()
-    with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
-        ninja_path = tmpdir / "flashinfer_jit.ninja"
-        write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
-        for spec, expected in built_specs:
-            if spec.jit_library_path.exists():
-                _write_meta_atomic(spec.meta_path, expected)
+        tmpdir = get_tmpdir()
+        with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
+            ninja_path = tmpdir / "flashinfer_jit.ninja"
+            write_if_different(ninja_path, "\n".join(lines))
+            run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+            for spec, expected in built_specs:
+                if spec.jit_library_path.exists():
+                    _write_meta_atomic(spec.meta_path, expected)

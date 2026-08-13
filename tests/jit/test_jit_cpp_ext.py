@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,7 +145,7 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
         extra_include_dirs=None,
     )
 
-    monkeypatch.setattr(spec, "write_ninja", lambda: writes.append(True))
+    monkeypatch.setattr(spec, "write_ninja", lambda _content=None: writes.append(True))
     monkeypatch.setattr(core, "run_ninja", lambda *_args, **_kwargs: None)
 
     spec.build(verbose=False, need_lock=False)
@@ -326,9 +327,18 @@ def _make_nvcc_spec(monkeypatch, tmp_path, name="test_fp_module", mtime_shift=No
 
     calls = {}
 
-    def fake_write_ninja():
+    def fake_render_ninja():
+        return (
+            "ninja_required_version = 1.3\n"
+            f"cflags = {spec.extra_cflags}\n"
+            f"cuda_cflags = {spec.extra_cuda_cflags}\n"
+            f"ldflags = {spec.extra_ldflags}\n"
+        )
+
+    def fake_write_ninja(content=None):
         spec.build_dir.mkdir(parents=True, exist_ok=True)
-        (spec.build_dir / "build.ninja").write_text("ninja_required_version = 1.3\n")
+        content = fake_render_ninja() if content is None else content
+        (spec.build_dir / "build.ninja").write_text(content)
 
     def fake_run_ninja(*_args, **_kwargs):
         spec.build_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +347,7 @@ def _make_nvcc_spec(monkeypatch, tmp_path, name="test_fp_module", mtime_shift=No
         (spec.build_dir / "built.marker").write_text("1")
         calls["builds"] = calls.get("builds", 0) + 1
 
+    monkeypatch.setattr(spec, "_render_ninja", fake_render_ninja)
     monkeypatch.setattr(spec, "write_ninja", fake_write_ninja)
     monkeypatch.setattr(core, "run_ninja", fake_run_ninja)
     monkeypatch.setattr(core.jit_env, "FLASHINFER_CSRC_DIR", tmp_path / "csrc")
@@ -375,6 +386,9 @@ def test_stale_source_rewrites_same_mtime_still_invalidates(monkeypatch, tmp_pat
     spec.build(verbose=False, need_lock=False)
     assert (spec.build_dir / f"{spec.name}.so").exists()
     assert (spec.build_dir / "built.marker").exists()
+    stale_artifact = spec.build_dir / "stale-artifact"
+    stale_artifact.write_text("must be removed")
+    old_meta = core._read_meta(spec.meta_path)
 
     # Change the source content, keep its mtime unchanged.
     src = spec.sources[0]
@@ -385,7 +399,12 @@ def test_stale_source_rewrites_same_mtime_still_invalidates(monkeypatch, tmp_pat
 
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 2
-    # The stale directory was actually wiped and rebuilt (marker refreshed).
+    # The stale directory was actually wiped before the fake build recreated
+    # its normal outputs.
+    assert not stale_artifact.exists()
+    assert (
+        core._read_meta(spec.meta_path)["sources_sha256"] != old_meta["sources_sha256"]
+    )
     assert (spec.build_dir / "built.marker").exists()
     assert (spec.build_dir / "built.marker").read_text() == "1"
     assert (spec.build_dir / f"{spec.name}.so").exists()
@@ -425,8 +444,11 @@ def test_missing_meta_triggers_rebuild(monkeypatch, tmp_path):
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 1
     spec.meta_path.unlink()
+    stale_artifact = spec.build_dir / "stale-without-meta"
+    stale_artifact.write_text("must be removed")
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 2
+    assert not stale_artifact.exists()
     assert core._read_meta(spec.meta_path) == spec.expected_meta
 
 
@@ -435,8 +457,35 @@ def test_corrupt_meta_triggers_rebuild(monkeypatch, tmp_path):
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 1
     spec.meta_path.write_text("{ not valid json !!!")
+    stale_artifact = spec.build_dir / "stale-with-corrupt-meta"
+    stale_artifact.write_text("must be removed")
     spec.build(verbose=False, need_lock=False)
     assert calls["builds"] == 2
+    assert not stale_artifact.exists()
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_rendered_ninja_change_invalidates_existing_build(monkeypatch, tmp_path):
+    """Fingerprint the Ninja content the current process would render, not the
+    previous build.ninja stored in the cache directory."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+    old_meta = core._read_meta(spec.meta_path)
+    stale_artifact = spec.build_dir / "stale-ninja-config"
+    stale_artifact.write_text("must be removed")
+
+    old_render = spec._render_ninja
+    monkeypatch.setattr(
+        spec, "_render_ninja", lambda: old_render() + "generator_input = changed\n"
+    )
+    assert (
+        old_meta["ninja_content_sha256"] != spec.expected_meta["ninja_content_sha256"]
+    )
+
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert not stale_artifact.exists()
     assert core._read_meta(spec.meta_path) == spec.expected_meta
 
 
@@ -565,6 +614,56 @@ def test_build_jit_specs_applies_fingerprint_and_commits_meta(monkeypatch, tmp_p
     assert calls2["builds"] == 2  # run_ninja invoked for both (ninja decides)
     assert core._read_meta(spec1.meta_path) == spec1.expected_meta
     assert core._read_meta(spec2.meta_path) == spec2.expected_meta
+
+
+def _lock_is_held_by_another_process(lock_path: Path) -> bool:
+    """Probe a FileLock from a separate interpreter.
+
+    A single-spec build uses this same lock, so a timeout proves it cannot race
+    the batch builder while Ninja runs or metadata is committed.
+    """
+    script = """
+import sys
+from filelock import FileLock, Timeout
+
+try:
+    with FileLock(sys.argv[1], timeout=0.2, thread_local=False):
+        pass
+except Timeout:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(lock_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def test_build_jit_specs_holds_module_lock_through_meta_commit(monkeypatch, tmp_path):
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path, name="batch_locked")
+    lock_observations = []
+
+    def batch_run_ninja(*_args, **_kwargs):
+        lock_observations.append(_lock_is_held_by_another_process(spec.lock_path))
+        spec.jit_library_path.write_bytes(b"\x7fELF")
+
+    original_write_meta = core._write_meta_atomic
+
+    def write_meta_while_observing_lock(meta_path, meta):
+        lock_observations.append(_lock_is_held_by_another_process(spec.lock_path))
+        original_write_meta(meta_path, meta)
+
+    monkeypatch.setattr(core, "run_ninja", batch_run_ninja)
+    monkeypatch.setattr(core, "_write_meta_atomic", write_meta_while_observing_lock)
+
+    core.build_jit_specs([spec], verbose=False, skip_prebuilt=False)
+
+    assert lock_observations == [True, True]
+    assert not _lock_is_held_by_another_process(spec.lock_path)
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
 
 
 def test_wipe_failure_aborts_build(monkeypatch, tmp_path):
