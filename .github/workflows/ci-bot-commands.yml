@@ -1,5 +1,6 @@
 # Bot command handler for CI permissions
-# Authorized users (ci-users team) can comment to control CI:
+# Authorized users - anyone who can apply the run-ci label to a PR, plus the
+# ci-users team - can comment to control CI:
 #   @flashinfer-bot run          - Apply run-ci label to start CI on the current
 #                                  commit; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
@@ -26,22 +27,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check team membership
+      - name: Check permission
         id: check-permission
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           ORG: ${{ github.repository_owner }}
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Checking if $ACTOR is a member of $ORG/$TEAM..."
-
           # Verify token is set
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
             echo "authorized=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          ROLE=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/collaborators/${ACTOR}/permission" \
+            --jq '.role_name' 2>/dev/null) || ROLE="none"
+
+          case "$ROLE" in
+            admin|maintain|write|triage)
+              echo "$ACTOR is authorized by repository role"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
 
           # List team members and check if commenter is in the list
           MEMBERS=$(gh api \
@@ -56,10 +70,10 @@ jobs:
           }
 
           if echo "$MEMBERS" | grep -qx "$ACTOR"; then
-            echo "$ACTOR is a member of $TEAM"
+            echo "$ACTOR is authorized by team membership"
             echo "authorized=true" >> "$GITHUB_OUTPUT"
           else
-            echo "$ACTOR is not a member of $TEAM"
+            echo "$ACTOR is not authorized"
             echo "authorized=false" >> "$GITHUB_OUTPUT"
           fi
 

@@ -6,7 +6,7 @@
 # - Push to main: Always runs
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
 #   Applying the label is the trigger, so new commits need a new trigger:
-#   @flashinfer-bot run. Only users with write access can apply labels.
+#   @flashinfer-bot run.
 #
 # Instance Purchasing:
 # - All runners are on-demand. Spot was removed.
@@ -77,8 +77,7 @@ jobs:
 
           # Authorize on run-ci being applied, not on it being present: presence
           # would re-authorize every later push, which is the auto-trigger this
-          # gate removes. Applying a label needs write access, so this also holds
-          # on fork PRs, where secrets are unavailable.
+          # gate removes.
           if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "run-ci label applied, authorized"
