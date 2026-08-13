@@ -114,6 +114,7 @@ finish_aot_memory_monitoring() {
     if [ "$exit_code" -ne 0 ]; then
         print_aot_memory_diagnostics
     fi
+    collect_sccache_diagnostics || true
 }
 
 trap finish_aot_memory_monitoring EXIT
@@ -258,12 +259,6 @@ run_with_aot_memory_monitor "verify_all_modules_compiled" python scripts/verify_
     exit 1
 }
 echo "✓ All modules verified successfully"
-
-echo ""
-echo "========================================"
-echo "sccache stats"
-echo "========================================"
-sccache --show-stats
 
 echo ""
 echo "========================================"

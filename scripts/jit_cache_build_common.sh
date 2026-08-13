@@ -4,6 +4,10 @@
 #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
 
+SCCACHE_VERSION="0.17.0"
+# The v0.17 client-side architecture remains opt-in while this change isolates
+# the version upgrade from a separate execution-mode change.
+
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
 # memory to avoid OOMs on multi-arch builds.
@@ -111,14 +115,15 @@ install_sccache() {
 #   $1 - Cache key prefix tag (e.g. "cuda128-x86_64").
 #   $2 - Source root directory for SCCACHE_BASEDIRS.
 #
-# Reads (optional): SCCACHE_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+# Reads (optional): SCCACHE_REGION, SCCACHE_DIAGNOSTICS_DIR,
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
 setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
   sccache_arch=$(uname -m)
-  install_sccache "0.9.1" "${sccache_arch}"
+  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
 
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
@@ -132,18 +137,88 @@ setup_sccache() {
   case $- in *x*) _sccache_xtrace=1; set +x ;; esac
   if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
     unset SCCACHE_S3_NO_CREDENTIALS
+    export FLASHINFER_SCCACHE_CACHE_MODE="read-write"
     echo "sccache mode: read-write"
   else
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
     export SCCACHE_S3_NO_CREDENTIALS=true
+    export FLASHINFER_SCCACHE_CACHE_MODE="read-only"
     echo "sccache mode: read-only (public bucket, no credentials)"
   fi
   (( _sccache_xtrace )) && set -x
 
+  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
+    mkdir -p "${SCCACHE_DIAGNOSTICS_DIR}"
+    export SCCACHE_ERROR_LOG="${SCCACHE_DIAGNOSTICS_DIR}/sccache-debug.log"
+    # Keep this below trace: trace-level compile requests include the full
+    # compiler environment, which contains the S3 credentials in write jobs.
+    export SCCACHE_LOG="sccache=debug"
+    export SCCACHE_LOG_MILLIS=1
+  fi
+
   sccache --start-server
+  sccache --zero-stats
+  export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
+
+  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
+    local git_commit
+    git_commit=$(git -C "${source_root}" rev-parse HEAD 2>/dev/null || true)
+    {
+      printf 'git_commit=%s\n' "${git_commit:-unknown}"
+      printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
+      printf 'sccache_bucket=%s\n' "${SCCACHE_BUCKET}"
+      printf 'sccache_region=%s\n' "${SCCACHE_REGION}"
+      printf 'sccache_key_prefix=%s\n' "${SCCACHE_S3_KEY_PREFIX}"
+      printf 'sccache_basedirs=%s\n' "${SCCACHE_BASEDIRS}"
+      printf 'sccache_client_side=%s\n' "${SCCACHE_CLIENT_SIDE:-false}"
+      printf 'machine_arch=%s\n' "${sccache_arch}"
+      printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
+      printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
+    } > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-metadata.txt"
+  fi
+}
+
+# Print final stats and, when SCCACHE_DIAGNOSTICS_DIR is configured, retain
+# text/JSON stats plus the server debug log for artifact upload. This helper is
+# intended for EXIT traps; callers should ignore failures so diagnostics never
+# mask the build result.
+collect_sccache_diagnostics() {
+  if [ "${FLASHINFER_SCCACHE_ACTIVE:-false}" != "true" ] || \
+     [ "${FLASHINFER_SCCACHE_DIAGNOSTICS_COLLECTED:-false}" = "true" ] || \
+     ! command -v sccache >/dev/null 2>&1; then
+    return 0
+  fi
+  export FLASHINFER_SCCACHE_DIAGNOSTICS_COLLECTED=true
+
+  echo "::group::sccache stats"
+  if [ -n "${SCCACHE_DIAGNOSTICS_DIR:-}" ]; then
+    mkdir -p "${SCCACHE_DIAGNOSTICS_DIR}"
+    if ! sccache --show-stats > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.txt"; then
+      echo "WARNING: Failed to collect text sccache stats" >&2
+    fi
+    cat "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.txt" 2>/dev/null || true
+    if ! sccache --show-stats --stats-format=json \
+        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stats.json"; then
+      echo "WARNING: Failed to collect JSON sccache stats" >&2
+    fi
+    if ! sccache --show-adv-stats --stats-format=json \
+        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-advanced-stats.json"; then
+      echo "WARNING: Failed to collect advanced JSON sccache stats" >&2
+    fi
+    if ! sccache --stop-server \
+        > "${SCCACHE_DIAGNOSTICS_DIR}/sccache-stop-server.txt" 2>&1; then
+      echo "WARNING: Failed to stop the sccache server" >&2
+    fi
+  else
+    sccache --show-stats || true
+    sccache --stop-server >/dev/null 2>&1 || true
+  fi
+  export FLASHINFER_SCCACHE_ACTIVE=false
+  echo "::endgroup::"
 }

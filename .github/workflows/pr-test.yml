@@ -286,12 +286,36 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-diagnostics"
           bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
+            -e SCCACHE_DIAGNOSTICS_DIR /workspace/sccache-diagnostics \
             --no-gpu ./scripts/${{ matrix.script }}
+
+      - name: Record sccache job metadata
+        if: always() && matrix.kind == 'aot'
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-diagnostics"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${{ matrix.cuda }}"
+            printf 'matrix_arch=%s\n' "${{ matrix.runner[2] }}"
+          } > "${GITHUB_WORKSPACE}/sccache-diagnostics/job-metadata.txt"
+
+      - name: Upload sccache diagnostics
+        if: always() && matrix.kind == 'aot'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-diagnostics-${{ matrix.cuda }}-${{ matrix.runner[2] }}
+          path: sccache-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run Test
         if: matrix.kind != 'aot'
