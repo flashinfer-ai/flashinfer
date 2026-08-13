@@ -311,12 +311,13 @@ def test_expert_major_matches_torch_oracle():
         f"max|Δ|={(yk - ref).abs().max().item():.4g} "
         f"amax(ref)={ref.abs().max().item():.4g}"
     )
-    # MXFP4 weights are coarse; the kernel's intermediate MXFP8 scale codes may
-    # differ from mxfp8_quantize by ±1 near block boundaries (see
-    # tests/moe/test_cute_dsl_mxfp8_mxfp4_grouped_gemm.py), so tolerances are
-    # wider than the NVFP4 split oracle.
-    torch.testing.assert_close(yk, ref, rtol=5e-2, atol=0.25)
-    assert rel_l2.item() < 0.10
+    # Measured on B200 (job 2390487): rel_l2≈0.0155, max|Δ|≈0.016 on
+    # amax(ref)≈0.78. The kernel's intermediate MXFP8 scale codes may differ
+    # from mxfp8_quantize by ±1 near block boundaries (see
+    # tests/moe/test_cute_dsl_mxfp8_mxfp4_grouped_gemm.py) — bounds carry
+    # ~3x headroom over the measured band.
+    torch.testing.assert_close(yk, ref, rtol=5e-2, atol=0.05)
+    assert rel_l2.item() < 0.05
 
 
 def test_rank_major_masks_non_local_picks():
