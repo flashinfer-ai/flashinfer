@@ -367,7 +367,7 @@ def test_frozen_route_and_ffi_abi(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
         (1, 8, 1024, ("m64", 0, 0)),
-        (1, 8, 2048, ("m128_k1_parallel", 8, 35)),
+        (1, 8, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
         (1, 48, 4096, ("m64", 0, 0)),
         (1, 64, 8192, ("m64", 0, 0)),
@@ -400,32 +400,93 @@ def test_k1_parallel_b200_oracle(
     assert actual == expected
 
 
-def test_k1_parallel_is_b200_fixed_layout_only(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_sequences", "num_heads", "sequence_length", "expected"),
+    [
+        (1, 8, 1024, ("m64", 0, 0)),
+        (1, 8, 2048, ("m128_k1_parallel", 4, 30)),
+        (1, 16, 4096, ("m128_k1_parallel", 4, 45)),
+        (1, 32, 8192, ("m128_k1_parallel", 4, 45)),
+        (2, 8, 4096, ("m128_k1_parallel", 4, 45)),
+        (4, 8, 8192, ("m128_k1_parallel", 4, 45)),
+        (1, 48, 4096, ("m64", 0, 0)),
+        (1, 80, 8192, ("m128", 0, 0)),
+    ],
+)
+def test_k1_parallel_b300_oracle(
+    monkeypatch, num_sequences, num_heads, sequence_length, expected
+):
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 3)
     )
-    assert kda_prefill_api._select_flash_kda_prefill_variant(
+    actual = kda_prefill_api._select_flash_kda_prefill_variant(
         fixed_layout=True,
-        num_sequences=1,
-        num_heads=8,
-        sequence_length=8192,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=sequence_length,
         device=torch.device("cuda:0"),
-    ) == ("m128", 0, 0)
+    )
+    assert actual == expected
 
+
+@pytest.mark.parametrize(
+    ("compute_capability", "num_sequences", "num_heads", "total_tokens", "expected"),
+    [
+        ((10, 0), 1, 8, 8192, ("m128_k1_parallel", 4, 15)),
+        ((10, 0), 2, 8, 4096, ("m128_k1_parallel", 4, 30)),
+        ((10, 3), 1, 8, 8192, ("m128", 0, 0)),
+        ((10, 3), 2, 8, 4096, ("m128", 0, 0)),
+        ((10, 3), 4, 8, 4096, ("m128", 0, 0)),
+        ((10, 3), 4, 8, 8192, ("m128", 0, 0)),
+        ((10, 3), 5, 8, 10240, ("m128", 0, 0)),
+        ((10, 3), 1, 12, 8192, ("m128", 0, 0)),
+    ],
+)
+def test_k1_parallel_varlen_oracle(
+    monkeypatch,
+    compute_capability,
+    num_sequences,
+    num_heads,
+    total_tokens,
+    expected,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: compute_capability,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148),
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            sequence_length=total_tokens,
+            device=torch.device("cuda:0"),
+        )
+        == expected
+    )
+
+
+def test_k1_parallel_varlen_fallback_stays_m128(monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
     )
     assert kda_prefill_api._select_flash_kda_prefill_variant(
         fixed_layout=False,
         num_sequences=1,
-        num_heads=8,
-        sequence_length=8192,
+        num_heads=64,
+        sequence_length=1024,
         device=torch.device("cuda:0"),
     ) == ("m128", 0, 0)
 
 
 def test_k1_mailbox_size_is_bounded():
-    assert kda_prefill_api._k1_mailbox_bytes(8, 35) < 9_000_000
+    assert kda_prefill_api._k1_mailbox_bytes(8, 15) < 4_000_000
     assert kda_prefill_api._k1_mailbox_bytes(32, 30) < 31_000_000
 
 
@@ -458,9 +519,9 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
     assert len(args) == 24
     assert args[13].shape == (768,)
     assert args[14].dtype == torch.uint8
-    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 35)
+    assert args[14].numel() == kda_prefill_api._k1_mailbox_bytes(8, 15)
     assert args[15] == 1
-    assert args[16:21] == (8, 0, 0, 8, 35)
+    assert args[16:21] == (8, 0, 0, 4, 15)
     assert math.isclose(args[21], 128**-0.5)
     assert args[22] == -5.0
     assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
@@ -1000,8 +1061,6 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
 
 @pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 8), (2048, 16)])
 def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_heads):
-    if get_compute_capability(flash_kda_device) != (10, 0):
-        pytest.skip("K1 owner/helper prefill is tuned for B200/GB200")
     inputs = _make_inputs(
         seq_lens=[seq_len],
         num_heads=num_heads,
@@ -1028,6 +1087,45 @@ def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_he
     torch.testing.assert_close(
         actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+def test_k1_parallel_varlen_matches_m128_bitwise(cuda_device, monkeypatch):
+    if get_compute_capability(cuda_device) != (10, 0):
+        pytest.skip("packed-varlen K1 helpers are currently enabled only on B200")
+
+    seq_lens = [2304, 1792]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=8,
+        packed=True,
+        initial_state=True,
+        seed=9017,
+    )
+    initial_state = inputs["initial_state"].clone()
+    seq_order = torch.tensor([0, 1], dtype=torch.int32, device=cuda_device)
+
+    helper_output, helper_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        seq_order=seq_order,
+    )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128", 0, 0),
+    )
+    baseline_inputs = {**inputs, "initial_state": initial_state}
+    baseline_output, baseline_state = recurrent_kda(
+        **_strict_prefill_kwargs(baseline_inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        seq_order=seq_order,
+    )
+
+    torch.testing.assert_close(helper_output, baseline_output, atol=0, rtol=0)
+    torch.testing.assert_close(helper_state, baseline_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

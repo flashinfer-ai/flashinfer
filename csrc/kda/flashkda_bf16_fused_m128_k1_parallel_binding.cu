@@ -49,8 +49,8 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "K1-parallel FlashKDA is tuned only for B200/GB200 (CC 10.0)";
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
+      << "K1-parallel FlashKDA requires CC 10.0 or CC 10.3";
 
   const int64_t num_seqs =
       CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,

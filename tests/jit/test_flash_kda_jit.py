@@ -234,6 +234,7 @@ def test_flash_kda_k1_parallel_jit_spec(monkeypatch, target):
 
     binding_text = spec.sources[0].read_text()
     assert "cluster_size == 4 || cluster_size == 8" in binding_text
+    assert "major == 10 && (minor == 0 || minor == 3)" in binding_text
     assert "cluster_size < 0" not in binding_text
     assert "cluster_size" in text
 

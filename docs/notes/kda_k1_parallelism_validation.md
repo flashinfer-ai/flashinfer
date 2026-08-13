@@ -1,12 +1,13 @@
 # CAKE KDA K1 parallelism validation
 
-This report records the upstream-readiness checks for the B200 owner/helper
+This report records the upstream-readiness checks for the SM100-family owner/helper
 kernel. It is intentionally separate from an upstream pull request: no PR has
 been opened from this branch.
 
 ## Validated revision and environment
 
-- Source revision: `406978e99ad1065386055b1201df46ca4145f7b3`
+- Base source revision before this retuning diff:
+  `d651fad743d2dca713f4bddeeb0c422cb7f1d06e`
 - Date: 2026-08-13
 - Device-reported name: NVIDIA L20C
 - Compute capability: 10.0
@@ -25,7 +26,8 @@ capability, not that product string.
 
 | Gate | Result |
 | --- | --- |
-| Targeted JIT and recurrent-KDA tests | 78 passed, 3 warnings |
+| Targeted JIT and recurrent-KDA tests, B200 | 95 passed, 3 warnings |
+| Targeted JIT and recurrent-KDA tests, B300 | 86 passed |
 | C8 and C4 output versus FP32 reference | Passed |
 | C8 and C4 recurrent state versus FP32 reference | Passed |
 | Benchmark output/state versus CAKE-M64 | Bitwise identical for all measured shapes |
@@ -80,6 +82,159 @@ baseline is selected independently for every shape as
 The router therefore keeps T=1024 on the exact M64/M128 fallback and enables
 owner/helper execution only from T=2048. Across the enabled table above, the
 measured range is 1.049x to 1.196x over the per-shape oracle.
+
+## B200 packed-varlen validation
+
+Packed-varlen dispatch was enabled only after an independent B200 sweep. The
+router uses `total_tokens // num_sequences` as a host-known average and does
+not inspect device-resident `cu_seqlens`. Sequences are still consumed using
+their real offsets and may have arbitrary, non-multiple-of-32 lengths.
+
+```bash
+python benchmarks/bench_kda_k1_parallelism.py \
+  --varlen-profiles 8192 4096,4096 \
+    4096,3072,2048,1024 8192,512,256,256 \
+    1024,1024,1024,1024 \
+  --num-heads 8 \
+  --warmup-ms 10 --bench-ms 30 --state-rotations 2048 \
+  --measurement-rounds 4 \
+  --forced-configs 4:15 4:30 4:45 8:35 \
+  --json k1_b200_varlen_sweep.json
+```
+
+Every automatic and forced route was bitwise identical to CAKE-M64 for output
+and final recurrent state before timing. Results use cold-L2 CUDA-event timing
+and report against `min(CAKE-M64, CAKE-M128)`:
+
+| Sequence lengths | Tasks | Average T | Auto route | Speedup |
+| --- | ---: | ---: | --- | ---: |
+| 8192 | 8 | 8192 | C4/D15 | 1.184x |
+| 4096, 4096 | 16 | 4096 | C4/D30 | 1.148x |
+| 4096, 3072, 2048, 1024 | 32 | 2560 | C4/D30 | 1.131x |
+| 8192, 512, 256, 256 | 32 | 2304 | C4/D30 | 1.192x |
+| 1024, 1024, 1024, 1024 | 32 | 1024 | M128 fallback | unchanged from public packed baseline |
+
+The uneven and high-skew profiles show that helpers overlap K1 production at
+chunk granularity; K2 does not wait for a batch-wide K1 phase. C8 was not
+selected: it was 0.605x and 0.731x of the oracle for the two- and four-sequence
+balanced/skewed profiles, while C4 remained profitable. The result JSON SHA256
+was `79208f48a7164f317b3e98e3fb348bf0de955a27e41e5f0cfcbd911e36e7cb51`.
+
+Packed B300 input remains on the pre-existing M128 route. That is a validation
+boundary, not a claim that the technique is B200-specific.
+
+The B200 container used for this packed-varlen sweep did not include the
+`compute-sanitizer` executable. The retained fixed-layout C4/C8 kernel had
+already passed memcheck and synccheck on CC 10.0, but the packed-varlen profile
+must be rerun under both tools before opening the upstream PR.
+
+## Cluster-size tuning sweep
+
+C4 and C8 were compared by an explicit forced-route sweep rather than by the
+producer-capacity model alone. Each shape was measured in four rounds with a
+deterministically shuffled route order to reduce clock and route-order bias:
+
+```bash
+python benchmarks/bench_kda_k1_parallelism.py \
+  --sequence-lengths 1024 2048 4096 8192 \
+  --num-heads 8 16 24 32 \
+  --warmup-ms 10 --bench-ms 30 --state-rotations 4096 \
+  --measurement-rounds 4 \
+  --forced-configs 4:15 4:30 4:45 8:35 8:70 \
+  --json k1_cluster_depth_sweep.json
+```
+
+The full 16-shape result JSON SHA256 was
+`97d6a4836a82de3ef712da94e2da6cce2aa554ba429c79dfdd05c3b343d938bf`.
+All forced routes were bitwise identical to CAKE-M64 for output and recurrent
+state before timing.
+
+For the only region previously assigned to C8, C4/D15 was faster at every
+enabled sequence length:
+
+| B | H | T | C4/D15 | C8/D35 | C4 advantage |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 2048 | 0.119808 ms | 0.120000 ms | 1.002x |
+| 1 | 8 | 4096 | 0.210816 ms | 0.213024 ms | 1.010x |
+| 1 | 8 | 8192 | 0.394400 ms | 0.396208 ms | 1.005x |
+
+This focused post-retuning confirmation used the same four-round shuffled
+method; its JSON SHA256 was
+`883f90133c85facfbe601db72e88c62e151d1e4450ce722ae2c08c0035c99571`.
+Two additional batch/head decompositions confirmed that the decision follows
+the batch-head task count rather than only the B=1 shapes:
+
+| B | H | Tasks | Best tested C4 range vs C8/D35 |
+| ---: | ---: | ---: | ---: |
+| 2 | 8 | 16 | 1.859x-1.938x faster |
+| 4 | 8 | 32 | 2.700x-2.718x faster |
+
+Those JSON SHA256 values were
+`61fe07ee5108a20f718956aefa88fe9266d727fad99c3431905a9d6dd4f7fcac`
+and
+`2d83dadff687f964a6e51e700648ffd11c707cf1a33d3a63a658b10548012803`,
+respectively.
+
+At H=16, 24, and 32, C8 expands the grid to 128, 192, and 256 CTAs,
+respectively, and was substantially slower than C4 because the launch spans
+more waves on 148 SMs. The retained policy is therefore C4/D15 for up to eight
+batch-head tasks and C4/D30 for 9-32 tasks. C8 remains in the kernel ABI and
+sanitizer coverage so future devices or a future scheduling design can retune
+it, but it is not claimed as the B200 end-to-end optimum.
+
+## B300 cluster-size tuning and validation
+
+The CC 10.3 path was independently swept on a 148-SM B300-class device exposed
+by the remote platform under the NVIDIA L20D product string:
+
+- PyTorch: 2.9.1+cu130
+- CUDA runtime reported by PyTorch: 13.0
+- Compute capability: 10.3
+- SM count: 148
+
+The same cold-L2, four-round shuffled benchmark compared C4/D15, C4/D30,
+C4/D45, and C8/D35 against both frozen CAKE baselines. Every forced route was
+bitwise identical to CAKE-M64 for output and recurrent state before timing.
+The selected B300 policy is C4/D30 through eight batch-head tasks and C4/D45
+for 9-32 tasks:
+
+| B | H | T=2048 | T=4096 | T=8192 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 1.075x | 1.149x | 1.182x |
+| 1 | 16 | 1.084x | 1.136x | 1.181x |
+| 1 | 24 | 1.067x | 1.136x | 1.179x |
+| 1 | 32 | 1.066x | 1.105x | 1.126x |
+| 2 | 8 | 1.085x | 1.136x | 1.191x |
+| 4 | 8 | 1.069x | 1.115x | 1.130x |
+
+Each value is the final automatic route's speedup over
+`min(CAKE-M64, CAKE-M128)` for that shape. The enabled range is therefore
+1.066x-1.191x. T=1024 remains on the baseline
+fallback because no helper configuration beat the oracle across the table.
+C8 again lost once its grid crossed additional waves, so it remains a forced
+benchmark and sanitizer configuration rather than an automatic route.
+
+The result JSON SHA256 values were:
+
+- B=1, H=8/16/24/32:
+  `e3c87cfdad23b5660e9ce4eb024b0dd5861a077fa9f74c7b7825119344be170a`
+- B=2, H=8:
+  `0166fba8f084448199155191c2c90059c6d031aa3b381f9591ea18324561ff10`
+- B=4, H=8:
+  `3ebde3b8579f68aee04cfe6491d13a89c13d1824f4965b98ba41aa7db563ee12`
+
+The post-dispatch automatic-route confirmation JSON SHA256 values were:
+
+- B=1, H=8/16/24/32:
+  `c4c84c01cb818d5d4c4822c564cf6fc4d032202b007d019e6632709aa34c8f81`
+- B=2, H=8:
+  `73491f7eadd6ebc98b6e510ae6c2a63473386c638282c875d6276987f3a17be4`
+- B=4, H=8:
+  `dfeeef44863e998cad414066c7fe712789efc6d429018566680d75da6caf13e8`
+
+B300 memcheck and synccheck were not rerun in this performance-validation
+pass. They remain required on CC 10.3 before opening the upstream pull
+request; the sanitizer results above cover CC 10.0 only.
 
 ## Upstream PR preparation
 

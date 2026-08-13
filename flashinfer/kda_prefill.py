@@ -252,11 +252,15 @@ def _select_flash_kda_prefill_variant(
     sequence_length: int,
     device: torch.device,
 ) -> tuple["FlashKDAVariant", int, int]:
-    """Select the measured B200 oracle and optional K1-helper schedule."""
+    """Select the measured SM100-family oracle and K1-helper schedule.
 
-    if not fixed_layout:
-        return "m128", 0, 0
-    if get_compute_capability(device) != (10, 0):
+    ``sequence_length`` is the per-sequence length for fixed input and the
+    packed token count for varlen input. Packed dispatch deliberately uses the
+    host-known average length so it never reads ``cu_seqlens`` back to the CPU.
+    """
+
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
         return (
             ("m64", 0, 0)
             if num_sequences == 1 and num_heads == 64
@@ -268,19 +272,35 @@ def _select_flash_kda_prefill_variant(
         )
 
     task_count = num_sequences * num_heads
+    average_sequence_length = (
+        sequence_length if fixed_layout else sequence_length // num_sequences
+    )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     cluster_size = 0
     mailbox_depth = 0
-    if num_heads >= 8 and num_heads % 8 == 0:
-        num_chunks = (sequence_length + 31) // 32
-        if task_count <= 8 and sequence_length >= 2048:
-            cluster_size = 8
-            mailbox_depth = min(num_chunks, 35)
-        elif task_count <= 32 and sequence_length >= 2048:
-            cluster_size = 4
-            mailbox_depth = min(num_chunks, 30)
+    varlen_helpers_supported = fixed_layout or compute_capability == (10, 0)
+    if varlen_helpers_supported and num_heads >= 8 and num_heads % 8 == 0:
+        average_num_chunks = (average_sequence_length + 31) // 32
+        if average_sequence_length >= 2048:
+            # Architecture-specific cold-L2 forced-route sweeps are recorded
+            # in docs/notes/kda_k1_parallelism_validation.md.
+            if compute_capability == (10, 0):
+                if task_count <= 8:
+                    cluster_size = 4
+                    mailbox_depth = min(average_num_chunks, 15)
+                elif task_count <= 32:
+                    cluster_size = 4
+                    mailbox_depth = min(average_num_chunks, 30)
+            elif task_count <= 8:
+                cluster_size = 4
+                mailbox_depth = min(average_num_chunks, 30)
+            elif task_count <= 32:
+                cluster_size = 4
+                mailbox_depth = min(average_num_chunks, 45)
     if cluster_size:
         return "m128_k1_parallel", cluster_size, mailbox_depth
+    if not fixed_layout:
+        return "m128", 0, 0
     if num_heads >= 8 and num_heads % 8 == 0 and 2 * task_count <= sm_count:
         return "m64", 0, 0
     return "m128", 0, 0

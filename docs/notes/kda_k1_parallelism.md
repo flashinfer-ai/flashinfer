@@ -1,37 +1,49 @@
-# CAKE KDA K1 parallelism on B200
+# CAKE KDA K1 parallelism on B200 and B300
 
 This optimization keeps the fused CAKE chunk-32 K1 and ordered K2 recurrence,
-but gives under-filled fixed-length B200 grids additional CTAs for independent
-K1 chunk preparation. One owner CTA retains recurrent state and consumes
-chunks in token order. Helper CTAs produce K1 operand packets out of order and
-publish them through a generation-tagged bounded ring mailbox.
+but gives under-filled B200/B300 grids additional CTAs for independent K1
+chunk preparation. One owner CTA retains recurrent state and consumes chunks
+in token order. Helper CTAs produce K1 operand packets out of order and publish
+them through a release/acquire synchronized bounded ring mailbox. B200 packed
+varlen inputs use the same protocol without a host synchronization.
 
 ## Dispatch policy
 
 The route is intentionally conservative and falls back to the existing M64 or
 M128 kernel outside measured profitable regions.
 
-| Batch-head tasks | Route | K1 parallelism | Minimum length |
-| ---: | --- | ---: | ---: |
-| 1-8 | C8 owner/helper | 1 owner + 7 helpers | 2048 |
-| 9-32 | C4 owner/helper | 1 owner + 3 helpers | 2048 |
-| other | exact M64/M128 oracle fallback | unchanged | N/A |
+| Device | Layout | Batch-head tasks | Route | Minimum length |
+| --- | --- | ---: | --- | ---: |
+| B200/GB200 | fixed or packed | 1-8 | C4, depth 15 | 2048 |
+| B200/GB200 | fixed or packed | 9-32 | C4, depth 30 | 2048 |
+| B300/GB300 | fixed | 1-8 | C4, depth 30 | 2048 |
+| B300/GB300 | fixed | 9-32 | C4, depth 45 | 2048 |
+| either | other | other | exact baseline fallback | N/A |
 
 M64 is selected while `2 * batch * heads <= SM count`; otherwise M128 is the
-fallback. Packed varlen input and CC 10.3 continue to use the existing M128
-path. The helper implementation also requires at least eight heads and a head
-count divisible by eight because of the generated beta TMA layout.
+fixed-layout fallback. Outside the enabled B200 helper region, packed varlen
+input falls back to M128. For packed B200 input, the minimum length is the
+host-known integer average `total_tokens / num_sequences`; dispatch never
+copies `cu_seqlens` to the CPU.
+This deliberately conservative rule can leave a highly skewed, low-average
+batch on M128, but it cannot introduce a device-to-host synchronization or
+make graph capture depend on device data. Packed B300 remains on M128 until it
+is independently tuned and validated. The helper implementation also requires
+at least eight heads and a head count divisible by eight because of the
+generated beta TMA layout.
 
-Each helper CTA contains five K1 preparation instances. C8 therefore exposes
-35 concurrent instances, or about seven times the K1 producer capacity of the
-original five-instance M128 CTA. This is not a sevenfold end-to-end speedup:
-ordered K2 recurrence and the 31,520-byte packet handoff remain serial or
-bandwidth limits.
+Each helper CTA contains five K1 preparation instances. C4 therefore exposes
+15 concurrent helper instances in addition to the owner's original five. C8
+can expose 35 helper instances, but cold-L2 B200 and B300 sweeps found that its
+larger grid costs more than the extra K1 capacity saves. C8 remains a supported
+forced benchmark configuration, not a public dispatch choice. Ordered K2
+recurrence and the 31,520-byte packet handoff remain serial or bandwidth
+limits.
 
 ## Validation required before an upstream PR
 
-Run on a B200 with the exact pushed commit and record CUDA, PyTorch, Python,
-GPU, and driver versions:
+Run on B200 and B300 with the exact pushed commit and record CUDA, PyTorch,
+Python, GPU, and driver versions:
 
 1. `pytest tests/jit/test_flash_kda_jit.py -q`
 2. targeted recurrent-KDA prefill correctness, routing, non-default stream,
