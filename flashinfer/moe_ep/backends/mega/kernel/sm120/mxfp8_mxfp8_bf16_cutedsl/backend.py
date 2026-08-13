@@ -48,9 +48,7 @@ def _resolve_gate_up_clamp(
 
 @register_mega_kernel("sm120_mxfp8_mxfp8_bf16_cutedsl")
 class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
-    def __init__(
-        self, config: Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    ) -> None:
+    def __init__(self, config: Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
         if config.in_kernel_fc2_reduce:

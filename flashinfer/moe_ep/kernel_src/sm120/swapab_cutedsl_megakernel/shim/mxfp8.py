@@ -144,8 +144,7 @@ class MegaMoESm120Mxfp8Config:
         # and the swap-AB register interleave of 8 divides evenly).
         if self.hidden % _MXFP8_BLOCK_SIZE != 0:
             raise ValueError(
-                f"hidden must be a multiple of {_MXFP8_BLOCK_SIZE}, "
-                f"got {self.hidden}."
+                f"hidden must be a multiple of {_MXFP8_BLOCK_SIZE}, got {self.hidden}."
             )
         if self.intermediate % _MXFP8_BLOCK_SIZE != 0:
             raise ValueError(
@@ -493,9 +492,7 @@ class MegaMoESm120Mxfp8Frontend:
                     "re-audit staging-buffer shapes and weight preprocessing."
                 )
 
-    def _ensure_mega_compiled(
-        self, inputs: MegaMoESm120Mxfp8Inputs
-    ) -> _CompiledMega:
+    def _ensure_mega_compiled(self, inputs: MegaMoESm120Mxfp8Inputs) -> _CompiledMega:
         key = self._mega_compile_key()
         if self._mega is not None and self._mega_key == key:
             return self._mega
@@ -587,9 +584,7 @@ class MegaMoESm120Mxfp8Frontend:
         # Per-expert epilogue args.  The drop's kernel currently ignores them;
         # all-ones keeps the math neutral if a future drop wires them through
         # (runner ``_init_global_scales_and_norm`` pins exactly this).
-        ones = torch.ones(
-            (c.num_experts_per_rank,), dtype=torch.float32, device="cuda"
-        )
+        ones = torch.ones((c.num_experts_per_rank,), dtype=torch.float32, device="cuda")
         mega = _CompiledMega(
             compiled=None,
             kernel=kernel,
@@ -1005,7 +1000,9 @@ def get_symm_buffer_for_sm120_mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     in_kernel_fc2_reduce: bool = False,
-    token_back_mode: str = "epi_warps",
+    token_back_mode: Literal[
+        "epi_warps", "standalone_warps", "reuse_dispatch_warps"
+    ] = "epi_warps",
     knobs: Optional[dict] = None,
 ) -> MegaMoESm120Mxfp8SymmBuffer:
     """Allocate symmetric-heap inputs for one SM120 MXFP8 MegaMoE session.
