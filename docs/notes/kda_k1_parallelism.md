@@ -15,8 +15,6 @@ M128 kernel outside measured profitable regions.
 | ---: | --- | ---: | ---: |
 | 1-8 | C8 owner/helper | 1 owner + 7 helpers | 1024 |
 | 9-32 | C4 owner/helper | 1 owner + 3 helpers | 1024 |
-| 33-56 | global helper pool when M64 fits one wave | fill idle B200 SMs | 4096 |
-| 57-64 | global helper pool when M64 fits one wave | fill idle B200 SMs | 8192 |
 | other | exact M64/M128 oracle fallback | unchanged | N/A |
 
 M64 is selected while `2 * batch * heads <= SM count`; otherwise M128 is the
@@ -38,9 +36,10 @@ GPU, and driver versions:
 1. `pytest tests/jit/test_flash_kda_jit.py -q`
 2. targeted recurrent-KDA prefill correctness, routing, non-default stream,
    and CUDA graph tests in `tests/kda/test_recurrent_kda_prefill.py`
-3. focused C8, C4, global-pool, M64-fallback, and M128-fallback cases under
+3. focused C8, C4, M64-fallback, and M128-fallback cases under
    `compute-sanitizer --tool memcheck`
-4. the same focused cases under `compute-sanitizer --tool synccheck`
+4. focused C8, C4, M64-fallback, and M128-fallback cases under
+   `compute-sanitizer --tool synccheck`
 5. `pre-commit run --all-files`
 6. a cold-L2 CUPTI table against both M64 and M128 for every benchmark shape;
    report speedup against `min(M64, M128)`, not against only one baseline

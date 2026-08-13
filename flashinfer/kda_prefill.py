@@ -279,17 +279,6 @@ def _select_flash_kda_prefill_variant(
         elif task_count <= 32 and sequence_length >= 1024:
             cluster_size = 4
             mailbox_depth = min(num_chunks, 30)
-        elif (
-            33 <= task_count <= 56
-            and sequence_length >= 4096
-            and 2 * task_count <= sm_count
-        ) or (
-            57 <= task_count <= 64
-            and sequence_length >= 8192
-            and 2 * task_count <= sm_count
-        ):
-            cluster_size = -sm_count
-            mailbox_depth = min(num_chunks, 20)
     if cluster_size:
         return "m128_k1_parallel", cluster_size, mailbox_depth
     if num_heads >= 8 and num_heads % 8 == 0 and 2 * task_count <= sm_count:

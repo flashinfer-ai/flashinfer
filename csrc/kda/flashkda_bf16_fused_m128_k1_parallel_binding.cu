@@ -80,8 +80,7 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   if (store_final_state != 0) {
     CheckNoOverlap(k1_workspace, "k1_workspace", final_state, "final_state");
   }
-  TVM_FFI_ICHECK(cluster_size == 4 || cluster_size == 8 || cluster_size < 0)
-      << "cluster_size must be C4, C8, or a negative global-pool CTA count";
+  TVM_FFI_ICHECK(cluster_size == 4 || cluster_size == 8) << "cluster_size must be C4 or C8";
   TVM_FFI_ICHECK(mailbox_depth > 0 && mailbox_depth <= std::numeric_limits<int32_t>::max())
       << "mailbox_depth must be in the positive int32 range";
   TVM_FFI_ICHECK(num_heads >= 8 && num_heads % 8 == 0)

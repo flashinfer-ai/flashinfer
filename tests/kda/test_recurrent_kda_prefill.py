@@ -368,8 +368,8 @@ def test_frozen_route_and_ffi_abi(
     [
         (1, 8, 1024, ("m128_k1_parallel", 8, 32)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
-        (1, 48, 4096, ("m128_k1_parallel", -148, 20)),
-        (1, 64, 8192, ("m128_k1_parallel", -148, 20)),
+        (1, 48, 4096, ("m64", 0, 0)),
+        (1, 64, 8192, ("m64", 0, 0)),
         (1, 64, 4096, ("m64", 0, 0)),
         (1, 72, 8192, ("m64", 0, 0)),
         (1, 80, 8192, ("m128", 0, 0)),
@@ -1028,39 +1028,6 @@ def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_he
     torch.testing.assert_close(
         actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
-
-
-def test_k1_parallel_global_pool_matches_m64(flash_kda_device, monkeypatch):
-    if get_compute_capability(flash_kda_device) != (10, 0):
-        pytest.skip("K1 owner/helper prefill is tuned for B200/GB200")
-    inputs = _make_inputs(
-        seq_lens=[4096],
-        num_heads=40,
-        packed=False,
-        initial_state=True,
-        seed=9040,
-    )
-    initial_state = inputs["initial_state"].clone()
-    parallel_output, parallel_state = recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=torch.empty_like(inputs["q"]),
-        output_final_state=True,
-    )
-
-    inputs["initial_state"] = initial_state
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_select_flash_kda_prefill_variant",
-        lambda **kwargs: ("m64", 0, 0),
-    )
-    baseline_output, baseline_state = recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=torch.empty_like(inputs["q"]),
-        output_final_state=True,
-    )
-
-    torch.testing.assert_close(parallel_output, baseline_output, atol=0, rtol=0)
-    torch.testing.assert_close(parallel_state, baseline_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
