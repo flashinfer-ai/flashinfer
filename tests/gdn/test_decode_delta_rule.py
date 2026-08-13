@@ -1271,7 +1271,8 @@ def test_verify_kernel_mtp(
 # ============================================================================
 
 
-@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+# T >= 3 all select the same tile config, so 3/5/6/7 only re-specialize on T.
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
 # One B per get_mtp_config bucket.
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 64])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -1288,8 +1289,8 @@ def test_mtp_fp32_state_with_cache_and_state_update(
     - FP32 h state (not bf16)
     - cache_intermediate_states=True
     - disable_state_update=False (h is updated)
-    - All batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
-    - All sequence lengths: 2, 3, 4, 5, 6, 7, 8
+    - One batch size per get_mtp_config bucket: 1, 4, 8, 16, 64
+    - Sequence lengths 2, 4, 8 (T>=3 shares one tile config)
     """
     scale_val = 1.0 / math.sqrt(128)  # head_size=128
     _test_verify_kernel_mtp(
@@ -2346,7 +2347,8 @@ except ImportError:
 
 @pytest.mark.parametrize("tile_v", [32, 64, 128])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
-@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+# T >= 3 all select the same tile config, so 3/5/6/7 only re-specialize on T.
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
