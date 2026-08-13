@@ -130,21 +130,24 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     ]
 
 
-def test_run_ninja_uses_ninja_default_when_max_jobs_is_invalid(monkeypatch, tmp_path):
+@pytest.mark.parametrize("max_jobs", ["auto", "0", "-1"])
+def test_run_ninja_applies_memory_cap_when_max_jobs_is_invalid(
+    monkeypatch, tmp_path, max_jobs
+):
     commands = []
 
     def fake_run(command, **kwargs):
         commands.append(command)
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setenv("MAX_JOBS", "auto")
+    monkeypatch.setenv("MAX_JOBS", max_jobs)
     monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 31.0)
-    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext, "_get_available_cpu_count", lambda: 20)
     monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
 
-    assert "-j" not in commands[0]
+    assert commands[0][-2:] == ["-j", "3"]
 
 
 def test_get_available_memory_prefers_linux_mem_available(monkeypatch):
@@ -156,6 +159,7 @@ def test_get_available_memory_prefers_linux_mem_available(monkeypatch):
 
     monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: meminfo)
     monkeypatch.setattr(cpp_ext, "_get_total_memory_gib", lambda: 1.0)
+    monkeypatch.setattr(cpp_ext, "_get_cgroup_memory_available_gib", lambda: None)
 
     assert cpp_ext._get_available_memory_gib() == 100.0
 
@@ -163,8 +167,88 @@ def test_get_available_memory_prefers_linux_mem_available(monkeypatch):
 def test_get_available_memory_falls_back_to_total_memory(monkeypatch):
     monkeypatch.setattr(cpp_ext, "_get_linux_mem_available_gib", lambda: None)
     monkeypatch.setattr(cpp_ext, "_get_total_memory_gib", lambda: 64.0)
+    monkeypatch.setattr(cpp_ext, "_get_cgroup_memory_available_gib", lambda: None)
 
     assert cpp_ext._get_available_memory_gib() == 64.0
+
+
+def test_get_cgroup_memory_available_v2(monkeypatch):
+    values = {
+        "/sys/fs/cgroup/memory.max": "21474836480\n",
+        "/sys/fs/cgroup/memory.current": "5368709120\n",
+    }
+
+    monkeypatch.setattr(
+        cpp_ext,
+        "_get_cgroup_memory_paths",
+        lambda: [("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current")],
+    )
+    monkeypatch.setattr("builtins.open", lambda path: io.StringIO(values[str(path)]))
+
+    assert cpp_ext._get_cgroup_memory_available_gib() == 15.0
+
+
+def test_get_cgroup_memory_available_uses_inherited_v2_limit(monkeypatch):
+    paths = [
+        (
+            "/sys/fs/cgroup/workload/leaf/memory.max",
+            "/sys/fs/cgroup/workload/leaf/memory.current",
+        ),
+        (
+            "/sys/fs/cgroup/workload/memory.max",
+            "/sys/fs/cgroup/workload/memory.current",
+        ),
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+    ]
+    values = {
+        paths[0][0]: "max\n",
+        paths[1][0]: "21474836480\n",
+        paths[1][1]: "5368709120\n",
+        paths[2][0]: "max\n",
+    }
+
+    monkeypatch.setattr(cpp_ext, "_get_cgroup_memory_paths", lambda: paths)
+    monkeypatch.setattr("builtins.open", lambda path: io.StringIO(values[str(path)]))
+
+    assert cpp_ext._get_cgroup_memory_available_gib() == 15.0
+
+
+def test_get_cgroup_memory_paths_include_v2_ancestors(monkeypatch):
+    cgroup = io.StringIO("0::/workload/leaf\n")
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: cgroup)
+
+    assert cpp_ext._get_cgroup_memory_paths()[:3] == [
+        (
+            "/sys/fs/cgroup/workload/leaf/memory.max",
+            "/sys/fs/cgroup/workload/leaf/memory.current",
+        ),
+        (
+            "/sys/fs/cgroup/workload/memory.max",
+            "/sys/fs/cgroup/workload/memory.current",
+        ),
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+    ]
+
+
+def test_get_cgroup_memory_available_v1_and_clamps_usage(monkeypatch):
+    paths = (
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    )
+    values = {paths[0]: "10737418240\n", paths[1]: "11811160064\n"}
+
+    monkeypatch.setattr(cpp_ext, "_get_cgroup_memory_paths", lambda: [paths])
+    monkeypatch.setattr("builtins.open", lambda path: io.StringIO(values[str(path)]))
+
+    assert cpp_ext._get_cgroup_memory_available_gib() == 0.0
+
+
+def test_get_available_memory_honors_cgroup_limit(monkeypatch):
+    monkeypatch.setattr(cpp_ext, "_get_linux_mem_available_gib", lambda: 100.0)
+    monkeypatch.setattr(cpp_ext, "_get_total_memory_gib", lambda: 128.0)
+    monkeypatch.setattr(cpp_ext, "_get_cgroup_memory_available_gib", lambda: 15.0)
+
+    assert cpp_ext._get_available_memory_gib() == 15.0
 
 
 def test_run_ninja_limits_jobs_when_available_memory_is_low(monkeypatch, tmp_path):
@@ -176,7 +260,7 @@ def test_run_ninja_limits_jobs_when_available_memory_is_low(monkeypatch, tmp_pat
 
     monkeypatch.delenv("MAX_JOBS", raising=False)
     monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 31.0)
-    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext, "_get_available_cpu_count", lambda: 20)
     monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
@@ -204,7 +288,7 @@ def test_run_ninja_uses_ninja_default_when_memory_is_unknown(monkeypatch, tmp_pa
 
     monkeypatch.delenv("MAX_JOBS", raising=False)
     monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: None)
-    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext, "_get_available_cpu_count", lambda: 20)
     monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
@@ -223,7 +307,27 @@ def test_run_ninja_uses_ninja_default_when_memory_supports_all_cpus(
 
     monkeypatch.delenv("MAX_JOBS", raising=False)
     monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 128.0)
-    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(cpp_ext, "_get_available_cpu_count", lambda: 8)
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    assert "-j" not in commands[0]
+
+
+def test_run_ninja_respects_cpu_affinity_when_memory_supports_more_jobs(
+    monkeypatch, tmp_path
+):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 31.0)
+    monkeypatch.setattr(cpp_ext.os, "sched_getaffinity", lambda _pid: {2, 3})
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
     monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)

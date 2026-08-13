@@ -372,24 +372,121 @@ def _get_total_memory_gib() -> Optional[float]:
     return pages * page_size / (1024**3)
 
 
+def _get_cgroup_memory_paths() -> List[tuple[str, str]]:
+    """Return limit and usage files from the current cgroup to its root."""
+    cgroup_files = []
+
+    def add_hierarchy(
+        root: Path, cgroup_path: str, limit_name: str, usage_name: str
+    ) -> None:
+        relative_parts = [part for part in cgroup_path.split("/") if part]
+        if ".." in relative_parts:
+            return
+
+        current = root.joinpath(*relative_parts)
+        while True:
+            cgroup_files.append((str(current / limit_name), str(current / usage_name)))
+            if current == root:
+                break
+            current = current.parent
+
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                _hierarchy, controllers, cgroup_path = line.strip().split(":", 2)
+                if not controllers:
+                    add_hierarchy(
+                        Path("/sys/fs/cgroup"),
+                        cgroup_path,
+                        "memory.max",
+                        "memory.current",
+                    )
+                elif "memory" in controllers.split(","):
+                    add_hierarchy(
+                        Path("/sys/fs/cgroup/memory"),
+                        cgroup_path,
+                        "memory.limit_in_bytes",
+                        "memory.usage_in_bytes",
+                    )
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    cgroup_files.extend(
+        (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            ),
+        )
+    )
+
+    return list(dict.fromkeys(cgroup_files))
+
+
+def _get_cgroup_memory_available_gib() -> Optional[float]:
+    """Return the tightest available-memory estimate in the cgroup hierarchy."""
+    available_estimates = []
+    for limit_path, usage_path in _get_cgroup_memory_paths():
+        try:
+            with open(limit_path) as f:
+                limit = f.read().strip()
+            if limit == "max":
+                continue
+            with open(usage_path) as f:
+                usage = f.read().strip()
+            available_bytes = max(0, int(limit) - int(usage))
+            available_estimates.append(available_bytes / (1024**3))
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+
+    return min(available_estimates) if available_estimates else None
+
+
 def _get_available_memory_gib() -> Optional[float]:
     """Return the best memory estimate for choosing ninja parallelism."""
-    mem_available_gib = _get_linux_mem_available_gib()
-    if mem_available_gib is not None:
-        return mem_available_gib
-    return _get_total_memory_gib()
+    system_available_gib = _get_linux_mem_available_gib()
+    if system_available_gib is None:
+        system_available_gib = _get_total_memory_gib()
+
+    cgroup_available_gib = _get_cgroup_memory_available_gib()
+    estimates = [
+        value
+        for value in (system_available_gib, cgroup_available_gib)
+        if value is not None
+    ]
+    return min(estimates) if estimates else None
+
+
+def _get_available_cpu_count() -> Optional[int]:
+    """Return the process CPU allowance, accounting for affinity when available."""
+    try:
+        affinity_count = len(os.sched_getaffinity(0))
+        if affinity_count > 0:
+            return affinity_count
+    except (AttributeError, OSError):
+        pass
+
+    return os.cpu_count()
 
 
 def _get_num_workers() -> Optional[int]:
     """Return a ninja worker cap, or None to use ninja's default."""
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None:
-        if max_jobs.isdigit():
-            return int(max_jobs)
-        logger.warning("Ignoring invalid MAX_JOBS=%r; using ninja default.", max_jobs)
-        return None
+        try:
+            max_jobs_value = int(max_jobs)
+        except ValueError:
+            max_jobs_value = 0
+        if max_jobs_value >= 1:
+            return max_jobs_value
+        logger.warning(
+            "Ignoring invalid MAX_JOBS=%r; value must be a positive integer. "
+            "Applying automatic parallelism limits.",
+            max_jobs,
+        )
 
-    cpu_count = os.cpu_count()
+    cpu_count = _get_available_cpu_count()
     available_gib = _get_available_memory_gib()
     if cpu_count is None or available_gib is None:
         return None
