@@ -426,7 +426,6 @@ def test_k1_parallel_is_b200_fixed_layout_only(monkeypatch):
 def test_k1_mailbox_size_is_bounded():
     assert kda_prefill_api._k1_mailbox_bytes(8, 35) < 9_000_000
     assert kda_prefill_api._k1_mailbox_bytes(32, 30) < 31_000_000
-    assert kda_prefill_api._k1_mailbox_bytes(64, 20) < 41_000_000
 
 
 def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):

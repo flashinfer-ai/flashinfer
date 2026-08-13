@@ -119,21 +119,20 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   CheckCuda(cudaMemsetAsync(flags, 0, packet_count * sizeof(uint32_t), stream),
             "cudaMemsetAsync(K1 mailbox flags)");
 
-  const bool global_pool = cluster_size < 0;
-  const int64_t grid_x_i64 = global_pool ? -cluster_size : num_tasks * cluster_size;
+  const int64_t grid_x_i64 = num_tasks * cluster_size;
   TVM_FFI_ICHECK(grid_x_i64 > 0 && grid_x_i64 <= std::numeric_limits<uint32_t>::max())
       << "K1-parallel FlashKDA grid.x is out of range: " << grid_x_i64;
 
   cudaLaunchAttribute attribute{};
   attribute.id = cudaLaunchAttributeClusterDimension;
-  attribute.val.clusterDim = {global_pool ? 1u : static_cast<uint32_t>(cluster_size), 1u, 1u};
+  attribute.val.clusterDim = {static_cast<uint32_t>(cluster_size), 1u, 1u};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<uint32_t>(grid_x_i64), 1, 1);
   config.blockDim = dim3(THREADS, 1, 1);
   config.dynamicSmemBytes = kSmemBytes;
   config.stream = stream;
-  config.attrs = global_pool ? nullptr : &attribute;
-  config.numAttrs = global_pool ? 0 : 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
 
   CheckCuda(
       cudaLaunchKernelEx(
