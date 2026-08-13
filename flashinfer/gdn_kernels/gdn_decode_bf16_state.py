@@ -47,7 +47,7 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from .device_target import gdn_compile_options, gdn_device_target
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
@@ -2853,8 +2853,11 @@ def _bf16_state_kernel_name(variant: str, cache_key: tuple) -> str:
     ``variant`` distinguishes the compiled entry points sharing this module
     ("wide_vec", "wide_vec_t1", "mtp_ilp4"); ``cache_key`` is the in-process
     cache tuple, which already encodes every parameter that affects codegen.
+    Its last component is the compile target, of which only the arch names an
+    artifact.
     """
-    return make_kernel_name(variant, *cache_key)
+    *codegen, target_key = cache_key
+    return make_kernel_name(variant, target_arch(target_key), *codegen)
 
 
 def _dtype_key(
@@ -3193,7 +3196,7 @@ def gated_delta_rule_mtp_wide_vec(
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3483,7 +3486,7 @@ def gated_delta_rule_t1_wide_vec(
         use_packed_fma,
         same_pool,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3869,7 +3872,7 @@ def gated_delta_rule_mtp(
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_mtp:

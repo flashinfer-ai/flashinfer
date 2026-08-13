@@ -37,7 +37,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.cute_dsl.utils import get_num_sm
 
-from ..device_target import gdn_compile_options, gdn_device_target
+from ..device_target import gdn_compile_options, gdn_device_target, target_arch
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..cute_dsl_cache_naming import make_kernel_name
@@ -65,7 +65,7 @@ def _kernel_source_files() -> tuple:
 
 
 def _prefill_kernel_name(
-    arch: str,
+    target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
@@ -88,7 +88,7 @@ def _prefill_kernel_name(
     which the compile below bakes in as ``max_active_clusters``.
     """
     return make_kernel_name(
-        arch,
+        target_arch(target_key),
         num_sm,
         io_dtype_str,
         state_dtype_str,
@@ -109,7 +109,7 @@ def _prefill_kernel_name(
 
 @functools.cache
 def _get_compiled_cache(
-    arch: str,
+    target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
@@ -265,7 +265,7 @@ def chunk_gated_delta_rule_sm100(
     target = gdn_device_target(q.device)
     num_sm = get_num_sm(q.device)
     cache_key = (
-        target.arch,
+        target.compile_key,
         num_sm,
         str(q.dtype),
         str(state_torch_dtype),

@@ -48,7 +48,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
-from .device_target import gdn_compile_options, gdn_device_target
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
 
 # ============================================================================
@@ -2506,6 +2506,7 @@ _CUTE_DSL_MODULE = "gdn_decode_mtp"
 
 def _mtp_kernel_name(
     variant: str,
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2524,13 +2525,13 @@ def _mtp_kernel_name(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
-    arch: str = "",
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
     codegen."""
     return make_kernel_name(
         variant,
+        target_arch(target_key),
         T,
         H,
         HV,
@@ -2549,12 +2550,12 @@ def _mtp_kernel_name(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
-        arch,
     )
 
 
 @functools.cache
 def _get_compiled_mtp_kernel(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2573,7 +2574,6 @@ def _get_compiled_mtp_kernel(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
-    arch: str = "",
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2581,6 +2581,7 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2599,7 +2600,6 @@ def _get_compiled_mtp_kernel_inline(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
-    arch: str = "",
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2697,6 +2697,7 @@ def run_mtp_decode(
 
     if use_inline_kernel:
         inline_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2715,11 +2716,11 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
-            target.arch,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
         warp_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2738,7 +2739,6 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
-            target.arch,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 

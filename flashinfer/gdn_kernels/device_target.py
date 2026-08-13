@@ -1,37 +1,73 @@
 """Per-device compile target and launch policy for the GDN CuTe-DSL kernels.
 
-The DSL resolves its default ``GPUArch`` from ``CUTE_DSL_ARCH`` or CUDA device 0,
-so kernels compiled for operands on another device could be built and tuned for
-the wrong GPU. Resolve one target from the operand device and use it for both the
-``cute.compile`` options and the compile-cache key so the two always agree.
+The DSL resolves its default ``GPUArch`` from ``CUTE_DSL_ARCH`` or CUDA device 0, so
+compile options have to name the operand's device or a kernel gets built for someone
+else's architecture. The compile-cache key names it for a separate reason, see
+:attr:`GdnDeviceTarget.compile_key`.
 """
 
 import functools
 import os
+import re
 from typing import NamedTuple, Union
 
 import cutlass.cute as cute
 import torch
 
+_ARCH_RE = re.compile(r"^sm_(\d+)(\d)[a-z]?$")
+
 
 class GdnDeviceTarget(NamedTuple):
     """Architecture and launch policy of a single CUDA device."""
 
+    device_index: int
     arch: str
     major: int
     minor: int
     num_sms: int
     use_packed_fma: bool
 
+    @property
+    def compile_key(self) -> tuple:
+        """Compile-cache identity.
+
+        The device index is part of it because these cache entries also hold
+        device-resident defaults that nothing else keys by device. The compiled
+        artifact itself is device agnostic from DSL 4.6.2 on: a TVM-FFI function's
+        ``to()`` returns itself, and ``CudaDialectJitCompiledFunction.to()`` ignores
+        its device argument and loads the cubin on every device.
+        """
+        return (self.device_index, self.arch)
+
+
+def target_arch(target_key: tuple) -> str:
+    """The arch component of :attr:`GdnDeviceTarget.compile_key`.
+
+    On-disk artifacts are per arch, so the device index -- which separates
+    in-process entries only -- must not reach a kernel's specialization name.
+    """
+    _device_index, arch = target_key
+    return arch
+
+
+def _arch_string(major: int, minor: int) -> str:
+    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+
 
 @functools.lru_cache(maxsize=None)
 def _resolve(device_index: int) -> GdnDeviceTarget:
     major, minor = torch.cuda.get_device_capability(device_index)
-    # CUTE_DSL_ARCH is the DSL's own cross-compile override; keep it authoritative.
+    # CUTE_DSL_ARCH is the DSL's own cross-compile override; an explicit GPUArch would
+    # otherwise beat it, so honor it here and derive the policy from it too.
     env_arch = os.environ.get("CUTE_DSL_ARCH")
-    suffix = "a" if major >= 9 else ""
+    if env_arch:
+        match = _ARCH_RE.match(env_arch)
+        if match is None:
+            raise ValueError(f"CUTE_DSL_ARCH is not a recognized arch: {env_arch!r}")
+        major, minor = int(match.group(1)), int(match.group(2))
     return GdnDeviceTarget(
-        arch=env_arch or f"sm_{major}{minor}{suffix}",
+        device_index=device_index,
+        arch=env_arch or _arch_string(major, minor),
         major=major,
         minor=minor,
         num_sms=torch.cuda.get_device_properties(device_index).multi_processor_count,
@@ -41,10 +77,12 @@ def _resolve(device_index: int) -> GdnDeviceTarget:
 
 def gdn_device_target(device: Union[str, torch.device]) -> GdnDeviceTarget:
     """Resolve the compile target from an operand's device."""
-    d = torch.device(device)
-    if d.type != "cuda":
-        raise ValueError(f"GDN CuTe-DSL kernels require CUDA tensors, got {d}")
-    return _resolve(torch.cuda.current_device() if d.index is None else d.index)
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"GDN CuTe-DSL kernels require CUDA tensors, got {device}")
+    index = device.index
+    return _resolve(torch.cuda.current_device() if index is None else index)
 
 
 @functools.lru_cache(maxsize=None)
@@ -61,4 +99,9 @@ def gdn_compile_options(device: Union[str, torch.device], *extra) -> tuple:
     return _arch_options(gdn_device_target(device).arch) + tuple(extra)
 
 
-__all__ = ["GdnDeviceTarget", "gdn_compile_options", "gdn_device_target"]
+__all__ = [
+    "GdnDeviceTarget",
+    "gdn_compile_options",
+    "gdn_device_target",
+    "target_arch",
+]

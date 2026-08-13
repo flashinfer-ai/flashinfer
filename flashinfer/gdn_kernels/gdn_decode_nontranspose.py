@@ -31,7 +31,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
-from .device_target import gdn_compile_options, gdn_device_target
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
 
 # ============================================================================
 # Constants for NONTRANSPOSE version ([pool, HV, K, V])
@@ -683,7 +683,7 @@ _CUTE_DSL_MODULE = "gdn_decode_nontranspose"
 
 
 def _nontranspose_kernel_name(
-    arch: str,
+    target_key: tuple,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -697,7 +697,7 @@ def _nontranspose_kernel_name(
     """Specialization name within the gdn_decode_nontranspose module, encoding
     every parameter that affects codegen."""
     return make_kernel_name(
-        arch,
+        target_arch(target_key),
         "small" if use_small_batch else "big",
         T,
         H,
@@ -712,7 +712,7 @@ def _nontranspose_kernel_name(
 
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
-    arch: str,
+    target_key: tuple,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -760,7 +760,7 @@ def run_nontranspose_decode(
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
     target = gdn_device_target(q.device)
     cache_key = (
-        target.arch,
+        target.compile_key,
         use_small_batch,
         T,
         H,
