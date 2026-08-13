@@ -3799,6 +3799,188 @@ cute_dsl_moe_wrapper_run_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
+# CuteDSL MoE, MXFP8 activations x MXFP4 weights (SM100+)
+# ---------------------------------------------------------------------------
+
+cute_dsl_fused_moe_mxfp8_mxfp4_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_fused_moe_mxfp8_mxfp4",
+    description=(
+        "CuteDSL MXFP8 activation x MXFP4 weight fused MoE (SM100/SM103). "
+        "Takes precomputed top-k routing, E4M3 activations with linear block-32 "
+        "E8M0 scales, and packed E2M1 weights with MMA-layout E8M0 scales."
+    ),
+    axes={
+        "num_tokens": Var(description="Total tokens across the batch."),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk"),
+        "num_local_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "intermediate_size": Var(description="MoE intermediate size."),
+        "num_packed_hidden": Var(description="hidden_size // 2 (MXFP4 packed)."),
+        "num_packed_intermediate": Var(
+            description="intermediate_size // 2 (MXFP4 packed)."
+        ),
+        "num_mx_hidden_blocks": Var(description="hidden_size // 32 activation scales."),
+        "gemm1_out_size": Const(
+            abbrev="",
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated SwiGLU, "
+                "intermediate_size for non-gated ReLU^2."
+            ),
+        ),
+        "w1_sf_dim0": Var(description="MMA scale-factor layout mode 0 (always 32)."),
+        "w1_sf_dim1": Var(description="MMA scale-factor layout mode 1 (always 4)."),
+        "w1_sf_dim2": Var(description="ceil(gemm1_out_size / 128)."),
+        "w1_sf_dim3": Var(description="MMA scale-factor layout mode 3 (always 4)."),
+        "w1_sf_dim4": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_dim2": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_dim4": Var(description="ceil(intermediate_size / 128)."),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="float8_e4m3fn",
+            description="MXFP8 activations.",
+        ),
+        "x_sf": Tensor(
+            ["num_tokens", "num_mx_hidden_blocks"],
+            dtype="uint8",
+            description="Linear block-32 E8M0 activation scale bytes.",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            dtype="uint8",
+            description="FC1 weights, two packed E2M1 values per byte.",
+        ),
+        "w1_weight_sf": Tensor(
+            [
+                "w1_sf_dim0",
+                "w1_sf_dim1",
+                "w1_sf_dim2",
+                "w1_sf_dim3",
+                "w1_sf_dim4",
+                "num_local_experts",
+            ],
+            dtype="uint8",
+            description="FC1 E8M0 scales in the block-32 MMA layout.",
+        ),
+        "w1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC1 global scale.",
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            dtype="uint8",
+            description="FC2 weights, two packed E2M1 values per byte.",
+        ),
+        "w2_weight_sf": Tensor(
+            [
+                "w1_sf_dim0",
+                "w1_sf_dim1",
+                "w2_sf_dim2",
+                "w1_sf_dim3",
+                "w2_sf_dim4",
+                "num_local_experts",
+            ],
+            dtype="uint8",
+            description="FC2 E8M0 scales in the block-32 MMA layout.",
+        ),
+        "w2_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC2 global scale.",
+        ),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32", description="Number of experts per token."),
+        "num_local_experts": Scalar(
+            "int32", optional=True, description="Experts owned by this rank."
+        ),
+        "local_expert_offset": Scalar(
+            "int32", optional=True, description="Offset of local experts."
+        ),
+        "activation_type": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "GEMM1 activation type: ActivationType.Swiglu for gated "
+                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
+                "Determines gemm1_out_size."
+            ),
+        ),
+        "swiglu_alpha": Scalar(
+            "float32", optional=True, description="SwiGLU sigmoid multiplier."
+        ),
+        "swiglu_beta": Scalar(
+            "float32", optional=True, description="SwiGLU up-projection bias."
+        ),
+        "swiglu_limit": Scalar(
+            "float32", optional=True, description="SwiGLU clamp limit."
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "quantization:mxfp4"],
+)
+
+_cute_dsl_mxfp8_mxfp4_wrapper_inputs = dict(cute_dsl_fused_moe_mxfp8_mxfp4_trace.inputs)
+# These are configured on the wrapper instance in __init__, not on run().
+for _wrapper_only_scalar, _wrapper_only_dtype in (
+    ("num_experts", "int32"),
+    ("top_k", "int32"),
+    ("num_local_experts", "int32"),
+    ("local_expert_offset", "int32"),
+    ("activation_type", "int32"),
+    ("swiglu_alpha", "float32"),
+    ("swiglu_beta", "float32"),
+    ("swiglu_limit", "float32"),
+):
+    _cute_dsl_mxfp8_mxfp4_wrapper_inputs[_wrapper_only_scalar] = Scalar(
+        _wrapper_only_dtype,
+        optional=True,
+        description="Set at wrapper __init__, not passed to run().",
+    )
+
+_cute_dsl_mxfp8_mxfp4_wrapper_axes = dict(cute_dsl_fused_moe_mxfp8_mxfp4_trace.axes)
+# No tensor on run() carries a num_experts or top_k dim once the scalars move
+# to __init__, so both axes have to be free variables here.
+_cute_dsl_mxfp8_mxfp4_wrapper_axes["num_experts"] = Var(
+    description="Total number of experts."
+)
+_cute_dsl_mxfp8_mxfp4_wrapper_axes["top_k"] = Var(description="Experts per token.")
+
+cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_mxfp8_mxfp4_moe_wrapper",
+    description=(
+        "CuteDslMxfp8Mxfp4MoEWrapper.run(): stateful version of "
+        "cute_dsl_fused_moe_mxfp8_mxfp4 (same schema; the wrapper persists "
+        "workspace and autotuning state across calls)."
+    ),
+    axes=_cute_dsl_mxfp8_mxfp4_wrapper_axes,
+    inputs=_cute_dsl_mxfp8_mxfp4_wrapper_inputs,
+    outputs=dict(cute_dsl_fused_moe_mxfp8_mxfp4_trace.outputs),
+    tags=cute_dsl_fused_moe_mxfp8_mxfp4_trace.tags,
+)
+
+
+# ---------------------------------------------------------------------------
 # B12x MoE (SM120/SM121 CuTe-DSL, bf16 input + FP4 packed weights)
 # ---------------------------------------------------------------------------
 

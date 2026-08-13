@@ -28,7 +28,7 @@ This module wraps the TensorRT-LLM CuteDSL grouped GEMM kernel for MoE GEMM2:
 - Output C: finalized token rows or unfinalized expanded token/top-k rows
 
 Key features:
-- NVFP4 x NVFP4 grouped GEMM with FP8 scale factors
+- NVFP4 x NVFP4 or MXFP8 x MXFP4 grouped GEMM with FP8 scale factors
 - Optional fused finalize operation in epilogue:
   a) Map permuted rows to (token_idx, topk_idx) using permuted_idx_to_expanded_idx
   b) Apply router scale: scaled_output = gemm_output * token_final_scales[token_idx, topk_idx]
@@ -187,13 +187,18 @@ def _get_compiled_finalize_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
+    a_dtype: type,
+    b_dtype: type,
+    sf_dtype: type,
+    out_dtype: type,
+    final_scale_dtype: type,
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
@@ -202,13 +207,18 @@ def _get_compiled_finalize_kernel(
     """
     global _finalize_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
+    # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
     cache_key = (
         sf_vec_size,
         tile_size,
         mma_tiler_mn,
         cluster_shape_mn,
         raster_along_m,
+        a_dtype,
+        b_dtype,
+        sf_dtype,
+        out_dtype,
+        final_scale_dtype,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
@@ -265,7 +275,7 @@ def _get_compiled_finalize_kernel(
     return _finalize_kernel_cache[cache_key]
 
 
-def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -279,7 +289,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     out: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
-    ab_dtype: str = "float4_e2m1fn",
+    a_dtype: str,
+    b_dtype: str,
     sf_dtype: str = "float8_e4m3fn",
     out_dtype: str = "bfloat16",
     sf_vec_size: int = 16,
@@ -314,7 +325,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              NVFP4 quantizer instead of the fused GEMM1 epilogue.
-        ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
+        a_dtype: Data type for the A matrix.
+        b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
         sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
@@ -375,8 +387,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     num_experts = b.shape[0]
     n = b.shape[1]
     k = a.shape[1]
-    if ab_dtype == "float4_e2m1fn":
+    if a_dtype == "float4_e2m1fn":
         k = k * 2  # FP4 is packed 2 elements per byte
+    b_k = b.shape[2]
+    if b_dtype == "float4_e2m1fn":
+        b_k = b_k * 2
+    if b_k != k:
+        raise ValueError(
+            f"A and B logical K dimensions must match, got A K={k} and B K={b_k}"
+        )
 
     seq_len = token_final_scales.shape[0]
     topk = token_final_scales.shape[1]
@@ -404,7 +423,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         )
 
     # Validate configuration
-    ab_dtype_cutlass = get_cutlass_dtype(ab_dtype)
+    a_dtype_cutlass = get_cutlass_dtype(a_dtype)
+    b_dtype_cutlass = get_cutlass_dtype(b_dtype)
     sf_dtype_cutlass = get_cutlass_dtype(sf_dtype)
     out_dtype_cutlass = get_cutlass_dtype(out_dtype)
     # Token final scales - determine dtype
@@ -416,7 +436,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         token_scales_dtype = cutlass.Float16
 
     if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-        ab_dtype_cutlass,
+        a_dtype_cutlass,
+        b_dtype_cutlass,
         sf_dtype_cutlass,
         sf_vec_size,
         out_dtype_cutlass,
@@ -432,7 +453,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         out_major="n",
     ):
         raise ValueError(
-            f"Unsupported configuration: ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
+            f"Unsupported configuration: a_dtype={a_dtype}, b_dtype={b_dtype}, "
+            f"sf_dtype={sf_dtype}, "
             f"sf_vec_size={sf_vec_size}, out_dtype={out_dtype}, "
             f"final_scale_dtype={token_final_scales.dtype}, "
             f"mma_tiler_mn={mma_tiler_mn}, cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
@@ -448,10 +470,16 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
         )
-    elif out.shape != (output_rows, n):
-        raise ValueError(
-            f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
-        )
+    else:
+        expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
+        if out.shape != (output_rows, n):
+            raise ValueError(
+                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+            )
+        if out.dtype != expected_out_dtype:
+            raise TypeError(
+                f"out must have dtype {expected_out_dtype}, got {out.dtype}"
+            )
 
     # Get SM count
     if sm_count is None:
@@ -467,10 +495,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
-        ab_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        a_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     b_ptr = make_ptr(
-        ab_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        b_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     a_sf_ptr = make_ptr(
         sf_dtype_cutlass, a_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -546,6 +574,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
+        a_dtype=a_dtype_cutlass,
+        b_dtype=b_dtype_cutlass,
+        sf_dtype=sf_dtype_cutlass,
+        out_dtype=out_dtype_cutlass,
+        final_scale_dtype=token_scales_dtype,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
@@ -579,3 +612,156 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     )
 
     return out
+
+
+def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
+    ab_dtype: str = "float4_e2m1fn",
+    sf_dtype: str = "float8_e4m3fn",
+    out_dtype: str = "bfloat16",
+    sf_vec_size: int = 16,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+    use_fused_finalize: bool = True,
+) -> torch.Tensor:
+    """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
+    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        token_final_scales,
+        out,
+        a_per_token_scale=a_per_token_scale,
+        a_dtype=ab_dtype,
+        b_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+        use_fused_finalize=use_fused_finalize,
+    )
+
+
+def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+) -> torch.Tensor:
+    """Run GEMM2 finalize with MXFP8 activations and packed MXFP4 weights.
+
+    ``a`` contains E4M3 values, while ``b`` contains two packed E2M1 values
+    per byte. Both scale tensors use the MMA-compatible E8M0 block-32 layout.
+    The finalized scatter-reduced output is BF16. The problem N dimension must
+    be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
+    epilogue does not predicate a partial N tile.
+    """
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
+    if a.dtype is not torch.float8_e4m3fn:
+        raise TypeError(f"MXFP8 A must have dtype torch.float8_e4m3fn, got {a.dtype}")
+    if b.dtype is not torch.uint8:
+        raise TypeError(f"Packed MXFP4 B must have dtype torch.uint8, got {b.dtype}")
+    if a_scale.dtype is not torch.uint8 or b_scale.dtype is not torch.uint8:
+        raise TypeError("MXFP8/MXFP4 E8M0 scale tensors must have dtype torch.uint8")
+    if alpha.dtype is not torch.float32:
+        raise TypeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+    if token_final_scales.dtype is not torch.float32:
+        raise TypeError("MXFP8/MXFP4 token_final_scales must have dtype torch.float32")
+    int32_tensors = {
+        "tile_idx_to_expert_idx": tile_idx_to_expert_idx,
+        "num_non_exiting_tiles": num_non_exiting_tiles,
+        "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+        "permuted_idx_to_expanded_idx": permuted_idx_to_expanded_idx,
+    }
+    for name, tensor in int32_tensors.items():
+        if tensor.dtype is not torch.int32:
+            raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+    contiguous_tensors = {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "alpha": alpha,
+        "token_final_scales": token_final_scales,
+        **int32_tensors,
+    }
+    for name, tensor in contiguous_tensors.items():
+        if tensor.device != a.device:
+            raise ValueError(f"{name} must be on {a.device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    # b_scale is the standard non-contiguous logical view returned by
+    # convert_sf_to_mma_layout; its underlying physical storage is canonical.
+    if b_scale.device != a.device:
+        raise ValueError(f"b_scale must be on {a.device}, got {b_scale.device}")
+    if out is not None and out.dtype is not torch.bfloat16:
+        raise TypeError(
+            f"MXFP8/MXFP4 GEMM2 output must have dtype torch.bfloat16, got {out.dtype}"
+        )
+    if out is not None:
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        token_final_scales,
+        out,
+        a_dtype="float8_e4m3fn",
+        b_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        out_dtype="bfloat16",
+        sf_vec_size=32,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+    )
