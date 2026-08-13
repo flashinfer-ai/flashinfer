@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from pr_checks.git_compare import resolve_merge_base
 from pr_checks.register_checks import API_RST_MISSING, API_RST_STALE
 from pr_checks.write_reports import PrFinding, emit_finding, write_report
 
@@ -163,11 +164,12 @@ def main() -> int:
     )
     parser.add_argument("--report-json", type=Path, help="Write findings as JSON")
     args = parser.parse_args()
+    base = resolve_merge_base(args.base, args.head)
 
     with tempfile.TemporaryDirectory(prefix="flashinfer-pr-doc-check-") as temp:
         temp_root = Path(temp)
         base_src, head_src = temp_root / "base", temp_root / "head"
-        archive_revision(args.base, base_src)
+        archive_revision(base, base_src)
         archive_revision(args.head, head_src)
         base_out, head_out = temp_root / "base-out", temp_root / "head-out"
         run_checker(base_src, base_out, "pr-base")
@@ -185,7 +187,7 @@ def main() -> int:
         write_report(
             args.report_json,
             "static_documentation",
-            args.base,
+            base,
             args.head,
             new_findings,
         )
