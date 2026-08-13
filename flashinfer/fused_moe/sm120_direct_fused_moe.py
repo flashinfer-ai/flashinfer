@@ -279,6 +279,7 @@ def sm120_direct_fused_moe(
     gemm2_weights: torch.Tensor,
     expert_map: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
     workspace: Optional[torch.Tensor] = None,
     outputs_per_warp: Optional[int] = None,
     num_threads: Optional[int] = None,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import tempfile
 from pathlib import Path
 
 import torch
@@ -77,8 +78,10 @@ def main() -> None:
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("bench_sm120_direct_fused_moe requires SM120")
+    force_jit_aot_dir = None
     if args.force_jit_baseline:
-        jit_env.FLASHINFER_AOT_DIR = Path("/tmp/flashinfer-empty-aot")
+        force_jit_aot_dir = tempfile.TemporaryDirectory(prefix="flashinfer-empty-aot-")
+        jit_env.FLASHINFER_AOT_DIR = Path(force_jit_aot_dir.name)
     torch.manual_seed(args.seed)
     geometry = PRESETS[args.preset]
     hidden = geometry["hidden"]

@@ -73,6 +73,8 @@ SM120 Low-Token BF16 Fused MoE
 -------------------------------
 
 Direct pre-routed BF16 SwiGLU MoE for decode batches with one to eight tokens.
+Supports ``topk <= 8``, hidden size ``H <= 8192``, and intermediate size
+``I <= 1024``.
 The operator returns the rank-local partial when ``expert_map`` is provided;
 callers are responsible for the cross-rank collective.
 
