@@ -2,6 +2,7 @@ import abc
 import dataclasses
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -23,6 +24,17 @@ from .utils import write_if_different
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 # Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
 # which may be read-only after installation
+
+
+class _PersistentFileLock(FileLock):
+    """Native file lock whose pathname remains stable on shared caches."""
+
+    def __init__(self, lock_file: Union[str, os.PathLike], **kwargs: Any):
+        # Older filelock releases do not expose this option; their Unix
+        # backend already preserves the lock pathname.
+        if "preserve_lock_file" in inspect.signature(FileLock).parameters:
+            kwargs["preserve_lock_file"] = True
+        super().__init__(lock_file, **kwargs)
 
 
 class MissingJITCacheError(RuntimeError):
@@ -885,7 +897,7 @@ def build_jit_specs(
     # prevents deadlocks when their module sets overlap.
     with ExitStack() as stack:
         for lock_path in sorted({spec.lock_path for spec in selected_specs}, key=str):
-            stack.enter_context(FileLock(lock_path, thread_local=False))
+            stack.enter_context(_PersistentFileLock(lock_path, thread_local=False))
 
         lines: List[str] = []
         built_specs: List[tuple[JitSpecNvcc, dict]] = []

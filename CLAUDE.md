@@ -419,7 +419,10 @@ FlashInfer uses two-level caching to avoid recompilation:
 - CUDA architecture change
 - FlashInfer version change
 
-URI computed as: `hash(operation_type + parameters + source_hashes + flags + cuda_arch)`
+The URI identifies the operation's parameter-derived module configuration.
+For NVCC JIT modules, `meta.json` separately validates the cached `.so` against
+the source, rendered Ninja configuration, flags, architecture, ABI, and
+toolchain fingerprint described above.
 
 **Cache management:**
 - Clear cache: `rm -rf ~/.cache/flashinfer/`
