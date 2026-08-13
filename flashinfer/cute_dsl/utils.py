@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import ctypes
 import functools
 import os
@@ -28,6 +29,10 @@ import torch
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    with contextlib.suppress(AttributeError):
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
 def ceil_div(a: int, b: int) -> int:

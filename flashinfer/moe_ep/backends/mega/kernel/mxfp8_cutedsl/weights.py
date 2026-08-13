@@ -20,13 +20,13 @@ Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 def _mxfp8_data_dtype(kind: Mxfp8Kind) -> "torch.dtype":
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.cutedsl_megamoe import kind_data_dtype
+    from .....kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from .....kernel_src.cutedsl_megamoe import to_blocked
+    from .....kernel_src.sm100.cutedsl_megamoe import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -52,7 +52,7 @@ def _interleave_gate_up_32(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Mxfp8BlockSize
+    from .....kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize
 
     block = Mxfp8BlockSize
     if intermediate_size % (2 * block) != 0:
@@ -98,7 +98,7 @@ def _quantize_mxfp8_weight_k_major(
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import mxfp8_quantize_per_block_32
+    from .....kernel_src.sm100.cutedsl_megamoe import mxfp8_quantize_per_block_32
 
     data_dtype = _mxfp8_data_dtype(kind)
     return mxfp8_quantize_per_block_32(weight_k_major.to(torch.float32), data_dtype)
@@ -112,7 +112,7 @@ def _as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype
+    from .....kernel_src.sm100.cutedsl_megamoe import Mxfp8ScaleDtype
 
     if scale.dtype == Mxfp8ScaleDtype:
         return scale
@@ -138,7 +138,7 @@ def preprocess_mega_weights(
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # shim exposes the cutlass-pulling stacking helper lazily via the boundary.
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         _stack_byte_reinterpretable_tensors,
         ceil_div,
@@ -279,7 +279,7 @@ def _mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
+    from .....kernel_src.sm100.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
 
     plain = torch.zeros(rows, cols, dtype=Mxfp8ScaleDtype)
     return to_blocked(plain).numel()
@@ -315,7 +315,7 @@ def validate_transformed_mega_weights(
     data_dtype = _mxfp8_data_dtype(kind)
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
+    from .....kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)

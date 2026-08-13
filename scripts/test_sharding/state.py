@@ -233,6 +233,7 @@ def verify_manifest(
     selection: dict[str, Any],
     planning_options: dict[str, Any],
     pytest_command_prefix: tuple[str, ...] = (),
+    estimate_files: dict[str, str | None] | None = None,
 ) -> None:
     mismatches: list[str] = []
     checks = {
@@ -252,6 +253,8 @@ def verify_manifest(
             planning_options,
         ),
     }
+    if estimate_files is not None:
+        checks["estimate_files"] = (manifest.get("estimate_files"), estimate_files)
     for name, (saved, current) in checks.items():
         if saved != current:
             mismatches.append(f"{name}: saved={saved!r}, current={current!r}")

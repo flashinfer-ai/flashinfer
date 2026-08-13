@@ -41,13 +41,10 @@ def _queue_test_unit(identifier: str) -> Unit:
     )
 
 
-def test_worker_unit_selection_prefers_local_queue_then_lowest_tied_donor() -> None:
-    work_by_worker = [queue.Queue() for _ in range(3)]
-    work_by_worker[0].put(_queue_test_unit("donor-0-first"))
-    work_by_worker[0].put(_queue_test_unit("donor-0-second"))
+def test_worker_unit_selection_prefers_local_queue_before_stealing() -> None:
+    work_by_worker = [queue.Queue() for _ in range(2)]
+    work_by_worker[0].put(_queue_test_unit("donor"))
     work_by_worker[1].put(_queue_test_unit("local"))
-    work_by_worker[2].put(_queue_test_unit("donor-2-first"))
-    work_by_worker[2].put(_queue_test_unit("donor-2-second"))
 
     local_queue, local_unit = runner._next_worker_unit(work_by_worker, 1)
 
@@ -57,7 +54,7 @@ def test_worker_unit_selection_prefers_local_queue_then_lowest_tied_donor() -> N
     donor_queue, donor_unit = runner._next_worker_unit(work_by_worker, 1)
 
     assert donor_queue is work_by_worker[0]
-    assert donor_unit.id == "donor-0-first"
+    assert donor_unit.id == "donor"
 
 
 def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
@@ -87,24 +84,48 @@ def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
     assert all(work.unfinished_tasks == 0 for work in work_by_worker)
 
 
-def test_compatibility_defaults_use_file_sized_units_without_time_limits(
+def test_compatibility_defaults_use_file_sized_units_with_failure_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("UNIT_TEST_DEADLINE_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.delenv("UNIT_TEST_UNKNOWN_CASE_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_TIMEOUT_POLICY", raising=False)
+    monkeypatch.delenv("UNIT_TEST_DEFAULT_CASE_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_DEFAULT_SOURCE_OVERHEAD_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_DURATION_ESTIMATES", raising=False)
+    monkeypatch.delenv("UNIT_TEST_OVERHEAD_ESTIMATES", raising=False)
+    monkeypatch.delenv("UNIT_TEST_SHARD_COUNT", raising=False)
     monkeypatch.delenv("UNIT_TEST_CHECKPOINT_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_TARGET_SECONDS", raising=False)
 
     args = unit_test_runner._parser().parse_args(["run"])
 
     assert args.deadline_seconds == 0
-    assert args.unit_timeout_seconds == 0
-    assert args.unknown_case_seconds == 1
+    assert args.unit_timeout_seconds == 7_200
+    assert args.timeout_policy == "fail"
+    assert args.default_case_seconds == 1
+    assert args.default_source_overhead_seconds == 30
+    assert args.duration_estimates is None
+    assert args.overhead_estimates is None
+    assert args.shard_count == 1
     assert args.checkpoint_seconds == 1_000_000
     assert args.target_unit_seconds == 1_000_000
-    assert PlanningOptions(profile="test").checkpoint_seconds == 1_000_000
-    assert PlanningOptions(profile="test").target_unit_seconds == 1_000_000
+    assert PlanningOptions().checkpoint_seconds == 1_000_000
+    assert PlanningOptions().target_unit_seconds == 1_000_000
+
+
+def test_shard_count_precedence_is_cli_then_environment_then_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UNIT_TEST_SHARD_COUNT", raising=False)
+    assert unit_test_runner._parser().parse_args(["run"]).shard_count == 1
+
+    monkeypatch.setenv("UNIT_TEST_SHARD_COUNT", "4")
+    assert unit_test_runner._parser().parse_args(["run"]).shard_count == 4
+    assert (
+        unit_test_runner._parser().parse_args(["run", "--shard-count", "2"]).shard_count
+        == 2
+    )
 
 
 def test_explicit_zero_deadline_is_disabled(
@@ -195,7 +216,8 @@ def test_help_reports_effective_argument_defaults(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("UNIT_TEST_TARGET_SECONDS", "123")
-    monkeypatch.delenv("UNIT_TEST_TIMING_PROFILE", raising=False)
+    monkeypatch.setenv("UNIT_TEST_DURATION_ESTIMATES", "/tmp/durations.csv.gz")
+    monkeypatch.setenv("UNIT_TEST_OVERHEAD_ESTIMATES", "/tmp/overheads.csv")
 
     with pytest.raises(SystemExit) as exit_info:
         unit_test_runner._parser().parse_args(["run", "--help"])
@@ -206,26 +228,16 @@ def test_help_reports_effective_argument_defaults(
         "soft logical-unit target (UNIT_TEST_TARGET_SECONDS) (default: 123)"
         in help_text
     )
-    assert (
-        "stable timing profile (UNIT_TEST_TIMING_PROFILE; default: auto-detected)"
-    ) in help_text
+    assert "optional per-node duration CSV or CSV.gz" in help_text
+    assert "default estimate for a node missing timing data" in help_text
+    assert "default per-source process overhead" in help_text
+    assert "--dry-run" in help_text
+    assert "--wrapper-started-at" in help_text
+    assert "--timing-profile" not in help_text
+    assert "--unknown-case-seconds" not in help_text
     assert "exit codes: 0=complete without failures;" in help_text
-
-
-def test_help_reports_configured_timing_profile_default(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("UNIT_TEST_TIMING_PROFILE", "sm103-cuda13")
-
-    with pytest.raises(SystemExit) as exit_info:
-        unit_test_runner._parser().parse_args(["run", "--help"])
-
-    assert exit_info.value.code == 0
-    help_text = " ".join(capsys.readouterr().out.split())
-    assert (
-        "stable timing profile (UNIT_TEST_TIMING_PROFILE) (default: sm103-cuda13)"
-    ) in help_text
+    assert "(default: /tmp/durations.csv.gz)" in help_text
+    assert "(default: /tmp/overheads.csv)" in help_text
 
 
 def test_pytest_command_prefix_wraps_batches_and_is_frozen_in_manifest(
@@ -277,7 +289,7 @@ os.execv(sys.argv[1], sys.argv[1:])
     )
 
     assert changed.returncode == 3
-    assert "pytest_command_prefix" in changed.stderr
+    assert "pytest_command_prefix" in changed.stdout
 
 
 def _run(
@@ -299,10 +311,10 @@ def _run(
             str(tmp_path / "junit"),
             "--test-path",
             str(test_path),
-            "--timing-profile",
-            "synthetic",
-            "--unknown-case-seconds",
+            "--default-case-seconds",
             "1",
+            "--default-source-overhead-seconds",
+            "0",
             "--checkpoint-seconds",
             "1",
             "--target-unit-seconds",
@@ -324,6 +336,102 @@ def _run(
     )
 
 
+def test_cli_summary_uses_scoped_shell_invocation_start_time(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
+
+    result = _run(
+        tmp_path,
+        "plan",
+        suite,
+        "--wrapper-started-at",
+        "1700000000",
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "Start time: 2023-11-14T22:13:20Z" in result.stdout
+    assert "End time: " in result.stdout
+    assert "Time elapsed: " in result.stdout
+
+
+def test_cli_summary_ignores_unscoped_start_time_environment(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
+
+    result = _run(
+        tmp_path,
+        "plan",
+        suite,
+        env_override={"UNIT_TEST_RUN_STARTED_AT": "1700000000"},
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "Start time: 2023-11-14T22:13:20Z" not in result.stdout
+
+
+def test_optional_timing_files_use_first_matching_rows(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    source = suite / "test_sample.py"
+    source.write_text("def test_case(): pass\n", encoding="utf-8")
+    nodeid = f"{source.name}::test_case"
+    source_file = str(source.resolve())
+    duration = tmp_path / "durations.csv"
+    duration.write_text(
+        f"nodeid,estimated_seconds\n{nodeid},7\n{nodeid},99\n",
+        encoding="utf-8",
+    )
+    overhead = tmp_path / "overheads.csv"
+    overhead.write_text(
+        "source_file,process_startup_seconds,source_warmup_seconds\n"
+        f"{source_file},3,7\n"
+        f"{source_file},99,99\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "plan",
+        suite,
+        "--duration-estimates",
+        str(duration),
+        "--overhead-estimates",
+        str(overhead),
+    )
+
+    assert result.returncode == 0, result.stdout
+    manifest = json.loads(
+        (tmp_path / "junit" / "manifest.json").read_text(encoding="utf-8")
+    )
+    batch = manifest["plan"]["units"][0]["batches"][0]
+    assert batch["estimated_ms"] == 17_000
+    assert set(manifest["estimate_files"]) == {"duration", "overhead"}
+
+
+def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
+    content = "nodeid,estimated_seconds\ntest_sample.py::test_case,7\n"
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    first.write_text(content, encoding="utf-8")
+    second.write_text(content, encoding="utf-8")
+
+    created = _run(tmp_path, "plan", suite, "--duration-estimates", str(first))
+    reused = _run(tmp_path, "plan", suite, "--duration-estimates", str(second))
+    second.write_text(content.replace(",7", ",8"), encoding="utf-8")
+    changed = _run(tmp_path, "plan", suite, "--duration-estimates", str(second))
+
+    assert created.returncode == 0, created.stdout
+    assert reused.returncode == 0, reused.stdout
+    assert "Using plan" in reused.stdout
+    assert changed.returncode == 3
+    assert "estimate_files" in changed.stdout
+
+
 def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -341,9 +449,7 @@ def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> N
             str(tmp_path / "junit"),
             "--test-path",
             str(suite),
-            "--timing-profile",
-            "synthetic",
-            "--unknown-case-seconds",
+            "--default-case-seconds",
             "1",
             "--checkpoint-seconds",
             "1",
@@ -399,6 +505,64 @@ def test_slow_collection_reports_a_live_heartbeat(
     output = capsys.readouterr().out
     assert "RUNNER HEARTBEAT: state=collecting" in output
     assert f"test_path={suite}" in output
+
+
+def test_collection_isolates_sm90_pull_multirank_modules(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    sm100 = suite / "sm100"
+    sm100.mkdir()
+    (sm100 / "common.py").write_text("BACKEND = 'sm100'\n", encoding="utf-8")
+    sm90 = suite / "sm90"
+    sm90.mkdir()
+    (sm90 / "common.py").write_text("BACKEND = 'sm90'\n", encoding="utf-8")
+    (suite / "test_aaa_sm100.py").write_text(
+        """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "sm100"))
+import common
+
+assert common.BACKEND == "sm100"
+
+def test_sm100():
+    pass
+""",
+        encoding="utf-8",
+    )
+    isolated = suite / "test_moe_ep_sm90_pull_fp8_mega_multirank.py"
+    isolated.write_text(
+        """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "sm90"))
+import common
+
+if common.BACKEND != "sm90":
+    raise RuntimeError("SM100 and SM90 common modules cannot share one process")
+
+def test_sm90():
+    pass
+""",
+        encoding="utf-8",
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+
+    assert [node["nodeid"] for node in nodes] == [
+        "test_aaa_sm100.py::test_sm100",
+        f"{isolated.name}::test_sm90",
+    ]
+    assert [node["order"] for node in nodes] == [0, 1]
+
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, isolated, 15, 0)
+
+    assert [node["nodeid"] for node in isolated_nodes] == [
+        f"{isolated.name}::test_sm90"
+    ]
+    assert [node["order"] for node in isolated_nodes] == [0]
 
 
 def test_collection_termination_uses_configured_grace(
@@ -478,7 +642,7 @@ def test_worker_exception_is_reported_as_infrastructure_error(
         shard_index=0,
     )
     plan = Plan(
-        options=PlanningOptions(profile="synthetic"),
+        options=PlanningOptions(),
         nodes=(node,),
         units=(unit,),
     )
@@ -522,7 +686,7 @@ def test_worker_exception_is_reported_as_infrastructure_error(
     assert any(
         "cannot start pytest" in error for error in done["infrastructure_errors"]
     )
-    assert not list((tmp_path / "junit").glob("units/*/batches/*.xml"))
+    assert not list((tmp_path / "junit").glob("shards/*/units/*/batches/*.xml"))
     summary = json.loads(
         (tmp_path / "junit" / "run-summary.json").read_text(encoding="utf-8")
     )
@@ -530,6 +694,216 @@ def test_worker_exception_is_reported_as_infrastructure_error(
     closure = summary["attempts"][0]["closure"]
     assert closure["infrastructure_error"] is True
     assert closure["infrastructure_errors"]
+
+
+def test_setup_error_is_not_masked_when_lease_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_sample.py::test_case", 0)
+    batch = Batch(
+        id="batch-1",
+        source_file=node.source_file,
+        nodeids=(node.nodeid,),
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    plan = Plan(
+        options=PlanningOptions(),
+        nodes=(node,),
+        units=(
+            Unit(
+                id="unit-1",
+                batches=(batch,),
+                estimated_ms=1000,
+                oversized=False,
+                shard_index=0,
+            ),
+        ),
+    )
+    execution = runner.ExecutionSettings(
+        workers=1,
+        shard_index=0,
+        attempt=AttemptSettings(
+            deadline_seconds=0,
+            unit_timeout_seconds=0,
+            timeout_grace_seconds=0,
+            timeout_policy="resume",
+        ),
+        monitor_memory=False,
+    )
+    monkeypatch.setattr(runner, "visible_devices", lambda: [None])
+    original_write = runner.atomic_write_json
+
+    def fail_settings(path: Path, value) -> None:
+        if path.name.endswith(".settings.json"):
+            raise OSError("cannot write shard settings")
+        original_write(path, value)
+
+    class FailingLeases:
+        def close(self) -> None:
+            raise runner.RunnerStateError("cannot close shard leases")
+
+    monkeypatch.setattr(runner, "atomic_write_json", fail_settings)
+    monkeypatch.setattr(
+        runner,
+        "_claim_shard_leases",
+        lambda *_args, **_kwargs: FailingLeases(),
+    )
+
+    with pytest.raises(OSError, match="cannot write shard settings"):
+        runner.execute_shard(
+            repo_root=REPO_ROOT,
+            junit_dir=tmp_path / "junit",
+            plan=plan,
+            execution=execution,
+            operation_started_at=time.time(),
+        )
+
+    assert "cannot close shard leases" in capsys.readouterr().out
+
+
+def test_partial_shard_lease_claim_is_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_sample.py::test_case", 0)
+    batch = Batch(
+        id="batch-1",
+        source_file=node.source_file,
+        nodeids=(node.nodeid,),
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    plan = Plan(
+        options=PlanningOptions(),
+        nodes=(node,),
+        units=(
+            Unit(
+                id="unit-1",
+                batches=(batch,),
+                estimated_ms=1000,
+                oversized=False,
+                shard_index=0,
+            ),
+        ),
+    )
+    execution = runner.ExecutionSettings(
+        workers=1,
+        shard_index=0,
+        attempt=AttemptSettings(
+            deadline_seconds=0,
+            unit_timeout_seconds=0,
+            timeout_grace_seconds=0,
+            timeout_policy="resume",
+        ),
+        monitor_memory=False,
+    )
+    monkeypatch.setattr(runner, "visible_devices", lambda: [None])
+    original_add = runner._LeaseHeartbeat.add
+
+    def fail_worker_lease(
+        heartbeat: runner._LeaseHeartbeat, path: Path, worker: str
+    ) -> None:
+        if worker == "worker-0":
+            raise OSError("cannot create worker lease")
+        original_add(heartbeat, path, worker)
+
+    monkeypatch.setattr(runner._LeaseHeartbeat, "add", fail_worker_lease)
+
+    with pytest.raises(OSError, match="cannot create worker lease"):
+        runner.execute_shard(
+            repo_root=REPO_ROOT,
+            junit_dir=tmp_path / "junit",
+            plan=plan,
+            execution=execution,
+            operation_started_at=time.time(),
+        )
+
+    leases = tmp_path / "junit" / "attempts" / "attempt-0001" / "leases"
+    assert list(leases.glob("*.json")) == []
+
+
+def test_heartbeat_close_is_bounded_when_storage_write_is_stuck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = {
+        "id": "attempt-1",
+        "started_at": time.time(),
+        "deadline_at": None,
+        "settings": {
+            "deadline_seconds": 0,
+            "unit_timeout_seconds": 0,
+            "timeout_grace_seconds": 0,
+            "timeout_policy": "resume",
+        },
+    }
+    heartbeat = runner._LeaseHeartbeat(attempt, 0)  # type: ignore[arg-type]
+    lease = tmp_path / "lease.json"
+    heartbeat.add(lease, "coordinator")
+    entered = threading.Event()
+    release = threading.Event()
+    original_renew = heartbeat._renew
+
+    def block_background_write(path: Path, worker: str) -> None:
+        if threading.current_thread() is heartbeat.thread:
+            entered.set()
+            release.wait(timeout=5)
+            return
+        original_renew(path, worker)
+
+    monkeypatch.setattr(heartbeat, "_renew", block_background_write)
+    monkeypatch.setattr(runner, "_LEASE_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(runner, "_LEASE_CLOSE_SECONDS", 0.05)
+    heartbeat.start()
+    assert entered.wait(timeout=2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(runner.RunnerStateError, match="did not stop"):
+            heartbeat.close()
+    finally:
+        release.set()
+        heartbeat.thread.join(timeout=2)
+        lease.unlink(missing_ok=True)
+
+    assert time.monotonic() - started < 0.5
+
+
+def test_heartbeat_close_attempts_every_lease_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = {
+        "id": "attempt-1",
+        "started_at": time.time(),
+        "deadline_at": None,
+        "settings": {
+            "deadline_seconds": 0,
+            "unit_timeout_seconds": 0,
+            "timeout_grace_seconds": 0,
+            "timeout_policy": "resume",
+        },
+    }
+    heartbeat = runner._LeaseHeartbeat(attempt, 0)  # type: ignore[arg-type]
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    heartbeat.add(first, "first")
+    heartbeat.add(second, "second")
+    original_unlink = Path.unlink
+
+    def fail_first(path: Path, *, missing_ok: bool = False) -> None:
+        if path == first:
+            raise OSError("first lease is busy")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_first)
+    try:
+        with pytest.raises(runner.RunnerStateError, match="first lease is busy"):
+            heartbeat.close()
+        assert not second.exists()
+    finally:
+        original_unlink(first, missing_ok=True)
 
 
 def test_lease_heartbeat_failure_aborts_work_and_is_reported(
@@ -552,7 +926,7 @@ def test_lease_heartbeat_failure_aborts_work_and_is_reported(
         shard_index=0,
     )
     plan = Plan(
-        options=PlanningOptions(profile="synthetic"),
+        options=PlanningOptions(),
         nodes=(node,),
         units=(unit,),
     )
@@ -609,7 +983,7 @@ def test_lease_heartbeat_failure_aborts_work_and_is_reported(
         "lease heartbeat failed: lease storage unavailable" in error
         for error in done["infrastructure_errors"]
     )
-    assert not list((tmp_path / "junit").glob("units/*/batches/*.xml"))
+    assert not list((tmp_path / "junit").glob("shards/*/units/*/batches/*.xml"))
 
 
 def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> None:
@@ -629,7 +1003,9 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
     assert "deadline=1s" in combined
 
 
-def test_completed_manifest_skips_slow_recollection(tmp_path: Path) -> None:
+def test_plan_run_and_completed_reuse_publish_resumable_artifacts(
+    tmp_path: Path,
+) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "conftest.py").write_text(
@@ -642,31 +1018,6 @@ if os.environ.get("SLOW_COLLECTION"):
 """,
         encoding="utf-8",
     )
-    (suite / "test_sample.py").write_text(
-        "def test_one(): pass\ndef test_two(): pass\n", encoding="utf-8"
-    )
-    completed = _run(tmp_path, "run", suite)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-
-    reused = _run(
-        tmp_path,
-        "run",
-        suite,
-        "--deadline-seconds",
-        "1",
-        env_override={"SLOW_COLLECTION": "1"},
-    )
-
-    assert reused.returncode == 0, reused.stdout + reused.stderr
-    assert "Using plan" in reused.stdout
-    assert "RUNNER STATUS: shard=0 state=completed" in reused.stdout
-    assert "finalized=2/2 passed=2 failed=0 skipped=0 pending=0" in reused.stdout
-    assert "PYTEST KILLED phase=collection" not in reused.stdout + reused.stderr
-
-
-def test_plan_and_run_publish_complete_resumable_artifacts(tmp_path: Path) -> None:
-    suite = tmp_path / "suite"
-    suite.mkdir()
     (suite / "test_sample.py").write_text(
         """\
 def test_passes():
@@ -695,12 +1046,26 @@ def test_fails():
         "0",
     )
     assert executed.returncode == 1, executed.stdout + executed.stderr
+    failure_detail_at = executed.stdout.index("FAILED TEST NODES")
+    summary_at = executed.stdout.index("TEST SUMMARY")
+    assert failure_detail_at < summary_at
+    assert "test_sample.py::test_fails" in executed.stdout[:summary_at]
+    assert "intentional" in executed.stdout[:summary_at]
+    summary_output = executed.stdout[summary_at:]
+    assert f"Failed test files:\n  - {suite / 'test_sample.py'}" in summary_output
+    assert "test_sample.py::test_fails" not in summary_output
+    assert "intentional" not in summary_output
+    assert "Top 10 longest-running source files:" in executed.stdout
+    assert "Top 10 highest host RSS source files:" in executed.stdout
+    assert "Top 10 highest GPU memory source files:" in executed.stdout
     assert "RUNNER STATUS: shard=0 state=completed" in executed.stdout
     assert "finalized=2/2 passed=1 failed=1 skipped=0 pending=0" in executed.stdout
     summary = json.loads(
         (tmp_path / "junit" / "run-summary.json").read_text(encoding="utf-8")
     )
     assert summary["complete"] is True
+    assert summary["failed_nodes"][0]["nodeid"] == "test_sample.py::test_fails"
+    assert "intentional" in summary["failed_nodes"][0]["diagnostic"]
     assert summary["outcomes"] == {"failed": 1, "passed": 1, "skipped": 0}
     assert summary["shards"]["0"] == {
         "complete": True,
@@ -709,18 +1074,19 @@ def test_fails():
         "pending_nodes": 0,
         "planned_nodes": 2,
     }
-    assert summary["fallback_counts"] == {"suite-mean-other-profile": 2}
-    assert summary["fallbacks"] == [
-        {"node_indexes": [0, 1], "source": "suite-mean-other-profile"}
-    ]
+    assert summary["fallback_counts"] == {"default-case": 2}
+    assert summary["fallbacks"] == [{"node_indexes": [0, 1], "source": "default-case"}]
     assert summary["capacity"]["estimated_makespan_ms"] > 0
     assert not list((tmp_path / "junit").glob("unit-*.xml"))
-    batch_xml = sorted((tmp_path / "junit").glob("units/*/batches/batch-*.xml"))
+    batch_xml = sorted(
+        (tmp_path / "junit").glob("shards/shard-0000/units/*/batches/batch-*.xml")
+    )
     planned_batches = sum(len(unit["batches"]) for unit in manifest["plan"]["units"])
     assert len(batch_xml) == planned_batches
     assert all(ET.parse(path).getroot().tag == "testsuites" for path in batch_xml)
     assert not (tmp_path / "junit" / ".state").exists()
 
+    # A completed run must use its frozen plan without repeating collection.
     repeated = _run(
         tmp_path,
         "run",
@@ -729,8 +1095,15 @@ def test_fails():
         "60",
         "--timeout-grace-seconds",
         "0",
+        "--deadline-seconds",
+        "1",
+        env_override={"SLOW_COLLECTION": "1"},
     )
     assert repeated.returncode == 1
+    assert "Using plan" in repeated.stdout
+    assert "RUNNER STATUS: shard=0 state=completed" in repeated.stdout
+    assert "finalized=2/2 passed=1 failed=1 skipped=0 pending=0" in repeated.stdout
+    assert "PYTEST KILLED phase=collection" not in repeated.stdout + repeated.stderr
     assert len(list((tmp_path / "junit" / "attempts").glob("attempt-*"))) == 1
 
 
@@ -810,7 +1183,7 @@ def test_completed_node_progress_observes_finalized_batches_from_every_shard(
         for index, node in enumerate(nodes)
     )
     plan = Plan(
-        options=PlanningOptions(profile="synthetic", shard_count=2),
+        options=PlanningOptions(shard_count=2),
         nodes=nodes,
         units=units,
     )
@@ -926,6 +1299,120 @@ def test_regular():
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
+def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "phase-state"
+    state.mkdir()
+    for name in ("a", "b"):
+        (suite / f"test_long_{name}.py").write_text(
+            f"""\
+import os
+import time
+from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.long_running
+
+def test_long_{name}():
+    state = Path(os.environ["PHASE_STATE"])
+    (state / "long-{name}-started").write_text("1", encoding="utf-8")
+    time.sleep(0.5)
+    (state / "long-{name}-done").write_text("1", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+    (suite / "test_normal.py").write_text(
+        """\
+import os
+from pathlib import Path
+
+def test_normal():
+    state = Path(os.environ["PHASE_STATE"])
+    assert (state / "long-a-started").exists()
+    assert (state / "long-b-started").exists()
+    (state / "normal-done").write_text("1", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    (suite / "test_solo.py").write_text(
+        """\
+import os
+from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.solo
+
+def test_solo():
+    state = Path(os.environ["PHASE_STATE"])
+    assert (state / "long-a-done").exists()
+    assert (state / "long-b-done").exists()
+    assert (state / "normal-done").exists()
+""",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--workers",
+        "2",
+        env_override={
+            "CUDA_VISIBLE_DEVICES": "0,1",
+            "PHASE_STATE": str(state),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "WORKER START worker=0" in result.stdout
+    assert "WORKER TASK worker=0" in result.stdout
+    assert "WORKER END worker=0" in result.stdout
+    assert "PROGRESS shard=0 finalized=4/4" in result.stdout
+    assert "PYTEST RUNNING" not in result.stdout
+
+
+def test_pending_non_solo_work_blocks_the_solo_phase(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    solo_started = tmp_path / "solo-started"
+    (suite / "test_regular.py").write_text(
+        "import time\ndef test_regular(): time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    (suite / "test_solo.py").write_text(
+        f"""\
+from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.solo
+
+def test_solo():
+    Path({str(solo_started)!r}).write_text("started", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--unit-timeout-seconds",
+        "1",
+        "--timeout-grace-seconds",
+        "0",
+        "--timeout-policy",
+        "resume",
+    )
+
+    assert result.returncode == 2, result.stdout
+    assert not solo_started.exists()
+    assert "WORKER TASK worker=solo-0" not in result.stdout
+    assert "Pending: 2" in result.stdout
+
+
 def test_run_records_the_shared_attempt_before_pytest_collection(
     tmp_path: Path,
 ) -> None:
@@ -987,7 +1474,7 @@ def test_manifest_compares_source_git_sha_only_when_both_values_are_available(
     )
     assert manifest["source_git_sha"] == "source-a"
     assert mismatch.returncode == 3
-    assert "source_git_sha" in mismatch.stderr
+    assert "source_git_sha" in mismatch.stdout
     assert unavailable.returncode == 0, unavailable.stdout + unavailable.stderr
 
 
@@ -1049,7 +1536,7 @@ def test_timeout_policy_resume_starts_a_new_attempt_without_fake_results(
     )
     options = (
         "--unit-timeout-seconds",
-        "3",
+        "2",
         "--timeout-grace-seconds",
         "0",
         "--timeout-policy",
@@ -1099,7 +1586,7 @@ def test_timed_out_shard_is_not_retried_inside_the_same_attempt(
     assert repeated.returncode == 2, repeated.stdout + repeated.stderr
     attempts = list((tmp_path / "junit" / "attempts").glob("attempt-*"))
     assert len(attempts) == 1
-    logs = list((tmp_path / "junit" / "units").glob("**/*.log"))
+    logs = list((tmp_path / "junit" / "shards" / "shard-0000").glob("**/*.log"))
     assert len(logs) == 1
     assert logs[0].read_text(encoding="utf-8").count("command:") == 1
 
@@ -1181,8 +1668,11 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
         timeout=30,
     )
 
-    assert partial.returncode == 2, partial.stdout + partial.stderr
+    assert partial.returncode == 0, partial.stdout + partial.stderr
+    assert "Shared run: finalized=1/2 pending=1" in partial.stdout
     assert finalized.returncode == 0, finalized.stdout + finalized.stderr
+    assert "Scope: shared run" in finalized.stdout
+    assert "Finalized nodes: 2" in finalized.stdout
     attempt = tmp_path / "junit" / "attempts" / "attempt-0001"
     closure = json.loads((attempt / "closed.json").read_text(encoding="utf-8"))
     assert closure["reason"] == "explicit-fan-in"

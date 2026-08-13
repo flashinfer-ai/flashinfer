@@ -46,6 +46,7 @@ struct SM120BlockScalingFusedMoeBuilder
   using SFConfig = typename Base::SFConfig;
   using StagedR2GStoreConfig = typename Base::StagedR2GStoreConfig;
 
+  static constexpr bool kUnionSmem = SwapAB_;
   static constexpr uint32_t LoadRegisterRequirement = Base::kUseStagedR2G ? 120 : 40;
   static constexpr uint32_t MmaRegisterRequirement = Base::kUseStagedR2G ? 192 : 232;
 
@@ -78,6 +79,11 @@ struct SM120BlockScalingFusedMoeBuilder
       std::conditional_t<SwapAB_, SharedStorageLoadSwapAB, SharedStorageLoadDefault>;
 
   union TensorStorageUnion {
+    SharedStorageLoad load;
+    typename Base::R2GStoreConfig::SharedStorageR2G store;
+  };
+
+  struct TensorStorageR2GSplit {
     SharedStorageLoad load;
     typename Base::R2GStoreConfig::SharedStorageR2G store;
   };

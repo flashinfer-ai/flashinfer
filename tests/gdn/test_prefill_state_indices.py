@@ -67,7 +67,18 @@ def _make_inputs(seq_lens, H, D, dtype, device, seed):
     return q, k, v, g, beta, cu_seqlens, init_state
 
 
-def _run(q, k, v, g, beta, cu_seqlens, initial_state, output_state, state_indices):
+def _run(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens,
+    initial_state,
+    output_state,
+    state_indices,
+    use_cp,
+):
     total, H, D = q.shape
     out = torch.empty(total, H, D, dtype=q.dtype, device=q.device)
     output, final = chunk_gated_delta_rule(
@@ -84,6 +95,7 @@ def _run(q, k, v, g, beta, cu_seqlens, initial_state, output_state, state_indice
         output=out,
         output_state=output_state,
         state_indices=state_indices,
+        use_cp=use_cp,
     )
     return output, final
 
@@ -118,7 +130,8 @@ def _make_pool(init_state, perm, n_pool, pad, dtype, device):
 )
 @pytest.mark.parametrize("H", [16, 32])
 @pytest.mark.parametrize("pad", [0, 96])  # 0 = compact pool, 96 = non-compact
-def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad):
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     """A pool + state_indices in-place update must match the packed,
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
@@ -133,7 +146,16 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad):
     # (a) packed baseline, no state_indices
     out_state_a = torch.empty(num_seqs, H, D, D, dtype=dtype, device=device)
     output_a, final_a = _run(
-        q, k, v, g, beta, cu_seqlens, init_state.clone(), out_state_a, None
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        out_state_a,
+        None,
+        use_cp,
     )
     torch.cuda.synchronize()
 
@@ -143,7 +165,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad):
     assert len(set(perm)) == num_seqs  # distinct slots
     pool = _make_pool(init_state, perm, n_pool, pad, dtype, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
-    output_b, _ = _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx)
+    output_b, _ = _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp)
     torch.cuda.synchronize()
 
     assert not torch.isnan(output_b).any()
@@ -193,7 +215,8 @@ def test_prefill_state_indices_requires_output_state_pool():
         )
 
 
-def test_prefill_state_indices_none_is_default():
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_none_is_default(use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""
     _skip_if_not_sm100()
     device = torch.device("cuda")
@@ -204,9 +227,9 @@ def test_prefill_state_indices_none_is_default():
         seq_lens, H, D, torch.bfloat16, device, seed=1
     )
     s1 = torch.empty(num_seqs, H, D, D, dtype=torch.bfloat16, device=device)
-    o1, f1 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s1, None)
+    o1, f1 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s1, None, use_cp)
     s2 = torch.empty(num_seqs, H, D, D, dtype=torch.bfloat16, device=device)
-    o2, f2 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s2, None)
+    o2, f2 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s2, None, use_cp)
     torch.cuda.synchronize()
     assert torch.equal(o1, o2)
     assert torch.equal(f1, f2)

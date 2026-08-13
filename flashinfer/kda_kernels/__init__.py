@@ -24,9 +24,18 @@ explicit Cake backend backed by frozen SM100a CUDA modules.
 
 Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
+- run_fused_kda_decode: Fused Kimi K3 conv, recurrent KDA, and RMSNorm backend
 """
 
 import torch as _torch
+
+try:
+    from .fused_kda_decode import run_fused_kda_decode
+
+    fused_kda_decode = run_fused_kda_decode
+except (ImportError, RuntimeError):
+    run_fused_kda_decode = None  # type: ignore
+    fused_kda_decode = None  # type: ignore
 
 try:
     if _torch.cuda.is_available():
@@ -47,6 +56,8 @@ except (ImportError, RuntimeError):
     recurrent_kda = None  # type: ignore
 
 __all__ = [
+    "fused_kda_decode",
     "recurrent_kda",
+    "run_fused_kda_decode",
     "run_recurrent_kda",
 ]

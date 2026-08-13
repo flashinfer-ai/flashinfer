@@ -5,6 +5,7 @@ import io
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -12,7 +13,7 @@ from .io import atomic_write_json, atomic_write_text
 from .junit import validate_batch_xml
 from .models import Batch, Plan, Unit
 from .planner import CapacityMetrics, capacity_metrics
-from .state import AttemptRecord, list_attempts, load_attempt, state_lock, units_dir
+from .state import AttemptRecord, list_attempts, load_attempt, state_lock
 
 
 TIMING_HEADER = [
@@ -30,6 +31,7 @@ TIMING_HEADER = [
     "shard_index",
     "attempt_id",
 ]
+_TERMINAL_SEPARATOR = "=" * 42
 
 
 class AttemptSummary(AttemptRecord, total=False):
@@ -49,6 +51,38 @@ class ShardSummary(TypedDict):
 class FallbackSummary(TypedDict):
     source: str
     node_indexes: list[int]
+
+
+class FailedNodeSummary(TypedDict):
+    shard_index: int
+    source_file: str
+    nodeid: str
+    diagnostic: str
+    batch_id: str
+    unit_id: str
+    log_path: str
+    results_path: str
+    junit_path: str
+    synthetic: bool
+
+
+class SourceSummary(TypedDict):
+    shard_index: int
+    source_file: str
+    planned_nodes: int
+    finalized_nodes: int
+    pending_nodes: int
+    passed: int
+    failed: int
+    skipped: int
+    unknown: int
+    synthetic: int
+    process_seconds: float
+    max_host_rss_mib: float
+    max_gpu_memory_mib: float
+    memory_samples: int
+    partial_resources: bool
+    status: str
 
 
 class RunSummary(TypedDict):
@@ -71,10 +105,20 @@ class RunSummary(TypedDict):
     capacity: CapacityMetrics
     attempts: list[AttemptSummary]
     infrastructure_errors: list[str]
+    shard_infrastructure_errors: dict[str, list[str]]
+    failed_nodes: list[FailedNodeSummary]
+    sources: list[SourceSummary]
 
 
 def batch_directory(junit_dir: Path, unit: Unit) -> Path:
-    return units_dir(junit_dir) / unit.id / "batches"
+    return (
+        junit_dir
+        / "shards"
+        / f"shard-{unit.shard_index:04d}"
+        / "units"
+        / unit.id
+        / "batches"
+    )
 
 
 def batch_xml_path(junit_dir: Path, unit: Unit, batch: Batch) -> Path:
@@ -124,6 +168,14 @@ def _memory_samples(path: Path) -> list[dict[str, float]]:
     except (OSError, KeyError, TypeError, ValueError):
         return []
     return samples
+
+
+def _json_sidecar(path: Path, suffix: str) -> dict[str, Any]:
+    try:
+        value = json.loads(_sidecar(path, suffix).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _max_memory(samples: list[dict[str, float]]) -> tuple[float, float]:
@@ -288,6 +340,147 @@ def _write_memory_csv(junit_dir: Path, scan: _SummaryScan) -> None:
     atomic_write_text(junit_dir / "memory_summary.csv", memory_stream.getvalue())
 
 
+SOURCE_HEADER = [
+    "shard_index",
+    "source_file",
+    "status",
+    "planned_nodes",
+    "finalized_nodes",
+    "pending_nodes",
+    "passed",
+    "failed",
+    "skipped",
+    "unknown",
+    "synthetic",
+    "process_seconds",
+    "max_host_rss_mib",
+    "max_gpu_memory_mib",
+    "memory_samples",
+    "partial_resources",
+]
+
+
+def _source_status(row: SourceSummary) -> str:
+    if row["failed"]:
+        return "failed"
+    if row["finalized_nodes"] == 0:
+        return "no result"
+    if row["pending_nodes"]:
+        return "incomplete"
+    if row["unknown"]:
+        return "unknown"
+    return "passed"
+
+
+def _source_and_failure_summaries(
+    junit_dir: Path, plan: Plan
+) -> tuple[list[SourceSummary], list[FailedNodeSummary]]:
+    by_source: dict[tuple[int, str], SourceSummary] = {}
+    failed_nodes: list[FailedNodeSummary] = []
+    for unit in plan.units:
+        for batch in unit.batches:
+            key = (unit.shard_index, batch.source_file)
+            row = by_source.setdefault(
+                key,
+                {
+                    "shard_index": unit.shard_index,
+                    "source_file": batch.source_file,
+                    "planned_nodes": 0,
+                    "finalized_nodes": 0,
+                    "pending_nodes": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "unknown": 0,
+                    "synthetic": 0,
+                    "process_seconds": 0.0,
+                    "max_host_rss_mib": 0.0,
+                    "max_gpu_memory_mib": 0.0,
+                    "memory_samples": 0,
+                    "partial_resources": False,
+                    "status": "",
+                },
+            )
+            row["planned_nodes"] += len(batch.nodeids)
+            path = batch_xml_path(junit_dir, unit, batch)
+            validation = (
+                validate_batch_xml(path, batch.nodeids) if path.exists() else None
+            )
+            if validation is None or not validation.valid:
+                row["pending_nodes"] += len(batch.nodeids)
+                row["partial_resources"] = True
+                continue
+            phases = _phase_results(path)
+            meta = _json_sidecar(path, ".meta.json")
+            telemetry = _json_sidecar(path, ".telemetry.json")
+            samples = _memory_samples(path)
+            memory = _max_memory(samples)
+            row["max_host_rss_mib"] = max(row["max_host_rss_mib"], memory[0])
+            row["max_gpu_memory_mib"] = max(row["max_gpu_memory_mib"], memory[1])
+            row["memory_samples"] += len(samples)
+            launched = telemetry.get("process_launch", meta.get("launched_at"))
+            exited = telemetry.get("process_exit", meta.get("exited_at"))
+            try:
+                row["process_seconds"] += max(0.0, float(exited) - float(launched))
+            except (TypeError, ValueError):
+                if not bool(meta.get("synthetic", False)):
+                    row["partial_resources"] = True
+            if not bool(meta.get("synthetic", False)) and (
+                not bool(meta.get("monitor_memory", True)) or not samples
+            ):
+                row["partial_resources"] = True
+            for case in validation.cases:
+                phase = phases.get(case.nodeid, {})
+                outcome = str(phase.get("outcome", case.outcome))
+                if outcome not in {"passed", "failed", "skipped", "unknown"}:
+                    outcome = "unknown"
+                row["finalized_nodes"] += 1
+                cast(dict[str, Any], row)[outcome] += 1
+                row["synthetic"] += int(case.synthetic)
+                if outcome == "failed":
+                    failed_nodes.append(
+                        {
+                            "shard_index": unit.shard_index,
+                            "source_file": batch.source_file,
+                            "nodeid": case.nodeid,
+                            "diagnostic": str(
+                                phase.get("longrepr")
+                                or case.diagnostic
+                                or "pytest failure"
+                            ),
+                            "batch_id": batch.id,
+                            "unit_id": unit.id,
+                            "log_path": str(_sidecar(path, ".log")),
+                            "results_path": str(_sidecar(path, ".results.json")),
+                            "junit_path": str(path),
+                            "synthetic": case.synthetic,
+                        }
+                    )
+    rows: list[SourceSummary] = []
+    for key in sorted(by_source, key=lambda item: (item[0], item[1].encode("utf-8"))):
+        row = by_source[key]
+        row["status"] = _source_status(row)
+        row["process_seconds"] = round(float(row["process_seconds"]), 6)
+        row["max_host_rss_mib"] = round(float(row["max_host_rss_mib"]), 3)
+        row["max_gpu_memory_mib"] = round(float(row["max_gpu_memory_mib"]), 3)
+        rows.append(row)
+    failed_nodes.sort(
+        key=lambda item: (item["shard_index"], item["nodeid"].encode("utf-8"))
+    )
+    return rows, failed_nodes
+
+
+def _write_source_csv(junit_dir: Path, rows: list[SourceSummary]) -> None:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=SOURCE_HEADER, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(
+        {name: cast(dict[str, Any], row)[name] for name in SOURCE_HEADER}
+        for row in rows
+    )
+    atomic_write_text(junit_dir / "source_summary.csv", stream.getvalue())
+
+
 def _attempt_history(junit_dir: Path) -> tuple[list[AttemptSummary], list[Path]]:
     attempts: list[AttemptSummary] = []
     attempt_paths = list_attempts(junit_dir)
@@ -337,14 +530,33 @@ def _capacity_for_latest_attempt(
     )
 
 
-def _latest_infrastructure_errors(attempts: list[AttemptSummary]) -> list[str]:
-    if not attempts:
-        return []
-    closure = attempts[-1].get("closure", {})
-    errors = closure.get("infrastructure_errors", [])
-    if isinstance(errors, list):
-        return [str(error) for error in errors]
-    return ["latest attempt has malformed infrastructure error state"]
+def _latest_shard_infrastructure_errors(
+    attempt_paths: list[Path], shard_count: int
+) -> dict[str, list[str]]:
+    errors_by_shard: dict[str, list[str]] = {
+        str(index): [] for index in range(shard_count)
+    }
+    if not attempt_paths:
+        return errors_by_shard
+    for marker in sorted((attempt_paths[-1] / "shards").glob("shard-*.done.json")):
+        try:
+            shard_index = int(marker.name.removeprefix("shard-").split(".", 1)[0])
+        except ValueError:
+            continue
+        key = str(shard_index)
+        if key not in errors_by_shard:
+            continue
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            marker_errors = value.get("infrastructure_errors", [])
+            if not isinstance(marker_errors, list):
+                raise TypeError("infrastructure_errors is not a list")
+            errors_by_shard[key].extend(str(error) for error in marker_errors)
+        except (OSError, AttributeError, TypeError, json.JSONDecodeError) as error:
+            errors_by_shard[key].append(
+                f"invalid shard completion marker {marker}: {error}"
+            )
+    return errors_by_shard
 
 
 def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
@@ -353,10 +565,15 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     scan = _scan_batches(junit_dir, plan)
     _write_timing_csv(junit_dir, scan.rows)
     _write_memory_csv(junit_dir, scan)
+    sources, failed_nodes = _source_and_failure_summaries(junit_dir, plan)
+    _write_source_csv(junit_dir, sources)
     attempts, attempt_paths = _attempt_history(junit_dir)
+    shard_infrastructure_errors = _latest_shard_infrastructure_errors(
+        attempt_paths, plan.options.shard_count
+    )
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "complete": not scan.pending,
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
@@ -388,7 +605,14 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
         "estimated_total_overhead_ms": capacity["total_estimated_overhead_ms"],
         "capacity": capacity,
         "attempts": attempts,
-        "infrastructure_errors": _latest_infrastructure_errors(attempts),
+        "infrastructure_errors": [
+            f"shard-{index}: {error}"
+            for index, errors in shard_infrastructure_errors.items()
+            for error in errors
+        ],
+        "shard_infrastructure_errors": shard_infrastructure_errors,
+        "failed_nodes": failed_nodes,
+        "sources": sources,
     }
     atomic_write_json(junit_dir / "run-summary.json", summary)
     return summary
@@ -404,6 +628,223 @@ def publish_summary(junit_dir: Path, plan: Plan) -> RunSummary:
 def exit_code_for_summary(summary: RunSummary) -> int:
     if summary["infrastructure_errors"]:
         return 3
-    if not summary["complete"]:
-        return 2
-    return 1 if summary["outcomes"].get("failed", 0) else 0
+    if summary["outcomes"].get("failed", 0):
+        return 1
+    return 2 if not summary["complete"] else 0
+
+
+def exit_code_for_shard(summary: RunSummary, shard_index: int) -> int:
+    if summary["shard_infrastructure_errors"].get(str(shard_index), []):
+        return 3
+    shard = summary["shards"][str(shard_index)]
+    if shard["outcomes"].get("failed", 0):
+        return 1
+    return 2 if not shard["complete"] else 0
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{seconds:.1f}s"
+
+
+def _format_timestamp(timestamp: float) -> str:
+    return (
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _format_test_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_memory(mib: float) -> str:
+    return f"{mib / 1024:.1f} GiB" if mib >= 1024 else f"{mib:.0f} MiB"
+
+
+def _top_source_lines(
+    rows: list[SourceSummary], field: str, *, limit: int = 10
+) -> list[str]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            -float(cast(dict[str, Any], row)[field]),
+            row["source_file"].encode("utf-8"),
+        ),
+    )[:limit]
+    lines = []
+    for index, row in enumerate(ordered, 1):
+        partial = " (partial)" if row["partial_resources"] else ""
+        lines.append(
+            f"  {index:2d}. {row['source_file']} - "
+            f"duration {_format_duration(float(row['process_seconds']))}, "
+            f"peak RSS {_format_memory(float(row['max_host_rss_mib']))}, "
+            f"peak GPU {_format_memory(float(row['max_gpu_memory_mib']))}, "
+            f"samples {row['memory_samples']}{partial}"
+        )
+    return lines or ["  No finalized source data."]
+
+
+def _failure_detail_lines(
+    failed_nodes: list[FailedNodeSummary], diagnostic_limit: int
+) -> list[str]:
+    if not failed_nodes:
+        return []
+    lines = [_TERMINAL_SEPARATOR, "FAILED TEST NODES", _TERMINAL_SEPARATOR]
+    for failure in failed_nodes:
+        diagnostic = str(failure["diagnostic"])
+        encoded = diagnostic.encode("utf-8")
+        truncated = len(encoded) > diagnostic_limit
+        if truncated:
+            diagnostic = encoded[:diagnostic_limit].decode("utf-8", errors="replace")
+        lines.extend(
+            [
+                f"  - {failure['nodeid']}",
+                "    " + diagnostic.replace("\n", "\n    "),
+            ]
+        )
+        if truncated:
+            lines.append(f"    [diagnostic truncated at {diagnostic_limit} bytes]")
+        lines.extend(
+            [
+                f"    log: {failure['log_path']}",
+                f"    results: {failure['results_path']}",
+                f"    junit: {failure['junit_path']}",
+            ]
+        )
+    return lines
+
+
+def terminal_summary_lines(
+    summary: RunSummary | None,
+    *,
+    shard_index: int | None,
+    runner_exit_code: int,
+    shell_exit_code: int | None = None,
+    status: str,
+    test_started_at: float,
+    test_ended_at: float,
+    cause: str | None = None,
+    diagnostic_limit: int = 32 * 1024,
+) -> list[str]:
+    lines = [
+        _TERMINAL_SEPARATOR,
+        "TEST SUMMARY",
+        _TERMINAL_SEPARATOR,
+        f"Start time: {_format_timestamp(test_started_at)}",
+        f"End time: {_format_timestamp(test_ended_at)}",
+        f"Time elapsed: {_format_test_elapsed(test_ended_at - test_started_at)}",
+    ]
+    if summary is None:
+        lines.extend(
+            [
+                "Scope: unavailable",
+                "Planned nodes: unavailable",
+                "Finalized nodes: unavailable",
+            ]
+        )
+        failed_nodes: list[FailedNodeSummary] = []
+        sources: list[SourceSummary] = []
+        infrastructure_errors: list[str] = []
+    else:
+        if shard_index is None:
+            outcomes = summary["outcomes"]
+            sources = summary["sources"]
+            failed_nodes = summary["failed_nodes"]
+            scope_lines = [
+                "Scope: shared run",
+                f"Planned nodes: {summary['planned_nodes']}",
+                f"Finalized nodes: {summary['finalized_nodes']}",
+            ]
+            pending_count = len(summary["pending_nodes"])
+            infrastructure_errors = summary["infrastructure_errors"]
+        else:
+            shard = summary["shards"][str(shard_index)]
+            outcomes = shard["outcomes"]
+            sources = [
+                row for row in summary["sources"] if row["shard_index"] == shard_index
+            ]
+            failed_nodes = [
+                row
+                for row in summary["failed_nodes"]
+                if row["shard_index"] == shard_index
+            ]
+            scope_lines = [
+                f"Shard: {shard_index}",
+                f"Planned nodes: {shard['planned_nodes']}",
+                f"Finalized nodes: {shard['finalized_nodes']}",
+            ]
+            pending_count = shard["pending_nodes"]
+            infrastructure_errors = summary["shard_infrastructure_errors"].get(
+                str(shard_index), []
+            )
+        source_statuses = Counter(row["status"] for row in sources)
+        synthetic = sum(int(row["synthetic"]) for row in sources)
+        lines.extend(
+            [
+                *scope_lines,
+                f"Passed: {outcomes.get('passed', 0)}",
+                f"Failed: {outcomes.get('failed', 0)}",
+                f"Skipped: {outcomes.get('skipped', 0)}",
+                f"Unknown: {outcomes.get('unknown', 0)}",
+                f"Pending: {pending_count}",
+                f"Synthetic: {synthetic}",
+                f"Source files: passed={source_statuses['passed']} "
+                f"failed={source_statuses['failed']} "
+                f"incomplete={source_statuses['incomplete']} "
+                f"unknown={source_statuses['unknown']} "
+                f"no-result={source_statuses['no result']}",
+            ]
+        )
+        if shard_index is not None:
+            lines.append(
+                f"Shared run: finalized={summary['finalized_nodes']}/{summary['planned_nodes']} "
+                f"pending={len(summary['pending_nodes'])}"
+            )
+    if cause:
+        lines.extend(["", "STOP CAUSE", f"  {cause}"])
+    if infrastructure_errors:
+        lines.extend(["", "INFRASTRUCTURE ERRORS"])
+        lines.extend(f"  - {error}" for error in infrastructure_errors)
+    if failed_nodes:
+        failed_sources = sorted(
+            {failure["source_file"] for failure in failed_nodes},
+            key=lambda source: source.encode("utf-8"),
+        )
+        lines.extend(["", "Failed test files:"])
+        lines.extend(f"  - {source}" for source in failed_sources)
+    lines.extend(
+        ["", "TEST RUN RESOURCE SUMMARY", "Top 10 longest-running source files:"]
+    )
+    lines.extend(_top_source_lines(sources, "process_seconds"))
+    lines.append("Top 10 highest host RSS source files:")
+    lines.extend(_top_source_lines(sources, "max_host_rss_mib"))
+    lines.append("Top 10 highest GPU memory source files:")
+    lines.extend(_top_source_lines(sources, "max_gpu_memory_mib"))
+    lines.extend(
+        [
+            _TERMINAL_SEPARATOR,
+            f"Result: status={status} python_exit_code={runner_exit_code} "
+            + (
+                f"shell_exit_code={shell_exit_code}"
+                if shell_exit_code is not None
+                else "shell_exit_code=pending"
+            ),
+            _TERMINAL_SEPARATOR,
+        ]
+    )
+    return [*_failure_detail_lines(failed_nodes, diagnostic_limit), *lines]
