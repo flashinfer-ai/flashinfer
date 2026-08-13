@@ -1371,8 +1371,16 @@ def single_prefill_with_kv_cache(
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
+    # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
+    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO. Gate on the packed
+    # (uint8) storage, not just kv_cache_sf, so a stray scale-factor tensor on a
+    # non-uint8 cache cannot silently double the output width.
+    out_head_dim = (
+        v.shape[-1] * 2
+        if kv_cache_sf is not None and v.dtype == torch.uint8
+        else v.shape[-1]
+    )
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -1488,6 +1496,31 @@ def _compute_page_mask_indptr(
         0,
     )
     return mask_indptr
+
+
+def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
+    """Whether split-KV must be disabled because the KV cache is NVFP4.
+
+    This gate is an *empirical workaround*: with split-KV (flash-decoding)
+    enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
+    a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
+    and prefix-cache extend), while dense full-prefill was unaffected.
+    Disabling split-KV removes the corruption, and decode-throughput
+    measurements showed no cost from the gate.
+
+    The root cause has not been confirmed. The FP8 scale-factor blocks
+    themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
+    *head-dim* elements of a single token, whereas split-KV partitions the
+    *token* axis, so a split boundary never slices a scale block. The current
+    hypothesis (unconfirmed) is that the small per-split KV chunks interact
+    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
+    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
+    FP8 and 16-bit KV caches are unaffected and keep split-KV.
+    """
+    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
+        return True
+    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    return native_fp4 is not None and kv_data_type == native_fp4
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -1660,10 +1693,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
+            or ``cute-dsl``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1677,10 +1712,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         _check_kv_layout(kv_layout)
 
+        self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
-            raise NotImplementedError(
-                "cute-dsl backend is not yet supported for paged KV cache. "
-                "Use BatchPrefillWithRaggedKVCacheWrapper instead."
+            from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+            self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
+                float_workspace_buffer, use_cuda_graph=use_cuda_graph
             )
 
         if jit_args is not None and backend != "cute-dsl":
@@ -1692,9 +1729,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_additional_scalar_names = list(jit_args[9])
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_additional_scalar_names = []
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2258,9 +2297,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # The segment_packbits kernel requires the indptr on the mask's
+            # device (CHECK_DEVICE in quantization.cu), but mask_indptr
+            # inherits qo_indptr's device, which callers (e.g. vLLM) routinely
+            # keep on CPU while the mask is on GPU.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
@@ -2375,7 +2418,76 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cached_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
 
-        if self._jit_module is not None:
+        if self._backend == "cute-dsl":
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support custom_mask"
+                )
+            if head_dim_vo is not None and head_dim_vo != head_dim_qk:
+                raise NotImplementedError(
+                    "cute-dsl backend requires head_dim_vo == head_dim_qk"
+                )
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode!r}. "
+                    "For RoPE, apply rotary embeddings to Q/K before calling the kernel."
+                )
+            if kv_data_type is not None and q_data_type != kv_data_type:
+                raise ValueError(
+                    "cute-dsl paged prefill requires q_data_type == "
+                    f"kv_data_type, got {q_data_type} and {kv_data_type}"
+                )
+
+            cute_variant: Optional[Any] = None
+            if pos_encoding_mode == "ALIBI":
+                from .cute_dsl.attention import ALiBiAttention
+
+                slopes = ALiBiAttention.get_slopes(num_qo_heads)
+                cute_variant = ALiBiAttention(
+                    torch.tensor(slopes, dtype=torch.float32, device=self.device)
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                from .cute_dsl.attention import SoftCappingAttention
+
+                if cute_variant is not None:
+                    raise NotImplementedError(
+                        "the public cute-dsl route cannot combine ALiBi with "
+                        "logits_soft_cap (one plan-time variant per kernel); "
+                        "a fused custom variant can express both — use "
+                        "flashinfer.cute_dsl.attention."
+                        "BatchPrefillCuteDSLWrapper with plan(..., variant=...)"
+                    )
+                cute_variant = SoftCappingAttention(cap=logits_soft_cap)
+
+            _sm_scale = (
+                sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
+            )
+            # All paged plans use the modular kernel — the vendored FMHA
+            # artifacts (the ragged wrapper's dense/causal route) have no
+            # paged variant.
+            # Consume the wrapper-owned buffers (populated above) rather
+            # than the raw arguments: they are the stable-address contract
+            # for CUDA-graph mode and the single normalized copy otherwise.
+            self._cute_dsl_wrapper.plan(
+                self._qo_indptr_buf,
+                None,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo=head_dim_qk,
+                causal=causal,
+                sm_scale=_sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
+                window_left=window_left,
+                variant=cute_variant,
+                page_size=page_size,
+                paged_kv_indptr=self._paged_kv_indptr_buf,
+                paged_kv_indices=self._paged_kv_indices_buf,
+                paged_kv_last_page_len=self._paged_kv_last_page_len_buf,
+                kv_layout=self._kv_layout,
+            )
+        elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
@@ -2471,6 +2583,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
@@ -2683,6 +2802,48 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"where total_tokens = qo_indptr[-1]."
                 )
 
+        if self._backend == "cute-dsl":
+            if q_scale is not None or k_scale is not None or v_scale is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support q/k/v scale factors"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support NVFP4 KV cache "
+                    "scale factors (kv_cache_sf)"
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "the public cute-dsl paged route does not accept run-time "
+                    "attention sinks yet; the backend supports sinks as a "
+                    "plan-time variant — use flashinfer.cute_dsl.attention."
+                    "BatchPrefillCuteDSLWrapper with "
+                    "plan(..., variant=AttentionWithSink(sinks))"
+                )
+            if skip_softmax_threshold_scale_factor is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support skip-softmax"
+                )
+            if window_left is not None and window_left != self._window_left:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support per-call "
+                    "window_left overrides; re-plan instead"
+                )
+            # enable_pdl is accepted as a hint (no-op for the modular kernel,
+            # matching the ragged cute-dsl route).
+            if out is None and q.dtype.itemsize == 1:
+                # fp8 inputs produce bf16 output, matching the ragged
+                # cute-dsl route's convention (the kernel's native scratch
+                # is fp16; the copy-out converts).
+                out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+            return self._cute_dsl_wrapper.run_paged(
+                q,
+                (k_cache, v_cache),
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+            )
+
         if (
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
         ) and kv_cache_sf is None:
@@ -2737,7 +2898,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
+        # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
+        # (2 values per byte): the unpacked VO width is v_cache.shape[-1]*2,
+        # which equals head_dim_vo even for asymmetric (QK, VO) plans.
+        # Using q.shape[-1] here assumed head_dim_vo == head_dim_qk and made
+        # the kernel (which writes head_dim_vo-wide rows) garble a too-wide
+        # output buffer whenever VO < QK.
+        out_head_dim = (
+            v_cache.shape[-1] * 2
+            if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            else v_cache.shape[-1]
+        )
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -2827,19 +2998,58 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                run_args.extend(
-                    prepare_jit_additional_args(
-                        self._jit_additional_tensor_names,
-                        {
-                            "maybe_custom_mask": self._custom_mask_buf,
-                            "maybe_mask_indptr": self._mask_indptr_buf,
-                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                                q.shape[1], q.device
-                            ),
-                        },
-                        args,
-                    )
+                additional_args = prepare_jit_additional_args(
+                    self._jit_additional_tensor_names,
+                    {
+                        "maybe_custom_mask": self._custom_mask_buf,
+                        "maybe_mask_indptr": self._mask_indptr_buf,
+                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                            q.shape[1], q.device
+                        ),
+                        "maybe_prefix_len_ptr": self._prefix_len_ptr,
+                        "maybe_token_pos_in_items_ptr": self._token_pos_in_items_ptr,
+                        "maybe_max_item_len_ptr": self._max_item_len_ptr,
+                        "maybe_k_cache_sf": key_block_scales,
+                        "maybe_v_cache_sf": value_block_scales,
+                    },
+                    args,
                 )
+                expected_additional_arg_count = len(
+                    self._jit_additional_tensor_names
+                ) + len(self._jit_additional_scalar_names)
+                if len(additional_args) < expected_additional_arg_count:
+                    _, scale_q_scalar = _split_scale_param(q_scale)
+                    _, scale_k_scalar = _split_scale_param(k_scale)
+                    _, scale_v_scalar = _split_scale_param(v_scale)
+                    jit_scalar_values = {
+                        "logits_soft_cap": logits_soft_cap,
+                        "sm_scale": sm_scale,
+                        "rope_rcp_scale": 1.0 / rope_scale,
+                        "rope_rcp_theta": 1.0 / rope_theta,
+                        "scale_q_scalar": scale_q_scalar,
+                        "scale_k_scalar": scale_k_scalar,
+                        "scale_v_scalar": scale_v_scalar,
+                        "token_pos_in_items_len": self._token_pos_in_items_len,
+                    }
+                    # prepare_jit_additional_args returns one entry per declared
+                    # tensor name plus any scalars the caller passed
+                    # positionally, so the number of scalars already provided is
+                    # exactly the excess over the tensor-name count.
+                    num_scalars_provided = len(additional_args) - len(
+                        self._jit_additional_tensor_names
+                    )
+                    for name in self._jit_additional_scalar_names[
+                        num_scalars_provided:
+                    ]:
+                        if name not in jit_scalar_values:
+                            raise ValueError(
+                                f"JIT module declares additional scalar {name!r}, "
+                                "which was not passed positionally to run() and "
+                                "cannot be derived automatically; derivable "
+                                f"scalars are: {sorted(jit_scalar_values)}"
+                            )
+                        additional_args.append(jit_scalar_values[name])
+                run_args.extend(additional_args)
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -3371,9 +3581,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # segment_packbits requires mask_indptr on the same device as
+            # custom_mask, but mask_indptr inherits qo_indptr's device (often
+            # CPU) while custom_mask is on GPU. Mirror the paged path's
+            # .to(device) so the ragged custom-mask flow doesn't crash.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
@@ -3479,14 +3693,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
                 slopes = ALiBiAttention.get_slopes(num_qo_heads)
                 variant = ALiBiAttention(
-                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                    torch.tensor(slopes, dtype=torch.float32, device=self.device)
                 )
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 from .cute_dsl.attention import SoftCappingAttention
 
                 if variant is not None:
                     raise NotImplementedError(
-                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                        "the public cute-dsl route cannot combine ALiBi with "
+                        "logits_soft_cap (one plan-time variant per kernel); "
+                        "a fused custom variant can express both — use "
+                        "flashinfer.cute_dsl.attention."
+                        "BatchPrefillCuteDSLWrapper with plan(..., variant=...)"
                     )
                 variant = SoftCappingAttention(cap=logits_soft_cap)
 
@@ -3503,11 +3721,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 variant is None and head_dim_qk == 128 and window_left < 0
             )
             if self._cute_dsl_use_fmha:
-                q_lens = qo_indptr[1:] - qo_indptr[:-1]
-                k_lens = kv_indptr[1:] - kv_indptr[:-1]
+                # Wrapper-owned buffers (populated above): stable addresses
+                # for CUDA-graph mode, single normalized copy otherwise.
+                q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+                k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
                 self._cute_dsl_fmha_plan = {
-                    "qo_indptr": qo_indptr,
-                    "kv_indptr": kv_indptr,
+                    "qo_indptr": self._qo_indptr_buf,
+                    "kv_indptr": self._kv_indptr_buf,
                     "seq_lens": k_lens.to(torch.int32),
                     "batch_size": qo_indptr.shape[0] - 1,
                     "max_q_len": int(q_lens.max().item()),
@@ -3528,8 +3748,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         f"kv_data_type, got {q_data_type} and {kv_data_type}"
                     )
                 self._cute_dsl_wrapper.plan(
-                    qo_indptr,
-                    kv_indptr,
+                    self._qo_indptr_buf,
+                    self._kv_indptr_buf,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim_qk,
@@ -3659,6 +3879,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
@@ -3855,8 +4082,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
 
-        # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+        # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
+        # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed
+        # (uint8) storage so a stray scale-factor tensor on a non-uint8 cache
+        # can't silently double the output width (matches the decode-side guard).
+        out_head_dim = (
+            v.shape[-1] * 2
+            if kv_cache_sf is not None and v.dtype == torch.uint8
+            else v.shape[-1]
+        )
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
@@ -3929,6 +4163,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl backend does not support NVFP4 packed KV cache "
                     "(kv_cache_sf)"
+                )
+            # vLLM's metadata builder stashes attention sinks on the wrapper
+            # for the fmha_v2 route; the cute-dsl route would silently
+            # ignore them (wrong results), so fail loudly with the
+            # supported alternative.
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but "
+                    "the public cute-dsl ragged route does not consume "
+                    "them; the backend supports sinks as a plan-time "
+                    "variant — use flashinfer.cute_dsl.attention."
+                    "BatchPrefillCuteDSLWrapper with "
+                    "plan(..., variant=AttentionWithSink(sinks))"
                 )
             # enable_pdl is a launch-latency hint: forwarded on the FMHA
             # route below; the modular kernel has no PDL support.

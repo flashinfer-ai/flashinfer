@@ -434,6 +434,37 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
+        def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+            # Stage profiling passes only activation and weight tensors, so the
+            # profile key captures their shapes but not constructor-fixed options
+            # such as top-k, parallel ranks, quantization mode, or activation.
+            # The in-memory runner hash distinguishes instances, but it is
+            # intentionally excluded from persisted file keys. Include those
+            # options here to prevent runners with identical tensor profiles from
+            # reusing incompatible saved tactics.
+            return (
+                self.x_dtype,
+                self.weight_dtype,
+                self.output_dtype,
+                self.top_k,
+                self.tp_size,
+                self.tp_rank,
+                self.ep_size,
+                self.ep_rank,
+                self.cluster_size,
+                self.cluster_rank,
+                self.enable_alltoall,
+                self.use_deepseek_fp8_block_scale,
+                self.use_w4_group_scaling,
+                self.use_mxfp8_act_scaling,
+                self.use_wfp4afp8_humming,
+                self.min_latency_mode,
+                self.enable_pdl,
+                int(self.activation_type),
+                self.use_packed_weights,
+                self.use_fused_finalize,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -878,6 +909,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     # Register the module
     return SimpleNamespace(
+        MoERunner=MoERunner,
         cutlass_fused_moe=cutlass_fused_moe,
         cutlass_fused_moe_workspace_size=_cutlass_fused_moe_workspace_size,
         interleave_moe_weights_for_sm90_mixed_gemm=(
@@ -969,6 +1001,13 @@ def cutlass_fused_moe(
             - gemm2 activation quant scale
             - gemm2 dequant scale
             - gemm1 input dequant scale
+
+        Humming FP8 x MXFP4 (``use_wfp4afp8_humming=True``):
+            - gemm1 folded weight block scales
+            - gemm1 per-local-expert residual scale, including the fixed ``2^6`` compensation
+            - reserved scalar or per-local-expert gemm2 activation scale
+            - gemm2 folded weight block scales
+            - gemm2 per-local-expert residual scale, including the fixed ``2^6`` compensation
 
     fc1_expert_biases : Optional[torch.Tensor]
         GEMM1 biases for each expert.
@@ -3287,10 +3326,14 @@ def _validate_fp8_block_scale_gemm1_activation_params(
 ) -> None:
     if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
         return
-    if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
+    if Fp8QuantizationType(fp8_quantization_type) not in (
+        Fp8QuantizationType.MxFp8,
+        Fp8QuantizationType.DeepSeekFp8,
+    ):
         raise ValueError(
             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
-            "for Fp8QuantizationType.MxFp8 in FP8 block scale MoE."
+            "for Fp8QuantizationType.MxFp8 and Fp8QuantizationType.DeepSeekFp8 in "
+            f"FP8 block scale MoE, got {Fp8QuantizationType(fp8_quantization_type)}."
         )
     if int(activation_type) != int(ActivationType.Swiglu):
         raise ValueError(
@@ -4143,25 +4186,25 @@ def trtllm_fp8_block_scale_moe(
         CUDA-graph pre-allocation; only rows ``[0, num_tokens)`` are written.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
-        parameter.  Currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.  Any
+        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.  Any
         subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
         can be provided independently.  When ``None`` (default),
         ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
-        (linear/up half) and ``X2`` (gate half).  The fused activation
+        (linear/up half) and ``X2`` (gate half).  The activation
         output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
-        values for MxFp8; no host-side scalar dequant-scale conversion is
-        applied.
+        values; neither block-scale recipe carries a scalar dequant scale, so
+        no host-side conversion is applied.
     gemm1_beta : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
-        parameter.  Currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.
+        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
         When ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
-        Currently supported only for ``Fp8QuantizationType.MxFp8`` with
-        ``ActivationType.Swiglu``.  When provided,
-        ``X1 = clamp(X1, -limit, limit)`` and
+        Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
+        When provided, ``X1 = clamp(X1, -limit, limit)`` and
         ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
         is applied.
     output : Optional[torch.Tensor]
@@ -4389,25 +4432,25 @@ def trtllm_fp8_block_scale_routed_moe(
         ``6`` Relu2; ``7`` Identity.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
-        parameter.  Currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.  Any
+        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.  Any
         subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
         can be provided independently.  When ``None`` (default),
         ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
-        (linear/up half) and ``X2`` (gate half).  The fused activation
+        (linear/up half) and ``X2`` (gate half).  The activation
         output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
-        values for MxFp8; no host-side scalar dequant-scale conversion is
-        applied.
+        values; neither block-scale recipe carries a scalar dequant scale, so
+        no host-side conversion is applied.
     gemm1_beta : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
-        parameter.  Currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.
+        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
         When ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
-        Currently supported only for ``Fp8QuantizationType.MxFp8`` with
-        ``ActivationType.Swiglu``.  When provided,
-        ``X1 = clamp(X1, -limit, limit)`` and
+        Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
+        When provided, ``X1 = clamp(X1, -limit, limit)`` and
         ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
         is applied.
 

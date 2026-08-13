@@ -60,6 +60,7 @@ NON_CODEGEN_PARAMS = {"mac_override", "tile_m"}
 
 STATIC_BASELINE = {
     "activation_precision": "fp4",
+    "quant_mode": "nvfp4",
     "state_E": 32,
     "weight_E": 32,
     "m": 64,
@@ -79,6 +80,7 @@ STATIC_BASELINE = {
 }
 STATIC_PERTURBED = {
     "activation_precision": "w4a16",
+    "quant_mode": "mxfp4",
     "state_E": 16,
     "weight_E": 16,
     "m": 128,
@@ -112,6 +114,7 @@ MICRO_PERTURBED.update(
 
 DYNAMIC_BASELINE = {
     "activation_precision": "fp4",
+    "quant_mode": "nvfp4",
     "E": 32,
     "k": 2048,
     "n": 1024,
@@ -129,6 +132,7 @@ DYNAMIC_BASELINE = {
 }
 DYNAMIC_PERTURBED = {
     "activation_precision": "w4a16",
+    "quant_mode": "mxfp4",
     "E": 16,
     "k": 4096,
     "n": 2048,
