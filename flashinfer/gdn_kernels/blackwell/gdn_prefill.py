@@ -50,7 +50,7 @@ from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 # the key because the tile scheduler and GQA reshape logic bake them in.
 @functools.cache
 def _get_compiled_cache(
-    arch: str,
+    target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
@@ -194,7 +194,7 @@ def chunk_gated_delta_rule_sm100(
     # num_sm is baked into the kernel's tile scheduler, so it belongs in the key.
     target = gdn_device_target(q.device)
     cache = _get_compiled_cache(
-        target.arch,
+        target.compile_key,
         get_num_sm(q.device),
         str(q.dtype),
         str(state_torch_dtype),

@@ -2499,6 +2499,7 @@ def run_gdn_verify_kernel_mtp_inline(
 
 @functools.cache
 def _get_compiled_mtp_kernel(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2518,7 +2519,6 @@ def _get_compiled_mtp_kernel(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
-    arch: str = "",
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2526,6 +2526,7 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2545,7 +2546,6 @@ def _get_compiled_mtp_kernel_inline(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
-    arch: str = "",
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2643,6 +2643,7 @@ def run_mtp_decode(
 
     if use_inline_kernel:
         inline_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2662,11 +2663,11 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
-            target.arch,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
         warp_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2686,7 +2687,6 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
-            target.arch,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 

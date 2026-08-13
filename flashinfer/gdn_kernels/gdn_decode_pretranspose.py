@@ -898,7 +898,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel(
-    arch: str,
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -966,7 +966,7 @@ def run_pretranspose_decode(
         stride1 = stride2 = stride3 = 0
     target = gdn_device_target(q.device)
     cache_key = (
-        target.arch,
+        target.compile_key,
         T,
         H,
         HV,

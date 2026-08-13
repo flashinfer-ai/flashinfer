@@ -58,6 +58,14 @@ def test_device_target_reads_the_requested_device(fake_devices):
     assert (d1.arch, d1.num_sms, d1.use_packed_fma) == ("sm_100a", 148, True)
 
 
+def test_compile_key_separates_devices(fake_devices):
+    """A compiled artifact is pinned to the device it first ran on, so two devices
+    must not share a cache entry even when they are the same architecture."""
+    assert dt.gdn_device_target("cuda:0").compile_key != (
+        dt.gdn_device_target("cuda:1").compile_key
+    )
+
+
 def test_index_less_device_follows_current_device(fake_devices, monkeypatch):
     assert dt.gdn_device_target("cuda").arch == "sm_90a"
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
@@ -67,7 +75,18 @@ def test_index_less_device_follows_current_device(fake_devices, monkeypatch):
 def test_cute_dsl_arch_env_override_wins(fake_devices, monkeypatch):
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_90a")
     dt._resolve.cache_clear()
-    assert dt.gdn_device_target("cuda:1").arch == "sm_90a"
+
+    target = dt.gdn_device_target("cuda:1")
+    # The whole policy must follow the override, not just the arch string: packed
+    # F32x2 codegen against an sm_90a target would not assemble.
+    assert (target.arch, target.major, target.use_packed_fma) == ("sm_90a", 9, False)
+
+
+def test_unparsable_cute_dsl_arch_is_rejected(fake_devices, monkeypatch):
+    monkeypatch.setenv("CUTE_DSL_ARCH", "hopper")
+    dt._resolve.cache_clear()
+    with pytest.raises(ValueError, match="not a recognized arch"):
+        dt.gdn_device_target("cuda:0")
 
 
 def test_non_cuda_device_is_rejected(fake_devices):
@@ -84,27 +103,40 @@ def test_compile_options_pin_arch_and_preserve_extras(fake_devices):
     assert options[1:] == extras
 
 
-def test_gdn_compile_sites_do_not_pass_string_options():
-    """``cute.compile[opts](..., options="...")`` drops ``opts`` instead of merging.
+def _is_cute_compile(func: ast.expr) -> bool:
+    target = func.value if isinstance(func, ast.Subscript) else func
+    if not isinstance(target, ast.Attribute) or target.attr != "compile":
+        return False
+    owner = target.value
+    if isinstance(owner, ast.Name):
+        return owner.id == "cute"
+    return isinstance(owner, ast.Attribute) and owner.attr == "cute"
 
-    The DSL replaces subscripted options wholesale when a string ``options=``
-    kwarg is present, so a string here would silently un-pin the target arch.
+
+def test_every_gdn_cute_compile_pins_an_explicit_target():
+    """Un-subscripted ``cute.compile`` targets whatever the DSL picks (device 0).
+
+    A string ``options=`` kwarg is equally unsafe: the DSL replaces subscripted
+    options wholesale when one is present, silently dropping the ``GPUArch``.
     """
-    offenders = []
+    unpinned, string_options = [], []
     for path in sorted(GDN_KERNELS_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            if not isinstance(node, ast.Call) or not _is_cute_compile(node.func):
                 continue
-            if "compile" not in ast.dump(node.func):
-                continue
-            for kw in node.keywords:
-                if kw.arg == "options" and isinstance(kw.value, ast.Constant):
-                    offenders.append(f"{path.name}:{node.lineno}")
+            where = f"{path.name}:{node.lineno}"
+            if not isinstance(node.func, ast.Subscript):
+                unpinned.append(where)
+            if any(
+                kw.arg == "options" and isinstance(kw.value, ast.Constant)
+                for kw in node.keywords
+            ):
+                string_options.append(where)
 
-    assert not offenders, (
-        "pass compile options via cute.compile[gdn_compile_options(device, ...)] "
-        f"instead of a string options= kwarg: {offenders}"
+    assert not unpinned and not string_options, (
+        "call cute.compile[gdn_compile_options(device, ...)](...) instead; "
+        f"unpinned={unpinned} string_options={string_options}"
     )
 
 
@@ -119,45 +151,40 @@ def test_bf16_mtp_tile_v_follows_device_sm_count():
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="needs at least two CUDA devices"
 )
-def test_decode_matches_across_current_device(monkeypatch):
-    """Operands on cuda:1 must decode identically whatever the current device is."""
+def test_decode_agrees_across_devices():
+    """The same decode must give the same answer on every device in one process.
+
+    A compiled CuTe-DSL artifact is pinned to the device it first ran on, so before
+    the device index entered the compile key the second device silently reused the
+    first device's artifact.
+    """
     from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
     B, T, H, HV, K, V = 2, 1, 4, 4, 128, 128
-    device = torch.device("cuda", 1)
     torch.manual_seed(0)
+    cpu_inputs = {
+        "q": torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1,
+        "k": torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1,
+        "v": torch.randn(B, T, HV, V, dtype=torch.bfloat16) * 0.1,
+        "a": torch.randn(B, T, HV, dtype=torch.bfloat16) * 0.1,
+        "b": torch.randn(B, T, HV, dtype=torch.bfloat16) * 0.1,
+        "A_log": torch.randn(HV, dtype=torch.float32) * 0.1,
+        "dt_bias": torch.randn(HV, dtype=torch.float32) * 0.1,
+        "state": torch.randn(B, HV, V, K, dtype=torch.bfloat16) * 0.1,
+    }
 
-    def make(dtype):
-        return torch.randn(B, T, H, K, dtype=dtype, device=device) * 0.1
+    def run_on(index):
+        # The DSL binds an artifact to the current device, so make it the operand's.
+        with torch.cuda.device(index):
+            args = {k: v.cuda(index) for k, v in cpu_inputs.items()}
+            out, _ = gated_delta_rule_decode_pretranspose(
+                **args, scale=1.0 / math.sqrt(K), use_qk_l2norm=True
+            )
+            torch.cuda.synchronize(index)
+            return out.float().cpu()
 
-    q, k = make(torch.bfloat16), make(torch.bfloat16)
-    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device) * 0.1
-    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device) * 0.1
-    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device) * 0.1
-    A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
-    dt_bias = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
-    state = torch.randn(B, HV, V, K, dtype=torch.bfloat16, device=device) * 0.1
-
-    def run():
-        out, _ = gated_delta_rule_decode_pretranspose(
-            q=q,
-            k=k,
-            v=v,
-            state=state.clone(),
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-            scale=1.0 / math.sqrt(K),
-            use_qk_l2norm=True,
-        )
-        return out
-
-    torch.cuda.set_device(0)
-    from_other_device = run()
-    torch.cuda.set_device(1)
-    from_same_device = run()
-
-    torch.testing.assert_close(
-        from_other_device.float(), from_same_device.float(), atol=0, rtol=0
-    )
+    original_device = torch.cuda.current_device()
+    try:
+        torch.testing.assert_close(run_on(0), run_on(1), atol=0, rtol=0)
+    finally:
+        torch.cuda.set_device(original_device)

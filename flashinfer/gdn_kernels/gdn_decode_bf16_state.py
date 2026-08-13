@@ -3179,7 +3179,7 @@ def gated_delta_rule_mtp_wide_vec(
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3464,7 +3464,7 @@ def gated_delta_rule_t1_wide_vec(
         use_packed_fma,
         same_pool,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3845,7 +3845,7 @@ def gated_delta_rule_mtp(
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         _dtype_key(A_log, dt_bias, initial_state_indices),
-        target.arch,
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_mtp:

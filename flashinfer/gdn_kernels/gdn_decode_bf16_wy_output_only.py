@@ -47,7 +47,7 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
-from .device_target import gdn_compile_options
+from .device_target import gdn_compile_options, gdn_device_target
 from .dtype_compat import as_bf16
 
 
@@ -1945,10 +1945,6 @@ class GdnDecodeKernel:
 _CACHE: dict = {}
 
 
-def _compile_options(device: torch.device) -> tuple:
-    return gdn_compile_options(device)
-
-
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
 # pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
@@ -2232,7 +2228,8 @@ def gated_delta_rule_mtp(
                 bb[:, :T].copy_(b)
             q, k, v, a, b = qb, kb, vb, ab, bb
 
-    _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    target = gdn_device_target(device)
+    _num_sms = target.num_sms
     # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM (ncu, B200).
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
@@ -2259,10 +2256,8 @@ def gated_delta_rule_mtp(
     # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
     # by the intense correctness sweep; invisible to the tests/benches, which use
     # one HV per process.
-    cc = torch.cuda.get_device_capability(device)
     cache_key: tuple = (
-        str(device),
-        cc,
+        target.compile_key,
         mbp,
         t_disc,
         n_valid,
@@ -2330,7 +2325,7 @@ def gated_delta_rule_mtp(
             qkv_row_stride=_qkv_rs,
             ab_native=_ab_native_flag,
         )
-        _CACHE[cache_key] = cute.compile[_compile_options(device)](kernel, *args)
+        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](kernel, *args)
     _CACHE[cache_key](*args)
 
     if output is None:

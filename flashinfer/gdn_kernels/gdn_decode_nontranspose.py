@@ -679,7 +679,7 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
-    arch: str,
+    target_key: tuple,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -727,7 +727,7 @@ def run_nontranspose_decode(
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
     target = gdn_device_target(q.device)
     cache_key = (
-        target.arch,
+        target.compile_key,
         use_small_batch,
         T,
         H,
