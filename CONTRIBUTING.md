@@ -119,18 +119,20 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
-**For org members (`ci-users` team):** CI triggers automatically when you open or update a PR.
+Public CI does not start on its own for any PR. A member of the `ci-users` team starts it by commenting `@flashinfer-bot run`, or by adding the `run-ci` label directly. This applies to everyone, including maintainers.
 
-**For other contributors:** If you are not in the `ci-users` team, CI will not run automatically. A `ci-users` team member can approve it by commenting `@flashinfer-bot run` or by adding the `run-ci` label to the PR.
+Starting CI applies to the commit that is current at that moment. Pushing new commits, rebasing, or merging `main` into your branch does **not** start a new run, so ask for `@flashinfer-bot run` again once your PR is ready for a final check. Note that GitHub requires the checks to pass on the last commit before a PR can merge.
+
+It is what applies the `run-ci` label that starts CI, not the label sitting on the PR, so the label stays behind after a run and adding it a second time does nothing. `@flashinfer-bot run` handles this for you by removing the label before re-adding it. If you would rather use the label directly, remove `run-ci` and add it again.
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `@flashinfer-bot run` | `ci-users` team | Approve and trigger CI for a PR |
+| `@flashinfer-bot run` | `ci-users` team | Start CI on the PR's current commit |
 | `@flashinfer-bot rerun` | `ci-users` team | Cancel and rerun all workflows |
 | `@flashinfer-bot rerun failed` | `ci-users` team | Rerun only failed/cancelled jobs |
 | `@flashinfer-bot stop` | `ci-users` team | Cancel all in-progress workflows |
 
-> **Note:** Draft PRs skip CI automatically. Mark your PR as ready for review to enable CI.
+> **Note:** Draft PRs work the same way. They never run CI on their own, but a `ci-users` member can start a run on one when you need it.
 
 ## NVIDIA Internal CI (GitLab)
 
