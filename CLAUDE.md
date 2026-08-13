@@ -38,6 +38,12 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 
+The minimum Python version used by CI and build tooling is defined in
+`.python-version`. CI Docker images use a stable Conda environment name and
+derive their interpreter and site-packages paths from that file. When raising
+the minimum, also update `project.requires-python` and `tool.mypy.python_version`
+in `pyproject.toml`.
+
 ## Quick Start for Development
 
 ### Installation
