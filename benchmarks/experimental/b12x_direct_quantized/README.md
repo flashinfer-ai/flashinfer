@@ -44,3 +44,8 @@ changing the baseline kernel or launch policy.
 All 32 measured points exceed the 1.08x acceptance threshold. The complete
 baseline latency, optimized latency, speedup, and numerical error are recorded
 in `results/b12x_direct_vs_pristine_final.csv`.
+
+Additional vLLM modular-dispatch, CUDA Graph, and host Compute Sanitizer data
+is recorded in
+`results/vllm_sm120_integration_sanitizer_20260813.md`. The report includes the
+W4A16 racecheck follow-up observed on the target H2048/I512 Tensor Core path.
