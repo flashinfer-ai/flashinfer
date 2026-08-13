@@ -6,10 +6,15 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Repo**: NVIDIA CuTeDSL MegaMoE kernel team's repo (see `ACKNOWLEDGEMENT.md`
-  for authors/contacts). <!-- TODO: pin the repo URL -->
-- **Vendored commit**: <!-- TODO: record the upstream SHA of the current src/ drop -->
-- **Last synced**: <!-- TODO: date of the current drop -->
+- **Repo**: <https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe>
+  (NVIDIA-internal GitLab; see `ACKNOWLEDGEMENT.md` for authors/contacts).
+- **Vendored commit**: not recorded — the current `src/` drop was taken
+  2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
+  PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
+  then the only pinned points are the two files synced ahead of the drop
+  (see pending diffs below, `50117315d`).
+- **Last synced**: 2026-07-13 (full drop); 2026-08-10 partial re-sync of
+  `inputs_process.py` + `host_utils.py` (see pending diffs).
 - **Vendored subset**: the four kernel packages only (`common/`, `src/`,
   `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
   (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
