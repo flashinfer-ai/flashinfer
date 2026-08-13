@@ -398,7 +398,7 @@ def nvfp4_attention_sm120_fwd(
     lse: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     softmax_scale: Optional[float] = None,
-    return_lse: bool = False,
+    return_lse: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run SM120 NVFP4 attention on pre-quantized Q/K/V tensors.
 
@@ -433,7 +433,8 @@ def nvfp4_attention_sm120_fwd(
         Deprecated alias for ``sm_scale``.
     return_lse : bool, optional
         Whether to compute and return the log-sum-exp tensor. Defaults to
-        ``False``.
+        ``True`` for compatibility with the legacy ``(out, lse)`` return
+        contract. Set to ``False`` to return only the attention output.
 
     Returns
     -------

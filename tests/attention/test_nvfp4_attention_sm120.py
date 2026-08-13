@@ -358,6 +358,7 @@ def test_nvfp4_attention_sm120_structured_q_correction(per_block_mean):
         sm_scale=head_dim**-0.5,
         causal=False,
         per_block_mean=per_block_mean,
+        return_lse=False,
     )
     torch.cuda.synchronize()
 
@@ -468,18 +469,22 @@ def test_nvfp4_attention_sm120_without_lse(causal):
     v = torch.randn_like(q)
 
     quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
-    out_with_lse, _ = flashinfer.nvfp4_attention_sm120_fwd(
-        *quantized, sm_scale=head_dim**-0.5, causal=causal, return_lse=True
+    out_default, lse_default = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized, sm_scale=head_dim**-0.5, causal=causal
     )
     out_without_lse = flashinfer.nvfp4_attention_sm120_fwd(
         *quantized,
         sm_scale=head_dim**-0.5,
         causal=causal,
+        return_lse=False,
     )
     torch.cuda.synchronize()
 
+    assert isinstance(out_default, torch.Tensor)
+    assert isinstance(lse_default, torch.Tensor)
+    assert lse_default.shape == (batch, num_heads, seq_len)
     assert isinstance(out_without_lse, torch.Tensor)
-    torch.testing.assert_close(out_without_lse, out_with_lse, rtol=0, atol=5e-4)
+    torch.testing.assert_close(out_without_lse, out_default, rtol=0, atol=5e-4)
 
 
 @torch.inference_mode()
@@ -507,6 +512,7 @@ def test_nvfp4_attention_sm120_causal_mask_column_order():
         qk_correction,
         sm_scale=head_dim**-0.5,
         causal=True,
+        return_lse=False,
     )
     torch.cuda.synchronize()
     out = out[0, 0].float()
