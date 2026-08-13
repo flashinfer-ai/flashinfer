@@ -44,6 +44,31 @@ def skip_if_nvfp4_asymmetric_unsupported(head_dim_qk: int):
         )
 
 
+def _accumulate_mismatch_count(mismatch_counts, out, ref, rtol, atol):
+    """Record the per-request mismatch count on device without synchronizing.
+
+    The per-request reference loops used to call torch.testing.assert_close per
+    request, which synchronizes the device once per request (up to 128x per
+    test). Accumulating counts and checking once in _assert_no_ref_mismatch
+    keeps a single sync per test, with request-sized (not batch-sized)
+    comparison temporaries.
+    """
+    close = torch.isclose(
+        out.float(), ref.float(), rtol=rtol, atol=atol, equal_nan=True
+    )
+    mismatch_counts.append((~close).sum())
+
+
+def _assert_no_ref_mismatch(mismatch_counts):
+    counts = torch.stack(mismatch_counts).cpu()  # single device sync
+    if counts.any():
+        bad = counts.nonzero().flatten().tolist()
+        raise AssertionError(
+            f"output mismatches reference in request(s) {bad}; "
+            f"mismatched elements per request: {[int(counts[i]) for i in bad]}"
+        )
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -254,6 +279,7 @@ def test_batch_prefill_with_paged_kv_cache(
 
         g.replay()
 
+    mismatch_counts = []
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
         perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
@@ -305,7 +331,8 @@ def test_batch_prefill_with_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -372,6 +399,7 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+    mismatch_counts = []
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         ki = torch.cat(
@@ -405,7 +433,8 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
             backend="fa2",
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
@@ -593,6 +622,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         g.replay()
 
     k_cache, v_cache = kv_data_fp32
+    mismatch_counts = []
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
         perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
@@ -636,7 +666,8 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
@@ -829,6 +860,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     else:
         o = wrapper.run(q, k, v)
 
+    mismatch_counts = []
     for i in range(batch_size):
         o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             q[q_indptr[i] : q_indptr[i + 1]],
@@ -839,7 +871,8 @@ def test_batch_prefill_with_ragged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr[i] : q_indptr[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -905,6 +938,7 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+    mismatch_counts = []
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         ki = k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
@@ -918,7 +952,8 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
             backend="fa2",
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])

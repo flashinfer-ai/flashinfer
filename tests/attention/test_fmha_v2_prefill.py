@@ -132,68 +132,95 @@ def attention_ref_torch(
 
     outputs = []
     lse_outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        seq_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        seq_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (seq_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:seq_len].float() * k_scale
-            v_seq = torch.cat(v_pages, dim=0)[:seq_len].float() * v_scale
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                (
+                    paged_kv_cache[pages, 0].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * k_scale
+            )
+            v_seq = (
+                (
+                    paged_kv_cache[pages, 1].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * v_scale
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float() * k_scale
             v_seq = v_flat[kv_start:kv_end].float() * v_scale
 
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        head_dim_v = v_seq.shape[-1]
+
+        # Masks depend only on positions: build once per sequence, shared by
+        # all heads (the previous per-head loop rebuilt them per head).
+        drop_mask = None
+        if causal or window_left >= 0:
+            q_indices = torch.arange(q_len, device=device).unsqueeze(1)
+            kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+            offset = seq_len - q_len
+            keep = torch.ones(q_len, seq_len, dtype=torch.bool, device=device)
+            if causal:
+                keep &= (q_indices + offset) >= kv_indices
+            if window_left >= 0:
+                keep &= kv_indices >= (q_indices + offset - window_left)
+            drop_mask = ~keep
+
+        # Batch the per-head math by KV-head group: identical formula, but one
+        # [G, q_len, kv_len] matmul per KV head instead of a Python loop over
+        # every query head. Grouped (not all-heads-at-once) to bound the
+        # materialized fp32 score matrix at long sequence lengths.
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim_v, dtype=torch.float32, device=device
         )
         if return_lse:
-            lse_seq = torch.zeros(
+            lse_seq = torch.empty(
                 q_len, num_qo_heads, dtype=torch.float32, device=device
             )
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-
-            q_h = q_seq[:, h, :]
-            k_h = k_seq[:, kv_h, :]
-            v_h = v_seq[:, kv_h, :]
-
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
+        for kv_h in range(num_kv_heads):
+            k_h = k_seq[:, kv_h, :]  # [kv_len, head_dim]
+            v_h = v_seq[:, kv_h, :]  # [kv_len, head_dim_v]
+            # [G, q_len, kv_len]; in-place ops below to bound fp32 temporaries.
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
 
             if logits_soft_cap > 0.0:
-                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+                scores.div_(logits_soft_cap).tanh_().mul_(logits_soft_cap)
 
-            if causal:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                causal_mask = (q_indices + offset) >= kv_indices
-                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if drop_mask is not None:
+                scores.masked_fill_(drop_mask, float("-inf"))
 
-            if window_left >= 0:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                window_mask = kv_indices >= (q_indices + offset - window_left)
-                scores = scores.masked_fill(~window_mask, float("-inf"))
-
+            h_lo = kv_h * G
+            h_hi = h_lo + G
             if return_lse:
-                lse_seq[:, h] = torch.logsumexp(scores, dim=-1)
+                lse_seq[:, h_lo:h_hi] = torch.logsumexp(scores, dim=-1).permute(1, 0)
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            o_seq[:, h_lo:h_hi, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
         if return_lse:
@@ -268,64 +295,77 @@ def chunked_attention_ref_torch(
     q_float = q_flat.float()
 
     outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        kv_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        kv_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (kv_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:kv_len].float()
-            v_seq = torch.cat(v_pages, dim=0)[:kv_len].float()
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                paged_kv_cache[pages, 0]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
+            v_seq = (
+                paged_kv_cache[pages, 1]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float()
             v_seq = v_flat[kv_start:kv_end].float()
-
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
-        )
 
         # Absolute KV-space positions for each query token.
         # Query token i corresponds to KV position (kv_len - q_len + i).
         offset = kv_len - q_len
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-            q_h = q_seq[:, h, :]
+        # Build chunked causal mask once per sequence (shared by all heads).
+        # q_abs[i] = offset + i  (absolute KV-space row for query token i)
+        # kv_pos[j] = j           (KV column index)
+        q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
+        kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+
+        # Causal: col <= row
+        causal_mask = kv_pos <= q_abs
+
+        # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
+        chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
+        chunk_mask = kv_pos >= chunk_start
+
+        drop_mask = ~(causal_mask & chunk_mask)
+
+        # Batch the per-head math by KV-head group (see attention_ref_torch).
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        for kv_h in range(num_kv_heads):
             k_h = k_seq[:, kv_h, :]
             v_h = v_seq[:, kv_h, :]
 
-            # scores: [q_len, kv_len]
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
-
-            # Build chunked causal mask.
-            # q_abs[i] = offset + i  (absolute KV-space row for query token i)
-            # kv_pos[j] = j           (KV column index)
-            q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
-            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
-
-            # Causal: col <= row
-            causal_mask = kv_pos <= q_abs
-
-            # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
-            chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
-            chunk_mask = kv_pos >= chunk_start
-
-            mask = causal_mask & chunk_mask
-            scores = scores.masked_fill(~mask, float("-inf"))
+            # scores: [G, q_len, kv_len]
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
+            scores.masked_fill_(drop_mask, float("-inf"))
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            h_lo = kv_h * G
+            o_seq[:, h_lo : h_lo + G, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
 
