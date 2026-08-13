@@ -590,6 +590,9 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
+    # Shared FP4 requires explicit routed/physical expert geometry and scalar
+    # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
+    "moe_fp4_block_scale_ds_shared_experts",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
