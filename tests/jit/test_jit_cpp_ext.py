@@ -1,4 +1,6 @@
+import os
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -289,3 +291,176 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+# ---------------------------------------------------------------------------
+# NVCC JIT cache build-fingerprint invalidation (meta.json)
+# ---------------------------------------------------------------------------
+
+
+def _make_nvcc_spec(monkeypatch, tmp_path, name="test_fp_module", mtime_shift=None):
+    """Build a JitSpecNvcc isolated in tmp_path, with source files in a
+    separate (later-hashed) tree whose mtimes can be backdated."""
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "kernel.cu"
+    src.write_text("__global__ void k() {}")
+    if mtime_shift is not None:
+        os.utime(src, (mtime_shift, mtime_shift))
+
+    spec = core.JitSpecNvcc(
+        name=name,
+        sources=[src],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    calls = {}
+
+    def fake_write_ninja():
+        spec.build_dir.mkdir(parents=True, exist_ok=True)
+        (spec.build_dir / "build.ninja").write_text("ninja_required_version = 1.3\n")
+
+    def fake_run_ninja(*_args, **_kwargs):
+        (spec.build_dir / f"{spec.name}.so").write_bytes(b"\x7fELF")
+        calls["builds"] = calls.get("builds", 0) + 1
+
+    monkeypatch.setattr(spec, "write_ninja", fake_write_ninja)
+    monkeypatch.setattr(core, "run_ninja", fake_run_ninja)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_CSRC_DIR", tmp_path / "csrc")
+    return spec, calls
+
+
+def test_meta_schema_invariants(monkeypatch, tmp_path):
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path)
+    meta = spec.expected_meta
+    assert meta["schema"] == core._META_SCHEMA_VERSION
+    assert "flashinfer_version" in meta
+    assert "python_soabi" in meta
+    assert "torch_build_identity" in meta
+    assert "source_sha256" in meta
+    assert "cflags" in meta
+    assert "cuda_cflags" in meta
+    # Deterministic: computing twice yields identical metadata.
+    assert meta == spec.expected_meta
+
+
+def test_meta_committed_after_successful_build(monkeypatch, tmp_path):
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    assert not spec.meta_path.exists()
+    spec.build(verbose=False, need_lock=False)
+    assert spec.meta_path.exists()
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+    assert calls["builds"] == 1
+
+
+def test_stale_source_rewrites_same_mtime_still_invalidates(monkeypatch, tmp_path):
+    """Source bytes change while the mtime stays *older* than the committed
+    artifacts: the fingerprint must change and wipe the stale build dir."""
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path, mtime_shift=1_700_000_000)
+    # First build: mtime is old already; a naive ninja timestamp scan would
+    # think everything is fresh. Meta still commits.
+    spec.build(verbose=False, need_lock=False)
+    assert (spec.build_dir / f"{spec.name}.so").exists()
+
+    # Change the source content, keep its mtime unchanged.
+    src = spec.sources[0]
+    old_mtime = src.stat().st_mtime
+    src.write_text("__global__ void k() {}\n// changed")
+    os.utime(src, (old_mtime, old_mtime))
+    assert src.stat().st_mtime == old_mtime
+
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert (spec.build_dir / f"{spec.name}.so").exists()
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_compile_flags_change_invalidates(monkeypatch, tmp_path):
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+
+    spec.extra_cuda_cflags = ["-O3", "-gencode=arch=compute_90a,code=sm_90a"]
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+
+
+def test_matching_meta_keeps_build_dir_and_ninja_incremental(monkeypatch, tmp_path):
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+    build_dir = spec.build_dir
+    assert build_dir.exists()
+
+    # No source/flag change: build() keeps the dir and run_ninja is still
+    # invoked (ninja owns the fine-grained incremental decision), so builds
+    # counter increments once per call but the .so/meta are stable.
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert build_dir.exists()
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_missing_meta_triggers_rebuild(monkeypatch, tmp_path):
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+    spec.meta_path.unlink()
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_corrupt_meta_triggers_rebuild(monkeypatch, tmp_path):
+    spec, calls = _make_nvcc_spec(monkeypatch, tmp_path)
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 1
+    spec.meta_path.write_text("{ not valid json !!!")
+    spec.build(verbose=False, need_lock=False)
+    assert calls["builds"] == 2
+    assert core._read_meta(spec.meta_path) == spec.expected_meta
+
+
+def test_failed_ninja_does_not_commit_meta(monkeypatch, tmp_path):
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path)
+
+    def failing_ninja(*_args, **_kwargs):
+        raise RuntimeError("nvcc failed")
+
+    monkeypatch.setattr(core, "run_ninja", failing_ninja)
+    with pytest.raises(RuntimeError, match="nvcc failed"):
+        spec.build(verbose=False, need_lock=False)
+    assert not spec.meta_path.exists()
+
+
+def test_aot_path_ignores_meta(monkeypatch, tmp_path):
+    """AOT artifacts are loaded without touching JIT meta.json."""
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path)
+    aot = tmp_path / "aot" / spec.name / f"{spec.name}.so"
+    aot.parent.mkdir(parents=True, exist_ok=True)
+    aot.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_AOT_DIR", tmp_path / "aot")
+    assert spec.is_aot
+    # try_load routes to the AOT path and never consults meta.json.
+    monkeypatch.setattr(
+        spec, "load", lambda so_path=None: SimpleNamespace(path=so_path)
+    )
+    loaded = spec.try_load()
+    assert loaded is not None
+    assert loaded.path == aot
+
+
+def test_meta_is_json_serializable(monkeypatch, tmp_path):
+    spec, _ = _make_nvcc_spec(monkeypatch, tmp_path)
+    import json as _json
+
+    _json.dumps(spec.expected_meta)
+    # numpy scalars or Path objects must not leak into the fingerprint.
+    for v in spec.expected_meta.values():
+        assert not isinstance(v, Path)

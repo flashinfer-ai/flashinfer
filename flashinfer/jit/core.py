@@ -1,12 +1,16 @@
 import abc
 import dataclasses
 import functools
+import hashlib
+import json
 import logging
 import os
+import shutil
+import sysconfig
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -138,6 +142,127 @@ sm120f_nvcc_flags = ["-gencode=arch=compute_120f,code=sm_120f"] + common_nvcc_fl
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
 
 current_compilation_context = CompilationContext()
+
+_META_FILENAME = "meta.json"
+_META_SCHEMA_VERSION = 1
+
+
+def _hash_file_sha256(path: Path) -> str:
+    """Return the SHA-256 of ``path``'s contents, or ``None`` if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _hash_source_tree_cached(include_dirs: Tuple[Path, ...]) -> str:
+    return _hash_source_tree_uncached(include_dirs)
+
+
+def _hash_source_tree_uncached(include_dirs: Sequence[Path]) -> str:
+    """Hash the flashinfer C++/CUDA source tree under ``include_dirs``.
+
+    Each directory is walked independently; files are keyed by their absolute
+    path so overlapping roots (e.g. ``data/csrc`` and the repository ``csrc``)
+    are all covered without double-counting. Digest is stable regardless of
+    directory enumeration order.
+    """
+    sha = hashlib.sha256()
+    seen = set()
+    for base in include_dirs:
+        if base is None or not Path(base).is_dir():
+            continue
+        for root, _dirs, files in os.walk(Path(base)):
+            for fname in sorted(files):
+                fpath = Path(root) / fname
+                if fpath in seen:
+                    continue
+                seen.add(fpath)
+                sha.update(str(fpath).encode())
+                digest = _hash_file_sha256(fpath)
+                if digest is not None:
+                    sha.update(digest.encode())
+    return sha.hexdigest()
+
+
+def _hash_source_tree(include_dirs: Sequence[Path]) -> str:
+    return _hash_source_tree_cached(tuple(Path(p) for p in include_dirs))
+
+
+@functools.lru_cache(maxsize=1)
+def _get_wheel_record_hash() -> Optional[str]:
+    """Hash the wheel RECORD entries for files under ``flashinfer/``.
+
+    A wheel reinstall with different byte content (even at the same version)
+    changes this digest, so stale nvcc artifacts built from the previous
+    install are invalidated. Returns ``None`` when not installed from a wheel.
+    """
+    try:
+        import importlib.metadata as _md
+
+        dist = _md.distribution("flashinfer-python")
+        record = dist.read_text("RECORD")
+    except Exception:
+        return None
+    if record is None:
+        return None
+    sha = hashlib.sha256()
+    for line in record.splitlines():
+        entry = line.split(",", 1)[0]
+        if entry.startswith("flashinfer/"):
+            sha.update(entry.encode())
+    return sha.hexdigest()
+
+
+def _get_python_soabi() -> str:
+    soabi = sysconfig.get_config_var("SOABI")
+    return soabi or "unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def _get_torch_build_identity() -> str:
+    """Torch version, bundled CUDA version and libstdc++ ABI as one string."""
+    try:
+        import torch
+
+        cxx11 = getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", None)
+        return f"torch={torch.__version__},cuda={torch.version.cuda},cxx11_abi={cxx11}"
+    except Exception:
+        return "torch=unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def _get_tvm_ffi_version() -> str:
+    try:
+        import importlib.metadata as _md
+
+        return _md.version("tvm-ffi")
+    except Exception:
+        return "unknown"
+
+
+def _read_meta(meta_path: Path) -> Optional[dict]:
+    """Read and parse a module ``meta.json``; ``None`` when absent/corrupt."""
+    try:
+        with open(meta_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_meta_atomic(meta_path: Path, meta: dict) -> None:
+    """Atomically write ``meta.json`` via a temp file + ``os.replace``."""
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = meta_path.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+        os.replace(tmp, meta_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 @dataclasses.dataclass
@@ -375,6 +500,67 @@ class JitSpecNvcc(JitSpec):
     def lock_path(self) -> Path:
         return get_tmpdir() / f"{self.name}.lock"
 
+    @property
+    def meta_path(self) -> Path:
+        return self.build_dir / _META_FILENAME
+
+    @property
+    def expected_meta(self) -> dict:
+        """Build fingerprint for this module.
+
+        Every entry participates in cache invalidation: if any of them
+        differs from the committed ``meta.json``, the module build directory
+        is wiped and rebuilt. Source hashes cover both the module's own
+        sources and the C++/CUDA include tree so that a same-version wheel
+        reinstall with new bytes (whose mtimes may be *older* than the stale
+        artifacts) still triggers a rebuild.
+        """
+        from ..version import __version__ as _fi_version
+        from ..version import __git_commit__ as _fi_git_commit
+
+        include_dirs: List[Path] = []
+        if self.extra_include_dirs is not None:
+            include_dirs.extend(self.extra_include_dirs)
+        include_dirs.append(jit_env.FLASHINFER_CSRC_DIR)
+        # Source installs keep the C++/CUDA sources in the repository tree
+        # rather than ``data/csrc`` (populated only by the wheel build).
+        pkg_root = Path(__file__).resolve().parents[1]
+        for candidate in (
+            pkg_root / "data" / "csrc",
+            pkg_root.parent / "csrc",
+            pkg_root / "data" / "include",
+        ):
+            if candidate.is_dir() and candidate not in include_dirs:
+                include_dirs.append(candidate)
+
+        return {
+            "schema": _META_SCHEMA_VERSION,
+            "flashinfer_version": _fi_version,
+            "git_commit": _fi_git_commit,
+            "wheel_record_hash": _get_wheel_record_hash(),
+            "python_soabi": _get_python_soabi(),
+            "torch_build_identity": _get_torch_build_identity(),
+            "tvm_ffi_version": _get_tvm_ffi_version(),
+            "source_sha256": _hash_source_tree(tuple(include_dirs)),
+            "ninja_content_sha256": _hash_file_sha256(self.ninja_path),
+            "cflags": self.extra_cflags,
+            "cuda_cflags": self.extra_cuda_cflags,
+            "ldflags": self.extra_ldflags,
+        }
+
+    def _meta_matches(self) -> bool:
+        if not self.meta_path.exists():
+            return False
+        return _read_meta(self.meta_path) == self.expected_meta
+
+    def _invalidate_stale_build(self) -> None:
+        if self.build_dir.exists() and not self._meta_matches():
+            logger.info(
+                f"Invalidating stale nvcc module {self.name} "
+                "(build fingerprint mismatch)"
+            )
+            shutil.rmtree(self.build_dir, ignore_errors=True)
+
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         self.build_dir.mkdir(parents=True, exist_ok=True)
@@ -423,8 +609,11 @@ class JitSpecNvcc(JitSpec):
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
+            self._invalidate_stale_build()
             self.write_ninja()
             run_ninja(self.build_dir, self.ninja_path, verbose)
+            if self.jit_library_path.exists():
+                _write_meta_atomic(self.meta_path, self.expected_meta)
 
     def load(self, so_path: Optional[Path] = None):
         return tvm_ffi.load_module(str(so_path or self.jit_library_path))
