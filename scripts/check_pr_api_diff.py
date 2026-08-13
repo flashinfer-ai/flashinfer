@@ -143,6 +143,12 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     return bool(added) and all(item.default is not None for item in added)
 
 
+def is_compatible_api(before: ApiFunction, after: ApiFunction) -> bool:
+    return before.signature == after.signature or is_compatible_signature_extension(
+        before, after
+    )
+
+
 def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]:
     if source is None:
         return {}
@@ -345,25 +351,25 @@ def changed_files(base: str, head: str) -> list[ChangedFile]:
     return result
 
 
-def public_module(path: str | None) -> str | None:
+def public_module(path: str | None, *, has_decorated_api: bool = False) -> str | None:
     if path is None:
         return None
-    parts = PurePosixPath(path).parts
-    if (
-        len(parts) == 2
-        and parts[0] == "flashinfer"
-        and path.endswith(".py")
-        and not parts[1].startswith("_")
-    ):
-        return path[:-3].replace("/", ".")
-    if (
-        len(parts) == 3
-        and parts[0] == "flashinfer"
-        and parts[2] == "__init__.py"
-        and not parts[1].startswith("_")
-    ):
-        return f"flashinfer.{parts[1]}"
-    return None
+    parts = list(PurePosixPath(path).parts)
+    if not path.endswith(".py") or not parts or parts[0] != "flashinfer":
+        return None
+
+    parts[-1] = parts[-1][:-3]
+    if parts[-1] == "__init__":
+        parts.pop()
+    if len(parts) < 2 or any(part.startswith("_") for part in parts[1:]):
+        return None
+
+    # Top-level modules and packages are established import paths.  For deeper
+    # modules, require direct evidence that the old file defines public APIs so
+    # internal implementation-file renames do not generate noise.
+    if len(parts) > 2 and not has_decorated_api:
+        return None
+    return ".".join(parts)
 
 
 def check(base: str, head: str) -> list[PrFinding]:
@@ -371,6 +377,9 @@ def check(base: str, head: str) -> list[PrFinding]:
     changes = changed_files(base, head)
     findings: list[PrFinding] = []
     target_cache: dict[str, dict[str, ApiFunction]] = {}
+    api_changes: dict[
+        ChangedFile, tuple[dict[str, ApiFunction], dict[str, ApiFunction]]
+    ] = {}
 
     python_changes = sorted(
         (
@@ -395,6 +404,7 @@ def check(base: str, head: str) -> list[PrFinding]:
             if new_path
             else {}
         )
+        api_changes[change] = (old, new)
 
         reexports = (
             module_reexports(old_path, git_file(head, old_path)) if old_path else {}
@@ -407,7 +417,19 @@ def check(base: str, head: str) -> list[PrFinding]:
                 target_api = module_apis(head, target_module, target_cache).get(
                     target_name
                 )
-                if target_api and target_api.signature == api.signature:
+                if target_api:
+                    if is_compatible_api(api, target_api):
+                        continue
+                    findings.append(
+                        PrFinding(
+                            "public_api_signature_changed",
+                            target_api.path,
+                            target_api.line,
+                            f"Public API `{api.module}.{name}` remains re-exported from "
+                            f"`{target_api.module}`, but its signature changed in a potentially breaking way. "
+                            f"Before: `{api.signature}`; after: `{target_api.signature}`.",
+                        )
+                    )
                     continue
             findings.append(
                 PrFinding(
@@ -420,9 +442,7 @@ def check(base: str, head: str) -> list[PrFinding]:
 
         for name in sorted(set(old) & set(new)):
             before, after = old[name], new[name]
-            if before.signature == after.signature:
-                continue
-            if is_compatible_signature_extension(before, after):
+            if is_compatible_api(before, after):
                 continue
             findings.append(
                 PrFinding(
@@ -458,7 +478,8 @@ def check(base: str, head: str) -> list[PrFinding]:
                 )
             )
     for change in changes:
-        old_module = public_module(change.old_path)
+        old_apis, new_apis = api_changes.get(change, ({}, {}))
+        old_module = public_module(change.old_path, has_decorated_api=bool(old_apis))
         if not old_module:
             continue
         if change.status == "D":
@@ -471,7 +492,9 @@ def check(base: str, head: str) -> list[PrFinding]:
                 )
             )
         elif change.status.startswith("R"):
-            new_module = public_module(change.new_path)
+            new_module = public_module(
+                change.new_path, has_decorated_api=bool(new_apis)
+            )
             findings.append(
                 PrFinding(
                     "public_module_moved",
