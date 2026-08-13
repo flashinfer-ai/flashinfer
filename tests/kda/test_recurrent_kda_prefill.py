@@ -998,6 +998,71 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     )
 
 
+@pytest.mark.parametrize(("seq_len", "num_heads"), [(1024, 8), (1024, 16)])
+def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_heads):
+    if get_compute_capability(flash_kda_device) != (10, 0):
+        pytest.skip("K1 owner/helper prefill is tuned for B200/GB200")
+    inputs = _make_inputs(
+        seq_lens=[seq_len],
+        num_heads=num_heads,
+        packed=False,
+        initial_state=True,
+        seed=9000 + num_heads,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    output = torch.empty_like(inputs["q"])
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_k1_parallel_global_pool_matches_m64(flash_kda_device, monkeypatch):
+    if get_compute_capability(flash_kda_device) != (10, 0):
+        pytest.skip("K1 owner/helper prefill is tuned for B200/GB200")
+    inputs = _make_inputs(
+        seq_lens=[4096],
+        num_heads=40,
+        packed=False,
+        initial_state=True,
+        seed=9040,
+    )
+    initial_state = inputs["initial_state"].clone()
+    parallel_output, parallel_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    inputs["initial_state"] = initial_state
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **kwargs: ("m64", 0, 0),
+    )
+    baseline_output, baseline_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(parallel_output, baseline_output, atol=0, rtol=0)
+    torch.testing.assert_close(parallel_state, baseline_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     ("packed", "num_heads", "has_initial_state"),
     [(False, 64, True), (True, 2, False)],
