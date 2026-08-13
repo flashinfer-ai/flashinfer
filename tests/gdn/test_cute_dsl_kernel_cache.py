@@ -112,6 +112,7 @@ def test_make_kernel_name_caps_length_without_collision():
 # ---------------------------------------------------------------------------
 
 NONTRANSPOSE_BASELINE = {
+    "arch": "sm100a",
     "use_small_batch": True,
     "T": 1,
     "H": 16,
@@ -124,6 +125,7 @@ NONTRANSPOSE_BASELINE = {
 }
 
 PRETRANSPOSE_BASELINE = {
+    "arch": "sm100a",
     "T": 1,
     "H": 16,
     "HV": 32,
@@ -140,6 +142,7 @@ PRETRANSPOSE_BASELINE = {
 
 MTP_BASELINE = {
     "variant": "warp",
+    "arch": "sm100a",
     "T": 2,
     "H": 16,
     "HV": 32,
@@ -161,6 +164,7 @@ MTP_BASELINE = {
 }
 
 PREFILL_BASELINE = {
+    "arch": "sm100a",
     "io_dtype_str": "torch.bfloat16",
     "state_dtype_str": "torch.float32",
     "HQ": 32,
@@ -204,6 +208,7 @@ BF16_STATE_BASELINES = {
         False,  # per_token_pool_scatter
         False,  # per_token_pool_scatter_flat
         (torch.float32, torch.float32, torch.int32),  # _dtype_key
+        "sm100a",  # target arch
     ),
     "wide_vec_t1": (
         "v3_mtp_bf16_tiled_dynB",
@@ -224,6 +229,7 @@ BF16_STATE_BASELINES = {
         True,
         True,
         (torch.float32, torch.float32, torch.int32),
+        "sm100a",  # target arch
     ),
     "mtp_ilp4": (
         "mtp_bf16_dynB",
@@ -249,6 +255,7 @@ BF16_STATE_BASELINES = {
         False,  # per_token_pool_scatter
         False,  # per_token_pool_scatter_flat
         (torch.float32, torch.float32, torch.int32),
+        "sm100a",  # target arch
     ),
 }
 
@@ -294,6 +301,7 @@ def test_kernel_name_signature_covers_getter_params(getter, name_fn):
 @pytest.mark.parametrize(
     "param,alternate",
     [
+        ("arch", "sm90a"),
         ("use_small_batch", False),
         ("T", 2),
         ("H", 32),
@@ -317,6 +325,7 @@ def test_nontranspose_name_varies_with_every_argument(param, alternate):
 @pytest.mark.parametrize(
     "param,alternate",
     [
+        ("arch", "sm90a"),
         ("T", 2),
         ("H", 32),
         ("HV", 64),
@@ -344,6 +353,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
     "param,alternate",
     [
         ("variant", "inline"),
+        ("arch", "sm90a"),
         ("T", 3),
         ("H", 32),
         ("HV", 64),
@@ -389,6 +399,7 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("initial_state_inner_strides", (16384, 128, 1)),
         ("output_state_inner_strides", (16384, 128, 1)),
         ("num_sm", 132),
+        ("arch", "sm90a"),
     ],
 )
 def test_prefill_name_varies_with_every_argument(param, alternate):

@@ -31,6 +31,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target
 
 # ============================================================================
 # Constants for NONTRANSPOSE version ([pool, HV, K, V])
@@ -682,6 +683,7 @@ _CUTE_DSL_MODULE = "gdn_decode_nontranspose"
 
 
 def _nontranspose_kernel_name(
+    arch: str,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -695,6 +697,7 @@ def _nontranspose_kernel_name(
     """Specialization name within the gdn_decode_nontranspose module, encoding
     every parameter that affects codegen."""
     return make_kernel_name(
+        arch,
         "small" if use_small_batch else "big",
         T,
         H,
@@ -709,6 +712,7 @@ def _nontranspose_kernel_name(
 
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
+    arch: str,
     use_small_batch: bool,
     T: int,
     H: int,
@@ -754,7 +758,19 @@ def run_nontranspose_decode(
         use_qk_l2norm: Whether to apply L2 normalization.
     """
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
-    cache_key = (use_small_batch, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
+    target = gdn_device_target(q.device)
+    cache_key = (
+        target.arch,
+        use_small_batch,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+    )
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
 
     aux_map = cache.setdefault("aux", {})
@@ -767,7 +783,7 @@ def run_nontranspose_decode(
     h0_indices, cu_seqlens = aux_map[aux_key]
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         # Choose kernel based on batch size
         if use_small_batch:
@@ -798,7 +814,9 @@ def run_nontranspose_decode(
         compiled = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
             _nontranspose_kernel_name(*cache_key),
-            lambda: cute.compile(
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True))
+            ](
                 run_func,
                 cu_seqlens_tensor,
                 q_tensor,
@@ -822,7 +840,6 @@ def run_nontranspose_decode(
                 use_initial_state=True,
                 use_qk_l2norm=use_qk_l2norm,
                 stream=stream,
-                options="--enable-tvm-ffi",
             ),
             extra_key_files=(__file__,),
         )
@@ -831,7 +848,7 @@ def run_nontranspose_decode(
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
         cu_seqlens,
         q,

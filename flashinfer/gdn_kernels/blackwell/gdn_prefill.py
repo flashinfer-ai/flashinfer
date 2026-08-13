@@ -37,6 +37,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.cute_dsl.utils import get_num_sm
 
+from ..device_target import gdn_compile_options, gdn_device_target
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..cute_dsl_cache_naming import make_kernel_name
@@ -64,6 +65,8 @@ def _kernel_source_files() -> tuple:
 
 
 def _prefill_kernel_name(
+    arch: str,
+    num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
     HQ: int,
@@ -78,14 +81,15 @@ def _prefill_kernel_name(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides,
     output_state_inner_strides,
-    num_sm: int,
 ) -> str:
     """Specialization name within the gdn_blackwell_prefill module.
 
-    Encodes every ``_get_compiled_cache`` key component plus ``num_sm``, which
-    the compile below bakes in as ``max_active_clusters``.
+    Encodes every ``_get_compiled_cache`` key component, including ``num_sm``,
+    which the compile below bakes in as ``max_active_clusters``.
     """
     return make_kernel_name(
+        arch,
+        num_sm,
         io_dtype_str,
         state_dtype_str,
         HQ,
@@ -100,12 +104,13 @@ def _prefill_kernel_name(
         cu_checkpoints_dtype_str,
         initial_state_inner_strides,
         output_state_inner_strides,
-        num_sm,
     )
 
 
 @functools.cache
 def _get_compiled_cache(
+    arch: str,
+    num_sm: int,
     io_dtype_str: str,
     state_dtype_str: str,
     HQ: int,
@@ -256,7 +261,12 @@ def chunk_gated_delta_rule_sm100(
     use_state_indices = state_indices is not None
     _state_indices = state_indices if use_state_indices else None
 
+    # num_sm is baked in as max_active_clusters, so it belongs to the key.
+    target = gdn_device_target(q.device)
+    num_sm = get_num_sm(q.device)
     cache_key = (
+        target.arch,
+        num_sm,
         str(q.dtype),
         str(state_torch_dtype),
         HQ,
@@ -284,7 +294,6 @@ def chunk_gated_delta_rule_sm100(
 
     if "compiled" not in cache:
         # --- First call: compile the kernel ---
-        num_sm = get_num_sm(q.device)
         max_active_clusters = num_sm
 
         gdn = GatedDeltaNetChunkedKernel(
@@ -374,8 +383,10 @@ def chunk_gated_delta_rule_sm100(
 
         compiled = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
-            _prefill_kernel_name(*cache_key, num_sm),
-            lambda: cute.compile(
+            _prefill_kernel_name(*cache_key),
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True), cute.OptLevel(3))
+            ](
                 gdn,
                 q_cute,
                 k_cute,
@@ -393,7 +404,6 @@ def chunk_gated_delta_rule_sm100(
                 scale,
                 workspace_cute,
                 stream,
-                options="--enable-tvm-ffi --opt-level 3",
             ),
             extra_key_files=_kernel_source_files(),
         )

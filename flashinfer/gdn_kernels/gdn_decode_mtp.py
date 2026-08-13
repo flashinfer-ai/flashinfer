@@ -48,7 +48,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
-
+from .device_target import gdn_compile_options, gdn_device_target
 from .dtype_compat import as_bf16
 
 # ============================================================================
@@ -2524,6 +2524,7 @@ def _mtp_kernel_name(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    arch: str = "",
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2548,6 +2549,7 @@ def _mtp_kernel_name(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        arch,
     )
 
 
@@ -2571,6 +2573,7 @@ def _get_compiled_mtp_kernel(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    arch: str = "",
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2596,6 +2599,7 @@ def _get_compiled_mtp_kernel_inline(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    arch: str = "",
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2673,8 +2677,8 @@ def run_mtp_decode(
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
-    major, _ = torch.cuda.get_device_capability(q.device)
-    use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
+    target = gdn_device_target(q.device)
+    use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
 
@@ -2711,6 +2715,7 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
+            target.arch,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -2733,6 +2738,7 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
+            target.arch,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -2778,7 +2784,7 @@ def run_mtp_decode(
         h0_out_indices = initial_state_indices
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
             # 4D pool [pool, HV, V, K], possibly non-contiguous (e.g. a strided
@@ -2825,31 +2831,14 @@ def run_mtp_decode(
             ssm_state_indices_arg, assumed_align=16
         ).mark_layout_dynamic()
 
+        compile_options = gdn_compile_options(
+            q.device, cute.EnableTVMFFI(True), cute.GenerateLineInfo(True)
+        )
         if use_inline_kernel:
             compiled = build_and_load_cute_dsl_kernel(
                 _CUTE_DSL_MODULE,
-                _mtp_kernel_name(
-                    "inline",
-                    T,
-                    H,
-                    HV,
-                    K,
-                    V,
-                    cache_steps,
-                    disable_state_update,
-                    use_pool_indexing,
-                    pool_strides_key,
-                    scale,
-                    use_qk_l2norm,
-                    tile_v,
-                    vec_size,
-                    dtype_key,
-                    ilp_rows,
-                    use_smem_v,
-                    use_packed_fma,
-                    per_token_pool_scatter,
-                ),
-                lambda: cute.compile(
+                _mtp_kernel_name("inline", *inline_cache_key),
+                lambda: cute.compile[compile_options](
                     run_gdn_verify_kernel_mtp_inline,
                     h0_source_tensor,
                     intermediate_states_tensor,
@@ -2888,35 +2877,14 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     stream=stream,
-                    options="--enable-tvm-ffi --generate-line-info",
                 ),
                 extra_key_files=(__file__,),
             )
         else:
             compiled = build_and_load_cute_dsl_kernel(
                 _CUTE_DSL_MODULE,
-                _mtp_kernel_name(
-                    "warp",
-                    T,
-                    H,
-                    HV,
-                    K,
-                    V,
-                    cache_steps,
-                    disable_state_update,
-                    use_pool_indexing,
-                    pool_strides_key,
-                    scale,
-                    use_qk_l2norm,
-                    tile_v,
-                    vec_size,
-                    dtype_key,
-                    ilp_rows,
-                    use_smem_v,
-                    use_packed_fma,
-                    per_token_pool_scatter,
-                ),
-                lambda: cute.compile(
+                _mtp_kernel_name("warp", *warp_cache_key),
+                lambda: cute.compile[compile_options](
                     run_gdn_verify_kernel_mtp,
                     h0_source_tensor,
                     intermediate_states_tensor,
@@ -2955,7 +2923,6 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     stream=stream,
-                    options="--enable-tvm-ffi --generate-line-info",
                 ),
                 extra_key_files=(__file__,),
             )
@@ -2963,7 +2930,7 @@ def run_mtp_decode(
     else:
         compiled = cache["compiled"]
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
         h0_source,
         intermediate_states,
