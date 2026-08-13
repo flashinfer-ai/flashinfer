@@ -476,10 +476,7 @@ def cp_delta_rule_fixup_dsl_sm100(
                         f"{('[N_pool]' if use_state_indices else f'[{cu_seqlens.shape[0] - 1}]')}"
                         f" + {expected_tail}, got {tuple(tensor.shape)}"
                     )
-                if tensor.dtype not in (torch.float32, torch.bfloat16, torch.float16):
-                    raise RuntimeError(
-                        f"{name} must have dtype float32, bfloat16, or float16, got {tensor.dtype}"
-                    )
+                _cutlass_state_dtype(tensor.dtype)
         if use_state_indices:
             if not is_integer_dtype(state_indices.dtype) or state_indices.shape != (
                 cu_seqlens.shape[0] - 1,
@@ -796,10 +793,7 @@ def cp_delta_rule_prefill_dsl_sm100(
                 raise RuntimeError(
                     f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
                 )
-            if state.dtype not in (torch.float32, torch.bfloat16, torch.float16):
-                raise RuntimeError(
-                    f"state must have dtype float32, bfloat16, or float16, got {state.dtype}"
-                )
+            _cutlass_state_dtype(state.dtype)
         if initial_state is not None:
             if initial_state.shape != expected_state_shape:
                 raise RuntimeError(
@@ -1155,15 +1149,9 @@ def cp_delta_rule_dsl_sm100(
         raise RuntimeError("q/k/v/o dtypes must match")
     if alpha.dtype != torch.float32 or beta.dtype != torch.float32:
         raise RuntimeError("alpha and beta must have dtype torch.float32")
-    for name, tensor in (("state", state), ("initial_state", initial_state)):
-        if tensor is not None and tensor.dtype not in (
-            torch.float32,
-            torch.bfloat16,
-            torch.float16,
-        ):
-            raise RuntimeError(
-                f"{name} must have dtype float32, bfloat16, or float16, got {tensor.dtype}"
-            )
+    for tensor in (state, initial_state):
+        if tensor is not None:
+            _cutlass_state_dtype(tensor.dtype)
     for name, tensor in (
         ("q", q),
         ("k", k),
