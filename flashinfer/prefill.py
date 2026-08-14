@@ -46,6 +46,7 @@ from .trace.templates.attention import (
 )
 from .trace.templates.gemm import (
     fmha_v2_prefill_deepseek_trace,
+    fmha_v2_prefill_sm120_trace,
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
@@ -5588,6 +5589,174 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
+def _fmha_v2_prefill_sm120_run(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float],
+    scale_bmm2: Optional[float],
+    causal: bool,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+    scale_bmm1_d: Optional[torch.Tensor],
+    scale_bmm2_d: Optional[torch.Tensor],
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    module = get_trtllm_fmha_v2_sm120_module()
+    is_e4m3 = query.dtype == torch.float8_e4m3fn
+    is_bf16_output = out.dtype == torch.bfloat16
+    scale_softmax = (
+        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
+    )
+    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
+    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    for name, device_scale in (
+        ("scale_bmm1_d", scale_bmm1_d),
+        ("scale_bmm2_d", scale_bmm2_d),
+    ):
+        if not is_e4m3 and device_scale is not None:
+            raise ValueError(f"{name} is only valid for FP8 E4M3 input.")
+        if device_scale is not None and (
+            device_scale.shape != (1,)
+            or device_scale.dtype != torch.float32
+            or device_scale.device != query.device
+            or not device_scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous FP32 CUDA tensor with shape [1] "
+                "on the query device."
+            )
+    module.run(
+        query,
+        key,
+        value,
+        out,
+        lse,
+        scale_bmm1_d,
+        scale_bmm2_d,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        causal,
+        is_e4m3,
+        is_bf16_output,
+    )
+    if return_lse:
+        return out, lse
+    return out
+
+
+@flashinfer_api(trace=fmha_v2_prefill_sm120_trace)
+def fmha_v2_prefill_sm120(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    causal: bool = True,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+    scale_bmm1_d: Optional[torch.Tensor] = None,
+    scale_bmm2_d: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
+
+    Supports FP8 E4M3 standard MHA self-attention with equal Q/K/V head counts
+    and head dimensions of 64 or 128, and BF16 output. GQA and MQA are not
+    supported by this entry point. ``scale_bmm1`` combines the Q and K
+    dequantization scales with the attention scale; ``scale_bmm2`` is the V
+    dequantization scale. Set ``causal=False`` for dense / bidirectional
+    attention. Q/K/V/O use fixed-shape ``[batch, seq_len, heads, head_dim]``
+    storage, so every batch item has the same sequence length. Use
+    :func:`trtllm_fmha_v2_prefill` for ragged inputs.
+    FP8 calls may pass ``scale_bmm1_d`` and ``scale_bmm2_d`` as persistent
+    one-element FP32 CUDA model weights. ``scale_bmm1_d`` replaces
+    ``scale_bmm1`` and must contain the full fused
+    ``q_scale * k_scale / sqrt(head_dim)`` value; ``scale_bmm2_d`` replaces
+    ``scale_bmm2`` and contains the V dequantization scale. If either is
+    omitted, the kernel uses the corresponding host-encoded scale.
+
+    This entry point is validated for SM120. SM121 support is not enabled.
+    """
+    if not is_sm12x_supported(query.device) or torch.cuda.get_device_capability(
+        query.device
+    ) != (12, 0):
+        raise ValueError(
+            "fmha_v2_prefill_sm120 is only supported on SM120 GPUs; "
+            "SM121 has not been validated."
+        )
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
+        raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
+    if query.dtype != torch.float8_e4m3fn:
+        raise ValueError("standard SM120 self-attention requires FP8 E4M3 input.")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype.")
+    if not all(t.device == query.device for t in (key, value, out)):
+        raise ValueError("query, key, value, and out must be on the same device.")
+    expected_prefix = (query.shape[0], seq_len, num_heads)
+    if (
+        query.shape[:3] != expected_prefix
+        or key.shape[:3] != expected_prefix
+        or value.shape[:3] != expected_prefix
+        or out.shape[:3] != expected_prefix
+    ):
+        raise ValueError("tensor shapes must match batch, seq_len, and num_heads.")
+    if (
+        head_dim not in (64, 128)
+        or query.shape[3] != head_dim
+        or key.shape[3] != head_dim
+    ):
+        raise ValueError(
+            "standard SM120 self-attention requires Q/K head_dim=64 or 128."
+        )
+    if value.shape[3] != head_dim or out.shape[3] != head_dim:
+        raise ValueError(
+            "standard SM120 self-attention requires V/O head_dim to match Q/K."
+        )
+    if out.dtype != torch.bfloat16:
+        raise ValueError("standard SM120 self-attention requires BF16 output.")
+    if not all(t.is_contiguous() for t in (query, key, value, out)):
+        raise ValueError("query, key, value, and out must be contiguous.")
+    if return_lse and lse is None:
+        raise ValueError("lse must be provided when return_lse=True.")
+    if lse is not None and (
+        lse.shape != (*expected_prefix, 2)
+        or lse.dtype != torch.float32
+        or lse.device != query.device
+        or not lse.is_contiguous()
+    ):
+        raise ValueError("lse must be a contiguous FP32 [B, S, H, 2] tensor.")
+    return _fmha_v2_prefill_sm120_run(
+        query,
+        key,
+        value,
+        out,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        causal,
+        return_lse,
+        lse,
+        scale_bmm1_d,
+        scale_bmm2_d,
+    )
+
+
 @flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
@@ -5602,6 +5771,8 @@ def fmha_v2_prefill_deepseek(
     scale_bmm2: Optional[float] = None,
     return_lse: bool = False,
     lse: Optional[torch.Tensor] = None,
+    scale_bmm1_d: Optional[torch.Tensor] = None,
+    scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5630,6 +5801,13 @@ def fmha_v2_prefill_deepseek(
         scale for bmm2
     lse : Optional[torch.Tensor]
         log-sum-exp of attention output
+    scale_bmm1_d : Optional[torch.Tensor]
+        Optional persistent one-element FP32 CUDA model weight containing the
+        FP8 QK scale. The host ``scale_bmm1`` value is used when omitted.
+    scale_bmm2_d : Optional[torch.Tensor]
+        Optional persistent one-element FP32 CUDA model weight containing the
+        FP8 V dequantization scale. The host ``scale_bmm2`` value is used when
+        this is omitted.
     Returns
     -------
     out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -5639,36 +5817,30 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    if query.shape[1] != seq_len:
+        raise ValueError("query sequence length must match seq_len.")
+    if return_lse and lse is None:
+        raise ValueError("lse must be provided when return_lse=True.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
-    module = get_trtllm_fmha_v2_sm120_module()
-    is_e4m3 = query.dtype == torch.float8_e4m3fn
-    is_bf16_output = out.dtype == torch.bfloat16
-    scale_softmax = (
-        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
-    )
-    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
-    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
-    module.run(
+    return _fmha_v2_prefill_sm120_run(
         query,
         key,
         value,
         out,
-        lse,
         num_heads,
         head_dim,
         seq_len,
         scale_softmax,
         scale_bmm1,
         scale_bmm2,
-        is_e4m3,
-        is_bf16_output,
+        causal=True,
+        return_lse=return_lse,
+        lse=lse,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
     )
-    if return_lse:
-        return out, lse
-    else:
-        return out
 
 
 @functools.cache

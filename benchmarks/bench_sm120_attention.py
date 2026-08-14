@@ -42,6 +42,9 @@ CSV_FIELDS = (
     "attention_only_cuda_graph",
     "end_to_end_ms",
     "end_to_end_attention_tflops",
+    "fp8_attention_only_ms",
+    "fp8_attention_only_tflops",
+    "nvfp4_speedup_over_fp8",
     "warmup",
     "repeat",
 )
@@ -68,7 +71,7 @@ class BenchConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark FlashInfer SM120 NVFP4 attention latency and TFLOPs/s."
+        description=("Benchmark FlashInfer SM120 NVFP4 attention and FP8 FMHAv2.")
     )
     parser.add_argument(
         "--batch-size",
@@ -100,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Head dimension(s). SM120 NVFP4 attention supports 64 or 128.",
+        help="Head dimension(s). SM120 NVFP4 and FP8 attention support 64 or 128.",
     )
     causal_group = parser.add_mutually_exclusive_group()
     causal_group.add_argument(
@@ -269,6 +272,14 @@ def dtype_label(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def quantize_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, float]:
+    scale = max(
+        x.abs().max().float().item() / torch.finfo(torch.float8_e4m3fn).max,
+        1.0e-12,
+    )
+    return (x / scale).to(torch.float8_e4m3fn), scale
+
+
 def median_gpu_ms(
     fn,
     warmup: int,
@@ -376,6 +387,50 @@ def bench_config(
     attention_only_tflops = tflops_per_sec(config, attention_only_ms)
     end_to_end_tflops = tflops_per_sec(config, end_to_end_ms)
 
+    from flashinfer.prefill import fmha_v2_prefill_sm120
+
+    q_bshd = q.permute(0, 2, 1, 3).contiguous()
+    k_bshd = k.permute(0, 2, 1, 3).contiguous()
+    v_bshd = v.permute(0, 2, 1, 3).contiguous()
+    q_fp8, q_scale = quantize_e4m3(q_bshd)
+    k_fp8, k_scale = quantize_e4m3(k_bshd)
+    v_fp8, v_scale = quantize_e4m3(v_bshd)
+    out_fp8 = torch.empty_like(q_bshd, dtype=torch.bfloat16)
+    scale_bmm1_d = torch.tensor(
+        [q_scale * k_scale * sm_scale], dtype=torch.float32, device=q.device
+    )
+    scale_bmm2_d = torch.tensor([v_scale], dtype=torch.float32, device=q.device)
+
+    def fp8_attention_only():
+        return fmha_v2_prefill_sm120(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            out_fp8,
+            num_heads=config.num_heads,
+            head_dim=config.head_dim,
+            seq_len=config.seq_len,
+            scale_softmax=1.0,
+            scale_bmm1=q_scale * k_scale * sm_scale,
+            scale_bmm2=v_scale,
+            scale_bmm1_d=scale_bmm1_d,
+            scale_bmm2_d=scale_bmm2_d,
+            causal=config.causal,
+        )
+
+    fp8_attention_only()
+    torch.cuda.synchronize()
+    fp8_attention_only_ms = median_gpu_ms(
+        fp8_attention_only,
+        warmup,
+        repeat,
+        use_cuda_graph=attention_cuda_graph,
+        cold_l2_cache=not attention_cuda_graph,
+        num_iters_within_graph=1,
+    )
+    fp8_attention_only_tflops = tflops_per_sec(config, fp8_attention_only_ms)
+    nvfp4_speedup_over_fp8 = fp8_attention_only_ms / attention_only_ms
+
     print(
         "nvfp4_attention_sm120 "
         f"B={config.batch_size} H={config.num_heads} S={config.seq_len} "
@@ -385,6 +440,15 @@ def bench_config(
         f"cuda_graph={attention_cuda_graph}), "
         f"end_to_end={end_to_end_ms:.3f} ms "
         f"({end_to_end_tflops:.3f} attention-TFLOPs/s)"
+    )
+    print(
+        "fmha_v2_prefill_sm120_fp8 "
+        f"B={config.batch_size} H={config.num_heads} S={config.seq_len} "
+        f"D={config.head_dim} causal={config.causal}: "
+        f"attention_only={fp8_attention_only_ms:.3f} ms "
+        f"({fp8_attention_only_tflops:.3f} TFLOPs/s, "
+        f"cuda_graph={attention_cuda_graph}), "
+        f"nvfp4_speedup={nvfp4_speedup_over_fp8:.3f}x"
     )
     return {
         "batch_size": config.batch_size,
@@ -398,6 +462,9 @@ def bench_config(
         "attention_only_cuda_graph": attention_cuda_graph,
         "end_to_end_ms": end_to_end_ms,
         "end_to_end_attention_tflops": end_to_end_tflops,
+        "fp8_attention_only_ms": fp8_attention_only_ms,
+        "fp8_attention_only_tflops": fp8_attention_only_tflops,
+        "nvfp4_speedup_over_fp8": nvfp4_speedup_over_fp8,
         "warmup": warmup,
         "repeat": repeat,
     }
