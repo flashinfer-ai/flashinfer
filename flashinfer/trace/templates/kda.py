@@ -35,6 +35,10 @@ recurrent_kda_trace = TraceTemplate(
         "state_pool_size": Var(description="Number of writable state slots."),
         "source_pool_size": Var(description="Number of committed-state slots."),
         "num_sequences": Var(description="Number of state-source indices."),
+        "num_checkpoints": Var(description="Number of packed prefill checkpoints."),
+        "num_checkpoint_offsets": Var(
+            description="Number of packed checkpoint cumulative offsets."
+        ),
     },
     inputs={
         "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
@@ -56,6 +60,21 @@ recurrent_kda_trace = TraceTemplate(
             optional=True,
             description="Committed-state slot selected for each sequence.",
         ),
+        "ssm_state_indices": Tensor(
+            ["num_sequences"],
+            optional=True,
+            description="Writable state-pool slot selected for each prefill sequence.",
+        ),
+        "state_checkpoints": Tensor(
+            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+            optional=True,
+            description="Caller-owned packed KDA pre-block state output.",
+        ),
+        "checkpoint_cu_starts": Tensor(
+            ["num_checkpoint_offsets"],
+            optional=True,
+            description="Per-sequence cumulative packed checkpoint counts.",
+        ),
         "scale": Scalar("float32", optional=True),
         "output_final_state": Scalar("int32", optional=True),
         "use_qk_l2norm_in_kernel": Scalar("int32", optional=True),
@@ -63,6 +82,7 @@ recurrent_kda_trace = TraceTemplate(
         "lower_bound": Scalar("float32", optional=True),
         "num_spec_tokens": Scalar("int32", optional=True),
         "beta_is_logit": Scalar("int32", optional=True),
+        "checkpoint_every_n_tokens": Scalar("int32", optional=True),
     },
     outputs={
         "output": Tensor(
@@ -74,10 +94,17 @@ recurrent_kda_trace = TraceTemplate(
             dtype="bfloat16",
             optional=True,
         ),
+        "state_checkpoints": Tensor(
+            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+            dtype="bfloat16",
+            optional=True,
+            param="state_checkpoints",
+        ),
     },
     constraints=[
         "num_v_heads % num_q_heads == 0",
         "head_dim in (64, 128)",
+        "num_checkpoint_offsets == num_sequences + 1",
     ],
     tags=["stage:decode", "status:verified"],
 )

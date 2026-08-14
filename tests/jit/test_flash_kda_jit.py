@@ -30,9 +30,13 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     manifest_path = csrc_dir / "flashkda_bf16_fused_m128_import_manifest.json"
     manifest = json.loads(manifest_path.read_text())
 
-    assert manifest["schema_version"] == 1
-    assert manifest["cake_revision"] == "5abb116c396b8eb78e6ede721b4ba552e5b1ec4c"
-    assert manifest["cake_tree"] == "12567143d101ee987aaca7f859ce19ef569bfab3"
+    assert manifest["schema_version"] == 2
+    for private_provenance in (
+        "cake_revision",
+        "cake_tree",
+        "semantic_baseline_revision",
+    ):
+        assert private_provenance not in manifest
     assert manifest["architecture_artifacts_are_separate"] is True
     assert manifest["generated_source_text_equal_across_architectures"] is True
     assert set(manifest["profiles"]) == {
@@ -52,23 +56,19 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     expected_variants = {
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
-            "0b546eae3224d8518ab7b08894a8cf213aee8700c25444272b939ed8b9ef3461",
-            "ff04754e8cd75c4519f58e81bd867942f4f62242612964621fcf4315b656f10e",
-            "flashkda_bf16_fused_m128_d28b3f23fc",
-            162308,
+            "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
+            "1601e5b0b3c778c530c789c65cb8670a7f2b1979bb8ef3fe60f7d02883ec176b",
+            "flashkda_bf16_fused_m128_5527c05f05",
+            169299,
             219136,
-            "5abb116c396b8eb78e6ede721b4ba552e5b1ec4c",
-            "12567143d101ee987aaca7f859ce19ef569bfab3",
         ),
         "n32": (
             "flashkda_bf16_fused_m128.cu",
-            "b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
-            "f481e643f6eb52d1f81791a4d4fc3ff83702e6bda8c17bfa31e5557b2ef5c982",
-            "flashkda_bf16_fused_m128_9e356f6c5c",
-            161055,
+            "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
+            "3e9ece9b4e78804c612af233b1eded9bcd8f52dea33677bab26d9399a1eb7c63",
+            "flashkda_bf16_fused_m128_123cfd2bfa",
+            168024,
             227328,
-            "691136208f24a5160fcc5940ea4064e5613db2e4",
-            "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
         ),
     }
     for variant, (
@@ -78,8 +78,6 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         module_ident,
         raw_bytes,
         smem_bytes,
-        cake_revision,
-        cake_tree,
     ) in expected_variants.items():
         record = manifest["variants"][variant]
         frozen = csrc_dir / filename
@@ -88,12 +86,22 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         assert record["module_ident"] == module_ident
         assert record["raw_bytes"] == raw_bytes
         assert record["smem_bytes"] == smem_bytes
-        assert record["cake_revision"] == cake_revision
-        assert record["cake_tree"] == cake_tree
+        assert "cake_revision" not in record
+        assert "cake_tree" not in record
         assert record["frozen_path"] == f"csrc/kda/{filename}"
         assert (
             hashlib.sha256(frozen.read_bytes()).hexdigest() == record["frozen_sha256"]
         )
+        frozen_text = frozen.read_text()
+        for private_provenance in (
+            "gitlab-master.nvidia.com",
+            "merge_requests/",
+            "Cake revision",
+            "Cake commit",
+            "CAKE commit",
+            "MR !",
+        ):
+            assert private_provenance not in frozen_text
 
     import_tool = (
         Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
@@ -118,8 +126,6 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
     for variant_name, variant in namespace["VARIANTS"].items():
         record = manifest["variants"][variant_name]
         assert variant.module_ident == record["module_ident"]
-        assert variant.cake_revision == record["cake_revision"]
-        assert variant.cake_tree == record["cake_tree"]
         assert variant.raw_sha256 == record["raw_sha256"]
         assert variant.raw_bytes == record["raw_bytes"]
         assert variant.smem_bytes == record["smem_bytes"]
@@ -162,15 +168,15 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
         (
             "m128",
             227328,
-            "b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
-            "9e356f6c5c",
+            "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
+            "123cfd2bfa",
             True,
         ),
         (
             "m128_n16",
             219136,
-            "0b546eae3224d8518ab7b08894a8cf213aee8700c25444272b939ed8b9ef3461",
-            "d28b3f23fc",
+            "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
+            "5527c05f05",
             True,
         ),
     ],
@@ -327,12 +333,17 @@ def test_flash_kda_uri_and_jit_spec(
 
     binding_text = spec.sources[0].read_text()
     assert "#define uint64_t flashkda_generated_uint64_t" in binding_text
-    assert "TensorView descriptor_storage, int64_t prepare_descriptors" in binding_text
+    assert "TensorView descriptor_storage" in binding_text
+    assert "int64_t prepare_descriptors" in binding_text
     assert "CheckFlashKDATarget(device_id)" in binding_text
     chunk_tokens = 16 if variant == "m128_n16" else 32
     value_rows = 64 if variant == "m64" else 128
     assert f"EncodeTmaPointers<{value_rows}, {chunk_tokens}>" in binding_text
     if variant != "m64":
+        assert "TensorView state_indices" in binding_text
+        assert "TensorView state_checkpoints" in binding_text
+        assert "int64_t beta_token_stride" in binding_text
+        assert "int64_t checkpoint_every_n_tokens" in binding_text
         assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in (
             binding_text
         )
@@ -378,16 +389,18 @@ def test_flash_kda_descriptor_workspace_contract():
     m128_binding = (
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_binding.cu"
     ).read_text()
-    assert "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);" in (
-        m128_binding
+    assert (
+        "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);"
+        in m128_binding
     )
     assert "EncodeTmaPointers<128, 32>" in m128_binding
 
     m128_n16_binding = (
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_n16_binding.cu"
     ).read_text()
-    assert "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);" in (
-        m128_n16_binding
+    assert (
+        "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);"
+        in m128_n16_binding
     )
     assert "EncodeTmaPointers<128, 16>" in m128_n16_binding
 
@@ -426,12 +439,12 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     n16_sm103a = flash_kda.gen_flash_kda_module("m128_n16", "sm103a")
 
     assert sm100a is not sm103a
-    assert sm100a.name == "flash_kda_bf16_fused_m128_9e356f6c5c_sm100a"
-    assert sm103a.name == "flash_kda_bf16_fused_m128_9e356f6c5c_sm103a"
+    assert sm100a.name == "flash_kda_bf16_fused_m128_123cfd2bfa_sm100a"
+    assert sm103a.name == "flash_kda_bf16_fused_m128_123cfd2bfa_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_d28b3f23fc_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_d28b3f23fc_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_5527c05f05_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_5527c05f05_sm103a"
 
 
 @pytest.mark.parametrize(

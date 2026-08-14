@@ -59,7 +59,13 @@ def recurrent_kda(
     beta_is_logit: bool = False,
     seq_order: Optional[torch.Tensor] = None,
     prefill_workspace: Optional[_kda_prefill.RecurrentKDAPrefillWorkspace] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+) -> (
+    tuple[torch.Tensor, Optional[torch.Tensor]]
+    | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+):
     r"""Recurrent KDA (Kimi Delta Attention) decode and prefill kernel.
 
     This is the public API layer for the CuTe DSL implementation in
@@ -90,7 +96,9 @@ def recurrent_kda(
         beta (torch.Tensor):
             Delta-rule learning rate of shape ``[B, T, HV]``, or
             ``[1, total_tokens, HV]`` when packed. Must be bfloat16.
-            Pre-sigmoided unless ``beta_is_logit=True``.
+            Pre-sigmoided unless ``beta_is_logit=True``. Eligible frozen
+            prefill accepts non-overlapping token-row-strided storage with a
+            unit head stride, including a view into a fused projection.
         A_log (Optional[torch.Tensor]):
             Log decay parameter of shape ``[H]``. Must be float32.
             Required when ``use_gate_in_kernel=True``.
@@ -104,7 +112,9 @@ def recurrent_kda(
             If ``None``, zero-initialized. Updated in-place. For batched spec
             decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
             count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
-            omitted.
+            omitted. For eligible frozen prefill with ``ssm_state_indices``,
+            this is a state pool ``[N_pool, H, 128, 128]`` whose inner slots
+            are contiguous; padding between pool slots is allowed.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -125,7 +135,9 @@ def recurrent_kda(
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
-            be set).
+            be set). Eligible frozen packed prefill accepts contiguous CUDA
+            int32 ``[N_seq]`` indices and updates the selected
+            ``initial_state`` pool slots directly.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.
@@ -162,10 +174,23 @@ def recurrent_kda(
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation.
+        state_checkpoints (Optional[torch.Tensor]):
+            Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
+            frozen prefill. Row zero for each sequence is its initial state;
+            later rows are the states before token blocks beginning at
+            ``N, 2N, ...``. Required when ``checkpoint_every_n_tokens > 0``.
+        checkpoint_cu_starts (Optional[torch.Tensor]):
+            Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
+            Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
+        checkpoint_every_n_tokens (int):
+            Checkpoint interval. Zero disables checkpoints; a positive value
+            must be divisible by 32. SGLang normally uses 64 or a larger
+            cache-page-aligned multiple.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
-        when ``output_final_state=False``. See
+        when ``output_final_state=False``. When checkpointing is enabled, a
+        triple ``(output, final_state, state_checkpoints)`` is returned. See
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
@@ -194,6 +219,9 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
     )
     if use_flash_kda_prefill:
         assert A_log is not None
@@ -215,6 +243,20 @@ def recurrent_kda(
             output=output,
             seq_order=seq_order,
             prefill_workspace=prefill_workspace,
+            state_indices=ssm_state_indices,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+
+    if (
+        checkpoint_every_n_tokens != 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
+        raise ValueError(
+            "state checkpoints are supported only by eligible frozen "
+            "SM100/SM103 recurrent_kda prefill"
         )
 
     if prefill_workspace is not None:

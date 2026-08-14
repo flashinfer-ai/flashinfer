@@ -1,7 +1,5 @@
 {
   "architecture_artifacts_are_separate": true,
-  "cake_revision": "5abb116c396b8eb78e6ede721b4ba552e5b1ec4c",
-  "cake_tree": "12567143d101ee987aaca7f859ce19ef569bfab3",
   "generated_invariants": [
     "six fence.proxy.tensormap::generic.acquire.sys operations",
     "CTA barrier after tensor-map acquisition"
@@ -22,54 +20,49 @@
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n16-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-      "profile_sha256": "cc56204f4169e1319cc7eea9847179032710c3d927b319d90ca8fd26b2348c8d",
+      "profile_sha256": "07454267f93e63517848f481a1c16592e7f1724c7e549f5fcab32e3d8657ccc5",
       "variant": "n16"
     },
     "sm100_n32": {
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n32-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm100.json",
-      "profile_sha256": "aad3052837acc33386a91784cf16005b6f9be4858b4b9337bd51c42a0e4f8b02",
+      "profile_sha256": "9334e92deabedbe21a0f311a0207dcf7fa39e42b6daf52bcd495cfb1542f9522",
       "variant": "n32"
     },
     "sm103_n16": {
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n16-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-      "profile_sha256": "aecf16727bf8931774226a657867bb96701a222761558e914416ba76bebc8bd1",
+      "profile_sha256": "c56a3f74060906e654ba538e75bec5605666b1b1799b849850a00e426ccbc5c6",
       "variant": "n16"
     },
     "sm103_n32": {
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n32-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm103.json",
-      "profile_sha256": "9270f97dbee79da85f662205ebb198c148f8838c9ab28c947988d4be424c8b42",
+      "profile_sha256": "eddd227b2e6049fe3c8bebc99d7be315d22e3d118ed09dfcb8fadf874a3fee32",
       "variant": "n32"
     }
   },
-  "schema_version": 1,
-  "semantic_baseline_revision": "2396fef3d7132a8c6b49a962f2864c83fff29155",
+  "schema_version": 2,
   "variants": {
     "n16": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
-      "cake_revision": "5abb116c396b8eb78e6ede721b4ba552e5b1ec4c",
-      "cake_tree": "12567143d101ee987aaca7f859ce19ef569bfab3",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
-      "frozen_sha256": "ff04754e8cd75c4519f58e81bd867942f4f62242612964621fcf4315b656f10e",
-      "module_ident": "flashkda_bf16_fused_m128_d28b3f23fc",
-      "raw_bytes": 162308,
-      "raw_sha256": "0b546eae3224d8518ab7b08894a8cf213aee8700c25444272b939ed8b9ef3461",
+      "frozen_sha256": "1601e5b0b3c778c530c789c65cb8670a7f2b1979bb8ef3fe60f7d02883ec176b",
+      "module_ident": "flashkda_bf16_fused_m128_5527c05f05",
+      "raw_bytes": 169299,
+      "raw_sha256": "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
       "smem_bytes": 219136
     },
     "n32": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
-      "cake_revision": "691136208f24a5160fcc5940ea4064e5613db2e4",
-      "cake_tree": "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128.cu",
-      "frozen_sha256": "f481e643f6eb52d1f81791a4d4fc3ff83702e6bda8c17bfa31e5557b2ef5c982",
-      "module_ident": "flashkda_bf16_fused_m128_9e356f6c5c",
-      "raw_bytes": 161055,
-      "raw_sha256": "b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
+      "frozen_sha256": "3e9ece9b4e78804c612af233b1eded9bcd8f52dea33677bab26d9399a1eb7c63",
+      "module_ident": "flashkda_bf16_fused_m128_123cfd2bfa",
+      "raw_bytes": 168024,
+      "raw_sha256": "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
       "smem_bytes": 227328
     }
   }

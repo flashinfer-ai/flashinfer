@@ -198,7 +198,9 @@ def test_h12_smoke_reference_residual_carriers_round_every_boundary_on_cpu():
     assert not torch.equal(update_carrier, unrounded_update)
 
 
-def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
+def _chunk16_debug_reference(
+    inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0
+):
     """Clean-room H12 smoke reference; not the Phase-A contract authority.
 
     The recurrent state carrier stays in FP32 within each 16-token chunk, but
@@ -235,8 +237,12 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
     else:
         state = inputs["initial_state"].clone()
     out = torch.empty_like(q_flat)
+    checkpoints = []
     for sequence in range(len(offsets) - 1):
+        if checkpoint_every_n_tokens:
+            checkpoints.append(state[sequence].clone())
         carrier = state[sequence].float()
+        sequence_length = offsets[sequence + 1] - offsets[sequence]
         for local_token, token in enumerate(
             range(offsets[sequence], offsets[sequence + 1]), start=1
         ):
@@ -255,7 +261,16 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
             projected = torch.einsum("hk,hvk->hv", q_flat[token], updated)
             out[token] = (scale * projected).to(torch.bfloat16)
             carrier = state[sequence].float() if local_token % 16 == 0 else updated
-    return out.reshape_as(q), state
+            if (
+                checkpoint_every_n_tokens
+                and local_token % checkpoint_every_n_tokens == 0
+                and local_token < sequence_length
+            ):
+                checkpoints.append(state[sequence].clone())
+    result = (out.reshape_as(q), state)
+    if checkpoint_every_n_tokens:
+        return (*result, torch.stack(checkpoints))
+    return result
 
 
 @pytest.fixture
@@ -320,8 +335,11 @@ class _RecorderModule:
 
     def run(self, *args):
         self.calls.append(args)
-        if self.final_value is not None and bool(args[17]):
-            args[12].fill_(self.final_value)
+        if self.final_value is not None:
+            store_final_state = args[17] if len(args) == 21 else args[23]
+            if bool(store_final_state):
+                final_state = args[12] if len(args) == 21 else args[13]
+                final_state.fill_(self.final_value)
 
 
 def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
@@ -448,7 +466,8 @@ def test_frozen_route_and_ffi_abi(
     assert set(modules) == {expected_variant}
     assert routes == [(expected_variant, expected_target)]
     (args,) = modules[expected_variant].calls
-    assert len(args) == 21
+    expected_arg_count = 21 if expected_variant == "m64" else 28
+    assert len(args) == expected_arg_count
     assert args[0].data_ptr() == inputs["q"].data_ptr()
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
     assert args[5].shape == (
@@ -457,18 +476,137 @@ def test_frozen_route_and_ffi_abi(
     )
     assert args[8].dtype == torch.int64
     assert args[9].dtype == torch.int32
-    assert args[10].data_ptr() == args[12].data_ptr()
-    assert args[13].dtype == torch.uint8
-    assert args[13].shape == (768,)
-    assert args[14] == 1
-    assert args[15] == num_heads
-    assert args[16] == 0
-    assert args[17] == 0
-    assert math.isclose(args[18], 128**-0.5)
-    assert args[19] == -5.0
-    assert args[20] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
+    if expected_variant == "m64":
+        assert args[10].data_ptr() == args[12].data_ptr()
+        assert args[13].dtype == torch.uint8
+        assert args[13].shape == (768,)
+        assert args[14] == 1
+        assert args[15] == num_heads
+        assert args[16] == 0
+        assert args[17] == 0
+        assert math.isclose(args[18], 128**-0.5)
+        assert args[19] == -5.0
+        assert args[20] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
+    else:
+        assert args[11].data_ptr() == args[13].data_ptr()
+        assert args[16].dtype == torch.uint8
+        assert args[16].shape == (768,)
+        assert args[17] == 1
+        assert args[18] == num_heads
+        assert args[19] == inputs["beta"].stride(-2)
+        assert args[21] == 0
+        assert args[22] == 0
+        assert args[23] == 0
+        assert args[24] == 0
+        assert math.isclose(args[25], 128**-0.5)
+        assert args[26] == -5.0
+        assert args[27] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
+
+
+def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
+    cuda_device, monkeypatch
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+    )
+    total_tokens = inputs["q"].shape[1]
+    beta_carrier = torch.empty(
+        (total_tokens, 32), dtype=torch.bfloat16, device=cuda_device
+    )
+    beta_carrier[:, 8:20].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 8:20]
+    assert not inputs["beta"].is_contiguous()
+
+    state_slot_numel = 12 * 128 * 128
+    state_storage = torch.zeros(
+        (5, state_slot_numel + 64), dtype=torch.bfloat16, device=cuda_device
+    )
+    state_pool = state_storage.as_strided(
+        (5, 12, 128, 128),
+        (state_storage.stride(0), 128 * 128, 128, 1),
+    )
+    state_indices = torch.tensor([1, 3], dtype=torch.int32, device=cuda_device)
+    state_pool[state_indices.to(torch.int64)] = inputs["initial_state"]
+    inputs["initial_state"] = state_pool
+
+    checkpoint_cu_starts = torch.tensor(
+        [0, 2, 5], dtype=torch.int64, device=cuda_device
+    )
+    state_checkpoints = torch.empty(
+        (5, 12, 128, 128), dtype=torch.bfloat16, device=cuda_device
+    )
+    output, returned_state, returned_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=64,
+    )
+    assert output.shape == inputs["q"].shape
+    assert returned_state is state_pool
+    assert returned_checkpoints is state_checkpoints
+    assert routes == [("m128_n16", "sm100a")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[4].data_ptr() == inputs["beta"].data_ptr()
+    assert args[5].data_ptr() == inputs["beta"].data_ptr()
+    assert args[10].data_ptr() == state_indices.data_ptr()
+    assert args[11].data_ptr() == state_pool.data_ptr()
+    assert args[13].data_ptr() == state_pool.data_ptr()
+    assert args[14].data_ptr() == state_checkpoints.data_ptr()
+    assert args[15].data_ptr() == checkpoint_cu_starts.data_ptr()
+    assert args[19] == inputs["beta"].stride(-2)
+    assert args[20] == state_pool.stride(0)
+    assert args[21:25] == (1, 1, 1, 64)
+
+
+def test_unaligned_strided_beta_uses_internal_tma_workspace(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    module = _RecorderModule()
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant, target: module
+    )
+    inputs = _make_inputs(seq_lens=[32], num_heads=12, packed=True)
+    beta_carrier = torch.empty(
+        (32, 32), dtype=torch.bfloat16, device=cuda_device
+    )
+    beta_carrier[:, 7:19].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 7:19]
+
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs), output=torch.empty_like(inputs["q"])
+    )
+
+    (args,) = module.calls
+    assert args[4].data_ptr() == inputs["beta"].data_ptr()
+    assert args[5].data_ptr() != inputs["beta"].data_ptr()
+    assert args[5].shape == (32, 16)
 
 
 def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
@@ -490,7 +628,7 @@ def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
             output=torch.empty_like(inputs["q"]),
         )
     (args,) = module.calls
-    assert args[20] == int(stream.cuda_stream)
+    assert args[27] == int(stream.cuda_stream)
 
 
 def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
@@ -532,10 +670,10 @@ def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
     assert actual.shape == inputs["q"].shape
     assert returned_state is original_state
     (args,) = module.calls
-    assert args[10].data_ptr() == original_state.data_ptr()
-    assert args[12].data_ptr() == original_state.data_ptr()
-    assert args[16] == 1
-    assert args[17] == 1
+    assert args[11].data_ptr() == original_state.data_ptr()
+    assert args[13].data_ptr() == original_state.data_ptr()
+    assert args[22] == 1
+    assert args[23] == 1
     torch.testing.assert_close(
         original_state,
         torch.full_like(original_state, 0.25),
@@ -668,10 +806,10 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
             output=output,
             prefill_workspace=workspace,
         )
-    assert [args[14] for args in module.calls] == [1, 0]
+    assert [args[17] for args in module.calls] == [1, 0]
     assert (
-        module.calls[0][13].data_ptr()
-        == module.calls[1][13].data_ptr()
+        module.calls[0][16].data_ptr()
+        == module.calls[1][16].data_ptr()
         == workspace._descriptor_storages["m128"].data_ptr()
     )
 
@@ -681,7 +819,7 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
         output=changed_output,
         prefill_workspace=workspace,
     )
-    assert module.calls[-1][14] == 1
+    assert module.calls[-1][17] == 1
 
 
 def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
@@ -718,7 +856,7 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
         output=output,
         prefill_workspace=workspace,
     )
-    assert module.calls[-1][14] == 0
+    assert module.calls[-1][17] == 0
     assert workspace._captured
 
     with pytest.raises(RuntimeError, match="captured by another CUDA graph"):
@@ -963,6 +1101,86 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_reference(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=2064,
+    )
+    compact_initial_state = inputs["initial_state"].clone()
+    beta_carrier = torch.empty(
+        (inputs["q"].shape[1], 32),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    beta_carrier[:, 8:20].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 8:20]
+    expected_output, expected_state, expected_checkpoints = (
+        _chunk16_debug_reference(
+            {**inputs, "initial_state": compact_initial_state},
+            checkpoint_every_n_tokens=64,
+        )
+    )
+
+    state_slot_numel = 12 * 128 * 128
+    state_storage = torch.zeros(
+        (5, state_slot_numel + 64),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    state_pool = state_storage.as_strided(
+        (5, 12, 128, 128),
+        (state_storage.stride(0), 128 * 128, 128, 1),
+    )
+    state_indices = torch.tensor(
+        [1, 3], dtype=torch.int32, device=flash_kda_device
+    )
+    state_indices_i64 = state_indices.to(torch.int64)
+    state_pool[state_indices_i64] = compact_initial_state
+    untouched_before = state_pool[[0, 2, 4]].clone()
+    inputs["initial_state"] = state_pool
+    checkpoint_cu_starts = torch.tensor(
+        [0, 2, 5], dtype=torch.int64, device=flash_kda_device
+    )
+    state_checkpoints = torch.empty(
+        (5, 12, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+    )
+
+    actual_output, actual_state, actual_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=64,
+    )
+
+    assert actual_state is state_pool
+    assert actual_checkpoints is state_checkpoints
+    assert inputs["beta"].data_ptr() == beta_carrier[:, 8:20].data_ptr()
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_pool[state_indices_i64].float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_checkpoints.float(),
+        expected_checkpoints.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(state_pool[[0, 2, 4]], untouched_before)
 
 
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):

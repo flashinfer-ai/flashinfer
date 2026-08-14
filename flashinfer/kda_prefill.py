@@ -122,6 +122,48 @@ def _is_contiguous_cuda_tensor(
     )
 
 
+def _is_token_row_strided_cuda_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and tensor.device == device
+        and tensor.dtype == dtype
+        and tensor.ndim >= 2
+        and tensor.stride(-1) == 1
+        and tensor.stride(-2) >= tensor.shape[-1]
+    )
+
+
+def _is_state_pool_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    device: torch.device,
+    num_heads: int,
+) -> bool:
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and tensor.device == device
+        and tensor.dtype == torch.bfloat16
+        and tensor.ndim == 4
+        and tensor.shape[0] > 0
+        and tensor.data_ptr() % 16 == 0
+        and tuple(tensor.shape[1:])
+        == (num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+        and tensor.stride(-1) == 1
+        and tensor.stride(-2) == _FLASH_KDA_HEAD_DIM
+        and tensor.stride(-3) == _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        and tensor.stride(0)
+        >= num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        and tensor.stride(0) * tensor.element_size() % 16 == 0
+    )
+
+
 def _flash_kda_prefill_is_eligible(
     *,
     q: torch.Tensor,
@@ -143,14 +185,16 @@ def _flash_kda_prefill_is_eligible(
     initial_state_source: Optional[torch.Tensor],
     initial_state_indices: Optional[torch.Tensor],
     beta_is_logit: bool,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
 ) -> bool:
     """Return whether the call exactly matches the frozen FlashKDA contract."""
 
     if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
         return False
     if (
-        ssm_state_indices is not None
-        or num_accepted_tokens is not None
+        num_accepted_tokens is not None
         or initial_state_source is not None
         or initial_state_indices is not None
     ):
@@ -190,9 +234,11 @@ def _flash_kda_prefill_is_eligible(
             or tensor.shape != q.shape
         ):
             return False
-    if not _is_contiguous_cuda_tensor(
+    if not _is_token_row_strided_cuda_tensor(
         beta, dtype=torch.bfloat16, device=q.device
     ) or beta.shape != (batch_size, total_or_fixed_tokens, num_heads):
+        return False
+    if batch_size > 1 and beta.stride(0) != total_or_fixed_tokens * beta.stride(1):
         return False
     if not _is_contiguous_cuda_tensor(
         A_log, dtype=torch.float32, device=q.device
@@ -221,16 +267,48 @@ def _flash_kda_prefill_is_eligible(
         if num_sequences <= 0 or total_or_fixed_tokens <= num_sequences:
             return False
 
-    if initial_state is not None:
-        if not _is_contiguous_cuda_tensor(
-            initial_state, dtype=torch.bfloat16, device=q.device
-        ) or initial_state.shape != (
-            num_sequences,
-            num_heads,
-            _FLASH_KDA_HEAD_DIM,
-            _FLASH_KDA_HEAD_DIM,
+    if ssm_state_indices is not None:
+        if (
+            initial_state is None
+            or not _is_contiguous_cuda_tensor(
+                ssm_state_indices, dtype=torch.int32, device=q.device
+            )
+            or ssm_state_indices.ndim != 1
+            or ssm_state_indices.numel() != num_sequences
         ):
             return False
+    if initial_state is not None:
+        if not _is_state_pool_tensor(
+            initial_state,
+            device=q.device,
+            num_heads=num_heads,
+        ):
+            return False
+        if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
+            return False
+    if (
+        checkpoint_every_n_tokens < 0
+        or checkpoint_every_n_tokens > torch.iinfo(torch.int32).max
+        or checkpoint_every_n_tokens % 32 != 0
+    ):
+        return False
+    if checkpoint_every_n_tokens:
+        if (
+            not _is_contiguous_cuda_tensor(
+                state_checkpoints, dtype=torch.bfloat16, device=q.device
+            )
+            or state_checkpoints.ndim != 4
+            or tuple(state_checkpoints.shape[1:])
+            != (num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+            or not _is_contiguous_cuda_tensor(
+                checkpoint_cu_starts, dtype=torch.int64, device=q.device
+            )
+            or checkpoint_cu_starts.ndim != 1
+            or checkpoint_cu_starts.numel() != num_sequences + 1
+        ):
+            return False
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        return False
     if output is not None:
         if (
             not _is_contiguous_cuda_tensor(
@@ -243,11 +321,20 @@ def _flash_kda_prefill_is_eligible(
 
 
 def _select_flash_kda_prefill_variant(
-    *, fixed_layout: bool, num_sequences: int, num_heads: int
+    *,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    needs_direct_m128: bool = False,
 ) -> "FlashKDAVariant":
     if num_heads == 12:
         return "m128_n16"
-    if fixed_layout and num_sequences == 1 and num_heads == 64:
+    if (
+        not needs_direct_m128
+        and fixed_layout
+        and num_sequences == 1
+        and num_heads == 64
+    ):
         return "m64"
     return "m128"
 
@@ -319,6 +406,30 @@ def _dummy_bf16(device: torch.device) -> torch.Tensor:
     )
 
 
+def _dummy_i32(device: torch.device) -> torch.Tensor:
+    key = ("dummy_i32", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.int32, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy int32 metadata is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
+def _dummy_i64(device: torch.device) -> torch.Tensor:
+    key = ("dummy_i64", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.int64, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy int64 metadata is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
 def _stream_cache_key(device: torch.device) -> tuple[int, int]:
     stream = torch.cuda.current_stream(device)
     device_index = (
@@ -381,15 +492,31 @@ def _beta_tma_source(
 ) -> torch.Tensor:
     batch_size, seq_len, num_heads = beta.shape
     total_tokens = batch_size * seq_len
-    beta_flat = beta.reshape(total_tokens, num_heads)
+    if beta.stride(-1) != 1:
+        raise ValueError("beta must have unit head stride")
+    if batch_size == 1:
+        beta_flat = beta[0]
+    else:
+        if beta.stride(0) != seq_len * beta.stride(1):
+            raise ValueError(
+                "beta batch/token dimensions must collapse without a copy"
+            )
+        beta_flat = beta.as_strided(
+            (total_tokens, num_heads),
+            (beta.stride(1), beta.stride(2)),
+        )
+    if (
+        total_tokens >= 32
+        and beta_flat.data_ptr() % 16 == 0
+        and beta_flat.stride(0) * beta.element_size() % 16 == 0
+    ):
+        return beta_flat
     padded_tokens = max(total_tokens, 32)
     padded_heads = (
         (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
         // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
         * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
     )
-    if padded_tokens == total_tokens and padded_heads == num_heads:
-        return beta_flat
     shape = (padded_tokens, padded_heads)
     padded = _workspace_buffer(
         workspace=workspace,
@@ -466,10 +593,18 @@ def _storage_ranges_overlap(
 ) -> bool:
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
+    def storage_end(tensor: torch.Tensor) -> int:
+        max_element_offset = sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride())
+            if size > 0
+        )
+        return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
+
     left_start = left.data_ptr()
     right_start = right.data_ptr()
-    left_end = left_start + left.numel() * left.element_size()
-    right_end = right_start + right.numel() * right.element_size()
+    left_end = storage_end(left)
+    right_end = storage_end(right)
     return left_start < right_end and right_start < left_end
 
 
@@ -579,7 +714,14 @@ def _run_flash_kda_prefill(
     output: Optional[torch.Tensor],
     seq_order: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_indices: Optional[torch.Tensor],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> (
+    tuple[torch.Tensor, Optional[torch.Tensor]]
+    | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+):
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(
@@ -590,6 +732,16 @@ def _run_flash_kda_prefill(
     batch_size, seq_len, num_heads, _ = q.shape
     fixed_layout = cu_seqlens is None
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
+    variant = _select_flash_kda_prefill_variant(
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        needs_direct_m128=(
+            state_indices is not None
+            or checkpoint_every_n_tokens != 0
+            or not beta.is_contiguous()
+        ),
+    )
     if fixed_layout:
         cu_seqlens_i64 = _fixed_cu_seqlens(
             device=q.device, batch_size=batch_size, seq_len=seq_len
@@ -613,6 +765,8 @@ def _run_flash_kda_prefill(
         device=q.device,
     )
     dummy_state = _dummy_bf16(q.device)
+    dummy_i32 = _dummy_i32(q.device) if variant != "m64" else None
+    dummy_i64 = _dummy_i64(q.device) if variant != "m64" else None
 
     if output is None:
         if capturing:
@@ -640,6 +794,9 @@ def _run_flash_kda_prefill(
         _FLASH_KDA_HEAD_DIM,
     )
     use_initial_state = initial_state is not None
+    use_state_indices = state_indices is not None
+    if use_state_indices and initial_state is None:
+        raise ValueError("state_indices requires an initial_state pool")
     if initial_state is not None:
         initial_state_arg = initial_state
         final_state_arg = initial_state
@@ -661,17 +818,18 @@ def _run_flash_kda_prefill(
         final_state_arg = dummy_state
         store_final_state = False
         returned_state = None
+    active_state = initial_state if initial_state is not None else final_state_arg
+    state_slot_stride = (
+        active_state.stride(0)
+        if active_state.ndim == 4
+        else num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    )
 
     scale_value = (
         1.0 / math.sqrt(_FLASH_KDA_HEAD_DIM) if scale is None else float(scale)
     )
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    variant = _select_flash_kda_prefill_variant(
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-    )
     target = _select_flash_kda_prefill_target(q.device)
     stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
     explicit_workspace = prefill_workspace is not None
@@ -722,29 +880,71 @@ def _run_flash_kda_prefill(
         descriptor_storage = workspace._descriptor_storages[variant]
         module = _get_flash_kda_prefill_module(variant, target)
         try:
-            module.run(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                beta_tma,
-                A_log,
-                dt_bias,
-                cu_seqlens_i64,
-                seq_order_i32,
-                initial_state_arg,
-                out_buf,
-                final_state_arg,
-                descriptor_storage,
-                prepare_descriptors,
-                num_heads,
-                int(use_initial_state),
-                int(store_final_state),
-                scale_value,
-                float(lower_bound),
-                stream_ptr,
-            )
+            if variant == "m64":
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            else:
+                assert dummy_i32 is not None
+                assert dummy_i64 is not None
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    state_indices if state_indices is not None else dummy_i32,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    (
+                        state_checkpoints
+                        if state_checkpoints is not None
+                        else dummy_state
+                    ),
+                    (
+                        checkpoint_cu_starts
+                        if checkpoint_cu_starts is not None
+                        else dummy_i64
+                    ),
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    beta.stride(-2),
+                    state_slot_stride,
+                    int(use_state_indices),
+                    int(use_initial_state),
+                    int(store_final_state),
+                    checkpoint_every_n_tokens,
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
         except Exception:
             if prepare_descriptors:
                 workspace._descriptor_signatures.pop(variant, None)
@@ -753,7 +953,8 @@ def _run_flash_kda_prefill(
             workspace._descriptor_signatures[variant] = signature
         if capturing and explicit_workspace:
             workspace._captured = True
-    return (
-        out_buf,
-        returned_state if output_final_state else None,
-    )
+    result = (out_buf, returned_state if output_final_state else None)
+    if checkpoint_every_n_tokens:
+        assert state_checkpoints is not None
+        return (*result, state_checkpoints)
+    return result
