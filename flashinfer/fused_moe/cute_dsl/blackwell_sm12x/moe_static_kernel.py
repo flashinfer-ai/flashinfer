@@ -528,12 +528,14 @@ class MoEStaticKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        # NVFP4 (sf_vec_size 16) uses the MmaMXF4NVF4Op atom whose m-tile
-        # covers 64 rows (M//64); the MXFP4 atom (sf_vec_size 32) covers 32.
-        # Iterating the wrong m-tile count indexes past the register
-        # fragments — harmless in the two-pass layout but corrupts the fused
-        # FC1 pass where the up GEMM shares the accumulator tiling.
-        m_tile_rows = 16 * (4 if self.sf_vec_size == 16 else atom_shape[0])
+        # Both the MXFP4 and NVFP4 block-scaled MMA atoms are m16n8k64
+        # instructions, so the fused FC1 pass iterates the accumulator
+        # tiling in 64-row m-tiles for either format. #4290's unified
+        # M//(16*atom) formula under-sliced the NVFP4 accumulator and,
+        # once the gate/up GEMMs share the fused tiling, the MXFP4 one
+        # too — harmless in the two-pass layout but corrupting the fused
+        # gate+up pass.
+        m_tile_rows = 16 * 4
         self.num_m_tiles = self.tile_shape_mnk[0] // m_tile_rows
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
@@ -1543,10 +1545,12 @@ class MoEStaticKernel:
                     smem_copy_SFB, fz_csSFB_p[None, None, 0], fz_crSFB[None, None, 0]
                 )
                 for _k_tile in range(0, fc1_k_tile_cnt - 1, 1, unroll=4):  # type: ignore[call-overload]
+                    # Gate and up are emitted as two sequential phases per
+                    # stage (all gate k-blocks, then all up k-blocks) so the
+                    # per-accumulator MMA sequence matches the two-pass
+                    # layout; interleaving the GEMMs per k-block changed the
+                    # numerics on the strict fp32-scale paths.
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_next = (
-                            0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                        )
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
                                 mma_atom.set(
@@ -1564,9 +1568,35 @@ class MoEStaticKernel:
                                     tCrB[None, _nt, k_block_idx],
                                     gate_acc[None, _mt, _nt],
                                 )
-                        if cutlass.const_expr(self.is_gated):
-                            # Up GEMM reuses the B/SFB register fragments that
-                            # the gate GEMM just consumed.
+                        if k_block_idx + 1 < num_k_blocks:
+                            cute.copy(
+                                smem_copy_A,
+                                csA_p[None, None, k_block_idx + 1],
+                                crA_tile[None, None, k_block_idx + 1],
+                            )
+                            cute.copy(
+                                smem_copy_B,
+                                csB_p[None, None, k_block_idx + 1],
+                                crB[None, None, k_block_idx + 1],
+                            )
+                            fz_csSFA_cur = cute.filter_zeros(
+                                csSFA_tile[None, None, None, cons_state.index]
+                            )
+                            fz_csSFB_cur = cute.filter_zeros(
+                                csSFB_tile[None, None, None, cons_state.index]
+                            )
+                            cute.copy(
+                                smem_copy_SFA,
+                                fz_csSFA_cur[None, None, k_block_idx + 1],
+                                fz_crSFA[None, None, k_block_idx + 1],
+                            )
+                            cute.copy(
+                                smem_copy_SFB,
+                                fz_csSFB_cur[None, None, k_block_idx + 1],
+                                fz_crSFB[None, None, k_block_idx + 1],
+                            )
+                    if cutlass.const_expr(self.is_gated):
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                             cute.copy(
                                 smem_copy_B,
                                 csB_up_p[None, None, k_block_idx],
@@ -1594,78 +1624,40 @@ class MoEStaticKernel:
                                         tCrB[None, _nt, k_block_idx],
                                         up_acc[None, _mt, _nt],
                                     )
-                        # Stage-boundary advance must happen after the up B/SFB
-                        # copies above: they read the CURRENT stage's up tiles,
-                        # while the refresh below re-points every smem slice at
-                        # the NEXT stage (and the prefetch below consumes it).
-                        if k_block_idx == num_k_blocks - 1:
-                            ml_pipeline.consumer_release(cons_state)
-                            cons_state.advance()
-                            peek = ml_pipeline.consumer_try_wait(cons_state)
-                            csA_p = csA_tile[None, None, None, cons_state.index]
-                            csB_p = csB[None, None, None, cons_state.index]
-                            csB_up_p = csB_up[None, None, None, cons_state.index]
-                            csSFA_p = csSFA_tile[None, None, None, cons_state.index]
-                            csSFB_p = csSFB_tile[None, None, None, cons_state.index]
-                            csSFB_up_p = csSFB_up_tile[
-                                None, None, None, cons_state.index
-                            ]
-                            fz_csSFA_p = cute.filter_zeros(csSFA_p)
-                            fz_csSFB_p = cute.filter_zeros(csSFB_p)
-                            fz_csSFB_up_p = cute.filter_zeros(csSFB_up_p)
-                            ml_pipeline.consumer_wait(cons_state, peek)
-                        cute.copy(
-                            smem_copy_A,
-                            csA_p[None, None, k_next],
-                            crA_tile[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_copy_B,
-                            csB_p[None, None, k_next],
-                            crB[None, None, k_next],
-                        )
-                        fz_csSFA_cur = cute.filter_zeros(
-                            csSFA_tile[None, None, None, cons_state.index]
-                        )
-                        fz_csSFB_cur = cute.filter_zeros(
-                            csSFB_tile[None, None, None, cons_state.index]
-                        )
-                        cute.copy(
-                            smem_copy_SFA,
-                            fz_csSFA_cur[None, None, k_next],
-                            fz_crSFA[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_copy_SFB,
-                            fz_csSFB_cur[None, None, k_next],
-                            fz_crSFB[None, None, k_next],
-                        )
+                    ml_pipeline.consumer_release(cons_state)
+                    cons_state.advance()
+                    peek = ml_pipeline.consumer_try_wait(cons_state)
+                    csA_p = csA_tile[None, None, None, cons_state.index]
+                    csB_p = csB[None, None, None, cons_state.index]
+                    csB_up_p = csB_up[None, None, None, cons_state.index]
+                    csSFA_p = csSFA_tile[None, None, None, cons_state.index]
+                    csSFB_p = csSFB_tile[None, None, None, cons_state.index]
+                    csSFB_up_p = csSFB_up_tile[None, None, None, cons_state.index]
+                    fz_csSFA_p = cute.filter_zeros(csSFA_p)
+                    fz_csSFB_p = cute.filter_zeros(csSFB_p)
+                    fz_csSFB_up_p = cute.filter_zeros(csSFB_up_p)
+                    ml_pipeline.consumer_wait(cons_state, peek)
+                    cute.copy(
+                        smem_copy_A, csA_p[None, None, 0], crA_tile[None, None, 0]
+                    )
+                    cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
+                    fz_csSFA_cur = cute.filter_zeros(
+                        csSFA_tile[None, None, None, cons_state.index]
+                    )
+                    fz_csSFB_cur = cute.filter_zeros(
+                        csSFB_tile[None, None, None, cons_state.index]
+                    )
+                    cute.copy(
+                        smem_copy_SFA,
+                        fz_csSFA_cur[None, None, 0],
+                        fz_crSFA[None, None, 0],
+                    )
+                    cute.copy(
+                        smem_copy_SFB,
+                        fz_csSFB_cur[None, None, 0],
+                        fz_crSFB[None, None, 0],
+                    )
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                    k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                    if k_block_idx == num_k_blocks - 1:
-                        ml_pipeline.consumer_release(cons_state)
-                        cons_state.advance()
-                    if k_next > 0 and fc1_k_tile_cnt > Int32(0):
-                        cute.copy(
-                            smem_copy_A,
-                            csA_p[None, None, k_next],
-                            crA_tile[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_copy_B,
-                            csB_p[None, None, k_next],
-                            crB[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_copy_SFA,
-                            fz_csSFA_p[None, None, k_next],
-                            fz_crSFA[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_copy_SFB,
-                            fz_csSFB_p[None, None, k_next],
-                            fz_crSFB[None, None, k_next],
-                        )
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
                             mma_atom.set(
@@ -1683,34 +1675,58 @@ class MoEStaticKernel:
                                 tCrB[None, _nt, k_block_idx],
                                 gate_acc[None, _mt, _nt],
                             )
-                        if cutlass.const_expr(self.is_gated):
-                            cute.copy(
-                                smem_copy_B,
-                                csB_up_p[None, None, k_block_idx],
-                                crB[None, None, k_block_idx],
-                            )
-                            cute.copy(
-                                smem_copy_SFB,
-                                fz_csSFB_up_p[None, None, k_block_idx],
-                                fz_crSFB[None, None, k_block_idx],
-                            )
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
-                                    mma_atom.set(
-                                        WarpField.SFA,
-                                        tCrSFA_tile[None, _mt, k_block_idx].iterator,
-                                    )
-                                    mma_atom.set(
-                                        WarpField.SFB,
-                                        tCrSFB_tile[None, _nt, k_block_idx].iterator,
-                                    )
-                                    cute.gemm(
-                                        mma_atom,
-                                        up_acc[None, _mt, _nt],
-                                        tCrA_tile[None, _mt, k_block_idx],
-                                        tCrB[None, _nt, k_block_idx],
-                                        up_acc[None, _mt, _nt],
-                                    )
+                    if k_block_idx + 1 < num_k_blocks:
+                        cute.copy(
+                            smem_copy_A,
+                            csA_p[None, None, k_block_idx + 1],
+                            crA_tile[None, None, k_block_idx + 1],
+                        )
+                        cute.copy(
+                            smem_copy_B,
+                            csB_p[None, None, k_block_idx + 1],
+                            crB[None, None, k_block_idx + 1],
+                        )
+                        cute.copy(
+                            smem_copy_SFA,
+                            fz_csSFA_p[None, None, k_block_idx + 1],
+                            fz_crSFA[None, None, k_block_idx + 1],
+                        )
+                        cute.copy(
+                            smem_copy_SFB,
+                            fz_csSFB_p[None, None, k_block_idx + 1],
+                            fz_crSFB[None, None, k_block_idx + 1],
+                        )
+                if cutlass.const_expr(self.is_gated):
+                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                        cute.copy(
+                            smem_copy_B,
+                            csB_up_p[None, None, k_block_idx],
+                            crB[None, None, k_block_idx],
+                        )
+                        cute.copy(
+                            smem_copy_SFB,
+                            fz_csSFB_up_p[None, None, k_block_idx],
+                            fz_crSFB[None, None, k_block_idx],
+                        )
+                        for _mt in range(self.num_m_tiles):
+                            for _nt in range(self.num_n_tiles):
+                                mma_atom.set(
+                                    WarpField.SFA,
+                                    tCrSFA_tile[None, _mt, k_block_idx].iterator,
+                                )
+                                mma_atom.set(
+                                    WarpField.SFB,
+                                    tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                )
+                                cute.gemm(
+                                    mma_atom,
+                                    up_acc[None, _mt, _nt],
+                                    tCrA_tile[None, _mt, k_block_idx],
+                                    tCrB[None, _nt, k_block_idx],
+                                    up_acc[None, _mt, _nt],
+                                )
+                ml_pipeline.consumer_release(cons_state)
+                cons_state.advance()
                 # Drain the FC1 pass before the DMA warp reuses the staging
                 # buffers for the FC2 prefetch. (Gate and up were already
                 # fused into the single pass above.)
