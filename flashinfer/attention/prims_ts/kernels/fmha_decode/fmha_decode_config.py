@@ -58,7 +58,7 @@ from .fmha_decode_constants import (
     Q_ROW_ALIGNMENT_BYTES,
     REDUCTION_BYTES_PER_SLICE,
     REDUCTION_THREADS_PER_CTA,
-    SPLIT_KV_MIN_TILES_PER_CTA,
+    SPLIT_KV_MIN_TOKENS_PER_CTA,
     TMEM_COLUMNS_PER_ROW,
     TMEM_ROW_STRIDE,
     TOTAL_SMEM_BUDGET_KIB,
@@ -101,7 +101,7 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float16, Float16, Float16, 256, 128, 1, 1),
 }
 
-_KV_TILE_256_PHYSICAL_CONFIG: Mapping[str, ConfigValue] = {
+_KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
     "tmem_stats_cols": 32,
     "tmem_p_cols": 64,
@@ -117,10 +117,10 @@ _KV_TILE_256_PHYSICAL_CONFIG: Mapping[str, ConfigValue] = {
     "o_stages": 2,
 }
 
-# KV256 currently uses one validated 16-warp role assignment. Keeping the role
-# contract next to the physical tile config makes explicit overrides fail before
-# task construction instead of compiling a partially-overlaid schedule.
-_KV_TILE_256_TASK_TOPOLOGY: Mapping[str, int] = {
+# KV256 currently uses one validated 16-warp role assignment. Keep these
+# defaults next to the physical profile; explicit alternatives remain intact
+# until the common profile validator determines whether they are supported.
+_KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
     "softmax0_warp_idx": 0,
     "softmax0_num_warps": 4,
     "softmax1_warp_idx": 4,
@@ -143,6 +143,8 @@ _KV_TILE_256_TASK_TOPOLOGY: Mapping[str, int] = {
     "clc_tail_padding_warp_idx": 12,
     "clc_tail_padding_num_warps": 0,
 }
+
+_KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 
 # Public cost-model collection uses the FP8 proxy for every source dtype.  The
 # original fixed-Q1 ratio-32 requests exercise a partial grouped-Q tile; the
@@ -272,7 +274,7 @@ class QTileGeometry:
 
 @dataclass(frozen=True)
 class GroupedQMmaCandidate:
-    """One grouped-Q MMA geometry candidate, including a possible tail tile."""
+    """One grouped-Q MMA geometry candidate."""
 
     variant: str
     tile_size_q: int
@@ -639,8 +641,7 @@ class FmhaDecodeConfig:
             or (
                 self.tile_size_q == 64
                 and self.tile_size_kv == 256
-                and self.total_kv_tiles
-                >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+                and self.total_kv_tiles >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
             )
         )
 
@@ -1530,7 +1531,7 @@ class FmhaDecodeConfig:
         """Whether task roles match KV256's validated 16-warp layout."""
         return all(
             getattr(self, field) == expected
-            for field, expected in _KV_TILE_256_TASK_TOPOLOGY.items()
+            for field, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items()
         )
 
     @property
@@ -1556,9 +1557,7 @@ class FmhaDecodeConfig:
             and self.kv_stages == KV_TILE_256_SHARED_FIFO_STAGES
             and self.load_num_warps == 1
         )
-        has_direct_output_lifetime = not (
-            self.use_split_kv or self.use_attention_sinks
-        )
+        has_direct_output_lifetime = not (self.use_split_kv or self.use_attention_sinks)
         return has_rotating_kv_ring and has_direct_output_lifetime
 
     @property
@@ -2046,18 +2045,13 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "o_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "tile_size_q", tile_size_q, explicit_fields)
         if cfg.tile_size_kv == 256:
-            # One logical KV256 tile exposes two spatial KV128 partials. Route
-            # the complete physical ABI as one qualified profile rather than
-            # accepting incompatible tuning fields and validating them later.
-            for field_name, value in _KV_TILE_256_PHYSICAL_CONFIG.items():
-                current_value = getattr(cfg, field_name)
-                if field_name in explicit_fields and current_value != value:
-                    raise ValueError(
-                        f"KV256 requires {field_name}={value}, got "
-                        f"{current_value}"
-                    )
-                setattr(cfg, field_name, value)
-            explicit_fields.difference_update(_KV_TILE_256_PHYSICAL_CONFIG)
+            # Materialize the selected profile without overriding caller
+            # tuning. The common validator below decides whether the resulting
+            # effective configuration is supported by the kernel.
+            for field_name, value in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
+                _set_if_implicit(cfg, field_name, value, explicit_fields)
+            for field_name, value in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
+                _set_if_implicit(cfg, field_name, value, explicit_fields)
         else:
             _set_if_implicit(cfg, "tmem_s_cols", tile_size_kv, explicit_fields)
             _set_if_implicit(
@@ -2099,7 +2093,62 @@ def _finalize_static_decode_config(
     # having to repeat the (... and not use_split_kv) check.
     if cfg.use_split_kv:
         cfg.use_persistent_scheduler = False
-    if cfg.tile_size_kv == 256 and not cfg.supports_grouped_keeps:
+
+
+def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
+    """Validate the effective KV256 profile after implicit defaults are filled."""
+    if cfg.tile_size_kv != 256:
+        return
+
+    def _require_python_int(field_name: str) -> int:
+        value = getattr(cfg, field_name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                f"KV256 {field_name} must be a Python integer, "
+                f"got {type(value).__name__}"
+            )
+        return value
+
+    for field_name, expected in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
+        actual = _require_python_int(field_name)
+        if field_name in _KV_TILE_256_TUNABLE_FIELDS:
+            continue
+        if actual != expected:
+            raise ValueError(f"KV256 requires {field_name}={expected}, got {actual}")
+    for field_name, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
+        actual = _require_python_int(field_name)
+        if actual != expected:
+            raise ValueError(f"KV256 requires {field_name}={expected}, got {actual}")
+
+    if cfg.q_stages <= 0 or cfg.kv_stages <= 0:
+        raise ValueError(
+            "KV256 shared-memory pipeline requires positive q_stages and "
+            f"kv_stages, got q_stages={cfg.q_stages}, "
+            f"kv_stages={cfg.kv_stages}"
+        )
+    pipeline_smem_bytes = (
+        cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
+    )
+    pipeline_smem_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
+    if pipeline_smem_bytes > pipeline_smem_budget_bytes:
+        raise ValueError(
+            "KV256 shared-memory pipeline exceeds the static SMEM budget: "
+            f"q_stages={cfg.q_stages}, kv_stages={cfg.kv_stages} require "
+            f"{pipeline_smem_bytes} bytes, limit is "
+            f"{pipeline_smem_budget_bytes} bytes"
+        )
+    if (
+        cfg.use_persistent_scheduler
+        and not cfg.use_split_kv
+        and not cfg.use_attention_sinks
+        and cfg.kv_stages != KV_TILE_256_SHARED_FIFO_STAGES
+    ):
+        raise ValueError(
+            "persistent KV256 requires kv_stages="
+            f"{KV_TILE_256_SHARED_FIFO_STAGES} for the rotating shared-KV "
+            f"exchange, got {cfg.kv_stages}"
+        )
+    if not cfg.supports_grouped_keeps:
         raise ValueError(
             "KV256 currently supports only the qualified Q64 FP16/BF16/D128 "
             "grouped Keeps profile"
@@ -2273,6 +2322,7 @@ def _make_static_decode_config(
         explicit_fields=explicit_fields,
     )
     _finalize_static_decode_config(cfg, explicit_fields)
+    _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
     return cfg
 
@@ -2522,8 +2572,9 @@ def _select_auto_launch_mode(
       ``"gmem_reduction"``
           Split the K/V sequence across several CTAs (Flash-Decoding GMEM
           reduction). Chosen when the static grid sits under one SM wave
-          (``waves < 1``) *and* each CTA has enough K/V work to dwarf the
-          GMEM reduction overhead (``tiles_per_cta >= 16``). At ``b=1``
+          (``waves < 1``) *and* each CTA has at least 2,048 padded K/V tokens
+          to dwarf the GMEM reduction overhead. Legal split fanout is still
+          bounded independently by the minimum loop iterations. At ``b=1``
           there are only ``num_heads_kv`` CTAs in the static grid, which
           fills a few percent of an SM-rich device; splitting K/V across
           tens of CTAs unlocks the remaining bandwidth.
@@ -2549,7 +2600,8 @@ def _select_auto_launch_mode(
     ctas = batch_size * num_heads_kv * num_q_tiles
     waves = ctas / sm_count
     tiles_per_cta = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
-    if waves < 1 and tiles_per_cta >= SPLIT_KV_MIN_TILES_PER_CTA:
+    kv_tokens_per_cta = tiles_per_cta * tile_size_kv
+    if waves < 1 and kv_tokens_per_cta >= SPLIT_KV_MIN_TOKENS_PER_CTA:
         return "gmem_reduction"
     if (
         ctas > persistent_min_waves * sm_count
@@ -2728,24 +2780,22 @@ _LAUNCH_SELECTION_FIELDS = {
 def _try_apply_auto_kv256_profile(
     cfg: FmhaDecodeConfig,
     *,
+    q_candidate: GroupedQMmaCandidate | None,
     explicit_fields: set[str],
     auto_tuner: bool,
     split_kv_mode: str,
-    seq_len_kv: int,
     num_heads_q: int,
     num_heads_kv: int,
     splits_kv: int,
     max_splits_kv: int | None,
 ) -> bool:
-    """Try to select the native Q64/KV256 profile when unpinned.
+    """Promote KV128 after the Q cost model selects an exact Q64 Keeps tile.
 
-    These gates define the automatic policy, not the complete KV256 kernel
-    capability. An explicit MMA, KV tile, or launch policy retains the caller's
-    selection; shapes outside this narrow default retain the KV128 auto path.
-    Device compatibility is enforced by the public PrimTS wrapper, alongside
-    the other decode profiles, rather than duplicated in config selection.
+    Every other automatic Q result retains the default KV128 tile. Explicit
+    MMA, KV-tile, or launch policies remain caller-controlled. Device
+    compatibility is enforced by the public PrimTS wrapper, alongside the
+    other decode profiles, rather than duplicated in config selection.
     """
-
     selection_is_unpinned = (
         auto_tuner
         and split_kv_mode == "disabled"
@@ -2755,11 +2805,11 @@ def _try_apply_auto_kv256_profile(
         and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
         and "tile_size_kv" not in explicit_fields
     )
-    if not selection_is_unpinned:
-        return False
-
-    profile_is_auto_selectable = (
-        seq_len_kv > 0
+    profile_is_eligible = (
+        selection_is_unpinned
+        and q_candidate is not None
+        and q_candidate.variant == "keeps_mma_ab"
+        and q_candidate.tile_size_q == 64
         and cfg.use_paged_kv
         and cfg.groups_tokens_heads_q
         and cfg.headdim == 128
@@ -2767,11 +2817,9 @@ def _try_apply_auto_kv256_profile(
         and cfg.q_dtype == cfg.kv_dtype == cfg.out_dtype
         and num_heads_q // num_heads_kv <= 64
     )
-    if not profile_is_auto_selectable:
+    if not profile_is_eligible:
         return False
 
-    cfg.use_keeps_mma_ab = True
-    cfg.tile_size_q = 64
     cfg.tile_size_kv = 256
     return True
 
@@ -2810,12 +2858,33 @@ def _resolve_grouped_q_launch_candidates(
     candidate set.
     """
     probe = deepcopy(cfg)
+    # TileQ is always scored on the common KV128 baseline. This includes an
+    # explicitly requested final KV width: explicit materialization remains a
+    # downstream constraint and must not feed back into the Q winner.
+    probe.tile_size_kv = 128
     _apply_grouped_q_mma_candidate(probe, candidate)
+    cost_tile_size_kv = 128
+    if (
+        candidate.variant == "keeps_mma_ab"
+        and candidate.tile_size_q == 64
+        and probe.headdim == 128
+        and probe.q_dtype == BFloat16
+        and probe.q_dtype == probe.kv_dtype == probe.out_dtype
+    ):
+        # TileQ selection uses a common KV128 cost basis and is independent of
+        # the later KV-tile decision. BF16 Q64 has no final KV128 profile, but
+        # its Q geometry and modeled cost are identical to the qualified FP16
+        # logical candidate. The KV selector materializes and validates the
+        # actual BF16 profile only after the Q winner is known.
+        probe.q_dtype = Float16
+        probe.kv_dtype = Float16
+        probe.out_dtype = Float16
     try:
         _finalize_static_decode_config(
             probe,
             explicit_fields | {"tile_size_q"},
         )
+        cost_num_insts_kv = probe.num_insts_kv
         _validate_profile_support(
             cfg=probe,
             seq_len_q=seq_len_q,
@@ -2830,8 +2899,8 @@ def _resolve_grouped_q_launch_candidates(
         seq_len_kv=seq_len_kv,
         batch_size=batch_size,
         num_heads_kv=num_heads_kv,
-        tile_size_kv=probe.tile_size_kv,
-        num_insts_kv=probe.num_insts_kv,
+        tile_size_kv=cost_tile_size_kv,
+        num_insts_kv=cost_num_insts_kv,
         num_q_tiles=candidate.q_tiles,
         service_capacity=service_capacity,
     )
@@ -2857,8 +2926,8 @@ def _resolve_grouped_q_launch_candidates(
                 candidate,
                 splits_kv=candidate_splits_kv,
                 seq_len_kv=seq_len_kv,
-                tile_size_kv=probe.tile_size_kv,
-                num_insts_kv=probe.num_insts_kv,
+                tile_size_kv=cost_tile_size_kv,
+                num_insts_kv=cost_num_insts_kv,
                 batch_size=batch_size,
                 num_heads_kv=num_heads_kv,
                 service_capacity=service_capacity,
@@ -2939,9 +3008,8 @@ def _apply_auto_grouped_q_mma_config(
     else:
         # Every legal Q grid already fills the machine, so splitting cannot
         # expose otherwise-idle SMs. Compare direct recipes with the same
-        # mainloop-aware score instead of ``waves * TileQ``: the latter rewards
-        # narrow tiles even when they reread the complete KV sequence for each
-        # additional Q tile.
+        # mainloop-aware score instead of rewarding narrow tiles that reread
+        # the complete KV sequence for each additional Q tile.
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
         if not direct:
             return None
@@ -2973,8 +3041,8 @@ def _apply_auto_grouped_q_mma_config(
         else:
             cfg.use_persistent_scheduler = True
     # Keeps static defaults otherwise canonicalize an implicit tile to 64.
-    # Record only this local derived choice so finalization preserves TileQ128;
-    # no caller-visible knob is introduced.
+    # Record only these local derived choices so finalization preserves them;
+    # the pre-Q snapshot used by the downstream KV selector remains unpinned.
     explicit_fields.add("tile_size_q")
     return selected
 
@@ -3295,6 +3363,7 @@ def _validate_profile_support(
     use_groups_tokens_heads_q = cfg.groups_tokens_heads_q
     tile_size_q = cfg.tile_size_q
     cfg.validate_boolean_fields()
+    _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
     if cfg.use_paged_kv:
@@ -3660,15 +3729,19 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. An unpinned FP16/BF16 D128 paged launch first selects
-       the native Q64/KV256 profile; unsupported dtypes and explicit policies
-       retain KV128. For an unpinned fixed multi-Q paged-causal
-       page-32 launch, enumerate full Swaps8/16/32 and Keeps64/128 tiles and
-       every useful direct/split recipe through the first capacity-crossing
-       fanout. Production-valid recipes minimize the empirical TileQ
+       KV stage count. For an unpinned fixed multi-Q paged-causal page-32
+       launch, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
+       tiles and every useful direct/split recipe through the first
+       capacity-crossing fanout.
+       Production-valid recipes minimize the empirical TileQ
        mainloop-plus-reduction proxy using their actual Q-grid CTA waves.
-       TileQ128 remains automatic over TileQ64 only for staged D256.
-    3. Shapes outside that qualified joint selector retain the general launch
+       Only a selected Q64 Keeps recipe may then promote a qualified FP16/BF16
+       D128 launch from KV128 to KV256; every other automatic Q tile retains
+       KV128. The final KV width re-derives launch policy instead of reusing a
+       fanout scored for KV128. Explicit policies remain caller-controlled.
+       TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 is
+       outside this grouped-Q cost model and therefore remains KV128.
+    3. Shapes outside that qualified Q/launch selector retain the general launch
        policy: under-filled fixed-Q long-sequence grids use split-KV GMEM
        reduction, direct grids above one resident wave use persistent
        scheduling, and the rest stay static. Packed-Q and sliding-window grids
@@ -3723,7 +3796,9 @@ def make_decode_config(
     # promotion below.
     launch_mode_was_auto = split_kv_mode == "disabled"
     _fanout_was_explicit = splits_kv > 0
-    if num_heads_kv <= 0 or num_heads_q % num_heads_kv != 0:
+    if num_heads_q <= 0 or num_heads_kv <= 0:
+        raise ValueError("fmha_decode head counts must be positive")
+    if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")
     _apply_default_q_grouping(
         cfg,
@@ -3754,44 +3829,50 @@ def make_decode_config(
             "fixed-Q max_seq_len_q must equal seq_len_q; use "
             "use_variable_seqlens_q for a runtime-varying Q length"
         )
-    selected_kv256_profile = _try_apply_auto_kv256_profile(
+    # Resolve Q first. The KV selector consumes the multi-Q cost-model result
+    # instead of forcing a Q64 profile ahead of the established Q policy.
+    auto_selection_explicit_fields = set(explicit_fields)
+    selected_grouped_q_recipe = _apply_auto_grouped_q_mma_config(
         cfg,
         explicit_fields=explicit_fields,
         auto_tuner=auto_tuner,
         split_kv_mode=split_kv_mode,
+        seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
+        batch_size=batch_size,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
     )
-    # Probe the wider native Keeps profile before deriving the fallback Swaps
-    # geometry: grouped Swaps stops at a head ratio of 32, whereas Q64/KV256
-    # naturally covers a complete ratio-64 Q tile. Explicit Keeps selections
-    # also make this helper a no-op.
-    _apply_swaps_tile_config(
-        cfg,
-        explicit_fields=explicit_fields,
-        num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv,
-    )
-    selected_grouped_q_recipe = (
-        None
-        if selected_kv256_profile
-        else _apply_auto_grouped_q_mma_config(
+    if selected_grouped_q_recipe is None:
+        _apply_swaps_tile_config(
             cfg,
             explicit_fields=explicit_fields,
-            auto_tuner=auto_tuner,
-            split_kv_mode=split_kv_mode,
-            seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
-            batch_size=batch_size,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
-            splits_kv=splits_kv,
-            max_splits_kv=max_splits_kv,
         )
+    kv_tile_was_promoted = _try_apply_auto_kv256_profile(
+        cfg,
+        q_candidate=(
+            selected_grouped_q_recipe.mma
+            if selected_grouped_q_recipe is not None
+            else None
+        ),
+        explicit_fields=auto_selection_explicit_fields,
+        auto_tuner=auto_tuner,
+        split_kv_mode=split_kv_mode,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        splits_kv=splits_kv,
+        max_splits_kv=max_splits_kv,
     )
+    if kv_tile_was_promoted:
+        # The selected Q tile remains valid, but its KV128 launch fanout, score,
+        # and possible persistent side effect do not. Re-derive launch policy
+        # below from the final KV256 work granularity.
+        cfg.use_persistent_scheduler = False
+        selected_grouped_q_recipe = None
     _finalize_static_decode_config(cfg, explicit_fields)
     if not cfg.use_variable_seqlens_q:
         validate_causal_decode_lengths(

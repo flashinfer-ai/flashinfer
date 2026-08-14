@@ -701,6 +701,7 @@ def _policy(
     tile_size_q: int,
     *,
     grouped: bool = True,
+    tile_size_kv: int | object = _UNSET,
     splits: int | object = _UNSET,
     split: bool | object = _UNSET,
     cluster: bool | object = _UNSET,
@@ -715,6 +716,7 @@ def _policy(
         "groups_tokens_heads_q": grouped,
     }
     optional = {
+        "tile_size_kv": tile_size_kv,
         "splits_kv": splits,
         "use_split_kv": split,
         "use_cluster_smem_reduction": cluster,
@@ -750,6 +752,7 @@ _FMHA_CASES = (
         _policy(
             "swaps_mma_ab",
             8,
+            tile_size_kv=128,
             split=True,
             cluster=True,
             separate=False,
@@ -809,6 +812,7 @@ _FMHA_CASES = (
         _policy(
             "swaps_mma_ab",
             8,
+            tile_size_kv=128,
             split=False,
             cluster=False,
             separate=False,
@@ -1041,6 +1045,8 @@ def _assert_auto_policy(
         assert not use_separate
     if use_cluster or use_separate:
         assert use_split_kv
+    if "tile_size_kv" in expected_b200:
+        assert policy["tile_size_kv"] == expected_b200["tile_size_kv"]
 
     if (
         torch.cuda.get_device_capability(device) == (10, 0)
@@ -1284,6 +1290,49 @@ def _exercise_auto_case(
     return policy
 
 
+def _exercise_explicit_kv256_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _DecodeCase,
+    *,
+    exercise_all_paths: bool = False,
+) -> dict[str, object]:
+    """Run a public path with the qualified logical KV256 profile pinned."""
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    original_make_decode_config = fmha_decode_config.make_decode_config
+    explicit_profile = {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": 64,
+        "tile_size_kv": 256,
+        "groups_tokens_heads_q": True,
+    }
+
+    def _make_explicit_kv256_config(*args, **kwargs):
+        source = kwargs.get("args")
+        kwargs["args"] = (
+            explicit_profile if source is None else (source, explicit_profile)
+        )
+        return original_make_decode_config(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "make_decode_config",
+        _make_explicit_kv256_config,
+    )
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_module._get_compiled_decode.cache_clear()
+    try:
+        return _exercise_auto_case(
+            case,
+            exercise_all_paths=exercise_all_paths,
+        )
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_module._get_compiled_decode.cache_clear()
+
+
 @torch.no_grad()
 def _apply_decode_correction_pattern(case, pattern: str):
     query = case.q.unsqueeze(1) if case.q.ndim == 3 else case.q
@@ -1395,8 +1444,8 @@ def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
             _validate_decode_output_aliasing(runtime, **metadata)
 
 
-def test_attention_ts_decode_query_head_extent_guard() -> None:
-    """Host validation rejects Q/head coordinates that would wrap Int32."""
+def test_attention_ts_decode_public_query_geometry_guards() -> None:
+    """Reject unsupported public Q/head geometry before device probing."""
 
     int32_max = 2**31 - 1
     _validate_decode_query_head_extent(
@@ -1430,6 +1479,42 @@ def test_attention_ts_decode_query_head_extent_guard() -> None:
             seq_len_q=2**27,
             device="cuda:0",
         )
+
+    with pytest.raises(ValueError, match=r"Hq/Hkv <= 32"):
+        get_prims_ts_batch_decode_workspace_size(
+            batch_size=1,
+            num_qo_heads=33,
+            num_kv_heads=1,
+            head_dim=128,
+            page_size=32,
+            max_seq_len=128,
+            device="cuda:0",
+        )
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    try:
+        with pytest.raises(ValueError, match=r"Hq/Hkv <= 32"):
+            decode_module._resolve_decode_launch_spec(
+                0,
+                1,
+                33,
+                1,
+                128,
+                32,
+                128,
+                1,
+                "float16",
+                "float16",
+                "float16",
+                "HND",
+                "dense",
+                False,
+                -1,
+            )
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
 
 
 def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
@@ -2075,40 +2160,111 @@ def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check()
 
 
 @pytest.mark.parametrize(
-    ("field_name", "invalid_value", "message"),
+    ("field_name", "invalid_value", "error_type", "message"),
     (
         pytest.param(
             "mma_tile_n_bmm1",
             128,
+            ValueError,
             "mma_tile_n_bmm1",
             id="mma-geometry",
         ),
-        pytest.param("kv_stages", 2, "kv_stages", id="pipeline-depth"),
+        pytest.param(
+            "kv_stages",
+            4,
+            ValueError,
+            "KV256 shared-memory pipeline",
+            id="pipeline-capacity",
+        ),
         pytest.param(
             "load_warp_idx",
             14,
-            "qualified Q64 FP16/BF16/D128",
+            ValueError,
+            "load_warp_idx",
             id="static-load-role",
         ),
         pytest.param(
-            "clc_load_warp_idx",
-            16,
-            "qualified Q64 FP16/BF16/D128",
-            id="persistent-load-role",
+            "kv_stages",
+            2.5,
+            TypeError,
+            "kv_stages must be a Python integer",
+            id="fractional-kv-stages",
+        ),
+        pytest.param(
+            "q_stages",
+            True,
+            TypeError,
+            "q_stages must be a Python integer",
+            id="boolean-q-stages",
+        ),
+        pytest.param(
+            "load_warp_idx",
+            13.0,
+            TypeError,
+            "load_warp_idx must be a Python integer",
+            id="fractional-load-role",
         ),
     ),
 )
 def test_attention_ts_decode_kv256_rejects_incompatible_profile_overrides(
     field_name: str,
-    invalid_value: int,
+    invalid_value: object,
+    error_type: type[Exception],
     message: str,
 ) -> None:
-    """Reject representative conflicts with the fixed KV256 physical ABI."""
+    """Reject unsupported KV256 geometry, capacity, types, and roles."""
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(error_type, match=message):
         _make_contiguous_kv256_config(
             config_args={field_name: invalid_value},
         )
+
+
+@pytest.mark.parametrize(
+    ("persistent", "use_attention_sinks", "expected_error"),
+    (
+        pytest.param(False, False, None, id="static"),
+        pytest.param(
+            True,
+            False,
+            "persistent KV256 requires kv_stages=3",
+            id="persistent-direct",
+        ),
+        pytest.param(True, True, None, id="persistent-sinks"),
+    ),
+)
+def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
+    persistent: bool,
+    use_attention_sinks: bool,
+    expected_error: str | None,
+) -> None:
+    """Keep KV2 where work boundaries make its fixed exchange safe."""
+
+    config_args = {
+        "kv_stages": 2,
+        "use_attention_sinks": use_attention_sinks,
+    }
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            _make_contiguous_kv256_config(
+                persistent=persistent,
+                config_args=config_args,
+            )
+        return
+
+    cfg = _make_contiguous_kv256_config(
+        persistent=persistent,
+        config_args=config_args,
+    )
+    assert cfg.kv_stages == 2
+    assert cfg.use_persistent_scheduler is persistent
+    assert cfg.use_attention_sinks is use_attention_sinks
+    assert not cfg.uses_rotating_kv256_exchange
+
+    if not persistent:
+        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        assert resources["smemKv"].pipeline_config.num_stages == 2
+        _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
@@ -2662,6 +2818,43 @@ def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
     assert modes == ("static", "static", "persistent")
 
 
+@pytest.mark.parametrize(
+    ("tile_size_kv", "threshold_tiles"),
+    (
+        pytest.param(128, 16, id="kv128"),
+        pytest.param(256, 8, id="kv256"),
+    ),
+)
+def test_attention_ts_decode_auto_split_threshold_scales_with_kv_tile(
+    monkeypatch,
+    tile_size_kv: int,
+    threshold_tiles: int,
+) -> None:
+    """Equivalent scheduled KV work reaches split at either tile width."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    class _FourSmHardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 4
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
+
+    modes = tuple(
+        fmha_decode_config._select_auto_launch_mode(
+            batch_size=1,
+            num_heads_kv=1,
+            seq_len_kv=seq_len_kv,
+            tile_size_kv=tile_size_kv,
+        )
+        for seq_len_kv in (
+            (threshold_tiles - 1) * tile_size_kv,
+            (threshold_tiles - 1) * tile_size_kv + 1,
+        )
+    )
+    assert modes == ("static", "gmem_reduction")
+
+
 @pytest.mark.parametrize("seq_len_q", (3, 5, 17))
 def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
     seq_len_q: int,
@@ -2691,6 +2884,35 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
     assert cfg.num_q_ctas == seq_len_q
 
 
+@pytest.mark.parametrize(
+    ("num_heads_q", "num_heads_kv"),
+    (
+        pytest.param(0, 1, id="zero-q-heads"),
+        pytest.param(1, 0, id="zero-kv-heads"),
+    ),
+)
+def test_attention_ts_decode_config_requires_positive_head_counts(
+    num_heads_q: int,
+    num_heads_kv: int,
+) -> None:
+    """Reject non-positive head counts before automatic profile selection."""
+
+    with pytest.raises(ValueError, match="head counts must be positive"):
+        make_decode_config(
+            headdim=128,
+            seq_len_q=1,
+            seq_len_kv=2048,
+            batch_size=1,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            qkv_dtype=BFloat16,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=16,
+            auto_tuner=True,
+        )
+
+
 def _make_auto_kv_tile_config(monkeypatch, **overrides):
     """Resolve one automatic KV-tile candidate without compiling a kernel."""
 
@@ -2700,6 +2922,11 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
         fmha_decode_config,
         "_select_auto_launch_mode",
         lambda **_kwargs: "static",
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda _cluster_size: 148,
     )
     kwargs = {
         "headdim": 128,
@@ -2720,9 +2947,17 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
 
 @pytest.mark.parametrize("dtype", (BFloat16, Float16))
 def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
-    """Both qualified 16-bit dtypes participate in ordinary auto selection."""
+    """A Q64 cost-model result promotes both qualified 16-bit dtypes."""
 
-    dtype_args = {"qkv_dtype": dtype, "o_dtype": dtype}
+    dtype_args = {
+        "seq_len_q": 64,
+        "num_heads_q": 128,
+        "num_heads_kv": 4,
+        "qkv_dtype": dtype,
+        "o_dtype": dtype,
+        "num_tokens_per_page": 32,
+        "mask_type": "causal",
+    }
     cfg = _make_auto_kv_tile_config(monkeypatch, **dtype_args)
     explicit_reference = _make_auto_kv_tile_config(
         monkeypatch,
@@ -2739,36 +2974,412 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
     assert cfg.tile_size_q == 64
     assert cfg.tile_size_kv == 256
     assert cfg.groups_tokens_heads_q is True
-    assert cfg.q_tokens_per_cta == 64
+    assert cfg.q_tokens_per_cta == 2
     register_cfg = replace(cfg, total_kv_tiles=32)
     assert register_cfg.softmax_task_num_registers == 176
     assert register_cfg.correction_task_num_registers == 104
     assert cfg == explicit_reference
 
 
-def test_attention_ts_decode_auto_config_selects_kv256_for_ratio_64(monkeypatch):
-    """Probe KV256 before deriving the narrower default Swaps tile."""
+@pytest.mark.parametrize(
+    (
+        "overrides",
+        "expected_tile_size_q",
+        "expected_tile_size_kv",
+        "expected_keeps",
+        "expected_splits",
+        "expect_q_cost_model",
+        "expected_events",
+    ),
+    (
+        pytest.param(
+            {
+                "seq_len_q": 1,
+                "num_heads_q": 32,
+                "num_heads_kv": 4,
+                "qkv_dtype": Float16,
+                "o_dtype": Float16,
+                "num_tokens_per_page": 32,
+                "mask_type": "causal",
+            },
+            8,
+            128,
+            False,
+            1,
+            False,
+            ("q", "kv", "launch"),
+            id="sq1-bypasses-q-cost-and-keeps-kv128",
+        ),
+        pytest.param(
+            {
+                "seq_len_q": 64,
+                "num_heads_q": 128,
+                "num_heads_kv": 4,
+                "num_tokens_per_page": 32,
+                "mask_type": "causal",
+            },
+            64,
+            256,
+            True,
+            1,
+            True,
+            ("q", "kv", "launch"),
+            id="q-cost-selects-q64-before-kv256",
+        ),
+        pytest.param(
+            {
+                "seq_len_q": 8,
+                "num_heads_q": 32,
+                "num_heads_kv": 1,
+                "args": {"use_variable_seqlens_q": True},
+            },
+            32,
+            128,
+            False,
+            1,
+            False,
+            ("q", "kv", "launch"),
+            id="variable-q",
+        ),
+        pytest.param(
+            {
+                "seq_len_q": 1,
+                "num_heads_q": 64,
+                "num_heads_kv": 4,
+                "qkv_dtype": Float16,
+                "o_dtype": Float16,
+                "num_tokens_per_page": 32,
+                "mask_type": "causal",
+            },
+            16,
+            128,
+            False,
+            1,
+            False,
+            ("q", "kv", "launch"),
+            id="sq1-ratio16-bypasses-q-cost-and-keeps-kv128",
+        ),
+        pytest.param(
+            {
+                "headdim": 256,
+                "seq_len_q": 2,
+                "seq_len_kv": 512,
+                "num_heads_q": 16,
+                "num_heads_kv": 1,
+                "qkv_dtype": Float8E4M3FN,
+                "o_dtype": Float16,
+                "num_tokens_per_page": 32,
+                "mask_type": "causal",
+            },
+            64,
+            128,
+            True,
+            2,
+            True,
+            ("q", "kv"),
+            id="d256-cost-uses-finalized-one-inst-profile",
+        ),
+        pytest.param(
+            {
+                "seq_len_q": 1,
+                "num_heads_q": 32,
+                "num_heads_kv": 4,
+                "args": {
+                    "use_keeps_mma_ab": True,
+                    "tile_size_q": 64,
+                    "tile_size_kv": 256,
+                    "groups_tokens_heads_q": True,
+                },
+            },
+            64,
+            256,
+            True,
+            1,
+            False,
+            ("q", "kv", "launch"),
+            id="explicit-kv256",
+        ),
+    ),
+)
+def test_attention_ts_decode_auto_kv_tile_policy(
+    monkeypatch,
+    overrides: dict[str, object],
+    expected_tile_size_q: int,
+    expected_tile_size_kv: int,
+    expected_keeps: bool,
+    expected_splits: int,
+    expect_q_cost_model: bool,
+    expected_events: tuple[str, ...],
+) -> None:
+    """Cover KV/Q composition at utilization and compatibility boundaries."""
 
-    cfg = _make_auto_kv_tile_config(
-        monkeypatch,
-        num_heads_q=64,
-        num_heads_kv=1,
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    events = []
+    launch_kv_tiles = []
+    launch_persistent_flags = []
+    q_cost_kv_tiles = []
+    grouped_q_selections = []
+    original_q_selector = fmha_decode_config._apply_auto_grouped_q_mma_config
+    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
+    original_launch_selector = fmha_decode_config._apply_auto_launch_mode
+    original_make_q_recipe = fmha_decode_config.make_grouped_q_launch_candidate
+
+    def _spy_q_selector(*args, **kwargs):
+        events.append("q")
+        selected = original_q_selector(*args, **kwargs)
+        grouped_q_selections.append(selected)
+        return selected
+
+    def _spy_kv_promoter(*args, **kwargs):
+        events.append("kv")
+        return original_kv_promoter(*args, **kwargs)
+
+    def _spy_make_q_recipe(*args, **kwargs):
+        q_cost_kv_tiles.append(kwargs["tile_size_kv"])
+        return original_make_q_recipe(*args, **kwargs)
+
+    def _spy_launch_selector(*args, **kwargs):
+        events.append("launch")
+        launch_kv_tiles.append(args[0].tile_size_kv)
+        launch_persistent_flags.append(args[0].use_persistent_scheduler)
+        return original_launch_selector(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_apply_auto_grouped_q_mma_config",
+        _spy_q_selector,
     )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_try_apply_auto_kv256_profile",
+        _spy_kv_promoter,
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "make_grouped_q_launch_candidate",
+        _spy_make_q_recipe,
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_apply_auto_launch_mode",
+        _spy_launch_selector,
+    )
+    cfg = _make_auto_kv_tile_config(monkeypatch, **overrides)
 
-    assert cfg.use_keeps_mma_ab is True
-    assert cfg.tile_size_q == 64
-    assert cfg.tile_size_kv == 256
-    assert cfg.heads_q_per_kv == 64
-    assert cfg.q_tokens_per_cta == 1
+    assert cfg.tile_size_q == expected_tile_size_q
+    assert cfg.tile_size_kv == expected_tile_size_kv
+    assert cfg.use_keeps_mma_ab is expected_keeps
+    assert cfg.splits_kv == expected_splits
+    assert len(grouped_q_selections) == 1
+    assert (grouped_q_selections[0] is not None) is expect_q_cost_model
+    assert bool(q_cost_kv_tiles) is expect_q_cost_model
+    assert set(q_cost_kv_tiles) <= {128}
+    assert tuple(events) == expected_events
+    expected_launch_kv_tiles = (
+        (expected_tile_size_kv,) if "launch" in expected_events else ()
+    )
+    assert tuple(launch_kv_tiles) == expected_launch_kv_tiles
+    assert tuple(launch_persistent_flags) == (False,) * len(expected_launch_kv_tiles)
 
 
 def test_attention_ts_decode_auto_config_selection_is_device_agnostic(monkeypatch):
     """Kernel config selection relies on the public wrapper's device guard."""
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    cfg = _make_auto_kv_tile_config(monkeypatch)
+    cfg = _make_auto_kv_tile_config(
+        monkeypatch,
+        seq_len_q=64,
+        num_heads_q=128,
+        num_heads_kv=4,
+        num_tokens_per_page=32,
+        mask_type="causal",
+    )
 
     assert cfg.tile_size_kv == 256
+
+
+def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> None:
+    """Keep the legacy public Q8 override outside KV256 selection."""
+
+    from contextlib import nullcontext
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        lambda **_kwargs: "gmem_reduction",
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "select_splits_kv",
+        lambda **_kwargs: 4,
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+    make_config_calls = []
+    kv_q_candidates = []
+    original_make_decode_config = fmha_decode_config.make_decode_config
+    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
+
+    def _record_make_decode_config(*args, **kwargs):
+        cfg = original_make_decode_config(*args, **kwargs)
+        make_config_calls.append(cfg)
+        return cfg
+
+    def _record_kv_promoter(*args, q_candidate, **kwargs):
+        kv_q_candidates.append(q_candidate)
+        return original_kv_promoter(*args, q_candidate=q_candidate, **kwargs)
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "make_decode_config",
+        _record_make_decode_config,
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_try_apply_auto_kv256_profile",
+        _record_kv_promoter,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    try:
+        public_spec = decode_module._resolve_decode_launch_spec(
+            0,
+            1,
+            16,
+            1,
+            128,
+            32,
+            2048,
+            1,
+            "float16",
+            "float16",
+            "float16",
+            "HND",
+            "causal",
+            False,
+            -1,
+        )
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+
+    assert len(make_config_calls) == 2
+    grouped_cfg, head_band_cfg = make_config_calls
+    assert grouped_cfg.tile_size_q == 16
+    assert grouped_cfg.groups_tokens_heads_q is True
+    assert grouped_cfg.tile_size_kv == 128
+    assert head_band_cfg.tile_size_q == 8
+    assert head_band_cfg.groups_tokens_heads_q is False
+    assert head_band_cfg.tile_size_kv == 128
+    assert kv_q_candidates == [None, None]
+    assert public_spec.config.tile_size_q == 8
+    assert public_spec.config.groups_tokens_heads_q is False
+    assert public_spec.config.tile_size_kv == 128
+
+
+def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
+    monkeypatch,
+) -> None:
+    """Keep grouped Q when extra head-band CTAs would reduce KV fanout."""
+
+    from contextlib import nullcontext
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    try:
+        spec = decode_module._resolve_decode_launch_spec(
+            0,
+            3,
+            32,
+            1,
+            128,
+            32,
+            8192,
+            1,
+            "float16",
+            "float16",
+            "float16",
+            "HND",
+            "causal",
+            False,
+            -1,
+        )
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+
+    cfg = spec.config
+
+    assert cfg.tile_size_q == 32
+    assert cfg.groups_tokens_heads_q is True
+    assert cfg.tile_size_kv == 128
+    assert cfg.use_split_kv is True
+    assert cfg.splits_kv == 16
+    assert cfg.max_splits_kv == 16
+    assert cfg.use_cluster_smem_reduction is True
+    assert cfg.use_separate_reduction_kernel is False
+    assert cfg.use_persistent_scheduler is False
+
+
+def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
+    monkeypatch,
+) -> None:
+    """Keep explicit KV materialization independent of the SQ1 Q policy."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        lambda **_kwargs: "static",
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+    common = dict(
+        headdim=64,
+        seq_len_q=1,
+        seq_len_kv=1024,
+        batch_size=1,
+        num_heads_q=16,
+        num_heads_kv=1,
+        qkv_dtype=Float16,
+        o_dtype=Float16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=16,
+        mask_type="dense",
+        auto_tuner=True,
+    )
+    implicit = fmha_decode_config.make_decode_config(**common)
+    explicit = fmha_decode_config.make_decode_config(
+        **common,
+        args={"tile_size_kv": 128},
+    )
+
+    assert implicit.tile_size_q == explicit.tile_size_q == 16
+    assert implicit.groups_tokens_heads_q is explicit.groups_tokens_heads_q is True
+    assert implicit.tile_size_kv == explicit.tile_size_kv == 128
 
 
 @pytest.mark.parametrize(
@@ -2788,9 +3399,71 @@ def test_attention_ts_decode_auto_config_falls_back_to_kv128(
 ):
     """An unqualified or explicitly pinned request retains generic KV128."""
 
-    cfg = _make_auto_kv_tile_config(monkeypatch, **overrides)
+    qualified_auto_shape = {
+        "seq_len_q": 64,
+        "num_heads_q": 128,
+        "num_heads_kv": 4,
+        "qkv_dtype": Float16,
+        "o_dtype": Float16,
+        "num_tokens_per_page": 32,
+        "mask_type": "causal",
+    }
+    cfg = _make_auto_kv_tile_config(
+        monkeypatch,
+        **{**qualified_auto_shape, **overrides},
+    )
 
     assert cfg.tile_size_kv == 128
+
+
+def test_attention_ts_decode_q_cost_uses_kv128_with_explicit_kv256(
+    monkeypatch,
+) -> None:
+    """Keep explicit KV materialization downstream of the TileQ cost model."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    q_cost_kv_tiles = []
+    selected_q_candidates = []
+    original_make_q_recipe = fmha_decode_config.make_grouped_q_launch_candidate
+    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
+
+    def _record_q_cost_kv_tile(*args, **kwargs):
+        q_cost_kv_tiles.append(kwargs["tile_size_kv"])
+        return original_make_q_recipe(*args, **kwargs)
+
+    def _record_q_winner(*args, q_candidate, **kwargs):
+        selected_q_candidates.append(q_candidate)
+        return original_kv_promoter(*args, q_candidate=q_candidate, **kwargs)
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "make_grouped_q_launch_candidate",
+        _record_q_cost_kv_tile,
+    )
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_try_apply_auto_kv256_profile",
+        _record_q_winner,
+    )
+
+    with pytest.raises(ValueError, match="KV256"):
+        _make_auto_kv_tile_config(
+            monkeypatch,
+            seq_len_q=8,
+            seq_len_kv=4096,
+            num_heads_q=32,
+            num_heads_kv=4,
+            qkv_dtype=Float16,
+            o_dtype=Float16,
+            num_tokens_per_page=32,
+            mask_type="causal",
+            args={"tile_size_kv": 256},
+        )
+
+    assert q_cost_kv_tiles
+    assert set(q_cost_kv_tiles) == {128}
+    assert [candidate.tile_size_q for candidate in selected_q_candidates] == [8]
 
 
 @pytest.mark.parametrize(
@@ -2816,8 +3489,8 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
             return 4
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
-    # Keep this launch-mode unit test on the generic KV128 profile. The
-    # The 16-bit D128 auto candidate uses Q64/KV256 and changes the physical
+    # Keep this launch-mode unit test on the generic KV128 profile. A selected
+    # Q64 16-bit D128 auto candidate uses KV256 and changes the physical
     # Q CTAs used by the wave boundary below.
     config_args: dict[str, object] = {"tile_size_kv": 128}
     if packed_q:
@@ -3379,33 +4052,23 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize(
-    ("qkv_dtype", "num_qo_heads", "num_kv_heads", "mask_type"),
-    (
-        pytest.param(torch.bfloat16, 32, 32, "dense", id="bf16-mha-dense"),
-        pytest.param(torch.bfloat16, 64, 8, "causal", id="bf16-gqa-causal"),
-        pytest.param(torch.float16, 32, 32, "dense", id="fp16-mha-dense"),
-    ),
-)
-def test_attention_ts_decode_q64_kv256_auto_launch(
+@pytest.mark.parametrize("qkv_dtype", (torch.bfloat16, torch.float16))
+def test_attention_ts_decode_qfirst_auto_selects_q64_kv256(
     qkv_dtype: torch.dtype,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    mask_type: str,
 ):
-    """Exercise the KV256 policy through the standard public decode path."""
+    """Exercise a cost-model Q64 result and derived KV256 public launch."""
 
     case = _make_decode_case(
         kv_lens=(1024,),
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
+        num_qo_heads=128,
+        num_kv_heads=4,
         head_dim=128,
         seq_len_q=64,
-        page_size=16,
+        page_size=32,
         qkv_dtype=qkv_dtype,
         output_dtype=qkv_dtype,
         cache_form="combined",
-        mask_type=mask_type,
+        mask_type="causal",
         device="cuda",
         seed=20260729,
     )
@@ -3459,7 +4122,6 @@ def test_attention_ts_decode_q64_kv256_split_launch(
 ) -> None:
     """Exercise KV256 split-KV across distinct reducers and fanout shapes."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     if forced_mode is not None:
@@ -3484,13 +4146,7 @@ def test_attention_ts_decode_q64_kv256_split_launch(
         seed=20260805,
     )
 
-    decode_module._resolve_decode_launch_spec.cache_clear()
-    decode_module._get_compiled_decode.cache_clear()
-    try:
-        policy = _exercise_auto_case(case)
-    finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
-        decode_module._get_compiled_decode.cache_clear()
+    policy = _exercise_explicit_kv256_case(monkeypatch, case)
 
     assert policy["tile_size_kv"] == 256
     assert policy["use_split_kv"] is True
@@ -3546,6 +4202,7 @@ def test_attention_ts_decode_q64_kv256_split_launch(
     ),
 )
 def test_attention_ts_decode_q64_kv256_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
     seq_len_q: int,
     kv_lens: tuple[int, ...],
     page_size: int,
@@ -3572,7 +4229,7 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         seed=20260804 + max(kv_lens),
     )
 
-    policy = _exercise_auto_case(case)
+    policy = _exercise_explicit_kv256_case(monkeypatch, case)
 
     assert policy["tile_size_q"] == 64
     assert policy["tile_size_kv"] == 256

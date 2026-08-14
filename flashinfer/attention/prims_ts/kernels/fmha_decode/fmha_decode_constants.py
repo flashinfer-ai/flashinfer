@@ -83,13 +83,14 @@ MIN_LOOP_ITERS_PER_SPLIT = 2
 # The maximum number of warp groups per CTA.
 MAX_WARP_GROUPS = 4
 
-# Auto launch selection uses the default decode KV tile size; explicit profile
-# validation owns non-default tile sizes.
+# Default used only when the launch helper has no resolved decode config.
+# Config-aware FMHA and block-sparse callers pass their selected KV tile.
 AUTO_LAUNCH_TILE_SIZE_KV = 128
 
 # Split-KV is worthwhile below one static SM wave only when each CTA still owns
-# enough K/V tiles to amortize GMEM reduction.
-SPLIT_KV_MIN_TILES_PER_CTA = 16
+# enough K/V work to amortize GMEM reduction. The B200-qualified
+# crossover is 2,048 tokens: 16 KV128 tiles or 8 KV256 tiles.
+SPLIT_KV_MIN_TOKENS_PER_CTA = 2_048
 
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These

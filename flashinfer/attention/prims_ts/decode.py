@@ -1097,6 +1097,7 @@ def _resolve_decode_launch_spec(
     """Resolve automatic policy and workspace geometry without compiling."""
 
     seq_len_q = _validate_seq_len_q(seq_len_q)
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
     _validate_decode_query_head_extent(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -1175,9 +1176,9 @@ def _resolve_decode_launch_spec(
         # idle. In that regime, evaluate the narrowest supported Swaps head
         # band. Keep it only when the extra head-band CTAs fit in the same
         # resident wave without reducing KV fanout or changing the launch and
-        # reduction topology. These structural conditions avoid trading KV
-        # parallelism for head parallelism and naturally retain grouped Q once
-        # the launch already fills the device.
+        # reduction topology. The grouped cost selector excludes SQ1, so both
+        # configs below remain KV128; this legacy Q8-only adjustment cannot
+        # participate in or override automatic KV256 promotion.
         if (
             seq_len_q == 1
             and not use_packed_q
