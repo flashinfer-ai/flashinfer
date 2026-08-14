@@ -39,10 +39,11 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from flashinfer.cute_dsl.utils import get_num_sm
 
 
-@flashinfer_api
+@flashinfer_api(trace=grouped_gemm_nt_masked_trace)
 def grouped_gemm_nt_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
