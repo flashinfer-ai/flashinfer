@@ -1642,6 +1642,130 @@ def test_trtllm_batch_decode_head_dim_512(
     )
 
 
+def test_trtllm_batch_decode_reduction_indexing():
+    """Regression coverage for packed-Q offsets and causal KV tile extent."""
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 or SM103 GPUs.")
+
+    q_len_per_req = 6
+    page_size = 16
+    num_qo_heads = 8
+    num_kv_heads = 1
+    head_dim = 512
+    dtype = torch.bfloat16
+
+    # The first case isolates the packed Q/O request offset. The second uses
+    # variable sequence lengths so the long request raises mMaxNumCtasKv while
+    # the short request crosses a 128-token KV-tile boundary. Zero Q/K and a
+    # tile-coded V make a missing reduction contribution deterministic.
+    cases = (
+        ("packed_qo_offset", [4096, 4096, 4096, 4096], False),
+        ("causal_kv_extent", [2052, 8192], True),
+    )
+
+    for case_name, seq_len_values, use_tile_coded_v in cases:
+        batch_size = len(seq_len_values)
+        max_seq_len = max(seq_len_values)
+        max_pages = (max_seq_len + page_size - 1) // page_size
+        seq_lens = torch.tensor(seq_len_values, dtype=torch.int32)
+        q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+        page_table = torch.arange(
+            batch_size * max_pages, dtype=torch.int32, device=GPU_DEVICE
+        ).view(batch_size, max_pages)
+
+        if use_tile_coded_v:
+            query = torch.zeros(
+                batch_size * q_len_per_req,
+                num_qo_heads,
+                head_dim,
+                dtype=dtype,
+                device=GPU_DEVICE,
+            )
+            kv_cache = torch.zeros(
+                batch_size * max_pages,
+                2,
+                num_kv_heads,
+                page_size,
+                head_dim,
+                dtype=dtype,
+                device=GPU_DEVICE,
+            )
+            tile_values = (
+                torch.arange(max_pages * page_size, device=GPU_DEVICE)
+                .div(128, rounding_mode="floor")
+                .to(dtype)
+                .view(max_pages, page_size, 1)
+            )
+            for request_idx in range(batch_size):
+                page_start = request_idx * max_pages
+                kv_cache[page_start : page_start + max_pages, 1, 0] = tile_values
+        else:
+            torch.manual_seed(1234)
+            query_one = (
+                torch.randn(
+                    q_len_per_req,
+                    num_qo_heads,
+                    head_dim,
+                    dtype=dtype,
+                    device=GPU_DEVICE,
+                )
+                / 4
+            )
+            query = query_one.repeat(batch_size, 1, 1).contiguous()
+            kv_one = (
+                torch.randn(
+                    max_pages,
+                    2,
+                    num_kv_heads,
+                    page_size,
+                    head_dim,
+                    dtype=dtype,
+                    device=GPU_DEVICE,
+                )
+                / 4
+            )
+            kv_cache = kv_one.repeat(batch_size, 1, 1, 1, 1).contiguous()
+
+        output_ref = sdpa_paged_reference(
+            query,
+            kv_cache,
+            q_lens,
+            seq_lens,
+            page_table,
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            "HND",
+            -1,
+        )
+        workspace_buffer = torch.zeros(
+            256 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+        )
+        output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            block_tables=page_table,
+            seq_lens=seq_lens.to(GPU_DEVICE),
+            max_seq_len=max_seq_len,
+            bmm1_scale=head_dim**-0.5,
+            bmm2_scale=1.0,
+            window_left=-1,
+            kv_layout="HND",
+            backend="trtllm-gen",
+            q_len_per_req=q_len_per_req,
+        )
+
+        try:
+            torch.testing.assert_close(
+                output.float(), output_ref.float(), rtol=0.0, atol=1e-3
+            )
+        except AssertionError as error:
+            raise AssertionError(f"{case_name} failed: {error}") from error
+
+
 def make_query_non_contiguous(
     q: torch.Tensor, num_qo_heads: int, head_dim: int
 ) -> torch.Tensor:

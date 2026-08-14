@@ -382,8 +382,11 @@ struct KernelParams {
       strideBatch = options.vStrideBatch;
     }
 
-    // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
-    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+    // The TRTLLM-GEN ragged prefill launcher uses SeparateQkv for packed non-paged
+    // K/V. makeShapeKv collapses non-paged/non-contiguous K/V to a singleton batch
+    // dimension, so the TMA descriptor must not inherit a synthetic numel-derived
+    // batch stride. Zero handles both negative and positive int32 wraparound.
+    if (isSeparateQkv(options.mQkvLayout)) {
       strideBatch = 0;
     }
 

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import ctypes
 import functools
 import os
@@ -28,6 +29,10 @@ import torch
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    with contextlib.suppress(AttributeError):
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -674,8 +679,10 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    assert tile_shape_mnk[0] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[0] must be divisible by 64"
+    # Sub-64-row M tiles appear only in the b12x dense GEMM path, whose SF
+    # fragment layouts handle them.
+    assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[0] must be divisible by 16"
     )
 
     # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA

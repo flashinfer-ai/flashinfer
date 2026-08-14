@@ -170,8 +170,11 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
         torch.int32,
         512,
         512,
-        [],
-        [],
+        # NVFP4 (uint8) KV paged prefill now requires the scale-factor tensors as
+        # additional inputs (maybe_k_cache_sf / maybe_v_cache_sf), matching the
+        # generator contract; pass them so generation reaches the flag assertions.
+        ["maybe_k_cache_sf", "maybe_v_cache_sf"],
+        ["uint8_t", "uint8_t"],
         ["sm_scale"],
         ["double"],
         "DefaultAttention<false, false, false, false>",

@@ -236,6 +236,26 @@ def _make_blockscaled_gemm_compile_fn(
     return compile_kernel
 
 
+_CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_alpha_for_launch(alpha_tensor, device):
+    """Prepare alpha as a 1-dim float32 device tensor with shape [1].
+
+    When *alpha_tensor* is ``None``, returns a cached ``tensor([1.0])``
+    on *device* (allocated once, reused forever).
+    """
+    if alpha_tensor is None:
+        cached = _CUTE_DSL_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _CUTE_DSL_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha_tensor.dim() == 0:
+        return alpha_tensor.unsqueeze(0)
+    return alpha_tensor.reshape(1)
+
+
 def _mm_fp4_precompile_worker(payload):
     """Compile one mm_fp4 tactic in a spawned subprocess and persist it to
     the on-disk CuTe-DSL kernel cache.
