@@ -680,7 +680,9 @@ def can_use_cub_topk(input, tie_break):
 
 def is_cub_topk_beneficial(num_rows, d, k, dtype, tie_break, dsa_graph_safe):
     """Whether the CUB backend is expected to outperform the native backends for a
-    plain top_k call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    plain top_k call. Based on benchmarks collected from `bench_topk.py` on a
+    B200. See https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
+    for the benchmark results.
     """
     if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
         return True
@@ -693,7 +695,8 @@ def is_cub_topk_beneficial(num_rows, d, k, dtype, tie_break, dsa_graph_safe):
     if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
         return d >= (32768 if dtype == torch.float32 else 65536)
 
-    # For eager execution, CUB wins for 16 bit dtypes and larger values of `d` only for certain conditions
+    # For eager execution, CUB wins for 16 bit dtypes and larger values of `d`
+    # only under certain conditions
     if dtype != torch.float32 and d >= 131072:
         if tie_break == TopKTieBreak.NONE or num_rows < 256:
             return True
@@ -715,7 +718,10 @@ def is_cub_page_table_transform_beneficial(
     num_rows, d, dtype, tie_break, dsa_graph_safe
 ):
     """Whether the CUB backend is expected to outperform the native backends for a
-    fused page-table transform call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    fused page-table transform call. Based on benchmarks collected from
+    `bench_topk.py` on a B200. See
+    https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
+    for benchmark results.
     """
     if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
         return True
@@ -752,7 +758,10 @@ def is_cub_page_table_transform_beneficial(
 
 def is_cub_ragged_transform_beneficial(num_rows, d, dtype, tie_break, dsa_graph_safe):
     """Whether the CUB backend is expected to outperform the native backends for a
-    fused ragged transform call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    fused ragged transform call. Based on benchmarks collected from
+    `bench_topk.py` on a B200. See
+    https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
+    for the benchmark results.
     """
     if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
         return True
@@ -800,11 +809,14 @@ def top_k(
     tie_break: int = TopKTieBreak.NONE,
     dsa_graph_safe: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Radix-based Top-K selection.
+    r"""Top-K selection.
 
     This function selects the top-k largest elements from each row of the input
-    tensor. It uses an efficient radix-based selection algorithm that is
-    particularly fast for large vocabularies.
+    tensor. It automatically dispatches between several backends — the native
+    radix-based kernels, the clusters kernel (SM100), and CUB's
+    ``DeviceBatchedTopK`` — based on shape, dtype, and the requested modes.
+    Set ``FLASHINFER_TOPK_ALGO`` (``"default"``, ``"clusters"``, ``"cub"``) to
+    force a specific backend.
 
     This is designed as a drop-in replacement for ``torch.topk`` with better
     performance for large tensors (vocab_size > 10000).
@@ -999,7 +1011,11 @@ def top_k_page_table_transform(
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
     This function performs top-k selection on input scores and translates the
-    selected indices through a page table in a single fused kernel. Each
+    selected indices through a page table in a single fused kernel. It
+    automatically dispatches between several backends — the native radix-based
+    kernels, the clusters kernel (SM100), and CUB's ``DeviceBatchedTopK`` — based on shape, dtype,
+    and the requested modes. Set ``FLASHINFER_TOPK_ALGO`` (``"default"``,
+    ``"clusters"``, ``"cub"``) to force a specific backend. Each
     page-table entry represents ``page_size`` consecutive score positions. For
     each selected local index ``idx`` in row ``i``::
 
@@ -1226,6 +1242,11 @@ def top_k_ragged_transform(
     This function performs top-k selection on input scores and transforms the
     selected indices by adding an offset in a single fused kernel.
     Used in sparse attention's second stage with ragged/variable-length KV cache.
+    It automatically dispatches between several backends — the native
+    radix-based kernels, the clusters kernel (SM100), and CUB's
+    ``DeviceBatchedTopK`` — based on shape, dtype, and the requested modes. Set
+    ``FLASHINFER_TOPK_ALGO`` (``"default"``, ``"clusters"``, ``"cub"``) to
+    force a specific backend.
 
     For each row i:
         output_indices[i, j] = topk_indices[j] + offsets[i]
