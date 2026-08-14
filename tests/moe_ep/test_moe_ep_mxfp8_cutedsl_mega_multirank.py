@@ -532,6 +532,151 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     )
 
 
+def _run_mega_layer_zero_token_ikr_regression(
+    rank,
+    world_size,
+    *,
+    num_iters: int = 60,
+):
+    """Interleave num_tokens=0 and real forward() calls, in_kernel_fc2_reduce=True,
+    no barrier between iterations, at an independent per-rank schedule.
+
+    Regression guard for mxfp8_mega_moe()'s num_tokens==0 shortcut, which used to
+    return WITHOUT ever calling frontend.run() (i.e. without launching the kernel
+    at all) when in_kernel_fc2_reduce was enabled:
+
+        if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
+            return symm_buffer.output_activation[:0] if y is None else None
+
+    Sm100MegaMoEMxfp8Kernel is a persistent megakernel -- its CTA grid
+    (MoEFusedFc12SchedulerParams.get_grid_shape -> (cluster_mn[0], cluster_mn[1],
+    max_active_clusters)) is sized from hardware occupancy, never from
+    num_tokens, so even a genuinely zero-token launch still runs every CTA and
+    the warp-specialized dispatch / token-back / tail-cleanup logic that keeps
+    a rank's cross-rank REDG atomic-add combine session in lockstep with its EP
+    peers. A rank that takes the old shortcut instead silently skips that
+    round's kernel launch, desynchronizing its session state from its peers'
+    -- their subsequent launches then wait on a signal that rank never posts.
+
+    This only manifests when DP/EP ranks call forward() independently (no
+    cross-rank barrier between rounds, exactly how SGLang's per-rank scheduler
+    loop drives it) AND some rank legitimately hits num_tokens==0 (SGLang's own
+    idle-batch mechanism for keeping DP ranks in lockstep) while its peers have
+    real work -- light/symmetric/all-nonzero testing never exercises it. See
+    kernel_src/cutedsl_megamoe/shim/mxfp8.py::mxfp8_mega_moe.
+
+    CAVEAT: a regression here manifests as a LIVELOCK (100% GPU utilization,
+    zero forward progress, no exception, no crash), not a clean test failure --
+    a same-process watchdog can't interrupt a rank frozen inside
+    torch.cuda.synchronize() on a raw CUDA kernel wait (this isn't an NCCL
+    collective op, so dist.init_process_group(timeout=...) doesn't cover it
+    either). Rely on the CI job's own wall-clock timeout to catch a real
+    regression; tests/moe_ep/../repro_ikr_zero_token_idle.py is the
+    externally-timeout-guarded (shell `timeout`) standalone reproducer used to
+    originally bisect and verify this fix.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        ensure_moe_ep_cuda_device,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+
+    real_tokens = 4
+    problem = _mega_problem(rank, world_size, num_tokens=real_tokens, max_tokens=64)
+    hidden = problem["hidden"]
+    num_experts = problem["num_experts"]
+    topk = problem["topk"]
+
+    mega = MoEEpMegaLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=problem["max_tokens"],
+            token_hidden_size=hidden,
+        ),
+        weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+        backend=MegaConfig(
+            megakernel=_megakernel_config(problem, in_kernel_fc2_reduce=True),
+            preprocess_weights=True,
+        ),
+    )
+    try:
+        # Matched-count collective warmup -- every rank calls forward() with
+        # real tokens once, together, before the independent-cadence loop.
+        mega.forward(
+            MoEEpTensors(
+                hidden_states=problem["hidden_states"],
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+            )
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Deterministic (not random) per-rank zero/nonzero schedule for CI
+        # reproducibility: rank 0 always real (mirrors an always-busy rank);
+        # other ranks go to num_tokens=0 on a rank-staggered 1-in-3 cadence so
+        # every rank sees a different, independently-timed idle pattern.
+        for it in range(num_iters):
+            n = real_tokens if (rank == 0 or (it + rank) % 3 != 0) else 0
+            g = torch.Generator(device="cuda").manual_seed(1000 * it + rank)
+            hidden_states = torch.randn(
+                n, hidden, dtype=torch.bfloat16, device="cuda", generator=g
+            )
+            scores = torch.randn(
+                n, num_experts, dtype=torch.float32, device="cuda", generator=g
+            )
+            topk_weights, topk_ids = torch.topk(
+                scores, topk, dim=-1, largest=True, sorted=False
+            )
+            t = MoEEpTensors(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids.to(torch.int64),
+                topk_weights=topk_weights.to(torch.float32),
+            )
+            y = mega.forward(t)
+            torch.cuda.synchronize()
+            assert y.shape == (n, hidden)
+            assert y.dtype == torch.bfloat16
+            assert torch.isfinite(y).all()
+
+        dist.barrier()
+        return rank
+    finally:
+        mega.destroy()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regression():
+    """Zero-token / in_kernel_fc2_reduce livelock regression guard (MXFP8).
+
+    See ``_run_mega_layer_zero_token_ikr_regression`` for the full bug
+    writeup. Before the fix, this reliably livelocks within tens of
+    iterations; after the fix, all ``num_iters`` complete cleanly regardless
+    of each rank's independent zero/nonzero token schedule.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer_zero_token_ikr_regression(rank, world_size)
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer survives "
+        "interleaved zero-token/real in_kernel_fc2_reduce forward calls"
+    )
+
+
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
