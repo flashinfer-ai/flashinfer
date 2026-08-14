@@ -1274,8 +1274,21 @@ def main():
         args.compare_sglang = False
 
     # Test configurations
-    batch_sizes = [1, 16, 32, 64, 256]
-    seq_lens = [256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 131072, 262144, 524288]
+    batch_sizes = [1, 16, 32, 64, 128, 256]
+    seq_lens = [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+    ]
     k_values = [256, 512, 1024, 2048, 4096]
     top_k_cases = build_top_k_cases(
         batch_sizes=batch_sizes,
