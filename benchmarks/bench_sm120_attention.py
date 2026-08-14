@@ -453,49 +453,68 @@ def bench_config(
     attention_only_tflops = tflops_per_sec(config, attention_only_ms)
     end_to_end_tflops = tflops_per_sec(config, end_to_end_ms)
 
-    from flashinfer.prefill import fmha_v2_prefill_sm120
-
-    q_bshd = q.permute(0, 2, 1, 3).contiguous()
-    k_bshd = k.permute(0, 2, 1, 3).contiguous()
-    v_bshd = v.permute(0, 2, 1, 3).contiguous()
-    q_fp8, q_scale = quantize_e4m3(q_bshd)
-    k_fp8, k_scale = quantize_e4m3(k_bshd)
-    v_fp8, v_scale = quantize_e4m3(v_bshd)
-    out_fp8 = torch.empty_like(q_bshd, dtype=torch.bfloat16)
-    scale_bmm1_d = torch.tensor(
-        [q_scale * k_scale * sm_scale], dtype=torch.float32, device=q.device
+    fp8_baseline_available = (
+        config.num_qo_heads == config.num_kv_heads and dtype == torch.bfloat16
     )
-    scale_bmm2_d = torch.tensor([v_scale], dtype=torch.float32, device=q.device)
+    fp8_attention_only_ms = None
+    fp8_attention_only_tflops = None
+    nvfp4_speedup_over_fp8 = None
+    if fp8_baseline_available:
+        from flashinfer.prefill import fmha_v2_prefill_sm120
 
-    def fp8_attention_only():
-        return fmha_v2_prefill_sm120(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out_fp8,
-            num_heads=config.num_heads,
-            head_dim=config.head_dim,
-            seq_len=config.seq_len,
-            scale_softmax=1.0,
-            scale_bmm1=q_scale * k_scale * sm_scale,
-            scale_bmm2=v_scale,
-            scale_bmm1_d=scale_bmm1_d,
-            scale_bmm2_d=scale_bmm2_d,
-            causal=config.causal,
+        q_bshd = q.permute(0, 2, 1, 3).contiguous()
+        k_bshd = k.permute(0, 2, 1, 3).contiguous()
+        v_bshd = v.permute(0, 2, 1, 3).contiguous()
+        q_fp8, q_scale = quantize_e4m3(q_bshd)
+        k_fp8, k_scale = quantize_e4m3(k_bshd)
+        v_fp8, v_scale = quantize_e4m3(v_bshd)
+        out_fp8 = torch.empty_like(q_bshd, dtype=dtype)
+        lse_fp8 = None
+        if return_lse:
+            lse_fp8 = torch.empty(
+                config.batch_size,
+                config.seq_len,
+                config.num_qo_heads,
+                2,
+                dtype=torch.float32,
+                device=q.device,
+            )
+        scale_bmm1_d = torch.tensor(
+            [q_scale * k_scale * sm_scale], dtype=torch.float32, device=q.device
         )
+        scale_bmm2_d = torch.tensor([v_scale], dtype=torch.float32, device=q.device)
 
-    fp8_attention_only()
-    torch.cuda.synchronize()
-    fp8_attention_only_ms = median_gpu_ms(
-        fp8_attention_only,
-        warmup,
-        repeat,
-        use_cuda_graph=attention_cuda_graph,
-        cold_l2_cache=not attention_cuda_graph,
-        num_iters_within_graph=1,
-    )
-    fp8_attention_only_tflops = tflops_per_sec(config, fp8_attention_only_ms)
-    nvfp4_speedup_over_fp8 = fp8_attention_only_ms / attention_only_ms
+        def fp8_attention_only():
+            return fmha_v2_prefill_sm120(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                out_fp8,
+                num_heads=config.num_qo_heads,
+                head_dim=config.head_dim,
+                seq_len=config.seq_len,
+                scale_softmax=1.0,
+                scale_bmm1=q_scale * k_scale * sm_scale,
+                scale_bmm2=v_scale,
+                scale_bmm1_d=scale_bmm1_d,
+                scale_bmm2_d=scale_bmm2_d,
+                causal=config.causal,
+                return_lse=return_lse,
+                lse=lse_fp8,
+            )
+
+        fp8_attention_only()
+        torch.cuda.synchronize()
+        fp8_attention_only_ms = median_gpu_ms(
+            fp8_attention_only,
+            warmup,
+            repeat,
+            use_cuda_graph=attention_cuda_graph,
+            cold_l2_cache=not attention_cuda_graph,
+            num_iters_within_graph=1,
+        )
+        fp8_attention_only_tflops = tflops_per_sec(config, fp8_attention_only_ms)
+        nvfp4_speedup_over_fp8 = fp8_attention_only_ms / attention_only_ms
 
     print(
         "nvfp4_attention_sm120 "
@@ -509,15 +528,25 @@ def bench_config(
         f"end_to_end={end_to_end_ms:.3f} ms "
         f"({end_to_end_tflops:.3f} attention-TFLOPs/s)"
     )
-    print(
-        "fmha_v2_prefill_sm120_fp8 "
-        f"B={config.batch_size} H={config.num_heads} S={config.seq_len} "
-        f"D={config.head_dim} causal={config.causal}: "
-        f"attention_only={fp8_attention_only_ms:.3f} ms "
-        f"({fp8_attention_only_tflops:.3f} TFLOPs/s, "
-        f"cuda_graph={attention_cuda_graph}), "
-        f"nvfp4_speedup={nvfp4_speedup_over_fp8:.3f}x"
-    )
+    if fp8_baseline_available:
+        print(
+            "fmha_v2_prefill_sm120_fp8 "
+            f"B={config.batch_size} H={config.num_qo_heads} S={config.seq_len} "
+            f"D={config.head_dim} causal={config.causal}: "
+            f"attention_only={fp8_attention_only_ms:.3f} ms "
+            f"({fp8_attention_only_tflops:.3f} TFLOPs/s, "
+            f"cuda_graph={attention_cuda_graph}), "
+            f"nvfp4_speedup={nvfp4_speedup_over_fp8:.3f}x"
+        )
+    else:
+        print(
+            "fmha_v2_prefill_sm120_fp8 "
+            f"B={config.batch_size} Hq={config.num_qo_heads} "
+            f"Hkv={config.num_kv_heads} S={config.seq_len} "
+            f"D={config.head_dim} causal={config.causal}: "
+            "attention_only=unavailable "
+            "(requires equal Q/KV head counts and BF16 input/output)"
+        )
     return {
         "batch_size": config.batch_size,
         "num_qo_heads": config.num_qo_heads,
