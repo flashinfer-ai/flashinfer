@@ -6,6 +6,7 @@ import ast
 import re
 import subprocess
 import sys
+from importlib import resources as importlib_resources
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,20 +15,49 @@ import torch
 
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
 
-_FP8_SOURCE_DIR = (
-    Path(__file__).resolve().parents[2]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_SOURCE_TREE_PACKAGE_ROOT = (
+    _PROJECT_ROOT
     / "flashinfer"
     / "moe_ep"
     / "kernel_src"
     / "sm90"
     / "push_style_megamoe"
-    / "src"
-    / "fp8_gemm"
 )
 
 
+def _package_root():
+    if _SOURCE_TREE_PACKAGE_ROOT.is_dir():
+        return _SOURCE_TREE_PACKAGE_ROOT
+    return importlib_resources.files(_PACKAGE_NAME)
+
+
 def _private_source(name: str) -> str:
-    return (_FP8_SOURCE_DIR / name).read_text(encoding="utf-8")
+    return (_package_root() / "src" / "fp8_gemm" / name).read_text(encoding="utf-8")
+
+
+def _package_source(*parts: str) -> str:
+    resource = _package_root()
+    for part in parts:
+        resource = resource / part
+    return resource.read_text(encoding="utf-8")
+
+
+def _csrc_source(relative_path: str) -> str:
+    source_tree = _PROJECT_ROOT / "csrc" / relative_path
+    if source_tree.is_file():
+        return source_tree.read_text(encoding="utf-8")
+
+    from flashinfer.jit import env as jit_env
+
+    packaged = jit_env.FLASHINFER_CSRC_DIR / relative_path
+    if packaged.is_file():
+        return packaged.read_text(encoding="utf-8")
+
+    raise FileNotFoundError(
+        f"missing packaged or source-tree csrc file: {relative_path}"
+    )
 
 
 def _assert_in_order(source: str, fragments: tuple[str, ...]) -> None:
@@ -72,9 +102,7 @@ def test_private_fp8_jit_checks_exact_caches_before_nvcc() -> None:
     binding = _private_source("fp8_moe_binding.cu")
     launcher = _private_source("fp8_moe_launcher.cuh")
     jit = _private_source("fp8_moe_jit.cuh")
-    runner = (_FP8_SOURCE_DIR.parents[1] / "shim" / "runner.py").read_text(
-        encoding="utf-8"
-    )
+    runner = _package_source("shim", "runner.py")
 
     for name in (
         "get_deepgemm_cache_dir",
@@ -91,10 +119,7 @@ def test_private_fp8_jit_checks_exact_caches_before_nvcc() -> None:
     assert "fp8_moe_gemm_jit_cache_ready" in launcher
     assert "fp8_moe_fc1_fused_jit_cache_ready" in launcher
 
-    project_root = Path(__file__).resolve().parents[2]
-    compiler = (
-        project_root / "csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh"
-    ).read_text(encoding="utf-8")
+    compiler = _csrc_source("nv_internal/tensorrt_llm/deep_gemm/compiler.cuh")
     upstream_start = compiler.index(
         'std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_")'
     )
@@ -129,12 +154,10 @@ def test_private_fp8_jit_checks_exact_caches_before_nvcc() -> None:
 
 
 def test_private_fp8_jit_tactic_probe_matches_grouped_dispatch() -> None:
-    project_root = Path(__file__).resolve().parents[2]
-    upstream = (
-        project_root
-        / "csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels"
-        / "fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh"
-    ).read_text(encoding="utf-8")
+    upstream = _csrc_source(
+        "nv_internal/tensorrt_llm/kernels/cutlass_kernels/"
+        "fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh"
+    )
     private = _private_source("fp8_moe_launcher.cuh")
     upstream_body = upstream[
         upstream.index("void grouped_gemm_dispatch(") : upstream.index(
@@ -246,8 +269,8 @@ def test_private_fc1_launch_abi_matches_generated_kernel() -> None:
 
 
 def test_production_runner_marks_protocol_offsets_trusted() -> None:
-    runner_path = _FP8_SOURCE_DIR.parents[1] / "shim" / "runner.py"
-    tree = ast.parse(runner_path.read_text(encoding="utf-8"), filename=str(runner_path))
+    runner_source = _package_source("shim", "runner.py")
+    tree = ast.parse(runner_source, filename="shim/runner.py")
     calls = [
         node
         for node in ast.walk(tree)
@@ -268,9 +291,8 @@ def test_production_runner_marks_protocol_offsets_trusted() -> None:
 
 def test_capacity_factor_bounds_private_gemm_storage() -> None:
     binding = _private_source("fp8_moe_binding.cu")
-    package_dir = _FP8_SOURCE_DIR.parents[1]
-    runner = (package_dir / "shim" / "runner.py").read_text(encoding="utf-8")
-    protocol = (package_dir / "shim" / "protocol.py").read_text(encoding="utf-8")
+    runner = _package_source("shim", "runner.py")
+    protocol = _package_source("shim", "protocol.py")
 
     assert "expected_m_ = expected_m;" in binding
     assert "max_rows_ = ceil_div(max_rows, int64_t{4}) * 4;" in binding
