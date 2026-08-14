@@ -308,8 +308,10 @@ jobs:
       - setup
       - test
     runs-on: ubuntu-latest
-    # Bounds the wait below on a run that never reports.
-    timeout-minutes: 100
+    # GitHub's own ceiling for a hosted job, stated explicitly because it is what
+    # bounds the wait below. Not a guess at how long tests take, so it does not
+    # need revisiting as tests are added.
+    timeout-minutes: 360
     steps:
       - name: Check Authorization
         if: needs.gate.outputs.authorized != 'true'
@@ -399,11 +401,14 @@ jobs:
             # until the job ends.
             echo "::notice title=Tests are already running for this commit::$RUN_URL"
 
+            # Waits on the followed run reaching a conclusion, with no assumption
+            # about how long tests take: that number grows as tests are added,
+            # and guessing it low reports a failure for healthy tests. The only
+            # bound is timeout-minutes on this job, which is GitHub's own job
+            # ceiling rather than an estimate of test duration.
             CONCLUSION=""
-            DEADLINE=$((SECONDS + 5400))
-            while [ "$SECONDS" -lt "$DEADLINE" ]; do
-              # A transient API error retries rather than ending the wait, which
-              # would report a red result for a run that is still healthy.
+            UNREADABLE=0
+            while true; do
               INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
                 --json status,conclusion,jobs \
                 --jq '.status + "|" + (.conclusion // "") + "|"
@@ -415,6 +420,20 @@ jobs:
 
               if [ "$STATUS" == "completed" ]; then
                 break
+              fi
+
+              # A transient API error retries rather than ending the wait, which
+              # would report a red result for a run that is still healthy. Giving
+              # up needs the run to stay unreadable for 5 minutes, which means it
+              # was deleted and no conclusion is ever coming.
+              if [ -z "$STATUS" ]; then
+                UNREADABLE=$((UNREADABLE + 1))
+                if [ "$UNREADABLE" -ge 10 ]; then
+                  echo "Result: run $ACTIVE is no longer readable" >> $GITHUB_STEP_SUMMARY
+                  exit 1
+                fi
+              else
+                UNREADABLE=0
               fi
 
               # Per-job counts rather than the run status, which reads "queued"

@@ -11,7 +11,7 @@
 # write on PRs from forks. Nothing from the PR is checked out or executed here,
 # and the only write is deleting a PR Test run that provably ran no tests.
 
-name: Label Cleanup
+name: PR Test Run Cleanup
 
 on:
   pull_request_target:
@@ -37,7 +37,7 @@ jobs:
           RUNS="/repos/$REPO/actions/workflows/pr-test.yml/runs"
           QUERY="head_sha=$HEAD_SHA&event=pull_request&per_page=100"
 
-          # tests    - has test jobs, so it is a real run and must be left alone
+          # tests     - has test jobs, so it is a real run and must be left alone
           # empty     - the gate skipped setup, so this run tested nothing
           # unsettled - too early to tell; a real run looks empty until its
           #             matrix expands, so this must never be read as empty
@@ -98,16 +98,21 @@ jobs:
           fi
 
           # Everything above the testing run, so several labels applied at once
-          # do not leave one another behind.
+          # do not leave one another behind. A run has to finish before it can be
+          # deleted, and cancelling every one up front keeps the waits below
+          # overlapping rather than stacking up past this job's timeout.
+          TARGETS=""
           while read -r ID; do
             if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
               continue
             fi
+            TARGETS="$TARGETS $ID"
+            gh api -X POST "/repos/$REPO/actions/runs/$ID/cancel" > /dev/null 2>&1 || true
+          done <<< "$IDS"
 
+          for ID in $TARGETS; do
             echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
 
-            # A run has to finish before it can be deleted.
-            gh api -X POST "/repos/$REPO/actions/runs/$ID/cancel" > /dev/null 2>&1 || true
             for _ in $(seq 1 36); do
               STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
               [ "$STATUS" == "completed" ] && break
@@ -121,4 +126,4 @@ jobs:
             else
               echo "::warning::Could not delete run $ID"
             fi
-          done <<< "$IDS"
+          done
