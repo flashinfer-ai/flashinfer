@@ -1192,6 +1192,41 @@ def test_k1_parallel_h4_matches_m128_bitwise(cuda_device, monkeypatch):
     torch.testing.assert_close(helper_state, baseline_state, atol=0, rtol=0)
 
 
+def test_m128_k1_parallel_c8_matches_m128_bitwise(cuda_device, monkeypatch):
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=8,
+        packed=False,
+        initial_state=True,
+        seed=9080,
+    )
+    initial_state = inputs["initial_state"].clone()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128_k1_parallel", 8, 35),
+    )
+    helper_output, helper_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m128", 0, 0),
+    )
+    baseline_output, baseline_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(helper_output, baseline_output, atol=0, rtol=0)
+    torch.testing.assert_close(helper_state, baseline_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     ("seq_len", "num_heads"),
     [(1024, 1), (2048, 1), (4096, 1), (1024, 4), (2048, 4)],
