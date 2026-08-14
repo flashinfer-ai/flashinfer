@@ -85,7 +85,8 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params = {};
 
   const int batch = static_cast<int>(q.size(0));
-  const int num_heads = static_cast<int>(q.size(1));
+  const int num_q_heads = static_cast<int>(q.size(1));
+  const int num_kv_heads = static_cast<int>(k.size(1));
   const int seq_len_q = static_cast<int>(q.size(2));
   const int seq_len_k = static_cast<int>(k.size(2));
   const int head_dim = static_cast<int>(q.size(3) * 2);
@@ -134,9 +135,9 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.softmax_lse_ptr = lse.data_ptr();
 
   params.b = batch;
-  params.h = num_heads;
-  params.h_k = num_heads;
-  params.h_h_k_ratio = 1;
+  params.h = num_q_heads;
+  params.h_k = num_kv_heads;
+  params.h_h_k_ratio = num_q_heads / num_kv_heads;
   params.seqlen_q = seq_len_q;
   params.seqlen_k = seq_len_k;
   params.unpadded_seqlen_k = seq_len_k;
@@ -144,7 +145,7 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.seqlen_k_rounded = round_multiple(seq_len_k, 128);
   params.d = head_dim;
   params.d_rounded = head_dim;
-  params.head_divmod = cutlass::FastDivmod(num_heads);
+  params.head_divmod = cutlass::FastDivmod(num_q_heads);
 
   params.scale_softmax = sm_scale;
   params.scale_softmax_log2 = sm_scale * 1.4426950408889634f;
@@ -235,33 +236,36 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
       << "NVFP4 attention SM120 kernel requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp4.size(0);
-  const int64_t num_heads = q_fp4.size(1);
+  const int64_t num_q_heads = q_fp4.size(1);
+  const int64_t num_kv_heads = k_fp4.size(1);
   const int64_t seq_len = q_fp4.size(2);
   const int64_t head_dim = q_fp4.size(3) * 2;
 
   TVM_FFI_ICHECK(head_dim == 64 || head_dim == 128) << "head_dim must be 64 or 128";
   TVM_FFI_ICHECK_EQ(seq_len % 128, 0) << "seq_len must be a multiple of 128";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0);
+  TVM_FFI_ICHECK_EQ(num_q_heads % num_kv_heads, 0)
+      << "num_q_heads must be divisible by num_kv_heads for GQA";
 
   TVM_FFI_ICHECK_EQ(k_fp4.size(0), batch);
-  TVM_FFI_ICHECK_EQ(k_fp4.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(k_fp4.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(k_fp4.size(3), q_fp4.size(3));
 
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(0), batch);
-  TVM_FFI_ICHECK_EQ(v_fp4_t.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(v_fp4_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(3), seq_len / 2);
 
   TVM_FFI_ICHECK_EQ(q_scale.size(0), batch);
-  TVM_FFI_ICHECK_EQ(q_scale.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(q_scale.size(1), num_q_heads);
   TVM_FFI_ICHECK_EQ(q_scale.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(q_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(k_scale.size(0), batch);
-  TVM_FFI_ICHECK_EQ(k_scale.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(k_scale.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(k_scale.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(k_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(0), batch);
-  TVM_FFI_ICHECK_EQ(v_scale_t.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(v_scale_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len / 16);
 
@@ -269,16 +273,16 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   // layout addresses the tensor this way and broadcasts each row across
   // the rows of the corresponding Q tile.
   TVM_FFI_ICHECK_EQ(qk_correction.size(0), batch);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_q_heads);
   TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len / 128 : 1);
   TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len);
 
   TVM_FFI_ICHECK_EQ(out.size(0), batch);
-  TVM_FFI_ICHECK_EQ(out.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(out.size(1), num_q_heads);
   TVM_FFI_ICHECK_EQ(out.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(out.size(3), head_dim);
   TVM_FFI_ICHECK_EQ(lse.size(0), batch);
-  TVM_FFI_ICHECK_EQ(lse.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(lse.size(1), num_q_heads);
   TVM_FFI_ICHECK_EQ(lse.size(2), seq_len);
 
   check_same_device(q_fp4, k_fp4, "k_fp4");
