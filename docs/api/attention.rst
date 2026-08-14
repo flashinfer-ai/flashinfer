@@ -93,6 +93,23 @@ Batch Decoding
     trtllm_batch_decode_with_kv_cache
     xqa_batch_decode_with_kv_cache
 
+DCP Speculative Decode Workspace
+--------------------------------
+
+The native DCP speculative route of
+:func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
+scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+
+.. currentmodule:: flashinfer
+
+.. autosummary::
+    :toctree: ../generated
+
+    get_dcp_spec_workspace_size_bytes
+    get_dcp_spec_counter_bytes
+
+.. currentmodule:: flashinfer.decode
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
