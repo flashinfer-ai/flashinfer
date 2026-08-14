@@ -91,25 +91,32 @@ def _is_cuda_version_at_least(version: str) -> bool:
     return is_cuda_version_at_least(version)
 
 
-def _select_target(device: torch.device) -> "str":
+def _select_target(device: torch.device) -> str:
     capability = get_compute_capability(device)
     if capability not in ((10, 0), (10, 3)):
         raise RuntimeError(
             "DCP speculative FMHA requires compute capability 10.0 "
             f"(B200/GB200) or 10.3 (B300/GB300), got {capability[0]}.{capability[1]}"
         )
+    # Keep B200 on its architecture-specific target even when the toolkit can
+    # also emit the forward-compatible family target.  SM103 requires the
+    # family target, while SM100 benefits from retaining its independent JIT
+    # and performance baseline.
+    if capability == (10, 0):
+        if _is_cuda_version_at_least("12.8"):
+            return "sm100a"
+        raise RuntimeError(
+            "DCP speculative FMHA on compute capability 10.0 requires CUDA "
+            "12.8 or newer"
+        )
     if _is_cuda_version_at_least("12.9"):
         return "sm100f"
-    if capability == (10, 0) and _is_cuda_version_at_least("12.8"):
-        return "sm100a"
     if capability == (10, 3):
         raise RuntimeError(
             "DCP speculative FMHA on compute capability 10.3 requires CUDA 12.9 "
             "or newer for the sm_100f family target"
         )
-    raise RuntimeError(
-        "DCP speculative FMHA on compute capability 10.0 requires CUDA 12.8 or newer"
-    )
+    raise AssertionError(f"unreachable DCP target capability: {capability}")
 
 
 def _validate_core_inputs(

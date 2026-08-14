@@ -1,5 +1,6 @@
 """CPU-side validation for DCP speculative FMHA JIT specialization keys."""
 
+import importlib
 import inspect
 
 import pytest
@@ -54,3 +55,19 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=9) == 1
     assert _select_num_split(logical_tiles=8, sm_count=148, local_blocks=128) == 16
     assert _select_num_split(logical_tiles=64, sm_count=148, local_blocks=128) == 2
+
+
+@pytest.mark.parametrize(
+    ("capability", "target"),
+    [
+        ((10, 0), "sm100a"),
+        ((10, 3), "sm100f"),
+    ],
+)
+def test_dcp_target_keeps_independent_architecture_baselines(
+    monkeypatch, capability, target
+) -> None:
+    dcp = importlib.import_module("flashinfer.dcp")
+    monkeypatch.setattr(dcp, "get_compute_capability", lambda _device: capability)
+    monkeypatch.setattr(dcp, "_is_cuda_version_at_least", lambda _version: True)
+    assert dcp._select_target(None) == target
