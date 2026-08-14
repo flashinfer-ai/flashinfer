@@ -370,7 +370,7 @@ def _cudnn_mm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([100, 103])
 def _tgv_gemm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1850,7 +1850,31 @@ def _cute_dsl_fp8_gemm_runner(arch: Literal["sm100", "sm107"]):
                             sm_count,
                         )
                     else:
-                        tactic = 0
+                        # Never hardcode a config index here. SM107 config 0 is a
+                        # 2-CTA 256x256 tile ("best for large problems"); on a small
+                        # problem _can_implement_config_sm107 rejects it, and running
+                        # an invalid 2-CTA config is an illegal instruction (the
+                        # mma_tiler M>=256 constraint in bmm_fp8_wrapper). This is the
+                        # same reason get_valid_tactics returns [] rather than [0].
+                        valid_indices = get_valid_configs(
+                            m,
+                            n,
+                            k,
+                            batch,
+                            ab_dtype,
+                            c_dtype,
+                            a_major,
+                            b_major,
+                            c_major,
+                        )
+                        if not valid_indices:
+                            raise ValueError(
+                                "No valid cute-dsl SM107 bmm_fp8 config for problem "
+                                f"(batch={batch}, m={m}, n={n}, k={k}, "
+                                f"ab_dtype={ab_dtype}, c_dtype={c_dtype}). "
+                                "Run autotuning or select a different backend."
+                            )
+                        tactic = valid_indices[0]
 
             # CuTe-DSL kernel handles the computation with scale fused into epilogue.
             # The kernel natively supports Float16, BFloat16, and Float32 output.
@@ -2087,13 +2111,13 @@ def tgv_gemm_sm100(
         - torch.float16
 
     Note:
-        - Requires SM100, SM103, SM107, or SM110 architecture
+        - Requires SM100, SM103, or SM110 architecture
         - Input tensors a and b must have the same dtype
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
-    if not _match_sm_version(a.device, ["100", "103", "107"]):
-        raise ValueError("TGV GEMM requires SM100, SM103, SM107 architecture")
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError("TGV GEMM requires SM100, SM103 architecture")
 
     # Verify dtype support
     if a.dtype not in [torch.bfloat16, torch.float16]:
