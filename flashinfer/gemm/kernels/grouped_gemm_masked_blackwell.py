@@ -3753,3 +3753,14 @@ def _grouped_gemm_nt_masked_sm100(
         barrier_flag_local_tensor_gpu=barrier_flag_local,
         barrier_flag_multicast_tensor_gpu=barrier_flag_multicast,
     )
+
+
+# Backwards compatibility: ``grouped_gemm_nt_masked`` used to live in this module
+# and moved to ``grouped_gemm_masked_wrapper`` when SM107 support was added, since
+# it now dispatches on compute capability rather than being Blackwell-specific.
+# Re-exported here so the previous import path keeps working; prefer importing it
+# from ``flashinfer.gemm``. The import is deferred to module scope only (the
+# wrapper does not import this module at import time), so it introduces no cycle.
+from .grouped_gemm_masked_wrapper import (  # noqa: E402
+    grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+)
