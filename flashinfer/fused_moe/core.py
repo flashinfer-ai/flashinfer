@@ -3544,6 +3544,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     )
 
 
+def _torch_view_of_ffi_tensor(tensor: Any) -> torch.Tensor:
+    """Return a zero-copy Torch view for one tensor crossing the TVM-FFI boundary."""
+    if isinstance(tensor, torch.Tensor):
+        return tensor
+    return torch.from_dlpack(tensor)
+
+
 def _routing_metadata_slots_from_flat_tensors(
     tile_ns: Sequence[int], flat_tensors: Sequence[torch.Tensor]
 ) -> tuple[TrtllmMoERoutingMetadataSlot, ...]:
@@ -3576,7 +3583,11 @@ def trtllm_moe_allocate_routing_metadata_multi_tile(
     topk_weights: Optional[torch.Tensor] = None,
 ) -> TrtllmMoERoutingMetadata:
     """Allocate graph-stable TRT-LLM routing metadata for one or more tile-Ns."""
+    # Canonicalize ordering before native allocation because body-to-slot lookup is tile based and
+    # CUDA Graph storage must remain deterministic.
     normalized_tile_ns = tuple(sorted(set(int(tile_n) for tile_n in tile_ns)))
+    if len(normalized_tile_ns) != len(tile_ns):
+        raise ValueError("tile_ns must contain unique values")
     if not normalized_tile_ns:
         raise ValueError("tile_ns must contain at least one tile size")
     flat_tensors = get_trtllm_moe_sm100_module().allocate_routing_metadata_multi_tile(
@@ -3589,6 +3600,7 @@ def trtllm_moe_allocate_routing_metadata_multi_tile(
         int(routing_input_mode),
         topk_weights,
     )
+    flat_tensors = [_torch_view_of_ffi_tensor(tensor) for tensor in flat_tensors]
     return TrtllmMoERoutingMetadata(
         routing_input_mode=RoutingInputMode(routing_input_mode),
         num_experts=int(num_experts),
@@ -3630,7 +3642,7 @@ def populate_trtllm_moe_routing_metadata_(
     topk_ids: torch.Tensor,
     topk_weights: Optional[torch.Tensor] = None,
 ) -> None:
-    """Populate preallocated routing metadata in place from precomputed routing."""
+    """Populate prepared slots in place with one fused live-input kernel."""
     get_trtllm_moe_sm100_module().populate_routing_metadata_multi_tile(
         topk_ids,
         routing_metadata.num_experts,
@@ -3644,89 +3656,329 @@ def populate_trtllm_moe_routing_metadata_(
     )
 
 
+def allocate_trtllm_moe_canonical_routing(
+    routing_logits: torch.Tensor, *, top_k: int, tile_n: int
+) -> TRTLLMCanonicalRouting:
+    """Allocate stable real-router outputs and scratch without launching routing."""
+    runtime = get_trtllm_moe_sm100_module()
+    tensors = [
+        _torch_view_of_ffi_tensor(tensor)
+        for tensor in runtime.allocate_canonical_routing(routing_logits, top_k, tile_n)
+    ]
+    if len(tensors) != 11:
+        raise RuntimeError(
+            "Native canonical routing allocation returned an invalid ABI"
+        )
+    return TRTLLMCanonicalRouting(
+        routing_replay_ids=tensors[0],
+        expert_weights=tensors[1],
+        packed_router_scratch=tensors[2],
+        scratch=tuple(tensors[3:]),
+        tile_n=tile_n,
+    )
+
+
+def canonicalize_trtllm_moe_routing_(
+    canonical: TRTLLMCanonicalRouting,
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    *,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    use_routing_scales_on_input: bool,
+    use_deep_seek_fp8: bool,
+    norm_topk_prob: bool,
+    enable_pdl: bool,
+) -> None:
+    """Run the real router into stable packed and native replay representations."""
+    # Reuse the graph-stable canonical allocation; routing content changes without changing any
+    # address captured by later fixed-body profiling or framework replay.
+    runtime = get_trtllm_moe_sm100_module()
+    # Forward the complete public routing policy so native canonicalization matches ordinary MoE.
+    runtime.canonicalize_routing(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        canonical.tensors(),
+        top_k,
+        n_group,
+        topk_group,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        use_routing_scales_on_input,
+        use_deep_seek_fp8,
+        norm_topk_prob,
+        enable_pdl,
+        canonical.tile_n,
+    )
+
+
 class TrtllmDaRuntime:
-    """Bridge the generic DA lifecycle to the TRT-LLM fused-MoE native ABI."""
+    """Prepare and capture production TRTLLM DA bodies around one MoERunner."""
 
     def __init__(self, moe_runner: "TrtllmMoERunner") -> None:
-        """Retain the ordinary runner and its prepared-body adapter."""
+        """Compose the dtype-agnostic ordinary runner with its DA body capability."""
+        runtime = get_trtllm_moe_sm100_module()
+        # Ordinary full-operation runner retained for fallback and fixed-body capture.
         self._moe_runner = moe_runner
-        self._body_runner = get_trtllm_moe_sm100_module().DABodyRunner(moe_runner)
+        # Prepared-metadata capability that delegates to the runner's exact dtype branch.
+        self._body_runner = runtime.DABodyRunner(moe_runner)
+
+    @property
+    def moe_runner(self) -> "TrtllmMoERunner":
+        """Return the composed ordinary full-operation runner."""
+        return self._moe_runner
 
     def max_multi_tile_tokens(self, num_experts: int) -> int:
-        """Return the native FromLogits multi-tile routing token capacity."""
-        return int(get_trtllm_moe_sm100_module().max_da_multi_tile_tokens(num_experts))
+        """Return the native fused-preamble token bound for one expert domain."""
+        runtime = get_trtllm_moe_sm100_module()
+        return int(runtime.max_da_multi_tile_tokens(num_experts))
+
+    def prepare_from_logits_profile(
+        self,
+        inputs: List[torch.Tensor],
+        runner_kwargs: Mapping[str, Any],
+        tile_n: int,
+    ) -> tuple[TRTLLMCanonicalRouting, List[torch.Tensor], dict[str, Any]]:
+        """Allocate canonical router outputs and expose native replay profiling inputs."""
+        # Allocate stable router outputs once; later realizations overwrite contents in place.
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        if moe_inputs.routing_logits is None:
+            raise ValueError("FromLogits profiling requires routing logits")
+        canonical = allocate_trtllm_moe_canonical_routing(
+            moe_inputs.routing_logits,
+            top_k=self._moe_runner.top_k,
+            tile_n=tile_n,
+        )
+        # Replace logits-only slots with native replay IDs and weights while preserving every other
+        # exact body argument and its storage.
+        profile_inputs = list(inputs)
+        profile_inputs[MoeRunnerInputs.idx("routing_logits")] = None
+        profile_inputs[MoeRunnerInputs.idx("topk_ids")] = canonical.routing_replay_ids
+        profile_inputs[MoeRunnerInputs.idx("expert_weights")] = canonical.expert_weights
+        profile_kwargs = dict(runner_kwargs)
+        profile_kwargs["routing_input_mode"] = RoutingInputMode.UnpackedPrecomputed
+        return canonical, profile_inputs, profile_kwargs
+
+    def make_from_logits_body_inputs(
+        self, canonical: TRTLLMCanonicalRouting, inputs: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Return conventional placeholders for prepared bodies that consume metadata."""
+        body_inputs = list(inputs)
+        body_inputs[MoeRunnerInputs.idx("routing_logits")] = None
+        body_inputs[MoeRunnerInputs.idx("topk_ids")] = canonical.packed_router_scratch
+        body_inputs[MoeRunnerInputs.idx("expert_weights")] = canonical.expert_weights
+        return body_inputs
+
+    def make_from_logits_profile_runner(
+        self, canonical: TRTLLMCanonicalRouting
+    ) -> TunableRunner:
+        """Compose the native replay preamble with dtype-specific prepared bodies."""
+        runtime = get_trtllm_moe_sm100_module()
+        return runtime.DAProfileRunner(
+            self._body_runner,
+            canonical.packed_router_scratch,
+            canonical.expert_weights,
+        )
+
+    def make_from_logits_profile_tuning_config(
+        self, profile_inputs: List[torch.Tensor], num_tokens: int
+    ) -> TuningConfig:
+        """Build the fixed-body cold-L2 profile config for canonical routed pairs."""
+        return self._moe_runner._make_tuning_config(
+            MoeRunnerInputs.from_list(profile_inputs),
+            tune_max_num_tokens=num_tokens,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+
+    def refresh_canonical_routing(
+        self,
+        canonical: TRTLLMCanonicalRouting,
+        inputs: List[torch.Tensor],
+        runner_kwargs: Mapping[str, Any],
+    ) -> None:
+        """Refresh stable conventional and native replay outputs from live routing logits."""
+        # Resolve the live logits input while retaining the preallocated canonical destinations.
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        if moe_inputs.routing_logits is None:
+            raise ValueError("Canonical routing requires live routing logits")
+        # Forward the runner's exact routing policy so canonicalization matches ordinary dispatch.
+        canonicalize_trtllm_moe_routing_(
+            canonical,
+            moe_inputs.routing_logits,
+            runner_kwargs.get("routing_bias"),
+            moe_inputs.hidden_states,
+            top_k=self._moe_runner.top_k,
+            n_group=runner_kwargs.get("n_group"),
+            topk_group=runner_kwargs.get("topk_group"),
+            local_expert_offset=runner_kwargs["local_expert_offset"],
+            local_num_experts=runner_kwargs["local_num_experts"],
+            routed_scaling_factor=runner_kwargs.get("routed_scaling_factor"),
+            routing_method_type=runner_kwargs["routing_method_type"],
+            use_routing_scales_on_input=runner_kwargs.get(
+                "use_routing_scales_on_input", False
+            ),
+            use_deep_seek_fp8=(
+                self._moe_runner.fp8_quantization_type
+                == Fp8QuantizationType.DeepSeekFp8
+            ),
+            norm_topk_prob=runner_kwargs.get("norm_topk_prob", True),
+            enable_pdl=runner_kwargs["enable_pdl"],
+        )
 
     def prepare(
         self,
         plan: DAPlan,
-        inputs: list[Any],
+        inputs: List[torch.Tensor],
         topk_ids: torch.Tensor,
         *,
         num_experts: int,
         top_k: int,
         local_expert_offset: int,
         num_local_experts: int,
-        routing_input_mode: int,
-        topk_weights: Optional[torch.Tensor],
+        routing_input_mode: RoutingInputMode,
+        topk_weights: Optional[torch.Tensor] = None,
         **runner_kwargs,
     ) -> TrtllmDaResources:
-        """Allocate one graph-stable workspace lane for a published DA SWITCH plan."""
-        metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        """Allocate routing and body resources during noncapturing framework warmup."""
+        # Canonicalize logits routing to an unpacked stable pair before allocating metadata; direct
+        # precomputed modes reuse the caller's live tensors unchanged.
+        tile_ns = tuple(sorted({body.tile_n for body in plan.bodies}))
+        canonical_routing = None
+        body_inputs = inputs
+        body_routing_mode = RoutingInputMode(routing_input_mode)
+        body_input_mode = body_routing_mode
+        if body_routing_mode == RoutingInputMode.FromLogits:
+            canonical_kwargs = dict(runner_kwargs)
+            canonical_kwargs["local_expert_offset"] = local_expert_offset
+            canonical_kwargs["local_num_experts"] = num_local_experts
+            canonical_routing, body_inputs, runner_kwargs = (
+                self.prepare_from_logits_profile(inputs, canonical_kwargs, tile_ns[0])
+            )
+            self.refresh_canonical_routing(canonical_routing, inputs, runner_kwargs)
+            body_inputs = self.make_from_logits_body_inputs(canonical_routing, inputs)
+            topk_ids = canonical_routing.routing_replay_ids
+            topk_weights = canonical_routing.expert_weights
+            body_routing_mode = RoutingInputMode.UnpackedPrecomputed
+            body_input_mode = RoutingInputMode.PackedPrecomputed
+        # Allocate and prime every unique tile in one fused metadata topology shared by bodies.
+        routing_metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
             topk_ids,
             num_experts=num_experts,
             top_k=top_k,
             local_expert_offset=local_expert_offset,
             num_local_experts=num_local_experts,
-            tile_ns=tuple(body.tile_n for body in plan.bodies),
-            routing_input_mode=RoutingInputMode(routing_input_mode),
+            tile_ns=tile_ns,
+            routing_input_mode=body_routing_mode,
             topk_weights=topk_weights,
         )
-        slots_by_tile = {slot.tile_n: slot for slot in metadata.slots}
+        populate_trtllm_moe_routing_metadata_(routing_metadata, topk_ids, topk_weights)
+        slots = {slot.tile_n: slot for slot in routing_metadata.slots}
+        body_kwargs = dict(runner_kwargs)
+        body_kwargs.update(
+            routing_input_mode=body_input_mode,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+        )
+        # Retain the field-wise maximum allocation required by any exact-ABI body. Conditional
+        # bodies are mutually exclusive, so every body may reuse this one stable pointer set.
         device_index = topk_ids.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
+        capture_stream = _get_trtllm_da_body_capture_stream(device_index)
         body_workspace = TrtllmDaBodyWorkspace(
             tensors=self._body_runner.prepare_max_body_workspace(
-                inputs,
-                plan.bodies,
-                slots_by_tile,
-                **runner_kwargs,
+                body_inputs, plan.bodies, slots, **body_kwargs
             ),
-            capture_stream=_get_trtllm_da_body_capture_stream(device_index),
+            capture_stream=capture_stream,
         )
         return TrtllmDaResources(
             generation=plan.generation,
-            routing_metadata=metadata,
+            routing_metadata=routing_metadata,
             body_workspace=body_workspace,
             selected_body=torch.full(
                 (1,), -1, dtype=torch.int32, device=topk_ids.device
             ),
+            canonical_routing=canonical_routing,
         )
 
     def capture_switch(
         self,
         plan: DAPlan,
         resources: TrtllmDaResources,
-        inputs: list[Any],
+        inputs: List[torch.Tensor],
         topk_ids: torch.Tensor,
         *,
         expected_capture_id: int,
         previous_conditional_node_handle: int,
-        topk_weights: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor] = None,
         **runner_kwargs,
-    ) -> tuple[DAGraphTopology, int] | None:
-        """Inject the native selector/SWITCH and populate every conditional body graph."""
-        module = get_trtllm_moe_sm100_module()
-        state = TrtllmDaSwitchCaptureState.from_native(
-            module.begin_da_switch_capture(
+    ) -> Optional[tuple[DAGraphTopology, int]]:
+        """Inject one serial lane invocation or return None before graph mutation."""
+        # Prove capture identity and transitive ordering before canonicalization writes any shared
+        # lane storage. A failed proof leaves this invocation pristine for ordinary fallback.
+        runtime = get_trtllm_moe_sm100_module()
+        lane_inspection = tuple(
+            int(value)
+            for value in runtime.inspect_da_workspace_lane(
                 topk_ids,
-                resources.routing_metadata.num_experts,
-                resources.routing_metadata.top_k,
-                resources.routing_metadata.local_expert_offset,
-                resources.routing_metadata.num_local_experts,
-                list(resources.routing_metadata.tile_ns),
-                resources.routing_metadata.flat_tensors(),
-                int(resources.routing_metadata.routing_input_mode),
+                expected_capture_id,
+                previous_conditional_node_handle,
+            )
+        )
+        if len(lane_inspection) != 2:
+            raise RuntimeError("Incomplete native DA workspace-lane inspection")
+        if not lane_inspection[1]:
+            return None
+
+        # Refresh canonical routing inside the outer capture when logits are the live framework
+        # input, then expose its stable unpacked pair to every child body.
+        metadata = resources.routing_metadata
+        slots = {slot.tile_n: slot for slot in metadata.slots}
+        body_inputs = inputs
+        if resources.canonical_routing is not None:
+            self.refresh_canonical_routing(
+                resources.canonical_routing, inputs, runner_kwargs
+            )
+            body_inputs = self.make_from_logits_body_inputs(
+                resources.canonical_routing, inputs
+            )
+            topk_ids = resources.canonical_routing.routing_replay_ids
+            topk_weights = resources.canonical_routing.expert_weights
+        # Body callbacks consume the metadata's canonical routing representation rather than the
+        # original wrapper representation.
+        body_kwargs = dict(runner_kwargs)
+        body_kwargs.update(
+            routing_input_mode=(
+                RoutingInputMode.PackedPrecomputed
+                if resources.canonical_routing is not None
+                else metadata.routing_input_mode
+            ),
+            num_experts=metadata.num_experts,
+            local_expert_offset=metadata.local_expert_offset,
+        )
+        # Begin the outer selector/preamble/SWITCH mutation and decode its cross-language child
+        # graph handles before capturing any dtype-specific body.
+        capture_state = TrtllmDaSwitchCaptureState.from_native(
+            runtime.begin_da_switch_capture(
+                topk_ids,
+                metadata.num_experts,
+                metadata.top_k,
+                metadata.local_expert_offset,
+                metadata.num_local_experts,
+                list(metadata.tile_ns),
+                metadata.flat_tensors(),
+                int(metadata.routing_input_mode),
                 topk_weights,
                 plan.exemplar_spectra,
                 plan.exemplar_body_indices,
@@ -3737,124 +3989,36 @@ class TrtllmDaRuntime:
                 previous_conditional_node_handle,
             )
         )
-        if len(state.body_graph_handles) != len(plan.bodies):
-            raise RuntimeError("DA SWITCH body graph count does not match the plan")
-
         device_index = topk_ids.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        capture_stream = resources.body_workspace.capture_stream
-        lock = _get_trtllm_da_body_capture_lock(device_index)
-        slots_by_tile = {slot.tile_n: slot for slot in resources.routing_metadata.slots}
-        with lock, torch.cuda.stream(capture_stream.external_stream):
-            for body, body_graph in zip(
-                plan.bodies, state.body_graph_handles, strict=True
+        # Record each exact-ABI body directly into its CUDA-owned conditional child graph. The
+        # bounded per-device stream is serialized across operation domains and capture threads.
+        with _get_trtllm_da_body_capture_lock(device_index):
+            workspace = resources.body_workspace
+            for body, body_graph_handle in zip(
+                plan.bodies, capture_state.body_graph_handles, strict=True
             ):
-                module.begin_da_body_capture(
-                    device_index, capture_stream.handle, body_graph
+                stream_handle = workspace.capture_stream.handle
+                runtime.begin_da_body_capture(
+                    device_index, stream_handle, body_graph_handle
                 )
-                try:
+                with torch.cuda.stream(workspace.capture_stream.external_stream):
                     self._body_runner.forward_from_metadata(
-                        inputs,
+                        body_inputs,
                         body,
-                        slots_by_tile[body.tile_n],
-                        resources.body_workspace.tensors,
-                        **runner_kwargs,
+                        slots[body.tile_n],
+                        workspace.tensors,
+                        **body_kwargs,
                     )
-                except Exception:
-                    torch.cuda.current_stream().synchronize()
-                    raise
-                module.end_da_body_capture(
-                    device_index, capture_stream.handle, body_graph
+                runtime.end_da_body_capture(
+                    device_index, stream_handle, body_graph_handle
                 )
-        native_topology = module.finish_da_switch_capture(topk_ids, state.to_native())
-        topology = DAGraphTopology.from_native(
-            [int(value) for value in native_topology]
-        )
-        return topology, state.conditional_node_handle
-
-    def prepare_from_logits_profile(
-        self,
-        inputs: list[Any],
-        runner_kwargs: Mapping[str, Any],
-        tile_n: int,
-    ) -> tuple[TRTLLMCanonicalRouting, list[Any], dict[str, Any]]:
-        """Canonicalize FromLogits routing into precomputed buffers for DA profiling."""
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        if moe_inputs.routing_logits is None:
-            raise RuntimeError("FromLogits DA profiling requires routing logits")
-        flat_tensors = get_trtllm_moe_sm100_module().allocate_canonical_routing(
-            moe_inputs.routing_logits,
-            self._moe_runner.top_k,
-            int(tile_n),
-        )
-        if len(flat_tensors) != 11:
-            raise RuntimeError("canonical routing allocation returned an invalid ABI")
-        canonical = TRTLLMCanonicalRouting(
-            routing_replay_ids=flat_tensors[0],
-            expert_weights=flat_tensors[1],
-            packed_router_scratch=flat_tensors[2],
-            scratch=tuple(flat_tensors[3:]),
-            tile_n=int(tile_n),
-        )
-        self.refresh_canonical_routing(canonical, inputs, runner_kwargs)
-        profile_inputs = list(inputs)
-        profile_inputs[MoeRunnerInputs.idx("topk_ids")] = canonical.routing_replay_ids
-        profile_inputs[MoeRunnerInputs.idx("expert_weights")] = canonical.expert_weights
-        profile_kwargs = dict(runner_kwargs)
-        profile_kwargs["routing_input_mode"] = RoutingInputMode.UnpackedPrecomputed
-        return canonical, profile_inputs, profile_kwargs
-
-    def refresh_canonical_routing(
-        self,
-        canonical: TRTLLMCanonicalRouting,
-        inputs: list[Any],
-        runner_kwargs: Mapping[str, Any],
-    ) -> None:
-        """Refresh canonical precomputed routing from the live logits input."""
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        if moe_inputs.routing_logits is None:
-            raise RuntimeError("FromLogits DA profiling requires routing logits")
-        get_trtllm_moe_sm100_module().canonicalize_routing(
-            moe_inputs.routing_logits,
-            runner_kwargs.get("routing_bias"),
-            moe_inputs.hidden_states,
-            canonical.tensors(),
-            self._moe_runner.top_k,
-            runner_kwargs.get("n_group"),
-            runner_kwargs.get("topk_group"),
-            runner_kwargs["local_expert_offset"],
-            runner_kwargs["local_num_experts"],
-            runner_kwargs.get("routed_scaling_factor"),
-            runner_kwargs["routing_method_type"],
-            runner_kwargs.get("use_routing_scales_on_input", False),
-            runner_kwargs.get("use_deep_seek_fp8", False),
-            runner_kwargs.get("norm_topk_prob", True),
-            runner_kwargs.get("enable_pdl", True),
-            canonical.tile_n,
-        )
-
-    def make_from_logits_profile_tuning_config(
-        self, inputs: list[Any], num_tokens: int
-    ) -> TuningConfig:
-        """Return the ordinary profile config for canonical precomputed inputs."""
-        return self._moe_runner._make_tuning_config(
-            MoeRunnerInputs.from_list(inputs),
-            tune_max_num_tokens=int(num_tokens),
-            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
-            use_cuda_graph=True,
-            use_cold_l2_cache=True,
-        )
-
-    def make_from_logits_profile_runner(
-        self, canonical: TRTLLMCanonicalRouting
-    ) -> TunableRunner:
-        """Return a runner that profiles canonical precomputed routing and DA bodies."""
-        return get_trtllm_moe_sm100_module().DAProfileRunner(
-            self._body_runner,
-            canonical.packed_router_scratch,
-            canonical.expert_weights,
-        )
+        # Join the populated SWITCH to the outer capture and decode runtime-inspected topology.
+        topology = runtime.finish_da_switch_capture(topk_ids, capture_state.to_native())
+        return DAGraphTopology.from_native(
+            topology
+        ), capture_state.conditional_node_handle
 
 
 def _validate_routing_replay_out(
@@ -3975,8 +4139,8 @@ def trtllm_bf16_moe(
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        Optional ``[num_experts]`` tensor of routing bias.  Must be
-        ``bfloat16`` if provided.
+        Optional ``[num_experts]`` tensor of routing bias.  ``float32`` or
+        ``bfloat16``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.  Must be
         ``bfloat16``.
@@ -4389,11 +4553,14 @@ def trtllm_fp8_per_tensor_scale_moe(
     Parameters
     ----------
     routing_logits : torch.Tensor
-        ``[seq_len, num_experts]`` tensor of routing logits.
+        ``[seq_len, num_experts]`` tensor of routing logits, ``float32`` or
+        ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float8_e4m3fn``, ``float16``, or ``bfloat16``.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size]`` first-layer weights.  ``M`` is
         ``2 * intermediate_size`` for gated activations and ``intermediate_size``
@@ -4686,11 +4853,15 @@ def trtllm_fp8_block_scale_moe(
     Parameters
     ----------
     routing_logits : torch.Tensor
-        ``[seq_len, num_experts]`` tensor of routing logits.
+        ``[seq_len, num_experts]`` tensor of routing logits, ``float32`` or
+        ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float16``, ``bfloat16``, or ``float8_e4m3fn`` (block scale must
+        match: see ``hidden_states_scale``).
     hidden_states_scale : torch.Tensor
         ``[hidden_size // 128, seq_len]`` tensor of hidden-states block scales.
     gemm1_weights : torch.Tensor
@@ -4927,9 +5098,12 @@ def trtllm_fp8_block_scale_routed_moe(
         Alternatively a ``(topk_ids, topk_weights)`` pair of plain ``int32``
         indices and ``bfloat16`` or ``float32`` weights.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias (may be ``None``).
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32``.  May be ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``float16``, ``bfloat16``, or ``float8_e4m3fn`` (block scale must
+        match: see ``hidden_states_scale``).
     hidden_states_scale : torch.Tensor
         ``[hidden_size // (32 if mxfp8 else 128), seq_len]`` block scales for
         the hidden states.
@@ -5146,8 +5320,9 @@ def trtllm_fp4_block_scale_moe(
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` tensor of routing bias.  Same dtype as
-        ``routing_logits``; may be ``None``.
+        ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
+        ``float32`` (independent of ``routing_logits``'s dtype).  May be
+        ``None``.
     hidden_states : torch.Tensor
         Hidden states of shape ``[seq_len, hidden_size // 2]`` (NVFP4) or
         ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).  Supports bfloat16,
@@ -5165,10 +5340,17 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, ``float32``.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, dtype ``uint8``.
@@ -5227,6 +5409,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
     output : Optional[torch.Tensor]
@@ -5242,6 +5425,19 @@ def trtllm_fp4_block_scale_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
+
+    num_fused_shared_experts : Optional[int]
+        Number of shared experts to fuse into the MoE kernel (default
+        ``None`` / ``0``).  When ``> 0``, every per-expert tensor
+        (``gemm1_weights``, ``gemm1_weights_scale``, ``gemm2_weights``,
+        ``gemm2_weights_scale``, ``output*_scale_scalar``, biases) must have
+        ``num_experts + num_fused_shared_experts`` rows in the expert
+        dimension — the shared-expert weights are appended after the routed
+        ones.  Every token is unconditionally routed to the shared experts
+        with weight ``1.0``. With ``do_finalize=False``, the returned
+        ``expert_weights`` and ``expanded_idx_to_permuted_idx`` cover
+        ``top_k + num_fused_shared_experts`` slots per token.
+
 
     Returns
     -------
@@ -5571,7 +5767,8 @@ def trtllm_mxint4_block_scale_moe(
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` routing logits, ``float32`` or ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` routing bias, ``bfloat16``.  May be ``None``.
+        ``[num_experts]`` routing bias, ``bfloat16`` or ``float32``.  May be
+        ``None``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` input hidden states, ``bfloat16``.
     gemm1_weights : torch.Tensor
