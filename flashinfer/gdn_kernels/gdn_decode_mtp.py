@@ -226,7 +226,8 @@ def gdn_verify_kernel_mtp(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    # Runtime-uniform so cache on/off can share one compiled kernel.
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[
         bool
     ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
@@ -680,7 +681,7 @@ def gdn_verify_kernel_mtp(
                             r_h[7, i] += r_k[i] * vn7
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             it0 = cute.local_tile(
                                 intermediate_states,
@@ -1238,7 +1239,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -1409,7 +1410,7 @@ def gdn_verify_kernel_mtp(
                             r_h[1, i] += r_k[i] * v_new_b
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -1538,7 +1539,8 @@ def run_gdn_verify_kernel_mtp(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    # Runtime-uniform so cache on/off can share one compiled kernel.
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
@@ -1649,7 +1651,7 @@ def gdn_verify_kernel_mtp_inline(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[
         bool
     ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
@@ -1964,7 +1966,7 @@ def gdn_verify_kernel_mtp_inline(
                                 r_h[3, i] += r_k[i] * v_new_d
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -2298,7 +2300,7 @@ def gdn_verify_kernel_mtp_inline(
                                 sum_hq_b += r_h[1, i] * r_q_all[i_t, i]
 
                         # Cache intermediate state
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -2424,7 +2426,7 @@ def run_gdn_verify_kernel_mtp_inline(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
@@ -2505,7 +2507,6 @@ def _get_compiled_mtp_kernel(
     V: int,
     cache_steps: int,
     disable_state_update: bool,
-    cache_intermediate_states: bool,
     use_pool_indexing: bool,
     pool_strides_key,
     scale: float,
@@ -2531,7 +2532,6 @@ def _get_compiled_mtp_kernel_inline(
     V: int,
     cache_steps: int,
     disable_state_update: bool,
-    cache_intermediate_states: bool,
     use_pool_indexing: bool,
     pool_strides_key,
     scale: float,
@@ -2647,7 +2647,6 @@ def run_mtp_decode(
             V,
             cache_steps,
             disable_state_update,
-            cache_intermediate_states,
             use_pool_indexing,
             pool_strides_key,
             scale,
@@ -2670,7 +2669,6 @@ def run_mtp_decode(
             V,
             cache_steps,
             disable_state_update,
-            cache_intermediate_states,
             use_pool_indexing,
             pool_strides_key,
             scale,
@@ -2684,6 +2682,18 @@ def run_mtp_decode(
             per_token_pool_scatter,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
+
+    if not cache_intermediate_states:
+        # TVM-FFI validates static inner dimensions even when the runtime flag
+        # disables all accesses, so use a small [1, V, K] tensor instead of the
+        # public wrapper's [1, 1, 1] placeholder.
+        dummy_intermediate_states = cache.setdefault("dummy_intermediate_states", {})
+        dummy_key = (q.device, h0_source.dtype)
+        if dummy_key not in dummy_intermediate_states:
+            dummy_intermediate_states[dummy_key] = torch.empty(
+                1, V, K, dtype=h0_source.dtype, device=q.device
+            )
+        intermediate_states = dummy_intermediate_states[dummy_key]
 
     cu_seqlens_map = cache.setdefault("cu_seqlens", {})
     cu_key = (B, q.device)
@@ -2735,13 +2745,11 @@ def run_mtp_decode(
                 h0_source, assumed_align=16
             ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
-        if cache_intermediate_states:
-            # Caching-off dummy ([1,1,1]) is never read; skip marking it.
-            intermediate_states_tensor = (
-                intermediate_states_tensor.mark_compact_shape_dynamic(
-                    mode=0, stride_order=(0, 1, 2), divisibility=1
-                )
+        intermediate_states_tensor = (
+            intermediate_states_tensor.mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1, 2), divisibility=1
             )
+        )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
         a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
@@ -2795,7 +2803,7 @@ def run_mtp_decode(
                 use_qk_l2norm=use_qk_l2norm,
                 is_varlen=False,
                 disable_state_update=disable_state_update,
-                cache_intermediate_states=cache_intermediate_states,
+                cache_intermediate_states=cutlass.Boolean(cache_intermediate_states),
                 use_pool_indexing=use_pool_indexing,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
@@ -2835,7 +2843,7 @@ def run_mtp_decode(
                 use_qk_l2norm=use_qk_l2norm,
                 is_varlen=False,
                 disable_state_update=disable_state_update,
-                cache_intermediate_states=cache_intermediate_states,
+                cache_intermediate_states=cutlass.Boolean(cache_intermediate_states),
                 use_pool_indexing=use_pool_indexing,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
@@ -2864,6 +2872,7 @@ def run_mtp_decode(
         h0_out_indices,
         cu_seqlens,
         ssm_state_indices_arg,
+        cache_intermediate_states,
         stream,
     )
 

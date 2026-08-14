@@ -13,7 +13,7 @@ csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv 
 csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
 
 # ── GEMM ──
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
