@@ -5,6 +5,7 @@ ARG PYTORCH_INDEX=cu129
 ARG CUDNN_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV FLASHINFER_PYTHON_ENV=flashinfer
 
 RUN apt-get update && apt-get install -y \
     curl \
@@ -12,17 +13,19 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+COPY .python-version /install/.python-version
 COPY docker/install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh /opt/conda py312
+RUN bash /install/install_python.sh /opt/conda "$FLASHINFER_PYTHON_ENV" /install/.python-version
 
 WORKDIR /workspace
 
-RUN echo "source activate py312" >> /etc/bash.bashrc
-ENV PATH="/opt/conda/envs/py312/bin:/opt/conda/bin:$PATH"
+RUN echo "source activate ${FLASHINFER_PYTHON_ENV}" >> /etc/bash.bashrc
+ENV PATH="/opt/conda/bin:$PATH"
+ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 
 # Cover both CUDA-major layouts used by NVIDIA's pip packages. The path that
 # does not exist for a particular CUDA major is harmless.
-ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cu13/lib:/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
+ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib:/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
 ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
@@ -31,7 +34,7 @@ COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
 
-RUN conda install -n py312 -y mpi4py mpich
+RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
 FROM base AS dev
 

@@ -69,7 +69,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -104,7 +104,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -176,7 +176,7 @@ jobs:
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="${{ matrix.cuda.label }}"
 
-          mkdir -p ${{ github.workspace }}/ci-cache
+          mkdir -p ${{ github.workspace }}/ci-cache ${{ github.workspace }}/sccache-stats
 
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
@@ -195,10 +195,46 @@ jobs:
             -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
             -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
             -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
+            -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
         timeout-minutes: 360
+
+      - name: Display sccache stats
+        if: always()
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always()
+        env:
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${{ matrix.cuda.version }}"
+            printf 'matrix_cuda_label=%s\n' "${{ matrix.cuda.label }}"
+            printf 'matrix_arch=%s\n' "${{ matrix.arch }}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-${{ matrix.cuda.label }}-${{ matrix.arch }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Display wheel size
         run: du -h flashinfer-jit-cache/dist/*
@@ -427,7 +463,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Download all JIT cache reports
         uses: actions/download-artifact@v4
@@ -476,7 +512,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
         run: |

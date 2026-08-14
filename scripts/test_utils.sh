@@ -299,7 +299,7 @@ install_and_verify() {
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
         # version skew between libs-base and libs-cu13.
-        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
+        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
             _dependency_args+=("nvidia-cutlass-dsl[cu13]==4.7.0")
         fi
         pip install --no-deps "${_dependency_args[@]}"
