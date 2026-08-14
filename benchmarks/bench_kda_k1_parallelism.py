@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark SM100-family CAKE K1 parallelism against the M64/M128 oracle.
+"""Benchmark SM100-family CAKE K1 parallelism against the valid CAKE oracle.
 
 Every implementation is invoked through ``flashinfer.kda.recurrent_kda``.
 Before timing, the script requires M128 owner/helper routes to be
 bitwise-identical to CAKE-M128 and checks M64 dual-owner routes against
 CAKE-M128 with the recurrent-KDA reference tolerance. Physical routes are then
-measured with cold L2. Speedup is always reported against
-``min(CAKE-M64, CAKE-M128)`` for the same shape. Optional forced C4/C8 and
-mailbox-depth configurations preserve the evidence used to tune dispatch.
+measured with cold L2. CAKE-M64 participates in the baseline only for its
+original fixed ``B=1, H=64`` contract; all other shapes use CAKE-M128.
+Optional forced C4/C8 and mailbox-depth configurations preserve the evidence
+used to tune dispatch.
 """
 
 import argparse
@@ -215,9 +216,11 @@ def _run_case(
             for variant, cluster_size, mailbox_depth in forced_routes
         }
     )
+    baseline_routes = {"m128": ("m128", 0, 0)}
+    if not packed and batch_size == 1 and num_heads == 64:
+        baseline_routes["m64"] = ("m64", 0, 0)
     routes = {
-        "m64": ("m64", 0, 0),
-        "m128": ("m128", 0, 0),
+        **baseline_routes,
         **physical_routes,
         "k1_parallel": None,
     }
@@ -312,7 +315,7 @@ def _run_case(
 
     timings = {name: float(np.median(values)) for name, values in samples.items()}
 
-    oracle_ms = min(timings["m64"], timings["m128"])
+    oracle_ms = min(timings[name] for name in baseline_routes)
     forced_results = {
         name: {
             "cluster_size": route[1],
@@ -331,7 +334,7 @@ def _run_case(
         "layout": "packed" if packed else "fixed",
         "num_heads": num_heads,
         "task_count": num_sequences * num_heads,
-        "m64_ms": timings["m64"],
+        "m64_ms": timings.get("m64"),
         "m128_ms": timings["m128"],
         "oracle_ms": oracle_ms,
         "k1_parallel_ms": timings["k1_parallel"],
@@ -455,9 +458,14 @@ def main() -> None:
                 if varlen_profile is None
                 else "L=" + ",".join(str(length) for length in varlen_profile)
             )
+            m64_label = (
+                f"M64={result['m64_ms']:.6f} ms "
+                if result["m64_ms"] is not None
+                else ""
+            )
             print(
                 f"{shape_label} H={num_heads:2d} "
-                f"M64={result['m64_ms']:.6f} ms "
+                f"{m64_label}"
                 f"M128={result['m128_ms']:.6f} ms "
                 f"K1={result['k1_parallel_ms']:.6f} ms "
                 f"speedup={result['speedup_vs_oracle']:.3f}x",

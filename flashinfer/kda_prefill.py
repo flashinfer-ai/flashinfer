@@ -302,8 +302,7 @@ def _select_flash_kda_prefill_variant(
                 return "m128_k1_parallel", 4, mailbox_depth
     if not fixed_layout:
         return "m128", 0, 0
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    if _flash_kda_head_count_supports_tma(num_heads) and 2 * task_count <= sm_count:
+    if num_sequences == 1 and num_heads == 64:
         return "m64", 0, 0
     return "m128", 0, 0
 

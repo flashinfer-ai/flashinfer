@@ -282,7 +282,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
-        (False, 4, "m64"),
+        (False, 4, "m128"),
         (False, 64, "m64"),
         (True, 64, "m128"),
         (True, 2, "m128"),
@@ -367,20 +367,20 @@ def test_frozen_route_and_ffi_abi(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
-        (1, 1, 512, ("m64", 0, 0)),
-        (1, 1, 1024, ("m64", 0, 0)),
+        (1, 1, 512, ("m128", 0, 0)),
+        (1, 1, 1024, ("m128", 0, 0)),
         (1, 1, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 1, 4096, ("m64_k1_parallel", 4, 10)),
         (2, 1, 2048, ("m128_k1_parallel", 4, 15)),
-        (1, 4, 1024, ("m64", 0, 0)),
+        (1, 4, 1024, ("m128", 0, 0)),
         (1, 4, 2048, ("m128_k1_parallel", 4, 15)),
-        (1, 8, 1024, ("m64", 0, 0)),
+        (1, 8, 1024, ("m128", 0, 0)),
         (1, 8, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 32, 4096, ("m128_k1_parallel", 4, 30)),
-        (1, 48, 4096, ("m64", 0, 0)),
+        (1, 48, 4096, ("m128", 0, 0)),
         (1, 64, 8192, ("m64", 0, 0)),
         (1, 64, 4096, ("m64", 0, 0)),
-        (1, 72, 8192, ("m64", 0, 0)),
+        (1, 72, 8192, ("m128", 0, 0)),
         (1, 80, 8192, ("m128", 0, 0)),
         (2, 16, 2048, ("m128_k1_parallel", 4, 30)),
     ],
@@ -412,15 +412,15 @@ def test_k1_parallel_b200_oracle(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
         (1, 1, 4096, ("m128", 0, 0)),
-        (1, 4, 1024, ("m64", 0, 0)),
+        (1, 4, 1024, ("m128", 0, 0)),
         (1, 4, 2048, ("m128_k1_parallel", 4, 30)),
-        (1, 8, 1024, ("m64", 0, 0)),
+        (1, 8, 1024, ("m128", 0, 0)),
         (1, 8, 2048, ("m128_k1_parallel", 4, 30)),
         (1, 16, 4096, ("m128_k1_parallel", 4, 45)),
         (1, 32, 8192, ("m128_k1_parallel", 4, 45)),
         (2, 8, 4096, ("m128_k1_parallel", 4, 45)),
         (4, 8, 8192, ("m128_k1_parallel", 4, 45)),
-        (1, 48, 4096, ("m64", 0, 0)),
+        (1, 48, 4096, ("m128", 0, 0)),
         (1, 80, 8192, ("m128", 0, 0)),
     ],
 )
@@ -1061,16 +1061,13 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
     )
 
 
-@pytest.mark.parametrize(("seq_len", "num_heads"), [(1024, 1), (1024, 4), (2, 64)])
-def test_frozen_prefill_m64_matches_reference(
-    flash_kda_device, monkeypatch, seq_len, num_heads
-):
+def test_frozen_prefill_m64_matches_reference(flash_kda_device, monkeypatch):
     inputs = _make_inputs(
-        seq_lens=[seq_len],
-        num_heads=num_heads,
+        seq_lens=[2],
+        num_heads=64,
         packed=False,
         initial_state=True,
-        seed=2027 + num_heads,
+        seed=2027,
     )
     reference_inputs = {
         **inputs,
@@ -1105,6 +1102,31 @@ def test_frozen_prefill_m64_matches_reference(
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.parametrize("num_heads", [1, 4, 8])
+def test_frozen_prefill_m64_rejects_unsupported_heads(
+    flash_kda_device, monkeypatch, num_heads
+):
+    inputs = _make_inputs(
+        seq_lens=[2],
+        num_heads=num_heads,
+        packed=False,
+        initial_state=True,
+        seed=2100 + num_heads,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m64", 0, 0),
+    )
+
+    with pytest.raises(RuntimeError, match="specialized for fixed N=1, H=64"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+        )
 
 
 @pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 4), (2048, 8), (2048, 16)])

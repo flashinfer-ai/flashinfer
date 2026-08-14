@@ -22,8 +22,8 @@ M128 kernel outside measured profitable regions.
 | either | other | other | exact baseline fallback | N/A |
 
 The single-head M64 route takes precedence over the general M128 helper row.
-Outside a profitable helper region, baseline M64 is selected while
-`2 * batch * heads <= SM count`; otherwise M128 is the fixed-layout fallback.
+Outside a profitable helper region, baseline M64 keeps its original fixed
+`B=1, H=64` contract; all other fixed layouts fall back to M128.
 Outside the enabled B200 helper region, packed varlen input falls back to M128.
 For packed B200 input, the minimum length is the host-known integer average
 `total_tokens / num_sequences`; dispatch never copies `cu_seqlens` to the CPU.
