@@ -867,11 +867,21 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
         )
+    # `in_kernel_fc2_reduce` is a caller-owned correctness choice; see the
+    # NVFP4 factory. The MXFP8 kernel rejects ikr together with dispatch-warp
+    # token-back, so a tuned `token_back_mode` that isn't "epi_warps" must be
+    # sanitized *before* with_knobs() applies it -- with_knobs() does a single
+    # dataclasses.replace() on a frozen, __post_init__-validated config, so an
+    # override that conflicts with the (unrelated, untouched) in_kernel_fc2_reduce
+    # field raises immediately inside with_knobs(), before any post-hoc fixup
+    # here could run.
+    if in_kernel_fc2_reduce and knobs and knobs.get("token_back_mode") not in (
+        None,
+        "epi_warps",
+    ):
+        knobs = {**knobs, "token_back_mode": "epi_warps"}
     cfg = with_knobs(cfg, knobs)
     if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-        # Caller-owned correctness choice; see the NVFP4 factory. The MXFP8
-        # kernel rejects ikr together with dispatch-warp token-back, so the
-        # restored ikr also forces epi-warps token-back.
         cfg = dataclasses.replace(
             cfg,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
