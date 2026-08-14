@@ -29,15 +29,22 @@
   "name": "cake_fmha_dcp_spec_bf16_fp8",
   "route": {
     "binding": "cake_fmha_dcp_spec_bf16_fp8_binding.cu",
-    "body": "cake_fmha_dcp_spec_bf16_fp8.cu",
+    "bodies": {
+      "split1_retain0": "cake_fmha_dcp_spec_bf16_fp8_split1_retain0.cu",
+      "split1_retain1": "cake_fmha_dcp_spec_bf16_fp8_split1_retain1.cu",
+      "split2_retain0": "cake_fmha_dcp_spec_bf16_fp8_split2_retain0.cu",
+      "split2_retain1": "cake_fmha_dcp_spec_bf16_fp8_split2_retain1.cu",
+      "split3_retain0": "cake_fmha_dcp_spec_bf16_fp8_split3_retain0.cu",
+      "split3_retain1": "cake_fmha_dcp_spec_bf16_fp8_split3_retain1.cu",
+      "split4_retain0": "cake_fmha_dcp_spec_bf16_fp8_split4_retain0.cu",
+      "split4_retain1": "cake_fmha_dcp_spec_bf16_fp8_split4_retain1.cu"
+    },
     "macros": [
       "BATCH_SIZE",
       "NUM_Q_HEADS",
       "NUM_KV_HEADS",
       "Q_LEN",
-      "CP_WORLD",
-      "NUM_SPLIT",
-      "RETAIN_KV_L2"
+      "CP_WORLD"
     ],
     "mma": "direct_e4m3_qk_pv"
   },

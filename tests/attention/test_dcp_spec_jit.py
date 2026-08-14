@@ -58,13 +58,15 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
 
         assert Path(v1.sources[0]).name == "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
         assert Path(v4.sources[0]).name == "cake_fmha_dcp_spec_bf16_v4_split16.cu"
-        assert Path(fp8.sources[0]).name == "cake_fmha_dcp_spec_bf16_fp8.cu"
+        assert Path(fp8.sources[0]).name == (
+            "cake_fmha_dcp_spec_bf16_fp8_split3_retain1.cu"
+        )
         assert Path(fp8.sources[1]).name == "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
         assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
         assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
         assert "-DQ_LEN=3" in fp8.extra_cuda_cflags
-        assert "-DNUM_SPLIT=3" in fp8.extra_cuda_cflags
-        assert "-DRETAIN_KV_L2=1" in fp8.extra_cuda_cflags
+        assert "-DNUM_SPLIT=3" not in fp8.extra_cuda_cflags
+        assert "-DRETAIN_KV_L2=1" not in fp8.extra_cuda_cflags
     finally:
         jit_dcp.gen_dcp_spec_module.cache_clear()
         jit_dcp.gen_dcp_spec_fp8_module.cache_clear()

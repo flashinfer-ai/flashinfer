@@ -119,12 +119,8 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #ifndef CP_WORLD
 #define CP_WORLD 1
 #endif
-#ifndef NUM_SPLIT
 #define NUM_SPLIT 1
-#endif
-#ifndef RETAIN_KV_L2
-#define RETAIN_KV_L2 0
-#endif
+#define RETAIN_KV_L2 1
 
 #include <math_constants.h>
 
@@ -1683,7 +1679,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(LoomTensorMap const* Qt, LoomTensorMap const*
                             int toff = pg_i * PAGE_SIZE * HEAD_DIM;
                             {
                                 {
-                                    tma_4d_gmem2smem(ldst + toff, K, 0, 0, kv_head_idx_3, pg_k[pg_i], kv_full_addr + (kv_stage) * 8);
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                        :: "r"(ldst + toff), "l"(K), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_k[pg_i]),
+                                           "r"(kv_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                         }
@@ -1713,7 +1713,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(LoomTensorMap const* Qt, LoomTensorMap const*
                             int vtoff = pg_i_1 * PAGE_SIZE * HEAD_DIM;
                             {
                                 {
-                                    tma_4d_gmem2smem(vdst + vtoff, V, 0, 0, kv_head_idx_3, pg_v[pg_i_1], kv_full_addr + (stage) * 8);
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                        :: "r"(vdst + vtoff), "l"(V), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_v[pg_i_1]),
+                                           "r"(kv_full_addr + (stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                         }
@@ -1740,7 +1744,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(LoomTensorMap const* Qt, LoomTensorMap const*
                                 int ntoff = pg_i_2 * PAGE_SIZE * HEAD_DIM;
                                 {
                                     {
-                                        tma_4d_gmem2smem(kdst + ntoff, K, 0, 0, kv_head_idx_3, pg_nk[pg_i_2], kv_full_addr + (k_stage) * 8);
+                                        asm volatile(
+                                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                            :: "r"(kdst + ntoff), "l"(K), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_nk[pg_i_2]),
+                                               "r"(kv_full_addr + (k_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                     }
                                 }
                             }
@@ -1765,12 +1773,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(LoomTensorMap const* Qt, LoomTensorMap const*
                 for (int q_xform_row = 0; q_xform_row < TILE_Q; q_xform_row++) {
                     float q_value = smem_q_raw[q_xform_row * HEAD_DIM + q_xform_tid];
                     {
-                        uint16_t _fp8_pair_684016064;
+                        uint16_t _fp8_pair_88184512;
                         asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                            : "=h"(_fp8_pair_684016064) : "f"(0.0f), "f"(q_value));
-                        uint32_t _byte_684016064 = (uint32_t)(_fp8_pair_684016064 & 0xFF);
-                        uint32_t _addr_684016064 = static_cast<uint32_t>((smem_qt_addr + (unsigned int)(q_xform_row * 128 + q_xform_tid ^ (q_xform_row * 128 + q_xform_tid >> 7 & 7) << 4)));
-                        asm volatile("st.shared.u8 [%0], %1;" :: "r"(_addr_684016064), "r"(_byte_684016064) : "memory");
+                            : "=h"(_fp8_pair_88184512) : "f"(0.0f), "f"(q_value));
+                        uint32_t _byte_88184512 = (uint32_t)(_fp8_pair_88184512 & 0xFF);
+                        uint32_t _addr_88184512 = static_cast<uint32_t>((smem_qt_addr + (unsigned int)(q_xform_row * 128 + q_xform_tid ^ (q_xform_row * 128 + q_xform_tid >> 7 & 7) << 4)));
+                        asm volatile("st.shared.u8 [%0], %1;" :: "r"(_addr_88184512), "r"(_byte_88184512) : "memory");
                     }
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

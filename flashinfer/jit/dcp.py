@@ -259,7 +259,10 @@ def gen_dcp_spec_fp8_module(
         retain_kv_l2,
     )
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8.cu"
+    body = csrc_dir / (
+        f"cake_fmha_dcp_spec_bf16_fp8_split{num_split}"
+        f"_retain{retain_kv_l2}.cu"
+    )
     binding = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
     for source in (body, binding):
         if not source.exists():
@@ -275,8 +278,6 @@ def gen_dcp_spec_fp8_module(
             f"-DNUM_Q_HEADS={num_q_heads}",
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCP_WORLD={cp_world}",
-            f"-DNUM_SPLIT={num_split}",
-            f"-DRETAIN_KV_L2={retain_kv_l2}",
         ],
         extra_include_paths=[csrc_dir],
         extra_ldflags=["-lcuda"],
