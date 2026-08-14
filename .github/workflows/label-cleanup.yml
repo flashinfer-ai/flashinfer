@@ -1,0 +1,124 @@
+# Discards the PR Test run that a label other than run-ci starts.
+#
+# Applying any label starts PR Test, because GitHub cannot filter pull_request
+# types by label name. That run cannot test anything - the gate authorizes only
+# on run-ci - but the PR checks box renders just the newest run of a workflow,
+# so it hides the tests that are actually running. Deleting it puts the real run
+# back on the PR, which is what "an unrelated label changes nothing" should look
+# like.
+#
+# pull_request_target is required: it is the only PR trigger whose token can
+# write on PRs from forks. Nothing from the PR is checked out or executed here,
+# and the only write is deleting a PR Test run that provably ran no tests.
+
+name: Label Cleanup
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  actions: write
+
+jobs:
+  discard:
+    name: Discard Label-Only Run
+    # run-ci is the trigger for CI, so the run it starts is a real one.
+    if: github.event.label.name != 'run-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Discard the run this label started
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          RUNS="/repos/$REPO/actions/workflows/pr-test.yml/runs"
+          QUERY="head_sha=$HEAD_SHA&event=pull_request&per_page=100"
+
+          # tests    - has test jobs, so it is a real run and must be left alone
+          # empty     - the gate skipped setup, so this run tested nothing
+          # unsettled - too early to tell; a real run looks empty until its
+          #             matrix expands, so this must never be read as empty
+          kind() {
+            gh api "/repos/$REPO/actions/runs/$1/jobs?per_page=100" --jq '
+              [.jobs[]] as $j
+              | if ($j | map(.name | startswith("AOT Build Import") or startswith("JIT Unittest")) | any)
+                then "tests"
+                elif ($j | map(.name == "Setup" and .conclusion == "skipped") | any)
+                then "empty"
+                else "unsettled"
+                end' 2>/dev/null || echo "unsettled"
+          }
+
+          # This workflow and the run it is looking for start from the same
+          # event, so that run may not exist yet and its gate needs a moment to
+          # settle. A real run sitting on top therefore only means "nothing to
+          # discard" once it stays there.
+          IDS=""
+          FOUND=""
+          STABLE=0
+          for _ in $(seq 1 24); do
+            IDS=$(gh api "$RUNS?$QUERY" \
+              --jq '.workflow_runs | sort_by(.id) | reverse | .[].id' 2>/dev/null) || IDS=""
+            NEWEST=$(head -n 1 <<< "$IDS")
+
+            if [ -n "$NEWEST" ]; then
+              case "$(kind "$NEWEST")" in
+                empty) FOUND="$NEWEST" ;;
+                tests) STABLE=$((STABLE + 1)) ;;
+                *)     STABLE=0 ;;
+              esac
+            fi
+
+            { [ -n "$FOUND" ] || [ "$STABLE" -ge 6 ]; } && break
+            sleep 5
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "No label-only run on top of this commit, leaving the PR alone"
+            exit 0
+          fi
+
+          # Discard only runs that hide a run testing this commit. On a commit
+          # nobody has tested, the label-only run carries the "CI still needs to
+          # be triggered" report, which is worth keeping.
+          HIDDEN=""
+          while read -r ID; do
+            if [ -n "$ID" ] && [ "$(kind "$ID")" == "tests" ]; then
+              HIDDEN="$ID"
+              break
+            fi
+          done <<< "$IDS"
+
+          if [ -z "$HIDDEN" ]; then
+            echo "Run $FOUND hides nothing - no run is testing this commit"
+            exit 0
+          fi
+
+          # Everything above the testing run, so several labels applied at once
+          # do not leave one another behind.
+          while read -r ID; do
+            if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
+              continue
+            fi
+
+            echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
+
+            # A run has to finish before it can be deleted.
+            gh api -X POST "/repos/$REPO/actions/runs/$ID/cancel" > /dev/null 2>&1 || true
+            for _ in $(seq 1 36); do
+              STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
+              [ "$STATUS" == "completed" ] && break
+              sleep 5
+            done
+
+            # A concurrent label event may have deleted it already. Cleanup
+            # failing is not worth a red check on the PR.
+            if gh api -X DELETE "/repos/$REPO/actions/runs/$ID" > /dev/null 2>&1; then
+              echo "Deleted run $ID"
+            else
+              echo "::warning::Could not delete run $ID"
+            fi
+          done <<< "$IDS"

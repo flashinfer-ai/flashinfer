@@ -407,17 +407,21 @@ jobs:
               INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
                 --json status,conclusion,jobs \
                 --jq '.status + "|" + (.conclusion // "") + "|"
-                      + ([.jobs[] | select(.status == "completed")] | length | tostring)
-                      + "/" + (.jobs | length | tostring)' 2>/dev/null) || INFO=""
+                      + ([.jobs[] | select(.status == "completed")] | length | tostring) + " done, "
+                      + ([.jobs[] | select(.status == "in_progress")] | length | tostring) + " running, "
+                      + ([.jobs[] | select(.status == "queued")] | length | tostring) + " waiting for a runner, of "
+                      + (.jobs | length | tostring) + " jobs"' 2>/dev/null) || INFO=""
               IFS='|' read -r STATUS CONCLUSION PROGRESS <<< "$INFO"
 
               if [ "$STATUS" == "completed" ]; then
                 break
               fi
 
-              # Printed every poll so the log visibly ticks: an idle log is
-              # indistinguishable from a stuck one.
-              echo "run $ACTIVE is ${STATUS:-unreachable}, ${PROGRESS:-?} jobs finished, waited $((SECONDS / 60))m - $RUN_URL"
+              # Per-job counts rather than the run status, which reads "queued"
+              # for as long as any job is still waiting on a runner even though
+              # others have already finished. Printed every poll so the log
+              # visibly ticks: an idle log is indistinguishable from a stuck one.
+              echo "run $ACTIVE after $((SECONDS / 60))m: ${PROGRESS:-progress unavailable} - $RUN_URL"
               sleep 30
             done
 
