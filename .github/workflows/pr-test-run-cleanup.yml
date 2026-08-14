@@ -1,15 +1,7 @@
-# Discards the PR Test run that a label other than run-ci starts.
-#
-# Applying any label starts PR Test, because GitHub cannot filter pull_request
-# types by label name. That run cannot test anything - the gate authorizes only
-# on run-ci - but the PR checks box renders just the newest run of a workflow,
-# so it hides the tests that are actually running. Deleting it puts the real run
-# back on the PR, which is what "an unrelated label changes nothing" should look
-# like.
-#
-# pull_request_target is required: it is the only PR trigger whose token can
-# write on PRs from forks. Nothing from the PR is checked out or executed here,
-# and the only write is deleting a PR Test run that provably ran no tests.
+# Deletes the PR Test run a label other than run-ci starts: it tests nothing, but
+# the PR checks box renders only a workflow's newest run, so it hides the tests
+# that are really running. pull_request_target is the only PR trigger whose token
+# can write on fork PRs; nothing from the PR is checked out or run here.
 
 name: PR Test Run Cleanup
 
@@ -23,10 +15,9 @@ permissions:
 jobs:
   discard:
     name: Discard Label-Only Run
-    # run-ci is the trigger for CI, so the run it starts is a real one.
     if: github.event.label.name != 'run-ci'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Discard the run this label started
         env:
@@ -37,10 +28,12 @@ jobs:
           RUNS="/repos/$REPO/actions/workflows/pr-test.yml/runs"
           QUERY="head_sha=$HEAD_SHA&event=pull_request&per_page=100"
 
-          # tests     - has test jobs, so it is a real run and must be left alone
-          # empty     - the gate skipped setup, so this run tested nothing
-          # unsettled - too early to tell; a real run looks empty until its
-          #             matrix expands, so this must never be read as empty
+          POLL_SECONDS=5
+          SETTLE_POLLS=$((600 / POLL_SECONDS))
+          STABLE_POLLS=$((60 / POLL_SECONDS))
+          CANCEL_POLLS=$((180 / POLL_SECONDS))
+
+          # A real run looks empty until its matrix expands, so undecided is not empty.
           kind() {
             gh api "/repos/$REPO/actions/runs/$1/jobs?per_page=100" --jq '
               [.jobs[]] as $j
@@ -52,18 +45,12 @@ jobs:
                 end' 2>/dev/null || echo "unsettled"
           }
 
-          # This workflow and the run it is looking for start from the same
-          # event, so that run may not exist yet and its gate needs a moment to
-          # settle. A real run sitting on top therefore only means "nothing to
-          # discard" once it stays there, which is what STABLE counts: 6 polls,
-          # so half a minute.
-          #
-          # 24 polls at 5s is 2 minutes, generous for a gate that takes seconds.
-          # Running out is not a failure: it leaves the PR as it is today.
+          # The run being looked for starts from this same event, so a real run on
+          # top only counts once it stays there. Running out leaves the PR as is.
           IDS=""
           FOUND=""
           STABLE=0
-          for _ in $(seq 1 24); do
+          for _ in $(seq 1 "$SETTLE_POLLS"); do
             IDS=$(gh api "$RUNS?$QUERY" \
               --jq '.workflow_runs | sort_by(.id) | reverse | .[].id' 2>/dev/null) || IDS=""
             NEWEST=$(head -n 1 <<< "$IDS")
@@ -76,10 +63,10 @@ jobs:
               esac
             fi
 
-            if [ -n "$FOUND" ] || [ "$STABLE" -ge 6 ]; then
+            if [ -n "$FOUND" ] || [ "$STABLE" -ge "$STABLE_POLLS" ]; then
               break
             fi
-            sleep 5
+            sleep "$POLL_SECONDS"
           done
 
           if [ -z "$FOUND" ]; then
@@ -87,9 +74,7 @@ jobs:
             exit 0
           fi
 
-          # Discard only runs that hide a run testing this commit. On a commit
-          # nobody has tested, the label-only run carries the "CI still needs to
-          # be triggered" report, which is worth keeping.
+          # An untested commit keeps its label-only run: it carries the CI report.
           HIDDEN=""
           while read -r ID; do
             if [ -n "$ID" ] && [ "$(kind "$ID")" == "tests" ]; then
@@ -103,10 +88,8 @@ jobs:
             exit 0
           fi
 
-          # Everything above the testing run, so several labels applied at once
-          # do not leave one another behind. A run has to finish before it can be
-          # deleted, and cancelling every one up front keeps the waits below
-          # overlapping rather than stacking up past this job's timeout.
+          # Everything above the testing run, cancelled up front - a run must
+          # finish before it can be deleted - so the waits below overlap.
           TARGETS=""
           while read -r ID; do
             if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
@@ -119,19 +102,14 @@ jobs:
           for ID in $TARGETS; do
             echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
 
-            # 36 polls at 5s is 3 minutes. An empty run has nothing to stop, so
-            # the cancel lands in seconds and this is headroom; running out just
-            # leaves the run undeleted, which is again today's behaviour.
-            for _ in $(seq 1 36); do
+            for _ in $(seq 1 "$CANCEL_POLLS"); do
               STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
               if [ "$STATUS" == "completed" ]; then
                 break
               fi
-              sleep 5
+              sleep "$POLL_SECONDS"
             done
 
-            # A concurrent label event may have deleted it already. Cleanup
-            # failing is not worth a red check on the PR.
             if gh api -X DELETE "/repos/$REPO/actions/runs/$ID" > /dev/null 2>&1; then
               echo "Deleted run $ID"
             else
