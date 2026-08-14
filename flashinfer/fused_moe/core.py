@@ -5352,12 +5352,16 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[seq_len, top_k]`` in packed format ``(expert_id << 16) | weight`` or
         a tuple ``(ids, weights)`` where ``ids`` is int32 of shape
         ``[seq_len, top_k]`` (plain expert indices) and ``weights`` is
-        ``bfloat16`` of the same shape (routing weights).
+        ``bfloat16`` or ``float32`` of the same shape (routing weights). The
+        weights are consumed at their native dtype (no cast), so passing the
+        ``float32`` weights emitted by typical routers is copy-free.
     routing_bias : Optional[torch.Tensor]
-        ``[num_experts]`` routing bias.  May be ``None``.
+        ``[num_experts]`` routing bias, ``bfloat16`` or ``float32``.  May be
+        ``None``.
     hidden_states : torch.Tensor
         Hidden states of shape ``[seq_len, hidden_size // 2]`` (NVFP4) or
-        ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).
+        ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).  Supports bfloat16,
+        MXFP8 (``float8_e4m3fn``), and NVFP4 (packed into ``uint8``).
     hidden_states_scale : Optional[torch.Tensor]
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]`` block scales of
         the hidden states, float8.
@@ -5371,10 +5375,17 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, float32.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, float32.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, ``uint8``.
@@ -5432,6 +5443,7 @@ def trtllm_fp4_block_scale_routed_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, float32.
     output : Optional[torch.Tensor]
@@ -5462,17 +5474,21 @@ def trtllm_fp4_block_scale_routed_moe(
     )
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
-    # when the input is Fp8 or NvFp4 and DeepSeekFp8 is not used; pre-divide
-    # lora_delta to compensate.
+    # when the input is Fp8 or NvFp4 and DeepSeekFp8 is not used (see trtllm-gen
+    # getDoesScaleAb()); pre-divide lora_delta to compensate.
     if (
         gemm1_lora_delta is not None
         and output1_scale_gate_scalar is not None
         and hidden_states.dtype == torch.uint8
     ):
         if routing_mode == RoutingInputMode.UnpackedPrecomputed:
+            # topk_ids_tensor: [num_tokens, top_k] int32 of plain expert IDs.
             expert_idx = topk_ids_tensor.to(torch.int64)
         else:
+            # Packed format: high 16 bits = expert_id, low 16 bits = packed weight.
             expert_idx = (topk_ids_tensor.to(torch.int32) >> 16).to(torch.int64)
+        # topk_ids carry GLOBAL expert ids, but output1_scale_gate_scalar is
+        # [local_num_experts]. Convert to the local row (global - offset).
         local_idx = (expert_idx - local_expert_offset).clamp(0, local_num_experts - 1)
         inv_dequant_ab = (1.0 / output1_scale_gate_scalar.to(torch.float32))[local_idx]
         gemm1_lora_delta = (
