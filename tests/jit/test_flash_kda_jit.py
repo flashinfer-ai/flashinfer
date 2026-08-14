@@ -51,16 +51,16 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
             "fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f",
-            "718efaaac9253b0564d49e065cc0bb6755b21f6082f54ed3cd774d9cefccc0cc",
-            "flashkda_bf16_fused_m128_df718c4854",
+            "c9c147eadec6d27cd8170a404dcf47a6d2ad50bf488a918fe8e79403f77e2d59",
+            "flashkda_bf16_fused_m128_25af6159e2",
             170492,
             219136,
         ),
         "n32": (
             "flashkda_bf16_fused_m128.cu",
             "74b249b2616fc837e4bdcab2d4d18f6a6cb3b64a4785d6c124658e7cfcdcf75c",
-            "3cc8d5f3401b6f89d531ad09b5ef50c73bd5ef1ab4277458929bd2d15aabe145",
-            "flashkda_bf16_fused_m128_f6c3f8ea64",
+            "f18a1d71377b398686816e809ed79ad6f362af3dea575b766dd57e4f1d89fdb0",
+            "flashkda_bf16_fused_m128_871d55e77f",
             169217,
             227328,
         ),
@@ -154,14 +154,14 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
             "m128",
             227328,
             "74b249b2616fc837e4bdcab2d4d18f6a6cb3b64a4785d6c124658e7cfcdcf75c",
-            "f6c3f8ea64",
+            "871d55e77f",
             True,
         ),
         (
             "m128_n16",
             219136,
             "fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f",
-            "df718c4854",
+            "25af6159e2",
             True,
         ),
     ],
@@ -432,12 +432,12 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     n16_sm103a = flash_kda.gen_flash_kda_module("m128_n16", "sm103a")
 
     assert sm100a is not sm103a
-    assert sm100a.name == "flash_kda_bf16_fused_m128_f6c3f8ea64_sm100a"
-    assert sm103a.name == "flash_kda_bf16_fused_m128_f6c3f8ea64_sm103a"
+    assert sm100a.name == "flash_kda_bf16_fused_m128_871d55e77f_sm100a"
+    assert sm103a.name == "flash_kda_bf16_fused_m128_871d55e77f_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_df718c4854_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_df718c4854_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_25af6159e2_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_25af6159e2_sm103a"
 
 
 @pytest.mark.parametrize(
