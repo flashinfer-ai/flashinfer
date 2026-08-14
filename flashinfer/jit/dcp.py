@@ -260,8 +260,7 @@ def gen_dcp_spec_fp8_module(
     )
     csrc_dir = _get_csrc_dir()
     body = csrc_dir / (
-        f"cake_fmha_dcp_spec_bf16_fp8_split{num_split}"
-        f"_retain{retain_kv_l2}.cu"
+        f"cake_fmha_dcp_spec_bf16_fp8_split{num_split}_retain{retain_kv_l2}.cu"
     )
     binding = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
     for source in (body, binding):

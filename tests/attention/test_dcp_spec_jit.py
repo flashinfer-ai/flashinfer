@@ -34,8 +34,7 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     assert v4_uri.endswith("_b1_q8_hq64_hkv8_cp4_split16")
     fp8_uri = get_dcp_spec_fp8_uri("sm100a", 256, 3, 64, 8, 4, 3, 1)
     assert fp8_uri == (
-        "cake_fmha_dcp_spec_bf16_fp8_sm100a_"
-        "b256_q3_hq64_hkv8_cp4_split3_retain1"
+        "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
 
 
