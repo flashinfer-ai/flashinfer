@@ -143,7 +143,10 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
     if use_tma_store is None:
         tma = "x"
     elif isinstance(use_tma_store, tuple):
-        tma = "s" + "s".join(str(int(v)) for v in use_tma_store)
+        # prefetch_dist is enumerated as (0, 2, None) - None means "auto" and
+        # compiles differently from 0, so render it as its own symbol rather
+        # than letting int(None) raise.
+        tma = "s" + "s".join("x" if v is None else str(int(v)) for v in use_tma_store)
     else:
         tma = int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")

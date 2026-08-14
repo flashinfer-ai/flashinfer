@@ -6358,12 +6358,18 @@ def _cute_dsl_gemm_fp4_runner(
 
             valid_tactics = [(*t, "sm100", None) for t in sm100_base]
 
+            # Shared by the SM103 and SM107 tactic blocks below. Hoisted out of
+            # the SM103 block: the two blocks have independent guards (the SM103
+            # kernel needs the internal cutlass-dsl wheel, the SM107 one needs
+            # rubin_helpers), so on a public DSL with Sm103Kernel None but
+            # Sm107Kernel present the SM107 block would otherwise reference these
+            # before assignment.
+            batch_size = 1
+            m_aligned = m % 8 == 0
+            n_aligned = n % 8 == 0
+
             # --- SM103 tactics (only on SM103) ---
             if sm_version in [103, 107] and Sm103Kernel is not None:
-                batch_size = 1
-                m_aligned = m % 8 == 0
-                n_aligned = n % 8 == 0
-
                 sm103_mma_tiler_candidates = [
                     (128, 128),
                     (256, 128),
