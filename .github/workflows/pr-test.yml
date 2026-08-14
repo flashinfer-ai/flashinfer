@@ -297,6 +297,13 @@ jobs:
         if: matrix.kind != 'aot'
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/${{ matrix.script }}
 
+      - name: Make JUnit XML readable
+        if: ${{ always() && matrix.kind == 'h100' }}
+        run: |
+          if [ -d junit ]; then
+            sudo chmod -R a+rX junit
+          fi
+
       - name: Upload JUnit XML
         if: ${{ always() && matrix.kind == 'h100' }}
         uses: actions/upload-artifact@v4
