@@ -145,6 +145,30 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
     )
 
 
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "get_prims_ts_batch_decode_workspace_size",
+        "prims_ts_batch_decode_with_kv_cache",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Resolve PrimTS decode APIs without loading their runtime at import."""
+
+    if name in _PRIMS_TS_LAZY_EXPORTS:
+        from .attention.prims_ts import decode as prims_ts_decode
+
+        value = getattr(prims_ts_decode, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -2030,7 +2054,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
             # use q's head_dim for output instead
-            out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
+            # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
+            # asymmetric QK/VO plans; q.shape[-1] assumed QK == VO).
+            # Only the NVFP4 packed path (uint8 KV) stores VO at half width;
+            # derive the doubled output width from the KV dtype, not merely from
+            # kv_cache_sf being present, so a stray scale-factor tensor on a
+            # non-uint8 cache can't silently miscompute the output shape.
+            out_head_dim = (
+                v_cache.shape[-1] * 2
+                if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+                else v_cache.shape[-1]
+            )
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )

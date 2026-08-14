@@ -46,6 +46,22 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo ""
 fi
 
+# Install quack-kernels for the VSA blk128 backend tests.
+# quack-kernels is NOT a runtime requirement of flashinfer — only users of the
+# blk128 VSA backend need it, so it is intentionally kept out of requirements.txt
+# and installed here for CI only. The blk128 backend supports SM100/SM103, so we
+# install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The correct PyPI distribution name is quack-kernels (top-level package: quack).
+SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
+if [ "${SM_MAJOR}" = "10" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "========================================"
+  pip install "quack-kernels==0.6.4"
+  echo "quack-kernels install complete."
+  echo ""
+fi
+
 # Override nvidia-cutlass-dsl if specified
 if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   # Detect CUDA major version: only CUDA 13+ needs [cu13] extra

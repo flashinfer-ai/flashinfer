@@ -20,7 +20,8 @@ from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_grouped_gemm
 
 def _finalize_ok(n, mma_tiler_mn, cluster_shape_mn):
     return Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-        ab_dtype=cutlass.Float4E2M1FN,
+        a_dtype=cutlass.Float4E2M1FN,
+        b_dtype=cutlass.Float4E2M1FN,
         sf_dtype=cutlass.Float8E4M3FN,
         sf_vec_size=16,
         out_dtype=cutlass.BFloat16,
@@ -39,7 +40,8 @@ def _finalize_ok(n, mma_tiler_mn, cluster_shape_mn):
 
 def _gemm1_ok(n, mma_tiler_mn, cluster_shape_mn):
     return BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-        ab_dtype=cutlass.Float4E2M1FN,
+        a_dtype=cutlass.Float4E2M1FN,
+        b_dtype=cutlass.Float4E2M1FN,
         sf_dtype=cutlass.Float8E4M3FN,
         sf_vec_size=16,
         c_dtype=cutlass.Float4E2M1FN,
