@@ -850,8 +850,10 @@ def top_k(
         imply deterministic output ordering. Set ``deterministic=True`` when
         repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
-        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
-        Default is False.
+        If True, require a CUDA-graph-safe execution path. The native radix
+        backend satisfies this by forcing FilteredTopK with graph-safe
+        vectorization (VEC_SIZE=1); the CUB backend is graph-safe by
+        construction, so it may still serve such calls. Default is False.
 
     Returns
     -------
@@ -1061,8 +1063,10 @@ def top_k_page_table_transform(
         imply deterministic output ordering. Set ``deterministic=True`` when
         repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
-        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
-        Default is False.
+        If True, require a CUDA-graph-safe execution path. The native radix
+        backend satisfies this by forcing FilteredTopK with graph-safe
+        vectorization (VEC_SIZE=1); the CUB backend is graph-safe by
+        construction, so it may still serve such calls. Default is False.
     row_starts : Optional[torch.Tensor], optional
         Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
         Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
@@ -1278,8 +1282,10 @@ def top_k_ragged_transform(
         imply deterministic output ordering. Set ``deterministic=True`` when
         repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
-        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
-        Default is False.
+        If True, require a CUDA-graph-safe execution path. The native radix
+        backend satisfies this by forcing FilteredTopK with graph-safe
+        vectorization (VEC_SIZE=1); the CUB backend is graph-safe by
+        construction, so it may still serve such calls. Default is False.
     row_starts : Optional[torch.Tensor], optional
         Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
         Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
