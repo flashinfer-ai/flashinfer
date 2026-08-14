@@ -419,6 +419,15 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8(
   const int smem_p0_addr = smem + 202752;
   __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 204800);
   const int smem_p1_addr = smem + 204800;
+  if (tid == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"((uint64_t)(Qt)) : "memory");
+  }
+  if (tid == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"((uint64_t)(K)) : "memory");
+  }
+  if (tid == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"((uint64_t)(V)) : "memory");
+  }
 
   // Mbarrier init (19 groups, 28 barriers)
   // Mbarriers at smem_raw[0..224)
