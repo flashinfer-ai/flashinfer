@@ -57,6 +57,7 @@ def _cp_delta_rule_rejection_reason(
     beta: Optional[torch.Tensor],
     output: torch.Tensor,
     initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
@@ -87,6 +88,19 @@ def _cp_delta_rule_rejection_reason(
         return f"CP delta rule only supports fp16/bf16 inputs, got {q.dtype}"
     if k.dtype != q.dtype or v.dtype != q.dtype or output.dtype != q.dtype:
         return "CP delta rule requires q/k/v/output dtypes to match"
+    if arch_major == 10:
+        for name, tensor in (
+            ("initial_state", initial_state),
+            ("output_state", output_state),
+        ):
+            if tensor is not None and tensor.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                return (
+                    f"CP delta rule SM100 does not support FP8 {name}, "
+                    f"got {tensor.dtype}"
+                )
     for name, tensor in (("g", g), ("beta", beta)):
         if tensor is not None:
             if tensor.dtype != torch.float32:
@@ -394,6 +408,7 @@ def chunk_gated_delta_rule(
             beta=beta,
             output=output,
             initial_state=initial_state,
+            output_state=output_state,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
