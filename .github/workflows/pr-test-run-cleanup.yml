@@ -31,7 +31,7 @@ jobs:
           POLL_SECONDS=5
           SETTLE_POLLS=$((600 / POLL_SECONDS))
           STABLE_POLLS=$((60 / POLL_SECONDS))
-          CANCEL_POLLS=$((180 / POLL_SECONDS))
+          CANCEL_SECONDS=180
 
           # A real run looks empty until its matrix expands, so undecided is not empty.
           kind() {
@@ -45,8 +45,7 @@ jobs:
                 end' 2>/dev/null || echo "unsettled"
           }
 
-          # The run being looked for starts from this same event, so a real run on
-          # top only counts once it stays there. Running out leaves the PR as is.
+          # Started by this same event, so a real run on top only counts if it stays.
           IDS=""
           FOUND=""
           STABLE=0
@@ -88,8 +87,9 @@ jobs:
             exit 0
           fi
 
-          # Everything above the testing run, cancelled up front - a run must
-          # finish before it can be deleted - so the waits below overlap.
+          # Everything above the testing run. A run must finish before it can be
+          # deleted, so cancels go out together and share one deadline below,
+          # rather than each taking a budget that adds up past the job timeout.
           TARGETS=""
           while read -r ID; do
             if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
@@ -99,10 +99,11 @@ jobs:
             gh api -X POST "/repos/$REPO/actions/runs/$ID/cancel" > /dev/null 2>&1 || true
           done <<< "$IDS"
 
+          CANCELLED_BY=$((SECONDS + CANCEL_SECONDS))
           for ID in $TARGETS; do
             echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
 
-            for _ in $(seq 1 "$CANCEL_POLLS"); do
+            while [ "$SECONDS" -lt "$CANCELLED_BY" ]; do
               STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
               if [ "$STATUS" == "completed" ]; then
                 break

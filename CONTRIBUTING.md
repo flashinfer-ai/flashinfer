@@ -67,7 +67,7 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
-Public CI does not start on its own for any PR. Anyone who can label the PR, along with members of the `ci-users` team, starts it by commenting `@flashinfer-bot run`, or by adding the `run-ci` label directly. This applies to everyone, including maintainers.
+Public CI does not start on its own for any PR. Commenting `@flashinfer-bot run` starts it, and works for anyone who can label the PR as well as for members of the `ci-users` team. Adding the `run-ci` label by hand does the same, for anyone whose permissions let them label a PR. This applies to everyone, including maintainers.
 
 Starting CI applies to the commit that is current at that moment. Pushing new commits, rebasing, or merging `main` into your branch does **not** start a new run, so ask for `@flashinfer-bot run` again once your PR is ready for a final check. Note that GitHub requires the checks to pass on the last commit before a PR can merge.
 
