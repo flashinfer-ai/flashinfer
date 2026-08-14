@@ -130,6 +130,8 @@ def _validate_fp8_specialization(
     num_q_heads: int,
     num_kv_heads: int,
     cp_world: int,
+    num_split: int,
+    retain_kv_l2: int,
 ) -> None:
     if target not in _DCP_SPEC_NVCC_FLAGS:
         raise ValueError(f"unsupported DCP speculative FMHA target: {target}")
@@ -151,6 +153,10 @@ def _validate_fp8_specialization(
     group_ratio = num_q_heads // num_kv_heads
     if not 1 <= group_ratio <= 8:
         raise ValueError(f"head group ratio must be in [1, 8], got {group_ratio}")
+    if not 1 <= num_split <= 4:
+        raise ValueError(f"FP8 num_split must be in [1, 4], got {num_split}")
+    if retain_kv_l2 not in (0, 1):
+        raise ValueError(f"FP8 retain_kv_l2 must be 0 or 1, got {retain_kv_l2}")
 
 
 def get_dcp_spec_fp8_uri(
@@ -160,6 +166,8 @@ def get_dcp_spec_fp8_uri(
     num_q_heads: int,
     num_kv_heads: int,
     cp_world: int,
+    num_split: int,
+    retain_kv_l2: int,
 ) -> str:
     _validate_fp8_specialization(
         target,
@@ -168,10 +176,13 @@ def get_dcp_spec_fp8_uri(
         num_q_heads,
         num_kv_heads,
         cp_world,
+        num_split,
+        retain_kv_l2,
     )
     return (
         f"cake_fmha_dcp_spec_bf16_fp8_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}_cp{cp_world}"
+        f"_split{num_split}_retain{retain_kv_l2}"
     )
 
 
@@ -232,6 +243,8 @@ def gen_dcp_spec_fp8_module(
     num_q_heads: int,
     num_kv_heads: int,
     cp_world: int,
+    num_split: int,
+    retain_kv_l2: int,
 ) -> JitSpec:
     """Generate one BF16-Q/FP8-KV, HND-page64 Cake FMHA module."""
 
@@ -242,6 +255,8 @@ def gen_dcp_spec_fp8_module(
         num_q_heads,
         num_kv_heads,
         cp_world,
+        num_split,
+        retain_kv_l2,
     )
     csrc_dir = _get_csrc_dir()
     body = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8.cu"
@@ -260,6 +275,8 @@ def gen_dcp_spec_fp8_module(
             f"-DNUM_Q_HEADS={num_q_heads}",
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCP_WORLD={cp_world}",
+            f"-DNUM_SPLIT={num_split}",
+            f"-DRETAIN_KV_L2={retain_kv_l2}",
         ],
         extra_include_paths=[csrc_dir],
         extra_ldflags=["-lcuda"],
@@ -301,6 +318,8 @@ def load_dcp_spec_fp8_module(
     num_q_heads: int,
     num_kv_heads: int,
     cp_world: int,
+    num_split: int,
+    retain_kv_l2: int,
 ):
     module = gen_dcp_spec_fp8_module(
         target,
@@ -309,6 +328,8 @@ def load_dcp_spec_fp8_module(
         num_q_heads,
         num_kv_heads,
         cp_world,
+        num_split,
+        retain_kv_l2,
     ).build_and_load()
     logger.info(f"Loaded FP8 DCP speculative FMHA module: {module}")
     return module

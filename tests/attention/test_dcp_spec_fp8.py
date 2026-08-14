@@ -7,6 +7,10 @@ import math
 import pytest
 import torch
 
+from flashinfer.dcp import (
+    get_dcp_spec_counter_bytes,
+    get_dcp_spec_workspace_size_bytes,
+)
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
@@ -206,6 +210,7 @@ def _run_public_rank(
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
     workspace: torch.Tensor,
+    counter: torch.Tensor | None = None,
     *,
     max_local_seq_len: int,
     q_len: int,
@@ -231,6 +236,7 @@ def _run_public_rank(
         q_len_per_req=q_len,
         lse=lse.flatten(0, 1),
         return_lse=True,
+        multi_ctas_kv_counter_buffer=counter,
         cp_world=cp_world,
         cp_rank=cp_rank,
         causal_seqlens_kv_global=prefix_lens,
@@ -344,6 +350,116 @@ def test_fp8_page64_q3_public_api_rank_correctness_and_merge() -> None:
     )
     torch.testing.assert_close(merged_o, dense_o, atol=0.1, rtol=0.1)
     torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)
+
+
+def test_fp8_page64_b1_split3_public_api_correctness_and_graph_replay() -> None:
+    _require_blackwell_dcp()
+    torch.manual_seed(11)
+    batch_size, q_len = 1, 4
+    num_q_heads, num_kv_heads = 64, 8
+    cp_world, cp_rank = 4, 0
+    prefix_len = 8192
+    global_len = prefix_len + q_len
+    sm_scale = _HEAD_DIM**-0.5
+    query = (
+        torch.randn(
+            batch_size,
+            q_len,
+            num_q_heads,
+            _HEAD_DIM,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    k_source = (
+        torch.randn(
+            batch_size,
+            global_len,
+            num_kv_heads,
+            _HEAD_DIM,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    v_source = torch.randn_like(k_source) * 0.2
+    k_storage, k_scale = _quantize_fp8(k_source)
+    v_storage, v_scale = _quantize_fp8(v_source)
+    represented_k = k_storage.float() * k_scale
+    represented_v = v_storage.float() * v_scale
+    k_cache, v_cache, block_tables, seq_lens, max_local = _pack_rank_cache(
+        k_storage,
+        v_storage,
+        [global_len],
+        rank=cp_rank,
+        cp_world=cp_world,
+    )
+    prefix_lens = torch.full(
+        (batch_size,), prefix_len, dtype=torch.int32, device="cuda"
+    )
+    out = torch.empty_like(query)
+    lse = torch.empty(
+        (batch_size, q_len, num_q_heads), dtype=torch.float32, device="cuda"
+    )
+    workspace = torch.empty(
+        get_dcp_spec_workspace_size_bytes(batch_size, q_len, num_q_heads, 3),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    counter = torch.zeros(
+        get_dcp_spec_counter_bytes(batch_size, q_len, num_kv_heads),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    def run():
+        return _run_public_rank(
+            query,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens,
+            prefix_lens,
+            workspace,
+            counter,
+            max_local_seq_len=max_local,
+            q_len=q_len,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            bmm1_scale=sm_scale * k_scale,
+            bmm2_scale=v_scale,
+            out=out,
+            lse=lse,
+        )
+
+    expected_o, expected_lse = _rank_reference(
+        query,
+        represented_k,
+        represented_v,
+        [prefix_len],
+        rank=cp_rank,
+        cp_world=cp_world,
+        sm_scale=sm_scale,
+    )
+    run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected_o, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(lse, expected_lse, atol=0.1, rtol=0.1)
+    assert torch.count_nonzero(counter) == 0
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    captured_o = out.clone()
+    captured_lse = lse.clone()
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, captured_o, atol=0, rtol=0)
+    torch.testing.assert_close(lse, captured_lse, atol=0, rtol=0)
+    assert torch.count_nonzero(counter) == 0
 
 
 def test_fp8_page64_b256_public_api_cuda_graph_capture_replay() -> None:

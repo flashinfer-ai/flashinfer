@@ -37,6 +37,9 @@ _MAX_NUM_SPLIT = 16
 _MIN_SPLIT_LOCAL_BLOCKS = 16
 _TARGET_PAIRS_PER_SPLIT = 3
 _RETAIN_KV_L2_MAX_BLOCKS = 9
+_FP8_MAX_NUM_SPLIT = 4
+_FP8_MIN_SPLIT_LOCAL_BLOCKS = 4
+_FP8_RETAIN_KV_L2_MAX_BLOCKS = 18
 _BF16_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
@@ -48,7 +51,7 @@ def get_dcp_spec_workspace_size_bytes(
     num_qo_heads: int,
     num_split: int = _MAX_NUM_SPLIT,
 ) -> int:
-    """Bytes for v4 BF16 partial-O and FP32 partial-LSE scratch."""
+    """Bytes for Cake FMHA Split-KV BF16 partial-O and FP32 partial-LSE scratch."""
 
     if min(batch_size, q_len_per_req, num_qo_heads) <= 0:
         raise ValueError("batch_size, q_len_per_req, and num_qo_heads must be positive")
@@ -70,6 +73,65 @@ def get_dcp_spec_counter_bytes(
     return batch_size * q_len_per_req * num_kv_heads * 4
 
 
+def _split_workspace_views(
+    *,
+    workspace_buffer: torch.Tensor,
+    completion_buffer: Optional[torch.Tensor],
+    device: torch.device,
+    batch_size: int,
+    q_len_per_req: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    num_split: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bind caller-owned Split-KV scratch without allocating during launch."""
+
+    required_counter = get_dcp_spec_counter_bytes(
+        batch_size, q_len_per_req, num_kv_heads
+    )
+    if completion_buffer is None:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer is required for the DCP Split-KV route; "
+            f"pass a zero-initialized reusable CUDA buffer with at least {required_counter} bytes"
+        )
+    if completion_buffer.device != device or not completion_buffer.is_contiguous():
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be contiguous and on the query device"
+        )
+    _check_workspace_buffer_alignment(completion_buffer, "multi_ctas_kv_counter_buffer")
+    completion_u8 = completion_buffer.view(torch.uint8).reshape(-1)
+    if completion_u8.numel() < required_counter:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer is too small for DCP Split-KV: "
+            f"got {completion_u8.numel()} bytes, need {required_counter}"
+        )
+    split_completion = completion_u8[:required_counter].view(torch.int32)
+
+    if workspace_buffer.device != device or not workspace_buffer.is_contiguous():
+        raise ValueError("workspace_buffer must be contiguous and on the query device")
+    _check_workspace_buffer_alignment(workspace_buffer, "workspace_buffer")
+    required_workspace = get_dcp_spec_workspace_size_bytes(
+        batch_size,
+        q_len_per_req,
+        num_qo_heads,
+        num_split,
+    )
+    workspace_u8 = workspace_buffer.view(torch.uint8).reshape(-1)
+    if workspace_u8.numel() < required_workspace:
+        raise ValueError(
+            "workspace_buffer is too small for DCP Split-KV: "
+            f"got {workspace_u8.numel()} bytes, need {required_workspace}"
+        )
+    partial_rows = batch_size * q_len_per_req * num_qo_heads * num_split
+    partial_o_bytes = partial_rows * _HEAD_DIM * 2
+    partial_lse_bytes = partial_rows * 4
+    partial_o = workspace_u8[:partial_o_bytes].view(torch.bfloat16)
+    partial_lse = workspace_u8[
+        partial_o_bytes : partial_o_bytes + partial_lse_bytes
+    ].view(torch.float32)
+    return partial_o, partial_lse, split_completion
+
+
 def _select_num_split(
     *,
     logical_tiles: int,
@@ -82,6 +144,29 @@ def _select_num_split(
     work_cap = (total_pairs + _TARGET_PAIRS_PER_SPLIT - 1) // _TARGET_PAIRS_PER_SPLIT
     num_split = min(
         _MAX_NUM_SPLIT,
+        total_pairs,
+        work_cap,
+        sm_count // logical_tiles,
+    )
+    return num_split if num_split >= 2 else 1
+
+
+def _select_fp8_num_split(
+    *,
+    logical_tiles: int,
+    sm_count: int,
+    local_blocks: int,
+    cp_world: int,
+) -> int:
+    """Fill one SM wave while retaining two FP8 K/V block pairs per CTA."""
+
+    if logical_tiles >= sm_count or local_blocks < _FP8_MIN_SPLIT_LOCAL_BLOCKS:
+        return 1
+    total_pairs = (local_blocks + 1) // 2
+    work_cap = (total_pairs + 1) // 2
+    max_num_split = 3 if cp_world > 1 else _FP8_MAX_NUM_SPLIT
+    num_split = min(
+        max_num_split,
         total_pairs,
         work_cap,
         sm_count // logical_tiles,
@@ -306,6 +391,16 @@ def run_dcp_spec_decode(
     if profile == "fp8_p64":
         from .jit.dcp import load_dcp_spec_fp8_module
 
+        local_blocks = max(1, (max_local_seq_len + _BLOCK_N - 1) // _BLOCK_N)
+        num_split = _select_fp8_num_split(
+            logical_tiles=logical_tiles,
+            sm_count=sm_count,
+            local_blocks=local_blocks,
+            cp_world=cp_world,
+        )
+        retain_kv_l2 = int(
+            cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
+        )
         module = load_dcp_spec_fp8_module(
             target,
             batch_size,
@@ -313,14 +408,34 @@ def run_dcp_spec_decode(
             num_qo_heads,
             num_kv_heads,
             cp_world,
+            num_split,
+            retain_kv_l2,
         )
-        grid = min(sm_count, logical_tiles)
+        if num_split == 1:
+            partial_o = out
+            partial_lse = lse
+            split_completion = seq_lens
+        else:
+            partial_o, partial_lse, split_completion = _split_workspace_views(
+                workspace_buffer=workspace_buffer,
+                completion_buffer=completion_buffer,
+                device=query.device,
+                batch_size=batch_size,
+                q_len_per_req=q_len_per_req,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                num_split=num_split,
+            )
+        grid = min(sm_count, logical_tiles * num_split)
         module.run(
             query,
             k_cache.view(torch.uint8),
             v_cache.view(torch.uint8),
+            partial_o,
+            partial_lse,
             out,
             lse,
+            split_completion,
             block_tables,
             seq_lens,
             causal_seqlens_kv_global,
@@ -383,53 +498,16 @@ def run_dcp_spec_decode(
         )
         return
 
-    if completion_buffer is None:
-        required = get_dcp_spec_counter_bytes(batch_size, q_len_per_req, num_kv_heads)
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer is required for the DCP Split-KV route; "
-            f"pass a zero-initialized reusable CUDA buffer with at least {required} bytes"
-        )
-    if (
-        completion_buffer.device != query.device
-        or not completion_buffer.is_contiguous()
-    ):
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer must be contiguous and on the query device"
-        )
-    _check_workspace_buffer_alignment(completion_buffer, "multi_ctas_kv_counter_buffer")
-    required_counter = get_dcp_spec_counter_bytes(
-        batch_size, q_len_per_req, num_kv_heads
+    partial_o, partial_lse, split_completion = _split_workspace_views(
+        workspace_buffer=workspace_buffer,
+        completion_buffer=completion_buffer,
+        device=query.device,
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        num_split=num_split,
     )
-    completion_u8 = completion_buffer.view(torch.uint8).reshape(-1)
-    if completion_u8.numel() < required_counter:
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer is too small for DCP Split-KV: "
-            f"got {completion_u8.numel()} bytes, need {required_counter}"
-        )
-    split_completion = completion_u8[:required_counter].view(torch.int32)
-
-    if workspace_buffer.device != query.device or not workspace_buffer.is_contiguous():
-        raise ValueError("workspace_buffer must be contiguous and on the query device")
-    _check_workspace_buffer_alignment(workspace_buffer, "workspace_buffer")
-    required_workspace = get_dcp_spec_workspace_size_bytes(
-        batch_size,
-        q_len_per_req,
-        num_qo_heads,
-        num_split,
-    )
-    workspace_u8 = workspace_buffer.view(torch.uint8).reshape(-1)
-    if workspace_u8.numel() < required_workspace:
-        raise ValueError(
-            "workspace_buffer is too small for DCP Split-KV: "
-            f"got {workspace_u8.numel()} bytes, need {required_workspace}"
-        )
-    partial_rows = batch_size * q_len_per_req * num_qo_heads * num_split
-    partial_o_bytes = partial_rows * _HEAD_DIM * 2
-    partial_lse_bytes = partial_rows * 4
-    partial_o = workspace_u8[:partial_o_bytes].view(torch.bfloat16)
-    partial_lse = workspace_u8[
-        partial_o_bytes : partial_o_bytes + partial_lse_bytes
-    ].view(torch.float32)
 
     module = load_dcp_spec_module(
         "v4",

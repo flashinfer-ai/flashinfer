@@ -3307,11 +3307,12 @@ def trtllm_batch_decode_with_kv_cache(
         backend contract. Here ``max_seq_len`` is the maximum compact
         rank-local stored length; it may be zero for an entirely empty rank,
         while ``block_tables`` still supplies one masked physical page slot.
-        Long-context BF16 Split-KV uses
-        ``workspace_buffer`` for partials and requires a zero-initialized,
+        Long-context BF16 and underfilled FP8 Split-KV routes use
+        ``workspace_buffer`` for partials and require a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
-        completion tickets after every launch. Prewarm a fixed tensor/layout
-        binding before CUDA Graph capture.
+        completion tickets after every launch. The FP8 route specializes
+        split1--4 and short-shard K/V retention in its JIT cache key. Prewarm a
+        fixed tensor/layout binding before CUDA Graph capture.
 
     Returns
     -------

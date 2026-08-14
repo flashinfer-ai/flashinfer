@@ -35,8 +35,11 @@
       "NUM_Q_HEADS",
       "NUM_KV_HEADS",
       "Q_LEN",
-      "CP_WORLD"
-    ]
+      "CP_WORLD",
+      "NUM_SPLIT",
+      "RETAIN_KV_L2"
+    ],
+    "mma": "direct_e4m3_qk_pv"
   },
   "specialization_domain": {
     "batch_size": "positive integer",
@@ -48,6 +51,12 @@
       8
     ],
     "head_group_ratio": "integer in [1, 8]",
+    "num_split": [
+      1,
+      2,
+      3,
+      4
+    ],
     "q_len": [
       1,
       2,
@@ -56,6 +65,10 @@
       5,
       6,
       8
+    ],
+    "retain_kv_l2": [
+      0,
+      1
     ]
   }
 }
