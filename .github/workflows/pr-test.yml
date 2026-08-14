@@ -308,10 +308,6 @@ jobs:
       - setup
       - test
     runs-on: ubuntu-latest
-    # GitHub's own ceiling for a hosted job, stated explicitly because it is what
-    # bounds the wait below. Not a guess at how long tests take, so it does not
-    # need revisiting as tests are added.
-    timeout-minutes: 360
     steps:
       - name: Check Authorization
         if: needs.gate.outputs.authorized != 'true'
@@ -375,11 +371,9 @@ jobs:
             exit 0
           fi
 
-          # Same reason, for tests that are still running: this job reports the
-          # required check, so failing while another run is testing this very
-          # commit turns the check red underneath live GPU jobs, which reads as
-          # CI having stopped. Report what that run reports instead. Only older
-          # runs are followed, so two label events cannot wait on each other.
+          # Failing while another run tests this commit would turn the required
+          # check red under it, so report what that run reports. Older runs only,
+          # so two label events cannot wait on each other.
           ACTIVE=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "${{ github.workflow }}" \
@@ -394,18 +388,12 @@ jobs:
             RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/$ACTIVE"
             echo "Tests for this commit are running in [run $ACTIVE]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
 
-            # GitHub renders only the newest run of a workflow in the PR checks
-            # box, so this run hides the test jobs of the one it is following.
-            # An annotation is the one place that link shows up on the PR while
-            # this job is still going, since the summary above is not published
-            # until the job ends.
+            # The summary lands only when this job ends, so the annotation is
+            # what carries the link on the PR meanwhile.
             echo "::notice title=Tests are already running for this commit::$RUN_URL"
 
-            # Waits on the followed run reaching a conclusion, with no assumption
-            # about how long tests take: that number grows as tests are added,
-            # and guessing it low reports a failure for healthy tests. The only
-            # bound is timeout-minutes on this job, which is GitHub's own job
-            # ceiling rather than an estimate of test duration.
+            # No deadline: test duration grows as tests are added, and GitHub
+            # ends a hosted job at 6 hours anyway.
             CONCLUSION=""
             UNREADABLE=0
             while true; do
@@ -422,10 +410,8 @@ jobs:
                 break
               fi
 
-              # A transient API error retries rather than ending the wait, which
-              # would report a red result for a run that is still healthy. Giving
-              # up needs the run to stay unreadable for 5 minutes, which means it
-              # was deleted and no conclusion is ever coming.
+              # Transient errors retry; 5 minutes unreadable means the run is
+              # gone and no conclusion is coming.
               if [ -z "$STATUS" ]; then
                 UNREADABLE=$((UNREADABLE + 1))
                 if [ "$UNREADABLE" -ge 10 ]; then
@@ -436,10 +422,6 @@ jobs:
                 UNREADABLE=0
               fi
 
-              # Per-job counts rather than the run status, which reads "queued"
-              # for as long as any job is still waiting on a runner even though
-              # others have already finished. Printed every poll so the log
-              # visibly ticks: an idle log is indistinguishable from a stuck one.
               echo "run $ACTIVE after $((SECONDS / 60))m: ${PROGRESS:-progress unavailable} - $RUN_URL"
               sleep 30
             done

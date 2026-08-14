@@ -55,7 +55,11 @@ jobs:
           # This workflow and the run it is looking for start from the same
           # event, so that run may not exist yet and its gate needs a moment to
           # settle. A real run sitting on top therefore only means "nothing to
-          # discard" once it stays there.
+          # discard" once it stays there, which is what STABLE counts: 6 polls,
+          # so half a minute.
+          #
+          # 24 polls at 5s is 2 minutes, generous for a gate that takes seconds.
+          # Running out is not a failure: it leaves the PR as it is today.
           IDS=""
           FOUND=""
           STABLE=0
@@ -72,7 +76,9 @@ jobs:
               esac
             fi
 
-            { [ -n "$FOUND" ] || [ "$STABLE" -ge 6 ]; } && break
+            if [ -n "$FOUND" ] || [ "$STABLE" -ge 6 ]; then
+              break
+            fi
             sleep 5
           done
 
@@ -113,9 +119,14 @@ jobs:
           for ID in $TARGETS; do
             echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
 
+            # 36 polls at 5s is 3 minutes. An empty run has nothing to stop, so
+            # the cancel lands in seconds and this is headroom; running out just
+            # leaves the run undeleted, which is again today's behaviour.
             for _ in $(seq 1 36); do
               STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
-              [ "$STATUS" == "completed" ] && break
+              if [ "$STATUS" == "completed" ]; then
+                break
+              fi
               sleep 5
             done
 

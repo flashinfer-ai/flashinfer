@@ -75,12 +75,12 @@ It is what applies the `run-ci` label that starts CI, not the label sitting on t
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `@flashinfer-bot run` | Can label the PR | Start CI on the PR's current commit |
-| `@flashinfer-bot rerun` | Can label the PR | Cancel and rerun all workflows |
-| `@flashinfer-bot rerun failed` | Can label the PR | Rerun only failed/cancelled jobs |
-| `@flashinfer-bot stop` | Can label the PR | Cancel all in-progress workflows |
+| `@flashinfer-bot run` | Can label the PR, or `ci-users` | Start CI on the PR's current commit |
+| `@flashinfer-bot rerun` | Can label the PR, or `ci-users` | Cancel and rerun all workflows |
+| `@flashinfer-bot rerun failed` | Can label the PR, or `ci-users` | Rerun only failed/cancelled jobs |
+| `@flashinfer-bot stop` | Can label the PR, or `ci-users` | Cancel all in-progress workflows |
 
-> **Note:** Draft PRs work the same way. They never run CI on their own, but anyone who can label the PR can start a run on one when you need it.
+> **Note:** Draft PRs work the same way. They never run CI on their own, but anyone who can use the commands above can start a run on one when you need it.
 
 ## NVIDIA Internal CI (GitLab)
 
