@@ -30,8 +30,6 @@
 FP8 BMM Kernel for Blackwell (SM100) Architecture
 ==================================================
 
-Location: flashinfer/gemm/kernels/bmm_fp8_blackwell.py
-
 This module contains the base Blackwell persistent dense GEMM kernel class
 (PersistentDenseGemmKernel) that is extended by the SM107 (Rubin) kernel.
 
@@ -39,11 +37,6 @@ Key components:
 - PersistentDenseGemmKernel: Main kernel class with persistent tile scheduling
 - bmm(): Wrapper function used by cute.compile() for JIT compilation
 
-# ==============================================================================
-# UPSTREAM KERNEL CODE
-# To update: Copy the relevant classes and functions from the source file
-# Last synced: 2026-01-20
-# ==============================================================================
 """
 
 from typing import Optional, Tuple, Type, Union, Literal

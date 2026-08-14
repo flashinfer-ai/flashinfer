@@ -30,8 +30,6 @@
 FP8 BMM Kernel for Rubin (SM107) Architecture
 ==============================================
 
-Location: flashinfer/gemm/kernels/bmm_fp8_rubin.py
-
 This module contains the SM107 (Rubin) persistent dense GEMM kernel that extends
 the Blackwell kernel with SM107-specific optimizations.
 
@@ -40,11 +38,6 @@ Key components:
 - B-keep/B-reuse pattern for better memory efficiency
 - K-mode extent constraint: must be 32 or 64 for FP8 (not 128)
 
-# ==============================================================================
-# UPSTREAM KERNEL CODE
-# To update: Copy SM107PersistentDenseGemmKernel class and compile_bmm function
-# Last synced: 2026-01-20
-# ==============================================================================
 """
 
 from typing import Optional, Tuple, Type, Union, Literal

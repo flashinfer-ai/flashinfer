@@ -5,8 +5,6 @@
 FP8 Batched Matrix Multiplication (BMM) Wrapper for CuTe-DSL Kernels
 ====================================================================
 
-Location: flashinfer/gemm/kernels/bmm_fp8_wrapper.py
-
 This module provides the high-level wrapper for FP8 batched matrix multiplication
 using CuTe-DSL kernels on Rubin (SM107).
 

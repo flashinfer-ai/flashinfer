@@ -16,8 +16,6 @@
 Masked Grouped GEMM Wrapper for CuTe-DSL Kernels
 ===================================================
 
-Location: flashinfer/gemm/kernels/grouped_gemm_masked_wrapper.py
-
 This module provides the unified entry point for masked grouped GEMM
 with block-scaled inputs, supporting both Blackwell (SM100/SM103) and
 Rubin (SM107) architectures.

@@ -13,8 +13,6 @@
 Epilogue Utilities with Optimized Output Scaling
 =================================================
 
-Location: flashinfer/gemm/kernels/epilogue_utils.py
-
 Custom epilogue utility functions with optimized output scaling support.
 
 These functions are based on cutlass.utils.gemm.sm100 but modified to accept

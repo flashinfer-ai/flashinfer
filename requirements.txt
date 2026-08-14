@@ -29,10 +29,7 @@ nccl4py>=0.3.1
 ninja
 numpy
 nvidia-cudnn-frontend>=1.25.0
-# CuTe DSL floor. The SM107 kernels additionally require >= 4.8 (they use
-# cutlass.utils.rubin_helpers); they are imported lazily, so on an older DSL the
-# rest of FlashInfer works normally and only the SM107 CuTe DSL paths are absent.
-nvidia-cutlass-dsl>=4.7.0
+nvidia-cutlass-dsl==4.7.0
 nvidia-ml-py
 packaging>=24.2
 requests
