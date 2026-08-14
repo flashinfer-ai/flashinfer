@@ -2251,6 +2251,11 @@ def nvfp4_quantize_per_token_cute_dsl(
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         device capability (SM >= 9.0) when ``None``; pass ``False`` to force it
         off.
+    out_scale : torch.Tensor, optional
+        Scalar tensor (``float32``, same device) the returned
+        ``per_token_scale`` is multiplied by, folded in by the kernel so a
+        downstream output scalar needs no separate pass. Does not change
+        ``fp4_output`` or ``scale_output``.
 
     Returns
     -------
@@ -2264,7 +2269,8 @@ def nvfp4_quantize_per_token_cute_dsl(
           ``sf_layout``: ``linear`` keeps ``M`` rows, while ``128x4`` / ``8x4``
           pad rows and columns up to the layout tile.
         - ``per_token_scale`` is the per-row quantization scale of shape
-          ``[M]`` with dtype ``float32``.
+          ``[M]`` with dtype ``float32``, multiplied by ``out_scale`` when one
+          is given.
     """
     from ...utils import device_support_pdl
 
