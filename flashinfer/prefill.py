@@ -23,6 +23,21 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .jit import (
+    gen_batch_prefill_module,
+    gen_customize_batch_prefill_module,
+    gen_fmha_cutlass_sm100a_module,
+    gen_fmha_v2_module,
+    gen_single_prefill_module,
+    gen_trtllm_fmha_v2_sm120_module,
+    gen_trtllm_gen_fmha_module,
+    get_batch_prefill_uri,
+    get_single_prefill_uri,
+    setup_cubin_loader,
+)
+from .page import get_seq_lens
+from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
     gqa_paged_prefill_trace,
     gqa_ragged_prefill_trace,
@@ -34,23 +49,8 @@ from .trace.templates.gemm import (
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
-from .jit import (
-    gen_batch_prefill_module,
-    gen_customize_batch_prefill_module,
-    gen_fmha_cutlass_sm100a_module,
-    gen_fmha_v2_module,
-    gen_single_prefill_module,
-    get_batch_prefill_uri,
-    get_single_prefill_uri,
-    setup_cubin_loader,
-    gen_trtllm_gen_fmha_module,
-    gen_trtllm_fmha_v2_sm120_module,
-)
-from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
 from .utils import (
-    log2e,
+    SINGLE_KERNEL_TMP_SIZE,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -60,29 +60,29 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
-    check_shape_dtype_device,
-    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
-    _unpack_paged_kv_cache,
     _should_use_fmha_v2_sm120,
+    _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    ceil_div,
+    check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
+    get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
     is_float8,
+    is_sm12x_supported,
     is_sm100a_supported,
     is_sm110a_supported,
-    is_sm12x_supported,
+    log2e,
+    prepare_jit_additional_args,
     register_custom_op,
     register_fake_op,
-    ceil_div,
     round_up,
-    SINGLE_KERNEL_TMP_SIZE,
-    prepare_jit_additional_args,
 )
 
 
@@ -4711,6 +4711,8 @@ def trtllm_ragged_attention_deepseek(
     ] = (None, None, None, None),
     num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
     backend: str = "trtllm-gen",
+    q_seq_lens_cpu: Optional[torch.Tensor] = None,
+    kv_seq_lens_cpu: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -4777,6 +4779,16 @@ def trtllm_ragged_attention_deepseek(
         contains non-``None`` tensors.
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+    q_seq_lens_cpu : Optional[torch.Tensor]
+        Optional trusted CPU mirror of the per-row query lengths. When provided
+        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
+        all-active ragged fast path asynchronous while still compacting empty-KV
+        rows. If omitted, the wrapper derives lengths from the device indptrs
+        and may synchronize to preserve correctness for direct callers.
+        Currently only consulted by the ``trtllm-gen`` backend.
+    kv_seq_lens_cpu : Optional[torch.Tensor]
+        Optional trusted CPU mirror of the per-row KV lengths. Currently only
+        consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -4892,6 +4904,276 @@ def trtllm_ragged_attention_deepseek(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        def _validate_cpu_seq_lens(
+            lengths: torch.Tensor,
+            name: str,
+            total_tokens: int,
+            max_len: int,
+        ) -> int:
+            if lengths.device.type != "cpu":
+                raise ValueError(f"{name} must be a CPU tensor")
+            if lengths.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
+            if lengths.shape != (batch_size,):
+                raise ValueError(f"{name} must have shape ({batch_size},)")
+            if bool((lengths < 0).any().item()):
+                raise ValueError(f"{name} must contain non-negative lengths")
+
+            actual_total = int(lengths.sum().item())
+            if actual_total != total_tokens:
+                raise ValueError(
+                    f"{name} sums to {actual_total}, but expected {total_tokens} "
+                    "tokens from the corresponding ragged tensor"
+                )
+            if batch_size > 0 and int(lengths.max().item()) > max_len:
+                raise ValueError(f"{name} contains a length larger than max_len")
+            return actual_total
+
+        run_out = out
+        run_lse = lse
+        run_query = query
+        run_key = key
+        run_value = value
+        run_seq_lens = seq_lens
+        run_max_q_len = max_q_len
+        run_max_kv_len = max_kv_len
+        run_batch_size = batch_size
+        run_cum_seq_lens_q = cum_seq_lens_q
+        run_cum_seq_lens_kv = cum_seq_lens_kv
+        q_active_indices = None
+        should_launch = True
+
+        q_lens = None
+        kv_lens = None
+        q_lens_cpu = None
+        kv_lens_cpu = None
+        active_rows = None
+        has_inactive_rows = False
+        has_active_rows = True
+
+        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+            if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
+                raise ValueError(
+                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
+                )
+
+            _validate_cpu_seq_lens(
+                q_seq_lens_cpu,
+                "q_seq_lens_cpu",
+                query.shape[0],
+                max_q_len,
+            )
+            kv_total = _validate_cpu_seq_lens(
+                kv_seq_lens_cpu,
+                "kv_seq_lens_cpu",
+                key.shape[0],
+                max_kv_len,
+            )
+            if kv_total != value.shape[0]:
+                raise ValueError(
+                    "kv_seq_lens_cpu must sum to both key and value token counts"
+                )
+
+            q_lens_cpu = q_seq_lens_cpu
+            kv_lens_cpu = kv_seq_lens_cpu
+            active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+            if not bool(active_rows_cpu.all().item()):
+                has_inactive_rows = True
+                has_active_rows = bool(active_rows_cpu.any().item())
+        else:
+            if (
+                query.is_cuda
+                and hasattr(torch.cuda, "is_current_stream_capturing")
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise ValueError(
+                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided during "
+                    "CUDA graph capture"
+                )
+            q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+            kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+            active_rows = (q_lens > 0) & (kv_lens > 0)
+            has_inactive_rows = bool((~active_rows).any().item())
+            if has_inactive_rows:
+                has_active_rows = bool(active_rows.any().item())
+
+        if has_inactive_rows:
+            if isinstance(bmm1_scale, torch.Tensor) or isinstance(
+                bmm2_scale, torch.Tensor
+            ):
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when bmm scale tensors are provided."
+                )
+            if attention_sinks is not None:
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when attention sinks are provided."
+                )
+            if any(scale_tensor is not None for scale_tensor in sage_attn_sfs):
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when SageAttention scale-factor tensors are "
+                    "provided."
+                )
+
+            if not has_active_rows:
+                out.zero_()
+                if lse is not None:
+                    lse.fill_(-float("inf"))
+                should_launch = False
+            else:
+                if q_lens_cpu is not None:
+                    assert kv_lens_cpu is not None
+
+                    active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+                    q_active_mask_cpu = torch.repeat_interleave(
+                        active_rows_cpu, q_lens_cpu
+                    )
+                    q_inactive_indices_cpu = torch.nonzero(
+                        ~q_active_mask_cpu, as_tuple=False
+                    ).flatten()
+                    if q_inactive_indices_cpu.numel() > 0:
+                        q_inactive_indices = q_inactive_indices_cpu.to(
+                            query.device, non_blocking=True
+                        )
+                        out.index_fill_(0, q_inactive_indices, 0)
+                        if lse is not None:
+                            lse.index_fill_(0, q_inactive_indices, -float("inf"))
+
+                    active_indices_cpu = torch.nonzero(
+                        active_rows_cpu, as_tuple=False
+                    ).flatten()
+                    kv_active_mask_cpu = torch.repeat_interleave(
+                        active_rows_cpu, kv_lens_cpu
+                    )
+                    q_active_indices_cpu = torch.nonzero(
+                        q_active_mask_cpu, as_tuple=False
+                    ).flatten()
+                    kv_active_indices_cpu = torch.nonzero(
+                        kv_active_mask_cpu, as_tuple=False
+                    ).flatten()
+
+                    q_active_indices = q_active_indices_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    kv_active_indices = kv_active_indices_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_query = query.index_select(0, q_active_indices).contiguous()
+                    run_key = key.index_select(0, kv_active_indices).contiguous()
+                    run_value = value.index_select(0, kv_active_indices).contiguous()
+
+                    run_q_lens_cpu = q_lens_cpu.index_select(0, active_indices_cpu).to(
+                        dtype=cum_seq_lens_q.dtype
+                    )
+                    run_seq_lens_cpu = kv_lens_cpu.index_select(
+                        0, active_indices_cpu
+                    ).to(dtype=seq_lens.dtype)
+                    run_cum_seq_lens_q_cpu = torch.cat(
+                        [
+                            torch.zeros(1, dtype=cum_seq_lens_q.dtype),
+                            torch.cumsum(
+                                run_q_lens_cpu, dim=0, dtype=cum_seq_lens_q.dtype
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    run_cum_seq_lens_kv_cpu = torch.cat(
+                        [
+                            torch.zeros(1, dtype=cum_seq_lens_kv.dtype),
+                            torch.cumsum(
+                                run_seq_lens_cpu.to(dtype=cum_seq_lens_kv.dtype),
+                                dim=0,
+                                dtype=cum_seq_lens_kv.dtype,
+                            ),
+                        ],
+                        dim=0,
+                    )
+
+                    run_seq_lens = run_seq_lens_cpu.to(query.device, non_blocking=True)
+                    run_cum_seq_lens_q = run_cum_seq_lens_q_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_cum_seq_lens_kv = run_cum_seq_lens_kv_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_max_q_len = int(run_q_lens_cpu.max().item())
+                    run_max_kv_len = int(run_seq_lens_cpu.max().item())
+                    run_batch_size = int(active_indices_cpu.numel())
+                else:
+                    if q_lens is None:
+                        q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+                    if kv_lens is None:
+                        kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+                    assert active_rows is not None
+
+                    q_active_mask = torch.repeat_interleave(active_rows, q_lens)
+                    q_inactive_indices = torch.nonzero(
+                        ~q_active_mask, as_tuple=False
+                    ).flatten()
+                    if q_inactive_indices.numel() > 0:
+                        out.index_fill_(0, q_inactive_indices, 0)
+                        if lse is not None:
+                            lse.index_fill_(0, q_inactive_indices, -float("inf"))
+
+                    active_indices = torch.nonzero(
+                        active_rows, as_tuple=False
+                    ).flatten()
+                    kv_active_mask = torch.repeat_interleave(active_rows, kv_lens)
+                    kv_active_indices = torch.nonzero(
+                        kv_active_mask, as_tuple=False
+                    ).flatten()
+                    q_active_indices = torch.nonzero(
+                        q_active_mask, as_tuple=False
+                    ).flatten()
+
+                    run_query = query.index_select(0, q_active_indices).contiguous()
+                    run_key = key.index_select(0, kv_active_indices).contiguous()
+                    run_value = value.index_select(0, kv_active_indices).contiguous()
+                    run_seq_lens = kv_lens.index_select(0, active_indices).contiguous()
+                    run_q_lens = q_lens.index_select(0, active_indices).contiguous()
+                    run_cum_seq_lens_q = torch.cat(
+                        [
+                            torch.zeros(
+                                1, device=query.device, dtype=cum_seq_lens_q.dtype
+                            ),
+                            torch.cumsum(run_q_lens, dim=0, dtype=cum_seq_lens_q.dtype),
+                        ],
+                        dim=0,
+                    )
+                    run_cum_seq_lens_kv = torch.cat(
+                        [
+                            torch.zeros(
+                                1, device=query.device, dtype=cum_seq_lens_kv.dtype
+                            ),
+                            torch.cumsum(
+                                run_seq_lens, dim=0, dtype=cum_seq_lens_kv.dtype
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    run_max_q_len = int(run_q_lens.max().item())
+                    run_max_kv_len = int(run_seq_lens.max().item())
+                    run_batch_size = int(active_indices.numel())
+                run_out = torch.empty(
+                    run_query.shape[0],
+                    query.shape[1],
+                    value.shape[2],
+                    device=query.device,
+                    dtype=out.dtype,
+                )
+                run_lse = (
+                    torch.empty(
+                        run_query.shape[0],
+                        query.shape[1],
+                        device=query.device,
+                        dtype=torch.float32,
+                    )
+                    if lse is not None
+                    else None
+                )
+
         workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
         sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = (
             sage_attn_sfs
@@ -4899,38 +5181,44 @@ def trtllm_ragged_attention_deepseek(
         num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
             num_elts_per_sage_attn_blk
         )
-        run_func(
-            out,
-            query,
-            key,
-            value,
-            workspace_buffer,
-            seq_lens,
-            max_q_len,
-            max_kv_len,
-            bmm1_scale,
-            bmm2_scale,
-            o_sf_scale,
-            batch_size,
-            window_left,
-            cum_seq_lens_q,
-            cum_seq_lens_kv,
-            sm_count,
-            enable_pdl,
-            is_causal,
-            workspace_size,
-            attention_sinks,
-            skip_softmax_threshold_scale_factor,
-            lse,
-            sage_attn_sfs_q,
-            sage_attn_sfs_k,
-            sage_attn_sfs_p,
-            sage_attn_sfs_v,
-            num_elts_sage_q,
-            num_elts_sage_k,
-            num_elts_sage_p,
-            num_elts_sage_v,
-        )
+        if should_launch:
+            run_func(
+                run_out,
+                run_query,
+                run_key,
+                run_value,
+                workspace_buffer,
+                run_seq_lens,
+                run_max_q_len,
+                run_max_kv_len,
+                bmm1_scale,
+                bmm2_scale,
+                o_sf_scale,
+                run_batch_size,
+                window_left,
+                run_cum_seq_lens_q,
+                run_cum_seq_lens_kv,
+                sm_count,
+                enable_pdl,
+                is_causal,
+                workspace_size,
+                attention_sinks,
+                skip_softmax_threshold_scale_factor,
+                run_lse,
+                sage_attn_sfs_q,
+                sage_attn_sfs_k,
+                sage_attn_sfs_p,
+                sage_attn_sfs_v,
+                num_elts_sage_q,
+                num_elts_sage_k,
+                num_elts_sage_p,
+                num_elts_sage_v,
+            )
+            if q_active_indices is not None:
+                out.index_copy_(0, q_active_indices, run_out)
+                if lse is not None:
+                    assert run_lse is not None
+                    lse.index_copy_(0, q_active_indices, run_lse)
 
     if return_lse:
         assert lse is not None, (
@@ -5390,6 +5678,55 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
+def _check_paged_kv_non_interleaved(
+    k_cache: torch.Tensor, v_cache: torch.Tensor, block_tables: Optional[torch.Tensor]
+) -> None:
+    """Validate the separate-K/V paged input form.
+
+    The kernel addresses every block relative to ``k_cache``'s base pointer
+    with strides derived from shapes (never from tensor strides), so the
+    caller must supply contiguous same-shape caches whose V storage sits at a
+    positive block-aligned offset from K (one allocation), plus pre-expanded
+    ``[B, 2, M]`` block offsets whose V rows account for that offset (e.g.
+    ``page_idx + delta_blocks``).
+    """
+    if block_tables is None or block_tables.dim() != 3 or block_tables.shape[1] != 2:
+        raise ValueError(
+            "Non-interleaved paged KV (separate k_cache/v_cache tensors) requires "
+            "pre-expanded block_tables of shape [B, 2, M] with independent K and V "
+            f"block offsets; got {None if block_tables is None else tuple(block_tables.shape)}."
+        )
+    if (
+        k_cache.dim() != 4
+        or k_cache.shape != v_cache.shape
+        or k_cache.dtype != v_cache.dtype
+    ):
+        raise ValueError(
+            "Non-interleaved paged KV expects 4D k_cache/v_cache with identical shape "
+            f"and dtype; got {tuple(k_cache.shape)}/{k_cache.dtype} vs "
+            f"{tuple(v_cache.shape)}/{v_cache.dtype}."
+        )
+    if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+        raise ValueError(
+            "Non-interleaved paged KV requires contiguous k_cache/v_cache: the kernel "
+            "derives strides from shapes, not tensor strides."
+        )
+    block_bytes = k_cache[0].numel() * k_cache.element_size()
+    delta_bytes = v_cache.data_ptr() - k_cache.data_ptr()
+    if delta_bytes <= 0 or delta_bytes % block_bytes != 0:
+        raise ValueError(
+            "Non-interleaved paged KV requires V stored at a positive block-aligned "
+            f"offset from K in one allocation (v_ptr - k_ptr = {delta_bytes} "
+            f"bytes, block = {block_bytes} bytes). Pass a stacked [pages, 2, ...]"
+            "tensor instead of independently allocated K and V."
+        )
+
+
+def _check_paged_block_tables(block_tables: Optional[torch.Tensor]) -> None:
+    if block_tables is not None and block_tables.dtype != torch.int32:
+        raise ValueError(f"block_tables must be int32, got {block_tables.dtype}.")
+
+
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
@@ -5439,6 +5776,13 @@ def trtllm_fmha_v2_prefill(
           (``paged_KV[:, 0, ...]`` is key cache, ``paged_KV[:, 1, ...]`` is value cache).
         - ``Q_PAGED_KV_NHD``: same as ``Q_PAGED_KV_HND`` but paged_KV shape is
           ``[num_pages, 2, page_size, num_kv_heads, head_dim]``.
+
+          For both paged layouts, ``paged_KV`` may instead be a tuple
+          ``(k_cache, v_cache)`` of separate 4D tensors (non-interleaved). This
+          requires pre-expanded ``block_tables`` of shape ``[B, 2, M]`` holding
+          independent K and V block offsets relative to ``k_cache``'s base
+          pointer (K and V must live in one allocation at block-aligned
+          positions).
         - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
@@ -5461,8 +5805,16 @@ def trtllm_fmha_v2_prefill(
     cum_seq_lens_kv
         The cumulative sequence lengths for KV cache, shape: ``[batch_size + 1]``.
     block_tables
-        The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
-        Required when using paged KV cache format.
+        The page table mapping each sequence to its KV cache pages. Required
+        for the paged KV layouts. Its expected shape depends on the form of
+        the paged KV data tensor passed in ``qkv``
+        - Stacked pool (single 5D ``paged_KV`` tensor): shape
+          ``[batch_size, max_num_pages_per_seq]`` of logical page indices,
+          each shared by K and V of that page.
+        - Separate ``(k_cache, v_cache)`` tensors: pre-expanded shape
+          ``[batch_size, 2, max_num_pages_per_seq]``, where ``[:, 0, :]``
+          holds K block offsets and ``[:, 1, :]`` holds V block offsets,
+          both relative to ``k_cache``'s base pointer in units of blocks.
     out
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
@@ -5519,26 +5871,40 @@ def trtllm_fmha_v2_prefill(
             )
         k_cache = kv_cache
         v_cache = kv_cache  # placeholder (not used for this layout)
-    elif input_layout == "Q_PAGED_KV_NHD":
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
-    elif input_layout == "Q_PAGED_KV_HND":
-        assert isinstance(qkv, tuple)
-        query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
+        _check_paged_block_tables(block_tables)
         if block_tables is None:
+            # The kernel dereferences the block-offsets pointer unconditionally
+            # for paged layouts; there is no contiguous fallback.
             raise ValueError(
-                "block_tables is required for Q_PAGED_KV_HND input layout."
+                f"block_tables is required for the {input_layout} input layout."
             )
+        if block_tables.shape[0] != batch_size:
+            raise ValueError(
+                f"block_tables batch dimension ({block_tables.shape[0]}) does "
+                f"not match batch_size ({batch_size})."
+            )
+        if isinstance(paged_kv, tuple):
+            # Requires pre-expanded [B, 2, M] block_tables so the kernel can
+            # address V's blocks relative to K's base pointer.
+            k_cache, v_cache = paged_kv
+            _check_paged_kv_non_interleaved(k_cache, v_cache, block_tables)
+        else:
+            if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
+                raise ValueError(
+                    f"{input_layout} expects paged_KV shape [pages, 2, ...] "
+                    "(page_size/num_kv_heads per layout order), got "
+                    f"{tuple(paged_kv.shape)}"
+                )
+            if block_tables is not None and block_tables.dim() != 2:
+                raise ValueError(
+                    "Stacked paged_KV uses shared [B, M] block_tables; got "
+                    f"{tuple(block_tables.shape)}. Pre-expanded [B, 2, M] "
+                    "offsets are only valid with separate (k_cache, v_cache)."
+                )
+            k_cache, v_cache = paged_kv.unbind(dim=1)
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]

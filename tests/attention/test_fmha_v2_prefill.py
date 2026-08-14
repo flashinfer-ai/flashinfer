@@ -851,6 +851,115 @@ def test_trtllm_fmha_v2_prefill(
     )
 
 
+@pytest.mark.parametrize("input_layout", ["Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"])
+@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
+    input_layout: str,
+    page_size: int,
+    dtype: torch.dtype,
+    num_kv_heads: int,
+) -> None:
+    """Parity test for the non-interleaved paged-KV path: passing separate
+    (k_cache, v_cache) tensors with pre-expanded [B, 2, M] block tables must
+    match the stacked [num_pages, 2, ...] pool with shared [B, M] tables."""
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm12x_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    batch_size = 4
+    max_seq_len = 1024
+    num_qo_heads = 8
+    head_dim = 128
+
+    seq_lens = torch.randint(
+        max_seq_len // 2,
+        max_seq_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_kv_len = seq_lens.max().item()
+    max_q_len = max_kv_len
+    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    total_tokens = cum_seq_lens[-1].item()
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    is_nhd = input_layout == "Q_PAGED_KV_NHD"
+    max_num_blocks = (max_kv_len + page_size - 1) // page_size
+    num_pages = batch_size * max_num_blocks
+    paged_shape = (
+        (num_pages, 2, page_size, num_kv_heads, head_dim)
+        if is_nhd
+        else (num_pages, 2, num_kv_heads, page_size, head_dim)
+    )
+    paged = torch.randn(*paged_shape, dtype=dtype, device=device)
+    q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    block_tables = torch.zeros(
+        batch_size, max_num_blocks, dtype=torch.int32, device=device
+    )
+    for i in range(batch_size):
+        num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
+        block_tables[i, :num_blocks_needed] = torch.arange(
+            i * max_num_blocks,
+            i * max_num_blocks + num_blocks_needed,
+            device=device,
+        )
+
+    workspace_buffer = _get_workspace_buffer()
+
+    def run(qkv_arg, tables):
+        out = torch.zeros(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        return trtllm_fmha_v2_prefill(
+            qkv_arg,
+            input_layout,
+            workspace_buffer=workspace_buffer,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=sm_scale,
+            bmm2_scale=1.0,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens,
+            cum_seq_lens_kv=cum_seq_lens,
+            block_tables=tables,
+            out=out,
+            out_dtype=dtype,
+            mask_mode="CAUSAL",
+            window_left=-1,
+        )
+
+    # Trusted path: stacked [num_pages, 2, ...] pool + shared [B, M] tables.
+    out_stacked = run((q, paged), block_tables)
+
+    # Non-interleaved path: K and V as block-aligned halves of one allocation,
+    # with pre-expanded [B, 2, M] tables (V offsets shifted by delta blocks).
+    fused = torch.empty(2, *paged[:, 0].shape, dtype=dtype, device=device)
+    fused[0].copy_(paged[:, 0])
+    fused[1].copy_(paged[:, 1])
+    k_cache, v_cache = fused[0], fused[1]  # delta == num_pages
+    kv_tables = torch.stack(
+        [block_tables, block_tables + num_pages], dim=1
+    ).int()  # [B, 2, M]
+
+    out_separate = run((q, (k_cache, v_cache)), kv_tables)
+
+    torch.testing.assert_close(
+        out_separate.float(), out_stacked.float(), rtol=1e-3, atol=1e-3
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("num_qo_heads", [8])
