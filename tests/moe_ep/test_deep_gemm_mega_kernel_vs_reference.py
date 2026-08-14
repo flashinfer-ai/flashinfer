@@ -232,11 +232,14 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
     import deep_gemm
     import torch.distributed as dist
 
-    from flashinfer.moe_ep import DeepGemmMegaMoeConfig, preprocess_mega_weights
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+    from flashinfer.moe_ep import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 
@@ -291,7 +294,7 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
 
         y_kernel = torch.empty(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
         kernel = DeepGemmMegaKernelBackend(
-            DeepGemmMegaMoeConfig(
+            Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
                 top_k=TOP_K,
                 activation_clamp=CLAMP,

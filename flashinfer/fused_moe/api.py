@@ -999,10 +999,10 @@ class MoEActivationPack:
       selection on the host and passes ``topk_ids`` + ``topk_weights``.
       The TRTLLM runners normally combine both fields into one packed ``int32``
       tensor before launch.
-    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
-      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
-      BF16 or FP32 weights directly, avoiding packed-id construction. The
-      launcher consumes the weights in their native dtype.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
+      by the TRTLLM runners. The caller supplies ``int32`` ids and BF16 or FP32
+      weights directly, avoiding packed-id construction. The launcher consumes
+      the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -1025,7 +1025,7 @@ class MoEActivationPack:
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
-    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    # float32 for TRTLLM UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
     # Per-token NVFP4 row scale, shape [M].
     per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
