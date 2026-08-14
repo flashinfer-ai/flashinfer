@@ -3297,14 +3297,17 @@ def trtllm_batch_decode_with_kv_cache(
         ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
         enables DCP + speculative decoding without a per-row length tensor.
 
-        The current native Cake FMHA path requires BF16 Q/K/V/O, HND page size 16,
-        head dimension 128, uniform ``q_len_per_req`` in ``{1,2,4,5,6,8}``,
-        causal attention, ``return_lse=True`` (or a caller-owned ``lse``), and
-        head group ratio in ``[1,8]``. Its LSE is FP32 base-2, matching the
-        existing TRT-LLM backend contract. Here ``max_seq_len`` is the maximum
-        compact rank-local stored length; it may be zero for an entirely empty
-        rank, while ``block_tables`` still supplies one masked physical page
-        slot. Long-context Split-KV uses
+        The native Cake FMHA path requires BF16 Q/O, head dimension 128,
+        causal HND paging, ``return_lse=True`` (or a caller-owned ``lse``), and
+        head group ratio in ``[1,8]``. BF16 KV uses page size 16 and
+        ``q_len_per_req`` in ``{1,2,4,5,6,8}``; FP8 e4m3 KV uses page size 64
+        and also supports ``q_len_per_req=3``. ``bmm1_scale`` is the fused QK
+        scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV requires
+        ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing TRT-LLM
+        backend contract. Here ``max_seq_len`` is the maximum compact
+        rank-local stored length; it may be zero for an entirely empty rank,
+        while ``block_tables`` still supplies one masked physical page slot.
+        Long-context BF16 Split-KV uses
         ``workspace_buffer`` for partials and requires a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
         completion tickets after every launch. Prewarm a fixed tensor/layout
@@ -3379,7 +3382,8 @@ def trtllm_batch_decode_with_kv_cache(
             )
         if is_nvfp4_kvcache or kv_cache_sf is not None:
             raise ValueError(
-                "DCP speculative decode currently supports BF16 KV cache only"
+                "DCP speculative decode supports BF16 or FP8 e4m3 KV cache, "
+                "but not NVFP4 or block scale tensors"
             )
         if q_len_per_req is None:
             raise ValueError("DCP speculative decode requires uniform q_len_per_req")
@@ -3412,8 +3416,6 @@ def trtllm_batch_decode_with_kv_cache(
             raise TypeError(
                 "DCP speculative decode requires host scalar bmm1/bmm2 scales"
             )
-        if float(bmm2_scale) != 1.0:
-            raise ValueError("DCP speculative decode currently requires bmm2_scale=1.0")
         if o_scale is not None and float(o_scale) != 1.0:
             raise ValueError("DCP speculative decode currently requires o_scale=1.0")
         if o_sf_scale is not None or o_sf_vec_size is not None:
@@ -3448,7 +3450,8 @@ def trtllm_batch_decode_with_kv_cache(
             seq_lens=seq_lens,
             causal_seqlens_kv_global=causal_seqlens_kv_global,
             max_local_seq_len=max_seq_len,
-            sm_scale=float(bmm1_scale),
+            bmm1_scale=float(bmm1_scale),
+            bmm2_scale=float(bmm2_scale),
             cp_world=cp_world,
             cp_rank=cp_rank,
             q_len_per_req=q_len_per_req,

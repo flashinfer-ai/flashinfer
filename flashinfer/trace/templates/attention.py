@@ -2656,8 +2656,9 @@ trtllm_batch_decode_dcp_spec_trace = TraceTemplate(
     op_type="trtllm_paged_dcp_spec",
     name_prefix="trtllm_batch_decode_dcp_spec",
     description=(
-        "SM100/SM103 BF16 paged GQA decode with round-robin DCP ownership "
+        "SM100/SM103 BF16-Q paged GQA decode with round-robin DCP ownership "
         "and a row-dependent global causal bound for speculative queries. "
+        "KV is either BF16/page16 or FP8 e4m3/page64. "
         "This form describes a combined K/V cache tensor. The operation "
         "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
     ),
@@ -2668,11 +2669,12 @@ trtllm_batch_decode_dcp_spec_trace = TraceTemplate(
         "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
     },
     constraints=[
-        "q_len_per_req in [1, 2, 4, 5, 6, 8]",
+        "q_len_per_req in [1, 2, 3, 4, 5, 6, 8]",
         "cp_world in [1, 2, 4, 8]",
         "0 <= cp_rank < cp_world",
         "head_dim == 128",
-        "page_size == 16",
+        "page_size in [16, 64]",
+        "q_len_per_req != 3 or page_size == 64",
     ],
     tags=["status:verified", "stage:decode", "backend:dcp-spec"],
 )
@@ -2682,8 +2684,9 @@ trtllm_batch_decode_dcp_spec_split_kv_trace = TraceTemplate(
     op_type="trtllm_paged_dcp_spec",
     name_prefix="trtllm_batch_decode_dcp_spec_split_kv",
     description=(
-        "SM100/SM103 BF16 paged GQA decode with round-robin DCP ownership "
+        "SM100/SM103 BF16-Q paged GQA decode with round-robin DCP ownership "
         "and a row-dependent global causal bound for speculative queries. "
+        "KV is either BF16/page16 or FP8 e4m3/page64. "
         "This form describes the public (K, V) cache tuple. The operation "
         "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
     ),
@@ -2730,7 +2733,9 @@ trtllm_batch_decode_dcp_spec_split_kv_trace = TraceTemplate(
             "float32", optional=True, description="Scale applied after Q @ K^T."
         ),
         "bmm2_scale": Scalar(
-            "float32", optional=True, description="Must be 1.0 for this path."
+            "float32",
+            optional=True,
+            description="FP8 V/output scale; must be 1.0 for BF16 KV.",
         ),
         "causal_seqlens_kv_global": Tensor(
             ["batch_size"],
@@ -2751,11 +2756,12 @@ trtllm_batch_decode_dcp_spec_split_kv_trace = TraceTemplate(
         "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
     },
     constraints=[
-        "q_len_per_req in [1, 2, 4, 5, 6, 8]",
+        "q_len_per_req in [1, 2, 3, 4, 5, 6, 8]",
         "cp_world in [1, 2, 4, 8]",
         "0 <= cp_rank < cp_world",
         "head_dim == 128",
-        "page_size == 16",
+        "page_size in [16, 64]",
+        "q_len_per_req != 3 or page_size == 64",
     ],
     tags=["status:verified", "stage:decode", "backend:dcp-spec"],
 )

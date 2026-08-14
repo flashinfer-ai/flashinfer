@@ -31,12 +31,14 @@ from .utils import (
 
 _BLOCK_N = 128
 _HEAD_DIM = 128
-_PAGE_SIZE = 16
+_BF16_PAGE_SIZE = 16
+_FP8_PAGE_SIZE = 64
 _MAX_NUM_SPLIT = 16
 _MIN_SPLIT_LOCAL_BLOCKS = 16
 _TARGET_PAIRS_PER_SPLIT = 3
 _RETAIN_KV_L2_MAX_BLOCKS = 9
-_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
+_BF16_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
+_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
@@ -135,14 +137,22 @@ def _validate_core_inputs(
     q_len_per_req: int,
     cp_world: int,
     cp_rank: int,
-) -> tuple[int, int]:
-    if (
-        query.dtype != torch.bfloat16
-        or k_cache.dtype != torch.bfloat16
-        or v_cache.dtype != torch.bfloat16
-    ):
+) -> tuple[int, int, str, int]:
+    if query.dtype != torch.bfloat16:
+        raise TypeError("DCP speculative FMHA requires a BF16 query tensor")
+    if k_cache.dtype != v_cache.dtype:
+        raise TypeError("DCP speculative FMHA key and value dtypes must match")
+    if k_cache.dtype == torch.bfloat16:
+        profile = "bf16_p16"
+        page_size_required = _BF16_PAGE_SIZE
+        supported_q_lens = _BF16_SUPPORTED_Q_LENS
+    elif k_cache.dtype == torch.float8_e4m3fn:
+        profile = "fp8_p64"
+        page_size_required = _FP8_PAGE_SIZE
+        supported_q_lens = _FP8_SUPPORTED_Q_LENS
+    else:
         raise TypeError(
-            "DCP speculative FMHA requires BF16 query, key, and value tensors"
+            "DCP speculative FMHA requires BF16 or float8_e4m3fn key/value tensors"
         )
     if query.ndim != 3:
         raise ValueError(
@@ -156,8 +166,10 @@ def _validate_core_inputs(
             f"got {tuple(query.shape)}, expected tokens={batch_size * q_len_per_req} "
             f"and head_dim={_HEAD_DIM}"
         )
-    if q_len_per_req not in _SUPPORTED_Q_LENS:
-        raise ValueError(f"q_len_per_req must be one of {_SUPPORTED_Q_LENS}")
+    if q_len_per_req not in supported_q_lens:
+        raise ValueError(
+            f"q_len_per_req must be one of {supported_q_lens} for the {profile} profile"
+        )
     if cp_world not in _SUPPORTED_CP_WORLDS:
         raise ValueError(f"cp_world must be one of {_SUPPORTED_CP_WORLDS}")
     if not 0 <= cp_rank < cp_world:
@@ -165,14 +177,15 @@ def _validate_core_inputs(
     if k_cache.ndim != 4 or v_cache.ndim != 4:
         raise ValueError(
             "DCP speculative FMHA HND caches must have shape "
-            "[num_pages, num_kv_heads, 16, 128]"
+            "[num_pages, num_kv_heads, page_size, 128]"
         )
     if k_cache.shape != v_cache.shape:
         raise ValueError("key and value cache shapes must match")
     _, num_kv_heads, page_size, kv_head_dim = k_cache.shape
-    if page_size != _PAGE_SIZE or kv_head_dim != _HEAD_DIM:
+    if page_size != page_size_required or kv_head_dim != _HEAD_DIM:
         raise ValueError(
-            "DCP speculative FMHA requires HND page_size=16 and head_dim=128, "
+            f"DCP speculative FMHA {profile} requires HND "
+            f"page_size={page_size_required} and head_dim=128, "
             f"got page_size={page_size}, head_dim={kv_head_dim}"
         )
     if num_qo_heads % num_kv_heads != 0:
@@ -227,7 +240,7 @@ def _validate_core_inputs(
         )
     if not causal_seqlens_kv_global.is_contiguous():
         raise ValueError("causal_seqlens_kv_global must be contiguous")
-    return num_qo_heads, num_kv_heads
+    return num_qo_heads, num_kv_heads, profile, page_size_required
 
 
 def run_dcp_spec_decode(
@@ -239,7 +252,8 @@ def run_dcp_spec_decode(
     seq_lens: torch.Tensor,
     causal_seqlens_kv_global: torch.Tensor,
     max_local_seq_len: int,
-    sm_scale: float,
+    bmm1_scale: float,
+    bmm2_scale: float,
     cp_world: int,
     cp_rank: int,
     q_len_per_req: int,
@@ -252,7 +266,7 @@ def run_dcp_spec_decode(
     if q_len_per_req <= 0 or query.shape[0] % q_len_per_req != 0:
         raise ValueError("query token count must be divisible by q_len_per_req")
     batch_size = query.shape[0] // q_len_per_req
-    num_qo_heads, num_kv_heads = _validate_core_inputs(
+    num_qo_heads, num_kv_heads, profile, page_size = _validate_core_inputs(
         query,
         k_cache,
         v_cache,
@@ -270,26 +284,70 @@ def run_dcp_spec_decode(
         raise ValueError(
             f"max_local_seq_len must be nonnegative, got {max_local_seq_len}"
         )
-    local_capacity = block_tables.shape[1] * _PAGE_SIZE
+    local_capacity = block_tables.shape[1] * page_size
     if max_local_seq_len > local_capacity:
         raise ValueError(
             "max_local_seq_len exceeds the rank-local page-table capacity: "
             f"got {max_local_seq_len}, capacity={local_capacity}"
         )
 
+    if not math.isfinite(float(bmm1_scale)) or not math.isfinite(float(bmm2_scale)):
+        raise ValueError(
+            "DCP speculative FMHA bmm1_scale and bmm2_scale must be finite"
+        )
+
     sm_count = get_device_sm_count(query.device)
     logical_tiles = batch_size * q_len_per_req * num_kv_heads
+    target = _select_target(query.device)
+    softmax_scale_log2 = float(bmm1_scale) / math.log(2.0)
+    max_pages_per_seq = block_tables.shape[1]
+
+    if profile == "fp8_p64":
+        from .jit.dcp import load_dcp_spec_fp8_module
+
+        module = load_dcp_spec_fp8_module(
+            target,
+            batch_size,
+            q_len_per_req,
+            num_qo_heads,
+            num_kv_heads,
+            cp_world,
+        )
+        grid = min(sm_count, logical_tiles)
+        module.run(
+            query,
+            k_cache.view(torch.uint8),
+            v_cache.view(torch.uint8),
+            out,
+            lse,
+            block_tables,
+            seq_lens,
+            causal_seqlens_kv_global,
+            max_pages_per_seq,
+            max_local_seq_len,
+            softmax_scale_log2,
+            float(bmm2_scale),
+            cp_rank,
+            num_qo_heads,
+            num_kv_heads,
+            batch_size,
+            grid,
+            1,
+            1,
+        )
+        return
+
+    if float(bmm2_scale) != 1.0:
+        raise ValueError("the BF16/page16 DCP profile requires bmm2_scale=1.0")
+
     local_blocks = max(1, (max_local_seq_len + _BLOCK_N - 1) // _BLOCK_N)
     num_split = _select_num_split(
         logical_tiles=logical_tiles,
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    target = _select_target(query.device)
     from .jit.dcp import load_dcp_spec_module
 
-    softmax_scale_log2 = float(sm_scale) / math.log(2.0)
-    max_pages_per_seq = block_tables.shape[1]
     if num_split == 1:
         retain_kv_l2 = int(local_blocks <= _RETAIN_KV_L2_MAX_BLOCKS)
         module = load_dcp_spec_module(

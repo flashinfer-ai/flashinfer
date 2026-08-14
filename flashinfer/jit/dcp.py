@@ -37,6 +37,7 @@ _DCP_SPEC_NVCC_FLAGS = {
     "sm100f": sm100f_nvcc_flags,
 }
 _SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
+_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
@@ -122,6 +123,58 @@ def get_dcp_spec_uri(
     )
 
 
+def _validate_fp8_specialization(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+) -> None:
+    if target not in _DCP_SPEC_NVCC_FLAGS:
+        raise ValueError(f"unsupported DCP speculative FMHA target: {target}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if q_len not in _FP8_SUPPORTED_Q_LENS:
+        raise ValueError(f"q_len must be one of {_FP8_SUPPORTED_Q_LENS}, got {q_len}")
+    if cp_world not in _SUPPORTED_CP_WORLDS:
+        raise ValueError(
+            f"cp_world must be one of {_SUPPORTED_CP_WORLDS}, got {cp_world}"
+        )
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            "num_q_heads must be divisible by num_kv_heads for GQA: "
+            f"got {num_q_heads} and {num_kv_heads}"
+        )
+    group_ratio = num_q_heads // num_kv_heads
+    if not 1 <= group_ratio <= 8:
+        raise ValueError(f"head group ratio must be in [1, 8], got {group_ratio}")
+
+
+def get_dcp_spec_fp8_uri(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+) -> str:
+    _validate_fp8_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+    )
+    return (
+        f"cake_fmha_dcp_spec_bf16_fp8_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}_cp{cp_world}"
+    )
+
+
 @functools.cache
 def gen_dcp_spec_module(
     variant: DcpSpecVariant,
@@ -172,6 +225,50 @@ def gen_dcp_spec_module(
 
 
 @functools.cache
+def gen_dcp_spec_fp8_module(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+) -> JitSpec:
+    """Generate one BF16-Q/FP8-KV, HND-page64 Cake FMHA module."""
+
+    uri = get_dcp_spec_fp8_uri(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+    )
+    csrc_dir = _get_csrc_dir()
+    body = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8.cu"
+    binding = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
+    for source in (body, binding):
+        if not source.exists():
+            raise FileNotFoundError(f"DCP speculative FMHA source not found: {source}")
+
+    spec = gen_jit_spec(
+        name=uri,
+        sources=[body, binding],
+        extra_cuda_cflags=[
+            *_DCP_SPEC_NVCC_FLAGS[target],
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DQ_LEN={q_len}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCP_WORLD={cp_world}",
+        ],
+        extra_include_paths=[csrc_dir],
+        extra_ldflags=["-lcuda"],
+    )
+    logger.info(f"Generated FP8 DCP speculative FMHA JIT spec: {spec.name}")
+    return spec
+
+
+@functools.cache
 def load_dcp_spec_module(
     variant: DcpSpecVariant,
     target: DcpSpecTarget,
@@ -196,10 +293,34 @@ def load_dcp_spec_module(
     return module
 
 
+@functools.cache
+def load_dcp_spec_fp8_module(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+):
+    module = gen_dcp_spec_fp8_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+    ).build_and_load()
+    logger.info(f"Loaded FP8 DCP speculative FMHA module: {module}")
+    return module
+
+
 __all__ = [
     "DcpSpecTarget",
     "DcpSpecVariant",
+    "gen_dcp_spec_fp8_module",
     "gen_dcp_spec_module",
+    "get_dcp_spec_fp8_uri",
     "get_dcp_spec_uri",
+    "load_dcp_spec_fp8_module",
     "load_dcp_spec_module",
 ]
