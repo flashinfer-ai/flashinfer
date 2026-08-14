@@ -119,7 +119,7 @@ def _build_layer(
         MegaConfig,
         MoEEpLayer,
         MoEWeightPack,
-        Sm90PushFp8MegaMoeConfig,
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
     total_experts = LOCAL_EXPERTS * world_size
@@ -147,7 +147,7 @@ def _build_layer(
             w2=w2[local_start:local_end].contiguous(),
         ),
         backend=MegaConfig(
-            megakernel=Sm90PushFp8MegaMoeConfig(
+            megakernel=Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
                 top_k=TOP_K,
                 capacity_factor=capacity_factor,

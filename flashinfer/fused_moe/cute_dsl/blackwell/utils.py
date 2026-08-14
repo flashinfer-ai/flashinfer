@@ -114,6 +114,18 @@ def tanh_f32(
     ) - cutlass.Float32(1.0)
 
 
+def f32_reciprocal(value: float) -> float:
+    """Return ``1 / fp32(value)``, rounded to fp32.
+
+    The reciprocal must come from the same fp32 value the kernel multiplies back
+    in.  Taking it from the unrounded Python float instead can differ by 1 ulp for
+    betas that are not fp32-exact.  (f64 carries at least 2p+2 bits for p=24, so
+    computing the quotient in f64 and rounding once to fp32 is correctly rounded.)
+    """
+    beta_f32 = ctypes.c_float(float(value)).value
+    return ctypes.c_float(1.0 / beta_f32).value
+
+
 def situ_f32(
     a: Union[float, cutlass.Float32],
     beta: Union[float, cutlass.Float32],
@@ -122,9 +134,15 @@ def situ_f32(
     """Compute SiTU: beta * tanh(x / beta) * sigmoid(x)."""
     x = cutlass.Float32(a)
     beta_f32 = cutlass.Float32(beta)
+    # Multiply by the reciprocal: `x / beta` is a per-element div.rn.f32 the backend
+    # cannot strength-reduce (1/25.0 is inexact) nor hoist (varying numerator).
+    if isinstance(beta, (float, int)):
+        inv_beta = cutlass.Float32(f32_reciprocal(beta))
+    else:
+        inv_beta = cutlass.Float32(1.0) / beta_f32
     return (
         beta_f32
-        * tanh_f32(x / beta_f32, fastmath=fastmath)
+        * tanh_f32(x * inv_beta, fastmath=fastmath)
         * sigmoid_f32(x, fastmath=fastmath)
     )
 
