@@ -50,18 +50,18 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     expected_variants = {
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
-            "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
-            "19da7badad004917aea7df2cf89d04b49685a2ba04701221b2fb6d7a0c974598",
-            "flashkda_bf16_fused_m128_5527c05f05",
-            169299,
+            "dceabe1d8bf0ff5f477051c5d61c653b05f5f0f03cfd927b8b211d0ff7cad9c6",
+            "06aaae77a4c3763b94d14ebc90af2b35a48955ec8e9ebc4c740b8ebb8f3d07d0",
+            "flashkda_bf16_fused_m128_1c2da3341d",
+            170408,
             219136,
         ),
         "n32": (
             "flashkda_bf16_fused_m128.cu",
-            "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
-            "b291f299745c6b19c8df07563c9a847a620f35c3d190238a23bdd8d1e06eb5cd",
-            "flashkda_bf16_fused_m128_123cfd2bfa",
-            168024,
+            "9b42083740214803ec5d40320bf5ab04ac8cb90470607c68291ecb32d30e08dd",
+            "567683451b85b83a386cbb10e9f714dce30f3f30668f55e8331ee58269a2d9d2",
+            "flashkda_bf16_fused_m128_4fdc170c42",
+            169133,
             227328,
         ),
     }
@@ -153,15 +153,15 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
         (
             "m128",
             227328,
-            "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
-            "123cfd2bfa",
+            "9b42083740214803ec5d40320bf5ab04ac8cb90470607c68291ecb32d30e08dd",
+            "4fdc170c42",
             True,
         ),
         (
             "m128_n16",
             219136,
-            "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
-            "5527c05f05",
+            "dceabe1d8bf0ff5f477051c5d61c653b05f5f0f03cfd927b8b211d0ff7cad9c6",
+            "1c2da3341d",
             True,
         ),
     ],
@@ -329,6 +329,14 @@ def test_flash_kda_uri_and_jit_spec(
         assert "TensorView state_checkpoints" in binding_text
         assert "int64_t beta_token_stride" in binding_text
         assert "int64_t checkpoint_every_n_tokens" in binding_text
+        assert "reinterpret_cast<uintptr_t>(state_indices.data_ptr())" in binding_text
+        assert (
+            "reinterpret_cast<uintptr_t>(state_checkpoints.data_ptr())" in binding_text
+        )
+        assert (
+            "reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())"
+            in binding_text
+        )
         assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in (
             binding_text
         )
@@ -424,12 +432,12 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     n16_sm103a = flash_kda.gen_flash_kda_module("m128_n16", "sm103a")
 
     assert sm100a is not sm103a
-    assert sm100a.name == "flash_kda_bf16_fused_m128_123cfd2bfa_sm100a"
-    assert sm103a.name == "flash_kda_bf16_fused_m128_123cfd2bfa_sm103a"
+    assert sm100a.name == "flash_kda_bf16_fused_m128_4fdc170c42_sm100a"
+    assert sm103a.name == "flash_kda_bf16_fused_m128_4fdc170c42_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_5527c05f05_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_5527c05f05_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_1c2da3341d_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_1c2da3341d_sm103a"
 
 
 @pytest.mark.parametrize(

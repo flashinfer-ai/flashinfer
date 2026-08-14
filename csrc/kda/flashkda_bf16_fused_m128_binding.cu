@@ -106,18 +106,17 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
-      reinterpret_cast<int*>(state_indices.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
       reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.out),
-      reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(state_checkpoints.data_ptr()),
-      reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
-      static_cast<int32_t>(num_heads), static_cast<int64_t>(beta_token_stride),
-      static_cast<int64_t>(state_slot_stride), static_cast<int32_t>(use_state_indices),
+      reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
-      static_cast<int32_t>(checkpoint_every_n_tokens), static_cast<float>(scale),
-      static_cast<float>(lower_bound));
+      static_cast<float>(scale), static_cast<float>(lower_bound),
+      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(state_indices.data_ptr())),
+      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(state_checkpoints.data_ptr())),
+      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())),
+      static_cast<int64_t>(beta_token_stride), static_cast<int64_t>(state_slot_stride),
+      static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens));
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 launch");
 }
 

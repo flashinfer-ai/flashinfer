@@ -16,8 +16,8 @@
 
 // Frozen generated Loom export; do not edit by hand.
 // Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module
-// flashkda_bf16_fused_m128_123cfd2bfa; raw SHA-256:
-// 872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf.
+// flashkda_bf16_fused_m128_4fdc170c42; raw SHA-256:
+// 9b42083740214803ec5d40320bf5ab04ac8cb90470607c68291ecb32d30e08dd.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -505,7 +505,7 @@ extern "C" {
 
 __global__ __launch_bounds__(1024) void
 // FLASHINFER INTEGRATION BEGIN: allow exact state alias
-kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, LoomTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, LoomTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, LoomTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, LoomTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, int* __restrict__ state_indices, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, LoomTensorMap const* out_tma, __nv_bfloat16* final_state, __nv_bfloat16* __restrict__ state_checkpoints, long long* __restrict__ checkpoint_cu_starts, int num_heads, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int use_initial_state, int store_final_state, int checkpoint_every_n_tokens, float scale, float lower_bound)
+kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, LoomTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, LoomTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, LoomTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, LoomTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, LoomTensorMap const* out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens)
 // FLASHINFER INTEGRATION END: allow exact state alias
 {
     const int tid = threadIdx.x;
@@ -741,11 +741,14 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
             int state_row = warp_in_wg * 32 + lane;
             int warp_id_in_role = (warp - 0);
             int compute_local_warp = warp_id_in_role;
-            int state_slot = seq_idx;
-            if (use_state_indices != 0) {
-                state_slot = state_indices[seq_idx];
+            long long state_base = (((long long)seq_idx * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
+            {
+                int state_slot = seq_idx;
+                if (use_state_indices != 0) {
+                    state_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx];
+                }
+                state_base = (long long)state_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
             }
-            long long state_base = (long long)state_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
             #pragma unroll
             for (int state_col_block = 0; state_col_block < 4; state_col_block++) {
                 float state_frag[32];
@@ -824,37 +827,39 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block * 32), state_frag);
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-            if (checkpoint_every_n_tokens != 0) {
-                long long checkpoint_base = ((checkpoint_cu_starts[seq_idx] * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
-                #pragma unroll
-                for (int state_col_block_1 = 0; state_col_block_1 < 4; state_col_block_1++) {
-                    float _tmem_load_0[32];
-                    tmem_ld_x32(&_tmem_load_0[0], taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_1 * 32));
-                    {
-                        __nv_bfloat162 _pk[8];
-                        _pk[0] = __floats2bfloat162_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(_tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(_tmem_load_0[0 + 4], _tmem_load_0[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(_tmem_load_0[0 + 6], _tmem_load_0[0 + 7]);
-                        _pk[4] = __floats2bfloat162_rn(_tmem_load_0[0 + 8], _tmem_load_0[0 + 9]);
-                        _pk[5] = __floats2bfloat162_rn(_tmem_load_0[0 + 10], _tmem_load_0[0 + 11]);
-                        _pk[6] = __floats2bfloat162_rn(_tmem_load_0[0 + 12], _tmem_load_0[0 + 13]);
-                        _pk[7] = __floats2bfloat162_rn(_tmem_load_0[0 + 14], _tmem_load_0[0 + 15]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base + (long long)(state_col_block_1 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base + (long long)(state_col_block_1 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
-                    }
-                    {
-                        __nv_bfloat162 _pk[8];
-                        _pk[0] = __floats2bfloat162_rn(_tmem_load_0[16 + 0], _tmem_load_0[16 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(_tmem_load_0[16 + 2], _tmem_load_0[16 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(_tmem_load_0[16 + 4], _tmem_load_0[16 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(_tmem_load_0[16 + 6], _tmem_load_0[16 + 7]);
-                        _pk[4] = __floats2bfloat162_rn(_tmem_load_0[16 + 8], _tmem_load_0[16 + 9]);
-                        _pk[5] = __floats2bfloat162_rn(_tmem_load_0[16 + 10], _tmem_load_0[16 + 11]);
-                        _pk[6] = __floats2bfloat162_rn(_tmem_load_0[16 + 12], _tmem_load_0[16 + 13]);
-                        _pk[7] = __floats2bfloat162_rn(_tmem_load_0[16 + 14], _tmem_load_0[16 + 15]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base + (long long)(state_col_block_1 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base + (long long)(state_col_block_1 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+            {
+                if (checkpoint_every_n_tokens != 0) {
+                    long long checkpoint_base = ((reinterpret_cast<long long*>(checkpoint_cu_starts_addr)[seq_idx] * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
+                    #pragma unroll
+                    for (int state_col_block_1 = 0; state_col_block_1 < 4; state_col_block_1++) {
+                        float _tmem_load_0[32];
+                        tmem_ld_x32(&_tmem_load_0[0], taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_1 * 32));
+                        {
+                            __nv_bfloat162 _pk[8];
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_0[0 + 4], _tmem_load_0[0 + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_0[0 + 6], _tmem_load_0[0 + 7]);
+                            _pk[4] = __floats2bfloat162_rn(_tmem_load_0[0 + 8], _tmem_load_0[0 + 9]);
+                            _pk[5] = __floats2bfloat162_rn(_tmem_load_0[0 + 10], _tmem_load_0[0 + 11]);
+                            _pk[6] = __floats2bfloat162_rn(_tmem_load_0[0 + 12], _tmem_load_0[0 + 13]);
+                            _pk[7] = __floats2bfloat162_rn(_tmem_load_0[0 + 14], _tmem_load_0[0 + 15]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base + (long long)(state_col_block_1 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base + (long long)(state_col_block_1 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                        }
+                        {
+                            __nv_bfloat162 _pk[8];
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_0[16 + 0], _tmem_load_0[16 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_0[16 + 2], _tmem_load_0[16 + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_0[16 + 4], _tmem_load_0[16 + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_0[16 + 6], _tmem_load_0[16 + 7]);
+                            _pk[4] = __floats2bfloat162_rn(_tmem_load_0[16 + 8], _tmem_load_0[16 + 9]);
+                            _pk[5] = __floats2bfloat162_rn(_tmem_load_0[16 + 10], _tmem_load_0[16 + 11]);
+                            _pk[6] = __floats2bfloat162_rn(_tmem_load_0[16 + 12], _tmem_load_0[16 + 13]);
+                            _pk[7] = __floats2bfloat162_rn(_tmem_load_0[16 + 14], _tmem_load_0[16 + 15]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base + (long long)(state_col_block_1 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base + (long long)(state_col_block_1 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                        }
                     }
                 }
             }
@@ -954,39 +959,41 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
-                int checkpoint_token = (chunk_idx + 1) * 32;
-                if (checkpoint_every_n_tokens != 0 && checkpoint_token < seq_len && checkpoint_token % checkpoint_every_n_tokens == 0) {
-                    long long checkpoint_idx = checkpoint_cu_starts[seq_idx] + (long long)(checkpoint_token / checkpoint_every_n_tokens);
-                    long long checkpoint_base_1 = ((checkpoint_idx * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
-                    #pragma unroll
-                    for (int state_col_block_3 = 0; state_col_block_3 < 4; state_col_block_3++) {
-                        float _tmem_load_4[32];
-                        tmem_ld_x32(&_tmem_load_4[0], taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_3 * 32));
-                        {
-                            __nv_bfloat162 _pk[8];
-                            _pk[0] = __floats2bfloat162_rn(_tmem_load_4[0 + 0], _tmem_load_4[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(_tmem_load_4[0 + 2], _tmem_load_4[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(_tmem_load_4[0 + 4], _tmem_load_4[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(_tmem_load_4[0 + 6], _tmem_load_4[0 + 7]);
-                            _pk[4] = __floats2bfloat162_rn(_tmem_load_4[0 + 8], _tmem_load_4[0 + 9]);
-                            _pk[5] = __floats2bfloat162_rn(_tmem_load_4[0 + 10], _tmem_load_4[0 + 11]);
-                            _pk[6] = __floats2bfloat162_rn(_tmem_load_4[0 + 12], _tmem_load_4[0 + 13]);
-                            _pk[7] = __floats2bfloat162_rn(_tmem_load_4[0 + 14], _tmem_load_4[0 + 15]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base_1 + (long long)(state_col_block_3 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base_1 + (long long)(state_col_block_3 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
-                        }
-                        {
-                            __nv_bfloat162 _pk[8];
-                            _pk[0] = __floats2bfloat162_rn(_tmem_load_4[16 + 0], _tmem_load_4[16 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(_tmem_load_4[16 + 2], _tmem_load_4[16 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(_tmem_load_4[16 + 4], _tmem_load_4[16 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(_tmem_load_4[16 + 6], _tmem_load_4[16 + 7]);
-                            _pk[4] = __floats2bfloat162_rn(_tmem_load_4[16 + 8], _tmem_load_4[16 + 9]);
-                            _pk[5] = __floats2bfloat162_rn(_tmem_load_4[16 + 10], _tmem_load_4[16 + 11]);
-                            _pk[6] = __floats2bfloat162_rn(_tmem_load_4[16 + 12], _tmem_load_4[16 + 13]);
-                            _pk[7] = __floats2bfloat162_rn(_tmem_load_4[16 + 14], _tmem_load_4[16 + 15]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base_1 + (long long)(state_col_block_3 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base_1 + (long long)(state_col_block_3 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                {
+                    int checkpoint_token = (chunk_idx + 1) * 32;
+                    if (checkpoint_every_n_tokens != 0 && checkpoint_token < seq_len && checkpoint_token % checkpoint_every_n_tokens == 0) {
+                        long long checkpoint_idx = reinterpret_cast<long long*>(checkpoint_cu_starts_addr)[seq_idx] + (long long)(checkpoint_token / checkpoint_every_n_tokens);
+                        long long checkpoint_base_1 = ((checkpoint_idx * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
+                        #pragma unroll
+                        for (int state_col_block_3 = 0; state_col_block_3 < 4; state_col_block_3++) {
+                            float _tmem_load_4[32];
+                            tmem_ld_x32(&_tmem_load_4[0], taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_3 * 32));
+                            {
+                                __nv_bfloat162 _pk[8];
+                                _pk[0] = __floats2bfloat162_rn(_tmem_load_4[0 + 0], _tmem_load_4[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(_tmem_load_4[0 + 2], _tmem_load_4[0 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(_tmem_load_4[0 + 4], _tmem_load_4[0 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(_tmem_load_4[0 + 6], _tmem_load_4[0 + 7]);
+                                _pk[4] = __floats2bfloat162_rn(_tmem_load_4[0 + 8], _tmem_load_4[0 + 9]);
+                                _pk[5] = __floats2bfloat162_rn(_tmem_load_4[0 + 10], _tmem_load_4[0 + 11]);
+                                _pk[6] = __floats2bfloat162_rn(_tmem_load_4[0 + 12], _tmem_load_4[0 + 13]);
+                                _pk[7] = __floats2bfloat162_rn(_tmem_load_4[0 + 14], _tmem_load_4[0 + 15]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base_1 + (long long)(state_col_block_3 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base_1 + (long long)(state_col_block_3 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                            }
+                            {
+                                __nv_bfloat162 _pk[8];
+                                _pk[0] = __floats2bfloat162_rn(_tmem_load_4[16 + 0], _tmem_load_4[16 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(_tmem_load_4[16 + 2], _tmem_load_4[16 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(_tmem_load_4[16 + 4], _tmem_load_4[16 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(_tmem_load_4[16 + 6], _tmem_load_4[16 + 7]);
+                                _pk[4] = __floats2bfloat162_rn(_tmem_load_4[16 + 8], _tmem_load_4[16 + 9]);
+                                _pk[5] = __floats2bfloat162_rn(_tmem_load_4[16 + 10], _tmem_load_4[16 + 11]);
+                                _pk[6] = __floats2bfloat162_rn(_tmem_load_4[16 + 12], _tmem_load_4[16 + 13]);
+                                _pk[7] = __floats2bfloat162_rn(_tmem_load_4[16 + 14], _tmem_load_4[16 + 15]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base_1 + (long long)(state_col_block_3 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (checkpoint_base_1 + (long long)(state_col_block_3 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                            }
                         }
                     }
                 }
@@ -1352,8 +1359,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 int chunk_is_full_1 = ((seq_len_3 >= (chunk_idx_2 + 1) * 32) ? 1 : 0);
                 float early_beta_value = 0.0f;
                 float early_gate0 = 0.0f;
+                mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
                 if (chunk_is_full_1 != 0) {
-                    mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
                             mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
@@ -1429,7 +1436,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     if (chunk_is_full_1 == 0) {
                         long long beta_token = bos_3 + (long long)(chunk_idx_2 * 32 + lane);
                         if (beta_token < eos_3) {
-                            float beta_logit_1 = (float)beta[beta_token * beta_token_stride + (long long)head_idx_2];
+                            float beta_logit_1 = (float)beta[beta_token * (long long)num_heads + (long long)head_idx_2];
+                            {
+                                beta_logit_1 = (float)beta[beta_token * beta_token_stride + (long long)head_idx_2];
+                            }
                             float _tanh_approx_2;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(beta_logit_1 * 0.5f));
                             beta_value = _tanh_approx_2 * 0.5f + 0.5f;
