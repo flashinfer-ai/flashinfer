@@ -37,9 +37,7 @@ on:
         default: false
 
 concurrency:
-  # A label other than run-ci can never start tests, so it gets its own group and
-  # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
+  group: ${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && format('pr-test-noop-{0}', github.run_id) || format('pr-test-{0}', github.ref) }}
   cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
 
 permissions:
@@ -57,6 +55,7 @@ jobs:
   # ---------------------------------------------------------------------------
   gate:
     name: Permission Check
+    if: github.event.action != 'labeled' || github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     outputs:
       authorized: ${{ steps.check.outputs.authorized }}
@@ -301,8 +300,8 @@ jobs:
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
-    name: Test Results Summary
-    if: "!cancelled()"
+    name: ${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && 'Ignore Unrelated Label' || 'Test Results Summary' }}
+    if: "!cancelled() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')"
     needs:
       - gate
       - setup
