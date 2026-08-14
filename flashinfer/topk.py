@@ -678,6 +678,119 @@ def can_use_cub_topk(input, tie_break):
     return True
 
 
+def is_cub_topk_beneficial(num_rows, d, k, dtype, tie_break, dsa_graph_safe):
+    """Whether the CUB backend is expected to outperform the native backends for a
+    plain top_k call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    """
+    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+        return True
+
+    # CUB always wins under these conditions
+    if num_rows < 128 or d <= 8192:
+        return True
+
+    # If replaying in a CUDA graph, CUB wins for larger values of `d`
+    if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
+        return d >= (32768 if dtype == torch.float32 else 65536)
+
+    # For eager execution, CUB wins for 16 bit dtypes and larger values of `d` only for certain conditions
+    if dtype != torch.float32 and d >= 131072:
+        if tie_break == TopKTieBreak.NONE or num_rows < 256:
+            return True
+        # The native tie-break path is ~30% slower for bf16 specifically (fp16
+        # tie is free; CUB is dtype-invariant here), so bf16 tie-break keeps
+        # winning through batch 256.
+        return dtype == torch.bfloat16 and num_rows <= 256
+
+    # The native no-tie path slows sharply at k >= 4096 while CUB does not
+    # (1.3-1.6x on fp32 long rows at any batch); the native tie path rejects
+    # k >= 4096 outright
+    if dtype == torch.float32 and k >= 4096 and d >= 65536:
+        return True
+
+    return False
+
+
+def is_cub_page_table_transform_beneficial(
+    num_rows, d, dtype, tie_break, dsa_graph_safe
+):
+    """Whether the CUB backend is expected to outperform the native backends for a
+    fused page-table transform call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    """
+    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+        return True
+
+    fp32 = dtype == torch.float32
+    tie = tie_break != TopKTieBreak.NONE
+
+    if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
+        if tie:
+            # Tie-break wins at both ends of the d range with a losing pocket in
+            # the middle; larger batches enter the pocket earlier and leave later
+            if fp32:
+                return num_rows < 128 or d <= 2048 or d >= 262144
+            if num_rows < 128:
+                return d < 1024 or d >= 16384
+            return d < 512 or d >= 262144
+
+        if fp32:
+            return d >= (32768 if num_rows < 128 else 262144)
+        # For 16 bit dtypes, the winning `d` threshold moves up with batch size
+        return (
+            (num_rows < 64 and d >= 32768)
+            or (num_rows < 128 and d >= 65536)
+            or d >= 524288
+        )
+
+    if tie:
+        if fp32:
+            return (num_rows <= 16 and d >= 262144) or (num_rows <= 32 and d >= 524288)
+        return (num_rows <= 32 and d >= 262144) or (num_rows <= 64 and d >= 524288)
+
+    return False
+
+
+def is_cub_ragged_transform_beneficial(num_rows, d, dtype, tie_break, dsa_graph_safe):
+    """Whether the CUB backend is expected to outperform the native backends for a
+    fused ragged transform call. Based on benchmarks collected from `bench_topk.py` on a B200. See (TODO: add link to gist or PR description)
+    """
+    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+        return True
+
+    fp32 = dtype == torch.float32
+    tie = tie_break != TopKTieBreak.NONE
+
+    if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
+        if tie:
+            if fp32:
+                # Small batches win at every d; large batches only lose in the
+                # 16384-32768 pocket
+                return num_rows < 128 or d < 16384 or d > 32768
+            if num_rows < 128:
+                return d >= 8192
+            return 4096 <= d <= 8192 or d >= 65536
+
+        if fp32:
+            if num_rows < 128:
+                return d >= 8192
+            return 4096 <= d <= 8192 or d >= 65536
+        # For 16 bit dtypes, the winning `d` threshold moves up with batch size
+        # (and fp16 lags bf16 at large batch)
+        if num_rows < 128:
+            return d >= 32768
+        return d >= (65536 if dtype == torch.bfloat16 else 131072)
+
+    if tie:
+        if fp32:
+            return (num_rows <= 16 and d >= 262144) or (num_rows <= 32 and d >= 524288)
+
+        if dtype == torch.bfloat16:
+            return (num_rows <= 64 and d >= 262144) or d >= 524288
+        return num_rows <= 64 and d >= 262144
+
+    return False
+
+
 @flashinfer_api
 def top_k(
     input: torch.Tensor,
@@ -780,7 +893,14 @@ def top_k(
     # mode, so sorted / deterministic calls fall through to the native backends.
     # dsa_graph_safe is honored by serving the call: CUB's kernel selection depends
     # only on shape (static under a graph), so it is graph-safe by construction.
-    if not sorted and not deterministic and can_use_cub_topk(input, tie_break):
+    if (
+        not sorted
+        and not deterministic
+        and can_use_cub_topk(input, tie_break)
+        and is_cub_topk_beneficial(
+            batch_size, input.size(1), k, input.dtype, tie_break, dsa_graph_safe
+        )
+    ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -1008,7 +1128,13 @@ def top_k_page_table_transform(
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
 
-    if can_use_cub_topk(input, tie_break) and not deterministic:
+    if (
+        can_use_cub_topk(input, tie_break)
+        and not deterministic
+        and is_cub_page_table_transform_beneficial(
+            input.size(0), input.size(1), input.dtype, tie_break, dsa_graph_safe
+        )
+    ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -1171,7 +1297,13 @@ def top_k_ragged_transform(
     device = input.device
     num_rows = input.size(0)
 
-    if can_use_cub_topk(input, tie_break) and not deterministic:
+    if (
+        can_use_cub_topk(input, tie_break)
+        and not deterministic
+        and is_cub_ragged_transform_beneficial(
+            input.size(0), input.size(1), input.dtype, tie_break, dsa_graph_safe
+        )
+    ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
