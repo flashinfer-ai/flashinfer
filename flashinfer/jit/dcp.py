@@ -146,17 +146,13 @@ def gen_dcp_spec_module(
         route_param,
     )
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / f"cake_fmha_dcp_spec_bf16_{variant}.cu"
+    route_name = "retain" if variant == "v1" else "split"
+    body = csrc_dir / f"cake_fmha_dcp_spec_bf16_{variant}_{route_name}{route_param}.cu"
     binding = csrc_dir / f"cake_fmha_dcp_spec_bf16_{variant}_binding.cu"
     for source in (body, binding):
         if not source.exists():
             raise FileNotFoundError(f"DCP speculative FMHA source not found: {source}")
 
-    route_define = (
-        f"-DRETAIN_KV_L2={route_param}"
-        if variant == "v1"
-        else f"-DNUM_SPLIT={route_param}"
-    )
     spec = gen_jit_spec(
         name=uri,
         sources=[body, binding],
@@ -167,7 +163,6 @@ def gen_dcp_spec_module(
             f"-DNUM_Q_HEADS={num_q_heads}",
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCP_WORLD={cp_world}",
-            route_define,
         ],
         extra_include_paths=[csrc_dir],
         extra_ldflags=["-lcuda"],

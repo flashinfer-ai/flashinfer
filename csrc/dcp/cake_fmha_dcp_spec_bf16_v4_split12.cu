@@ -113,9 +113,7 @@ typedef struct __align__(64) {
 #ifndef CP_WORLD
 #define CP_WORLD 4
 #endif
-#ifndef NUM_SPLIT
-#define NUM_SPLIT 2
-#endif
+#define NUM_SPLIT 12
 
 #include <math_constants.h>
 
@@ -1212,32 +1210,38 @@ __global__ __launch_bounds__(512) void kernel_cake_fmha_dcp_spec_bf16_v4(
             int reduce_stat_base =
                 ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head) * NUM_SPLIT;
             {
-              float split_lse0 = partial_LSE_ptr[reduce_stat_base];
-              float split_lse1 = partial_LSE_ptr[reduce_stat_base + 1];
-              float _max_10 = max_noftz(split_lse0, split_lse1);
-              float merged_max = _max_10;
-              float weight0 = 0.0f;
-              float weight1 = 0.0f;
-              if (split_lse0 != -LOOM_INF) {
-                float _exp2_6 = approx_exp2(split_lse0 - merged_max);
-                weight0 = _exp2_6;
+              float merged_max = -LOOM_INF;
+#pragma unroll 2
+              for (int reduce_split = 0; reduce_split < NUM_SPLIT; reduce_split++) {
+                float split_lse = partial_LSE_ptr[reduce_stat_base + reduce_split];
+                float _max_11 = max_noftz(merged_max, split_lse);
+                merged_max = _max_11;
               }
-              if (split_lse1 != -LOOM_INF) {
-                float _exp2_7 = approx_exp2(split_lse1 - merged_max);
-                weight1 = _exp2_7;
+              float weight_sum = 0.0f;
+#pragma unroll 2
+              for (int reduce_split_1 = 0; reduce_split_1 < NUM_SPLIT; reduce_split_1++) {
+                float split_lse_1 = partial_LSE_ptr[reduce_stat_base + reduce_split_1];
+                float split_weight = 0.0f;
+                if (split_lse_1 != -LOOM_INF) {
+                  float _exp2_8 = approx_exp2(split_lse_1 - merged_max);
+                  split_weight = _exp2_8;
+                }
+                split_weights[reduce_split_1 * TILE_Q + d_idx] = split_weight;
+                weight_sum = weight_sum + split_weight;
               }
-              float weight_sum = weight0 + weight1;
-              float _rcp_1 = approx_rcp(weight_sum);
-              float inv_weight_sum = ((weight_sum > 0.0f) ? _rcp_1 : 0.0f);
-              split_weight0[d_idx] = weight0 * inv_weight_sum;
-              split_weight1[d_idx] = weight1 * inv_weight_sum;
+              float _rcp_2 = approx_rcp(weight_sum);
+              float inv_weight_sum = ((weight_sum > 0.0f) ? _rcp_2 : 0.0f);
+#pragma unroll 2
+              for (int reduce_split_2 = 0; reduce_split_2 < NUM_SPLIT; reduce_split_2++) {
+                int weight_idx = reduce_split_2 * TILE_Q + d_idx;
+                split_weights[weight_idx] = split_weights[weight_idx] * inv_weight_sum;
+              }
               float merged_lse = -LOOM_INF;
               if (weight_sum > 0.0f) {
-                float _log2_1;
-                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(weight_sum));
-                merged_lse = merged_max + _log2_1;
+                float _log2_2;
+                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(weight_sum));
+                merged_lse = merged_max + _log2_2;
               }
-              split_merged_lse[d_idx] = merged_lse;
               int final_lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head;
               *(reinterpret_cast<float*>(LSE_ptr + final_lse_idx) + (0)) = merged_lse;
             }
@@ -1255,7 +1259,7 @@ __global__ __launch_bounds__(512) void kernel_cake_fmha_dcp_spec_bf16_v4(
                 ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head_1) * HEAD_DIM +
                 merge_d_base;
             {
-              float _vec_load_0[8];
+              float _vec_load_2[8];
               {
                 const uint4* _vptr_0 =
                     reinterpret_cast<const uint4*>(partial_O_ptr + partial_o_base + 0);
@@ -1271,47 +1275,54 @@ __global__ __launch_bounds__(512) void kernel_cake_fmha_dcp_spec_bf16_v4(
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                        : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]),
+                          "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
                         : "r"(_vpairs_0[_pair]));
                   }
                 }
               }
-              float _vec_load_1[8];
-              {
-                const uint4* _vptr_1 =
-                    reinterpret_cast<const uint4*>(partial_O_ptr + (partial_o_base + HEAD_DIM) + 0);
-                uint4 _vld_1[1];
-#pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                  _vld_1[_blk] = _vptr_1[_blk];
-                  uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
-#pragma unroll
-                  for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
-                        : "r"(_vpairs_1[_pair]));
-                  }
-                }
-              }
-              float reduce_weight0 = split_weight0[merge_head_in_group];
-              float reduce_weight1 = split_weight1[merge_head_in_group];
+              float reduce_weight0 = split_weights[merge_head_in_group];
 #pragma unroll
               for (int elem = 0; elem < 8; elem++) {
-                _vec_load_0[elem] =
-                    _vec_load_0[elem] * reduce_weight0 + _vec_load_1[elem] * reduce_weight1;
+                _vec_load_2[elem] = _vec_load_2[elem] * reduce_weight0;
+              }
+#pragma unroll 2
+              for (int reduce_split_3 = 1; reduce_split_3 < NUM_SPLIT; reduce_split_3++) {
+                float _vec_load_3[8];
+                {
+                  const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
+                      partial_O_ptr + (partial_o_base + reduce_split_3 * HEAD_DIM) + 0);
+                  uint4 _vld_1[1];
+#pragma unroll
+                  for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_1[_blk] = _vptr_1[_blk];
+                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+#pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                      asm volatile(
+                          "{\n\t"
+                          "shl.b32 %0, %2, 16;\n\t"
+                          "and.b32 %1, %2, 0xffff0000;\n\t"
+                          "}\n"
+                          : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]),
+                            "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
+                          : "r"(_vpairs_1[_pair]));
+                    }
+                  }
+                }
+                float reduce_weight = split_weights[reduce_split_3 * TILE_Q + merge_head_in_group];
+#pragma unroll
+                for (int elem_1 = 0; elem_1 < 8; elem_1++) {
+                  float _fma_0 = __fmaf_rn(_vec_load_3[elem_1], reduce_weight, _vec_load_2[elem_1]);
+                  _vec_load_2[elem_1] = _fma_0;
+                }
               }
               {
                 __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(_vec_load_0[0 + 0], _vec_load_0[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(_vec_load_0[0 + 2], _vec_load_0[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(_vec_load_0[0 + 4], _vec_load_0[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(_vec_load_0[0 + 6], _vec_load_0[0 + 7]);
+                _pk[0] = __floats2bfloat162_rn(_vec_load_2[0 + 0], _vec_load_2[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(_vec_load_2[0 + 2], _vec_load_2[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(_vec_load_2[0 + 4], _vec_load_2[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(_vec_load_2[0 + 6], _vec_load_2[0 + 7]);
                 *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + final_o_idx))[0]) =
                     *reinterpret_cast<uint4*>(&_pk[0]);
               }

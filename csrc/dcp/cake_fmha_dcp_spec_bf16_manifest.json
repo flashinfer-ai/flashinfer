@@ -18,26 +18,43 @@
   "routes": {
     "v1": {
       "binding": "cake_fmha_dcp_spec_bf16_v1_binding.cu",
-      "body": "cake_fmha_dcp_spec_bf16_v1.cu",
+      "bodies": {
+        "0": "cake_fmha_dcp_spec_bf16_v1_retain0.cu",
+        "1": "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
+      },
       "macros": [
         "BATCH_SIZE",
         "NUM_Q_HEADS",
         "NUM_KV_HEADS",
         "Q_LEN",
-        "CP_WORLD",
-        "RETAIN_KV_L2"
+        "CP_WORLD"
       ]
     },
     "v4": {
       "binding": "cake_fmha_dcp_spec_bf16_v4_binding.cu",
-      "body": "cake_fmha_dcp_spec_bf16_v4.cu",
+      "bodies": {
+        "10": "cake_fmha_dcp_spec_bf16_v4_split10.cu",
+        "11": "cake_fmha_dcp_spec_bf16_v4_split11.cu",
+        "12": "cake_fmha_dcp_spec_bf16_v4_split12.cu",
+        "13": "cake_fmha_dcp_spec_bf16_v4_split13.cu",
+        "14": "cake_fmha_dcp_spec_bf16_v4_split14.cu",
+        "15": "cake_fmha_dcp_spec_bf16_v4_split15.cu",
+        "16": "cake_fmha_dcp_spec_bf16_v4_split16.cu",
+        "2": "cake_fmha_dcp_spec_bf16_v4_split2.cu",
+        "3": "cake_fmha_dcp_spec_bf16_v4_split3.cu",
+        "4": "cake_fmha_dcp_spec_bf16_v4_split4.cu",
+        "5": "cake_fmha_dcp_spec_bf16_v4_split5.cu",
+        "6": "cake_fmha_dcp_spec_bf16_v4_split6.cu",
+        "7": "cake_fmha_dcp_spec_bf16_v4_split7.cu",
+        "8": "cake_fmha_dcp_spec_bf16_v4_split8.cu",
+        "9": "cake_fmha_dcp_spec_bf16_v4_split9.cu"
+      },
       "macros": [
         "BATCH_SIZE",
         "NUM_Q_HEADS",
         "NUM_KV_HEADS",
         "Q_LEN",
-        "CP_WORLD",
-        "NUM_SPLIT"
+        "CP_WORLD"
       ]
     }
   },
@@ -63,6 +80,22 @@
       0,
       1
     ],
-    "v4_num_split": "integer in [2, 16]"
+    "v4_num_split": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ]
   }
 }

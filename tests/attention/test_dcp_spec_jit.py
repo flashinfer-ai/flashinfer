@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,29 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     v4_uri = get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16)
     assert v4_uri.startswith("cake_fmha_dcp_spec_bf16_v4_")
     assert v4_uri.endswith("_b1_q8_hq64_hkv8_cp4_split16")
+
+
+def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "dcp"
+    monkeypatch.setattr(jit_dcp, "_get_csrc_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        jit_dcp,
+        "gen_jit_spec",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    jit_dcp.gen_dcp_spec_module.cache_clear()
+
+    try:
+        v1 = jit_dcp.gen_dcp_spec_module("v1", "sm100a", 1, 1, 64, 8, 1, 1)
+        v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
+
+        assert Path(v1.sources[0]).name == "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
+        assert Path(v4.sources[0]).name == "cake_fmha_dcp_spec_bf16_v4_split16.cu"
+        assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
+        assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
+    finally:
+        jit_dcp.gen_dcp_spec_module.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -61,6 +85,7 @@ def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
 
 def test_dcp_split_selector_matches_promoted_policy() -> None:
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=9) == 1
+    assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=32) == 4
     assert _select_num_split(logical_tiles=8, sm_count=148, local_blocks=128) == 16
     assert _select_num_split(logical_tiles=64, sm_count=148, local_blocks=128) == 2
 
