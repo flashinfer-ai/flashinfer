@@ -86,7 +86,13 @@ def get_scratchpad_size_bytes() -> int:
 
 
 @flashinfer_api
-def alloc_scratchpad(device: torch.device) -> torch.Tensor:
+def demo_unlisted_monomoe_api() -> bool:
+    """DEMO ONLY: expose an API that is intentionally absent from docs/api."""
+    return True
+
+
+@flashinfer_api
+def alloc_scratchpad(device: torch.device, demo_alignment: int) -> torch.Tensor:
     """Allocate a zero-initialized scratchpad on ``device`` for the kernel.
 
     Returns a 1-D ``uint8`` tensor sized to :func:`get_scratchpad_size_bytes`.
