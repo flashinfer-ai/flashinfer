@@ -160,7 +160,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
     cap = get_compute_capability(torch.device("cuda"))
     if cap[0] != 10:
         pytest.skip(f"needs sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -169,7 +169,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
         MoEEpMegaLayer,
         MoEEpTensors,
         MoEWeightPack,
-        Nvfp4CutedslMegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
@@ -202,7 +202,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
             ),
             weights=MoEWeightPack(w13=w13, w2=w2),
             backend=MegaConfig(
-                megakernel=Nvfp4CutedslMegaMoeConfig(
+                megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                     intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
                 ),
                 quantize_input=True,

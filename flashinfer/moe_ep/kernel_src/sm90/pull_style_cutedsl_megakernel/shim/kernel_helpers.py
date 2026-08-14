@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Curated re-exports of raw-kernel helpers/constants/reference from ``../src``.
 
-SM90 counterpart of ``kernel_src/sm100/cutedsl_megamoe/shim/kernel_helpers.py``:
+SM90 counterpart of ``kernel_src/cutedsl_megamoe/shim/kernel_helpers.py``:
 the SINGLE shim file that surfaces kernel-team utilities which are *not* part
 of the frontend / fused-launch surface (FP8 quant helpers, block constants,
 byte-reinterpret stacking, and the FP8 torch reference).  The FI backend glue
-(``backends/mega/kernel/sm90_pull_fp8/{backend,staging,weights}.py``) and the
+(``backends/mega/kernel/sm90/fp8_fp8_bf16_pull_cutedsl/{backend,staging,weights}.py``) and the
 verification tests consume these through the package ``__init__`` so that
 **nothing outside ``shim/`` imports ``src/`` packages directly**.  Keeping them
 all here means a new ``src/`` drop has ONE file to re-audit for renamed helpers
