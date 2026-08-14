@@ -7318,6 +7318,7 @@ def _cute_dsl_bmm_fp8_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 107])
 def _check_bmm_fp8_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
