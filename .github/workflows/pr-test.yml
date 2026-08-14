@@ -391,7 +391,13 @@ jobs:
           if [ -n "$ACTIVE" ]; then
             RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/$ACTIVE"
             echo "Tests for this commit are running in [run $ACTIVE]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
-            echo "::notice::Following run $ACTIVE, which is already testing this commit"
+
+            # GitHub renders only the newest run of a workflow in the PR checks
+            # box, so this run hides the test jobs of the one it is following.
+            # An annotation is the one place that link shows up on the PR while
+            # this job is still going, since the summary above is not published
+            # until the job ends.
+            echo "::notice title=Tests are already running for this commit::$RUN_URL"
 
             CONCLUSION=""
             DEADLINE=$((SECONDS + 5400))
@@ -399,12 +405,19 @@ jobs:
               # A transient API error retries rather than ending the wait, which
               # would report a red result for a run that is still healthy.
               INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
-                --json status,conclusion \
-                --jq '.status + "|" + (.conclusion // "")' 2>/dev/null) || INFO=""
-              if [ "${INFO%%|*}" == "completed" ]; then
-                CONCLUSION="${INFO##*|}"
+                --json status,conclusion,jobs \
+                --jq '.status + "|" + (.conclusion // "") + "|"
+                      + ([.jobs[] | select(.status == "completed")] | length | tostring)
+                      + "/" + (.jobs | length | tostring)' 2>/dev/null) || INFO=""
+              IFS='|' read -r STATUS CONCLUSION PROGRESS <<< "$INFO"
+
+              if [ "$STATUS" == "completed" ]; then
                 break
               fi
+
+              # Printed every poll so the log visibly ticks: an idle log is
+              # indistinguishable from a stuck one.
+              echo "run $ACTIVE is ${STATUS:-unreachable}, ${PROGRESS:-?} jobs finished, waited $((SECONDS / 60))m - $RUN_URL"
               sleep 30
             done
 
