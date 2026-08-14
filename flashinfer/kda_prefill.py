@@ -504,6 +504,7 @@ def _beta_tma_source(
         )
     if (
         total_tokens >= 32
+        and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
         and beta_flat.data_ptr() % 16 == 0
         and beta_flat.stride(0) * beta.element_size() % 16 == 0
     ):

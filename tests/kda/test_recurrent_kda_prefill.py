@@ -607,6 +607,36 @@ def test_unaligned_strided_beta_uses_internal_tma_workspace(cuda_device, monkeyp
     assert args[5].shape == (32, 16)
 
 
+def test_aligned_h6_strided_beta_uses_head_padded_tma_workspace(
+    cuda_device, monkeypatch
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    module = _RecorderModule()
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant, target: module
+    )
+    inputs = _make_inputs(seq_lens=[128], num_heads=6, packed=True)
+    beta_carrier = torch.empty((128, 32), dtype=torch.bfloat16, device=cuda_device)
+    beta_carrier[:, 8:14].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 8:14]
+    assert inputs["beta"].data_ptr() % 16 == 0
+    assert inputs["beta"].stride(-2) == 32
+
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs), output=torch.empty_like(inputs["q"])
+    )
+
+    (args,) = module.calls
+    assert args[4].data_ptr() == inputs["beta"].data_ptr()
+    assert args[5].data_ptr() != inputs["beta"].data_ptr()
+    assert args[5].shape == (128, 8)
+
+
 def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
