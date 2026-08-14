@@ -74,7 +74,7 @@ void RunM64K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, Te
   if (store_final_state != 0) {
     CheckNoOverlap(k1_workspace, "k1_workspace", final_state, "final_state");
   }
-  TVM_FFI_ICHECK(cluster_size == 4 || cluster_size == 8) << "cluster_size must be C4 or C8";
+  TVM_FFI_ICHECK(cluster_size == 4) << "M64 K1-parallel FlashKDA requires cluster_size == 4";
   TVM_FFI_ICHECK(mailbox_depth > 0 && mailbox_depth <= std::numeric_limits<int32_t>::max())
       << "mailbox_depth must be in the positive int32 range";
   const int64_t producer_instances = (cluster_size - 2) * 5;

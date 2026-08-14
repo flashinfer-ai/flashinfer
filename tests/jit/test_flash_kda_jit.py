@@ -268,6 +268,7 @@ def test_flash_kda_m64_k1_parallel_jit_spec(monkeypatch, target):
     binding_text = spec.sources[0].read_text()
     assert "(cluster_size - 2) * 5" in binding_text
     assert "EncodeTmaPointers<64>" in binding_text
+    assert "cluster_size == 4" in binding_text
     assert "cluster_size" in text
 
 

@@ -14,34 +14,38 @@ M128 kernel outside measured profitable regions.
 
 | Device | Layout | Batch-head tasks | Route | Minimum length |
 | --- | --- | ---: | --- | ---: |
-| B200/GB200 | fixed or packed | 1-8 | C4, depth 15 | 2048 |
-| B200/GB200 | fixed or packed | 9-32 | C4, depth 30 | 2048 |
-| B300/GB300 | fixed | 1-8 | C4, depth 30 | 2048 |
-| B300/GB300 | fixed | 9-32 | C4, depth 45 | 2048 |
+| B200/GB200 | fixed `B=1, H=1` | 1 | M64 C4, depth 10 | 4096 |
+| B200/GB200 | fixed or packed | 1-8 | M128 C4, depth 15 | 2048 |
+| B200/GB200 | fixed or packed | 9-32 | M128 C4, depth 30 | 2048 |
+| B300/GB300 | fixed | 1-8 | M128 C4, depth 30 | 2048 |
+| B300/GB300 | fixed | 9-32 | M128 C4, depth 45 | 2048 |
 | either | other | other | exact baseline fallback | N/A |
 
-M64 is selected while `2 * batch * heads <= SM count`; otherwise M128 is the
-fixed-layout fallback. Outside the enabled B200 helper region, packed varlen
-input falls back to M128. For packed B200 input, the minimum length is the
-host-known integer average `total_tokens / num_sequences`; dispatch never
-copies `cu_seqlens` to the CPU.
+The single-head M64 route takes precedence over the general M128 helper row.
+Outside a profitable helper region, baseline M64 is selected while
+`2 * batch * heads <= SM count`; otherwise M128 is the fixed-layout fallback.
+Outside the enabled B200 helper region, packed varlen input falls back to M128.
+For packed B200 input, the minimum length is the host-known integer average
+`total_tokens / num_sequences`; dispatch never copies `cu_seqlens` to the CPU.
 This deliberately conservative rule can leave a highly skewed, low-average
 batch on M128, but it cannot introduce a device-to-host synchronization or
 make graph capture depend on device data. Packed B300 remains on M128 until it
-is independently tuned and validated. The helper implementation supports four
-heads or a head count of at least eight divisible by eight. Four-head beta
-tiles are padded to the generated eight-head TMA box.
+is independently tuned and validated. M128 helpers support fixed H=1, H=4, or
+a head count of at least eight divisible by eight; packed H=1 remains on M128.
+Four-head beta tiles are padded to the generated eight-head TMA box.
 
 Each helper CTA contains five K1 preparation instances while the owner focuses
-on mailbox ingress and ordered K2. C4 therefore exposes 15 concurrent K1
-instances instead of the baseline M128 CTA's five. C8 can expose 35, but
-cold-L2 B200 and B300 sweeps found that its
-larger grid costs more than the extra K1 capacity saves. C8 remains a supported
-forced benchmark configuration, not a public dispatch choice. Ordered K2
-recurrence and the 31,520-byte packet handoff remain serial or bandwidth
-limits. Mailbox depth is constrained to a multiple of the helper instance
-count (15 for C4 and 35 for C8), so a ring slot cannot be reassigned to a
-different producer generation before its current packet is consumed.
+on mailbox ingress and ordered K2. M128 C4 therefore exposes 15 concurrent K1
+instances instead of the baseline M128 CTA's five. The single-head M64 C4
+variant has two recurrent owners and two helpers, exposing ten K1 instances
+while splitting K2 across two 64-row state halves. M128 C8 can expose 35, but
+cold-L2 B200 and B300 sweeps found that its larger grid costs more than the
+extra K1 capacity saves. It remains a supported forced M128 benchmark
+configuration, not a public dispatch choice; M64 is restricted to validated
+C4 launches. Ordered K2 recurrence and the 31,520-byte packet handoff remain
+serial or bandwidth limits. Mailbox depth is constrained to a multiple of the
+helper instance count, so a ring slot cannot be reassigned to a different
+producer generation before its current packet is consumed.
 
 ## Validation required before an upstream PR
 

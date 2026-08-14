@@ -77,6 +77,10 @@ def _parse_forced_route(value: str) -> tuple[str, int, int]:
         )
     if cluster_size not in (4, 8):
         raise argparse.ArgumentTypeError("forced cluster size must be 4 or 8")
+    if variant == "m64_k1_parallel" and cluster_size != 4:
+        raise argparse.ArgumentTypeError(
+            "m64_k1_parallel has only been validated with cluster size 4"
+        )
     owner_count = 2 if variant == "m64_k1_parallel" else 1
     producer_instances = (cluster_size - owner_count) * 5
     if mailbox_depth <= 0 or mailbox_depth % producer_instances != 0:
@@ -268,20 +272,18 @@ def _run_case(
         sequence_length=total_tokens if packed else sequence_length,
         device=q.device,
     )
-    if auto_route[0] != "m128_k1_parallel":
-        helper_routes.remove("k1_parallel")
     for name in helper_routes:
         if name not in outputs:
             continue
-        route = routes[name]
-        if route is not None and route[0] == "m64_k1_parallel":
+        route = routes[name] or auto_route
+        if route[0] == "m64_k1_parallel":
             torch.testing.assert_close(
                 outputs[name].float(), outputs["m128"].float(), atol=1e-2, rtol=1e-2
             )
             torch.testing.assert_close(
                 states[name].float(), states["m128"].float(), atol=1e-2, rtol=1e-2
             )
-        else:
+        elif route[0] == "m128_k1_parallel":
             torch.testing.assert_close(outputs[name], outputs["m128"], atol=0, rtol=0)
             torch.testing.assert_close(states[name], states["m128"], atol=0, rtol=0)
 

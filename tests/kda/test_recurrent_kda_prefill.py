@@ -1061,13 +1061,16 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
     )
 
 
-def test_frozen_prefill_m64_matches_reference(flash_kda_device):
+@pytest.mark.parametrize(("seq_len", "num_heads"), [(1024, 1), (1024, 4), (2, 64)])
+def test_frozen_prefill_m64_matches_reference(
+    flash_kda_device, monkeypatch, seq_len, num_heads
+):
     inputs = _make_inputs(
-        seq_lens=[2],
-        num_heads=64,
+        seq_lens=[seq_len],
+        num_heads=num_heads,
         packed=False,
         initial_state=True,
-        seed=2027,
+        seed=2027 + num_heads,
     )
     reference_inputs = {
         **inputs,
@@ -1076,6 +1079,11 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     expected_output, expected_state = _reference(reference_inputs)
     output = torch.empty_like(inputs["q"])
     state_identity = inputs["initial_state"]
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m64", 0, 0),
+    )
 
     actual_output, actual_state = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
@@ -1201,6 +1209,28 @@ def test_m64_k1_parallel_matches_reference(
     )
 
 
+def test_m64_k1_parallel_rejects_unvalidated_c8(flash_kda_device, monkeypatch):
+    inputs = _make_inputs(
+        seq_lens=[1024],
+        num_heads=1,
+        packed=False,
+        initial_state=True,
+        seed=9164,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m64_k1_parallel", 8, 30),
+    )
+
+    with pytest.raises(RuntimeError, match="requires cluster_size == 4"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+        )
+
+
 @pytest.mark.parametrize("num_heads", [4, 8])
 def test_k1_parallel_varlen_matches_m128_bitwise(cuda_device, monkeypatch, num_heads):
     if get_compute_capability(cuda_device) != (10, 0):
@@ -1323,6 +1353,64 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 8), (4096, 1)])
+def test_k1_parallel_cuda_graph_capture_and_replay(
+    flash_kda_device, seq_len, num_heads
+):
+    if num_heads == 1 and get_compute_capability(flash_kda_device) != (10, 0):
+        pytest.skip("the M64 owner/helper route is enabled only on B200/GB200")
+
+    inputs = _make_inputs(
+        seq_lens=[seq_len],
+        num_heads=num_heads,
+        packed=False,
+        initial_state=True,
+        seed=9200 + num_heads,
+    )
+    state_seed = inputs["initial_state"].clone()
+    expected_inputs = {**inputs, "initial_state": state_seed.clone()}
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(expected_inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        prefill_workspace=RecurrentKDAPrefillWorkspace(flash_kda_device),
+    )
+
+    inputs["initial_state"].copy_(state_seed)
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        inputs["initial_state"].copy_(state_seed)
+        output.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["initial_state"].copy_(state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    torch.testing.assert_close(captured_output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(captured_state, expected_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("num_heads", [6, 12])
