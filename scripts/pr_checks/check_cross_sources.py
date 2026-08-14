@@ -403,7 +403,7 @@ def iter_markdown_path_locations(text: str) -> list[tuple[str, int]]:
     for match in _INLINE_CODE_RE.finditer(text):
         line_number = text.count("\n", 0, match.start()) + 1
         for path in _paths_in_fragment(match.group(1)):
-            paths.setdefault(path, line_number)
+            paths[path] = min(paths.get(path, line_number), line_number)
 
     in_fence = False
     for line_number, line in enumerate(text.splitlines(), 1):
@@ -412,7 +412,7 @@ def iter_markdown_path_locations(text: str) -> list[tuple[str, int]]:
             continue
         if in_fence or "|" in line:
             for path in _paths_in_fragment(_INLINE_CODE_RE.sub("", line)):
-                paths.setdefault(path, line_number)
+                paths[path] = min(paths.get(path, line_number), line_number)
     return list(paths.items())
 
 
