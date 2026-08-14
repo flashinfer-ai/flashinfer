@@ -43,7 +43,11 @@ from flashinfer.fused_moe import (
     trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
-from flashinfer.utils import device_support_pdl, get_compute_capability
+from flashinfer.utils import (
+    device_support_pdl,
+    get_compute_capability,
+    is_sm100a_supported,
+)
 from .trtllm_gen_fused_moe_utils import (
     FP4Moe,
     FP8BlockScaleMoe,
@@ -1585,12 +1589,11 @@ def test_situ_mxfp4_mxfp8_logits_match_pre_routed(alpha_value, beta_value, clamp
 
 def test_nvfp4_routed_unpacked_lora_delta_compensation():
     """Unpacked LoRA compensation matches packed routing and the FP4 reference."""
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    device = torch.device("cuda:0")
+    if not is_sm100a_supported(device):
+        pytest.skip("These tests require SM100/SM103 GPUs with CUDA 12.8 or newer.")
 
     torch.manual_seed(7)
-    device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
     num_tokens, hidden_size, intermediate_size = 8, 256, 256
     num_experts, local_num_experts, local_expert_offset, top_k = 16, 8, 4, 2
@@ -1626,7 +1629,7 @@ def test_nvfp4_routed_unpacked_lora_delta_compensation():
     gemm2_weights_bf16[:, 0, 0] = expert_factors.flip(0)
 
     local_topk_ids = torch.tensor(
-        [[0, 3], [7, 2], [1, 6], [5, 4], [2, 0], [6, 7], [3, 1], [4, 5]],
+        [[0, 3], [2, 7], [1, 6], [5, 4], [0, 2], [6, 7], [1, 3], [4, 5]],
         device=device,
         dtype=torch.int32,
     )
@@ -1634,12 +1637,12 @@ def test_nvfp4_routed_unpacked_lora_delta_compensation():
     topk_weights = torch.tensor(
         [
             [0.625, 0.375],
-            [0.25, 0.75],
-            [0.5, 0.5],
+            [0.75, 0.25],
+            [0.5625, 0.4375],
             [0.875, 0.125],
-            [0.2, 0.8],
+            [0.8, 0.2],
             [0.7, 0.3],
-            [0.4, 0.6],
+            [0.6, 0.4],
             [0.55, 0.45],
         ],
         device=device,
@@ -1650,8 +1653,10 @@ def test_nvfp4_routed_unpacked_lora_delta_compensation():
     )
     scores.scatter_(1, local_topk_ids.to(torch.int64), topk_weights)
     permute_info = routing_reference(scores, top_k, padding)
-    permute_info["topKIndices"] = local_topk_ids
-    permute_info["topKLogits"] = topk_weights
+    torch.testing.assert_close(
+        permute_info["topKIndices"], local_topk_ids.to(torch.int64)
+    )
+    torch.testing.assert_close(permute_info["topKLogits"], topk_weights)
 
     zero_delta = torch.zeros(
         num_tokens, top_k, 2 * intermediate_size, device=device, dtype=torch.bfloat16
@@ -1718,7 +1723,7 @@ def test_nvfp4_routed_unpacked_lora_delta_compensation():
     )
 
     def _run(routing_input, delta):
-        return trtllm_fp4_block_scale_routed_moe(
+        output = trtllm_fp4_block_scale_routed_moe(
             routing_input,
             None,
             kernel_inputs["hidden_states"],
@@ -1752,6 +1757,8 @@ def test_nvfp4_routed_unpacked_lora_delta_compensation():
             8192,
             gemm1_lora_delta=delta,
         )[0].to(torch.float)
+        assert output.shape == (num_tokens, hidden_size)
+        return output
 
     unpacked_routing = (topk_ids.contiguous(), topk_weights.contiguous())
     packed_routing = (topk_ids << 16) | (

@@ -2513,7 +2513,7 @@ class TestPrepareTrtllmFp4Helpers:
 
     def test_prepare_weights_rejects_unsupported_variant(self):
         w1, w2 = self._bf16_weights()
-        with pytest.raises(ValueError, match="NVFP4|MXFP4|W4A16"):
+        with pytest.raises(ValueError, match=r"NVFP4|MXFP4|W4A16"):
             prepare_trtllm_fp4_weights(
                 w1,
                 w2,
