@@ -2,7 +2,9 @@
 
 The aim of `flashinfer_benchmark.py` is to provide a single framework for benchmarking any FlashInfer kernel and replace standalone benchmarking scripts.
 
-Specialized review harnesses: [recurrent KDA H12 Phase-A evidence](KDA_H12_PHASE_A.md).
+`bench_recurrent_kda_prefill.py --case-set h12` runs the six Kimi-K3 TP8 H12
+public-API cases. `reduce_kda_h12.py` combines successful SM100a and SM103a
+result files without producing a cross-shape aggregate.
 
 ## Overview
 

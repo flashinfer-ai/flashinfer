@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "name": "recurrent_kda_prefill_h12_phase_a",
+  "name": "recurrent_kda_prefill_h12",
   "common": {
     "num_heads": 12,
     "head_dim_qk": 128,

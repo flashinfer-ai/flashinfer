@@ -201,14 +201,14 @@ def test_h12_smoke_reference_residual_carriers_round_every_boundary_on_cpu():
 def _chunk16_debug_reference(
     inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0
 ):
-    """Clean-room H12 smoke reference; not the Phase-A contract authority.
+    """Clean-room H12 smoke reference for focused numerical diagnostics.
 
     The recurrent state carrier stays in FP32 within each 16-token chunk, but
     the state/K prediction, V-minus-prediction delta, sigmoid beta, and
     post-beta update carrier each round through BF16.  A BF16 state snapshot
     becomes the next chunk's carrier, while each output projects the unrounded
-    FP32 state for its token.  This helper is diagnostic only; the three-oracle
-    Phase-A evidence harness is authoritative.
+    FP32 state for its token.  The public benchmark separately compares output
+    and complete final state against the pinned FlashKDA implementation.
     """
 
     q = inputs["q"]

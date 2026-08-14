@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUPTI benchmark for the six frozen recurrent-KDA prefill contract shapes.
+"""CUPTI benchmark for recurrent-KDA prefill public API shapes.
+
+The default case set combines the original H64/H96 coverage with six H12
+shapes representing Kimi-K3's per-rank head count under TP8.  ``--case-set``
+can select either group independently.
 
 The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. With ``--flash-kda-peer``, two commit-verified
@@ -47,10 +51,12 @@ from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
-FLASH_KDA_PEER_COMMIT = "d2ff19a6a0c82f39f796f637ebd1c36090b1268f"
+FLASH_KDA_PEER_COMMIT = "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
 DEFAULT_STATE_ROTATIONS = 512
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
+BENCHMARKS_DIR = Path(__file__).resolve().parent
+H12_PRESET = BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12.json"
 
 
 @dataclass(frozen=True)
@@ -78,7 +84,57 @@ class PreparedCase:
     metadata: dict
 
 
-CASES = (
+def _load_h12_cases(path: Path = H12_PRESET) -> tuple[Case, ...]:
+    """Load the small checked-in Kimi-K3 TP8 benchmark denominator."""
+
+    payload = json.loads(path.read_text())
+    expected_common = {
+        "num_heads": 12,
+        "head_dim_qk": 128,
+        "head_dim_vo": 128,
+        "dtype": "bfloat16",
+        "initial_state": "provided",
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "beta_is_logit": True,
+        "lower_bound": -5.0,
+    }
+    if payload.get("schema_version") != 1:
+        raise ValueError("H12 preset schema_version must be 1")
+    if payload.get("name") != "recurrent_kda_prefill_h12":
+        raise ValueError("unexpected H12 preset name")
+    if payload.get("common") != expected_common:
+        raise ValueError("unexpected H12 preset common parameters")
+    if payload.get("aggregation") != "per_case_only":
+        raise ValueError("H12 benchmark reports per-case results only")
+
+    raw_cases = payload.get("cases")
+    if not isinstance(raw_cases, list) or len(raw_cases) != 6:
+        raise ValueError("H12 preset must contain six cases")
+    if any(
+        not isinstance(item, dict) or item.get("layout") not in {"fixed", "packed"}
+        for item in raw_cases
+    ):
+        raise ValueError("H12 preset cases must use fixed or packed layout")
+
+    cases = tuple(
+        Case(
+            name=item["name"],
+            num_heads=expected_common["num_heads"],
+            seq_lens=tuple(item["seq_lens"]),
+            packed=item["layout"] == "packed",
+            seed=item["seed"],
+        )
+        for item in raw_cases
+    )
+    if len({case.name for case in cases}) != len(cases):
+        raise ValueError("H12 preset must contain six uniquely named cases")
+    if any(not case.seq_lens or min(case.seq_lens) <= 0 for case in cases):
+        raise ValueError("H12 sequence lengths must be positive")
+    return cases
+
+
+LEGACY_CASES = (
     Case("h96_fixed8192", 96, (8192,), False, 10000),
     Case("h96_mixed", 96, (1300, 547, 2048, 963, 271, 3063), True, 10001),
     Case("h96_uniform", 96, (1024,) * 8, True, 10002),
@@ -86,6 +142,8 @@ CASES = (
     Case("h64_mixed", 64, (1300, 547, 2048, 963, 271, 3063), True, 10004),
     Case("h64_uniform", 64, (1024,) * 8, True, 10005),
 )
+H12_CASES = _load_h12_cases()
+CASES = LEGACY_CASES + H12_CASES
 
 
 def _require_cupti() -> None:
@@ -200,6 +258,14 @@ def _make_state_pool(
     rotations: int,
 ) -> torch.Tensor:
     return initial_state.unsqueeze(0).expand(rotations, *initial_state.shape).clone()
+
+
+def _variant_for_case(case: Case) -> str:
+    if case.num_heads == 12:
+        return "m128_n16"
+    if case.name == "h64_fixed8192":
+        return "m64"
+    return "m128"
 
 
 def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedCase:
@@ -382,7 +448,7 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
         "seq_lens": list(case.seq_lens),
         "total_tokens": total_tokens,
         "layout": "packed" if case.packed else "fixed",
-        "variant": "m64" if case.name == "h64_fixed8192" else "m128",
+        "variant": _variant_for_case(case),
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -470,6 +536,12 @@ def main() -> None:
     parser.add_argument("--warmup-ms", type=int, default=20)
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
+        "--case-set",
+        choices=("all", "legacy", "h12"),
+        default="all",
+        help="Run all cases, the original H64/H96 cases, or the Kimi-K3 TP8 H12 cases.",
+    )
+    parser.add_argument(
         "--state-rotations",
         type=int,
         default=DEFAULT_STATE_ROTATIONS,
@@ -544,8 +616,13 @@ def main() -> None:
             args.flash_kda_source_dir,
         )
 
+    selected_cases = {
+        "all": CASES,
+        "legacy": LEGACY_CASES,
+        "h12": H12_CASES,
+    }[args.case_set]
     results = []
-    for case in CASES:
+    for case in selected_cases:
         prepared = _make_case(
             case,
             state_rotations=args.state_rotations,
