@@ -89,7 +89,9 @@ class _Pointer(Pointer):
     # Move mlir Type out of __init__ to decouple with mlir Context
     @property
     def mlir_type(self) -> ir.Type:
-        return _cute_ir.PtrType.get(self._dtype.mlir_type, self._addr_space, self._assumed_align)
+        return _cute_ir.PtrType.get(
+            self._dtype.mlir_type, self._addr_space, self._assumed_align
+        )
 
     @property
     def dtype(self) -> Type[Numeric]:
@@ -157,7 +159,9 @@ def make_ptr(
         address_value = ctypes.cast(value, ctypes.c_void_p).value
         assert address_value is not None, "Pointer address is None"
     else:
-        raise TypeError(f"Expect int or ctypes.POINTER for value but got {type(value)=}")
+        raise TypeError(
+            f"Expect int or ctypes.POINTER for value but got {type(value)=}"
+        )
 
     return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
 
@@ -206,7 +210,9 @@ def silu_f32(
 
 # TODO(zhichenj): try to move these to NVVM wrapper or helper functions
 @dsl_user_op
-def vectorized_atomic_add_bf16x8(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
+def vectorized_atomic_add_bf16x8(
+    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
+):
     llvm.inline_asm(
         None,
         [
@@ -225,7 +231,9 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed, scatter_out_offset, loc=None, 
 
 
 @dsl_user_op
-def vectorized_atomic_add_fp32x2(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
+def vectorized_atomic_add_fp32x2(
+    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
+):
     llvm.inline_asm(
         None,
         [

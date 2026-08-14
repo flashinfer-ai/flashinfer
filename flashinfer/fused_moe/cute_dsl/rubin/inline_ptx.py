@@ -59,7 +59,9 @@ def sm100_tma_gather4_load(
         AddressSpace.generic,
         64,
     )
-    desc_cute_ptr = _cute_nvgpu_ir.get_tma_desc_addr(desc_ptr_ty, exec_atom, loc=loc, ip=ip)
+    desc_cute_ptr = _cute_nvgpu_ir.get_tma_desc_addr(
+        desc_ptr_ty, exec_atom, loc=loc, ip=ip
+    )
     desc_i64 = desc_cute_ptr.toint().ir_value(loc=loc, ip=ip)
 
     smem_dst_int = cutlass.Int32(smem_dst_ptr.toint())

@@ -111,6 +111,9 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
   "build/",
 ]
 
@@ -135,6 +138,9 @@ extend-exclude = [
   "flashinfer/topk_varlen/kernels/block_scan.py",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
 ]
 force-exclude = true
 

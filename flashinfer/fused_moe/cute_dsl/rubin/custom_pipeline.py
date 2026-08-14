@@ -80,7 +80,9 @@ class PipelineCpAsyncUmma(PipelineAsync):
         """
         Computes the leading CTA rank.
         """
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
         return cta_rank_in_cluster // cta_v_size * cta_v_size
 
     @staticmethod
@@ -102,7 +104,9 @@ class PipelineCpAsyncUmma(PipelineAsync):
         """
         Computes a mask for signaling arrivals to multicasting threadblocks.
         """
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
         cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         mask_self = cute.nvgpu.cpasync.create_tma_multicast_mask(
             cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=0
@@ -166,7 +170,9 @@ class PipelineCpAsyncUmma(PipelineAsync):
             agent=consumer,
         )
 
-        cta_v_size = cute.size(cta_layout_vmnk, mode=[0]) if cta_layout_vmnk is not None else 1
+        cta_v_size = (
+            cute.size(cta_layout_vmnk, mode=[0]) if cta_layout_vmnk is not None else 1
+        )
         cta_group = (
             cute.nvgpu.tcgen05.CtaGroup.ONE
             if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1

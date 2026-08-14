@@ -313,9 +313,7 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
             for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
                 if tile[0] == 256 and cluster[0] < 2:
                     continue
-                swap_options = (
-                    (False, True) if (n_aligned and m_aligned) else (False,)
-                )
+                swap_options = (False, True) if (n_aligned and m_aligned) else (False,)
                 for swap_ab in swap_options:
                     if swap_ab and not n_aligned:
                         continue
@@ -489,8 +487,7 @@ def _build_bmm_fp8_bucket_tactics(
 
     # Cache per-config min-m + tile dims so the inner loop is pure Python arithmetic.
     config_info = {
-        idx: _extract_config_min_m_and_tile(CONFIGS[idx])
-        for idx in max_valid_indices
+        idx: _extract_config_min_m_and_tile(CONFIGS[idx]) for idx in max_valid_indices
     }
 
     if k <= 1024:
@@ -547,7 +544,15 @@ def _select_sm100_bmm_fp8_cute_dsl_tactic(
         previous fallback behavior).
     """
     cache_key = (
-        n, k, batch, ab_dtype, c_dtype, a_major, b_major, c_major, sm_count,
+        n,
+        k,
+        batch,
+        ab_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        c_major,
+        sm_count,
     )
     bucket_tactics = _BMM_FP8_TACTIC_CACHE.get(cache_key)
     if bucket_tactics is None:

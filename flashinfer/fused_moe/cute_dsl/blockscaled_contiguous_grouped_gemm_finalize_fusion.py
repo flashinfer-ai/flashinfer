@@ -80,14 +80,14 @@ def _sm107_finalize_kernel_cls():
 
     # The SM107 FC2 kernel reuses the Blackwell wrapper: both have identical
     # __call__ signatures, so the Blackwell implementation works for SM107 too.
-    if not hasattr(Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel, "wrapper"):
+    if not hasattr(
+        Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel, "wrapper"
+    ):
         Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper = (  # type: ignore[attr-defined]
             Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper
         )
 
     return Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
-
-
 
 
 def create_finalize_fusion_tensors(
@@ -475,24 +475,22 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         token_scales_dtype = cutlass.Float16
 
     if is_rubin:
-        can_impl = (
-            _sm107_finalize_kernel_cls().can_implement(
-                a_dtype=ab_dtype_cutlass,
-                b_dtype=ab_dtype_cutlass,
-                sf_dtype=sf_dtype_cutlass,
-                sf_vec_size=sf_vec_size,
-                c_dtype=out_dtype_cutlass,
-                mma_inst_shape=mma_inst_shape,
-                mma_tiler=mma_tiler,
-                cluster_shape_mn=cluster_shape_mn,
-                m=permuted_m,
-                n=n,
-                k=k,
-                l=num_experts,
-                a_major="k",
-                b_major="k",
-                c_major="n",
-            )
+        can_impl = _sm107_finalize_kernel_cls().can_implement(
+            a_dtype=ab_dtype_cutlass,
+            b_dtype=ab_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            c_dtype=out_dtype_cutlass,
+            mma_inst_shape=mma_inst_shape,
+            mma_tiler=mma_tiler,
+            cluster_shape_mn=cluster_shape_mn,
+            m=permuted_m,
+            n=n,
+            k=k,
+            l=num_experts,
+            a_major="k",
+            b_major="k",
+            c_major="n",
         )
     else:
         can_impl = (

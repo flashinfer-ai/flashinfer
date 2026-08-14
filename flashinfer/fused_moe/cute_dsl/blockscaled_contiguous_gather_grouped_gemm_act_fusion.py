@@ -77,7 +77,6 @@ from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
 )
 
 
-
 @functools.cache
 def _sm107_swiglu_kernel_cls():
     """Import the SM107 kernel lazily.
@@ -366,7 +365,6 @@ def _get_compiled_gather_kernel(
             )
         wrapper_fn = gemm.wrapper
 
-
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
         # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
@@ -612,24 +610,22 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     c_dtype_cutlass = get_cutlass_dtype(c_dtype)
 
     if is_rubin:
-        can_impl = (
-            _sm107_swiglu_kernel_cls().can_implement(
-                a_dtype=ab_dtype_cutlass,
-                b_dtype=ab_dtype_cutlass,
-                sf_dtype=sf_dtype_cutlass,
-                sf_vec_size=sf_vec_size,
-                c_dtype=c_dtype_cutlass,
-                mma_inst_shape=mma_inst_shape,
-                mma_tiler=mma_tiler,
-                cluster_shape_mn=cluster_shape_mn,
-                m=permuted_m,
-                n=n,
-                k=k,
-                l=num_experts,
-                a_major="k",
-                b_major="k",
-                c_major="n",
-            )
+        can_impl = _sm107_swiglu_kernel_cls().can_implement(
+            a_dtype=ab_dtype_cutlass,
+            b_dtype=ab_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            c_dtype=c_dtype_cutlass,
+            mma_inst_shape=mma_inst_shape,
+            mma_tiler=mma_tiler,
+            cluster_shape_mn=cluster_shape_mn,
+            m=permuted_m,
+            n=n,
+            k=k,
+            l=num_experts,
+            a_major="k",
+            b_major="k",
+            c_major="n",
         )
     else:
         can_impl = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(

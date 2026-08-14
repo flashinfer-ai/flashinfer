@@ -1833,9 +1833,15 @@ def _cute_dsl_fp8_gemm_runner(arch: Literal["sm100", "sm107"]):
                     if arch == "sm100":
                         sm_count = get_device_sm_count(a.device)
                         tactic = _select_sm100_bmm_fp8_cute_dsl_tactic(
-                            m, n, k, batch,
-                            ab_dtype, c_dtype,
-                            a_major, b_major, c_major,
+                            m,
+                            n,
+                            k,
+                            batch,
+                            ab_dtype,
+                            c_dtype,
+                            a_major,
+                            b_major,
+                            c_major,
                             sm_count,
                         )
                     else:
@@ -6608,9 +6614,7 @@ def _cute_dsl_gemm_fp4_runner(
 
             make_kernel: Callable
             if kernel_type == "sm107" and Sm107Kernel is not None:
-                sm107_params = (
-                    use_tma_store  # repurposed: (inst_m, inst_n, inst_k, tiler_k, prefetch_dist)
-                )
+                sm107_params = use_tma_store  # repurposed: (inst_m, inst_n, inst_k, tiler_k, prefetch_dist)
                 make_kernel = lambda: Sm107Kernel(
                     sf_vec_size,
                     (sm107_params[0], sm107_params[1], sm107_params[2]),
