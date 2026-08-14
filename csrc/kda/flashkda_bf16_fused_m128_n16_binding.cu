@@ -50,10 +50,9 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
                 TensorView out, TensorView final_state, TensorView state_checkpoints,
                 TensorView checkpoint_cu_starts, TensorView descriptor_storage,
                 int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
-                int64_t state_slot_stride, int64_t use_state_indices,
-                int64_t use_initial_state, int64_t store_final_state,
-                int64_t checkpoint_every_n_tokens, double scale, double lower_bound,
-                int64_t cuda_stream) {
+                int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
+                int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale,
+                double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -64,19 +63,18 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const int64_t state_pool_slots = ResolveAndCheckServingStatePool(
       state_indices, initial_state, final_state, device_id, unchecked_num_seqs, num_heads,
       state_slot_stride, use_state_indices, use_initial_state, store_final_state);
-  const int64_t num_seqs =
-      CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
-                        initial_state, out, final_state, descriptor_storage, prepare_descriptors,
-                        num_heads, use_initial_state, store_final_state, scale, lower_bound, true,
-                        state_pool_slots);
+  const int64_t num_seqs = CheckCommonInputs(
+      q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
+      final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
+      store_final_state, scale, lower_bound, true, state_pool_slots);
   TVM_FFI_ICHECK(beta_token_stride == beta.stride(beta.ndim() - 2))
       << "beta_token_stride must match beta's physical token stride";
   CheckServingCheckpointInputs(state_checkpoints, checkpoint_cu_starts, device_id, num_seqs,
                                num_heads, checkpoint_every_n_tokens);
-  CheckServingAuxiliaryNoOverlap(
-      state_indices, state_checkpoints, checkpoint_cu_starts, q, k, v, g, beta, beta_tma,
-      A_log, dt_bias, cu_seqlens, seq_order, initial_state, out, final_state,
-      descriptor_storage, use_state_indices, checkpoint_every_n_tokens);
+  CheckServingAuxiliaryNoOverlap(state_indices, state_checkpoints, checkpoint_cu_starts, q, k, v, g,
+                                 beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
+                                 initial_state, out, final_state, descriptor_storage,
+                                 use_state_indices, checkpoint_every_n_tokens);
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
@@ -119,8 +117,8 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       static_cast<int32_t>(num_heads), static_cast<int64_t>(beta_token_stride),
       static_cast<int64_t>(state_slot_stride), static_cast<int32_t>(use_state_indices),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
-      static_cast<int32_t>(checkpoint_every_n_tokens),
-      static_cast<float>(scale), static_cast<float>(lower_bound));
+      static_cast<int32_t>(checkpoint_every_n_tokens), static_cast<float>(scale),
+      static_cast<float>(lower_bound));
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 N16 launch");
 }
 

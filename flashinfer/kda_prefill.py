@@ -158,8 +158,7 @@ def _is_state_pool_tensor(
         and tensor.stride(-1) == 1
         and tensor.stride(-2) == _FLASH_KDA_HEAD_DIM
         and tensor.stride(-3) == _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
-        and tensor.stride(0)
-        >= num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        and tensor.stride(0) >= num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         and tensor.stride(0) * tensor.element_size() % 16 == 0
     )
 
@@ -498,9 +497,7 @@ def _beta_tma_source(
         beta_flat = beta[0]
     else:
         if beta.stride(0) != seq_len * beta.stride(1):
-            raise ValueError(
-                "beta batch/token dimensions must collapse without a copy"
-            )
+            raise ValueError("beta batch/token dimensions must collapse without a copy")
         beta_flat = beta.as_strided(
             (total_tokens, num_heads),
             (beta.stride(1), beta.stride(2)),
@@ -593,10 +590,11 @@ def _storage_ranges_overlap(
 ) -> bool:
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
+
     def storage_end(tensor: torch.Tensor) -> int:
         max_element_offset = sum(
             (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride())
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
             if size > 0
         )
         return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()

@@ -593,9 +593,7 @@ def test_unaligned_strided_beta_uses_internal_tma_workspace(cuda_device, monkeyp
         kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant, target: module
     )
     inputs = _make_inputs(seq_lens=[32], num_heads=12, packed=True)
-    beta_carrier = torch.empty(
-        (32, 32), dtype=torch.bfloat16, device=cuda_device
-    )
+    beta_carrier = torch.empty((32, 32), dtype=torch.bfloat16, device=cuda_device)
     beta_carrier[:, 7:19].copy_(inputs["beta"][0])
     inputs["beta"] = beta_carrier[None, :, 7:19]
 
@@ -1121,11 +1119,9 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
     )
     beta_carrier[:, 8:20].copy_(inputs["beta"][0])
     inputs["beta"] = beta_carrier[None, :, 8:20]
-    expected_output, expected_state, expected_checkpoints = (
-        _chunk16_debug_reference(
-            {**inputs, "initial_state": compact_initial_state},
-            checkpoint_every_n_tokens=64,
-        )
+    expected_output, expected_state, expected_checkpoints = _chunk16_debug_reference(
+        {**inputs, "initial_state": compact_initial_state},
+        checkpoint_every_n_tokens=64,
     )
 
     state_slot_numel = 12 * 128 * 128
@@ -1138,9 +1134,7 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
         (5, 12, 128, 128),
         (state_storage.stride(0), 128 * 128, 128, 1),
     )
-    state_indices = torch.tensor(
-        [1, 3], dtype=torch.int32, device=flash_kda_device
-    )
+    state_indices = torch.tensor([1, 3], dtype=torch.int32, device=flash_kda_device)
     state_indices_i64 = state_indices.to(torch.int64)
     state_pool[state_indices_i64] = compact_initial_state
     untouched_before = state_pool[[0, 2, 4]].clone()

@@ -205,7 +205,8 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     provenance = (
         "// Frozen generated Loom export; do not edit by hand.\n"
         "// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module\n"
-        f"// {variant.module_ident}; raw SHA-256: {variant.raw_sha256}.\n"
+        f"// {variant.module_ident}; raw SHA-256:\n"
+        f"// {variant.raw_sha256}.\n"
     )
     return (
         LICENSE_HEADER

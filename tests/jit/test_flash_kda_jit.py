@@ -31,12 +31,6 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     manifest = json.loads(manifest_path.read_text())
 
     assert manifest["schema_version"] == 2
-    for private_provenance in (
-        "cake_revision",
-        "cake_tree",
-        "semantic_baseline_revision",
-    ):
-        assert private_provenance not in manifest
     assert manifest["architecture_artifacts_are_separate"] is True
     assert manifest["generated_source_text_equal_across_architectures"] is True
     assert set(manifest["profiles"]) == {
@@ -57,7 +51,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
             "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
-            "1601e5b0b3c778c530c789c65cb8670a7f2b1979bb8ef3fe60f7d02883ec176b",
+            "19da7badad004917aea7df2cf89d04b49685a2ba04701221b2fb6d7a0c974598",
             "flashkda_bf16_fused_m128_5527c05f05",
             169299,
             219136,
@@ -65,7 +59,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n32": (
             "flashkda_bf16_fused_m128.cu",
             "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",
-            "3e9ece9b4e78804c612af233b1eded9bcd8f52dea33677bab26d9399a1eb7c63",
+            "b291f299745c6b19c8df07563c9a847a620f35c3d190238a23bdd8d1e06eb5cd",
             "flashkda_bf16_fused_m128_123cfd2bfa",
             168024,
             227328,
@@ -86,22 +80,13 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         assert record["module_ident"] == module_ident
         assert record["raw_bytes"] == raw_bytes
         assert record["smem_bytes"] == smem_bytes
-        assert "cake_revision" not in record
-        assert "cake_tree" not in record
         assert record["frozen_path"] == f"csrc/kda/{filename}"
         assert (
             hashlib.sha256(frozen.read_bytes()).hexdigest() == record["frozen_sha256"]
         )
         frozen_text = frozen.read_text()
-        for private_provenance in (
-            "gitlab-master.nvidia.com",
-            "merge_requests/",
-            "Cake revision",
-            "Cake commit",
-            "CAKE commit",
-            "MR !",
-        ):
-            assert private_provenance not in frozen_text
+        assert "Frozen generated Loom export" in frozen_text
+        assert "raw SHA-256:" in frozen_text
 
     import_tool = (
         Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"

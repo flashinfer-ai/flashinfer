@@ -50,7 +50,7 @@
     "n16": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
-      "frozen_sha256": "1601e5b0b3c778c530c789c65cb8670a7f2b1979bb8ef3fe60f7d02883ec176b",
+      "frozen_sha256": "19da7badad004917aea7df2cf89d04b49685a2ba04701221b2fb6d7a0c974598",
       "module_ident": "flashkda_bf16_fused_m128_5527c05f05",
       "raw_bytes": 169299,
       "raw_sha256": "6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98",
@@ -59,7 +59,7 @@
     "n32": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128.cu",
-      "frozen_sha256": "3e9ece9b4e78804c612af233b1eded9bcd8f52dea33677bab26d9399a1eb7c63",
+      "frozen_sha256": "b291f299745c6b19c8df07563c9a847a620f35c3d190238a23bdd8d1e06eb5cd",
       "module_ident": "flashkda_bf16_fused_m128_123cfd2bfa",
       "raw_bytes": 168024,
       "raw_sha256": "872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf",

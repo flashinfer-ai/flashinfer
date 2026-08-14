@@ -16,7 +16,8 @@
 
 // Frozen generated Loom export; do not edit by hand.
 // Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module
-// flashkda_bf16_fused_m128_123cfd2bfa; raw SHA-256: 872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf.
+// flashkda_bf16_fused_m128_123cfd2bfa; raw SHA-256:
+// 872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
