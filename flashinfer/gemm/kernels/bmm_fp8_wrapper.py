@@ -623,10 +623,12 @@ def cute_bmm_fp8_can_implement(
     if b.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         return False
 
-    # Check device compute capability
+    # Check device compute capability.  The CuTe DSL bmm_fp8 path is SM107
+    # only, so this probe must agree with bmm_fp8_cute_dsl -- reporting True
+    # on SM100/SM103 would turn an intended fallback into a hard ValueError.
     try:
         major, minor = get_compute_capability(a.device)
-        if major < 10:
+        if (major, minor) != (10, 7):
             return False
     except Exception:
         return False

@@ -41,7 +41,6 @@ Key components:
 """
 
 from typing import Optional, Tuple, Type, Union, Literal
-from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 
@@ -56,7 +55,6 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .bmm_fp8_blackwell import (
     PersistentDenseGemmKernel as BlackwellPersistentDenseGemmKernel,
-    bmm,
     _compute_stages,
 )
 
@@ -705,8 +703,7 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
                     f"For K=64 with use_2cta_instrs=True, mma_inst_shape M must be 256, got {self.mma_inst_shape[0]}"
                 )
         if (
-            self.mma_tiler[0] // self.mma_inst_shape[0] != 2
-            or self.mma_tiler[0] // self.mma_inst_shape[0] != 1
+            self.mma_tiler[0] // self.mma_inst_shape[0] not in (1, 2)
         ) and self.mma_tiler[1] != self.mma_inst_shape[1]:
             raise testing.CantImplementError(
                 f"Invalid mma tiler: {self.mma_tiler} with mma_inst_shape: {self.mma_inst_shape}"
@@ -836,80 +833,6 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         )
 
 
-@lru_cache(maxsize=1)
-def compile_bmm_sm107(
-    mnkl: Tuple[int, int, int, int],
-    a: cute.Tensor,
-    b: cute.Tensor,
-    c: cute.Tensor,
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    mma_tiler: Tuple[int, int, int] = (256, 256, 128),
-    mma_inst_shape: Tuple[int, int, int] = (256, 256, 64),
-    cluster_shape_mn: Tuple[int, int] = (2, 1),
-    max_active_clusters: cutlass.Constexpr = None,
-    use_2cta_instrs: bool = True,
-    use_tma_store: bool = True,
-    swizzle_size: int = 1,
-    raster_along: Literal["m", "n"] = "m",
-    epilogue_op: cutlass.Constexpr = lambda x: x,
-):
-    """Compile a batched matrix multiplication kernel for Rubin (SM107).
-
-    :param mnkl: Problem dimensions (M, N, K, L)
-    :param a: Input tensor A
-    :param b: Input tensor B
-    :param c: Output tensor C
-    :param acc_dtype: Accumulator data type
-    :param a_major: Major dimension of A ("k" or "m")
-    :param b_major: Major dimension of B ("k" or "n")
-    :param c_major: Major dimension of C ("n" or "m")
-    :param mma_tiler: MMA tile shape (M, N, K)
-    :param mma_inst_shape: MMA instruction shape (M, N, K)
-    :param cluster_shape_mn: Cluster shape (M, N)
-    :param max_active_clusters: Maximum active clusters
-    :param use_2cta_instrs: Use 2CTA instructions
-    :param use_tma_store: Use TMA store
-    :param swizzle_size: Swizzle size
-    :param raster_along: Raster along dimension ("m" or "n")
-    :param epilogue_op: Epilogue operation
-    :return: Compiled kernel function
-    """
-    from cutlass.cute.runtime import make_fake_stream
-
-    # Build GEMM object
-    gemm = SM107PersistentDenseGemmKernel(
-        acc_dtype,
-        use_2cta_instrs,
-        mma_tiler,
-        mma_inst_shape,
-        cluster_shape_mn,
-        use_tma_store,
-        swizzle_size,
-        raster_along,
-    )
-
-    # Check if configuration can be implemented
-    can_implement = gemm.can_implement(
-        mnkl, a.element_type, b.element_type, c.element_type, a_major, b_major, c_major
-    )
-
-    if not can_implement:
-        raise testing.CantImplementError(
-            f"The current config which is invalid/unsupported: use_2cta_instrs = {use_2cta_instrs}, "
-            f"mma_tiler = {mma_tiler}, mma_inst_shape = {mma_inst_shape}, cluster_shape_mn = {cluster_shape_mn}, "
-            f"use_tma_store = {use_tma_store},"
-            f"swizzle_size = {swizzle_size}, "
-            f"raster_along = {raster_along}"
-        )
-
-    stream = make_fake_stream()
-    return cute.compile(bmm, gemm, a, b, c, max_active_clusters, stream, epilogue_op)
-
-
 __all__ = [
     "SM107PersistentDenseGemmKernel",
-    "compile_bmm_sm107",
 ]

@@ -78,15 +78,6 @@ def _sm107_finalize_kernel_cls():
         Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
     )
 
-    # The SM107 FC2 kernel reuses the Blackwell wrapper: both have identical
-    # __call__ signatures, so the Blackwell implementation works for SM107 too.
-    if not hasattr(
-        Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel, "wrapper"
-    ):
-        Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper = (  # type: ignore[attr-defined]
-            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper
-        )
-
     return Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
 
 
@@ -272,6 +263,26 @@ def _get_compiled_finalize_kernel(
                     "not supported by the Rubin (SM107) finalize grouped "
                     "GEMM kernel yet: its wrapper has no "
                     "a_per_token_scale_ptr parameter."
+                )
+            if not use_fused_finalize:
+                # The Rubin kernel takes no use_fused_finalize parameter: it
+                # always does the atomic scatter-add into token rows.  The
+                # caller allocates `out` with torch.empty (not torch.zeros)
+                # and shape (seq_len * topk, n) in the unfused case, so
+                # silently ignoring this would accumulate into uninitialized
+                # memory at the wrong shape.
+                raise NotImplementedError(
+                    "use_fused_finalize=False is not supported by the Rubin "
+                    "(SM107) finalize grouped GEMM kernel: it always performs "
+                    "the fused atomic scatter-add."
+                )
+            if final_scale_dtype is not cutlass.Float32:
+                # The Rubin kernel hardcodes self.final_scale_dtype =
+                # cutlass.Float32; its can_implement never sees this dtype.
+                raise NotImplementedError(
+                    "The Rubin (SM107) finalize grouped GEMM kernel supports "
+                    "only Float32 router scales, got "
+                    f"{final_scale_dtype}."
                 )
             gemm_rubin = _sm107_finalize_kernel_cls()(
                 sf_vec_size=sf_vec_size,
@@ -487,6 +498,17 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         raise ValueError(
             f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM10x family. "
             f"Got SM{major}{minor}."
+        )
+    # See the matching check in the gather/act-fusion entry point: is_rubin is
+    # inferred from the tactic parameters and can disagree with the device.
+    if is_rubin and minor != 7:
+        raise ValueError(
+            f"mma_tiler/mma_inst_shape select the Rubin (SM107) finalize "
+            f"kernel, but the device is SM{major}{minor}."
+        )
+    if not is_rubin and minor == 7:
+        raise ValueError(
+            "SM107 requires the Rubin tactic parameters mma_tiler and mma_inst_shape."
         )
 
     # Validate configuration

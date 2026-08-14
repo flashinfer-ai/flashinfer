@@ -52,8 +52,17 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    topk_weights: Optional[torch.Tensor] = None,
+    idx_src_info: Optional[torch.Tensor] = None,
+    rank_src_info: Optional[torch.Tensor] = None,
+    out_ptrs: Optional[torch.Tensor] = None,
+    num_ranks: int = 0,
     dst_signals: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
+    barrier_flag_local: Optional[torch.Tensor] = None,
+    barrier_flag_multicast: Optional[torch.Tensor] = None,
+    is_combine_fusion: bool = False,
+    is_swap_ab: bool = False,
     **kwargs,
 ):
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
@@ -203,7 +212,31 @@ def grouped_gemm_nt_masked(
         mma_tiler = (mma_tiler_mn[0], mma_tiler_mn[1], tiler_k)
         mma_inst_shape = (mma_tiler_mn[0], mma_tiler_mn[1], inst_k)
 
-        assert len(kwargs) == 0, f"Unsupported kwargs: {kwargs}"
+        # The combine-fusion / multi-rank parameters are Blackwell-only; the
+        # Rubin kernel has no equivalent, so reject them explicitly instead of
+        # silently ignoring them.
+        unsupported = [
+            name
+            for name, value, default in (
+                ("topk_weights", topk_weights, None),
+                ("idx_src_info", idx_src_info, None),
+                ("rank_src_info", rank_src_info, None),
+                ("out_ptrs", out_ptrs, None),
+                ("num_ranks", num_ranks, 0),
+                ("barrier_flag_local", barrier_flag_local, None),
+                ("barrier_flag_multicast", barrier_flag_multicast, None),
+                ("is_combine_fusion", is_combine_fusion, False),
+                ("is_swap_ab", is_swap_ab, False),
+            )
+            if value is not default
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "The Rubin (SM107) masked grouped GEMM does not support: "
+                + ", ".join(unsupported)
+            )
+        if kwargs:
+            raise ValueError(f"Unsupported kwargs: {kwargs}")
 
         return _grouped_gemm_nt_masked_sm107(
             lhs=lhs,
@@ -238,8 +271,17 @@ def grouped_gemm_nt_masked(
             sf_dtype=sf_dtype,
             c_dtype=c_dtype,
             sf_vec_size=sf_vec_size,
+            topk_weights=topk_weights,
+            idx_src_info=idx_src_info,
+            rank_src_info=rank_src_info,
+            out_ptrs=out_ptrs,
+            num_ranks=num_ranks,
             dst_signals=dst_signals,
             sm_count=sm_count,
+            barrier_flag_local=barrier_flag_local,
+            barrier_flag_multicast=barrier_flag_multicast,
+            is_combine_fusion=is_combine_fusion,
+            is_swap_ab=is_swap_ab,
             **kwargs,
         )
 

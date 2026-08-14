@@ -159,13 +159,21 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
     mma_inst_k = 128
 
     # (mma_tiler_m, mma_inst_m) candidates — B-reuse when tiler_m = 2 * inst_m
+    #
+    # NOTE: while tile_size is restricted to 128 (see get_rubin_moe_valid_tactics),
+    # the mma_tiler_m == tile_size and cluster_shape_m * mma_tiler_m <= tile_size
+    # constraints below force mma_tiler_m = 128 and cluster_shape_m = 1.  Every
+    # 2CTA and B-reuse entry here is therefore currently unreachable, and only
+    # the two 1CTA (128, 128) tactics are actually tuned.  The entries are kept
+    # because they become reachable again once tile_size=256 is re-enabled.
     mma_m_candidates = [
         (128, 128),  # no B-reuse, 1CTA
-        (256, 256),  # no B-reuse, 2CTA
-        (256, 128),  # B-reuse, 1CTA
-        (512, 256),  # B-reuse, 2CTA
+        (256, 256),  # no B-reuse, 2CTA   (unreachable at tile_size=128)
+        (256, 128),  # B-reuse, 1CTA      (unreachable at tile_size=128)
+        (512, 256),  # B-reuse, 2CTA      (unreachable at tile_size=128)
     ]
     mma_n_candidates = [128, 256]
+    # (2, 1) is unreachable at tile_size=128 for the same reason.
     cluster_shape_mn_candidates = [(1, 1), (2, 1)]
     raster_along_m_candidates = [False]
 
@@ -179,11 +187,10 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
     ):
-        if mma_tiler_m > tile_size:
-            continue
         # GEMM1 is a gather GEMM: mma_tiler_m must equal tile_size so that
         # each CTA's tile exactly covers one moe_sort tile in the M dimension.
-        # Smaller mma_tiler_m causes incorrect gather indexing.
+        # Smaller mma_tiler_m causes incorrect gather indexing.  (This also
+        # subsumes the mma_tiler_m > tile_size case.)
         if mma_tiler_m != tile_size:
             continue
         if cluster_shape_mn[0] * mma_tiler_m > tile_size:
@@ -209,16 +216,20 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     mma_tiler_k = 256
     mma_inst_k = 128
 
+    # As in get_rubin_gemm1_valid_tactics, the mma_tiler_m == tile_size and
+    # cluster_shape_m * mma_tiler_m <= tile_size constraints below make every
+    # 2CTA and B-reuse entry unreachable while tile_size is restricted to 128.
     mma_m_candidates = [
         (128, 128),
-        (256, 256),
-        (256, 128),
-        (512, 256),
+        (256, 256),  # unreachable at tile_size=128
+        (256, 128),  # unreachable at tile_size=128
+        (512, 256),  # unreachable at tile_size=128
     ]
     mma_n_candidates = [128, 256]
-    # Restrict to cluster_shape_n=1 only. The Rubin finalize kernel
-    # triggers illegal memory accesses with cluster_shape_n>1 at
-    # larger token counts (non-deterministic, routing-dependent).
+    # cluster_shape_n is pinned to 1: the Rubin finalize kernel triggers
+    # illegal memory accesses with cluster_shape_n>1 at larger token counts
+    # (non-deterministic, routing-dependent).  cluster_shape_m varies here,
+    # but (2, 1) is unreachable at tile_size=128 per the note above.
     cluster_shape_mn_candidates = [(1, 1), (2, 1)]
     raster_along_m_candidates = [False]
 

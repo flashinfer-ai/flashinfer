@@ -630,6 +630,19 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             f"Blockscaled contiguous gather grouped GEMM requires SM10x family. "
             f"Got SM{major}{minor}."
         )
+    # is_rubin is inferred from the tactic parameters, so it can disagree with
+    # the device.  The autotuner is always self-consistent (it picks tactics by
+    # capability), but the public wrappers take these parameters directly --
+    # catch a mismatch here rather than deep inside kernel compilation.
+    if is_rubin and minor != 7:
+        raise ValueError(
+            f"mma_tiler/mma_inst_shape select the Rubin (SM107) kernel, but "
+            f"the device is SM{major}{minor}."
+        )
+    if not is_rubin and minor == 7:
+        raise ValueError(
+            "SM107 requires the Rubin tactic parameters mma_tiler and mma_inst_shape."
+        )
 
     # Validate configuration
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)

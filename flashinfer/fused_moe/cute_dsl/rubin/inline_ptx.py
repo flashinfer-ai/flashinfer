@@ -23,7 +23,11 @@ from cutlass.cutlass_dsl import dsl_user_op
 # PTX `mbarrier::peer_bit` mask used by TMA gather4 in 2CTA mode: keeps
 # all address bits except bit 24 (the peer-CTA bit), so both CTAs' bytes
 # flow to the leader CTA's mbar.
-_PEER_BIT_MASK = 0xFEFFFFFF
+#
+# Spelled as the signed value rather than 0xFEFFFFFF: this is consumed by
+# cutlass.Int32, and the unsigned literal is outside the signed 32-bit
+# range.  -16777217 is the same bit pattern.
+_PEER_BIT_MASK = -16777217
 
 
 @dsl_user_op
