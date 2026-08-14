@@ -392,8 +392,9 @@ jobs:
             # what carries the link on the PR meanwhile.
             echo "::notice title=Tests are already running for this commit::$RUN_URL"
 
-            # No deadline: test duration grows as tests are added, and GitHub
-            # ends a hosted job at 6 hours anyway.
+            # No wait limit, because any number here would guess at test duration
+            # and guessing low fails a healthy run. The wait ends when the
+            # followed run concludes, or when it stops being readable.
             CONCLUSION=""
             UNREADABLE=0
             while true; do
@@ -435,7 +436,7 @@ jobs:
           fi
 
           echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-          echo "A contributor with permission to label the PR can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
+          echo "A contributor who can label the PR, or a \`ci-users\` member, can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
           echo "This is also needed after pushing new commits, since CI no longer starts on its own." >> $GITHUB_STEP_SUMMARY
           echo "::warning::CI skipped — pending authorization"
           exit 1

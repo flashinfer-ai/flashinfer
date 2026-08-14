@@ -17,9 +17,11 @@ jobs:
     name: Discard Label-Only Run
     if: github.event.label.name != 'run-ci'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Discard the run this label started
+        # This job is a check on the PR: failing would add the red check it removes.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -88,8 +90,7 @@ jobs:
           fi
 
           # Everything above the testing run. A run must finish before it can be
-          # deleted, so cancels go out together and share one deadline below,
-          # rather than each taking a budget that adds up past the job timeout.
+          # deleted, so cancels go out together and share one deadline below.
           TARGETS=""
           while read -r ID; do
             if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
