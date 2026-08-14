@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared MoE test fixtures."""
+"""Shared MoE test fixtures and import-path setup."""
+
+import os
+import sys
 
 import pytest
 
 from tests.moe.trtllm_gen_fused_moe_utils import MoeGemmBackend
+
+# The DA acceptance tests reuse the public benchmark implementation. Pytest's
+# importlib mode does not reliably add the checkout root for plain ``pytest``.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 @pytest.fixture(autouse=True)

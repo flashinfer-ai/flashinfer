@@ -136,10 +136,52 @@ class MoERunner(TunableRunner):
             MoERunner.valid_tactics_dict[instance_key] = valid_tactics
         return MoERunner.valid_tactics_dict[instance_key]
 
+    def get_factorized_tactic_space(
+        self,
+        inputs: List[torch.Tensor],
+    ):
+        """Return C++-declared legal FC1/FC2 factors and tile-local anchors."""
+        from flashinfer.fused_moe.da_tuner import (
+            FactorizedTactic,
+            FactorizedTacticSpace,
+        )
+
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        rows = self.moe_op.trtllm_get_valid_moe_factorizations(
+            self.dtype_act,
+            self.dtype_weights,
+            self.fp8_quantization_type,
+            self.top_k + self.num_fused_shared_experts,
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_local_experts + self.num_fused_shared_experts,
+            self.activation_type,
+            self.use_shuffled_weight,
+            self.weight_layout,
+            self.use_per_token_scaling,
+            moe_inputs.hidden_states.shape[0],
+            moe_inputs.gemm1_lora_delta is not None,
+        )
+        tactics = []
+        anchors = {}
+        for tile_n, config, fc1, fc2, is_anchor in rows:
+            identity = (int(tile_n), int(config))
+            tactics.append(
+                FactorizedTactic(
+                    tactic=identity,
+                    tile_n=int(tile_n),
+                    fc1=int(fc1),
+                    fc2=int(fc2),
+                )
+            )
+            if is_anchor:
+                anchors[int(tile_n)] = identity
+        return FactorizedTacticSpace(tactics, anchors)
+
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs,
     ):
@@ -150,11 +192,19 @@ class MoERunner(TunableRunner):
         expert_weights = moe_inputs.expert_weights
         topk_weights = expert_weights
         hidden_states = moe_inputs.hidden_states
+        # Plain E4m3 returns false from trtllm_gen_dtype_has_scale, but DeepSeek
+        # block-FP8 still requires the real per-1x128-block activation scales.
         hidden_states_scale = (
             moe_inputs.hidden_states_scale
-            if trtllm_gen_dtype_has_scale(self.dtype_act)
+            if (
+                trtllm_gen_dtype_has_scale(self.dtype_act)
+                or self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            )
             else None
         )
+        da_routing_metadata = kwargs.get("da_routing_metadata", ())
+        da_body_workspace = kwargs.get("da_body_workspace", ())
+        prepare_da_body = do_preparation and bool(da_routing_metadata)
 
         num_tokens = hidden_states.shape[0]
         assert output.shape[0] == num_tokens, (
@@ -192,7 +242,7 @@ class MoERunner(TunableRunner):
                 )
 
         if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
-            self.moe_op.trtllm_bf16_moe(
+            result = self.moe_op.trtllm_bf16_moe(
                 kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
                 routing_logits,
                 kwargs["routing_bias"],
@@ -223,7 +273,12 @@ class MoERunner(TunableRunner):
                 self.activation_type,
                 kwargs.get("norm_topk_prob", True),
                 kwargs.get("routing_replay_out"),
+                list(da_routing_metadata),
+                list(da_body_workspace),
+                prepare_da_body,
             )
+            if prepare_da_body or da_routing_metadata:
+                return list(result)
         elif (
             self.dtype_act == DtypeTrtllmGen.E4m3
             and self.dtype_weights == DtypeTrtllmGen.E4m3
@@ -235,31 +290,14 @@ class MoERunner(TunableRunner):
                 self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
                 or self.fp8_quantization_type == Fp8QuantizationType.MxFp8
             ):
-                current_num_tokens = hidden_states.shape[0]
-                current_hidden_size = hidden_states.shape[1]
-                if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                    current_hidden_states_scale = torch.full(
-                        (current_hidden_size // 128, current_num_tokens),
-                        2.0,
-                        dtype=torch.float,
-                        device=hidden_states.device,
-                    )
-                elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-                    current_hidden_states_scale = hidden_states_scale
-                else:
-                    raise ValueError(
-                        f"Unsupported FP8 quantization type: "
-                        f"{self.fp8_quantization_type}"
-                    )
-
-                self.moe_op.trtllm_fp8_block_scale_moe(
+                result = self.moe_op.trtllm_fp8_block_scale_moe(
                     kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
                     routing_logits,
                     topk_ids,
                     topk_weights,
                     kwargs["routing_bias"],
                     hidden_states,
-                    current_hidden_states_scale,
+                    hidden_states_scale,
                     kwargs["gemm1_weights"],
                     kwargs["gemm1_weights_scale"],
                     moe_inputs.gemm1_lora_delta,
@@ -290,10 +328,12 @@ class MoERunner(TunableRunner):
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    list(da_routing_metadata),
+                    list(da_body_workspace),
+                    prepare_da_body,
                 )
             else:
-                self.moe_op.trtllm_fp8_per_tensor_scale_moe(
-                    routing_logits,
+                common_args = (
                     kwargs["routing_bias"],
                     hidden_states,
                     kwargs["gemm1_weights"],
@@ -318,12 +358,30 @@ class MoERunner(TunableRunner):
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    list(da_routing_metadata),
+                    list(da_body_workspace),
+                    prepare_da_body,
                 )
+                if (
+                    kwargs.get("routing_input_mode")
+                    == RoutingInputMode.PackedPrecomputed
+                ):
+                    result = self.moe_op.trtllm_fp8_per_tensor_scale_routed_moe(
+                        topk_ids,
+                        *common_args,
+                    )
+                else:
+                    result = self.moe_op.trtllm_fp8_per_tensor_scale_moe(
+                        routing_logits,
+                        *common_args,
+                    )
+            if prepare_da_body or da_routing_metadata:
+                return list(result)
         elif (
             self.dtype_act == DtypeTrtllmGen.Bfloat16
             and self.dtype_weights == DtypeTrtllmGen.MxInt4
         ):
-            self.moe_op.trtllm_mxint4_block_scale_moe(
+            result = self.moe_op.trtllm_mxint4_block_scale_moe(
                 routing_logits,
                 kwargs["routing_bias"],
                 topk_ids,
@@ -352,9 +410,14 @@ class MoERunner(TunableRunner):
                 [-1, -1] if tactic == -1 else tactic,
                 kwargs.get("norm_topk_prob", True),
                 kwargs.get("routing_replay_out"),
+                list(da_routing_metadata),
+                list(da_body_workspace),
+                prepare_da_body,
             )
+            if prepare_da_body or da_routing_metadata:
+                return list(result)
         else:
-            self.moe_op.trtllm_fp4_block_scale_moe(
+            result = self.moe_op.trtllm_fp4_block_scale_moe(
                 kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
                 routing_logits,
                 topk_ids,
@@ -393,4 +456,9 @@ class MoERunner(TunableRunner):
                 [-1, -1] if tactic == -1 else tactic,
                 kwargs.get("norm_topk_prob", True),
                 kwargs.get("routing_replay_out"),
+                list(da_routing_metadata),
+                list(da_body_workspace),
+                prepare_da_body,
             )
+            if prepare_da_body or da_routing_metadata:
+                return list(result)

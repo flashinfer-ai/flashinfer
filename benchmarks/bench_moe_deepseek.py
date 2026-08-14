@@ -49,7 +49,9 @@ Metrics:
 """
 
 import argparse
+import contextlib
 import gc
+import os
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -84,6 +86,17 @@ EP_CONFIGS = {
     8: {"num_local_experts": 32, "local_expert_offset": 0},
     16: {"num_local_experts": 16, "local_expert_offset": 0},
 }
+
+
+def _autotune_context(do_autotune, cache):
+    """Create a tuning, cache-only, or ordinary no-cache benchmark scope."""
+    from flashinfer.autotuner import autotune
+
+    if cache is not None:
+        return autotune(do_autotune, cache=cache)
+    if do_autotune:
+        return autotune(True)
+    return contextlib.nullcontext()
 
 
 def is_sm100_family():
@@ -224,7 +237,41 @@ def _measure_or_profile(
     profile_cuda,
     profile_iters,
 ):
-    from flashinfer.testing.utils import bench_gpu_time
+    from flashinfer.testing.utils import bench_gpu_time, get_l2_cache_size
+
+    da_capture = use_cuda_graph and os.getenv(
+        "FLASHINFER_DIST_AWARE_AUTOTUNE", "0"
+    ).lower() not in ("", "0", "false", "no", "off", "none")
+
+    if not profile_cuda and da_capture:
+        from flashinfer.fused_moe import trtllm_moe_acquire_da_graph_leases
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(**input_kwargs)
+        leases = trtllm_moe_acquire_da_graph_leases(graph)
+        l2_flush = torch.empty(2 * get_l2_cache_size(), device="cuda", dtype=torch.int8)
+        times = []
+        try:
+            for _ in range(warmup):
+                graph.replay()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            for _ in range(iters):
+                l2_flush.zero_()
+                torch.cuda.synchronize()
+                start.record()
+                graph.replay()
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end))
+        finally:
+            torch.cuda.synchronize()
+            graph.reset()
+            for lease in leases:
+                lease.release()
+        return np.median(times)
 
     if not profile_cuda:
         times = bench_gpu_time(
@@ -238,15 +285,17 @@ def _measure_or_profile(
         )
         return np.median(times)
 
-    from flashinfer.testing.utils import get_l2_cache_size
-
     def runner():
         return run(**input_kwargs)
 
+    leases = ()
     if use_cuda_graph:
+        from flashinfer.fused_moe import trtllm_moe_acquire_da_graph_leases
+
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run(**input_kwargs)
+        leases = trtllm_moe_acquire_da_graph_leases(graph)
         runner = graph.replay
     for _ in range(3):
         runner()
@@ -260,6 +309,11 @@ def _measure_or_profile(
         runner()
         torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
+    if use_cuda_graph:
+        torch.cuda.synchronize()
+        graph.reset()
+        for lease in leases:
+            lease.release()
     return float("nan")
 
 
@@ -279,6 +333,7 @@ def bench_cute_dsl(
     use_fused_finalize=True,
     profile_cuda=False,
     profile_iters=10,
+    autotune_cache=None,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -301,10 +356,7 @@ def bench_cute_dsl(
             cudaProfilerStart/Stop instead of benchmarking.
         profile_iters: Number of cold-L2 graph replays to capture.
     """
-    import contextlib
-
     from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -501,7 +553,7 @@ def bench_cute_dsl(
     # runs outside the autotune context so that choose_one in the
     # measurement loop returns the cached tactic via the non-tuning fast
     # path (no host-side tactic-walking inside the CUDA-event interval).
-    with autotune(True) if do_autotune else contextlib.nullcontext():
+    with _autotune_context(do_autotune, autotune_cache):
         run(**input_kwargs)
         torch.cuda.synchronize()
 
@@ -529,15 +581,13 @@ def bench_cutlass(
     include_activation_quant=False,
     profile_cuda=False,
     profile_iters=10,
+    autotune_cache=None,
 ):
     """Benchmark CUTLASS MoE.
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
     """
-    import contextlib
-
-    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -626,7 +676,7 @@ def bench_cutlass(
     }
 
     # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
-    with autotune(True) if do_autotune else contextlib.nullcontext():
+    with _autotune_context(do_autotune, autotune_cache):
         run(**input_kwargs)
         torch.cuda.synchronize()
 
@@ -655,17 +705,25 @@ def bench_trtllm(
     include_activation_quant=False,
     profile_cuda=False,
     profile_iters=10,
+    autotune_cache=None,
+    routing_input_mode="logits",
+    distributions=("uniform",),
 ):
     """Benchmark TRT-LLM-Gen MoE.
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
     """
-    import contextlib
-
     from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.autotuner import autotune
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
+    from flashinfer.fused_moe import (
+        RoutingMethodType,
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
+    from flashinfer.fused_moe.da_tuner import (
+        RoutingRealizationFactory,
+        RoutingRealizationKey,
+    )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
@@ -758,11 +816,61 @@ def bench_trtllm(
     # Scale tensors sized for LOCAL experts only
     sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
 
+    routing_ids = None
+    routing_weights = None
+    if routing_input_mode == "routed":
+        realized = RoutingRealizationFactory().get_or_create(
+            RoutingRealizationKey(
+                device=torch.device(dev),
+                num_tokens=n,
+                distribution=distributions[0],
+                sample_index=0,
+                local_expert_offset=0,
+                num_local_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                routing_rule_fingerprint="bench_moe_deepseek:renormalize",
+                routed_scaling_factor=1.0,
+            )
+        )
+        routing_ids = realized.expert_ids
+        routing_weights = realized.routing_weights
+
     def run(routing_logits, routing_bias, hidden_states, hidden_states_scale):
+        """Invoke the selected logits or pre-routed TRTLLM public entry point."""
         per_token_scale = hidden_per_token_scale
         if include_activation_quant:
             hidden_states, hidden_states_scale, per_token_scale = quantize_hidden(
                 hidden_states
+            )
+        if routing_input_mode == "routed":
+            return trtllm_fp4_block_scale_routed_moe(
+                topk_ids=(routing_ids, routing_weights),
+                routing_bias=None,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                gemm1_weights=w1f,
+                gemm1_weights_scale=w1s,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=w2f,
+                gemm2_weights_scale=w2s,
+                gemm2_bias=None,
+                output1_scale_scalar=sc,
+                output1_scale_gate_scalar=sc,
+                output2_scale_scalar=sc,
+                num_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                intermediate_size=CFG.intermediate_size,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=num_local_experts,
+                routed_scaling_factor=1.0,
+                routing_method_type=RoutingMethodType.Renormalize.value,
+                per_token_scale=per_token_scale,
+                do_finalize=True,
             )
         return trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
@@ -802,7 +910,7 @@ def bench_trtllm(
     }
 
     # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
-    with autotune(True) if do_autotune else contextlib.nullcontext():
+    with _autotune_context(do_autotune, autotune_cache):
         run(**input_kwargs)
         torch.cuda.synchronize()
 
@@ -856,6 +964,10 @@ def run_benchmark(
     profile_cuda=False,
     profile_iters=10,
     profile_backend=None,
+    backends=None,
+    routing_input_mode="logits",
+    distributions=("uniform",),
+    autotune_cache=None,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -903,10 +1015,10 @@ def run_benchmark(
             f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
         )
 
-    # Get EP configuration
-    ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS[1])
-    num_local = ep_cfg["num_local_experts"]
-    local_offset = ep_cfg["local_expert_offset"]
+    if CFG.num_experts % ep_config != 0:
+        raise ValueError("ep_config must divide num_experts")
+    num_local = CFG.num_experts // ep_config
+    local_offset = 0
     CFG.intermediate_size = BASE_INTERMEDIATE_SIZE // tp_config
 
     results = []
@@ -932,6 +1044,10 @@ def run_benchmark(
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
             profile_backend=profile_backend,
+            backends=backends,
+            routing_input_mode=routing_input_mode,
+            distributions=distributions,
+            autotune_cache=autotune_cache,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -940,7 +1056,15 @@ def run_benchmark(
         gc.collect()
         torch.cuda.empty_cache()
 
-    if verbose:
+    if verbose and backends is not None:
+        print("backend,tokens,latency_ms,tflops")
+        for row, _ in rows_and_histograms:
+            for result in row:
+                print(
+                    f"{result.backend},{result.tokens},{result.latency_ms:.6f},"
+                    f"{result.tflops:.6f}"
+                )
+    elif verbose:
         _print_header(
             ep_config,
             tp_config,
@@ -976,6 +1100,10 @@ def _benchmark_single(
     profile_cuda=False,
     profile_iters=10,
     profile_backend=None,
+    backends=None,
+    routing_input_mode="logits",
+    distributions=("uniform",),
+    autotune_cache=None,
 ):
     """Benchmark all backends for a single token count.
 
@@ -986,10 +1114,17 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    run_cute_dsl_w4a4 = profile_backend in (None, "cute-dsl")
-    run_cute_dsl_w4a16 = profile_backend in (None, "cute-dsl-w4a16")
-    run_cutlass = profile_backend in (None, "cutlass")
-    run_trtllm = profile_backend in (None, "trtllm")
+    selected = set(backends or ("cutedsl", "cutlass", "trtllm"))
+    run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
+        None,
+        "cute-dsl",
+    )
+    run_cute_dsl_w4a16 = "cutedsl" in selected and profile_backend in (
+        None,
+        "cute-dsl-w4a16",
+    )
+    run_cutlass = "cutlass" in selected and profile_backend in (None, "cutlass")
+    run_trtllm = "trtllm" in selected and profile_backend in (None, "trtllm")
 
     lat = {}
     if run_cute_dsl_w4a4:
@@ -1009,6 +1144,7 @@ def _benchmark_single(
             use_fused_finalize=use_fused_finalize,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
         )
     if run_cute_dsl_w4a16:
         lat["CuteDSL W4A16"] = bench_cute_dsl(
@@ -1027,6 +1163,7 @@ def _benchmark_single(
             use_fused_finalize=use_fused_finalize,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
         )
     if run_cutlass and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
@@ -1041,6 +1178,7 @@ def _benchmark_single(
             include_activation_quant=include_activation_quant,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
         )
     if run_trtllm:
         lat["TRTLLM"] = bench_trtllm(
@@ -1056,6 +1194,9 @@ def _benchmark_single(
             include_activation_quant=include_activation_quant,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
+            routing_input_mode=routing_input_mode,
+            distributions=distributions,
         )
 
     # Build results
@@ -1306,7 +1447,42 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
-    parser.add_argument("--no-autotune", action="store_true", help="Disable autotune")
+    parser.add_argument(
+        "--no-autotune",
+        "--skip-autotune",
+        dest="no_autotune",
+        action="store_true",
+        help="Disable profiling; a supplied cache is still loaded",
+    )
+    parser.add_argument(
+        "--cache",
+        "--tuning-cache",
+        "--bundle-output",
+        dest="cache",
+        help="Shared AutoTuner JSON cache path",
+    )
+    parser.add_argument(
+        "--num-experts",
+        type=int,
+        default=CFG.num_experts,
+        help="Number of global routing experts",
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        help="Comma-separated subset of cutedsl,cutlass,trtllm",
+    )
+    parser.add_argument(
+        "--distributions",
+        type=str,
+        help="Comma-separated DA tuner distributions",
+    )
+    parser.add_argument(
+        "--routing-input-mode",
+        choices=("logits", "routed"),
+        default="logits",
+        help="TRTLLM routing input representation",
+    )
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
         "--gen-phase",
@@ -1383,6 +1559,25 @@ def main():
 
     if args.tp < 1:
         parser.error("--tp must be positive")
+    if args.num_experts < 1:
+        parser.error("--num-experts must be positive")
+    if args.num_experts % args.ep != 0:
+        parser.error("--ep must divide --num-experts")
+    backends = None
+    if args.backends:
+        backends = tuple(
+            item.strip() for item in args.backends.split(",") if item.strip()
+        )
+        unknown = sorted(set(backends) - {"cutedsl", "cutlass", "trtllm"})
+        if unknown:
+            parser.error(f"unknown --backends value(s): {', '.join(unknown)}")
+    distributions = tuple(
+        item.strip()
+        for item in (args.distributions or "uniform").split(",")
+        if item.strip()
+    )
+    if not distributions:
+        parser.error("--distributions must not be empty")
     if BASE_INTERMEDIATE_SIZE % args.tp != 0:
         parser.error(
             f"--tp must divide the expert intermediate size ({BASE_INTERMEDIATE_SIZE})"
@@ -1396,6 +1591,13 @@ def main():
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
+
+    CFG.num_experts = args.num_experts
+    if args.routing_input_mode == "routed" and not args.no_cuda_graph:
+        os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
+        os.environ["FLASHINFER_DA_DISTRIBUTIONS"] = ",".join(distributions)
+    else:
+        os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "0"
 
     # Determine token counts
     if args.num_tokens:
@@ -1437,6 +1639,10 @@ def main():
         profile_cuda=args.profile_cuda,
         profile_iters=args.profile_iters,
         profile_backend=args.profile_backend,
+        backends=backends,
+        routing_input_mode=args.routing_input_mode,
+        distributions=distributions,
+        autotune_cache=args.cache,
     )
 
     return 0

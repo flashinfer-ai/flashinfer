@@ -1,5 +1,9 @@
 name: Nightly Release
 
+env:
+  NIGHTLY_RELEASE_REPOSITORY: flashinfer-ai/whl
+  LEGACY_NIGHTLY_RELEASE_REPOSITORY: flashinfer-ai/flashinfer
+
 on:
   schedule:
     # Run at 00:00 UTC every day
@@ -57,7 +61,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -92,7 +96,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -153,7 +157,7 @@ jobs:
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f 12.1a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f') || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
         run: |
           # Extract CUDA major and minor versions
@@ -206,25 +210,52 @@ jobs:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create GitHub Release (empty first)
+      # Temporary dual-write during the transition to flashinfer-ai/whl.
+      - name: Create legacy nightly release in flashinfer repository (empty first)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ needs.setup.outputs.release_tag }}"
 
-          # Delete existing release and tag if they exist
-          if gh release view "$TAG" &>/dev/null; then
+          if gh release view "$TAG" --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
             echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
+            gh release delete "$TAG" \
+              --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" \
+              --yes \
+              --cleanup-tag
+          fi
+
+          gh release create "$TAG" \
+            --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" \
+            --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
+            --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
+            --prerelease
+
+      - name: Create nightly release in wheel repository (empty first)
+        env:
+          # Requires contents: write access to NIGHTLY_RELEASE_REPOSITORY.
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
+        run: |
+          TAG="${{ needs.setup.outputs.release_tag }}"
+
+          # Delete existing release and tag if they exist
+          if gh release view "$TAG" --repo "${NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
+            echo "Deleting existing release: $TAG"
+            gh release delete "$TAG" \
+              --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+              --yes \
+              --cleanup-tag
           fi
 
           # Create new release without assets first
           gh release create "$TAG" \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
             --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
             --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
             --prerelease
@@ -235,11 +266,17 @@ jobs:
           name: flashinfer-python-dist
           path: dist-python/
 
-      - name: Upload flashinfer-python to release
+      - name: Upload flashinfer-python to both releases
         env:
           GH_TOKEN: ${{ github.token }}
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* \
+            --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
+          GH_TOKEN="${WHL_TOKEN}" gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
 
       - name: Download flashinfer-cubin artifact
         uses: actions/download-artifact@v4
@@ -247,15 +284,22 @@ jobs:
           name: flashinfer-cubin-wheel
           path: dist-cubin/
 
-      - name: Upload flashinfer-cubin to release
+      - name: Upload flashinfer-cubin to both releases
         env:
           GH_TOKEN: ${{ github.token }}
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* \
+            --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
+          GH_TOKEN="${WHL_TOKEN}" gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
 
-      - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
+      - name: Upload flashinfer-jit-cache wheels to both releases (one at a time to avoid OOM)
         env:
           GH_TOKEN: ${{ github.token }}
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
           # Upload jit-cache wheels one at a time to avoid OOM
           # Each wheel can be several GB, so we download, upload, delete, repeat
@@ -274,8 +318,13 @@ jobs:
 
               # Upload to release
               if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
+                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* \
+                  --repo "${LEGACY_NIGHTLY_RELEASE_REPOSITORY}" \
+                  --clobber
+                GH_TOKEN="${WHL_TOKEN}" gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* \
+                  --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+                  --clobber
+                echo "✅ Uploaded ${ARTIFACT_NAME} to both release repositories"
               fi
 
               # Clean up to save disk space before next iteration
@@ -369,7 +418,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Download all JIT cache reports
         uses: actions/download-artifact@v4
@@ -418,13 +467,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
         run: |
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
+            --base-url "https://github.com/${NIGHTLY_RELEASE_REPOSITORY}/releases/download" \
             --release-tag "${{ needs.setup.outputs.release_tag }}" \
             --nightly
 

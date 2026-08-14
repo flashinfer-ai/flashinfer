@@ -288,6 +288,32 @@ def test_sigmoid_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
+                "compatible_intermediate_size": [512, 1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
+                "enable_autotune": True,
+                "enable_da_moe": True,
+            },
+            id="DSv3_DA",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "num_fused_shared_experts": 1,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [512],
@@ -450,8 +476,9 @@ def test_deepseekv3_routing(
     routing_logits_dtype,
     moe_gemm_backend,
     cache_permute_indices,
+    monkeypatch,
 ):
-    """Test DeepSeekV3 routing configurations."""
+    """Test DeepSeekV3 routing configurations against independent references."""
     uses_oa = (
         activation_type == ActivationType.Situ
         or alpha_value is not None
@@ -463,6 +490,11 @@ def test_deepseekv3_routing(
             "Situ/OA activation params are covered for MoeGemmBackend.TRTLLM; "
             f"{moe_gemm_backend} does not yet advertise the same combo"
         )
+    enable_da_moe = routing_config.get("enable_da_moe", False)
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1" if enable_da_moe else "0")
+    if enable_da_moe:
+        monkeypatch.setenv("FLASHINFER_DA_DISTRIBUTIONS", "uniform,ddist:1.1")
+        monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
     num_experts = routing_config["num_experts"]
     gemm1_alpha = (
         None
@@ -525,6 +557,23 @@ def test_deepseekv3_routing(
                 "enable_autotune": True,
             },
             id="TopK",
+        ),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 2,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+                "compatible_intermediate_size": [512, 768, 1024],
+                "enable_autotune": True,
+                "enable_da_moe": True,
+            },
+            id="TopK_DA",
         ),
     ],
 )
@@ -598,8 +647,9 @@ def test_topk_routing(
     routing_logits_dtype,
     moe_gemm_backend,
     cache_permute_indices,
+    monkeypatch,
 ):
-    """Test TopK routing configuration."""
+    """Test TopK routing configurations against independent references."""
     uses_oa = (
         activation_type == ActivationType.Situ
         or alpha_value is not None
@@ -611,6 +661,11 @@ def test_topk_routing(
             "Situ/OA activation params are covered for MoeGemmBackend.TRTLLM; "
             f"{moe_gemm_backend} does not yet advertise the same combo"
         )
+    enable_da_moe = routing_config.get("enable_da_moe", False)
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1" if enable_da_moe else "0")
+    if enable_da_moe:
+        monkeypatch.setenv("FLASHINFER_DA_DISTRIBUTIONS", "uniform,ddist:1.1")
+        monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
     num_experts = routing_config["num_experts"]
     gemm1_alpha = (
         None

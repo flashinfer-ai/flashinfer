@@ -16,6 +16,7 @@
 name = "flashinfer-python"
 dynamic = ["version", "dependencies"]
 description = "FlashInfer: Kernel Library for LLM Serving"
+# Keep the lower bound in sync with .python-version.
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
@@ -80,6 +81,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.hpp",
   "instantiations/*.cu",
 ]
+"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+  "*.md",
+  "src/a2a/*.cu",
+  "src/a2a/*.cuh",
+  "src/fp8_gemm/*.cu",
+  "src/fp8_gemm/*.cuh",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
@@ -93,6 +101,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.mypy]
 files = ["flashinfer"]
+# Keep this literal in sync with .python-version.
+python_version = "3.10"
 ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
@@ -126,6 +136,7 @@ exclude = [
 # `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
 # `x == a or x == b` produces).
 [tool.ruff]
+# Ruff infers the target from project.requires-python.
 extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",

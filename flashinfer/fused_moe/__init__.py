@@ -39,6 +39,11 @@ from .api import (  # noqa: F401
     TrtllmMxInt4Config,
 )
 from .layer import MoELayer  # noqa: F401
+from .da_runtime import (  # noqa: F401
+    trtllm_moe_acquire_da_graph_leases,
+    trtllm_moe_da_diagnostics,
+    trtllm_moe_release_da_resources,
+)
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
@@ -64,6 +69,8 @@ from .backends.prims_ts.fp4_op import (
 )
 from .core import (
     RoutingInputMode,
+    TrtllmMoERoutingMetadata,
+    TrtllmMoERoutingMetadataSlot,
     convert_to_block_layout,
     cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
@@ -79,6 +86,8 @@ from .core import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
+    trtllm_moe_allocate_routing_metadata,
+    trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -130,6 +139,8 @@ try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
     )
@@ -157,6 +168,13 @@ __all__ = [
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
+    "TrtllmMoERoutingMetadata",
+    "TrtllmMoERoutingMetadataSlot",
+    "trtllm_moe_allocate_routing_metadata",
+    "trtllm_moe_allocate_routing_metadata_multi_tile",
+    "trtllm_moe_acquire_da_graph_leases",
+    "trtllm_moe_da_diagnostics",
+    "trtllm_moe_release_da_resources",
     "MoEConfig",
     "MoELayer",
     "MoEWeightPack",
@@ -227,6 +245,8 @@ if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
     ]

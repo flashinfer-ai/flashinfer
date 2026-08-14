@@ -418,6 +418,128 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
+    """rank_tactics should return best-first shortlist and cache the winner."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=2)
+        cached_ranking = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=3)
+
+    assert ranked == [1, 2]
+    assert cached_ranking == [1, 2, 0]
+    assert profile_calls == [0, 1, 2]
+    _, tactic = tuner.choose_one("dummy_rank", [runner], config, inputs)
+    assert tactic == 1
+
+
+def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_winner_only", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (0, None)
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_winner_only", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+
+
+def test_rank_tactics_rebuilds_shortlist_from_file_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_file_cache", runner, (inputs[0].shape,), config
+    )
+    tuner._file_configs[key.file_key] = ("DummyRunner", 0)
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_file_cache", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+    assert profile_calls == [0, 1, 2]
+
+
+def test_rank_tactics_uses_mapped_dynamic_profile(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((12, 4), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=lambda x: 8 if x <= 8 else 16,
+            ),
+        )
+    )
+    profiled_shapes = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profiled_shapes.append(tuple(prof_inputs[0].shape))
+        return float(tactic)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank_dynamic", [runner], config, inputs, k=2)
+
+    assert ranked == [0, 1]
+    assert profiled_shapes == [(16, 4), (16, 4)]
+
+
+def test_rank_tactics_outside_tuning_returns_single_cached_or_fallback():
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [-1]
+
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_infer", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (2, None)
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [2]
+
+
 def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     """Profiles apply constraints, dynamic inputs are recreated, static inputs are reused."""
     tuner = reset_autotuner()
@@ -933,6 +1055,264 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests for value-aware profiling usage
+# ---------------------------------------------------------------------------
+
+
+class ValueAwareCudaRunner(TunableRunner):
+    """CUDA operation used by value-aware expected-usage tests."""
+
+    def get_valid_tactics(self, inputs, profile):
+        """Expose two bodies so tests can compare them on one prepared schedule."""
+        del inputs, profile
+        return [0, 1]
+
+    def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
+        """Write a result that depends on both declared value-aware inputs."""
+        del tactic, do_preparation, kwargs
+        hidden, expert_ids, expert_weights, output, model_bias = inputs
+        output.copy_(
+            hidden + expert_ids.float().mean() + expert_weights.mean() + model_bias
+        )
+        return output
+
+
+def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
+    """Automatic tuning must stage one value sample fairly across candidate tactics."""
+    if not torch.cuda.is_available():
+        pytest.skip("value-aware profiling arenas require CUDA")
+
+    tuner = reset_autotuner()
+    runner = ValueAwareCudaRunner()
+    monkeypatch.setattr(tuner, "repeat", 4)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    num_tokens = 128
+    top_k = 4
+    num_experts = 32
+    inputs = [
+        torch.ones((num_tokens, 4), device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.bfloat16, device="cuda"),
+        torch.zeros((num_tokens, 4), device="cuda"),
+        torch.full((num_tokens, 4), 3.0, device="cuda"),
+    ]
+
+    sampled_expert_ids = (
+        torch.arange(num_tokens).unsqueeze(1) * top_k + torch.arange(top_k)
+    ) % num_experts
+    sampled_routing_weights = torch.full(
+        (num_tokens, top_k), 1.0 / top_k, dtype=torch.bfloat16
+    )
+
+    def stage_routing_distribution(profile_inputs):
+        """Stage one expert distribution without mutating caller-owned tensors."""
+        staged = list(profile_inputs)
+        staged[1] = sampled_expert_ids.to(profile_inputs[1].device, torch.int32)
+        staged[2] = sampled_routing_weights.to(profile_inputs[2].device, torch.bfloat16)
+        return staged
+
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        value_aware_input_indices=(1, 2),
+        profile_arena_input_indices=(0, 1, 2, 3),
+        inputs_pre_hook=stage_routing_distribution,
+    )
+    observed_schedules = []
+
+    def profile_from_staged_batches(
+        self,
+        runner_obj,
+        profile_inputs,
+        tactic,
+        tuning_config=None,
+        input_tensor_batches=None,
+        **kwargs,
+    ):
+        """Record the public profiling schedule and return deterministic tactic timing."""
+        del self, runner_obj, profile_inputs, tuning_config, kwargs
+        assert input_tensor_batches is not None
+        observed_schedules.append(input_tensor_batches)
+        return {0: 2.0, 1: 1.0}[tactic]
+
+    # Exercise the normal choose_one API: the hook runs once, then every tactic receives the
+    # same A/B-alternating ring schedule populated from that realization.
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", profile_from_staged_batches
+    )
+    with autotune(tune_mode=True):
+        selected_runner, selected_tactic = tuner.choose_one(
+            "value_aware_routing", [runner], config, inputs
+        )
+
+    assert selected_runner is runner
+    assert selected_tactic == 1
+    assert len(observed_schedules) == 2
+    assert observed_schedules[0] is observed_schedules[1]
+
+    # Arena-backed call tensors get stable lane views, while the omitted read-only model tensor
+    # keeps its original pointer across all tactic measurements.
+    schedule = observed_schedules[0]
+    assert len(schedule) == tuner.repeat
+    expected_ids = sampled_expert_ids.to(schedule[0][1].device, torch.int32)
+    expected_weights = sampled_routing_weights.to(schedule[0][2].device, torch.bfloat16)
+    for batch in schedule:
+        assert torch.equal(batch[1], expected_ids)
+        assert torch.equal(batch[2], expected_weights)
+        assert batch[4] is inputs[4]
+        for input_index in (0, 1, 2, 3):
+            assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
+    for input_index in (0, 1, 2, 3):
+        assert (
+            len({batch[input_index].data_ptr() for batch in schedule}) == tuner.repeat
+        )
+    assert torch.count_nonzero(inputs[1]).item() == 0
+    assert torch.count_nonzero(inputs[2]).item() == 0
+    sorted_ids = schedule[0][1].sort(dim=1).values
+    assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
+
+
+def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatch):
+    """One tuning transaction must restage distributions into one stable schedule."""
+    if not torch.cuda.is_available():
+        pytest.skip("value-aware profiling arenas require CUDA")
+
+    tuner = reset_autotuner()
+    runner = ValueAwareCudaRunner()
+    monkeypatch.setattr(tuner, "repeat", 4)
+    monkeypatch.setattr(tuner, "warmup", 0)
+    monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    operation_key = "value_aware_moe_distribution"
+    num_tokens = 1024
+    top_k = 4
+    num_experts = 32
+    inputs = [
+        torch.ones((num_tokens, 4), device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.bfloat16, device="cuda"),
+        torch.zeros((num_tokens, 4), device="cuda"),
+        torch.full((num_tokens, 4), 2.0, device="cuda"),
+    ]
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        value_aware_input_indices=(1, 2),
+        profile_arena_input_indices=(0, 1, 2, 3),
+    )
+
+    # Allocate one A/B arena pair for the operation, then retain its lane addresses for every
+    # distribution and every tactic in this single tuning transaction.
+    input_shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+    profile_records = []
+    observed_histograms = {}
+    # TODO: Let AutoTuner orchestrate multiple same-shaped value samples within one tuning transaction.
+    with autotune(tune_mode=True):
+        effective_config, shared_schedule = tuner.prepare_tactic_profile(inputs, config)
+        pointer_order = tuple(
+            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
+            for batch in shared_schedule
+        )
+
+        for distribution_index, distribution_name in enumerate(
+            ("uniform", "gaussian", "dirichlet")
+        ):
+            # Keep all three generators deterministic and inline so this expected-usage test
+            # does not acquire a production distribution dependency.
+            expert_positions = torch.arange(num_experts, dtype=torch.float64)
+            if distribution_name == "uniform":
+                expert_probabilities = torch.full(
+                    (num_experts,), 1.0 / num_experts, dtype=torch.float64
+                )
+            elif distribution_name == "gaussian":
+                deviations = (expert_positions - (num_experts - 1) / 2) / 4.0
+                expert_probabilities = torch.exp(-0.5 * deviations.square())
+                expert_probabilities /= expert_probabilities.sum()
+            else:
+                with torch.random.fork_rng():
+                    torch.manual_seed(17)
+                    expert_probabilities = torch.distributions.Dirichlet(
+                        torch.full((num_experts,), 0.15, dtype=torch.float64)
+                    ).sample()
+            sample_generator = torch.Generator().manual_seed(101 + distribution_index)
+            expert_ids = torch.multinomial(
+                expert_probabilities.expand(num_tokens, -1),
+                top_k,
+                replacement=False,
+                generator=sample_generator,
+            )
+            selected_probabilities = expert_probabilities[expert_ids]
+            # Probability-normalized weights are intentionally simple and coupled for brevity.
+            routing_weights = selected_probabilities / selected_probabilities.sum(
+                dim=1, keepdim=True
+            )
+
+            # Restage only values. Every tactic sees the same A/B lane order, and the next
+            # distribution overwrites those exact graph-stable addresses rather than reallocating.
+            inputs[1].copy_(expert_ids.to(inputs[1].device, torch.int32))
+            inputs[2].copy_(routing_weights.to(inputs[2].device, torch.bfloat16))
+            for batch in shared_schedule:
+                batch[1].copy_(inputs[1])
+                batch[2].copy_(inputs[2])
+            for tactic in (0, 1):
+                time_ms = tuner.profile_tactic(
+                    runner,
+                    inputs,
+                    tactic,
+                    effective_config,
+                    shared_schedule,
+                )
+                profile_records.append(
+                    (
+                        operation_key,
+                        input_shapes,
+                        distribution_name,
+                        tactic,
+                        time_ms,
+                        tuple(
+                            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
+                            for batch in shared_schedule
+                        ),
+                    )
+                )
+
+            # Each row models top-k routing rather than independent categorical draws, and the
+            # complete operation observes the newly staged IDs and coupled weights.
+            sorted_ids = expert_ids.sort(dim=1).values
+            assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
+            histogram = torch.bincount(
+                expert_ids.flatten(), minlength=num_experts
+            ).double()
+            observed_histograms[distribution_name] = histogram / histogram.sum()
+            expected_output = (
+                inputs[0] + inputs[1].float().mean() + inputs[2].mean() + inputs[4]
+            )
+            for batch in shared_schedule:
+                torch.testing.assert_close(batch[3], expected_output)
+                assert batch[4] is inputs[4]
+
+    assert len(profile_records) == 6
+    assert {record[0] for record in profile_records} == {operation_key}
+    assert {record[1] for record in profile_records} == {input_shapes}
+    assert [record[2:4] for record in profile_records] == [
+        (distribution_name, tactic)
+        for distribution_name in ("uniform", "gaussian", "dirichlet")
+        for tactic in (0, 1)
+    ]
+    assert all(record[4] >= 0 for record in profile_records)
+    assert all(record[5] == pointer_order for record in profile_records)
+    assert not torch.equal(
+        observed_histograms["uniform"], observed_histograms["gaussian"]
+    )
+    assert not torch.equal(
+        observed_histograms["gaussian"], observed_histograms["dirichlet"]
+    )
+    assert (
+        observed_histograms["gaussian"][num_experts // 2]
+        > observed_histograms["gaussian"][0]
+    )
+    assert observed_histograms["dirichlet"].max() > 2.0 / num_experts
+
+
+# ---------------------------------------------------------------------------
 # Tests for None / optional input tensors
 # ---------------------------------------------------------------------------
 
@@ -1028,6 +1408,7 @@ def test_skip_ops_prevents_profiling(monkeypatch):
         return 1.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with autotune(tune_mode=True, skip_ops={"skip_me"}):
         chosen_runner, tactic = tuner.choose_one("skip_me", [runner], config, inputs)
@@ -1035,6 +1416,46 @@ def test_skip_ops_prevents_profiling(monkeypatch):
     assert chosen_runner is runner
     assert tactic == -1
     assert len(profile_calls) == 0
+
+
+def test_active_capture_allows_warm_tuning_cache_hits(monkeypatch):
+    """A public tuning context may read a warm cache during capture but may not profile."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    capture_active = False
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        """Record the only profiling pass used to seed the public cache."""
+        profile_calls.append(tactic)
+        return {0: 2.0, 1: 1.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capture_active
+    )
+
+    # Seed the ordinary cache outside capture, then prove a tuning-mode hit performs no work.
+    with autotune(tune_mode=True):
+        _, seeded_tactic = tuner.choose_one("warm_capture_op", [runner], config, inputs)
+    assert seeded_tactic == 1
+    seeded_call_count = len(profile_calls)
+    capture_active = True
+    with autotune(tune_mode=True):
+        _, cached_tactic = tuner.choose_one("warm_capture_op", [runner], config, inputs)
+    assert cached_tactic == 1
+    assert len(profile_calls) == seeded_call_count
+
+    # A distinct cache miss still fails before input synthesis or kernel profiling.
+    with (
+        autotune(tune_mode=True),
+        pytest.raises(RuntimeError, match="active outer CUDA Graph capture"),
+    ):
+        tuner.choose_one("cold_capture_op", [runner], config, inputs)
 
 
 def test_skip_ops_does_not_affect_other_ops(monkeypatch):
