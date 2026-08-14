@@ -3101,6 +3101,9 @@ def trtllm_batch_decode_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     enable_block_sparse_attention: bool = False,
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -3278,6 +3281,32 @@ def trtllm_batch_decode_with_kv_cache(
         ``"k_only"`` selects the optimized K-only transform cubins, and
         ``"separate_kv"`` selects the separate transformed-K/V cubins.
 
+    cp_world : int = 1
+        Decode-context-parallel world size. The DCP speculative path is enabled
+        only when :attr:`causal_seqlens_kv_global` is provided. Supported values
+        are 1, 2, 4, and 8 on SM100/SM103.
+
+    cp_rank : int = 0
+        Rank in the DCP group. Rank ``r`` owns global KV positions
+        ``r, r + cp_world, ...`` in its compact local paged cache.
+
+    causal_seqlens_kv_global : Optional[torch.Tensor] = None
+        Optional contiguous int32 tensor of shape ``[batch_size]`` containing
+        each request's global KV prefix length before speculative query row 0.
+        When provided, query row ``j`` sees exactly
+        ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
+        enables DCP + speculative decoding without a per-row length tensor.
+
+        The current native path requires BF16 Q/K/V/O, HND page size 16,
+        head dimension 128, uniform ``q_len_per_req`` in ``{1,2,4,5,6,8}``,
+        causal attention, ``return_lse=True`` (or a caller-owned ``lse``), and
+        head group ratio in ``[1,8]``. Its LSE is FP32 base-2, matching the
+        existing TRT-LLM backend contract. Long-context Split-KV uses
+        ``workspace_buffer`` for partials and requires a zero-initialized,
+        reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
+        completion tickets after every launch. Prewarm a fixed tensor/layout
+        binding before CUDA Graph capture.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -3328,6 +3357,103 @@ def trtllm_batch_decode_with_kv_cache(
             k_block_scales.dtype == torch.float8_e4m3fn
             and v_block_scales.dtype == torch.float8_e4m3fn
         ), "kv_cache_sf tensors should be float8 dtype."
+
+    dcp_spec_enabled = causal_seqlens_kv_global is not None
+    if not dcp_spec_enabled and (cp_world != 1 or cp_rank != 0):
+        raise ValueError(
+            "cp_world/cp_rank require causal_seqlens_kv_global to enable the "
+            "DCP speculative decode path"
+        )
+    if dcp_spec_enabled:
+        if backend not in ("auto", "trtllm-gen"):
+            raise ValueError(
+                "DCP speculative decode is only available through backend='auto' "
+                "or backend='trtllm-gen'"
+            )
+        if kv_layout != "HND":
+            raise ValueError(
+                "DCP speculative decode currently requires kv_layout='HND'"
+            )
+        if is_nvfp4_kvcache or kv_cache_sf is not None:
+            raise ValueError(
+                "DCP speculative decode currently supports BF16 KV cache only"
+            )
+        if q_len_per_req is None:
+            raise ValueError("DCP speculative decode requires uniform q_len_per_req")
+        if max_q_len is not None or cum_seq_lens_q is not None:
+            raise ValueError(
+                "DCP speculative decode does not yet support ragged query lengths"
+            )
+        if window_left != -1 or mask is not None:
+            raise ValueError(
+                "DCP speculative decode currently supports causal full attention only"
+            )
+        if sinks is not None:
+            raise ValueError(
+                "DCP speculative decode does not yet support attention sinks"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("DCP speculative decode does not support skip-softmax")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError("DCP speculative decode requires a shared K/V page table")
+        if enable_block_sparse_attention:
+            raise ValueError(
+                "DCP speculative decode does not support block-sparse attention"
+            )
+        if bmm1_scale_log2 is not None:
+            raise ValueError(
+                "DCP speculative decode takes a host bmm1_scale; bmm1_scale_log2 "
+                "device tensors are not yet supported"
+            )
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise TypeError(
+                "DCP speculative decode requires host scalar bmm1/bmm2 scales"
+            )
+        if float(bmm2_scale) != 1.0:
+            raise ValueError("DCP speculative decode currently requires bmm2_scale=1.0")
+        if o_scale is not None and float(o_scale) != 1.0:
+            raise ValueError("DCP speculative decode currently requires o_scale=1.0")
+        if o_sf_scale is not None or o_sf_vec_size is not None:
+            raise ValueError(
+                "DCP speculative decode does not support scaled FP4 output"
+            )
+        if isinstance(out, FP4Tensor) or out_dtype == "nvfp4":
+            raise ValueError("DCP speculative decode requires BF16 output")
+        if out_dtype is not None and out_dtype != torch.bfloat16:
+            raise ValueError("DCP speculative decode requires out_dtype=torch.bfloat16")
+        if not return_lse and lse is None:
+            raise ValueError(
+                "DCP speculative decode requires return_lse=True or a caller-owned lse buffer"
+            )
+
+        num_qo_heads = query.shape[1]
+        lse_shape = (query.shape[0], num_qo_heads)
+        out = out if out is not None else torch.empty_like(query, dtype=torch.bfloat16)
+        lse = (
+            lse
+            if lse is not None
+            else torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+        )
+        from .dcp import run_dcp_spec_decode
+
+        run_dcp_spec_decode(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            causal_seqlens_kv_global=causal_seqlens_kv_global,
+            max_local_seq_len=max_seq_len,
+            sm_scale=float(bmm1_scale),
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lse=lse,
+            completion_buffer=multi_ctas_kv_counter_buffer,
+        )
+        return (out, lse) if return_lse else out
 
     if backend == "auto":
         backend = (

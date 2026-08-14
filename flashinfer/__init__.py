@@ -60,6 +60,10 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
+from .dcp import (
+    get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
+)
 from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,
