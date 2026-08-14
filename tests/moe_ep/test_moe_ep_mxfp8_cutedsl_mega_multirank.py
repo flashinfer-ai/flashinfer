@@ -565,16 +565,40 @@ def _run_mega_layer_zero_token_ikr_regression(
     real work -- light/symmetric/all-nonzero testing never exercises it. See
     kernel_src/cutedsl_megamoe/shim/mxfp8.py::mxfp8_mega_moe.
 
+    Shapes/scale intentionally match the real repro (hidden=2048,
+    intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384 --
+    the Qwen3-30B-A3B MXFP8 SGLang config that originally hit this), not this
+    file's usual small test defaults: the same test at
+    hidden=2048/intermediate=1024/num_experts=8/topk=4/max_tokens=64 (this
+    file's ``_mega_problem`` default) plus a deterministic modulo-based
+    zero/nonzero schedule passes vacuously even without the fix -- neither the
+    smaller buffer/expert-count nor a merely-deterministic (as opposed to
+    randomly-timed) schedule reproduces the desync on its own; both the scale
+    and genuinely independent per-rank timing (via per-rank-seeded
+    ``random.Random``, not a fixed formula) were needed to reproduce it.
+
     CAVEAT: a regression here manifests as a LIVELOCK (100% GPU utilization,
     zero forward progress, no exception, no crash), not a clean test failure --
     a same-process watchdog can't interrupt a rank frozen inside
     torch.cuda.synchronize() on a raw CUDA kernel wait (this isn't an NCCL
     collective op, so dist.init_process_group(timeout=...) doesn't cover it
     either). Rely on the CI job's own wall-clock timeout to catch a real
-    regression; tests/moe_ep/../repro_ikr_zero_token_idle.py is the
-    externally-timeout-guarded (shell `timeout`) standalone reproducer used to
-    originally bisect and verify this fix.
+    regression.
+
+    This exact scenario (matched shapes, matched random schedule, even a
+    deliberate timing nudge on real rounds, 2000 iterations) was confirmed to
+    reliably livelock pre-fix when run as a plain torchrun-launched script
+    (tests/moe_ep/../repro_ikr_zero_token_idle.py -- the authoritative
+    regression artifact for this bug) but passes vacuously pre-fix when run
+    under `torchrun -m pytest` specifically (root cause not fully isolated;
+    pytest's execution environment appears to dampen the wall-clock
+    divergence between ranks this race depends on). This test is kept as a
+    documented, passing correctness check of the exact scenario under the
+    project's normal test harness -- not as a guaranteed regression trap.
     """
+    import random
+    import time
+
     import torch
     import torch.distributed as dist
 
@@ -591,44 +615,66 @@ def _run_mega_layer_zero_token_ikr_regression(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
+    hidden = 2048
+    intermediate = 768
+    num_experts = 128
+    topk = 8
+    max_tokens = 16384
     real_tokens = 4
-    problem = _mega_problem(rank, world_size, num_tokens=real_tokens, max_tokens=64)
-    hidden = problem["hidden"]
-    num_experts = problem["num_experts"]
-    topk = problem["topk"]
+    assert num_experts % world_size == 0
+    num_local_experts = num_experts // world_size
+
+    w13, w2 = _make_bf16_weights(
+        rank,
+        num_local_experts=num_local_experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    warmup_hidden_states, warmup_topk_weights, warmup_topk_ids = _make_inputs(
+        rank, num_tokens=real_tokens, hidden=hidden, num_experts=num_experts, topk=topk
+    )
+    megakernel_config = _megakernel_config(
+        dict(
+            intermediate=intermediate,
+            topk=topk,
+            kind="mxfp8_e4m3",
+            gate_up_clamp=10.0,
+            fast_math=True,
+        ),
+        in_kernel_fc2_reduce=True,
+    )
 
     mega = MoEEpMegaLayer(
         bootstrap=bootstrap,
         fleet_params=FleetParams(
             num_experts=num_experts,
-            max_tokens_per_rank=problem["max_tokens"],
+            max_tokens_per_rank=max_tokens,
             token_hidden_size=hidden,
         ),
-        weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
-        backend=MegaConfig(
-            megakernel=_megakernel_config(problem, in_kernel_fc2_reduce=True),
-            preprocess_weights=True,
-        ),
+        weights=MoEWeightPack(w13=w13, w2=w2),
+        backend=MegaConfig(megakernel=megakernel_config, preprocess_weights=True),
     )
     try:
         # Matched-count collective warmup -- every rank calls forward() with
         # real tokens once, together, before the independent-cadence loop.
         mega.forward(
             MoEEpTensors(
-                hidden_states=problem["hidden_states"],
-                topk_ids=problem["topk_ids"],
-                topk_weights=problem["topk_weights"],
+                hidden_states=warmup_hidden_states,
+                topk_ids=warmup_topk_ids,
+                topk_weights=warmup_topk_weights,
             )
         )
         torch.cuda.synchronize()
         dist.barrier()
 
-        # Deterministic (not random) per-rank zero/nonzero schedule for CI
-        # reproducibility: rank 0 always real (mirrors an always-busy rank);
-        # other ranks go to num_tokens=0 on a rank-staggered 1-in-3 cadence so
-        # every rank sees a different, independently-timed idle pattern.
+        # Independently-seeded per-rank RNG, no barrier between iterations:
+        # rank 0 always real (mirrors an always-busy rank); other ranks
+        # independently coin-flip zero/real every iteration, so each rank's
+        # actual wall-clock cadence diverges from its peers' in a way a fixed
+        # formula doesn't produce. Seeded for CI reproducibility.
+        rnd = random.Random(4242 + rank)
         for it in range(num_iters):
-            n = real_tokens if (rank == 0 or (it + rank) % 3 != 0) else 0
+            n = real_tokens if rank == 0 else (0 if rnd.random() < 0.5 else real_tokens)
             g = torch.Generator(device="cuda").manual_seed(1000 * it + rank)
             hidden_states = torch.randn(
                 n, hidden, dtype=torch.bfloat16, device="cuda", generator=g
@@ -644,6 +690,15 @@ def _run_mega_layer_zero_token_ikr_regression(
                 topk_ids=topk_ids.to(torch.int64),
                 topk_weights=topk_weights.to(torch.float32),
             )
+            if n > 0:
+                # Nudge real per-rank wall-clock divergence: pre-fix, a
+                # zero-token round skips the kernel launch entirely and is
+                # near-instant, while a real round pays actual GPU cost --
+                # under plain torchrun that gap alone is enough to desync
+                # ranks within tens of rounds, but empirically not reliably
+                # under pytest (unconfirmed why; see the CAVEAT above). This
+                # doesn't guarantee detection here, just improves the odds.
+                time.sleep(0.003)
             y = mega.forward(t)
             torch.cuda.synchronize()
             assert y.shape == (n, hidden)
