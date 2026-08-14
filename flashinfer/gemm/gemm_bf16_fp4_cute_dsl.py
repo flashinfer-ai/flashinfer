@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Architecture-specific CuTe-DSL backend for the BF16 x NVFP4 GEMM."""
 
+import functools
 from typing import Dict, List, Optional, Tuple, cast
 
 import torch
@@ -18,6 +19,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 from ..utils import get_compute_capability
@@ -78,6 +80,55 @@ def _select_bf16_fp4_tile_shape(
     return ((64, 64, tile_k), (2, 2, 1))
 
 
+def _select_bf16_fp4_k_splits(
+    m: int, n: int, k: int, tile_shape_mnk: Tuple[int, int, int], sm_count: int
+) -> int:
+    """Static split-K pick for the no-autotune fallback: only clear-win
+    underfill grids get a split, closer calls are left to the autotuner."""
+    tile_m, tile_n, tile_k = tile_shape_mnk
+    if tile_m != (16 if tile_k == 128 else 32):
+        # Split only the tile shapes that the tactic space pairs with splits.
+        return 1
+    tiles = -(-m // tile_m) * -(-n // tile_n)
+    if tiles * 3 > sm_count:
+        return 1
+    k_tiles = k // tile_k
+    for splits in (8, 4, 2):
+        if splits <= k_tiles and tiles * splits <= sm_count:
+            return splits
+    return 1
+
+
+# Stream-GEMV residency window (warps/SM): below the floor DRAM latency is
+# uncovered, far above the ceiling splits just multiply partial traffic.
+_GEMV_MIN_WARPS_PER_SM = 12
+_GEMV_MAX_WARPS_PER_SM = 96
+
+
+def _bf16_fp4_gemv_knee_split(n: int, k: int, sm_count: int) -> int:
+    """Smallest K-split reaching ~20 warps/SM, where throughput saturates
+    and deeper splits only add partial traffic; capped under one full wave
+    (6 CTAs/SM = 1536-thread limit / 256) and at >= 4 K-tiles per split."""
+    ctas = -(-(n // 64) // 8)
+    cap = max(1, min(int(0.95 * sm_count * 6 / ctas), (k // 16) // 4))
+    return min(-(-20 * sm_count // (n // 64)), cap)
+
+
+def _select_bf16_fp4_gemv_split(
+    n: int, k: int, cc_major: int, sm_count: int
+) -> Optional[int]:
+    """m=1 no-autotune fallback pick: the stream GEMV where it applies,
+    ``None`` for the MMA heuristic.  Serving stacks do not tune every
+    shape (vLLM never tunes the logits GEMM), so untuned m=1 matters."""
+    if cc_major != 12 or n % 64 != 0 or k // 16 < 4:
+        return None
+    split = _bf16_fp4_gemv_knee_split(n, k, sm_count)
+    warps_per_sm = (n // 64) * split / sm_count
+    if not _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM:
+        return None
+    return split
+
+
 _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE: dict = {}
 
 
@@ -90,6 +141,8 @@ def _get_cute_dsl_bf16_fp4_gemm(
     use_fp16_mma: int = 1,
     enable_pdl: bool = True,
     tile_swizzle: int = 1,
+    k_splits: int = 1,
+    occupancy: int = 1,
 ):
     # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
@@ -97,6 +150,8 @@ def _get_cute_dsl_bf16_fp4_gemm(
     use_fp16_mma = int(use_fp16_mma)
     enable_pdl = bool(enable_pdl)
     tile_swizzle = int(tile_swizzle)
+    k_splits = int(k_splits)
+    occupancy = int(occupancy)
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -106,6 +161,8 @@ def _get_cute_dsl_bf16_fp4_gemm(
         use_fp16_mma,
         enable_pdl,
         tile_swizzle,
+        k_splits,
+        occupancy,
     )
     cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -147,6 +204,10 @@ def _get_cute_dsl_bf16_fp4_gemm(
     c_fake = cute.runtime.make_fake_compact_tensor(
         c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
     )
+    sym_partial = cute.sym_int()
+    partial_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (sym_partial,), assumed_align=16
+    )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
@@ -156,12 +217,19 @@ def _get_cute_dsl_bf16_fp4_gemm(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
+        # At occupancy 3 the SMEM budget per CTA only fits 2 ab stages next
+        # to the default 4-stage epilogue; a 2-stage epilogue keeps 3.
+        epi_stage=2 if occupancy >= 3 else 4,
         pipeline_depth=pipeline_depth,
         use_fp16_mma=use_fp16_mma,
         enable_pdl=enable_pdl,
         tile_swizzle=tile_swizzle,
+        k_splits=k_splits,
+        occupancy=occupancy,
     )
-    max_active_clusters = get_max_active_clusters(1)
+    # The persistent grid launches occupancy CTAs per SM; the kernel's stage
+    # budget (_compute_stages) shrinks SMEM per CTA so they co-reside.
+    max_active_clusters = get_max_active_clusters(1) * occupancy
 
     compiled = cute.compile(
         gemm.wrapper,
@@ -169,9 +237,77 @@ def _get_cute_dsl_bf16_fp4_gemm(
         b_packed_fake,
         b_sf_fake,
         c_fake,
+        partial_fake,
         alpha_fake,
         1,  # l (batch)
         max_active_clusters,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _get_cute_dsl_bf16_fp4_gemv(
+    splits: int,
+    a_dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    enable_pdl: bool = True,
+):
+    """Compile-cache the m=1 streaming GEMV (same call signature as the
+    compiled MMA kernel, so the runner dispatches either transparently)."""
+    splits = int(splits)
+    enable_pdl = bool(enable_pdl)
+    cache_key = ("gemv", splits, a_dtype, c_dtype, enable_pdl)
+    cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _check_cute_dsl_availability()
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.gemv_bf16_fp4_sm12x import GemvBf16Fp4Sm12x
+
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    sym = [cute.sym_int() for _ in range(6)]
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        torch_to_cutlass_dtype(a_dtype),
+        (sym[0], sym[1]),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (sym[2], sym[3]), stride_order=(1, 0), assumed_align=16
+    )
+    sf_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym[2], sym[4]), stride_order=(1, 0), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        torch_to_cutlass_dtype(c_dtype),
+        (sym[0], sym[4]),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    partial_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (sym[5],), assumed_align=16
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled = cute.compile(
+        GemvBf16Fp4Sm12x(splits=splits, enable_pdl=enable_pdl),
+        a_fake,
+        b_fake,
+        sf_fake,
+        c_fake,
+        partial_fake,
+        alpha_fake,
         stream_fake,
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -327,13 +463,22 @@ def _prepare_cute_dsl(
         )
 
 
+@functools.cache
 def _bf16_fp4_cute_dsl_tactic_configs(
-    n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]]:
+    n: int, k: int, sm_count: int
+) -> Tuple[
+    Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int, str],
+    ...,
+]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
-    Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma)`` tuples.
+    Returns a tuple of ``(tile_shape_mnk, atom_layout, pipeline_depth,
+    use_fp16_mma, tile_swizzle, k_splits, occupancy, kind)`` entries,
+    where ``kind`` selects the kernel: ``"mma"`` (the dense GEMM, all
+    fields live) or ``"gemv"`` (the m=1 streaming kernel, which only
+    reads ``k_splits``).  The gemv entries include device-derived splits,
+    so a tactic index is only meaningful for the ``(n, k, sm_count)`` it
+    was enumerated with.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -345,18 +490,23 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     tile_m_atoms.append((32, (2, 2, 1)))
     tile_m_atoms.append((64, (2, 2, 1)))
 
-    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]] = []
+    configs: List[
+        Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int, str]
+    ] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1):
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1, splits=1, occ=1):
         cfg = (
             (tile_m, tile_n, tile_k if tk is None else tk),
             atom,
             pdepth,
             fp16,
             swz,
+            splits,
+            occ,
+            "mma",
         )
-        key = (cfg[0], cfg[1], pdepth, fp16, swz)
+        key = (cfg[0], cfg[1], pdepth, fp16, swz, splits, occ)
         if key not in seen:
             seen.add(key)
             configs.append(cfg)
@@ -366,6 +516,13 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     add(base_tile_m, base_atom, 0, 1)  # no dequant prefetch (helps short-K)
     for tile_m, atom in tile_m_atoms[1:]:
         add(tile_m, atom, 1, 1)
+
+    # Small-N grids underfill the GPU; offer them split-K variants.
+    if n // 64 <= 256:
+        k_tiles = k // tile_k
+        for splits in (2, 4, 8):
+            if splits <= k_tiles:
+                add(base_tile_m, base_atom, 1, 1, splits=splits)
 
     # tile_N=128 halves the (m,n)-tile count but needs large wave count.
     if tile_k == 128 and n >= 12288 and n % 128 == 0:
@@ -390,7 +547,40 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=8)
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=1)
 
-    return configs
+    # occupancy=2: two co-resident CTAs per SM at half the ab_stage depth
+    # (the kernel's occupancy note explains the trade).  The 128-tile gate
+    # fills two CTAs per SM on ~188-SM parts; 5080-class still qualifies.
+    if tile_k == 128 and n // 64 >= 128:
+        add(base_tile_m, base_atom, 1, 1, occ=2)
+        add(base_tile_m, base_atom, 0, 1, occ=2)
+
+    # occupancy=2 x split-K: grids too small to fill two CTAs per SM (the
+    # down-proj class) get there by splitting K; the makespan gate decides
+    # per device whether the pieces fit.
+    if tile_k == 128 and n // 64 <= 256:
+        k_tiles = k // tile_k
+        for splits in (2, 4, 8):
+            if splits <= k_tiles:
+                add(base_tile_m, base_atom, 1, 1, splits=splits, occ=2)
+
+    # occupancy=3: 9 resident warps per SM; needs the 2-stage epilogue to
+    # keep 3 ab stages in SMEM (paired in _get_cute_dsl_bf16_fp4_gemm).
+    if tile_k == 128 and n // 64 >= 128:
+        add(base_tile_m, base_atom, 1, 1, occ=3)
+
+    # Streaming GEMV for m=1 decode (SMEM-free, no tensor cores; see
+    # GemvBf16Fp4Sm12x).  splits shards K across grid.y for grid fill.
+    if n % 64 == 0:
+        k_tiles16 = k // 16
+        gemv_splits = [s for s in (1, 2, 4, 8, 16, 32) if s * 4 <= k_tiles16]
+        if gemv_splits:
+            knee = _bf16_fp4_gemv_knee_split(n, k, sm_count)
+            if knee not in gemv_splits:
+                gemv_splits.append(knee)
+        for splits in gemv_splits:
+            configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
+
+    return tuple(configs)
 
 
 _BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
@@ -749,17 +939,56 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             a, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            return (out_dtype, n, k)
+            # The config list holds device-derived gemv splits, so a tuned
+            # index must not replay on a different SM count.
+            return (out_dtype, n, k, get_device_sm_count(a.device))
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            _, b, _, _, _, _, block_size = inputs
+            a, b, _, _, _, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            return list(range(len(_bf16_fp4_cute_dsl_tactic_configs(n, k))))
+            m_opt = int(profile.get_opt_shapes()[0][0])
+            sm_count = get_device_sm_count(a.device)
+            # GEMV is validated only on SM12x; the autotuner ranks by time
+            # and would not catch a wrong-but-fast kernel elsewhere.
+            gemv_ok = get_compute_capability(a.device)[0] == 12
+            configs = _bf16_fp4_cute_dsl_tactic_configs(n, k, sm_count)
+
+            def split_reduces_makespan(cfg) -> bool:
+                # Offer a split only if it shrinks the last wave >= 25%: the
+                # autotuner's warm-cache timing hides the partials cost, so it
+                # cannot reject bad splits itself.
+                splits = cfg[5]
+                if splits == 1:
+                    return True
+                tile_m, tile_n, _ = cfg[0]
+                tiles = (-(-m_opt // tile_m)) * (-(-n // tile_n))
+                # occupancy multiplies the co-resident CTA slots per SM, so
+                # occ2 x split-K fits 2x the pieces in one wave.
+                slots = sm_count * cfg[6]
+                base_waves = -(-tiles // sm_count)
+                split_waves = (-(-tiles * splits // slots)) / splits
+                return split_waves <= 0.75 * base_waves
+
+            def gemv_valid(cfg) -> bool:
+                # The m buckets round up, so only runtime m == 1 lands in
+                # the m_opt == 1 bucket.
+                if m_opt != 1 or not gemv_ok:
+                    return False
+                warps_per_sm = (n // 64) * cfg[5] / sm_count
+                return _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM
+
+            return [
+                i
+                for i, cfg in enumerate(configs)
+                if (
+                    gemv_valid(cfg) if cfg[7] == "gemv" else split_reduces_makespan(cfg)
+                )
+            ]
 
         def forward(
             self,
@@ -772,10 +1001,50 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
             m = int(a.shape[0])
+            cfg = (
+                _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(a.device))[
+                    tactic
+                ]
+                if tactic >= 0
+                else None
+            )
+            splits: Optional[int] = None
+            if cfg is not None and cfg[7] == "gemv":
+                if m != 1:
+                    raise ValueError(f"the gemv tactic requires m == 1, got m={m}")
+                splits = cfg[5]
+            elif cfg is None and m == 1 and not do_preparation:
+                # Prep calls run outside the autotuner's per-tactic exception
+                # guard; a gemv failure there would abort the whole op.
+                splits = _select_bf16_fp4_gemv_split(
+                    n,
+                    k,
+                    get_compute_capability(a.device)[0],
+                    get_device_sm_count(a.device),
+                )
+            if splits is not None:
+                compiled = _get_cute_dsl_bf16_fp4_gemv(
+                    splits, a.dtype, out_dtype, enable_pdl=enable_pdl
+                )
+                if splits > 1:
+                    partial = _get_cache_buf(
+                        "mm_bf16_fp4_split_k_partial",
+                        splits * m * n * 4,
+                        a.device,
+                    ).view(torch.float32)
+                else:
+                    partial = _get_cache_buf(
+                        "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
+                    ).view(torch.float32)
+                compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
+                return out
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
+                pipeline_depth, use_fp16_mma, tile_swizzle, occupancy = 1, 1, 1, 1
+                k_splits = _select_bf16_fp4_k_splits(
+                    m, n, k, tile_shape_mnk, get_device_sm_count(a.device)
+                )
             else:
                 (
                     tile_shape_mnk,
@@ -783,7 +1052,9 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     pipeline_depth,
                     use_fp16_mma,
                     tile_swizzle,
-                ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
+                    k_splits,
+                    occupancy,
+                ) = cfg[:7]
             compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
                 a.dtype,
@@ -793,8 +1064,27 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 use_fp16_mma,
                 enable_pdl=enable_pdl,
                 tile_swizzle=tile_swizzle,
+                k_splits=k_splits,
+                occupancy=occupancy,
             )
-            compiled(a, b, b_sf_u8, out, alpha_for_launch)
+            if k_splits > 1:
+                if k_splits > k // tile_shape_mnk[2]:
+                    raise ValueError(
+                        f"k_splits={k_splits} exceeds the K-tile count for "
+                        f"k={k}, tile_k={tile_shape_mnk[2]}"
+                    )
+                # The compiled call launches the reduce kernel as well, so
+                # ``out`` is final on return.
+                partial = _get_cache_buf(
+                    "mm_bf16_fp4_split_k_partial",
+                    k_splits * m * n * 4,
+                    a.device,
+                ).view(torch.float32)
+            else:
+                partial = _get_cache_buf(
+                    "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
+                ).view(torch.float32)
+            compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
             return out
 
     return CuteDslBf16Fp4Runner()
