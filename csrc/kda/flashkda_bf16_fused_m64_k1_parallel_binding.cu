@@ -10,13 +10,13 @@
 
 #include "flashkda_binding_common.cuh"
 
-#define uint8_t flashkda_k1_parallel_uint8_t
-#define uint16_t flashkda_k1_parallel_uint16_t
-#define uint32_t flashkda_k1_parallel_uint32_t
-#define uint64_t flashkda_k1_parallel_uint64_t
-#define int32_t flashkda_k1_parallel_int32_t
-#define int16_t flashkda_k1_parallel_int16_t
-#include "flashkda_bf16_fused_m128_k1_parallel.cu"
+#define uint8_t flashkda_m64_k1_parallel_uint8_t
+#define uint16_t flashkda_m64_k1_parallel_uint16_t
+#define uint32_t flashkda_m64_k1_parallel_uint32_t
+#define uint64_t flashkda_m64_k1_parallel_uint64_t
+#define int32_t flashkda_m64_k1_parallel_int32_t
+#define int16_t flashkda_m64_k1_parallel_int16_t
+#include "flashkda_bf16_fused_m64_k1_parallel.cu"
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -30,16 +30,16 @@ namespace flash_kda {
 constexpr int64_t kK1ParallelPacketBytes = 31520;
 static_assert(kK1ParallelPacketBytes == kK1PacketBytes);
 static_assert(THREADS == 1024);
-static_assert(SMEM_TOTAL == 227328);
+static_assert(SMEM_TOTAL == 219136);
 
-void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
-                       TensorView beta_tma, TensorView A_log, TensorView dt_bias,
-                       TensorView cu_seqlens, TensorView seq_order, TensorView initial_state,
-                       TensorView out, TensorView final_state, TensorView descriptor_storage,
-                       TensorView k1_workspace, int64_t prepare_descriptors, int64_t num_heads,
-                       int64_t use_initial_state, int64_t store_final_state, int64_t cluster_size,
-                       int64_t mailbox_depth, double scale, double lower_bound,
-                       int64_t cuda_stream) {
+void RunM64K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
+                      TensorView beta_tma, TensorView A_log, TensorView dt_bias,
+                      TensorView cu_seqlens, TensorView seq_order, TensorView initial_state,
+                      TensorView out, TensorView final_state, TensorView descriptor_storage,
+                      TensorView k1_workspace, int64_t prepare_descriptors, int64_t num_heads,
+                      int64_t use_initial_state, int64_t store_final_state, int64_t cluster_size,
+                      int64_t mailbox_depth, double scale, double lower_bound,
+                      int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -77,7 +77,7 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   TVM_FFI_ICHECK(cluster_size == 4 || cluster_size == 8) << "cluster_size must be C4 or C8";
   TVM_FFI_ICHECK(mailbox_depth > 0 && mailbox_depth <= std::numeric_limits<int32_t>::max())
       << "mailbox_depth must be in the positive int32 range";
-  const int64_t producer_instances = (cluster_size - 1) * 5;
+  const int64_t producer_instances = (cluster_size - 2) * 5;
   TVM_FFI_ICHECK(mailbox_depth >= producer_instances && mailbox_depth % producer_instances == 0)
       << "mailbox_depth must be a positive multiple of the helper producer count "
       << producer_instances << " for C" << cluster_size << "; got " << mailbox_depth;
@@ -103,13 +103,13 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
-  CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128,
+  CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64_k1_parallel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128_k1_parallel)");
+            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64_k1_parallel)");
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128>(q, k, v, g, beta_tma, out, descriptor_storage,
-                                                 prepare_descriptors, stream);
+  const TmaPointers tma = EncodeTmaPointers<64>(q, k, v, g, beta_tma, out, descriptor_storage,
+                                                prepare_descriptors, stream);
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);
 
   auto* workspace_bytes = static_cast<unsigned char*>(k1_workspace.data_ptr());
@@ -132,27 +132,28 @@ void RunM128K1Parallel(TensorView q, TensorView k, TensorView v, TensorView g, T
   config.attrs = &attribute;
   config.numAttrs = 1;
 
-  CheckCuda(
-      cudaLaunchKernelEx(
-          &config, kernel_flashkda_bf16_fused_m128, reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
-          tma.q, reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
-          reinterpret_cast<__nv_bfloat16*>(v.data_ptr()), tma.v,
-          reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), tma.g,
-          reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), tma.beta,
-          reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
-          reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-          reinterpret_cast<int*>(seq_order.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tma.out,
-          reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), workspace_bytes, flags,
-          static_cast<int32_t>(mailbox_depth), static_cast<int32_t>(cluster_size),
-          static_cast<int32_t>(num_heads), static_cast<int32_t>(use_initial_state),
-          static_cast<int32_t>(store_final_state), static_cast<float>(scale),
-          static_cast<float>(lower_bound)),
-      "kernel_flashkda_bf16_fused_m128_k1_parallel launch");
+  CheckCuda(cudaLaunchKernelEx(&config, kernel_flashkda_bf16_fused_m64_k1_parallel,
+                               reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), tma.q,
+                               reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
+                               reinterpret_cast<__nv_bfloat16*>(v.data_ptr()), tma.v,
+                               reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), tma.g,
+                               reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), tma.beta,
+                               reinterpret_cast<float*>(A_log.data_ptr()),
+                               reinterpret_cast<float*>(dt_bias.data_ptr()),
+                               reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
+                               reinterpret_cast<int*>(seq_order.data_ptr()),
+                               reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
+                               reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tma.out,
+                               reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()),
+                               workspace_bytes, flags, static_cast<int32_t>(mailbox_depth),
+                               static_cast<int32_t>(cluster_size), static_cast<int32_t>(num_heads),
+                               static_cast<int32_t>(use_initial_state),
+                               static_cast<int32_t>(store_final_state), static_cast<float>(scale),
+                               static_cast<float>(lower_bound)),
+            "kernel_flashkda_bf16_fused_m64_k1_parallel launch");
 }
 
 }  // namespace flash_kda
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM128K1Parallel);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM64K1Parallel);

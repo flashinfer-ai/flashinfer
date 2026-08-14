@@ -106,6 +106,9 @@ from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
 )
 from .flash_kda import (
+    gen_flash_kda_m64_k1_parallel_module as gen_flash_kda_m64_k1_parallel_module,
+)
+from .flash_kda import (
     gen_flash_kda_m128_module as gen_flash_kda_m128_module,
 )
 from .flash_kda import (
@@ -116,6 +119,9 @@ from .flash_kda import (
 )
 from .flash_kda import (
     load_flash_kda_m64_module as load_flash_kda_m64_module,
+)
+from .flash_kda import (
+    load_flash_kda_m64_k1_parallel_module as load_flash_kda_m64_k1_parallel_module,
 )
 from .flash_kda import (
     load_flash_kda_m128_module as load_flash_kda_m128_module,

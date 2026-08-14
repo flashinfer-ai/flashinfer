@@ -57,7 +57,7 @@ void RunM64(TensorView q, TensorView k, TensorView v, TensorView g, TensorView b
                         initial_state, out, final_state, descriptor_storage, prepare_descriptors,
                         num_heads, use_initial_state, store_final_state, scale, lower_bound);
   TVM_FFI_ICHECK(SupportsBetaTmaHeadCount(num_heads))
-      << "the M64 FlashKDA variant requires H == 4 or H >= 8 and divisible by 8; got H="
+      << "the M64 FlashKDA variant requires H == 1, H == 4, or H >= 8 and divisible by 8; got H="
       << num_heads;
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;

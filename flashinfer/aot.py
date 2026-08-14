@@ -64,6 +64,7 @@ from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.flash_kda import (
     FlashKDATarget,
     gen_flash_kda_m64_module,
+    gen_flash_kda_m64_k1_parallel_module,
     gen_flash_kda_m128_module,
     gen_flash_kda_m128_k1_parallel_module,
 )
@@ -559,6 +560,7 @@ def gen_all_modules(
             jit_specs.extend(
                 [
                     gen_flash_kda_m64_module(flash_kda_target),
+                    gen_flash_kda_m64_k1_parallel_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
                     gen_flash_kda_m128_k1_parallel_module(flash_kda_target),
                 ]

@@ -44,7 +44,7 @@ _flash_kda_tensor_cache_lock = threading.Lock()
 
 
 def _flash_kda_head_count_supports_tma(num_heads: int) -> bool:
-    return num_heads == 4 or (num_heads >= 8 and num_heads % 8 == 0)
+    return num_heads in (1, 4) or (num_heads >= 8 and num_heads % 8 == 0)
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -65,7 +65,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128", "m128_k1_parallel")
+            for variant in ("m64", "m128", "m64_k1_parallel", "m128_k1_parallel")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
         self._bound_stream_ptr: Optional[int] = None
@@ -274,9 +274,20 @@ def _select_flash_kda_prefill_variant(
         sequence_length if fixed_layout else sequence_length // num_sequences
     )
     helpers_supported = fixed_layout or compute_capability == (10, 0)
+    if num_heads == 1 and compute_capability != (10, 0):
+        return "m128", 0, 0
+    if (
+        compute_capability == (10, 0)
+        and fixed_layout
+        and num_sequences == 1
+        and num_heads == 1
+        and average_sequence_length >= 4096
+    ):
+        return "m64_k1_parallel", 4, 10
     if (
         helpers_supported
         and _flash_kda_head_count_supports_tma(num_heads)
+        and (num_heads != 1 or fixed_layout)
         and average_sequence_length >= 2048
     ):
         # Architecture-specific cold-L2 forced-route sweeps are recorded in
@@ -809,7 +820,7 @@ def _run_flash_kda_prefill(
                 final_state_arg,
                 descriptor_storage,
             )
-            if variant == "m128_k1_parallel":
+            if variant in ("m64_k1_parallel", "m128_k1_parallel"):
                 k1_mailbox = _k1_mailbox_workspace(
                     workspace=workspace,
                     device=q.device,

@@ -26,11 +26,12 @@ capability, not that product string.
 
 | Gate | Result |
 | --- | --- |
-| Targeted JIT and recurrent-KDA tests, B200 | 109 passed, 3 warnings |
+| Targeted JIT and recurrent-KDA tests, B200 | 121 passed, 3 warnings |
 | Targeted JIT and recurrent-KDA tests, B300 | 86 passed |
 | C8 and C4 output versus FP32 reference | Passed |
 | C8 and C4 recurrent state versus FP32 reference | Passed |
-| Owner/helper output/state versus CAKE-M128 | Bitwise identical for all measured shapes |
+| M128 owner/helper output/state versus CAKE-M128 | Bitwise identical for all measured shapes |
+| M64 dual-owner output/state versus FP32 reference | Passed with `atol=rtol=1e-2` |
 | CUDA graph capture/replay | Passed |
 | Pre-commit, all files | Passed |
 
@@ -46,11 +47,12 @@ Focused C8 and C4 runs of the retained implementation passed both tools:
 | C8, one owner plus seven helpers | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
 | C4, one owner plus three helpers | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
 | C4, packed varlen 2304/1792 | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
+| M64 C4/D10, H=1, T=2048 | `ERROR SUMMARY: 0 errors` | `ERROR SUMMARY: 0 errors` |
 
 The commands used `--report-api-errors no` because CuTe DSL capability probing
 calls `cuGetProcAddress_v2`; those API-probe diagnostics are unrelated to the
-generated CAKE kernel. A focused kernel filter was also used so the report
-covers the M128 owner/helper kernel.
+generated CAKE kernel. Focused kernel filters were used so the report covers
+the M128 owner/helper and M64 dual-owner kernels.
 
 An experimental device-wide helper pool was not retained. Although it matched
 the baseline bitwise and passed memcheck, synccheck reported divergent barrier
@@ -83,6 +85,41 @@ baseline is selected independently for every shape as
 The router therefore keeps T=1024 on the exact M64/M128 fallback and enables
 owner/helper execution only from T=2048. Across the enabled table above, the
 measured range is 1.049x to 1.196x over the per-shape oracle.
+
+### Single-head M64 owner/helper experiment
+
+The M128 owner/helper kernel raises K1 parallelism but still assigns one
+recurrent owner to each `(sequence, head)` task. For the most under-filled
+fixed shape, `B=1, H=1`, the M64 experiment instead launches a C4 cluster with
+two 64-row recurrent owners and two K1 helpers. The two owners consume the
+same prepared chunk and independently update disjoint halves of state and
+output. This doubles K2 parallelism while the helpers overlap independent K1
+preparation.
+
+Each mailbox flag carries a generation in its high bits, one ready bit, and
+one acknowledgement bit per owner. A producer reuses a slot only after both
+owners acknowledge the preceding generation. This avoids accepting a stale
+ready bit when an owner reaches a ring slot before the producer publishes its
+next generation.
+
+Cold-L2 B200 measurements selected C4/D10. Speedup is relative to
+`min(CAKE-M64, CAKE-M128)`:
+
+| B | H | T | M64 C4/D10 | M128 C4/D15 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 2048 | 1.146x | 1.103x |
+| 1 | 1 | 4096 | 1.250x | 1.177x |
+| 1 | 1 | 8192 | 1.280x | 1.242x |
+| 1 | 1 | 16384 | 1.337x | 1.200x |
+
+At T=256 and 512, C4/D10 reached only 0.796x and 0.916x. A later automatic-route
+confirmation at T=1024 measured 0.947x despite an earlier forced run reaching
+1.030x. The T=2048 ranking against the M128 helper also varied across rounds,
+so routing conservatively starts at T=4096. At `B=2, H=1`, M128 C4/D15 was
+equal or faster in the measured region; the M64 automatic route is therefore
+deliberately limited to fixed `B=1, H=1` on B200. Five H=1/H=4 cases from
+T=1024 through T=4096 matched the FP32 reference for output and final recurrent
+state with `atol=rtol=1e-2`.
 
 ### Four-head support
 

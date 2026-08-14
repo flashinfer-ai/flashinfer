@@ -15,11 +15,12 @@
 """Benchmark SM100-family CAKE K1 parallelism against the M64/M128 oracle.
 
 Every implementation is invoked through ``flashinfer.kda.recurrent_kda``.
-The script first requires every owner/helper route to be bitwise-identical to
-CAKE-M128 for output and recurrent state, then measures physical routes with
-cold L2. Speedup is always reported against ``min(CAKE-M64, CAKE-M128)`` for
-the same shape. Optional forced C4/C8 and mailbox-depth configurations preserve
-the evidence used to tune dispatch.
+Before timing, the script requires M128 owner/helper routes to be
+bitwise-identical to CAKE-M128 and checks M64 dual-owner routes against
+CAKE-M128 with the recurrent-KDA reference tolerance. Physical routes are then
+measured with cold L2. Speedup is always reported against
+``min(CAKE-M64, CAKE-M128)`` for the same shape. Optional forced C4/C8 and
+mailbox-depth configurations preserve the evidence used to tune dispatch.
 """
 
 import argparse
@@ -59,6 +60,31 @@ def _parse_forced_config(value: str) -> tuple[int, int]:
             f"{producer_instances} for C{cluster_size}"
         )
     return cluster_size, mailbox_depth
+
+
+def _parse_forced_route(value: str) -> tuple[str, int, int]:
+    try:
+        variant, cluster_size_text, mailbox_depth_text = value.split(":", 2)
+        cluster_size = int(cluster_size_text)
+        mailbox_depth = int(mailbox_depth_text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"expected VARIANT:CLUSTER_SIZE:MAILBOX_DEPTH, got {value!r}"
+        ) from error
+    if variant not in ("m64_k1_parallel", "m128_k1_parallel"):
+        raise argparse.ArgumentTypeError(
+            "forced variant must be m64_k1_parallel or m128_k1_parallel"
+        )
+    if cluster_size not in (4, 8):
+        raise argparse.ArgumentTypeError("forced cluster size must be 4 or 8")
+    owner_count = 2 if variant == "m64_k1_parallel" else 1
+    producer_instances = (cluster_size - owner_count) * 5
+    if mailbox_depth <= 0 or mailbox_depth % producer_instances != 0:
+        raise argparse.ArgumentTypeError(
+            "forced mailbox depth must be a positive multiple of "
+            f"{producer_instances} for {variant} C{cluster_size}"
+        )
+    return variant, cluster_size, mailbox_depth
 
 
 def _parse_varlen_profile(value: str) -> tuple[int, ...]:
@@ -122,6 +148,7 @@ def _run_case(
     bench_ms: int,
     state_rotations: int,
     forced_configs: list[tuple[int, int]],
+    forced_routes: list[tuple[str, int, int]],
     measurement_rounds: int,
 ) -> dict:
     generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -166,7 +193,7 @@ def _run_case(
         if packed
         else None
     )
-    forced_routes = {
+    physical_routes = {
         f"c{cluster_size}_d{mailbox_depth}": (
             "m128_k1_parallel",
             cluster_size,
@@ -174,10 +201,20 @@ def _run_case(
         )
         for cluster_size, mailbox_depth in forced_configs
     }
+    physical_routes.update(
+        {
+            f"{variant}_c{cluster_size}_d{mailbox_depth}": (
+                variant,
+                cluster_size,
+                mailbox_depth,
+            )
+            for variant, cluster_size, mailbox_depth in forced_routes
+        }
+    )
     routes = {
         "m64": ("m64", 0, 0),
         "m128": ("m128", 0, 0),
-        **forced_routes,
+        **physical_routes,
         "k1_parallel": None,
     }
     outputs = {name: torch.empty_like(q) for name in routes}
@@ -223,7 +260,7 @@ def _run_case(
         with _physical_route(route):
             launch(name)
     torch.cuda.synchronize()
-    helper_routes = [*forced_routes, "k1_parallel"]
+    helper_routes = [*physical_routes, "k1_parallel"]
     auto_route = kda_prefill._select_flash_kda_prefill_variant(
         fixed_layout=not packed,
         num_sequences=num_sequences,
@@ -236,8 +273,17 @@ def _run_case(
     for name in helper_routes:
         if name not in outputs:
             continue
-        torch.testing.assert_close(outputs[name], outputs["m128"], atol=0, rtol=0)
-        torch.testing.assert_close(states[name], states["m128"], atol=0, rtol=0)
+        route = routes[name]
+        if route is not None and route[0] == "m64_k1_parallel":
+            torch.testing.assert_close(
+                outputs[name].float(), outputs["m128"].float(), atol=1e-2, rtol=1e-2
+            )
+            torch.testing.assert_close(
+                states[name].float(), states["m128"].float(), atol=1e-2, rtol=1e-2
+            )
+        else:
+            torch.testing.assert_close(outputs[name], outputs["m128"], atol=0, rtol=0)
+            torch.testing.assert_close(states[name], states["m128"], atol=0, rtol=0)
 
     samples = {name: [] for name in routes}
     state_slots_used = {name: [] for name in routes}
@@ -272,7 +318,7 @@ def _run_case(
             "latency_ms": timings[name],
             "speedup_vs_oracle": oracle_ms / timings[name],
         }
-        for name, route in forced_routes.items()
+        for name, route in physical_routes.items()
     }
     return {
         "batch_size": 1 if packed else batch_size,
@@ -290,7 +336,10 @@ def _run_case(
         "speedup_vs_oracle": oracle_ms / timings["k1_parallel"],
         "forced_results": forced_results,
         "samples_ms": samples,
-        "correctness": "owner/helper routes bitwise output and state versus M128",
+        "correctness": (
+            "M128 helpers bitwise versus M128; M64 helpers within 1e-2 "
+            "absolute/relative tolerance versus M128"
+        ),
         "timing_backend": "cupti" if enable_cupti else "cuda_event",
         "cold_l2": True,
         "cuda_graph": False,
@@ -339,6 +388,18 @@ def main() -> None:
             "example: --forced-configs 4:15 4:30 8:35"
         ),
     )
+    parser.add_argument(
+        "--forced-routes",
+        type=_parse_forced_route,
+        nargs="*",
+        default=[],
+        metavar="VARIANT:C:D",
+        help=(
+            "force an owner/helper physical variant, for example: "
+            "--forced-routes m64_k1_parallel:4:10 "
+            "m64_k1_parallel:8:30"
+        ),
+    )
     parser.add_argument("--cupti", action="store_true")
     parser.add_argument("--seed", type=int, default=20260813)
     parser.add_argument("--json", type=Path)
@@ -382,6 +443,7 @@ def main() -> None:
                 bench_ms=args.bench_ms,
                 state_rotations=args.state_rotations,
                 forced_configs=args.forced_configs,
+                forced_routes=args.forced_routes,
                 measurement_rounds=args.measurement_rounds,
             )
             result["hardware"] = metadata

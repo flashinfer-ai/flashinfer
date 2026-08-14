@@ -238,6 +238,36 @@ def test_flash_kda_k1_parallel_jit_spec(monkeypatch, target):
     assert "mailbox_depth % producer_instances == 0" in binding_text
     assert "cluster_size < 0" not in binding_text
     assert "global_pool" not in text
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm100f"])
+def test_flash_kda_m64_k1_parallel_jit_spec(monkeypatch, target):
+    target_arch = (10, "0a") if target == "sm100a" else (10, "0f")
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {target_arch},
+    )
+    flash_kda.gen_flash_kda_module.cache_clear()
+
+    spec = flash_kda.gen_flash_kda_m64_k1_parallel_module(target)
+
+    assert spec.name == f"flash_kda_bf16_fused_m64_k1_parallel_{target}"
+    assert [source.name for source in spec.sources] == [
+        "flashkda_bf16_fused_m64_k1_parallel_binding.cu"
+    ]
+    source = spec.sources[0].parent / "flashkda_bf16_fused_m64_k1_parallel.cu"
+    text = source.read_text()
+    assert hashlib.sha256(text.encode()).hexdigest() == (
+        "0fd0e877cf3084423d4deb1b135164380ac2bcbea99366792918db060c1f0c91"
+    )
+    assert "constexpr int kOwnerCount = 2;" in text
+    assert "(generation << 3) | 1u" in text
+    assert "acknowledge_k1_global_packet" in text
+
+    binding_text = spec.sources[0].read_text()
+    assert "(cluster_size - 2) * 5" in binding_text
+    assert "EncodeTmaPointers<64>" in binding_text
     assert "cluster_size" in text
 
 
@@ -326,7 +356,7 @@ def test_aot_detects_flash_kda_target_matrix(
         ({"flash_kda_prefill_sm100f": True}, "sm100f"),
     ],
 )
-def test_aot_registers_three_flash_kda_modules(
+def test_aot_registers_all_flash_kda_modules(
     monkeypatch, capabilities, expected_target
 ):
     from flashinfer import aot
@@ -351,6 +381,11 @@ def test_aot_registers_three_flash_kda_modules(
         aot,
         "gen_flash_kda_m128_k1_parallel_module",
         lambda target: fake_flash_kda("m128_k1_parallel", target),
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_flash_kda_m64_k1_parallel_module",
+        lambda target: fake_flash_kda("m64_k1_parallel", target),
     )
     monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
@@ -379,12 +414,14 @@ def test_aot_registers_three_flash_kda_modules(
 
     assert calls == [
         ("m64", expected_target),
+        ("m64_k1_parallel", expected_target),
         ("m128", expected_target),
         ("m128_k1_parallel", expected_target),
     ]
     assert [spec.name for spec in specs] == [
         "spdlog",
         f"flash_kda_m64_{expected_target}",
+        f"flash_kda_m64_k1_parallel_{expected_target}",
         f"flash_kda_m128_{expected_target}",
         f"flash_kda_m128_k1_parallel_{expected_target}",
         "cudnn",

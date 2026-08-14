@@ -27,7 +27,7 @@ from .core import (
     sm100f_nvcc_flags,
 )
 
-FlashKDAVariant = Literal["m64", "m128", "m128_k1_parallel"]
+FlashKDAVariant = Literal["m64", "m128", "m64_k1_parallel", "m128_k1_parallel"]
 FlashKDATarget = Literal["sm100a", "sm100f"]
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -76,7 +76,7 @@ def _get_flash_kda_include_dir() -> Path:
 def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
     """Return the target-specific JIT/AOT key for one schedule."""
 
-    if variant not in ("m64", "m128", "m128_k1_parallel"):
+    if variant not in ("m64", "m128", "m64_k1_parallel", "m128_k1_parallel"):
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
     if target not in _FLASH_KDA_NVCC_FLAGS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
@@ -136,6 +136,12 @@ def gen_flash_kda_m128_k1_parallel_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("m128_k1_parallel", target)
 
 
+def gen_flash_kda_m64_k1_parallel_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the SM100-family dual-owner M64 module."""
+
+    return gen_flash_kda_module("m64_k1_parallel", target)
+
+
 @functools.cache
 def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Build or load one physical, target-specific FlashKDA module."""
@@ -163,6 +169,12 @@ def load_flash_kda_m128_k1_parallel_module(target: FlashKDATarget):
     return load_flash_kda_module("m128_k1_parallel", target)
 
 
+def load_flash_kda_m64_k1_parallel_module(target: FlashKDATarget):
+    """Load the SM100-family dual-owner M64 module."""
+
+    return load_flash_kda_module("m64_k1_parallel", target)
+
+
 def get_flash_kda_prefill_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
 
@@ -173,12 +185,14 @@ __all__ = [
     "FlashKDATarget",
     "FlashKDAVariant",
     "gen_flash_kda_m64_module",
+    "gen_flash_kda_m64_k1_parallel_module",
     "gen_flash_kda_m128_module",
     "gen_flash_kda_m128_k1_parallel_module",
     "gen_flash_kda_module",
     "get_flash_kda_prefill_module",
     "get_flash_kda_uri",
     "load_flash_kda_m64_module",
+    "load_flash_kda_m64_k1_parallel_module",
     "load_flash_kda_m128_module",
     "load_flash_kda_m128_k1_parallel_module",
     "load_flash_kda_module",

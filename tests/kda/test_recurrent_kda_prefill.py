@@ -367,6 +367,11 @@ def test_frozen_route_and_ffi_abi(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
+        (1, 1, 512, ("m64", 0, 0)),
+        (1, 1, 1024, ("m64", 0, 0)),
+        (1, 1, 2048, ("m128_k1_parallel", 4, 15)),
+        (1, 1, 4096, ("m64_k1_parallel", 4, 10)),
+        (2, 1, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 4, 1024, ("m64", 0, 0)),
         (1, 4, 2048, ("m128_k1_parallel", 4, 15)),
         (1, 8, 1024, ("m64", 0, 0)),
@@ -406,6 +411,7 @@ def test_k1_parallel_b200_oracle(
 @pytest.mark.parametrize(
     ("num_sequences", "num_heads", "sequence_length", "expected"),
     [
+        (1, 1, 4096, ("m128", 0, 0)),
         (1, 4, 1024, ("m64", 0, 0)),
         (1, 4, 2048, ("m128_k1_parallel", 4, 30)),
         (1, 8, 1024, ("m64", 0, 0)),
@@ -557,7 +563,7 @@ def test_k1_parallel_rejects_unsupported_head_count(flash_kda_device, monkeypatc
     )
     inputs = _make_inputs(seq_lens=[2048], num_heads=5, packed=False)
 
-    with pytest.raises(RuntimeError, match="requires H == 4"):
+    with pytest.raises(RuntimeError, match="requires H == 1, H == 4"):
         recurrent_kda(**_strict_prefill_kwargs(inputs))
 
 
@@ -1154,6 +1160,45 @@ def test_k1_parallel_h4_matches_m128_bitwise(cuda_device, monkeypatch):
 
     torch.testing.assert_close(helper_output, baseline_output, atol=0, rtol=0)
     torch.testing.assert_close(helper_state, baseline_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "num_heads"),
+    [(1024, 1), (2048, 1), (4096, 1), (1024, 4), (2048, 4)],
+)
+def test_m64_k1_parallel_matches_reference(
+    flash_kda_device, monkeypatch, seq_len, num_heads
+):
+    inputs = _make_inputs(
+        seq_lens=[seq_len],
+        num_heads=num_heads,
+        packed=False,
+        initial_state=True,
+        seed=9064 + seq_len,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_flash_kda_prefill_variant",
+        lambda **_kwargs: ("m64_k1_parallel", 4, 10),
+    )
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("num_heads", [4, 8])
