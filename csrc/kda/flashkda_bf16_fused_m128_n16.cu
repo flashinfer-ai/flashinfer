@@ -16,8 +16,8 @@
 
 // Frozen generated Loom export; do not edit by hand.
 // Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module
-// flashkda_bf16_fused_m128_1c2da3341d; raw SHA-256:
-// dceabe1d8bf0ff5f477051c5d61c653b05f5f0f03cfd927b8b211d0ff7cad9c6.
+// flashkda_bf16_fused_m128_df718c4854; raw SHA-256:
+// fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1535,7 +1535,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 int chunk_is_full_1 = ((seq_len_3 >= (chunk_idx_2 + 1) * 16) ? 1 : 0);
                 float early_beta_value = 0.0f;
                 float early_gate0 = 0.0f;
-                mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
+                if (chunk_is_full_1 != 0 || prep_iter != 0) {
+                    mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
+                }
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
