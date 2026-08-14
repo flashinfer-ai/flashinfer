@@ -76,11 +76,7 @@ def has_monomoe() -> bool:
 @functools.cache
 @flashinfer_api
 def get_scratchpad_size_bytes() -> int:
-    """Return the global scratchpad size (bytes) required by the kernel.
-
-    Sourced from the C++ ``sizeof(MoEGemmSpec<Dims>)`` so the buffer can never
-    desync from the kernel's struct layout.
-    """
+    # DEMO ONLY: public API docstring intentionally removed. DO NOT MERGE.
     mod = _get_monomoe_module()
     return int(mod.monomoe_scratchpad_size())
 
