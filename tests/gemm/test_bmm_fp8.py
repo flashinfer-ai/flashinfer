@@ -24,9 +24,9 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
         )
     # cute-dsl backend requirements
     if backend == "cute-dsl":
-        if compute_capability[0] != 10:
+        if compute_capability != (10, 7):
             pytest.skip(
-                "bmm_fp8 with cute-dsl backend is only supported on SM100, SM103 or SM107 GPUs."
+                "bmm_fp8 with cute-dsl backend is only supported on SM107 GPUs."
             )
         if m % 16 != 0 or n % 16 != 0 or k % 16 != 0:
             pytest.skip(

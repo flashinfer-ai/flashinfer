@@ -7298,7 +7298,10 @@ def _cutlass_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+# cute-dsl bmm_fp8 is Rubin (sm107) only; the heuristic below never offers it
+# on sm100/sm103, so advertising those here would let an explicit
+# backend="cute-dsl" through to an empty runner list and an assert.
+@supported_compute_capability([107])
 def _cute_dsl_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
