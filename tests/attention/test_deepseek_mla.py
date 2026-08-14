@@ -958,9 +958,8 @@ def test_batch_mla_fp8_nope_group_scales_matches_bf16_reference(backend):
         sm_scale,
         torch.bfloat16,
         torch.float8_e4m3fn,
-        ckv_scale=1.0,
-        kpe_scale=1.0,
         ckv_scale_arr=ckv_scales,
+        kpe_scale=1.0,
         head_dim_kpe=0,
     )
 
@@ -1409,9 +1408,6 @@ def test_fp8_kv_plan_rejects_fp16_q():
 
 
 def test_fp8_kv_scales_are_keyword_only():
-    """ckv_scale / kpe_scale must be passed by keyword. The `*` marker
-    in run()'s signature pins this; this test guards against accidental
-    removal of the marker."""
     import inspect
 
     sig = inspect.signature(flashinfer.mla.BatchMLAPagedAttentionWrapper.run)
@@ -1519,8 +1515,6 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
 
 
 def test_fp8_kv_requires_scales():
-    """Forgetting to pass ckv_scale / kpe_scale on the FP8 path should raise
-    a clear error rather than silently producing wrong output."""
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
     torch.manual_seed(0)
@@ -1577,7 +1571,7 @@ def test_fp8_kv_requires_scales():
         q_data_type=torch.bfloat16,
         kv_data_type=torch.float8_e4m3fn,
     )
-    with pytest.raises(ValueError, match="ckv_scale and kpe_scale are required"):
+    with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
         wrapper.run(q_nope, q_pe, ckv_fp8, kpe_fp8)
     invalid_scales = torch.ones(
         1, page_size, HEAD_DIM_CKV // 128 - 1, dtype=torch.float32, device=device
@@ -1588,9 +1582,21 @@ def test_fp8_kv_requires_scales():
             q_pe,
             ckv_fp8,
             kpe_fp8,
-            ckv_scale=1.0,
-            kpe_scale=1.0,
             ckv_scale_arr=invalid_scales,
+            kpe_scale=1.0,
+        )
+    valid_scales = torch.ones(
+        1, page_size, HEAD_DIM_CKV // 128, dtype=torch.float32, device=device
+    )
+    with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
+        wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_fp8,
+            kpe_fp8,
+            ckv_scale=1.0,
+            ckv_scale_arr=valid_scales,
+            kpe_scale=1.0,
         )
 
 

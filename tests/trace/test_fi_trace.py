@@ -693,9 +693,8 @@ def test_mla_paged_fi_trace():
         q_pe=q_pe,
         ckv_cache=ckv_cache,
         kpe_cache=kpe_cache,
-        ckv_scale=1.0,
-        kpe_scale=1.0,
         ckv_scale_arr=ckv_scale_arr,
+        kpe_scale=1.0,
     )
     _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
     axes = defn["axes"]

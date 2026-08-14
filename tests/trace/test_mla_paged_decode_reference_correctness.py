@@ -23,6 +23,7 @@ def test_mla_paged_decode_fp8_reference_dequantization(use_group_scales):
     dequantized_ckv = ckv_cache.float() * ckv_scale
 
     if use_group_scales:
+        ckv_scale = None
         ckv_scale_arr = torch.tensor(
             [
                 [
@@ -48,8 +49,8 @@ def test_mla_paged_decode_fp8_reference_dequantization(use_group_scales):
         kv_indices,
         1.0,
         ckv_scale,
-        kpe_scale,
         ckv_scale_arr,
+        kpe_scale,
         False,
     )
 

@@ -2279,8 +2279,8 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
-        kpe_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
+        kpe_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2300,8 +2300,8 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
-        kpe_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -2321,8 +2321,8 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
-        kpe_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -2363,19 +2363,19 @@ class BatchMLAPagedAttentionWrapper:
             the ``cutlass`` backend.
         ckv_scale : Optional[float]
             Per-tensor dequantization scale for the compressed-KV cache when
-            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
-            (together with ``kpe_scale``) for the FP8 KV cache path on the
-            ``fa2`` or ``fa3`` backend. Must be a finite positive value. Must not be
-            provided when ``kv_data_type`` is BF16/FP16.
-        kpe_scale : Optional[float]
-            Per-tensor dequantization scale for the rope-K cache when
-            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
-            usage rules as ``ckv_scale``.
+            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Exactly
+            one of ``ckv_scale`` or ``ckv_scale_arr`` is required for the FP8 KV
+            cache path. Must be a finite positive value. Must not be provided
+            when ``kv_data_type`` is BF16/FP16.
         ckv_scale_arr : Optional[torch.Tensor]
             Per-token, per-128-channel CKV dequantization scales. The expected
             shape is ``ckv_cache.shape[:-1] + (head_dim_ckv // 128,)`` and the
-            dtype must be contiguous float32. When provided, these values
-            override ``ckv_scale`` for CKV dequantization.
+            dtype must be contiguous float32. Exactly one of ``ckv_scale`` or
+            ``ckv_scale_arr`` is required for the FP8 KV cache path.
+        kpe_scale : Optional[float]
+            Per-tensor dequantization scale for the rope-K cache when
+            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Required
+            with either CKV scale representation.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -2467,13 +2467,18 @@ class BatchMLAPagedAttentionWrapper:
         # e4m3fn is the only FP8 dtype reachable here (plan() rejects others).
         kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
         if kv_is_fp8:
-            if ckv_scale is None or kpe_scale is None:
+            if (ckv_scale is None) == (ckv_scale_arr is None):
                 raise ValueError(
-                    "ckv_scale and kpe_scale are required when kv_data_type is FP8."
+                    "Exactly one of ckv_scale or ckv_scale_arr is required when "
+                    "kv_data_type is FP8."
                 )
-            ckv_scale_f = float(ckv_scale)
+            if kpe_scale is None:
+                raise ValueError("kpe_scale is required when kv_data_type is FP8.")
+            ckv_scale_f = 1.0 if ckv_scale is None else float(ckv_scale)
             kpe_scale_f = float(kpe_scale)
-            if not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0:
+            if ckv_scale is not None and (
+                not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0
+            ):
                 raise ValueError(
                     f"ckv_scale must be a finite positive value, got {ckv_scale}"
                 )
@@ -2482,9 +2487,14 @@ class BatchMLAPagedAttentionWrapper:
                     f"kpe_scale must be a finite positive value, got {kpe_scale}"
                 )
         else:
-            if ckv_scale is not None or kpe_scale is not None:
+            if (
+                ckv_scale is not None
+                or ckv_scale_arr is not None
+                or kpe_scale is not None
+            ):
                 raise ValueError(
-                    "ckv_scale / kpe_scale are only valid when kv_data_type is FP8."
+                    "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
+                    "kv_data_type is FP8."
                 )
             ckv_scale_f = 1.0
             kpe_scale_f = 1.0
