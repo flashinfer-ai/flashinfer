@@ -138,6 +138,7 @@ def _validate_core_inputs(
     cp_world: int,
     cp_rank: int,
 ) -> tuple[int, int, str, int]:
+    supported_q_lens: tuple[int, ...]
     if query.dtype != torch.bfloat16:
         raise TypeError("DCP speculative FMHA requires a BF16 query tensor")
     if k_cache.dtype != v_cache.dtype:
