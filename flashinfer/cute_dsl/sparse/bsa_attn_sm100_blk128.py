@@ -18,8 +18,8 @@ import cutlass.cute as cute
 from .bsa_utils.cache_utils import get_jit_cache
 from .bsa_utils.testing import is_fake_mode
 from .bsa_utils import fa_logging
-from .blk128.cute_dsl_utils import to_cute_tensor
-from .blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
+from .bsa_utils.cute_tensor_utils import to_cute_tensor
+from .sm100_blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 
@@ -58,8 +58,11 @@ torch2cute_dtype_map = {
 }
 
 
+_sm100_blk128_compile_cache = get_jit_cache("bsa_fwd")
+
+
 @flashinfer_api
-def bsa_attn_fwd(
+def bsa_attn_sm100_blk128_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -74,7 +77,9 @@ def bsa_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Forward pass for BSA block-sparse attention (SM100 only).
+    """Forward pass for BSA block-sparse attention using the blk128 CuTe-DSL kernel.
+
+    Supports SM100 and SM103.
 
     Args:
         q: Query tensor (batch, seqlen_q, num_heads, head_dim)
@@ -96,7 +101,6 @@ def bsa_attn_fwd(
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
-    k.shape[1]
     num_head_kv = k.shape[2]
     head_dim_v = v.shape[-1]
 
@@ -109,7 +113,9 @@ def bsa_attn_fwd(
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
-    assert arch // 10 in [10, 11], "BSA only supports SM100/SM110"
+    assert arch in (100, 103), (
+        f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103, got SM{arch}"
+    )
     assert num_head % num_head_kv == 0
 
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
@@ -182,7 +188,7 @@ def bsa_attn_fwd(
         has_block_sizes,
     )
 
-    if compile_key not in bsa_attn_fwd.compile_cache:  # type: ignore[attr-defined]
+    if compile_key not in _sm100_blk128_compile_cache:
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out)
         ]
@@ -207,7 +213,7 @@ def bsa_attn_fwd(
             has_block_sizes=has_block_sizes,
         )
 
-        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
+        _sm100_blk128_compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -224,8 +230,8 @@ def bsa_attn_fwd(
         )
 
     if not is_fake_mode():
-        with torch.cuda.nvtx.range("bsa_attn_fwd_kernel"):
-            bsa_attn_fwd.compile_cache[compile_key](  # type: ignore[attr-defined]
+        with torch.cuda.nvtx.range("bsa_attn_sm100_blk128_fwd_kernel"):
+            _sm100_blk128_compile_cache[compile_key](
                 q.detach(),
                 k.detach(),
                 v.detach(),
@@ -240,6 +246,3 @@ def bsa_attn_fwd(
             )
 
     return out, lse
-
-
-bsa_attn_fwd.compile_cache = get_jit_cache("bsa_fwd")  # type: ignore[attr-defined]

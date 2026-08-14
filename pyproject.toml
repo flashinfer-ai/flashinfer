@@ -70,11 +70,11 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
-# JIT sources for the blk64 BSA kernel extension (compiled on-demand via
-# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/blk64/loader.py).
+# JIT sources for the sm100_blk64 BSA kernel extension (compiled on-demand via
+# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/sm100_blk64/loader.py).
 # These live inside the package tree rather than csrc/, so they must be
 # registered explicitly or they won't be included in non-editable installs.
-"flashinfer.cute_dsl.sparse.blk64" = [
+"flashinfer.cute_dsl.sparse.sm100_blk64" = [
   "*.cpp",
   "*.cu",
   "*.h",
