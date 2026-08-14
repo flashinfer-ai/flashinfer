@@ -814,6 +814,41 @@ struct CollectiveMainloopFwd {
       }
     };
 
+    auto process_score_slot = [&](auto score_slot,
+                                  auto has_next_tile) __attribute__((always_inline)) {
+      constexpr int ScoreSlot = decltype(score_slot)::value;
+      constexpr bool HasNextTile = decltype(has_next_tile)::value;
+      static_assert(ScoreSlot == 0 || ScoreSlot == 1, "N64 score slot must be 0 or 1");
+
+      softmax_fused.template softmax_quantize_n64<ScoreSlot, Is_causal>(
+          tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
+      if constexpr (ScoreSlot == 0) {
+        // Keep one convergence point while score registers transition from
+        // softmax input to packed P and then back to the next QK tile.
+        __syncwarp();
+      }
+      quantize(score_slot);
+
+      if constexpr (HasNextTile) {
+        if constexpr (ScoreSlot == 0) {
+          consumer_wait(pipeline_k, smem_pipe_read_k);
+        }
+        add_delta_s_slot(tSrS, score_slot);
+        refill_score_slot(score_slot);
+        if constexpr (ScoreSlot == 1) {
+          pipeline_k.consumer_release(smem_pipe_read_k);
+          ++smem_pipe_read_k;
+        }
+      }
+
+      if constexpr (ScoreSlot == 0) {
+        consumer_wait(pipeline_v, smem_pipe_read_v);
+      }
+      copy_v_block(score_slot);
+      cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, score_slot), tOrSFP(_, _, score_slot)),
+                 make_zip_tensor(tOrVt(_, _, score_slot), tOrSFVt(_, _, score_slot)), tOrO_store);
+    };
+
     consumer_wait(pipeline_q, smem_pipe_read_q);
     copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
@@ -853,34 +888,8 @@ struct CollectiveMainloopFwd {
     // separately below.
 #pragma unroll 1
     for (int tile_idx = 0; tile_idx < n_block_count - 1; ++tile_idx) {
-      softmax_fused.template softmax_quantize_n64<0, Is_causal>(tSrS, AbsMaxP,
-                                                                mainloop_params.softmax_scale_log2);
-      // Keep one convergence point while score registers transition from
-      // softmax input to packed P and then back to the next QK tile.
-      __syncwarp();
-      quantize(_0{});
-
-      consumer_wait(pipeline_k, smem_pipe_read_k);
-      add_delta_s_slot(tSrS, _0{});
-      refill_score_slot(_0{});
-
-      consumer_wait(pipeline_v, smem_pipe_read_v);
-      copy_v_block(_0{});
-      cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _0{}), tOrSFP(_, _, _0{})),
-                 make_zip_tensor(tOrVt(_, _, _0{}), tOrSFVt(_, _, _0{})), tOrO_store);
-
-      softmax_fused.template softmax_quantize_n64<1, Is_causal>(tSrS, AbsMaxP,
-                                                                mainloop_params.softmax_scale_log2);
-      quantize(_1{});
-
-      add_delta_s_slot(tSrS, _1{});
-      refill_score_slot(_1{});
-      pipeline_k.consumer_release(smem_pipe_read_k);
-      ++smem_pipe_read_k;
-
-      copy_v_block(_1{});
-      cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _1{}), tOrSFP(_, _, _1{})),
-                 make_zip_tensor(tOrVt(_, _, _1{}), tOrSFVt(_, _, _1{})), tOrO_store);
+      process_score_slot(_0{}, cute::true_type{});
+      process_score_slot(_1{}, cute::true_type{});
 
       pipeline_v.consumer_release(smem_pipe_read_v);
       ++smem_pipe_read_v;
@@ -896,23 +905,8 @@ struct CollectiveMainloopFwd {
 
     // Drain the final score tile without carrying a per-iteration
     // has-next-tile predicate through the hot loop.
-    softmax_fused.template softmax_quantize_n64<0, Is_causal>(tSrS, AbsMaxP,
-                                                              mainloop_params.softmax_scale_log2);
-    __syncwarp();
-    quantize(_0{});
-
-    consumer_wait(pipeline_v, smem_pipe_read_v);
-    copy_v_block(_0{});
-    cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _0{}), tOrSFP(_, _, _0{})),
-               make_zip_tensor(tOrVt(_, _, _0{}), tOrSFVt(_, _, _0{})), tOrO_store);
-
-    softmax_fused.template softmax_quantize_n64<1, Is_causal>(tSrS, AbsMaxP,
-                                                              mainloop_params.softmax_scale_log2);
-    quantize(_1{});
-
-    copy_v_block(_1{});
-    cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, _1{}), tOrSFP(_, _, _1{})),
-               make_zip_tensor(tOrVt(_, _, _1{}), tOrSFVt(_, _, _1{})), tOrO_store);
+    process_score_slot(_0{}, cute::false_type{});
+    process_score_slot(_1{}, cute::false_type{});
 
     pipeline_v.consumer_release(smem_pipe_read_v);
     ++smem_pipe_read_v;

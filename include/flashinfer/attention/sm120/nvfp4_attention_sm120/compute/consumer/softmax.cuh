@@ -25,6 +25,11 @@
 
 namespace nvfp4_attention {
 
+using cute::_;
+using cute::_0;
+using cute::_1;
+using cute::_2;
+using cute::_3;
 using cute::clear;
 using cute::copy;
 using cute::fill;
