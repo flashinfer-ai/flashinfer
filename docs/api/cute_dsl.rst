@@ -86,8 +86,9 @@ CuTe-DSL block-sparse attention forward kernels.
 .. autosummary::
     :toctree: ../generated
 
-    bsa_attn_fwd
-    bsa_attn_blk64_fwd
+    bsa_attn_sm100_blk128.bsa_attn_sm100_blk128_fwd
+    bsa_attn_sm100_blk64.bsa_attn_sm100_blk64_fwd
+    bsa_attn_sm120.bsa_attn_sm120_blk64_fwd
 
 HCA Decode
 ----------

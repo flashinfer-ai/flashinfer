@@ -27,6 +27,7 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import MoERunner
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
 from flashinfer.tllm_enums import ActivationType
@@ -69,6 +70,86 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert CutlassConfig not in _BACKEND_RUNNERS
     assert _BACKEND_RUNNERS[CutlassBf16Config] is CutlassBf16Runner
     assert _BACKEND_RUNNERS[CutlassW4A16Config] is CutlassW4A16Runner
+
+
+def test_all_registered_runners_use_enforced_lifecycle():
+    for runner_type in _BACKEND_RUNNERS.values():
+        assert issubclass(runner_type, MoERunner)
+        assert runner_type.check_support is MoERunner.check_support
+        assert runner_type.build is MoERunner.build
+
+
+@pytest.mark.parametrize("runner_type", tuple(_BACKEND_RUNNERS.values()))
+@pytest.mark.parametrize(
+    "method,args",
+    (
+        ("pack_inputs", (None, None)),
+        ("get_valid_tactics", ([], None)),
+        ("forward", ([],)),
+    ),
+)
+def test_registered_runner_execution_requires_build(runner_type, method, args):
+    runner = runner_type.__new__(runner_type)
+
+    with pytest.raises(RuntimeError, match=r"build\(\).*before execution"):
+        getattr(runner, method)(*args)
+
+
+def test_moe_runner_enforces_lifecycle_order():
+    events = []
+
+    class Runner(MoERunner):
+        supported_quant_variants = (QuantVariant.BF16,)
+
+        def _check_support(self):
+            events.append("check_support")
+            super()._check_support()
+
+        def _build(self):
+            events.append("build")
+
+        def get_valid_tactics(self, inputs, profile):
+            self._require_built()
+            return [-1]
+
+        def forward(self, inputs, **kwargs):
+            self._require_built()
+            events.append("execution")
+
+    runner = Runner()
+    runner.config = _config()
+
+    with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
+        runner.build()
+    with pytest.raises(RuntimeError, match=r"build\(\).*before execution"):
+        runner.forward([])
+
+    runner.check_support()
+    runner.build()
+    runner.build()
+    runner.forward([])
+
+    assert events == ["check_support", "build", "execution"]
+
+
+def test_failed_support_check_does_not_authorize_build():
+    class Runner(MoERunner):
+        supported_quant_variants = (QuantVariant.NVFP4,)
+
+        def get_valid_tactics(self, inputs, profile):
+            return [-1]
+
+        def forward(self, inputs, **kwargs):
+            return None
+
+    runner = Runner()
+    runner.config = _config()
+    runner._support_checked = True
+
+    with pytest.raises(NotImplementedError, match="QuantVariant.BF16"):
+        runner.check_support()
+    with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
+        runner.build()
 
 
 def test_legacy_cutlass_config_is_deprecated():
@@ -393,7 +474,7 @@ def test_cutlass_direct_execution_requires_explicit_build(monkeypatch, execute):
         lambda *args, **kwargs: backend_calls.append("workspace"),
     )
 
-    with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
+    with pytest.raises(RuntimeError, match=r"build\(\).*before execution"):
         execute(runner)
 
     assert backend_calls == []
@@ -419,6 +500,7 @@ def test_cutlass_autotuner_preparation_initializes_both_gemms():
 
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner._inner = RecordingInner()
+    runner._built = True
     runner._workspace = torch.empty(1, dtype=torch.uint8)
     inputs = [torch.empty(1) for _ in range(6)]
 
@@ -437,9 +519,13 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
-            self.calls.append((custom_op, kwargs["gemm_idx"]))
-            return runners[0], 3 if kwargs["gemm_idx"] == 1 else 9
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            self.calls.append((custom_op, kwargs["gemm_idx"], k))
+            if kwargs["gemm_idx"] == 1:
+                return [3, 5][:k]
+            return [9, 7][:k]
 
     class Inner:
         gemm_idx_for_tuning = None
@@ -448,21 +534,42 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner._inner = Inner()
+    runner._built = True
     runner._device_arch = 100
+    runner._num_top_tactics_per_stage = 2
     inputs = [torch.empty(1) for _ in range(6)]
 
     tactics = runner.get_valid_tactics(inputs, None)
 
-    assert tactics == [(3, 9)]
+    assert tactics == [(3, 9), (3, 7), (5, 9), (5, 7)]
     assert tuner.calls == [
-        ("moe_cutlass_bf16_sm100_gemm1", 1),
-        ("moe_cutlass_bf16_sm100_gemm2", 2),
+        ("moe_cutlass_bf16_sm100_gemm1", 1, 2),
+        ("moe_cutlass_bf16_sm100_gemm2", 2, 2),
     ]
     assert runner._inner.gemm_idx_for_tuning is None
 
 
+def test_cutlass_one_top_tactic_preserves_single_compound_pair(monkeypatch):
+    class RecordingTuner:
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            return [3] if kwargs["gemm_idx"] == 1 else [9]
+
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: RecordingTuner()))
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner._inner = type("Inner", (), {"gemm_idx_for_tuning": None})()
+    runner._built = True
+    runner._device_arch = 100
+    runner._num_top_tactics_per_stage = 1
+    inputs = [torch.empty(1) for _ in range(6)]
+
+    assert runner.get_valid_tactics(inputs, None) == [(3, 9)]
+
+
 def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config()
     runner._device_arch = 90
     runner._enable_pdl = False
     without_pdl = runner.get_cache_key_extras([])
@@ -470,8 +577,9 @@ def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner._enable_pdl = True
     with_pdl = runner.get_cache_key_extras([])
 
-    assert without_pdl == (90, False)
-    assert with_pdl == (90, True)
+    assert without_pdl[-2:] == (90, False)
+    assert with_pdl[-2:] == (90, True)
+    assert without_pdl[:-2] == with_pdl[:-2]
 
 
 def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
@@ -479,6 +587,7 @@ def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
     runner.config = _config()
     runner.device = torch.device("cpu")
     runner._inner = object()
+    runner._built = True
     num_tokens, hidden_size, top_k = 65, 128, 2
     act = MoEActivationPack(
         torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16),
@@ -510,8 +619,8 @@ def test_cutlass_direct_pack_succeeds_after_explicit_build():
     def ensure_workspace(num_tokens, hidden_size):
         events.append("workspace")
 
-    runner.check_support = check_support
-    runner.build = build
+    runner._check_support = check_support
+    runner._build = build
     runner._ensure_workspace = ensure_workspace
     runner._pack_weight_inputs = lambda view, hidden_size: [
         torch.empty(1),

@@ -42,6 +42,12 @@ except (ImportError, RuntimeError):
     run_fused_kda_decode = None  # type: ignore
     fused_kda_decode = None  # type: ignore
 
+# NOTE: flashinfer.kda_kernels.packed_kda_decode_cute is an internal
+# implementation module, not public API. Its kernels back the T=1 fast path
+# of the public ``flashinfer.recurrent_kda`` operation (see
+# ``run_recurrent_kda`` in ``recurrent_kda.py``); import it by module path
+# only for tests and benchmarks.
+
 try:
     if _torch.cuda.is_available():
         from ..cute_dsl.utils import is_cute_dsl_arch_supported as _dsl_arch_ok

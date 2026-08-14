@@ -11,6 +11,7 @@ from flashinfer import (
 )
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.gemm import gemm_base
+from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
 
@@ -51,6 +52,12 @@ def _skip_if_unsupported(backend: str = "cutlass"):
             "Skipping test because mm_mxfp8 backend is not supported on compute "
             f"capability {compute_capability_number}."
         )
+    if backend == "b12x":
+        if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
+            pytest.skip("b12x mm_mxfp8 requires CUDA 13+")
+        # Not a hasattr(MmaMXF8Op) probe: the op exists on versions the gate rejects.
+        if not _b12x_mxfp8_dsl_supported():
+            pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
 
 
 def _run_mm_mxfp8(
@@ -71,6 +78,8 @@ def _run_mm_mxfp8(
             pytest.skip("trtllm does not support non-multiple of 256")
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
+    if backend == "b12x" and k % 128 != 0:
+        pytest.skip("b12x requires K % 128 == 0")
     if backend == "cutlass" and use_8x4_sf_layout_for_a:
         pytest.skip("cutlass doesn't support 8x4 swizzle layout")
 
@@ -149,7 +158,7 @@ def _prepare_mxfp8_tensors(
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm"])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "b12x"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_mm_mxfp8(m, n, k, input_dtype, out_dtype, backend, auto_tuning):
     _run_mm_mxfp8(
@@ -170,7 +179,7 @@ def test_mm_mxfp8(m, n, k, input_dtype, out_dtype, backend, auto_tuning):
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "auto"])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "b12x", "auto"])
 def test_mm_mxfp8_large_dimensions(m, n, k, input_dtype, out_dtype, backend):
     _run_mm_mxfp8(
         m,
@@ -205,6 +214,62 @@ def test_mm_mxfp8_small_m(m, n, k):
         torch.bfloat16,
         torch.bfloat16,
         "cutlass",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "m,k",
+    [
+        (1, 768),
+        (16, 1536),
+        (32, 2048),
+    ],
+)
+def test_mm_mxfp8_b12x_low_m(m, k):
+    _run_mm_mxfp8(
+        m,
+        256,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "b12x",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize("m,n,k", [(2048, 1024, 128), (2048, 1024, 256)])
+def test_mm_mxfp8_b12x_short_k_multi_wave(m, n, k):
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles. m=2048 keeps the
+    # launch multi-wave on the largest SM120 parts and misses the
+    # autotuner cache the parametrized suite fills. Repeats, since a bad
+    # handoff shows up as a timing-dependent mismatch.
+    for _ in range(3):
+        _run_mm_mxfp8(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            torch.bfloat16,
+            "b12x",
+            auto_tuning=False,
+            provide_out=True,
+        )
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64])
+@pytest.mark.parametrize("n,k", [(6144, 4096), (2688, 4096)])
+def test_mm_mxfp8_b12x_decode_m(m, n, k):
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "b12x",
         auto_tuning=False,
         provide_out=True,
     )

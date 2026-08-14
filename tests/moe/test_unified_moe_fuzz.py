@@ -993,9 +993,17 @@ class Cfg:
     routing_input_mode: str = "prerouted"
     logits_dtype: str = "bf16"  # "bf16" | "fp32" (#2796 fp32-router-logits class)
     unpacked_weights_dtype: str = "bf16"  # "bf16" | "fp32"; unpacked mode only
+    # Fused shared experts (S). Layer geometry, not a per-call value: the
+    # weight tensors carry n_local + S rows and the routing kernel appends
+    # ids [E, E+S) at weight 1.0 after the routed top-k.
+    num_fused_shared_experts: int = 0
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+
+    @property
+    def n_weight_rows(self):  # physical expert-major rows: routed + shared
+        return self.n_local + self.num_fused_shared_experts
 
     @property
     def n_local(self):  # experts actually held + computed on this rank
@@ -1024,8 +1032,13 @@ class Cfg:
             else ""
         )
         grp = f"g{self.n_group}x{self.topk_group}_" if self.n_group else ""
+        sh = (
+            f"s{self.num_fused_shared_experts}_"
+            if self.num_fused_shared_experts
+            else ""
+        )
         return (
-            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1104,6 +1117,26 @@ def _gen(seed):
         if variant in ("mxfp4", "w4a16", "mxint4")
         else ("fp32" if rng.random() < 0.25 else "bf16")
     )
+    # Fused shared experts: only the DeepSeekV3 FromLogits path emits appended
+    # slots. Block-FP8 and all TRTLLM FP4 variants forward S; EP is rejected.
+    # Roll sparsely so this axis does not crowd out routed coverage.
+    num_fused_shared_experts = 0
+    if (
+        method == RoutingMethodType.DeepSeekV3
+        and fromlogits
+        and offset == 0
+        and local == ne
+        and variant in ("deepseekfp8", "mxfp8", "nvfp4", "mxfp4", "w4a16")
+        and rng.random() < 0.25
+    ):
+        # Bounded by the kernel ceilings on the FUSED totals.
+        max_shared = min(2, 32 - top_k, 512 - ne)
+        if (
+            max_shared >= 1
+            and _weight_elems(local + max_shared, h, i) <= _WEIGHT_ELEM_BUDGET
+        ):
+            num_fused_shared_experts = rng.randint(1, max_shared)
+
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
@@ -1123,6 +1156,7 @@ def _gen(seed):
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
 
 
@@ -1391,6 +1425,63 @@ _CURATED = [
         routing_input_mode="fromlogits",
         logits_dtype="bf16",
     ),
+    # Fused shared experts. Curated rather than left to the sparse random roll.
+    Cfg(
+        256,
+        1024,
+        512,
+        128,
+        8,
+        "deepseekfp8",
+        "uniform",
+        900_037,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=8,
+        topk_group=4,
+        routed_scaling=2.5,
+        num_fused_shared_experts=1,
+    ),
+    Cfg(
+        128,
+        1024,
+        512,
+        128,
+        8,
+        "mxfp8",
+        "imbalanced",
+        900_038,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=8,
+        topk_group=4,
+        routed_scaling=2.5,
+        num_fused_shared_experts=2,
+    ),
+    *[
+        Cfg(
+            32,
+            1024,
+            512,
+            32,
+            8,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.DeepSeekV3,
+            routing_input_mode="fromlogits",
+            logits_dtype="bf16",
+            n_group=8,
+            topk_group=4,
+            routed_scaling=2.5,
+            num_fused_shared_experts=num_shared,
+        )
+        for variant, num_shared, seed in (
+            ("nvfp4", 1, 900_042),
+            ("mxfp4", 2, 900_043),
+            ("w4a16", 1, 900_044),
+        )
+    ],
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1489,7 +1580,10 @@ def _master(cfg, handler):
         keep = torch.rand(shape, device="cuda", generator=g) >= 0.75  # ~75% zeros
         return handler.snap(dense * keep)
 
-    x, w1, w2 = sparse(T, H), sparse(E_local, 2 * I, H), sparse(E_local, H, I)
+    # Expert-major tensors carry the SHARED rows too (routed first, shared
+    # appended); E_local stays routed-only, matching the API contract.
+    rows = cfg.n_weight_rows
+    x, w1, w2 = sparse(T, H), sparse(rows, 2 * I, H), sparse(rows, H, I)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -1519,6 +1613,25 @@ def _master(cfg, handler):
     selected_experts = (local_sel + cfg.expert_offset).to(
         torch.int32
     )  # local -> global ids
+
+    # Mirror the routing kernel's shared-expert append: ids [E, E+S) at weight
+    # exactly 1.0, after the routed top-k. The reference sums over these the
+    # same way it does the routed slots, so no reference change is needed --
+    # it already resolves a global id to a weight row via expert_offset and
+    # sizes itself from w1.shape[0].
+    S = cfg.num_fused_shared_experts
+    if S:
+        shared_ids = torch.arange(
+            cfg.num_experts, cfg.num_experts + S, device="cuda", dtype=torch.int32
+        ).expand(T, S)
+        selected_experts = torch.cat((selected_experts, shared_ids), dim=1)
+        final_scales = torch.cat(
+            (
+                final_scales,
+                torch.ones((T, S), device="cuda", dtype=final_scales.dtype),
+            ),
+            dim=1,
+        )
     return x, w1, w2, selected_experts, final_scales, logits, routing_bias
 
 
@@ -1714,7 +1827,7 @@ def test_unified_moe_fuzz(cfg):
     weight_pack = MoEWeightPack()
     for BackendCfg in wired_backends:
         prepare_kwargs = dict(
-            num_local_experts=cfg.n_local,
+            num_local_experts=cfg.n_weight_rows,
             hidden_size=cfg.hidden,
             intermediate_size=cfg.intermediate,
             device=dev,
@@ -1751,6 +1864,7 @@ def test_unified_moe_fuzz(cfg):
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
             local_expert_offset=cfg.expert_offset,
+            num_fused_shared_experts=cfg.num_fused_shared_experts,
         ),
         activation=ActivationConfig(),
         backend=BackendOptions(
