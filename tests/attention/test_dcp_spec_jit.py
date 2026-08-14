@@ -2,13 +2,16 @@
 
 import importlib
 import inspect
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from flashinfer.dcp import (
     _select_num_split,
     get_dcp_spec_counter_bytes,
     get_dcp_spec_workspace_size_bytes,
+    run_dcp_spec_decode,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.jit.dcp import get_dcp_spec_uri
@@ -92,3 +95,42 @@ def test_dcp_trace_dispatch_distinguishes_combined_and_split_kv() -> None:
         )
         is trtllm_batch_decode_dcp_spec_split_kv_trace
     )
+
+
+def _empty_rank_inputs(seq_lens_dtype=torch.int32):
+    return {
+        "query": torch.empty((1, 8, 128), dtype=torch.bfloat16),
+        "k_cache": torch.empty((1, 8, 16, 128), dtype=torch.bfloat16),
+        "v_cache": torch.empty((1, 8, 16, 128), dtype=torch.bfloat16),
+        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
+        "block_tables": torch.zeros((1, 1), dtype=torch.int32),
+        "seq_lens": torch.zeros((1,), dtype=seq_lens_dtype),
+        "causal_seqlens_kv_global": torch.zeros((1,), dtype=torch.int32),
+        "max_local_seq_len": 0,
+        "sm_scale": 128**-0.5,
+        "cp_world": 8,
+        "cp_rank": 7,
+        "q_len_per_req": 1,
+        "out": torch.empty((1, 8, 128), dtype=torch.bfloat16),
+        "lse": torch.empty((1, 8), dtype=torch.float32),
+        "completion_buffer": None,
+    }
+
+
+def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
+    dcp = importlib.import_module("flashinfer.dcp")
+    launches = []
+    module = SimpleNamespace(run=lambda *args: launches.append(args))
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
+
+    run_dcp_spec_decode(**_empty_rank_inputs())
+
+    assert len(launches) == 1
+
+
+def test_dcp_rejects_non_int32_local_seq_lens() -> None:
+    with pytest.raises(ValueError, match="contiguous int32"):
+        run_dcp_spec_decode(**_empty_rank_inputs(torch.int64))

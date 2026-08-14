@@ -30,6 +30,7 @@ from .utils import (
 
 _BLOCK_N = 128
 _HEAD_DIM = 128
+_PAGE_SIZE = 16
 _MAX_NUM_SPLIT = 16
 _MIN_SPLIT_LOCAL_BLOCKS = 16
 _TARGET_PAIRS_PER_SPLIT = 3
@@ -168,7 +169,7 @@ def _validate_core_inputs(
     if k_cache.shape != v_cache.shape:
         raise ValueError("key and value cache shapes must match")
     _, num_kv_heads, page_size, kv_head_dim = k_cache.shape
-    if page_size != 16 or kv_head_dim != _HEAD_DIM:
+    if page_size != _PAGE_SIZE or kv_head_dim != _HEAD_DIM:
         raise ValueError(
             "DCP speculative FMHA requires HND page_size=16 and head_dim=128, "
             f"got page_size={page_size}, head_dim={kv_head_dim}"
@@ -206,14 +207,23 @@ def _validate_core_inputs(
         device,
         "causal_seqlens_kv_global",
     )
+    if block_tables.ndim != 2 or not block_tables.is_contiguous():
+        raise ValueError("block_tables must be a contiguous 2D tensor")
     if block_tables.dtype != torch.int32 or block_tables.shape[0] != batch_size:
         raise ValueError(
             "block_tables must be int32 with shape [batch_size, max_pages_per_seq]"
         )
-    if block_tables.ndim != 2 or not block_tables.is_contiguous():
-        raise ValueError("block_tables must be a contiguous 2D tensor")
-    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size:
-        raise ValueError("seq_lens must have shape [batch_size]")
+    if block_tables.shape[1] <= 0:
+        raise ValueError("block_tables must contain at least one physical page slot")
+    if (
+        seq_lens.dtype != torch.int32
+        or seq_lens.ndim != 1
+        or seq_lens.shape[0] != batch_size
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError(
+            "seq_lens must be a contiguous int32 tensor with shape [batch_size]"
+        )
     if not causal_seqlens_kv_global.is_contiguous():
         raise ValueError("causal_seqlens_kv_global must be contiguous")
     return num_qo_heads, num_kv_heads
@@ -255,8 +265,16 @@ def run_dcp_spec_decode(
         cp_world=cp_world,
         cp_rank=cp_rank,
     )
-    if max_local_seq_len <= 0:
-        raise ValueError(f"max_local_seq_len must be positive, got {max_local_seq_len}")
+    if max_local_seq_len < 0:
+        raise ValueError(
+            f"max_local_seq_len must be nonnegative, got {max_local_seq_len}"
+        )
+    local_capacity = block_tables.shape[1] * _PAGE_SIZE
+    if max_local_seq_len > local_capacity:
+        raise ValueError(
+            "max_local_seq_len exceeds the rank-local page-table capacity: "
+            f"got {max_local_seq_len}, capacity={local_capacity}"
+        )
 
     sm_count = get_device_sm_count(query.device)
     logical_tiles = batch_size * q_len_per_req * num_kv_heads

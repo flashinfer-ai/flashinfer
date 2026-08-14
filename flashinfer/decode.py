@@ -3301,7 +3301,10 @@ def trtllm_batch_decode_with_kv_cache(
         head dimension 128, uniform ``q_len_per_req`` in ``{1,2,4,5,6,8}``,
         causal attention, ``return_lse=True`` (or a caller-owned ``lse``), and
         head group ratio in ``[1,8]``. Its LSE is FP32 base-2, matching the
-        existing TRT-LLM backend contract. Long-context Split-KV uses
+        existing TRT-LLM backend contract. Here ``max_seq_len`` is the maximum
+        compact rank-local stored length; it may be zero for an entirely empty
+        rank, while ``block_tables`` still supplies one masked physical page
+        slot. Long-context Split-KV uses
         ``workspace_buffer`` for partials and requires a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
         completion tickets after every launch. Prewarm a fixed tensor/layout
