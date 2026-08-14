@@ -308,6 +308,8 @@ jobs:
       - setup
       - test
     runs-on: ubuntu-latest
+    # Bounds the wait below on a run that never reports.
+    timeout-minutes: 100
     steps:
       - name: Check Authorization
         if: needs.gate.outputs.authorized != 'true'
@@ -371,8 +373,51 @@ jobs:
             exit 0
           fi
 
+          # Same reason, for tests that are still running: this job reports the
+          # required check, so failing while another run is testing this very
+          # commit turns the check red underneath live GPU jobs, which reads as
+          # CI having stopped. Report what that run reports instead. Only older
+          # runs are followed, so two label events cannot wait on each other.
+          ACTIVE=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --commit "$HEAD_SHA" \
+            --limit 50 \
+            --json databaseId,status \
+            --jq '[.[] | select(.databaseId < (env.GITHUB_RUN_ID | tonumber))
+                       | select(.status == "in_progress" or .status == "queued")]
+                  | min_by(.databaseId) | .databaseId // empty' 2>/dev/null) || ACTIVE=""
+
+          if [ -n "$ACTIVE" ]; then
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/$ACTIVE"
+            echo "Tests for this commit are running in [run $ACTIVE]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+            echo "::notice::Following run $ACTIVE, which is already testing this commit"
+
+            CONCLUSION=""
+            DEADLINE=$((SECONDS + 5400))
+            while [ "$SECONDS" -lt "$DEADLINE" ]; do
+              # A transient API error retries rather than ending the wait, which
+              # would report a red result for a run that is still healthy.
+              INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
+                --json status,conclusion \
+                --jq '.status + "|" + (.conclusion // "")' 2>/dev/null) || INFO=""
+              if [ "${INFO%%|*}" == "completed" ]; then
+                CONCLUSION="${INFO##*|}"
+                break
+              fi
+              sleep 30
+            done
+
+            if [ "$CONCLUSION" == "success" ] || [ "$CONCLUSION" == "skipped" ]; then
+              echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            echo "Result: run $ACTIVE ended as '${CONCLUSION:-still running}'" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
           echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-          echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
+          echo "A contributor with permission to label the PR can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
           echo "This is also needed after pushing new commits, since CI no longer starts on its own." >> $GITHUB_STEP_SUMMARY
           echo "::warning::CI skipped — pending authorization"
           exit 1
