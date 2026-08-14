@@ -12,6 +12,11 @@ from flashinfer.dcp import (
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.jit.dcp import get_dcp_spec_uri
+from flashinfer.trace.templates.attention import (
+    trtllm_batch_decode_dcp_spec_split_kv_trace,
+    trtllm_batch_decode_dcp_spec_trace,
+    trtllm_batch_decode_trace_dispatch,
+)
 
 
 def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
@@ -71,3 +76,19 @@ def test_dcp_target_keeps_independent_architecture_baselines(
     monkeypatch.setattr(dcp, "get_compute_capability", lambda _device: capability)
     monkeypatch.setattr(dcp, "_is_cuda_version_at_least", lambda _version: True)
     assert dcp._select_target(None) == target
+
+
+def test_dcp_trace_dispatch_distinguishes_combined_and_split_kv() -> None:
+    marker = object()
+    assert (
+        trtllm_batch_decode_trace_dispatch(
+            causal_seqlens_kv_global=marker, kv_cache=marker
+        )
+        is trtllm_batch_decode_dcp_spec_trace
+    )
+    assert (
+        trtllm_batch_decode_trace_dispatch(
+            causal_seqlens_kv_global=marker, kv_cache=(marker, marker)
+        )
+        is trtllm_batch_decode_dcp_spec_split_kv_trace
+    )

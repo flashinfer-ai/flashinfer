@@ -2634,6 +2634,133 @@ trtllm_batch_decode_trace.axes["max_pages_per_seq"] = Var(
 )
 
 
+_TRTLLM_DCP_INPUTS = {
+    **trtllm_batch_decode_trace.inputs,
+    "causal_seqlens_kv_global": Tensor(
+        ["batch_size"],
+        dtype="int32",
+        description=(
+            "Committed global-prefix length before speculative row zero for "
+            "each request."
+        ),
+    ),
+    "cp_world": Scalar("int32", description="Decode-context-parallel world size."),
+    "cp_rank": Scalar("int32", description="Round-robin DCP rank."),
+    "q_len_per_req": Scalar(
+        "int32", description="Uniform speculative query length per request."
+    ),
+}
+
+
+trtllm_batch_decode_dcp_spec_trace = TraceTemplate(
+    op_type="trtllm_paged_dcp_spec",
+    name_prefix="trtllm_batch_decode_dcp_spec",
+    description=(
+        "SM100/SM103 BF16 paged GQA decode with round-robin DCP ownership "
+        "and a row-dependent global causal bound for speculative queries. "
+        "This form describes a combined K/V cache tensor. The operation "
+        "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
+    ),
+    axes=dict(trtllm_batch_decode_trace.axes),
+    inputs=_TRTLLM_DCP_INPUTS,
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+        "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
+    },
+    constraints=[
+        "q_len_per_req in [1, 2, 4, 5, 6, 8]",
+        "cp_world in [1, 2, 4, 8]",
+        "0 <= cp_rank < cp_world",
+        "head_dim == 128",
+        "page_size == 16",
+    ],
+    tags=["status:verified", "stage:decode", "backend:dcp-spec"],
+)
+
+
+trtllm_batch_decode_dcp_spec_split_kv_trace = TraceTemplate(
+    op_type="trtllm_paged_dcp_spec",
+    name_prefix="trtllm_batch_decode_dcp_spec_split_kv",
+    description=(
+        "SM100/SM103 BF16 paged GQA decode with round-robin DCP ownership "
+        "and a row-dependent global causal bound for speculative queries. "
+        "This form describes the public (K, V) cache tuple. The operation "
+        "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
+    ),
+    axes={
+        "num_tokens": Var(description="Total query tokens across the batch."),
+        "num_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "page_size": Const(abbrev="ps"),
+        "num_pages": Var(),
+        "batch_size": Var(),
+        "max_pages_per_seq": Var(
+            description="Maximum number of pages per sequence (block_tables width)."
+        ),
+    },
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "k_cache": Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="kv_cache",
+            tuple_idx=0,
+            description="Compact rank-local paged key cache in HND layout.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="kv_cache",
+            tuple_idx=1,
+            description="Compact rank-local paged value cache in HND layout.",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Rank-local compact page table.",
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Stored rank-local KV lengths.",
+        ),
+        "max_seq_len": Scalar(
+            "int32", description="Maximum stored rank-local KV length."
+        ),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32", optional=True, description="Must be 1.0 for this path."
+        ),
+        "causal_seqlens_kv_global": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description=(
+                "Committed global-prefix length before speculative row zero "
+                "for each request."
+            ),
+        ),
+        "cp_world": Scalar("int32", description="Decode-context-parallel world size."),
+        "cp_rank": Scalar("int32", description="Round-robin DCP rank."),
+        "q_len_per_req": Scalar(
+            "int32", description="Uniform speculative query length per request."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+        "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
+    },
+    constraints=[
+        "q_len_per_req in [1, 2, 4, 5, 6, 8]",
+        "cp_world in [1, 2, 4, 8]",
+        "0 <= cp_rank < cp_world",
+        "head_dim == 128",
+        "page_size == 16",
+    ],
+    tags=["status:verified", "stage:decode", "backend:dcp-spec"],
+)
+
+
 @torch.no_grad()
 def _trtllm_batch_decode_block_sparse_reference(
     query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len, **kwargs
@@ -2808,12 +2935,16 @@ trtllm_batch_decode_block_sparse_trace = TraceTemplate(
 
 
 def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
-    """Select the dense or block-sparse decode template at call time.
+    """Select the dense, block-sparse, or DCP decode template at call time.
 
     Pass as ``trace=trtllm_batch_decode_trace_dispatch`` to ``@flashinfer_api``
-    so block-sparse calls (per-KV-head ``block_tables``/``seq_lens`` shapes)
-    are dumped with the matching schema instead of corrupting the dense one.
+    so calls are dumped with the schema matching their cache and causal
+    metadata instead of corrupting the conventional dense definition.
     """
+    if kwargs.get("causal_seqlens_kv_global") is not None:
+        if isinstance(kwargs.get("kv_cache"), (tuple, list)):
+            return trtllm_batch_decode_dcp_spec_split_kv_trace
+        return trtllm_batch_decode_dcp_spec_trace
     if kwargs.get("enable_block_sparse_attention"):
         return trtllm_batch_decode_block_sparse_trace
     return trtllm_batch_decode_trace
@@ -2824,6 +2955,8 @@ def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
 trtllm_batch_decode_trace_dispatch.templates = [  # type: ignore[attr-defined]
     trtllm_batch_decode_trace,
     trtllm_batch_decode_block_sparse_trace,
+    trtllm_batch_decode_dcp_spec_trace,
+    trtllm_batch_decode_dcp_spec_split_kv_trace,
 ]
 
 trtllm_batch_context_trace = TraceTemplate(
