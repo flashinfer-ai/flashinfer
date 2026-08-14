@@ -75,7 +75,10 @@ from flashinfer.fused_moe.api import (
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
-from flashinfer.fused_moe.prepare import prepare_trtllm_fp4_weights
+from flashinfer.fused_moe.prepare import (
+    prepare_trtllm_fp4_activations,
+    prepare_trtllm_fp4_weights,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -2520,6 +2523,14 @@ class TestPrepareTrtllmFp4Helpers:
                 intermediate_size=self._I,
             )
 
+    def test_prepare_activations_rejects_unsupported_variant(self):
+        x = torch.randn(8, self._H, dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match=r"got .*BF16"):
+            prepare_trtllm_fp4_activations(
+                x,
+                variant=QuantVariant.BF16,
+            )
+
     @sm100_required
     def test_prepare_activations_nvfp4(self):
         device = torch.device("cuda")
@@ -2529,7 +2540,9 @@ class TestPrepareTrtllmFp4Helpers:
         assert q.shape == (8, self._H // 2)
         assert sf is not None
         assert tuple(sf.shape) == (8, self._H // 16)
-        assert sf.dtype in (torch.uint8, torch.float8_e4m3fn)
+        assert sf.dtype == torch.float8_e4m3fn
+        assert torch.isfinite(sf.float()).all()
+        assert (sf.float() != 0).all()
 
 
 # ---------------------------------------------------------------------------
