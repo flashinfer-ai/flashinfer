@@ -14,11 +14,11 @@
   },
   "format_version": 1,
   "minimum_arch": "sm_100a",
-  "name": "trtllm_fmha_dcp_spec_bf16",
+  "name": "cake_fmha_dcp_spec_bf16",
   "routes": {
     "v1": {
-      "binding": "trtllm_fmha_dcp_spec_bf16_v1_binding.cu",
-      "body": "trtllm_fmha_dcp_spec_bf16_v1.cu",
+      "binding": "cake_fmha_dcp_spec_bf16_v1_binding.cu",
+      "body": "cake_fmha_dcp_spec_bf16_v1.cu",
       "macros": [
         "BATCH_SIZE",
         "NUM_Q_HEADS",
@@ -29,8 +29,8 @@
       ]
     },
     "v4": {
-      "binding": "trtllm_fmha_dcp_spec_bf16_v4_binding.cu",
-      "body": "trtllm_fmha_dcp_spec_bf16_v4.cu",
+      "binding": "cake_fmha_dcp_spec_bf16_v4_binding.cu",
+      "body": "cake_fmha_dcp_spec_bf16_v4.cu",
       "macros": [
         "BATCH_SIZE",
         "NUM_Q_HEADS",

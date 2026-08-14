@@ -3297,7 +3297,7 @@ def trtllm_batch_decode_with_kv_cache(
         ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
         enables DCP + speculative decoding without a per-row length tensor.
 
-        The current native path requires BF16 Q/K/V/O, HND page size 16,
+        The current native Cake FMHA path requires BF16 Q/K/V/O, HND page size 16,
         head dimension 128, uniform ``q_len_per_req`` in ``{1,2,4,5,6,8}``,
         causal attention, ``return_lse=True`` (or a caller-owned ``lse``), and
         head group ratio in ``[1,8]``. Its LSE is FP32 base-2, matching the

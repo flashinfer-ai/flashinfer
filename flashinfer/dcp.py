@@ -1,4 +1,5 @@
-"""
+"""Cake FMHA routing and validation for DCP speculative decode.
+
 Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -246,7 +247,7 @@ def run_dcp_spec_decode(
     lse: torch.Tensor,
     completion_buffer: Optional[torch.Tensor],
 ) -> None:
-    """Run one rank-local DCP speculative FMHA specialization."""
+    """Run one rank-local Cake FMHA DCP speculative specialization."""
 
     if q_len_per_req <= 0 or query.shape[0] % q_len_per_req != 0:
         raise ValueError("query token count must be divisible by q_len_per_req")

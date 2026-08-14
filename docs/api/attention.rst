@@ -96,7 +96,7 @@ Batch Decoding
 DCP Speculative Decode Workspace
 --------------------------------
 
-The native DCP speculative route of
+The native Cake FMHA DCP speculative route of
 :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
 scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
 

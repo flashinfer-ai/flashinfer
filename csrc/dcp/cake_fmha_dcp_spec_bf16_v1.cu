@@ -368,7 +368,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512) void kernel_trtllm_fmha_dcp_spec_bf16(
+__global__ __launch_bounds__(512) void kernel_cake_fmha_dcp_spec_bf16(
     LoomTensorMap const* Qt, LoomTensorMap const* K, LoomTensorMap const* V,
     __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table,
     int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len,

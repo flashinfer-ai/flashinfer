@@ -116,7 +116,7 @@ def get_dcp_spec_uri(
     )
     route_name = "retain" if variant == "v1" else "split"
     return (
-        f"trtllm_fmha_dcp_spec_bf16_{variant}_{target}"
+        f"cake_fmha_dcp_spec_bf16_{variant}_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_cp{cp_world}_{route_name}{route_param}"
     )
@@ -146,8 +146,8 @@ def gen_dcp_spec_module(
         route_param,
     )
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / f"trtllm_fmha_dcp_spec_bf16_{variant}.cu"
-    binding = csrc_dir / f"trtllm_fmha_dcp_spec_bf16_{variant}_binding.cu"
+    body = csrc_dir / f"cake_fmha_dcp_spec_bf16_{variant}.cu"
+    binding = csrc_dir / f"cake_fmha_dcp_spec_bf16_{variant}_binding.cu"
     for source in (body, binding):
         if not source.exists():
             raise FileNotFoundError(f"DCP speculative FMHA source not found: {source}")

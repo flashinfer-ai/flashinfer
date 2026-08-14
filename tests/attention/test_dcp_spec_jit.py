@@ -23,12 +23,12 @@ from flashinfer.trace.templates.attention import (
 
 
 def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
-    assert get_dcp_spec_uri("v1", "sm100f", 64, 5, 32, 4, 8, 1).endswith(
-        "_b64_q5_hq32_hkv4_cp8_retain1"
-    )
-    assert get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16).endswith(
-        "_b1_q8_hq64_hkv8_cp4_split16"
-    )
+    v1_uri = get_dcp_spec_uri("v1", "sm100f", 64, 5, 32, 4, 8, 1)
+    assert v1_uri.startswith("cake_fmha_dcp_spec_bf16_v1_")
+    assert v1_uri.endswith("_b64_q5_hq32_hkv4_cp8_retain1")
+    v4_uri = get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16)
+    assert v4_uri.startswith("cake_fmha_dcp_spec_bf16_v4_")
+    assert v4_uri.endswith("_b1_q8_hq64_hkv8_cp4_split16")
 
 
 @pytest.mark.parametrize(
