@@ -7,6 +7,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 from dataclasses import dataclass
+from functools import cached_property
 from math import prod
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
@@ -309,10 +310,12 @@ class Contract:
     mapping: MappingSpec
 
     def __post_init__(self) -> None:
-        # Validate eagerly so malformed contracts fail at construction time.
-        self.mapping.normalize(domain=self.domain, codomain=self.codomain)
+        # Touching ``table`` validates eagerly (malformed contracts fail at
+        # construction time) and caches the normalized table so repeated
+        # property accesses don't re-run ``normalize``.
+        self.table
 
-    @property
+    @cached_property
     def table(self) -> tuple[int, ...]:
         return self.mapping.normalize(domain=self.domain, codomain=self.codomain)
 

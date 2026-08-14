@@ -32,8 +32,17 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from typing_extensions import deprecated
 
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
+
+# ---------------------------------------------------------------------------
+# Kernel ceilings
+# ---------------------------------------------------------------------------
+# Mirrored from MaxSupportedTopExperts and NumNemotronExperts in the
+# trtllm-gen DeepSeek router. These limits apply after adding shared experts.
+MAX_SUPPORTED_TOP_EXPERTS = 32
+MAX_SUPPORTED_TOTAL_EXPERTS = 512
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -175,11 +184,24 @@ class ExpertConfig:
         Start index for expert-parallel sharding.
     local_num_experts : int or None
         Number of experts on this rank.  ``None`` → ``num_experts`` at runtime.
+    num_fused_shared_experts : int
+        Number of shared experts run for every token. Their rows follow the
+        routed experts, so weights have ``E + S`` rows while routing fields
+        remain routed-only. Cross-field constraints are checked by
+        :class:`MoEConfig`.
     """
 
     intermediate_size: int
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
+    num_fused_shared_experts: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_fused_shared_experts < 0:
+            raise ValueError(
+                "num_fused_shared_experts must be >= 0, got "
+                f"{self.num_fused_shared_experts}."
+            )
 
     def __repr__(self) -> str:
         parts = [f"intermediate_size={self.intermediate_size!r}"]
@@ -187,6 +209,8 @@ class ExpertConfig:
             parts.append(f"local_expert_offset={self.local_expert_offset!r}")
         if self.local_num_experts is not None:
             parts.append(f"local_num_experts={self.local_num_experts!r}")
+        if self.num_fused_shared_experts != 0:
+            parts.append(f"num_fused_shared_experts={self.num_fused_shared_experts!r}")
         return f"ExpertConfig({', '.join(parts)})"
 
 
@@ -202,11 +226,14 @@ class ExecutionConfig:
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
     """
 
     do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
+    use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
@@ -216,6 +243,8 @@ class ExecutionConfig:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -233,6 +262,13 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # The FP8 kernels are validated on the SM100 family only — the outer JIT module
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
+
+# Dense BF16 follows the architecture dispatch already exposed by the flat
+# CUTLASS API.
+_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+
+# W4A16 uses Hopper-specific mixed-input weight and scale layouts.
+_CUTLASS_W4A16_ARCHS = (90,)
 
 
 @dataclass(frozen=True)
@@ -267,6 +303,11 @@ class TrtllmFp4Config:
         ``variant`` selects NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``
         (MXFP4 weights x BF16 activations).
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+
+        .. warning::
+           ``num_local_experts`` is the physical row count: ``E_local + S``
+           when fused shared experts are present. :class:`ExpertConfig` keeps
+           ``local_num_experts`` as the routed-only count ``E_local``.
         """
         from .prepare import prepare_trtllm_fp4_weights
 
@@ -328,6 +369,12 @@ class TrtllmFp8BlockConfig:
         prepared by separate paths. The shuffled MXFP8 view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
+
+        .. warning::
+           ``num_local_experts`` here is the **physical row count** of
+           ``w1_bf16`` / ``w2_bf16``: ``E_local + S`` with shared experts.
+           :attr:`ExpertConfig.local_num_experts` remains routed-only
+           (``E_local``).
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
@@ -478,16 +525,118 @@ class TrtllmMxInt4Config:
         return "TrtllmMxInt4Config()"
 
 
+@deprecated(
+    "CutlassConfig is deprecated and non-runnable; use CutlassBf16Config or "
+    "CutlassW4A16Config instead."
+)
 @dataclass(frozen=True)
 class CutlassConfig:
-    """CUTLASS backend — broadest architecture support."""
+    """Legacy quantization-neutral CUTLASS configuration placeholder.
+
+    .. deprecated::
+        Use :class:`CutlassBf16Config` or :class:`CutlassW4A16Config` instead.
+
+    This type is preserved for source compatibility, but it is intentionally
+    not registered with :class:`MoELayer` and therefore is not runnable. Select
+    a concrete tensor contract such as :class:`CutlassBf16Config` or
+    :class:`CutlassW4A16Config` instead.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        # Compatibility-only placeholder: it has no registered runner and must
+        # never be surfaced as a dispatch candidate by BackendOptions.valid_for().
+        return False
 
     def __repr__(self) -> str:
         return "CutlassConfig()"
+
+
+@dataclass(frozen=True)
+class CutlassBf16Config:
+    """CUTLASS BF16 backend for the unified MoE API.
+
+    Architecture coverage follows the dense-BF16 legacy flat API. The unified
+    GPU tests currently exercise SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``cutlass_bf16`` canonical BF16 weight view.
+
+        GEMM1 uses the public ``[up, gate]`` row convention.  Unlike TRTLLM's
+        BlockMajorK path, CUTLASS BF16 kernels consume these weights directly
+        and need no physical reordering.
+        """
+        from .prepare import prepare_cutlass_bf16_weights
+
+        return prepare_cutlass_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CutlassW4A16Config:
+    """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported. Both ``hidden_size`` and ``intermediate_size`` must be divisible
+    by 128.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_W4A16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Quantize and interleave canonical BF16 weights for SM90 W4A16."""
+        from .prepare import prepare_cutlass_w4a16_weights
+
+        return prepare_cutlass_w4a16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassW4A16Config()"
 
 
 @dataclass(frozen=True)
@@ -624,6 +773,8 @@ BackendConfigType = Union[
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassConfig,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -636,6 +787,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassConfig,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -690,7 +843,8 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmFp8PerTensorConfig(),
         TrtllmBf16Config(),
         TrtllmMxInt4Config(),
-        CutlassConfig(),
+        CutlassBf16Config(),
+        CutlassW4A16Config(),
         CuteDslConfig(),
     )
 )
@@ -722,6 +876,59 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+
+    def __post_init__(self) -> None:
+        # Not in check_support(): MoELayer swallows its exceptions to filter
+        # backends, so errors raised there surface as "no backend available".
+        self._validate_fused_shared_experts()
+
+    def _validate_fused_shared_experts(self) -> None:
+        s = self.experts.num_fused_shared_experts
+        if s == 0:
+            return
+
+        # Only DeepSeekV3 routing emits shared-expert slots.
+        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+            raise ValueError(
+                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                f"method={self.routing.method!r}."
+            )
+
+        # Kernel limits apply to the fused totals.
+        total_top_k = self.routing.top_k + s
+        if total_top_k > MAX_SUPPORTED_TOP_EXPERTS:
+            raise ValueError(
+                f"top_k + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOP_EXPERTS}, got {self.routing.top_k} + {s} = "
+                f"{total_top_k}."
+            )
+        total_experts = self.routing.num_experts + s
+        if total_experts > MAX_SUPPORTED_TOTAL_EXPERTS:
+            raise ValueError(
+                f"num_experts + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOTAL_EXPERTS}, got {self.routing.num_experts} "
+                f"+ {s} = {total_experts}."
+            )
+
+        # The kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), so all routed experts must be local.
+        local_num_experts = (
+            self.experts.local_num_experts
+            if self.experts.local_num_experts is not None
+            else self.routing.num_experts
+        )
+        if self.experts.local_expert_offset != 0 or (
+            local_num_experts != self.routing.num_experts
+        ):
+            raise ValueError(
+                "num_fused_shared_experts > 0 does not support expert "
+                "parallelism: require local_expert_offset == 0 and "
+                "local_num_experts == num_experts. Got "
+                f"num_fused_shared_experts={s}, "
+                f"local_expert_offset={self.experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts}, "
+                f"num_experts={self.routing.num_experts}."
+            )
 
     # --- Dict-unpacking protocol: enables ``**config`` at call sites ---
 
@@ -792,10 +999,10 @@ class MoEActivationPack:
       selection on the host and passes ``topk_ids`` + ``topk_weights``.
       The TRTLLM runners normally combine both fields into one packed ``int32``
       tensor before launch.
-    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
-      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
-      BF16 or FP32 weights directly, avoiding packed-id construction. The
-      launcher consumes the weights in their native dtype.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
+      by the TRTLLM runners. The caller supplies ``int32`` ids and BF16 or FP32
+      weights directly, avoiding packed-id construction. The launcher consumes
+      the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -807,8 +1014,8 @@ class MoEActivationPack:
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
-    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
-    are keyword-only.
+    positional construction of pre-routed packs is unchanged. Additional activation metadata
+    and the in-kernel routing fields are keyword-only.
     """
 
     # Backend-native activation payload; layouts documented above.
@@ -818,8 +1025,10 @@ class MoEActivationPack:
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
-    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    # float32 for TRTLLM UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
+    # Per-token NVFP4 row scale, shape [M].
+    per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -922,6 +1131,7 @@ class MoEActivationPack:
             "hidden_states_scale",
             "topk_ids",
             "topk_weights",
+            "per_token_scale",
             "routing_logits",
             "routing_bias",
         ):
