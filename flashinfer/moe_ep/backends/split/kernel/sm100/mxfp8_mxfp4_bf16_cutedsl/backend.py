@@ -29,6 +29,36 @@ if TYPE_CHECKING:
 
 from ......core.kernel.registry import register_split_kernel
 
+# Per-token row widths (bf16 elements) the nccl_ep LL dispatch device kernel
+# accepts; anything else hits 'Unsupported hidden' (low_latency.cu). Probed
+# empirically on nccl4py 0.3.1 (jobs 2390737/2390761): 3072 is REJECTED even
+# though nixl_ep supports it, and sub-2048 widths are all rejected. The kernel
+# also rejects 1-byte payload dtypes outright, hence the bf16 view below.
+_NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def packed_dispatch_width(hidden: int) -> int:
+    """Smallest transport-supported bf16 send width holding the packed row.
+
+    The packed row is ``hidden`` fp8 payload bytes + ``hidden/32`` UE8M0
+    scale bytes, viewed as bf16 (so ``hidden`` must be divisible by 64 for an
+    exact element count) and zero-padded up to a supported width.
+    """
+    if hidden % 64:
+        raise ValueError(
+            f"mxfp8_dispatch requires hidden % 64 == 0 for an exact bf16 "
+            f"packed-row width, got {hidden}"
+        )
+    need = (hidden + hidden // 32) // 2
+    for width in _NCCL_EP_LL_BF16_WIDTHS:
+        if width >= need:
+            return width
+    raise ValueError(
+        f"packed MXFP8 row for hidden={hidden} needs {need} bf16 elements, "
+        f"above the largest transport-supported width "
+        f"{_NCCL_EP_LL_BF16_WIDTHS[-1]}"
+    )
+
 
 @register_split_kernel("sm100_mxfp8_mxfp4_bf16_cutedsl")
 class Mxfp8Mxfp4CutedslSplitKernelBackend(SplitKernelBackend):
@@ -122,6 +152,70 @@ class Mxfp8Mxfp4CutedslSplitKernelBackend(SplitKernelBackend):
             self._wrappers[top_k] = wrapper
         return wrapper
 
+    def pack_dispatch_payload(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Quantize tokens pre-dispatch when ``mxfp8_dispatch`` is enabled.
+
+        Packs the ``[M, H]`` fp8 payload and the ``[M, H/32]`` linear UE8M0
+        scale bytes into one row per token, zero-padded to the nearest
+        transport-supported width and viewed as bf16 (the LL dispatch kernel
+        rejects 1-byte payload dtypes and off-whitelist widths). Wire bytes
+        vs plain BF16: 0.57x at H=7168, 0.625x at H=4096/8192; no saving at
+        H<=2048 (the whitelist floor). Per-token rows quantize identically
+        before or after dispatch, so results match the default path bit for
+        bit.
+        """
+        if not self._kernel_config.mxfp8_dispatch:
+            return x
+        import torch
+
+        if x.dim() != 2 or x.dtype != torch.bfloat16:
+            raise ValueError(
+                "mxfp8_dispatch expects 2D BF16 [num_tokens, hidden] tokens, "
+                f"got {x.dtype} shape {tuple(x.shape)}"
+            )
+        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+        m, hidden = x.shape
+        send_width = packed_dispatch_width(hidden)
+        q, sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+        packed = torch.zeros(m, 2 * send_width, dtype=torch.uint8, device=x.device)
+        packed[:, :hidden] = q.view(torch.uint8)
+        packed[:, hidden : hidden + hidden // 32] = sf.view(torch.uint8).reshape(
+            m, hidden // 32
+        )
+        return packed.view(torch.bfloat16)
+
+    def _unpack_or_quantize(
+        self, flat: "torch.Tensor", hidden: int
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Return (fp8 values ``[M, H]``, uint8 scale bytes ``[M, H/32]``)."""
+        import torch
+
+        m = flat.shape[0]
+        if self._kernel_config.mxfp8_dispatch:
+            send_width = packed_dispatch_width(hidden)
+            if flat.dtype != torch.bfloat16 or flat.shape[1] != send_width:
+                raise ValueError(
+                    "mxfp8_dispatch compute expects packed bf16-viewed rows of "
+                    f"width {send_width} ({hidden} payload + {hidden // 32} "
+                    f"scale bytes, zero-padded), got {flat.dtype} width "
+                    f"{flat.shape[1]}"
+                )
+            packed_bytes = flat.contiguous().view(torch.uint8)
+            x_q = packed_bytes[:, :hidden].contiguous().view(torch.float8_e4m3fn)
+            x_sf = packed_bytes[:, hidden : hidden + hidden // 32].contiguous()
+            return x_q, x_sf
+        if flat.dtype != torch.bfloat16 or flat.shape[1] != hidden:
+            raise ValueError(
+                "sm100_mxfp8_mxfp4_bf16_cutedsl consumes BF16 dispatch tokens "
+                f"of width {hidden} (quantized locally to MXFP8), got "
+                f"{flat.dtype} width {flat.shape[1]}"
+            )
+        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+        x_q, x_sf = mxfp8_quantize(flat.contiguous(), is_sf_swizzled_layout=False)
+        return x_q, x_sf.view(torch.uint8).reshape(m, hidden // 32).contiguous()
+
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor":
         import torch
 
@@ -132,15 +226,11 @@ class Mxfp8Mxfp4CutedslSplitKernelBackend(SplitKernelBackend):
                 "compute expects a 3D dispatch tensor, got shape "
                 f"{tuple(expert_tensors.shape)}"
             )
-        if expert_tensors.dtype != torch.bfloat16:
-            raise ValueError(
-                "sm100_mxfp8_mxfp4_bf16_cutedsl consumes BF16 dispatch tokens "
-                f"(quantized locally to MXFP8), got {expert_tensors.dtype}"
-            )
         fleet_params = ctx.fleet_params
         offset = self._rank * tw.num_local_experts
-        dim0, dim1, hidden = expert_tensors.shape
-        flat = expert_tensors.reshape(dim0 * dim1, hidden)
+        hidden = tw.hidden_size
+        dim0, dim1, _row_width = expert_tensors.shape
+        flat = expert_tensors.reshape(dim0 * dim1, _row_width)
         m = flat.shape[0]
         device = flat.device
 
@@ -181,10 +271,7 @@ class Mxfp8Mxfp4CutedslSplitKernelBackend(SplitKernelBackend):
             final_scales = torch.ones(m, 1, dtype=torch.float32, device=device)
             top_k = 1
 
-        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
-
-        x_q, x_sf = mxfp8_quantize(flat.contiguous(), is_sf_swizzled_layout=False)
-        x_sf = x_sf.view(torch.uint8).reshape(m, hidden // 32).contiguous()
+        x_q, x_sf = self._unpack_or_quantize(flat, hidden)
 
         wrapper = self._ensure_wrapper(top_k, fleet_params.num_experts)
         out = wrapper.run(

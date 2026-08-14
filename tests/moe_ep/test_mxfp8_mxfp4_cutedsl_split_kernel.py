@@ -205,6 +205,79 @@ def test_expert_major_matches_direct_kernel():
     )
 
 
+def test_pack_dispatch_payload_default_is_identity():
+    import torch
+
+    from flashinfer.moe_ep.backends.split.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
+        Mxfp8Mxfp4CutedslSplitKernelBackend,
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig,
+    )
+
+    kernel = Mxfp8Mxfp4CutedslSplitKernelBackend(
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig()
+    )
+    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    assert kernel.pack_dispatch_payload(x) is x
+
+
+def test_mxfp8_dispatch_packed_compute_matches_bf16_path():
+    """mxfp8_dispatch=True: pack → unpack compute is bit-identical to the
+    default post-dispatch quantization (same rows → same MXFP8 codes)."""
+    _require_gpu_backend()
+
+    import torch
+
+    from flashinfer.moe_ep import EpLayout, SplitKernelContext
+    from flashinfer.moe_ep.backends.split.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
+        Mxfp8Mxfp4CutedslSplitKernelBackend,
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig,
+    )
+
+    kernel_bf16, tw, fleet_params, _, _ = _make_backend_and_weights(
+        layout=EpLayout.EXPERT_MAJOR
+    )
+    kernel_packed = Mxfp8Mxfp4CutedslSplitKernelBackend(
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig(mxfp8_dispatch=True)
+    )
+    kernel_packed._rank = kernel_bf16._rank
+    kernel_packed._transformed_weights = tw
+
+    g = torch.Generator(device="cuda").manual_seed(23)
+    expert_tensors = (
+        torch.randn(NUM_EXPERTS, CAP, HIDDEN, device="cuda", generator=g) * 0.5
+    ).to(torch.bfloat16)
+    m = NUM_EXPERTS * CAP
+
+    from flashinfer.moe_ep.backends.split.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        packed_dispatch_width,
+    )
+
+    send_width = packed_dispatch_width(HIDDEN)
+    packed = kernel_packed.pack_dispatch_payload(
+        expert_tensors.reshape(m, HIDDEN).contiguous()
+    )
+    assert packed.dtype == torch.bfloat16
+    assert packed.shape == (m, send_width)
+
+    out_bf16 = kernel_bf16.compute(
+        SplitKernelContext(
+            expert_tensors=expert_tensors,
+            num_tokens=m,
+            fleet_params=fleet_params,
+        )
+    )
+    out_packed = kernel_packed.compute(
+        SplitKernelContext(
+            expert_tensors=packed.view(NUM_EXPERTS, CAP, send_width),
+            num_tokens=m,
+            fleet_params=fleet_params,
+        )
+    )
+    torch.cuda.synchronize()
+    assert out_packed.shape == (NUM_EXPERTS, CAP, HIDDEN)
+    assert torch.equal(out_packed, out_bf16)
+
+
 def _e8m0_to_float(sf_uint8):
     """Decode UE8M0 scale bytes; code 0 decodes to 0 (matches kernel tests)."""
     import torch
