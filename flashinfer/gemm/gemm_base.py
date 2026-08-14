@@ -67,7 +67,6 @@ from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
     _score_sm100_mm_fp4_tactic,
-    _select_sm100_bmm_fp8_cute_dsl_tactic,
     _select_sm100_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_fp4_cute_dsl_tactic,
 )
@@ -1728,26 +1727,17 @@ def bf16_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-def _cute_dsl_fp8_gemm_runner(arch: Literal["sm100", "sm107"]):
-    """Create a TunableRunner for CuTe-DSL FP8 GEMM.
+def _cute_dsl_fp8_gemm_runner():
+    """Create a TunableRunner for CuTe-DSL FP8 GEMM on SM107 (Rubin).
 
-    This is the unified runner factory that supports both SM100 (Blackwell) and SM107 (Rubin).
-    Each tactic corresponds to an index into the architecture-specific AUTOTUNE_CONFIGS.
+    Each tactic corresponds to an index into SM107_AUTOTUNE_CONFIGS.
 
-    :param arch: Architecture identifier ("sm100" or "sm107")
-    :return: A TunableRunner instance for the specified architecture
+    :return: A TunableRunner instance
     """
-    # Import config functions based on architecture
-    if arch == "sm100":
-        from .kernels.bmm_fp8_wrapper import (
-            get_valid_sm100_configs as get_valid_configs,
-        )
-        from .kernels.bmm_fp8_wrapper import SM100_AUTOTUNE_CONFIGS as AUTOTUNE_CONFIGS
-    else:  # sm107
-        from .kernels.bmm_fp8_wrapper import (
-            get_valid_sm107_configs as get_valid_configs,
-        )
-        from .kernels.bmm_fp8_wrapper import SM107_AUTOTUNE_CONFIGS as AUTOTUNE_CONFIGS
+    from .kernels.bmm_fp8_wrapper import (
+        get_valid_sm107_configs as get_valid_configs,
+    )
+    from .kernels.bmm_fp8_wrapper import SM107_AUTOTUNE_CONFIGS as AUTOTUNE_CONFIGS
 
     class CuteDslFp8GemmRunner(TunableRunner):
         def get_valid_tactics(
@@ -1835,53 +1825,38 @@ def _cute_dsl_fp8_gemm_runner(arch: Literal["sm100", "sm107"]):
                     else:
                         b_major = "n" if b_strides[1] >= b_strides[2] else "k"
                     c_major = "n"
-                    if arch == "sm100":
-                        sm_count = get_device_sm_count(a.device)
-                        tactic = _select_sm100_bmm_fp8_cute_dsl_tactic(
-                            m,
-                            n,
-                            k,
-                            batch,
-                            ab_dtype,
-                            c_dtype,
-                            a_major,
-                            b_major,
-                            c_major,
-                            sm_count,
+                    # Never hardcode a config index here. SM107 config 0 is a
+                    # 2-CTA 256x256 tile ("best for large problems"); on a small
+                    # problem _can_implement_config_sm107 rejects it, and running
+                    # an invalid 2-CTA config is an illegal instruction (the
+                    # mma_tiler M>=256 constraint in bmm_fp8_wrapper). This is the
+                    # same reason get_valid_tactics returns [] rather than [0].
+                    valid_indices = get_valid_configs(
+                        m,
+                        n,
+                        k,
+                        batch,
+                        ab_dtype,
+                        c_dtype,
+                        a_major,
+                        b_major,
+                        c_major,
+                    )
+                    if not valid_indices:
+                        raise ValueError(
+                            "No valid cute-dsl SM107 bmm_fp8 config for problem "
+                            f"(batch={batch}, m={m}, n={n}, k={k}, "
+                            f"ab_dtype={ab_dtype}, c_dtype={c_dtype}). "
+                            "Run autotuning or select a different backend."
                         )
-                    else:
-                        # Never hardcode a config index here. SM107 config 0 is a
-                        # 2-CTA 256x256 tile ("best for large problems"); on a small
-                        # problem _can_implement_config_sm107 rejects it, and running
-                        # an invalid 2-CTA config is an illegal instruction (the
-                        # mma_tiler M>=256 constraint in bmm_fp8_wrapper). This is the
-                        # same reason get_valid_tactics returns [] rather than [0].
-                        valid_indices = get_valid_configs(
-                            m,
-                            n,
-                            k,
-                            batch,
-                            ab_dtype,
-                            c_dtype,
-                            a_major,
-                            b_major,
-                            c_major,
-                        )
-                        if not valid_indices:
-                            raise ValueError(
-                                "No valid cute-dsl SM107 bmm_fp8 config for problem "
-                                f"(batch={batch}, m={m}, n={n}, k={k}, "
-                                f"ab_dtype={ab_dtype}, c_dtype={c_dtype}). "
-                                "Run autotuning or select a different backend."
-                            )
-                        tactic = valid_indices[0]
+                    tactic = valid_indices[0]
 
             # CuTe-DSL kernel handles the computation with scale fused into epilogue.
             # The kernel natively supports Float16, BFloat16, and Float32 output.
             # Scale is applied in Float32 precision inside the kernel's epilogue
             # before the final dtype conversion.
             bmm_fp8_cute_dsl(
-                a, b, scale_a, scale_b, out.dtype, out, config_index=tactic, arch=arch
+                a, b, scale_a, scale_b, out.dtype, out, config_index=tactic
             )
             return out
 
@@ -1890,7 +1865,7 @@ def _cute_dsl_fp8_gemm_runner(arch: Literal["sm100", "sm107"]):
 
 def _cute_dsl_fp8_gemm_runner_sm107():
     """Create a TunableRunner for CuTe-DSL FP8 GEMM on SM107 (Rubin)."""
-    return _cute_dsl_fp8_gemm_runner("sm107")
+    return _cute_dsl_fp8_gemm_runner()
 
 
 def fp8_gemm_sm100(

@@ -40,9 +40,7 @@ if is_cute_dsl_available():
     from .bmm_fp8_wrapper import (
         bmm_fp8_cute_dsl,
         cute_bmm_fp8_can_implement,
-        SM100_AUTOTUNE_CONFIGS,
         SM107_AUTOTUNE_CONFIGS,
-        get_valid_sm100_configs,
         get_valid_sm107_configs,
     )
     from .bmm_fp8_blackwell import PersistentDenseGemmKernel
@@ -57,10 +55,8 @@ if is_cute_dsl_available():
         "bmm_fp8_cute_dsl",
         "cute_bmm_fp8_can_implement",
         # Autotune configuration spaces
-        "SM100_AUTOTUNE_CONFIGS",
         "SM107_AUTOTUNE_CONFIGS",
         # Configuration validation helpers
-        "get_valid_sm100_configs",
         "get_valid_sm107_configs",
         # Kernel classes
         "PersistentDenseGemmKernel",

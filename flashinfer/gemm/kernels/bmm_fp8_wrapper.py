@@ -8,10 +8,10 @@ FP8 Batched Matrix Multiplication (BMM) Wrapper for CuTe-DSL Kernels
 Location: flashinfer/gemm/kernels/bmm_fp8_wrapper.py
 
 This module provides the high-level wrapper for FP8 batched matrix multiplication
-using CuTe-DSL kernels, supporting both Blackwell (SM100) and Rubin (SM107) architectures.
+using CuTe-DSL kernels on Rubin (SM107).
 
 It handles:
-- Autotuning configuration spaces (SM100_AUTOTUNE_CONFIGS, SM107_AUTOTUNE_CONFIGS)
+- Autotuning configuration space (SM107_AUTOTUNE_CONFIGS)
 - Kernel compilation and caching with symbolic M, N, K dimensions
 - Configuration validation for different problem sizes
 - Entry points for both default and autotuned execution
@@ -28,10 +28,7 @@ import torch
 from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import torch_dtype_to_cutlass
 
-from .bmm_fp8_blackwell import (
-    PersistentDenseGemmKernel,
-    bmm,
-)
+from .bmm_fp8_blackwell import bmm
 
 
 # =============================================================================
@@ -54,32 +51,6 @@ from .bmm_fp8_blackwell import (
 # SM100 (Blackwell) Configuration Space
 # Format: (mma_tiler_mn, cluster_shape_mn, use_2cta_instrs, use_tma_store, swizzle_size, raster_along)
 # IMPORTANT: Index 0 is the fallback config - must be the most reliable/tested configuration
-SM100_AUTOTUNE_CONFIGS: Tuple[Tuple, ...] = (
-    # Format: (mma_tiler_mn, cluster_shape_mn, use_2cta_instrs, use_tma_store, swizzle_size, raster_along)
-    #
-    # Default/fallback config - this is the same as bmm_fp8_cute_dsl's hardcoded default
-    # Must be first (index 0) since tactic=-1 falls back to index 0
-    ((128, 128), (2, 1), True, True, 1, "m"),  # Index 0: DEFAULT FALLBACK
-    #
-    # === 2-CTA configurations with TMA store (best for large problems) ===
-    # Large tiles for high throughput
-    ((256, 256), (2, 1), True, True, 1, "m"),
-    ((256, 128), (2, 1), True, True, 1, "m"),
-    ((128, 256), (2, 1), True, True, 1, "m"),
-    # Larger cluster shapes for more parallelism
-    ((256, 128), (2, 2), True, True, 1, "m"),
-    ((128, 128), (2, 2), True, True, 1, "m"),
-    ((128, 128), (4, 1), True, True, 1, "m"),
-    # Raster along N variants (better for certain aspect ratios)
-    ((256, 128), (2, 1), True, True, 1, "n"),
-    ((128, 256), (2, 1), True, True, 1, "n"),
-    #
-    # === 1-CTA configurations with TMA store (better for smaller problems) ===
-    ((128, 128), (1, 1), False, True, 1, "m"),
-    ((128, 64), (1, 1), False, True, 1, "m"),
-    ((64, 128), (1, 1), False, True, 1, "m"),
-    ((64, 64), (1, 1), False, True, 1, "m"),
-)
 
 # SM107 (Rubin) Configuration Space
 # Format: (mma_tiler, mma_inst_shape, cluster_shape_mn, use_2cta_instrs, use_tma_store, swizzle_size, raster_along)
@@ -210,7 +181,7 @@ def _compile_and_create_tensor_api(
 ) -> Callable:
     """Compile a GEMM kernel and return a tensor API closure.
 
-    :param gemm_kernel: The GEMM kernel instance (PersistentDenseGemmKernel or SM107PersistentDenseGemmKernel)
+    :param gemm_kernel: The GEMM kernel instance (SM107PersistentDenseGemmKernel)
     :param a_fake, b_fake, c_fake, scale_fake, stream_fake: Fake tensors for compilation
     :param cluster_shape_mn: Cluster shape for computing max active clusters
     :return: A closure that accepts torch tensors directly via TVM-FFI
@@ -254,45 +225,6 @@ def _compile_and_create_tensor_api(
         )
 
     return tensor_api
-
-
-@functools.cache
-def _get_compiled_bmm_sm100(
-    ab_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    use_2cta_instrs: bool,
-    use_tma_store: bool,
-    swizzle_size: int,
-    raster_along: Literal["m", "n"],
-) -> Callable:
-    """Get compiled BMM kernel for SM100 using TVM-FFI.
-
-    Returns a closure that accepts torch tensors directly without
-    per-call tensor wrapping overhead.
-    """
-    a_fake, b_fake, c_fake, scale_fake, stream_fake = _create_fake_tensors(
-        ab_dtype, c_dtype, a_major, b_major, c_major
-    )
-
-    gemm = PersistentDenseGemmKernel(
-        acc_dtype,
-        use_2cta_instrs,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        use_tma_store,
-        swizzle_size,
-        raster_along,
-    )
-
-    return _compile_and_create_tensor_api(
-        gemm, a_fake, b_fake, c_fake, scale_fake, stream_fake, cluster_shape_mn
-    )
 
 
 @functools.cache
@@ -340,55 +272,6 @@ def _get_compiled_bmm_sm107(
 # =============================================================================
 # Compile and Run Functions (Simplified)
 # =============================================================================
-
-
-def _compile_and_run_bmm_sm100(
-    a_tensor: torch.Tensor,
-    b_tensor: torch.Tensor,
-    c_tensor: torch.Tensor,
-    ab_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    use_2cta_instrs: bool,
-    use_tma_store: bool,
-    swizzle_size: int,
-    raster_along: Literal["m", "n"],
-    output_scale_tensor: torch.Tensor,
-):
-    """Compile (if needed) and run the BMM kernel for SM100.
-
-    :param output_scale_tensor: 1-element Float32 tensor on GPU containing the scale.
-                                For FP8 GEMM, this is typically a_scale * b_scale.
-                                Using a tensor avoids host-device sync for CUDA graph compatibility.
-    """
-    batch, m, k = a_tensor.shape
-
-    # Get cached compiled kernel (M, N, K are symbolic - kernel handles any size at runtime)
-    # Only batch, dtypes, layouts, and config params are in the cache key
-    # Note: cutlass types are hashable but mypy doesn't recognize this
-    tensor_api = _get_compiled_bmm_sm100(
-        batch,
-        ab_dtype,  # type: ignore[arg-type]
-        c_dtype,  # type: ignore[arg-type]
-        acc_dtype,  # type: ignore[arg-type]
-        a_major,
-        b_major,
-        c_major,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        use_2cta_instrs,
-        use_tma_store,
-        swizzle_size,
-        raster_along,
-    )
-    # Run kernel - tensors passed directly via TVM-FFI
-    # Actual M, N, K dimensions are determined at runtime from tensor shapes
-    tensor_api(a_tensor, b_tensor, c_tensor, output_scale_tensor)
 
 
 def _compile_and_run_bmm_sm107(
@@ -471,81 +354,6 @@ def _detect_major_dim(tensor: torch.Tensor, dim_names: Tuple[str, str]) -> str:
 # =============================================================================
 # Configuration Validation for Autotuning
 # =============================================================================
-
-
-def _can_implement_config_sm100(
-    m: int,
-    n: int,
-    k: int,
-    batch: int,
-    config: Tuple,
-    ab_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-) -> bool:
-    """Check if an SM100 config can implement the given problem size.
-
-    :param m: M dimension
-    :param n: N dimension
-    :param k: K dimension
-    :param batch: Batch size
-    :param config: SM100 config tuple (mma_tiler_mn, cluster_shape_mn, use_2cta_instrs,
-                   use_tma_store, swizzle_size, raster_along)
-    :param ab_dtype: Input data type (cutlass.Numeric)
-    :param c_dtype: Output data type (cutlass.Numeric)
-    :param a_major: Major dimension of A ("m" or "k")
-    :param b_major: Major dimension of B ("k" or "n")
-    :param c_major: Major dimension of C ("m" or "n")
-    :return: True if config can implement, False otherwise
-    """
-    (
-        mma_tiler_mn,
-        cluster_shape_mn,
-        use_2cta_instrs,
-        use_tma_store,
-        swizzle_size,
-        raster_along,
-    ) = config
-
-    # Additional minimum size check: problem must be at least as large as CTA tile
-    # to avoid launching kernels with invalid grid dimensions
-    cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
-    cta_tile_n = mma_tiler_mn[1]
-
-    # Problem size must be able to fill at least one CTA tile
-    # This prevents "illegal instruction" errors from invalid kernel launches
-    if m < cta_tile_m or n < cta_tile_n:
-        return False
-
-    # For cluster shapes > 1, we need enough tiles to fill the cluster
-    min_tiles_m = cluster_shape_mn[0]
-    min_tiles_n = cluster_shape_mn[1]
-    if m < cta_tile_m * min_tiles_m or n < cta_tile_n * min_tiles_n:
-        return False
-
-    try:
-        gemm = PersistentDenseGemmKernel(
-            cutlass.Float32,  # acc_dtype
-            use_2cta_instrs,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            use_tma_store,
-            swizzle_size,
-            raster_along,
-        )
-        return gemm.can_implement(
-            (m, n, k, batch),
-            ab_dtype,
-            ab_dtype,  # b_dtype same as a_dtype for FP8
-            c_dtype,
-            a_major,
-            b_major,
-            c_major,
-        )
-    except Exception:
-        return False
 
 
 def _can_implement_config_sm107(
@@ -639,30 +447,6 @@ def _can_implement_config_sm107(
         return False
 
 
-def get_valid_sm100_configs(
-    m: int,
-    n: int,
-    k: int,
-    batch: int,
-    ab_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-) -> Tuple[int, ...]:
-    """Get indices of valid SM100 configs for the given problem.
-
-    :return: Tuple of valid config indices into SM100_AUTOTUNE_CONFIGS
-    """
-    valid_indices = []
-    for idx, config in enumerate(SM100_AUTOTUNE_CONFIGS):
-        if _can_implement_config_sm100(
-            m, n, k, batch, config, ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
-            valid_indices.append(idx)
-    return tuple(valid_indices)
-
-
 def get_valid_sm107_configs(
     m: int,
     n: int,
@@ -693,14 +477,6 @@ def get_valid_sm107_configs(
 
 
 # Default kernel configurations for each architecture
-_DEFAULT_SM100_CONFIG = (
-    (128, 128),
-    (2, 1),
-    True,
-    True,
-    1,
-    "m",
-)  # Same as SM100_AUTOTUNE_CONFIGS[0]
 _DEFAULT_SM107_CONFIG = (
     (256, 256, 128),
     (256, 256, 64),
@@ -720,7 +496,7 @@ def bmm_fp8_cute_dsl(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     config_index: Optional[int] = None,
-    arch: Optional[Literal["sm100", "sm107"]] = None,
+    arch: Optional[Literal["sm107"]] = None,
 ) -> torch.Tensor:
     """Batched matrix multiplication with FP8 inputs using CuTe-DSL backend.
 
@@ -734,8 +510,8 @@ def bmm_fp8_cute_dsl(
     :param dtype: Output data type (torch.bfloat16, torch.float16, or torch.float32)
     :param out: Optional pre-allocated output tensor. If None, a new tensor is allocated.
     :param config_index: Optional config index for autotuning. If None, uses default config.
-                         Index into SM100_AUTOTUNE_CONFIGS or SM107_AUTOTUNE_CONFIGS.
-    :param arch: Optional architecture override ("sm100" or "sm107"). If None, auto-detected
+                         Index into SM107_AUTOTUNE_CONFIGS.
+    :param arch: Optional architecture override ("sm107"). If None, auto-detected
                  from the device compute capability.
     :return: Output tensor C of shape (batch, m, n)
     """
@@ -762,11 +538,10 @@ def bmm_fp8_cute_dsl(
         major, minor = get_compute_capability(a.device)
         if major == 10 and minor == 7:
             arch = "sm107"
-        elif major >= 10:
-            arch = "sm100"
         else:
             raise ValueError(
-                f"CuTe-DSL FP8 BMM is only supported on SM100+ (Blackwell/Rubin), got SM{major}{minor}"
+                "CuTe-DSL FP8 BMM is only supported on SM107 (Rubin), got "
+                f"SM{major}{minor}"
             )
 
     # Map torch dtype to cutlass dtype
@@ -817,40 +592,6 @@ def bmm_fp8_cute_dsl(
             raster_along=raster_along,
             output_scale_tensor=combined_scale_tensor,
         )
-    else:
-        # SM100 (Blackwell) - default for sm100 and other SM10x variants
-        if config_index is not None:
-            config = SM100_AUTOTUNE_CONFIGS[config_index]
-        else:
-            config = _DEFAULT_SM100_CONFIG
-        (
-            mma_tiler_mn,
-            cluster_shape_mn,
-            use_2cta_instrs,
-            use_tma_store,
-            swizzle_size,
-            raster_along,
-        ) = config
-
-        _compile_and_run_bmm_sm100(
-            a_tensor=a,
-            b_tensor=b,
-            c_tensor=out,
-            ab_dtype=ab_dtype,
-            c_dtype=c_dtype,
-            acc_dtype=acc_dtype,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            use_2cta_instrs=use_2cta_instrs,
-            use_tma_store=use_tma_store,
-            swizzle_size=swizzle_size,
-            raster_along=raster_along,
-            output_scale_tensor=combined_scale_tensor,
-        )
-
     return out
 
 
@@ -908,9 +649,7 @@ __all__ = [
     "bmm_fp8_cute_dsl",
     "cute_bmm_fp8_can_implement",
     # Autotune configuration spaces
-    "SM100_AUTOTUNE_CONFIGS",
     "SM107_AUTOTUNE_CONFIGS",
     # Configuration validation helpers
-    "get_valid_sm100_configs",
     "get_valid_sm107_configs",
 ]
