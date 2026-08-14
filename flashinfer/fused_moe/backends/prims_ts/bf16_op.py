@@ -319,7 +319,70 @@ def prims_ts_bf16_moe(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """BF16 MoE using the Prims-TS batched GEMM backend on SM100."""
+    r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100.
+
+    Same arguments and return value as :func:`~flashinfer.fused_moe.trtllm_bf16_moe`.
+
+    Parameters
+    ----------
+    routing_logits : torch.Tensor
+        ``[seq_len, num_experts]`` routing logits.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    hidden_states : torch.Tensor
+        ``[seq_len, hidden_size]`` BF16 activations.
+    gemm1_weights : torch.Tensor
+        First-layer expert weights.
+    gemm2_weights : torch.Tensor
+        Second-layer expert weights.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups (DeepSeek-style routing).
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled MajorK layout (default ``True``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : bool
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+    output : Optional[torch.Tensor]
+        Optional in-place ``[seq_len, hidden_size]`` output.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as :func:`~flashinfer.fused_moe.trtllm_bf16_moe`.
+    """
 
     result = prims_ts_bf16_moe_op(
         routing_logits=routing_logits,
@@ -383,7 +446,71 @@ def prims_ts_bf16_routed_moe(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """BF16 Prims-TS MoE with precomputed packed or unpacked routing."""
+    r"""BF16 Prims-TS MoE with precomputed packed or unpacked routing.
+
+    Same arguments and return value as
+    :func:`~flashinfer.fused_moe.trtllm_bf16_routed_moe`.
+
+    Parameters
+    ----------
+    topk_ids : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Packed ``(expert_id, weight)`` tensor or unpacked
+        ``(topk_ids, topk_weights)`` pair.
+    hidden_states : torch.Tensor
+        ``[seq_len, hidden_size]`` BF16 activations.
+    gemm1_weights : torch.Tensor
+        First-layer expert weights.
+    gemm2_weights : torch.Tensor
+        Second-layer expert weights.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled MajorK layout (default ``True``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : bool
+        Enable Programmatic Dependent Launch when supported.
+    gemm1_lora_delta : Optional[torch.Tensor]
+        Optional MoE LoRA delta applied before the gated activation.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+    output : Optional[torch.Tensor]
+        Optional in-place ``[seq_len, hidden_size]`` output.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.trtllm_bf16_routed_moe`.
+    """
 
     if isinstance(topk_ids, tuple):
         topk_ids_tensor, expert_weights = topk_ids

@@ -4844,9 +4844,10 @@ def trtllm_fp8_block_scale_moe(
     gemm1_alpha: Optional[torch.Tensor] = None,
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
-    output: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 block-scaled MoE operation.
 
@@ -4966,18 +4967,19 @@ def trtllm_fp8_block_scale_moe(
         When provided, ``X1 = clamp(X1, -limit, limit)`` and
         ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
         is applied.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
+        Allocated internally when ``None`` (default).
     gemm1_bias : Optional[torch.Tensor]
-        Optional FC1 bias, float32.  Shape is
+        Optional FC1 bias, float32 (keyword-only).  Shape is
         ``[local_num_experts, 2 * intermediate_size]`` for gated activations
         and ``[local_num_experts, intermediate_size]`` for non-gated
         activations.  This tensor must be in the same row layout as
         ``gemm1_weights``.
     gemm2_bias : Optional[torch.Tensor]
-        Optional ``[local_num_experts, hidden_size]`` FC2 bias, float32.  This
-        tensor must be in the same row layout as ``gemm2_weights``.
-    output : Optional[torch.Tensor]
-        Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
-        Allocated internally when ``None`` (default).
+        Optional ``[local_num_experts, hidden_size]`` FC2 bias, float32
+        (keyword-only).  This tensor must be in the same row layout as
+        ``gemm2_weights``.
 
     Returns
     -------
@@ -5651,6 +5653,16 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
         set it is added to FC1 before the fused gated activation and the
         post-activation FC1 output is appended to the return list.
+    num_fused_shared_experts : Optional[int]
+        Number of shared experts to fuse into the MoE kernel (default
+        ``None`` / ``0``).  When ``> 0``, every per-expert tensor must have
+        ``num_experts + num_fused_shared_experts`` rows in the expert
+        dimension — the shared-expert weights are appended after the routed
+        ones.  Every token is unconditionally routed to the shared experts
+        with weight ``1.0``.  Expert parallelism is not yet supported
+        together with fused shared experts: require
+        ``local_expert_offset == 0`` and ``local_num_experts == num_experts``.
+        Only ``DeepSeekV3`` routing is supported when this is ``> 0``.
 
     Returns
     -------

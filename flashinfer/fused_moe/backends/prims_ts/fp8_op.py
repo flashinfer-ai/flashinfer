@@ -161,6 +161,76 @@ def prims_ts_fp8_per_tensor_scale_moe(
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
+    r"""FP8 per-tensor-scaled MoE using the Prims-TS backend on SM100.
+
+    Same arguments and return value as
+    :func:`~flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe`.
+
+    Parameters
+    ----------
+    routing_logits : torch.Tensor
+        ``[seq_len, num_experts]`` routing logits.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    hidden_states : torch.Tensor
+        ``float8_e4m3fn`` activations.
+    gemm1_weights : torch.Tensor
+        ``float8_e4m3fn`` FC1 weights.
+    output1_scales_scalar : torch.Tensor
+        Per-expert FC1 output scales.
+    output1_scales_gate_scalar : torch.Tensor
+        Per-expert FC1 gate scales.
+    gemm2_weights : torch.Tensor
+        ``float8_e4m3fn`` FC2 weights.
+    output2_scales_scalar : torch.Tensor
+        Per-expert FC2 output scales.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    use_routing_scales_on_input : bool
+        Apply routing scales on the input path when ``True``.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    fc1_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC1 weight scales.
+    fc2_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC2 weight scales.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe`.
+    """
     if hidden_states.dtype != torch.float8_e4m3fn:
         raise ValueError("Prims-TS FP8 per-tensor path requires float8_e4m3fn input")
     if gemm1_weights.dtype != torch.float8_e4m3fn:
@@ -427,9 +497,90 @@ def prims_ts_fp8_block_scale_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
+    r"""FP8 block-scaled MoE using the Prims-TS backend on SM100.
+
+    Same arguments and return value as
+    :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_moe`.
+
+    Parameters
+    ----------
+    routing_logits : torch.Tensor
+        ``[seq_len, num_experts]`` routing logits.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    hidden_states : torch.Tensor
+        Activations (BF16/FP16 or ``float8_e4m3fn`` depending on mode).
+    hidden_states_scale : torch.Tensor
+        Block scales for ``hidden_states``.
+    gemm1_weights : torch.Tensor
+        FC1 expert weights.
+    gemm1_weights_scale : torch.Tensor
+        FC1 block scales.
+    gemm2_weights : torch.Tensor
+        FC2 expert weights.
+    gemm2_weights_scale : torch.Tensor
+        FC2 block scales.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled layout (default ``False``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    fp8_quantization_type : Fp8QuantizationType
+        Block-scale recipe (DeepSeek FP8 or MXFP8).
+    num_fused_shared_experts : Optional[int]
+        Number of fused shared experts (default ``None`` / ``0``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    gemm1_bias : Optional[torch.Tensor]
+        Optional FC1 bias (keyword-only).
+    gemm2_bias : Optional[torch.Tensor]
+        Optional FC2 bias (keyword-only).
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_moe`.
+    """
     return _prims_ts_fp8_block_scale_moe_impl(
         routing_logits=routing_logits,
         topk_ids=None,
@@ -501,9 +652,88 @@ def prims_ts_fp8_block_scale_routed_moe(
     gemm1_alpha: Optional[torch.Tensor] = None,
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
+    r"""Pre-routed FP8 block-scaled MoE using the Prims-TS backend on SM100.
+
+    Same arguments and return value as
+    :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe`, plus
+    optional keyword-only FC1/FC2 bias tensors.
+
+    Parameters
+    ----------
+    topk_ids : torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
+        Packed ``(expert_id, weight)`` tensor or unpacked
+        ``(topk_ids, topk_weights)`` pair.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    hidden_states : torch.Tensor
+        Activations (BF16/FP16 or ``float8_e4m3fn`` depending on mode).
+    hidden_states_scale : torch.Tensor
+        Block scales for ``hidden_states``.
+    gemm1_weights : torch.Tensor
+        FC1 expert weights.
+    gemm1_weights_scale : torch.Tensor
+        FC1 block scales.
+    gemm2_weights : torch.Tensor
+        FC2 expert weights.
+    gemm2_weights_scale : torch.Tensor
+        FC2 block scales.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled layout (default ``False``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    gemm1_lora_delta : Optional[torch.Tensor]
+        Optional MoE LoRA delta applied before the gated activation.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    fp8_quantization_type : Fp8QuantizationType
+        Block-scale recipe (DeepSeek FP8 or MXFP8).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+    gemm1_bias : Optional[torch.Tensor]
+        Optional FC1 bias (keyword-only).
+    gemm2_bias : Optional[torch.Tensor]
+        Optional FC2 bias (keyword-only).
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe`.
+    """
     if isinstance(topk_ids, tuple):
         topk_ids_tensor, expert_weights = topk_ids
         routing_mode = RoutingInputMode.UnpackedPrecomputed
@@ -775,6 +1005,7 @@ def _fake_prims_ts_fp8_block_scale_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:

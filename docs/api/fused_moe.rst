@@ -86,6 +86,34 @@ TensorRT-LLM Fused MoE
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
+Prims-TS Fused MoE
+------------------
+
+Experimental Blackwell (SM100) Prims-TS backends.  Public entry points match
+the corresponding ``trtllm_*`` APIs.
+
+.. autosummary::
+    :toctree: ../generated
+
+    prims_ts_bf16_moe
+    prims_ts_bf16_routed_moe
+    prims_ts_fp4_block_scale_moe
+    prims_ts_fp4_block_scale_routed_moe
+    prims_ts_fp8_block_scale_moe
+    prims_ts_fp8_block_scale_routed_moe
+    prims_ts_fp8_per_tensor_scale_moe
+
+These symbols are defined in the backend modules and re-exported from
+:mod:`flashinfer.fused_moe`:
+
+* :func:`flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_routed_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_routed_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_routed_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe`
+
 CuteDSL Fused MoE
 -----------------
 
