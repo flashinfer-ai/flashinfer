@@ -215,10 +215,22 @@ struct CollectiveMainloopFwd {
     TMA_SFVt tma_load_sfvt = make_tma_copy<uint16_t>(
         GmemTiledCopySF{}, mSFVt, SmemLayoutSFVt{}(_, _, _0{}),
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), _1{});
-    return {args.shape_Q, layout_sfq,    args.shape_K, args.unpadded_shape_K,
-            layout_sfk,   args.shape_Vt, layout_sfvt,  layout_ds,
-            tma_load_Q,   tma_load_sfq,  tma_load_K,   tma_load_sfk,
-            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.group_size_fastdiv,
+    return {args.shape_Q,
+            layout_sfq,
+            args.shape_K,
+            args.unpadded_shape_K,
+            layout_sfk,
+            args.shape_Vt,
+            layout_sfvt,
+            layout_ds,
+            tma_load_Q,
+            tma_load_sfq,
+            tma_load_K,
+            tma_load_sfk,
+            tma_load_Vt,
+            tma_load_sfvt,
+            tma_load_ds,
+            args.group_size_fastdiv,
             args.softmax_scale_log2};
   }
 
@@ -826,10 +838,11 @@ struct CollectiveMainloopFwd {
     ++smem_pipe_read_k;
 
     int const first_n_block = n_block_count - 1;
-    // The quantized fixed-length binding pads K to N128 and exposes no
-    // separate unpadded length, so noncausal tiles are always fully valid.
-    // Compile the mask machinery out of that hot specialization entirely.
     if constexpr (Is_causal) {
+      apply_mask(tSrS, first_n_block);
+    } else if (unpadded_seqlen_k < seqlen_k) {
+      // Only the prologue owns the highest (possibly partial) K tile. All
+      // tiles rebuilt in the steady-state loop below are fully valid.
       apply_mask(tSrS, first_n_block);
     }
     softmax_fused.template prepare_online_softmax_n128<true, Is_causal>(

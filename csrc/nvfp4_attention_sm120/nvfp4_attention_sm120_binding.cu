@@ -81,7 +81,7 @@ int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
 void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, TensorView v,
                       TensorView q_scale, TensorView k_scale, TensorView v_scale,
                       TensorView qk_correction, TensorView out, ffi::Optional<TensorView> maybe_lse,
-                      float sm_scale, bool causal, bool per_block_mean) {
+                      float sm_scale, bool causal, bool per_block_mean, int64_t unpadded_k_len) {
   params = {};
 
   const int batch = static_cast<int>(q.size(0));
@@ -141,7 +141,7 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.h_h_k_ratio = num_qo_heads / num_kv_heads;
   params.seqlen_q = seq_len_q;
   params.seqlen_k = seq_len_k;
-  params.unpadded_seqlen_k = seq_len_k;
+  params.unpadded_seqlen_k = static_cast<int>(unpadded_k_len);
   params.seqlen_q_rounded = round_multiple(seq_len_q, 128);
   params.seqlen_k_rounded = round_multiple(seq_len_k, 128);
   params.d = head_dim;
@@ -202,7 +202,8 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
 void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_scale,
          TensorView k_scale, TensorView v_scale_t, TensorView qk_correction, TensorView out,
-         ffi::Optional<TensorView> maybe_lse, double sm_scale, bool causal, bool per_block_mean) {
+         ffi::Optional<TensorView> maybe_lse, double sm_scale, bool causal, bool per_block_mean,
+         int64_t unpadded_k_len) {
   CHECK_INPUT(q_fp4);
   CHECK_INPUT(k_fp4);
   CHECK_INPUT(v_fp4_t);
@@ -251,11 +252,16 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   const int64_t batch = q_fp4.size(0);
   const int64_t num_qo_heads = q_fp4.size(1);
   const int64_t num_kv_heads = k_fp4.size(1);
-  const int64_t seq_len = q_fp4.size(2);
+  const int64_t seq_len_q = q_fp4.size(2);
+  const int64_t seq_len_k = k_fp4.size(2);
   const int64_t head_dim = q_fp4.size(3) * 2;
 
   TVM_FFI_ICHECK(head_dim == 64 || head_dim == 128) << "head_dim must be 64 or 128";
-  TVM_FFI_ICHECK_EQ(seq_len % 128, 0) << "seq_len must be a multiple of 128";
+  TVM_FFI_ICHECK_EQ(seq_len_q % 128, 0) << "Q sequence length must be a multiple of 128";
+  TVM_FFI_ICHECK_EQ(seq_len_k % 128, 0) << "K/V sequence length must be a multiple of 128";
+  TVM_FFI_ICHECK_GT(unpadded_k_len, 0) << "unpadded_k_len must be positive";
+  TVM_FFI_ICHECK_LE(unpadded_k_len, seq_len_k)
+      << "unpadded_k_len must not exceed the physical K/V sequence length";
   TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be positive";
   TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
   TVM_FFI_ICHECK_GE(num_qo_heads, num_kv_heads)
@@ -264,43 +270,42 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
       << "num_qo_heads must be divisible by num_kv_heads";
 
   TVM_FFI_ICHECK_EQ(k_fp4.size(0), batch);
-  TVM_FFI_ICHECK_EQ(k_fp4.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(k_fp4.size(3), q_fp4.size(3));
 
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(0), batch);
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(2), head_dim);
-  TVM_FFI_ICHECK_EQ(v_fp4_t.size(3), seq_len / 2);
+  TVM_FFI_ICHECK_EQ(v_fp4_t.size(3), seq_len_k / 2);
 
   TVM_FFI_ICHECK_EQ(q_scale.size(0), batch);
   TVM_FFI_ICHECK_EQ(q_scale.size(1), num_qo_heads);
-  TVM_FFI_ICHECK_EQ(q_scale.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(q_scale.size(2), seq_len_q);
   TVM_FFI_ICHECK_EQ(q_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(k_scale.size(0), batch);
   TVM_FFI_ICHECK_EQ(k_scale.size(1), num_kv_heads);
-  TVM_FFI_ICHECK_EQ(k_scale.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(k_scale.size(2), seq_len_k);
   TVM_FFI_ICHECK_EQ(k_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(0), batch);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(2), head_dim);
-  TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len / 16);
+  TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len_k / 16);
 
   // Compact correction: one row per 128-token Q block. The kernel's TMA
   // layout addresses the tensor this way and broadcasts each row across
   // the rows of the corresponding Q tile.
   TVM_FFI_ICHECK_EQ(qk_correction.size(0), batch);
   TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_qo_heads);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len / 128 : 1);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len_q / 128 : 1);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len_k);
 
   TVM_FFI_ICHECK_EQ(out.size(0), batch);
   TVM_FFI_ICHECK_EQ(out.size(1), num_qo_heads);
-  TVM_FFI_ICHECK_EQ(out.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(out.size(2), seq_len_q);
   TVM_FFI_ICHECK_EQ(out.size(3), head_dim);
   if (maybe_lse.has_value()) {
     TVM_FFI_ICHECK_EQ(maybe_lse.value().size(0), batch);
     TVM_FFI_ICHECK_EQ(maybe_lse.value().size(1), num_qo_heads);
-    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(2), seq_len);
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(2), seq_len_q);
   }
 
   check_same_device(q_fp4, k_fp4, "k_fp4");
@@ -316,7 +321,7 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
 
   cudaStream_t stream = get_stream(q_fp4.device());
 
-  if (seq_len == 0) {
+  if (seq_len_q == 0) {
     status = cudaMemsetAsync(out.data_ptr(), 0, numel(out) * get_element_size(out), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaMemsetAsync(out) failed: " << cudaGetErrorString(status);
@@ -340,7 +345,7 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
 
   Flash_fwd_params params;
   set_params_fprop(params, q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction, out,
-                   maybe_lse, static_cast<float>(sm_scale), causal, per_block_mean);
+                   maybe_lse, static_cast<float>(sm_scale), causal, per_block_mean, unpadded_k_len);
   run_mha_fwd(params, stream);
 }
 
