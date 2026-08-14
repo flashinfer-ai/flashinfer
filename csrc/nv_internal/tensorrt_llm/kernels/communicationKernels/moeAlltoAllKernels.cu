@@ -230,8 +230,8 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 //
 // base and remainder are precomputed by the caller once outside the per-token TOP_K loop
 // so the hot path performs at most one integer divide.
-__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder, int invalid_expert_id) {
-
+__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder,
+                                                      int invalid_expert_id) {
   // Padding slots: a token whose expert id matches the invalid sentinel
   // (default -1) has no owning rank; return -1 so the caller skips it.
   if (expert_id == invalid_expert_id) {
@@ -441,7 +441,8 @@ __global__ void moeA2ADispatchKernel(
         int k = lane_id;
         int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
         // Use contiguous ceil/floor partitioning (supports non-divisible num_experts % ep_size).
-        int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder, invalid_expert_id);
+        int target_rank =
+            compute_target_rank_id(expert_id, ep_base, ep_remainder, invalid_expert_id);
 
         // Elect the first top-k lane for each destination rank; duplicate targets within a
         // token collapse to a single send (replaces the old serial already_copied bitmask).
@@ -723,12 +724,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
         int shared_bytes = 2 * params.top_k * (int)sizeof(int);
         SWITCH_TOP_K(params.top_k, TOP_K, {
           auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false>;
-          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
-                                   block_size, shared_bytes, params.stream,
-                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                                   params.max_tokens_per_rank, params.local_num_tokens,
-                                   params.ep_rank, params.ep_size, params.num_experts,
-                                   params.eplb_stats_num_experts, params.enable_pdl, params.invalid_expert_id);
+          launchWithPdlWhenEnabled(
+              "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+              shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+              params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+              params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
+              params.enable_pdl, params.invalid_expert_id);
         });
       }
     });
