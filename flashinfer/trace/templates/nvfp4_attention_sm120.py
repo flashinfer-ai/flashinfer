@@ -157,6 +157,7 @@ nvfp4_attention_sm120_fwd_trace = TraceTemplate(
             param="out",
             dtype="bfloat16",
             dtype_from="out",
+            dtype_from_scalar="out_dtype",
         ),
         "lse": Tensor(
             ["batch_size", "num_qo_heads", "padded_qo_len"],
