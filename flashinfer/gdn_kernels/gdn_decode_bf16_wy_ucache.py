@@ -85,7 +85,13 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
-from .device_target import gdn_compile_options, gdn_device_target
+try:
+    from .device_target import gdn_compile_options, gdn_device_target
+except ImportError:  # tests and benchmarks load this file by path, outside the package
+    from flashinfer.gdn_kernels.device_target import (
+        gdn_compile_options,
+        gdn_device_target,
+    )
 
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).

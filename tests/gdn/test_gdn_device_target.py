@@ -45,6 +45,9 @@ def fake_devices(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
+    # The real DSL arch comes from the host's device 0; neutralize it so these tests
+    # exercise resolution alone. test_rejects_* below drive the guard directly.
+    monkeypatch.setattr(dt, "_dsl_runtime_arch", lambda: None)
     dt._resolve.cache_clear()
     yield
     dt._resolve.cache_clear()
@@ -94,6 +97,18 @@ def test_non_cuda_device_is_rejected(fake_devices):
         dt.gdn_device_target("cpu")
 
 
+def test_rejects_a_device_the_dsl_would_cross_compile_for(fake_devices, monkeypatch):
+    """A mismatch here yields no JIT engine, so fail with the remedy instead."""
+    monkeypatch.setattr(dt, "_dsl_runtime_arch", lambda: "sm_89")
+    with pytest.raises(RuntimeError, match="CUTE_DSL_ARCH=sm_90a"):
+        dt.gdn_device_target("cuda:0")
+
+
+def test_accepts_a_device_matching_the_dsl_arch(fake_devices, monkeypatch):
+    monkeypatch.setattr(dt, "_dsl_runtime_arch", lambda: "sm_90a")
+    assert dt.gdn_device_target("cuda:0").arch == "sm_90a"
+
+
 def test_compile_options_pin_arch_and_preserve_extras(fake_devices):
     extras = (cute.EnableTVMFFI(True), cute.OptLevel(3))
     options = dt.gdn_compile_options("cuda:1", *extras)
@@ -140,6 +155,38 @@ def test_every_gdn_cute_compile_pins_an_explicit_target():
     )
 
 
+# tests/gdn/test_decode_ucache.py and benchmarks/bench_gdn_ucache_flush.py load these
+# by path to re-specialize them per dtype arm, so they execute outside the package.
+STANDALONE_LOADED = (
+    "gdn_decode_bf16_wy_ucache.py",
+    "gdn_decode_bf16_wy_ucache_flush.py",
+)
+
+
+@pytest.mark.parametrize("filename", STANDALONE_LOADED)
+def test_by_path_modules_guard_their_relative_imports(filename):
+    """A bare relative import raises ImportError when loaded outside the package."""
+    tree = ast.parse((GDN_KERNELS_DIR / filename).read_text(), filename=filename)
+    guarded = {
+        id(node)
+        for parent in ast.walk(tree)
+        if isinstance(parent, ast.Try)
+        for node in ast.walk(parent)
+        if isinstance(node, ast.ImportFrom)
+    }
+    unguarded = [
+        f"{filename}:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.level > 0
+        and id(node) not in guarded
+    ]
+    assert not unguarded, (
+        "wrap in try/ImportError with an absolute flashinfer.gdn_kernels fallback: "
+        f"{unguarded}"
+    )
+
+
 def test_bf16_mtp_tile_v_follows_device_sm_count():
     from flashinfer.gdn_kernels import gdn_decode_bf16_state as bf16_state
 
@@ -148,9 +195,20 @@ def test_bf16_mtp_tile_v_follows_device_sm_count():
     assert small_gpu != large_gpu
 
 
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2, reason="needs at least two CUDA devices"
-)
+def _gdn_capable_devices() -> list[int]:
+    """Indices of devices GDN supports, restricted to a single architecture.
+
+    The DSL builds a JIT engine only when its process-global arch (``CUTE_DSL_ARCH``
+    or CUDA device 0) can run the compiled target, so one process serves one arch.
+    """
+    by_capability: dict[tuple, list[int]] = {}
+    for index in range(torch.cuda.device_count()):
+        capability = torch.cuda.get_device_capability(index)
+        if capability[0] in (9, 10, 11, 12):
+            by_capability.setdefault(capability, []).append(index)
+    return max(by_capability.values(), key=len, default=[])
+
+
 def test_decode_agrees_across_devices():
     """The same decode must give the same answer on every device in one process.
 
@@ -158,6 +216,11 @@ def test_decode_agrees_across_devices():
     the device index entered the compile key the second device silently reused the
     first device's artifact.
     """
+    devices = _gdn_capable_devices()
+    if len(devices) < 2:
+        pytest.skip("needs two GDN-capable CUDA devices of the same architecture")
+    first, second = devices[0], devices[1]
+
     from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
     B, T, H, HV, K, V = 2, 1, 4, 4, 128, 128
@@ -185,6 +248,6 @@ def test_decode_agrees_across_devices():
 
     original_device = torch.cuda.current_device()
     try:
-        torch.testing.assert_close(run_on(0), run_on(1), atol=0, rtol=0)
+        torch.testing.assert_close(run_on(first), run_on(second), atol=0, rtol=0)
     finally:
         torch.cuda.set_device(original_device)

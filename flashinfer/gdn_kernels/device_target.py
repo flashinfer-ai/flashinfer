@@ -40,6 +40,45 @@ def _arch_string(major: int, minor: int) -> str:
     return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
 
 
+def _dsl_runtime_arch() -> Union[str, None]:
+    """The arch the DSL will accept a JIT engine for, or ``None`` if unavailable."""
+    try:
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        return CuTeDSL._get_dsl().envar.arch
+    except Exception:
+        return None
+
+
+def _check_dsl_can_run(target: GdnDeviceTarget) -> None:
+    """Reject a target the DSL would silently turn into a cross-compile.
+
+    The DSL builds a JIT engine only when its process-global arch (``CUTE_DSL_ARCH``,
+    else CUDA device 0) can run the requested target, so one process serves one
+    architecture. Without this the failure surfaces as an internal DSL error, or on
+    an unpinned build as ``cudaErrorNoKernelImageForDevice`` at launch.
+    """
+    runtime_arch = _dsl_runtime_arch()
+    if runtime_arch is None or runtime_arch == target.arch:
+        return
+    try:
+        from cutlass.base_dsl import Arch
+
+        if Arch.from_string(runtime_arch).can_run_binary_built_for(
+            Arch.from_string(target.arch)
+        ):
+            return
+    except Exception:
+        return
+    raise RuntimeError(
+        f"GDN CuTe-DSL cannot target cuda:{target.device_index} ({target.arch}): the "
+        f"CuTe DSL compiles this process for {runtime_arch}, taken from CUDA device 0 "
+        "unless CUTE_DSL_ARCH is set, and one process can only serve one architecture. "
+        f"Set CUTE_DSL_ARCH={target.arch} or restrict CUDA_VISIBLE_DEVICES to devices "
+        "of a single architecture."
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _resolve(device_index: int) -> GdnDeviceTarget:
     major, minor = torch.cuda.get_device_capability(device_index)
@@ -51,7 +90,7 @@ def _resolve(device_index: int) -> GdnDeviceTarget:
         if match is None:
             raise ValueError(f"CUTE_DSL_ARCH is not a recognized arch: {env_arch!r}")
         major, minor = int(match.group(1)), int(match.group(2))
-    return GdnDeviceTarget(
+    target = GdnDeviceTarget(
         device_index=device_index,
         arch=env_arch or _arch_string(major, minor),
         major=major,
@@ -59,6 +98,8 @@ def _resolve(device_index: int) -> GdnDeviceTarget:
         num_sms=torch.cuda.get_device_properties(device_index).multi_processor_count,
         use_packed_fma=major >= 10,
     )
+    _check_dsl_can_run(target)
+    return target
 
 
 def gdn_device_target(device: Union[str, torch.device]) -> GdnDeviceTarget:
