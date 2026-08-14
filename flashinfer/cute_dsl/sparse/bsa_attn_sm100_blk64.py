@@ -21,7 +21,7 @@ from flashinfer.api_logging import flashinfer_api
 
 
 @flashinfer_api
-def bsa_attn_blk64_fwd(
+def bsa_attn_sm100_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -34,15 +34,18 @@ def bsa_attn_blk64_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Forward pass for BSA block-sparse attention using the blk64 CUDA C++ kernel (SM100 only).
+    """Forward pass for BSA block-sparse attention using the blk64 CUDA C++ kernel.
+
+    Supports SM100 and SM103.
 
     Block granularity is 64 tokens (kSparseBlockSize=64, kRows=64).  Only bfloat16
-    inputs are supported and head_dim must be 128.
+    inputs are supported, head_dim must be 128, and num_kv_heads must equal
+    num_heads — this kernel has no KV-head mapping and does not support GQA/MQA.
 
     Args:
         q: Query tensor (batch, seqlen_q, num_heads, head_dim).
-        k: Key tensor (batch, seqlen_k, num_heads_kv, head_dim).
-        v: Value tensor (batch, seqlen_k, num_heads_kv, head_dim).
+        k: Key tensor (batch, seqlen_k, num_heads, head_dim).
+        v: Value tensor (batch, seqlen_k, num_heads, head_dim).
         q2k_block_index: Block index tensor (batch, num_heads, num_q_blocks, max_kv_blocks), int32.
         block_sparse_num: Number of KV blocks each Q block attends to (>= 1).
             Ignored when q2k_block_nums is provided.
@@ -58,7 +61,7 @@ def bsa_attn_blk64_fwd(
     Returns:
         (out, lse) where lse is None if return_lse is False.
     """
-    from .blk64 import load_blk64_ext  # noqa: PLC0415
+    from .sm100_blk64 import load_blk64_ext  # noqa: PLC0415
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     seqlen_k = k.shape[1]
@@ -69,8 +72,11 @@ def bsa_attn_blk64_fwd(
     assert q.is_cuda and k.is_cuda and v.is_cuda
     major, minor = torch.cuda.get_device_capability(q.device)
     arch = major * 10 + minor
-    if arch // 10 != 10:
-        raise RuntimeError(f"BSA blk64 only supports SM100, current device is SM{arch}")
+    if (major, minor) not in ((10, 0), (10, 3)):
+        raise RuntimeError(
+            "bsa_attn_sm100_blk64_fwd only supports "
+            f"SM100/SM103, current device is SM{arch}"
+        )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
