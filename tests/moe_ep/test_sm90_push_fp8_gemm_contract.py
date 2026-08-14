@@ -27,21 +27,23 @@ _SOURCE_TREE_PACKAGE_ROOT = (
 )
 
 
-def _package_root():
-    if _SOURCE_TREE_PACKAGE_ROOT.is_dir():
-        return _SOURCE_TREE_PACKAGE_ROOT
-    return importlib_resources.files(_PACKAGE_NAME)
+def _package_text(*parts: str) -> str:
+    source_tree = _SOURCE_TREE_PACKAGE_ROOT.joinpath(*parts)
+    if source_tree.is_file():
+        return source_tree.read_text(encoding="utf-8")
 
-
-def _private_source(name: str) -> str:
-    return (_package_root() / "src" / "fp8_gemm" / name).read_text(encoding="utf-8")
-
-
-def _package_source(*parts: str) -> str:
-    resource = _package_root()
+    resource = importlib_resources.files(_PACKAGE_NAME)
     for part in parts:
         resource = resource / part
     return resource.read_text(encoding="utf-8")
+
+
+def _private_source(name: str) -> str:
+    return _package_text("src", "fp8_gemm", name)
+
+
+def _package_source(*parts: str) -> str:
+    return _package_text(*parts)
 
 
 def _csrc_source(relative_path: str) -> str:
