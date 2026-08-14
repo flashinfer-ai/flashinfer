@@ -2,6 +2,7 @@ ARG CUDA_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS base
 
 ARG PYTORCH_INDEX=cu129
+ARG CUDNN_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -24,10 +25,11 @@ ENV PATH="/opt/conda/envs/py312/bin:/opt/conda/bin:$PATH"
 ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cu13/lib:/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
+ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}"
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
 
 RUN conda install -n py312 -y mpi4py mpich
 

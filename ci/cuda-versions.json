@@ -4,13 +4,15 @@
       "label": "cu129",
       "version": "12.9",
       "image": "nvidia/cuda:12.9.0-devel-ubuntu24.04",
-      "pytorch_index": "cu129"
+      "pytorch_index": "cu129",
+      "cudnn_version": "9.24.0.43"
     },
     {
       "label": "cu130",
       "version": "13.0",
       "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
-      "pytorch_index": "cu130"
+      "pytorch_index": "cu130",
+      "cudnn_version": "9.24.0.43"
     }
   ],
   "jit_cache": [

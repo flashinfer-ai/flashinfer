@@ -80,6 +80,7 @@ jobs:
           build-args: |
             CUDA_IMAGE=${{ matrix.cuda.image }}
             PYTORCH_INDEX=${{ matrix.cuda.pytorch_index }}
+            CUDNN_VERSION=${{ matrix.cuda.cudnn_version }}
           platforms: linux/${{ matrix.arch }}
           load: true
           pull: true  # Always pull the latest base image
