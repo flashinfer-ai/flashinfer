@@ -6,7 +6,7 @@
 # - Push to main: Always runs
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
 #   Applying the label is the trigger, so new commits need a new trigger:
-#   @flashinfer-bot run. Only users with write access can apply labels.
+#   @flashinfer-bot run.
 #
 # Instance Purchasing:
 # - All runners are on-demand. Spot was removed.
@@ -77,8 +77,7 @@ jobs:
 
           # Authorize on run-ci being applied, not on it being present: presence
           # would re-authorize every later push, which is the auto-trigger this
-          # gate removes. Applying a label needs write access, so this also holds
-          # on fork PRs, where secrets are unavailable.
+          # gate removes.
           if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "run-ci label applied, authorized"
@@ -422,8 +421,72 @@ jobs:
             exit 0
           fi
 
+          # Failing while another run tests this commit would turn the required
+          # check red under it, so report what that run reports. Older runs only,
+          # so two label events cannot wait on each other.
+          ACTIVE=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --commit "$HEAD_SHA" \
+            --limit 50 \
+            --json databaseId,status \
+            --jq '[.[] | select(.databaseId < (env.GITHUB_RUN_ID | tonumber))
+                       | select(.status == "in_progress" or .status == "queued")]
+                  | min_by(.databaseId) | .databaseId // empty' 2>/dev/null) || ACTIVE=""
+
+          if [ -n "$ACTIVE" ]; then
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/$ACTIVE"
+            echo "Tests for this commit are running in [run $ACTIVE]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+
+            # The summary lands only when this job ends, so the annotation is
+            # what carries the link on the PR meanwhile.
+            echo "::notice title=Tests are already running for this commit::$RUN_URL"
+
+            # No wait limit, because any number here would guess at test duration
+            # and guessing low fails a healthy run. The wait ends when the
+            # followed run concludes, or when it stops being readable.
+            CONCLUSION=""
+            UNREADABLE=0
+            while true; do
+              INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
+                --json status,conclusion,jobs \
+                --jq '.status + "|" + (.conclusion // "") + "|"
+                      + ([.jobs[] | select(.status == "completed")] | length | tostring) + " done, "
+                      + ([.jobs[] | select(.status == "in_progress")] | length | tostring) + " running, "
+                      + ([.jobs[] | select(.status == "queued")] | length | tostring) + " waiting for a runner, of "
+                      + (.jobs | length | tostring) + " jobs"' 2>/dev/null) || INFO=""
+              IFS='|' read -r STATUS CONCLUSION PROGRESS <<< "$INFO"
+
+              if [ "$STATUS" == "completed" ]; then
+                break
+              fi
+
+              # Transient errors retry; 5 minutes unreadable means the run is
+              # gone and no conclusion is coming.
+              if [ -z "$STATUS" ]; then
+                UNREADABLE=$((UNREADABLE + 1))
+                if [ "$UNREADABLE" -ge 10 ]; then
+                  echo "Result: run $ACTIVE is no longer readable" >> $GITHUB_STEP_SUMMARY
+                  exit 1
+                fi
+              else
+                UNREADABLE=0
+              fi
+
+              echo "run $ACTIVE after $((SECONDS / 60))m: ${PROGRESS:-progress unavailable} - $RUN_URL"
+              sleep 30
+            done
+
+            if [ "$CONCLUSION" == "success" ] || [ "$CONCLUSION" == "skipped" ]; then
+              echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            echo "Result: run $ACTIVE ended as '${CONCLUSION:-still running}'" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
           echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-          echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
+          echo "A contributor who can label the PR, or a \`ci-users\` member, can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
           echo "This is also needed after pushing new commits, since CI no longer starts on its own." >> $GITHUB_STEP_SUMMARY
           echo "::warning::CI skipped — pending authorization"
           exit 1
