@@ -67,6 +67,118 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 views are prepared for the first match only). The W4A8 split kernel requires
 hidden and intermediate sizes to be multiples of 128.
 
+## How tuning works
+
+Two independent tuning systems, matching the two execution modes:
+
+- **Split** kernels tune through the generic FlashInfer `AutoTuner`: each
+  `fused_moe` runner enumerates kernel *tactics*, the tuner times them per
+  token bucket (up to `ExecutionConfig.tune_max_num_tokens`), and `MoELayer`
+  additionally picks a cross-backend winner per bucket. Nothing moe_ep-specific
+  — see the fused_moe docs.
+- **Mega** CuTeDSL kernels tune through the moe_ep-owned **knob** system
+  described below. The knob space is larger than a tactic id (tile, cluster,
+  warp-role, and scheduling choices that must be fixed at `cute.compile` time)
+  and every measurement is a **collective** — the fused kernel spans all EP
+  ranks, so candidates must compile and launch in lockstep on every rank.
+
+### Knob resolution (mega CuTeDSL)
+
+`Sm100_*_Cutedsl_MegaMoeConfig.knobs` accepts three values; resolution happens
+when the symmetric-memory session is created (and, for `"auto"`, at the first
+`compute()`):
+
+```mermaid
+flowchart TD
+    A["MegaConfig(megakernel=cfg)"] --> B{"cfg.knobs?"}
+    B -- "dict" --> C["validate via tuner.is_valid<br/>→ pin exactly these knobs"]
+    B -- "None (default)" --> D{"knob cache hit?<br/>FLASHINFER_MOE_EP_KNOB_CACHE<br/>key: device, dtype, world_size,<br/>geometry, combine_dtype + max_tokens bucket"}
+    D -- "hit" --> E["use recorded winner<br/>(pure dict lookup — no compiles,<br/>no collectives)"]
+    D -- "miss" --> F["tuner.default_knobs(max_tokens)<br/>measured token-count profiles<br/>(NVFP4: 4 profiles, MXFP8: 2)"]
+    B -- "auto" --> G["defer to first compute()"]
+    G --> H["COLLECTIVE candidate sweep<br/>(shim/autotune.py)"]
+    H --> I["per candidate, on every rank in lockstep:<br/>cute.compile → barrier →<br/>timed launches → barrier"]
+    I --> J["all-reduce per-candidate time with MAX<br/>(slowest rank = real collective latency)<br/>→ argmin winner identical on all ranks"]
+    J --> K["apply winner to the session"]
+    K --> L["rank 0 records winner into the knob cache<br/>→ later sessions with knobs=None hit E"]
+    C --> M["cute.compile session<br/>(memoized per knobs+geometry)"]
+    E --> M
+    F --> M
+```
+
+The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
+
+- **correctness knobs** change a code path or the output and must be kept at
+  the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
+  `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
+  `in_kernel_fc2_reduce` (ikr — makes the accumulation order
+  nondeterministic; pin `False` for bit-reproducibility);
+- **perf knobs** are output-neutral and free to sweep: `group_hint`,
+  `flag_batch`, `epi_flag_batch`.
+
+A validity predicate (`tuner.is_valid`) mirrors the kernel team's
+`inference_solver.filter_invalid` rules, so sweeps only enumerate
+compilable combinations.
+
+### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
+
+**1. Default (`knobs=None`).** The session resolves the knob cache first;
+on a miss it falls back to four measured token-count profiles keyed on the
+compile-time buffer capacity (`max_tokens_per_rank * world`):
+
+| bucket | profile |
+|---|---|
+| < 512 | small-batch latency: 128-wide N tile, `token_back_mode="epi_warps"` |
+| 512–1023 | mid: `reuse_dispatch_warps` |
+| 1024–2047 | mid-large: 256-wide N tile, `standalone_warps` |
+| ≥ 2048 | large throughput: `flag_batch=8`, `reuse_dispatch_warps` |
+
+**2. Pinned (`knobs=dict`).** E.g. a winner from the kernel team's tester
+sweep:
+
+```python
+Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    intermediate_size=2048, top_k=8,
+    knobs={"mma_tiler_mnk": (256, 128, 256), "cluster_shape_mnk": (2, 1, 1),
+           "token_back_mode": "reuse_dispatch_warps", "flag_batch": 8,
+           "group_hint": 512, "epi_flag_batch": (2, 4),
+           "load_balance_mode": "atomic_counter",
+           "in_kernel_fc2_reduce": False},
+)
+```
+
+**3. Online (`knobs="auto"`).** At the first `compute()` every rank runs the
+same ~24-candidate sweep (`nvfp4_candidates()`: tile {256×128, 256×256} ×
+`flag_batch` {4, 8} × three `token_back_mode` values × ikr {off, on}, over a
+fixed base of `cluster (2,1,1)`, `group_hint 512`, `epi_flag_batch (2,4)`,
+`atomic_counter`). Each candidate costs one `cute.compile` (minutes), so the
+sweep is a multi-minute, collective, once-per-session event — **never run it
+inside a serving engine**. The winner is applied and rank 0 records it in the
+knob cache.
+
+**4. Offline CLI (the intended production flow).** Run the same sweep outside
+the engine, with the production EP world size, GPU model, and geometry:
+
+```shell
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+    --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+    --num-experts 256 --topk 8 --max-tokens 8 512 2048
+```
+
+Winners land in the JSON knob cache (default
+`~/.cache/flashinfer/moe_ep_knob_cache.json`; override or disable with
+`FLASHINFER_MOE_EP_KNOB_CACHE`), keyed by (device, dtype, world_size, hidden,
+intermediate, num_experts, topk, combine_dtype) plus a `max_tokens` bucket
+(exact bucket when present, else the smallest recorded bucket ≥ the request,
+else the largest below). The engine then constructs the layer with the
+default `knobs=None` and gets the tuned winner as a pure lookup — no
+compiles, no collectives, no timing on the hot path. Nondeterministic ikr
+candidates are excluded from the CLI sweep unless
+`--allow-nondeterministic` is passed.
+
+Measured results, methodology, and the full knob reference live in
+[kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+
 ## Layout
 
 ```
