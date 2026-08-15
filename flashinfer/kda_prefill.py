@@ -1033,10 +1033,9 @@ def _run_flash_kda_prefill(
         final_state_arg = dummy_state
         store_final_state = False
         returned_state = None
-    active_state = initial_state if initial_state is not None else final_state_arg
     state_slot_stride = (
-        active_state.stride(0)
-        if active_state.ndim == 4
+        initial_state.stride(0)
+        if initial_state is not None and initial_state.ndim == 4
         else num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     )
 
