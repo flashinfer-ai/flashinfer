@@ -642,6 +642,7 @@ def test_b200_uniform_prefill_reaches_persistent_worker_abi(
         seq_lens=[2, 2],
         num_heads=96,
         packed=True,
+        initial_state=True,
     )
     output, state = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
