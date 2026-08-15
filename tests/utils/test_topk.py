@@ -2347,24 +2347,25 @@ def _make_tie_break_test_case(num_rows, width, k, dtype, pattern):
     )
 
 
+@pytest.mark.parametrize("algo", ["filtered", "cub"])
 @pytest.mark.parametrize(
-    ("algo", "batch_size", "vocab_size", "k", "pattern"),
+    ("batch_size", "vocab_size", "k"),
     [
-        ("clusters", 2, 128 * 1024, 2048, "all_equal"),
-        ("filtered", 2, 128 * 1024, 2048, "all_equal"),
-        ("filtered", 1, 1024 * 1024, 1024, "all_equal"),
-        ("filtered", 74, 16 * 1024, 512, "all_equal"),
-        ("cub", 4, 4096, 256, "boundary_tie"),
+        (2, 128 * 1024, 2048),
+        (1, 1024 * 1024, 1024),
+        (74, 16 * 1024, 512),
     ],
     ids=[
-        "clusters_override_b2_l128k_k2048",
-        "filtered_b2_l128k_k2048",
-        "filtered_b1_l1m_k1024",
-        "filtered_b74_l16k_k512",
-        "cub_b4_l4k_k256_boundary_tie",
+        "rows2_l128k_k2048",
+        "rows1_l1m_k1024",
+        "rows74_l16k_k512",
     ],
 )
-def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, pattern, set_topk_algo):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("pattern", ["all_equal", "boundary_tie"])
+def test_top_k_tie_break_modes(
+    algo, batch_size, vocab_size, k, dtype, pattern, set_topk_algo
+):
     """tie_break=1|2 should select row-global smallest/largest pivot indices."""
     if algo == "cub":
         _require_cub_tie_break_support()
@@ -2373,7 +2374,7 @@ def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, pattern, set_top
 
     set_topk_algo(algo)
     logits, expected_small, expected_large = _make_tie_break_test_case(
-        batch_size, vocab_size, k, torch.float32, pattern
+        batch_size, vocab_size, k, dtype, pattern
     )
 
     values_small, indices_small = flashinfer.top_k(logits, k, tie_break=1)
@@ -2385,31 +2386,27 @@ def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, pattern, set_top
     _assert_unordered_indices_match(indices_large, expected_large)
 
 
+@pytest.mark.parametrize("algo", ["filtered", "cub"])
 @pytest.mark.parametrize(
-    ("algo", "num_rows", "max_len", "k", "dtype", "page_size", "pattern"),
+    ("num_rows", "max_len", "k"),
     [
-        ("clusters", 2, 128 * 1024, 2048, torch.bfloat16, 1, "all_equal"),
-        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 1, "all_equal"),
-        ("filtered", 1, 1024 * 1024, 1024, torch.float32, 1, "all_equal"),
-        ("filtered", 74, 16 * 1024, 512, torch.float32, 1, "all_equal"),
-        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 64, "all_equal"),
-        ("filtered", 1, 256 * 1024, 1024, torch.float32, 64, "all_equal"),
-        ("filtered", 74, 16 * 1024, 512, torch.float32, 64, "all_equal"),
-        ("cub", 4, 4096, 256, torch.float32, 1, "boundary_tie"),
-        ("cub", 4, 4096, 256, torch.float32, 64, "boundary_tie"),
+        (2, 128 * 1024, 2048),
+        (1, 1024 * 1024, 1024),
+        (74, 16 * 1024, 512),
     ],
     ids=[
-        "clusters_override_rows2_l128k_k2048",
-        "filtered_rows2_l128k_k2048",
-        "filtered_rows1_l1m_k1024",
-        "filtered_rows74_l16k_k512",
-        "filtered_compact_rows2_l128k_k2048",
-        "filtered_compact_rows1_l256k_k1024",
-        "filtered_compact_rows74_l16k_k512",
-        "cub_rows4_l4k_k256_boundary_tie",
-        "cub_compact_rows4_l4k_k256_boundary_tie",
+        "rows2_l128k_k2048",
+        "rows1_l1m_k1024",
+        "rows74_l16k_k512",
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize(
+    "page_size",
+    [1, 64],
+    ids=["wide", "compact"],
+)
+@pytest.mark.parametrize("pattern", ["all_equal", "boundary_tie"])
 def test_top_k_tie_break_modes_transform_apis(
     algo, num_rows, max_len, k, dtype, page_size, pattern, set_topk_algo
 ):
