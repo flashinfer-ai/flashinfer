@@ -16,8 +16,10 @@ from flashinfer.jit.cake_fmha import (
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
     CAKE_FMHA_MANIFEST_SHA256,
     gen_cake_fmha_compat_module,
+    gen_cake_fmha_context_bf16_module,
     gen_cake_fmha_decode_native_bf16_module,
     get_cake_fmha_compat_uri,
+    get_cake_fmha_context_bf16_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_manifest,
 )
@@ -115,6 +117,47 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
     assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
 
 
+def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
+    monkeypatch,
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_context_bf16_module(
+        "sm103a",
+        1,
+        4,
+        2,
+        2,
+        16,
+        1,
+        is_causal=True,
+        return_lse=True,
+        enable_sink=False,
+    )
+    assert spec.name == get_cake_fmha_context_bf16_uri(
+        "sm103a",
+        1,
+        4,
+        2,
+        2,
+        16,
+        1,
+        is_causal=True,
+        return_lse=True,
+        enable_sink=False,
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "enable_sink0_is_causal1_return_lse1.cu",
+        "cake_fmha_context_bf16_binding.cu",
+        "cake_fmha_context_bf16_jit_binding.cu",
+    }
+    assert "-DNUM_M_BLOCKS=1" in spec.extra_cuda_cflags
+    assert "-DHEADS_PER_GROUP=2" in spec.extra_cuda_cflags
+    assert "-DPACK_G=2" in spec.extra_cuda_cflags
+    assert "-DTOK_PER_STAGE=64" in spec.extra_cuda_cflags
+
+
 def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     monkeypatch,
 ) -> None:
@@ -163,6 +206,63 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     assert (
         cake_api.select_cake_fmha_decode_route(
             query.device, **{**kwargs, "uses_shared_paged_kv_idx": False}
+        )
+        is None
+    )
+
+
+def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    query = torch.empty((14, 4, 128), dtype=torch.bfloat16)
+    key = torch.empty((4, 2, 16, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    out = torch.empty_like(query)
+    lse = torch.empty((14, 4), dtype=torch.float32)
+    kwargs = dict(
+        query=query,
+        key_cache=key,
+        value_cache=value,
+        out=out,
+        block_tables=torch.zeros((2, 2), dtype=torch.int32),
+        seq_lens=torch.tensor([31, 29], dtype=torch.int32),
+        batch_size=2,
+        max_q_len=7,
+        max_kv_len=31,
+        window_left=-1,
+        bmm1_scale=0.125,
+        bmm2_scale=1.0,
+        sinks=None,
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=torch.tensor([0, 7, 14], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 31, 60], dtype=torch.int32),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        is_causal=True,
+        lse=lse,
+    )
+    route = cake_api.select_cake_fmha_context_route(query.device, **kwargs)
+    assert route == cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        num_m_blocks=1,
+        num_q_heads=4,
+        num_kv_heads=2,
+        pack_g=2,
+        page_size=16,
+        l2_swizzle=1,
+        is_causal=True,
+        return_lse=True,
+        enable_sink=False,
+    )
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            query.device,
+            **{
+                **kwargs,
+                "bmm1_scale": torch.ones(1, dtype=torch.float32),
+            },
         )
         is None
     )

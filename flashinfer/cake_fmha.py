@@ -16,6 +16,7 @@ import torch
 from .jit.cake_fmha import (
     CakeFmhaTarget,
     get_cake_fmha_manifest,
+    load_cake_fmha_context_bf16_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_module,
 )
@@ -35,6 +36,22 @@ class CakeFmhaDecodeRoute:
     has_window: bool
     use_scale_ptr: bool
     retain_kv_l2: bool
+
+
+@dataclass(frozen=True)
+class CakeFmhaContextRoute:
+    """One exact manifest-backed optimized context specialization."""
+
+    target: CakeFmhaTarget
+    num_m_blocks: int
+    num_q_heads: int
+    num_kv_heads: int
+    pack_g: int
+    page_size: int
+    l2_swizzle: int
+    is_causal: bool
+    return_lse: bool
+    enable_sink: bool
 
 
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
@@ -181,6 +198,177 @@ def get_cake_fmha_decode_module(
     )
 
 
+def _context_tile_mma_work(q_len: int, kv_len: int, tokens_per_tile: int) -> int:
+    """Mirror the standalone route's bottom-right causal tile-work model."""
+
+    total = 0
+    full_n_blocks = (kv_len + 127) // 128
+    shift = kv_len - q_len
+    for m_block in range((q_len + tokens_per_tile - 1) // tokens_per_tile):
+        max_n = (m_block + 1) * tokens_per_tile + shift
+        total += (max_n + 127) // 128 if max_n < kv_len else full_n_blocks
+    return total
+
+
+def _context_pack_g(
+    max_q_len: int, max_kv_len: int, num_q_heads: int, num_kv_heads: int
+) -> int:
+    """Choose the canonical packed-GQA axis from host-visible maxima."""
+
+    group = num_q_heads // num_kv_heads
+    if group <= 1 or group > 128:
+        return 1
+    unpacked = num_q_heads * _context_tile_mma_work(max_q_len, max_kv_len, 256)
+    packed = num_kv_heads * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // group)
+    )
+    return group if packed < unpacked else 1
+
+
+def select_cake_fmha_context_route(
+    device: torch.device,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    window_left: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    sinks: torch.Tensor | None,
+    uses_shared_paged_kv_idx: bool,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    key_block_scales: torch.Tensor | None,
+    value_block_scales: torch.Tensor | None,
+    skip_softmax_threshold_scale_factor: float | None,
+    is_causal: bool,
+    lse: torch.Tensor | None,
+) -> CakeFmhaContextRoute | None:
+    """Select BF16 context only when the exported route preserves every input."""
+
+    if batch_size <= 0 or max_q_len <= 0 or max_kv_len <= 0 or window_left != -1:
+        return None
+    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+        return None
+    if float(bmm2_scale) != 1.0:
+        return None
+    if key_block_scales is not None or value_block_scales is not None:
+        return None
+    if skip_softmax_threshold_scale_factor not in (None, 0.0):
+        return None
+    if any(
+        tensor.dtype != torch.bfloat16
+        for tensor in (query, key_cache, value_cache, out)
+    ):
+        return None
+    if query.ndim != 3 or query.shape[2] != 128 or query.stride(2) != 1:
+        return None
+    if out.shape != query.shape or not out.is_contiguous():
+        return None
+    if key_cache.ndim != 4 or value_cache.ndim != 4:
+        return None
+    if key_cache.shape != value_cache.shape or key_cache.shape[3] != 128:
+        return None
+    if key_cache.stride(3) != 1 or value_cache.stride(3) != 1:
+        return None
+    page_size = int(key_cache.shape[2])
+    if page_size not in (16, 32, 64, 128, 256, 512, 1024):
+        return None
+    num_q_heads = int(query.shape[1])
+    num_kv_heads = int(key_cache.shape[1])
+    if num_q_heads <= 0 or num_kv_heads <= 0 or num_q_heads % num_kv_heads:
+        return None
+    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size:
+        return None
+    if seq_lens.dtype not in (torch.int32, torch.uint32):
+        return None
+    if not seq_lens.is_contiguous():
+        return None
+    for indptr in (cum_seq_lens_q, cum_seq_lens_kv):
+        if (
+            indptr.ndim != 1
+            or indptr.shape[0] != batch_size + 1
+            or indptr.dtype != torch.int32
+            or not indptr.is_contiguous()
+        ):
+            return None
+    if sinks is not None and (
+        sinks.dtype != torch.float32
+        or sinks.numel() != num_q_heads
+        or not sinks.is_contiguous()
+    ):
+        return None
+    if sinks is not None and lse is not None:
+        return None
+    if lse is not None and (
+        lse.dtype != torch.float32
+        or lse.shape != (query.shape[0], num_q_heads)
+        or not lse.is_contiguous()
+    ):
+        return None
+    if block_tables.dtype not in (torch.int32, torch.uint32):
+        return None
+    if uses_shared_paged_kv_idx:
+        if (
+            block_tables.ndim != 2
+            or block_tables.shape[0] != batch_size
+            or block_tables.stride(1) != 1
+        ):
+            return None
+    elif (
+        block_tables.ndim != 3
+        or block_tables.shape[:2] != (batch_size, 2)
+        or block_tables.stride(2) != 1
+    ):
+        return None
+
+    pack_g = _context_pack_g(max_q_len, max_kv_len, num_q_heads, num_kv_heads)
+    tok_per_stage = 128 // pack_g
+    num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
+    total_bh = batch_size * (num_q_heads // pack_g)
+    return CakeFmhaContextRoute(
+        target=_cake_fmha_target(device),
+        num_m_blocks=num_m_blocks,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        pack_g=pack_g,
+        page_size=page_size,
+        l2_swizzle=8 if total_bh % 8 == 0 else 1,
+        is_causal=is_causal,
+        return_lse=lse is not None,
+        enable_sink=sinks is not None,
+    )
+
+
+def get_cake_fmha_context_module(
+    device: torch.device, route: CakeFmhaContextRoute | None
+):
+    """Load an optimized context module, or the authenticated portable fallback."""
+
+    if route is None:
+        return load_cake_fmha_compat_module(_cake_fmha_target(device))
+    if route.target != _cake_fmha_target(device):
+        raise RuntimeError("Cake FMHA context route target does not match the device")
+    return load_cake_fmha_context_bf16_module(
+        route.target,
+        route.num_m_blocks,
+        route.num_q_heads,
+        route.num_kv_heads,
+        route.pack_g,
+        route.page_size,
+        route.l2_swizzle,
+        is_causal=route.is_causal,
+        return_lse=route.return_lse,
+        enable_sink=route.enable_sink,
+    )
+
+
 def cake_fmha_manifest() -> dict[str, Any]:
     """Return a copy of the authenticated product/capability manifest."""
 
@@ -220,11 +408,14 @@ def cake_batch_context_with_kv_cache(*args, **kwargs):
 
 
 __all__ = [
+    "CakeFmhaContextRoute",
     "CakeFmhaDecodeRoute",
     "cake_batch_context_with_kv_cache",
     "cake_batch_decode_with_kv_cache",
     "cake_fmha_manifest",
+    "get_cake_fmha_context_module",
     "get_cake_fmha_decode_module",
     "get_cake_fmha_module",
+    "select_cake_fmha_context_route",
     "select_cake_fmha_decode_route",
 ]
