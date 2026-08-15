@@ -33,10 +33,11 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
     assert manifest["capability"]["cake_covered_cases"] == 57_280
     assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_482
-    assert len(manifest["route_probes"]) == 28
+    assert len(manifest["route_probes"]) == 29
     assert {probe["label"] for probe in manifest["route_probes"]} >= {
         "correctness_compat_decode_fp8_nhd_separate_group5",
-        "correctness_decode_fp8_hnd_shared_group8",
+        "correctness_compat_decode_fp8_hnd_shared_group8_partial",
+        "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
     assert len(manifest["artifacts"]) == 117
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]

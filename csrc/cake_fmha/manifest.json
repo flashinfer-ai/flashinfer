@@ -4106,7 +4106,12 @@
       "selected_route": "cake_fmha_compat_v1"
     },
     {
-      "label": "correctness_decode_fp8_hnd_shared_group8",
+      "label": "correctness_compat_decode_fp8_hnd_shared_group8_partial",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_decode_fp8_hnd_shared_group8_full_blocks",
       "profile": "conventional",
       "selected_route": "decode_quantized_fp8_8e5b_v1"
     },
