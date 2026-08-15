@@ -3556,9 +3556,10 @@ def trtllm_batch_decode_with_kv_cache(
                 v_block_scales = v_block_scales.transpose(-3, -2).contiguous()
 
         if backend == "cake":
-            from .cake_fmha import get_cake_fmha_module
-
-            run_func = get_cake_fmha_module(query.device).cake_paged_attention_decode
+            # Route selection needs the finalized output/scales and exact
+            # uniform-query shape, so defer module loading until those values
+            # have been resolved below.
+            run_func = None
         else:
             run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
@@ -3657,15 +3658,8 @@ def trtllm_batch_decode_with_kv_cache(
         bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
             bmm1_scale, bmm1_scale_log2, query.device
         )
-        if backend == "cake" and isinstance(bmm1_scale, torch.Tensor):
-            # The TRTLLM ABI passes a precomputed base-2 scale tensor.  The
-            # complete-domain Cake route consumes the equivalent natural-log
-            # scalar.  Materialize it before entering the stable JIT ABI.
-            bmm1_scale = float(bmm1_scale.item()) / log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
-            if backend == "cake":
-                bmm2_scale = float(bmm2_scale.item())
 
         if q_len_per_req is not None:
             max_q_len = q_len_per_req
@@ -3715,6 +3709,49 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             lse_stride_tokens = 0
             lse_stride_heads = 0
+
+        if backend == "cake":
+            from .cake_fmha import (
+                get_cake_fmha_decode_module,
+                select_cake_fmha_decode_route,
+            )
+
+            cake_route = select_cake_fmha_decode_route(
+                query.device,
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                out=out,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                batch_size=batch_size,
+                q_len=q_len_per_req,
+                max_seq_len=max_seq_len,
+                window_left=window_left,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                o_scale=o_scale,
+                sinks=sinks,
+                kv_layout=kv_layout,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                cum_seq_lens_q=cum_seq_lens_q,
+                key_block_scales=k_block_scales,
+                value_block_scales=v_block_scales,
+                skip_softmax_threshold_scale_factor=(
+                    skip_softmax_threshold_scale_factor
+                ),
+                enable_block_sparse_attention=enable_block_sparse_attention,
+            )
+            if cake_route is None:
+                # compat_v1 takes host scalar scales; only the optimized
+                # scale-pointer specialization preserves the device binding.
+                if isinstance(bmm1_scale, torch.Tensor):
+                    bmm1_scale = float(bmm1_scale.item()) / log2e
+                if isinstance(bmm2_scale, torch.Tensor):
+                    bmm2_scale = float(bmm2_scale.item())
+            run_func = get_cake_fmha_decode_module(
+                query.device, cake_route
+            ).cake_paged_attention_decode
 
         run_func(
             out,

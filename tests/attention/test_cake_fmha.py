@@ -16,7 +16,9 @@ from flashinfer.jit.cake_fmha import (
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
     CAKE_FMHA_MANIFEST_SHA256,
     gen_cake_fmha_compat_module,
+    gen_cake_fmha_decode_native_bf16_module,
     get_cake_fmha_compat_uri,
+    get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_manifest,
 )
 
@@ -74,6 +76,96 @@ def test_cake_fmha_jit_spec_uses_versioned_standalone_sources(monkeypatch) -> No
             "cake_fmha_compat_v1_binding.cu",
             "cake_fmha_jit_binding.cu",
         }
+
+
+def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
+    monkeypatch,
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_decode_native_bf16_module(
+        "sm100a",
+        2,
+        1,
+        4,
+        2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
+    )
+    assert spec.name == get_cake_fmha_decode_native_bf16_uri(
+        "sm100a",
+        2,
+        1,
+        4,
+        2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "cake_fmha_decode_native_bf16_binding.cu",
+        "cake_fmha_decode_native_bf16_jit_binding.cu",
+    }
+    assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
+
+
+def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    query = torch.empty((2, 4, 128), dtype=torch.bfloat16)
+    key = torch.empty((4, 2, 16, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    out = torch.empty_like(query)
+    block_tables = torch.zeros((2, 2), dtype=torch.int32)
+    seq_lens = torch.tensor([31, 29], dtype=torch.int32)
+    kwargs = dict(
+        query=query,
+        key_cache=key,
+        value_cache=value,
+        out=out,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        batch_size=2,
+        q_len=1,
+        max_seq_len=31,
+        window_left=-1,
+        bmm1_scale=torch.ones(1, dtype=torch.float32),
+        bmm2_scale=1.0,
+        o_scale=1.0,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    assert route == cake_api.CakeFmhaDecodeRoute(
+        target="sm100a",
+        batch_size=2,
+        q_len=1,
+        num_q_heads=4,
+        num_kv_heads=2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
+    )
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            query.device, **{**kwargs, "uses_shared_paged_kv_idx": False}
+        )
+        is None
+    )
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:

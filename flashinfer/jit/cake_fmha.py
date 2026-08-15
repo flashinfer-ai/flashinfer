@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,11 +25,12 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "0ba265ee60e50548481fd1d2e2891496e84c98858ec1c132b452298dabcf8249"
+    "c181a7378577b171671c95c1ed758aca06541251d0c6c54b93b5ea600bb4bbe1"
 )
 
 _FLASHINFER_BINDINGS = (
     "cake_fmha_jit_binding.cu",
+    "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
@@ -38,6 +40,10 @@ _TARGET_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
 }
+_TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+_DECODE_NATIVE_BF16_JIT_BINDING = (
+    "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+)
 
 
 def get_cake_fmha_csrc_dir() -> Path:
@@ -143,6 +149,187 @@ def get_cake_fmha_compat_uri(target: CakeFmhaTarget) -> str:
     )
 
 
+def _validate_decode_native_bf16_specialization(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> dict[str, int]:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    if batch_size <= 0 or q_len <= 0:
+        raise ValueError("batch_size and q_len must be positive")
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if not 1 <= num_q_heads // num_kv_heads <= 8:
+        raise ValueError("decode-native BF16 requires a head-group ratio in [1, 8]")
+    return {
+        "HAS_SINK": int(has_sink),
+        "HAS_WINDOW": int(has_window),
+        "RETAIN_KV_L2": int(retain_kv_l2),
+        "USE_SCALE_PTR": int(use_scale_ptr),
+    }
+
+
+def _get_component_sources(
+    component_name: str,
+    target: CakeFmhaTarget,
+    selector: Mapping[str, int],
+    jit_binding: str,
+) -> tuple[Path, Path, Path]:
+    component = get_cake_fmha_manifest()["components"][component_name]
+    normalized_selector = dict(sorted(selector.items()))
+    matches = [
+        member
+        for member in component["source_family"]
+        if member.get("selector") == normalized_selector
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Cake FMHA component selector is not unique: "
+            f"{component_name} {normalized_selector!r}"
+        )
+    csrc_dir = get_cake_fmha_csrc_dir()
+    body = csrc_dir / matches[0]["sources"][_TARGET_MANIFEST_ARCH[target]]
+    launch_binding = csrc_dir / component["binding_source"]
+    api_binding = csrc_dir / jit_binding
+    for source in (body, launch_binding, api_binding):
+        if not source.is_file():
+            raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
+    return body, launch_binding, api_binding
+
+
+def get_cake_fmha_decode_native_bf16_uri(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> str:
+    selector = _validate_decode_native_bf16_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    )
+    return (
+        f"cake_fmha_decode_native_bf16_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_sink{selector['HAS_SINK']}_window{selector['HAS_WINDOW']}"
+        f"_scale{selector['USE_SCALE_PTR']}_retain{selector['RETAIN_KV_L2']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_decode_native_bf16_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> JitSpec:
+    """Build one authenticated decode-native BF16 specialization."""
+
+    selector = _validate_decode_native_bf16_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    )
+    sources = _get_component_sources(
+        "decode_native_bf16",
+        target,
+        selector,
+        _DECODE_NATIVE_BF16_JIT_BINDING,
+    )
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_native_bf16_uri(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            has_sink=has_sink,
+            has_window=has_window,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=retain_kv_l2,
+        ),
+        sources=list(sources),
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DQ_LEN={q_len}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCAKE_FMHA_HAS_SINK={selector['HAS_SINK']}",
+            f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
+            f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA decode-native BF16 JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_native_bf16_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+):
+    module = gen_cake_fmha_decode_native_bf16_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA decode-native BF16 module: %s", module)
+    return module
+
+
 @functools.cache
 def gen_cake_fmha_compat_module(target: CakeFmhaTarget) -> JitSpec:
     """Build the complete-domain route from the authenticated source package."""
@@ -187,9 +374,12 @@ __all__ = [
     "CAKE_FMHA_FLASHINFER_MATRIX_REVISION",
     "CAKE_FMHA_MANIFEST_SHA256",
     "CakeFmhaTarget",
+    "gen_cake_fmha_decode_native_bf16_module",
     "gen_cake_fmha_compat_module",
+    "get_cake_fmha_decode_native_bf16_uri",
     "get_cake_fmha_compat_uri",
     "get_cake_fmha_csrc_dir",
     "get_cake_fmha_manifest",
+    "load_cake_fmha_decode_native_bf16_module",
     "load_cake_fmha_compat_module",
 ]
