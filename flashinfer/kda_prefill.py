@@ -39,6 +39,10 @@ _FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
 _FLASH_KDA_K1_PACKET_BYTES = 31_520
+_FLASH_KDA_K1_PARALLEL_VARIANTS = (
+    "m64_k1_parallel",
+    "m128_k1_parallel",
+)
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
@@ -65,7 +69,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128", "m64_k1_parallel", "m128_k1_parallel")
+            for variant in ("m64", "m128", *_FLASH_KDA_K1_PARALLEL_VARIANTS)
         }
         self._descriptor_signatures: dict[str, tuple] = {}
         self._bound_stream_ptr: Optional[int] = None
@@ -290,8 +294,8 @@ def _select_flash_kda_prefill_variant(
         and (num_heads != 1 or fixed_layout)
         and average_sequence_length >= 2048
     ):
-        # Architecture-specific cold-L2 forced-route sweeps are recorded in
-        # docs/notes/kda_k1_parallelism_validation.md.
+        # Keep only schedules that won the architecture-specific cold-L2
+        # forced-route sweeps used to tune this dispatch.
         depth_schedule = (
             ((8, 15), (32, 30))
             if compute_capability == (10, 0)
@@ -819,7 +823,7 @@ def _run_flash_kda_prefill(
                 final_state_arg,
                 descriptor_storage,
             )
-            if variant in ("m64_k1_parallel", "m128_k1_parallel"):
+            if variant in _FLASH_KDA_K1_PARALLEL_VARIANTS:
                 k1_mailbox = _k1_mailbox_workspace(
                     workspace=workspace,
                     device=q.device,

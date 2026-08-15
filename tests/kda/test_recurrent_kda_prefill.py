@@ -14,7 +14,6 @@
 
 import importlib
 import math
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -391,12 +390,6 @@ def test_k1_parallel_b200_oracle(
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
     )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=148),
-    )
-
     actual = kda_prefill_api._select_flash_kda_prefill_variant(
         fixed_layout=True,
         num_sequences=num_sequences,
@@ -468,11 +461,6 @@ def test_k1_parallel_varlen_oracle(
         "get_compute_capability",
         lambda device: compute_capability,
     )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=148),
-    )
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=False,
@@ -499,8 +487,10 @@ def test_k1_parallel_varlen_fallback_stays_m128(monkeypatch):
 
 
 def test_k1_mailbox_size_is_bounded():
-    assert kda_prefill_api._k1_mailbox_bytes(8, 15) < 4_000_000
-    assert kda_prefill_api._k1_mailbox_bytes(32, 30) < 31_000_000
+    assert kda_prefill_api._k1_mailbox_bytes(8, 15) == 3_782_880
+    assert kda_prefill_api._k1_mailbox_bytes(32, 30) == 30_263_040
+    assert kda_prefill_api._k1_mailbox_bytes(32, 45) == 45_394_560
+    assert kda_prefill_api._k1_mailbox_bytes(32, 45) < 48_000_000
 
 
 def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
@@ -511,11 +501,6 @@ def test_k1_parallel_route_and_ffi_abi(cuda_device, monkeypatch):
         kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
     )
     monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=148),
-    )
     module = _RecorderModule()
     routes = []
 
@@ -1131,6 +1116,17 @@ def test_frozen_prefill_m64_rejects_unsupported_heads(
 
 @pytest.mark.parametrize(("seq_len", "num_heads"), [(2048, 4), (2048, 8), (2048, 16)])
 def test_k1_parallel_prefill_matches_reference(flash_kda_device, seq_len, num_heads):
+    variant, cluster_size, _mailbox_depth = (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=True,
+            num_sequences=1,
+            num_heads=num_heads,
+            sequence_length=seq_len,
+            device=flash_kda_device,
+        )
+    )
+    assert (variant, cluster_size) == ("m128_k1_parallel", 4)
+
     inputs = _make_inputs(
         seq_lens=[seq_len],
         num_heads=num_heads,
@@ -1193,6 +1189,9 @@ def test_k1_parallel_h4_matches_m128_bitwise(cuda_device, monkeypatch):
 
 
 def test_m128_k1_parallel_c8_matches_m128_bitwise(cuda_device, monkeypatch):
+    if get_compute_capability(cuda_device) not in ((10, 0), (10, 3)):
+        pytest.skip("the forced M128 C8 route requires an SM100-family GPU")
+
     inputs = _make_inputs(
         seq_lens=[2048],
         num_heads=8,

@@ -300,7 +300,8 @@ def _run_case(
         route_orders.append(route_order)
         for name in route_order:
             route = routes[name]
-            timed_state_pool.copy_(initial.unsqueeze(0))
+            if state_cursor:
+                timed_state_pool[:state_cursor].copy_(initial.unsqueeze(0))
             state_cursor = 0
             torch.cuda.synchronize()
             with _physical_route(route):
@@ -402,7 +403,7 @@ def main() -> None:
         help=(
             "force an owner/helper physical variant, for example: "
             "--forced-routes m64_k1_parallel:4:10 "
-            "m64_k1_parallel:8:30"
+            "m128_k1_parallel:8:35"
         ),
     )
     parser.add_argument("--cupti", action="store_true")
