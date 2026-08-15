@@ -14,6 +14,7 @@
 
 import importlib
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -328,6 +329,98 @@ def test_flash_kda_target_resolution(
         )
 
 
+def test_flash_kda_sm_count_is_cached_per_device(monkeypatch):
+    calls = []
+
+    def get_device_properties(device):
+        resolved = torch.device(device)
+        calls.append(resolved)
+        return SimpleNamespace(
+            multi_processor_count=148 if resolved.index == 0 else 152
+        )
+
+    kda_prefill_api._flash_kda_device_sm_count.cache_clear()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
+    try:
+        assert kda_prefill_api._flash_kda_device_sm_count(torch.device("cuda:0")) == 148
+        assert kda_prefill_api._flash_kda_device_sm_count(torch.device("cuda:0")) == 148
+        assert kda_prefill_api._flash_kda_device_sm_count(torch.device("cuda:1")) == 152
+        assert kda_prefill_api._flash_kda_device_sm_count(torch.device("cuda:1")) == 152
+        assert calls == [torch.device("cuda:0"), torch.device("cuda:1")]
+    finally:
+        kda_prefill_api._flash_kda_device_sm_count.cache_clear()
+
+
+def test_persistent_policy_is_exact_b200_and_bins_match_cake():
+    for target, sm_count, expected in (
+        ("sm100a", 148, True),
+        ("sm100a", 152, False),
+        ("sm103a", 148, False),
+        ("sm103a", 152, False),
+    ):
+        assert (
+            kda_prefill_api._uses_measured_b200_persistent_policy(
+                target=target,
+                sm_count=sm_count,
+            )
+            is expected
+        )
+
+    uniform = kda_prefill_api._persistent_task_plan(
+        (8192,) * 8,
+        num_heads=96,
+        sm_count=148,
+    )
+    assert uniform is not None
+    sequence_order, task_ids, task_offsets = uniform
+    assert sequence_order == tuple(range(8))
+    assert sorted(task_ids) == list(range(8 * 96))
+    assert len(task_offsets) == 129
+    assert {
+        right - left
+        for left, right in zip(task_offsets, task_offsets[1:], strict=False)
+    } == {6}
+
+    mixed = kda_prefill_api._persistent_task_plan(
+        (3063, 2048, 1300, 963, 547, 271),
+        num_heads=96,
+        sm_count=148,
+    )
+    assert mixed is not None
+    _, mixed_ids, mixed_offsets = mixed
+    assert sorted(mixed_ids) == list(range(6 * 96))
+    assert len(mixed_offsets) == 149
+    assert (
+        kda_prefill_api._persistent_task_plan(
+            (8192,) * 8,
+            num_heads=96,
+            sm_count=152,
+        )
+        is None
+    )
+
+
+def test_variant_selector_exposes_persistent_only_when_requested():
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=8,
+            num_heads=96,
+            use_persistent_m128=True,
+        )
+        == "persistent_m128"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=8,
+            num_heads=12,
+            use_persistent_m128=True,
+        )
+        == "m128_n16"
+    )
+
+
 class _RecorderModule:
     def __init__(self, *, final_value=None):
         self.calls = []
@@ -336,9 +429,21 @@ class _RecorderModule:
     def run(self, *args):
         self.calls.append(args)
         if self.final_value is not None:
-            store_final_state = args[17] if len(args) == 21 else args[23]
+            store_final_state = (
+                args[17]
+                if len(args) == 21
+                else args[19]
+                if len(args) == 23
+                else args[23]
+            )
             if bool(store_final_state):
-                final_state = args[12] if len(args) == 21 else args[13]
+                final_state = (
+                    args[12]
+                    if len(args) == 21
+                    else args[14]
+                    if len(args) == 23
+                    else args[13]
+                )
                 final_state.fill_(self.final_value)
 
 
@@ -503,6 +608,59 @@ def test_frozen_route_and_ffi_abi(
         assert args[27] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
+
+
+def test_b200_uniform_prefill_reaches_persistent_worker_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 0),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 148,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[2, 2],
+        num_heads=96,
+        packed=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+    )
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("persistent_m128", "sm100a")]
+    (args,) = module.calls
+    assert len(args) == 23
+    assert args[9].tolist() == [0, 1]
+    assert sorted(args[10].tolist()) == list(range(2 * 96))
+    assert args[11].numel() == 149
+    assert args[11][0].item() == 0
+    assert args[11][-1].item() == 2 * 96
+    assert args[15].dtype == torch.uint8
+    assert args[15].shape == (768,)
+    assert args[16] == 1
+    assert args[17] == 96
 
 
 def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(

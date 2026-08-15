@@ -73,8 +73,9 @@ def recurrent_kda(
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
     gate modes as the backend implementation. On SM100a (B200/GB200) and
     SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
-    prefill is dispatched to the corresponding frozen SM100-family kernel. All
-    existing decode and speculative-decode calls retain the CuTe DSL backend.
+    prefill is dispatched across the frozen direct-M128, M64, and B200-only
+    persistent schedules. All existing decode and speculative-decode calls
+    retain the CuTe DSL backend.
 
     Args:
         q (torch.Tensor):
@@ -131,7 +132,9 @@ def recurrent_kda(
             int64 outside graph capture; graph capture requires caller-provided
             int64 offsets. For frozen prefill, values must start at zero, be
             strictly increasing, and end at the total token count. This value
-            contract is not host-validated to avoid a device synchronization.
+            contract is not normally host-validated. Eager 148-SM B200 calls
+            that are candidates for the persistent schedule read these values
+            once to construct the worker task bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
@@ -165,15 +168,19 @@ def recurrent_kda(
             Optional packed-prefill sequence order, as a contiguous CUDA int32
             permutation of shape ``[N]``. Sorting by descending sequence length
             improves tail utilization. It is only consumed by the frozen
-            FlashKDA prefill backend; prepare it before CUDA graph capture or
-            timed launches. Fixed-layout prefill and decode calls must leave it
-            as ``None``.
+            FlashKDA prefill backend; supplying it keeps the direct schedule so
+            caller-owned ordering is not replaced by persistent task bins.
+            Prepare it before CUDA graph capture or timed launches.
+            Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for the frozen SM100-family prefill backend.
             It is optional for eager execution and required for CUDA graph
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
-            ``recurrent_kda`` invocation.
+            ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
+            capture use direct/M64 schedules; persistent task planning is an
+            eager-only B200 route because its bins depend on host-visible
+            sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
             Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
             frozen prefill. Row zero for each sequence is its initial state;

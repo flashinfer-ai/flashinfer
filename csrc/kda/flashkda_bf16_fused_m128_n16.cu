@@ -16,8 +16,8 @@
 
 // Frozen generated Loom export; do not edit by hand.
 // Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module
-// flashkda_bf16_fused_m128_25af6159e2; raw SHA-256:
-// fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f.
+// flashkda_bf16_fused_m128_ef8b47d690; raw SHA-256:
+// bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -333,16 +333,6 @@ __device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src)
 }
 
 
-__device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count, uint32_t pred) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %2, 0;\n\t"
-        "@p mbarrier.init.shared::cta.b64 [%0], %1;\n\t"
-        "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
-}
-
-
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -615,102 +605,55 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
     // Mbarriers at smem_raw[0..616)
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
         // --- pipeline 'chunk_pipe' ---
         // qk_full: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 0, 1, leader);
-        mbarrier_init_pred(smem + 8, 1, leader);
-        mbarrier_init_pred(smem + 16, 1, leader);
-        mbarrier_init_pred(smem + 24, 1, leader);
-        mbarrier_init_pred(smem + 32, 1, leader);
         // gate_raw_full: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 40, 1, leader);
-        mbarrier_init_pred(smem + 48, 1, leader);
-        mbarrier_init_pred(smem + 56, 1, leader);
-        mbarrier_init_pred(smem + 64, 1, leader);
-        mbarrier_init_pred(smem + 72, 1, leader);
         // qk_raw_full: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 80, 1, leader);
-        mbarrier_init_pred(smem + 88, 1, leader);
-        mbarrier_init_pred(smem + 96, 1, leader);
-        mbarrier_init_pred(smem + 104, 1, leader);
-        mbarrier_init_pred(smem + 112, 1, leader);
         // v_full: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 120, 1, leader);
-        mbarrier_init_pred(smem + 128, 1, leader);
-        mbarrier_init_pred(smem + 136, 1, leader);
-        mbarrier_init_pred(smem + 144, 1, leader);
-        mbarrier_init_pred(smem + 152, 1, leader);
         // v_free: 5 barriers, init_count=4
-        mbarrier_init_pred(smem + 160, 4, leader);
-        mbarrier_init_pred(smem + 168, 4, leader);
-        mbarrier_init_pred(smem + 176, 4, leader);
-        mbarrier_init_pred(smem + 184, 4, leader);
-        mbarrier_init_pred(smem + 192, 4, leader);
         // smem_free: 5 barriers, init_count=4
-        mbarrier_init_pred(smem + 200, 4, leader);
-        mbarrier_init_pred(smem + 208, 4, leader);
-        mbarrier_init_pred(smem + 216, 4, leader);
-        mbarrier_init_pred(smem + 224, 4, leader);
-        mbarrier_init_pred(smem + 232, 4, leader);
         // raw_inputs_free: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 240, 1, leader);
-        mbarrier_init_pred(smem + 248, 1, leader);
-        mbarrier_init_pred(smem + 256, 1, leader);
-        mbarrier_init_pred(smem + 264, 1, leader);
-        mbarrier_init_pred(smem + 272, 1, leader);
         // state_inp_ready: 5 barriers, init_count=4
-        mbarrier_init_pred(smem + 280, 4, leader);
-        mbarrier_init_pred(smem + 288, 4, leader);
-        mbarrier_init_pred(smem + 296, 4, leader);
-        mbarrier_init_pred(smem + 304, 4, leader);
-        mbarrier_init_pred(smem + 312, 4, leader);
         // old_out_ready: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 320, 1, leader);
-        mbarrier_init_pred(smem + 328, 1, leader);
-        mbarrier_init_pred(smem + 336, 1, leader);
-        mbarrier_init_pred(smem + 344, 1, leader);
-        mbarrier_init_pred(smem + 352, 1, leader);
         // u_inp_ready: 5 barriers, init_count=4
-        mbarrier_init_pred(smem + 360, 4, leader);
-        mbarrier_init_pred(smem + 368, 4, leader);
-        mbarrier_init_pred(smem + 376, 4, leader);
-        mbarrier_init_pred(smem + 384, 4, leader);
-        mbarrier_init_pred(smem + 392, 4, leader);
         // u2_acc_ready: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 400, 1, leader);
-        mbarrier_init_pred(smem + 408, 1, leader);
-        mbarrier_init_pred(smem + 416, 1, leader);
-        mbarrier_init_pred(smem + 424, 1, leader);
-        mbarrier_init_pred(smem + 432, 1, leader);
         // u2_inp_ready: 5 barriers, init_count=4
-        mbarrier_init_pred(smem + 440, 4, leader);
-        mbarrier_init_pred(smem + 448, 4, leader);
-        mbarrier_init_pred(smem + 456, 4, leader);
-        mbarrier_init_pred(smem + 464, 4, leader);
-        mbarrier_init_pred(smem + 472, 4, leader);
         // final_ready: 5 barriers, init_count=1
-        mbarrier_init_pred(smem + 480, 1, leader);
-        mbarrier_init_pred(smem + 488, 1, leader);
-        mbarrier_init_pred(smem + 496, 1, leader);
-        mbarrier_init_pred(smem + 504, 1, leader);
-        mbarrier_init_pred(smem + 512, 1, leader);
         // out_empty: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 520, 1, leader);
         // tmem_dealloc_ready: 1 barriers, init_count=2
-        mbarrier_init_pred(smem + 528, 2, leader);
         // prep_diag_ready: 5 barriers, init_count=2
-        mbarrier_init_pred(smem + 536, 2, leader);
-        mbarrier_init_pred(smem + 544, 2, leader);
-        mbarrier_init_pred(smem + 552, 2, leader);
-        mbarrier_init_pred(smem + 560, 2, leader);
-        mbarrier_init_pred(smem + 568, 2, leader);
         // prep_inv16_ready: 5 barriers, init_count=2
-        mbarrier_init_pred(smem + 576, 2, leader);
-        mbarrier_init_pred(smem + 584, 2, leader);
-        mbarrier_init_pred(smem + 592, 2, leader);
-        mbarrier_init_pred(smem + 600, 2, leader);
-        mbarrier_init_pred(smem + 608, 2, leader);
+        // Warp-cooperative initialization, grouped by equal arrival count.
+        for (int _bar = lane; _bar < 20; _bar += 32) {
+            mbarrier_init(smem + 0 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 10; _bar += 32) {
+            mbarrier_init(smem + 160 + _bar * 8, 4);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 240 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 280 + _bar * 8, 4);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 320 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 360 + _bar * 8, 4);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 400 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 440 + _bar * 8, 4);
+        }
+        for (int _bar = lane; _bar < 6; _bar += 32) {
+            mbarrier_init(smem + 480 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 11; _bar += 32) {
+            mbarrier_init(smem + 528 + _bar * 8, 2);
+        }
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
 

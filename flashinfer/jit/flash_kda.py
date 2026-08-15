@@ -27,13 +27,14 @@ from .core import (
     sm103a_nvcc_flags,
 )
 
-FlashKDAVariant = Literal["m64", "m128", "m128_n16"]
+FlashKDAVariant = Literal["m64", "m128", "m128_n16", "persistent_m128"]
 FlashKDATarget = Literal["sm100a", "sm103a"]
 
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
     "m128",
     "m128_n16",
+    "persistent_m128",
 )
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -45,12 +46,21 @@ _FLASH_KDA_TARGET_DEFINE = {
     "sm103a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
 }
 
-# Keep frozen M128 cache keys tied to the exact Loom module identities. This
-# prevents an installed JIT/AOT cache containing the previous N32 body from
-# satisfying either refreshed schedule after an in-place package upgrade.
-_FLASH_KDA_M128_MODULE_IDENTS = {
-    "m128": "871d55e77f",
-    "m128_n16": "25af6159e2",
+# Keep every frozen cache key tied to the exact Loom module identity. This
+# prevents an installed JIT/AOT cache from satisfying a refreshed export after
+# an in-place package upgrade.
+_FLASH_KDA_MODULE_IDENTS = {
+    "m64": "9a5566f3be",
+    "m128": "ea022a2f1f",
+    "m128_n16": "ef8b47d690",
+    "persistent_m128": "0f3142c047",
+}
+
+_FLASH_KDA_BINDING_STEMS = {
+    "m64": "flashkda_bf16_fused_m64",
+    "m128": "flashkda_bf16_fused_m128",
+    "m128_n16": "flashkda_bf16_fused_m128_n16",
+    "persistent_m128": "flashkda_bf16_persistent_m128",
 }
 
 
@@ -94,10 +104,10 @@ def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
     if target not in _FLASH_KDA_NVCC_FLAGS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
-    if variant in _FLASH_KDA_M128_MODULE_IDENTS:
-        module_ident = _FLASH_KDA_M128_MODULE_IDENTS[variant]
-        return f"flash_kda_bf16_fused_{variant}_{module_ident}_{target}"
-    return f"flash_kda_bf16_fused_{variant}_{target}"
+    if variant == "persistent_m128" and target != "sm100a":
+        raise ValueError("persistent FlashKDA is exported only for exact sm100a")
+    module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
+    return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
 
 
 @functools.cache
@@ -114,7 +124,7 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
     csrc_dir = _get_flash_kda_csrc_dir()
     include_dir = _get_flash_kda_include_dir()
     uri = get_flash_kda_uri(variant, target)
-    binding = csrc_dir / f"flashkda_bf16_fused_{variant}_binding.cu"
+    binding = csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"
     if not binding.exists():
         raise FileNotFoundError(f"FlashKDA binding source not found: {binding}")
 
@@ -153,6 +163,12 @@ def gen_flash_kda_m128_n16_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("m128_n16", target)
 
 
+def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the B200-only static-binned persistent M128 module."""
+
+    return gen_flash_kda_module("persistent_m128", target)
+
+
 @functools.cache
 def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Build or load one physical, target-specific FlashKDA module."""
@@ -180,6 +196,12 @@ def load_flash_kda_m128_n16_module(target: FlashKDATarget):
     return load_flash_kda_module("m128_n16", target)
 
 
+def load_flash_kda_persistent_m128_module(target: FlashKDATarget):
+    """Load the B200-only static-binned persistent M128 module."""
+
+    return load_flash_kda_module("persistent_m128", target)
+
+
 def get_flash_kda_prefill_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
 
@@ -193,11 +215,13 @@ __all__ = [
     "gen_flash_kda_m64_module",
     "gen_flash_kda_m128_module",
     "gen_flash_kda_m128_n16_module",
+    "gen_flash_kda_persistent_m128_module",
     "gen_flash_kda_module",
     "get_flash_kda_prefill_module",
     "get_flash_kda_uri",
     "load_flash_kda_m64_module",
     "load_flash_kda_m128_module",
     "load_flash_kda_m128_n16_module",
+    "load_flash_kda_persistent_m128_module",
     "load_flash_kda_module",
 ]

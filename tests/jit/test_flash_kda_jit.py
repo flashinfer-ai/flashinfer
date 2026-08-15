@@ -27,17 +27,24 @@ from flashinfer.jit import flash_kda
 
 def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     csrc_dir = flash_kda._get_flash_kda_csrc_dir()
-    manifest_path = csrc_dir / "flashkda_bf16_fused_m128_import_manifest.json"
+    manifest_path = csrc_dir / "flashkda_prefill_import_manifest.json"
     manifest = json.loads(manifest_path.read_text())
 
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["architecture_artifacts_are_separate"] is True
-    assert manifest["generated_source_text_equal_across_architectures"] is True
+    assert manifest["generated_source_text_equal_across_architectures"] == [
+        "n16",
+        "n32",
+        "m64",
+    ]
     assert set(manifest["profiles"]) == {
         "sm100_n16",
         "sm103_n16",
         "sm100_n32",
         "sm103_n32",
+        "sm100_m64",
+        "sm103_m64",
+        "sm100_persistent",
     }
     assert {profile["arch"] for profile in manifest["profiles"].values()} == {
         "sm_100a",
@@ -50,19 +57,35 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     expected_variants = {
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
-            "fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f",
-            "c9c147eadec6d27cd8170a404dcf47a6d2ad50bf488a918fe8e79403f77e2d59",
-            "flashkda_bf16_fused_m128_25af6159e2",
-            170492,
+            "bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c",
+            "5a701fc2cc38a24b3c46498859d96ec62cacc8a8c011514d3297416f92a34470",
+            "flashkda_bf16_fused_m128_ef8b47d690",
+            167472,
             219136,
         ),
         "n32": (
             "flashkda_bf16_fused_m128.cu",
-            "74b249b2616fc837e4bdcab2d4d18f6a6cb3b64a4785d6c124658e7cfcdcf75c",
-            "f18a1d71377b398686816e809ed79ad6f362af3dea575b766dd57e4f1d89fdb0",
-            "flashkda_bf16_fused_m128_871d55e77f",
-            169217,
+            "bee12ccbc2c30bfa79ca5f698a2373bda83e6e76cf31988ef25de50dfda526c1",
+            "1eccb8096762b69abd2fbdf445e9da2faf6981f23606d78a368f946ee35d7987",
+            "flashkda_bf16_fused_m128_ea022a2f1f",
+            166197,
             227328,
+        ),
+        "m64": (
+            "flashkda_bf16_fused_m64.cu",
+            "1cea03f061dd0bcf687f419d3bc5e48b4112374dc31c7f41c1922e6152ca7536",
+            "758d319df9cc56fb9bb37d40c7876e2855fbfbc198fabe8623157541ccf635f5",
+            "flashkda_bf16_fused_m64_9a5566f3be",
+            169546,
+            221696,
+        ),
+        "persistent": (
+            "flashkda_bf16_persistent_m128.cu",
+            "56a16e141ed0aa9844df310739bfdc3b50619c24bec251f6998e8cbfd17b2300",
+            "a78fdbfced65a4aa5e0d91a51735847f3f01a183804a2999d7586da46b4ec8a8",
+            "flashkda_bf16_persistent_m128_0f3142c047",
+            162850,
+            221696,
         ),
     }
     for variant, (
@@ -104,7 +127,7 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
     manifest = json.loads(
         (
             flash_kda._get_flash_kda_csrc_dir()
-            / "flashkda_bf16_fused_m128_import_manifest.json"
+            / "flashkda_prefill_import_manifest.json"
         ).read_text()
     )
     assert namespace["PROFILES"] == manifest["profiles"]
@@ -145,23 +168,30 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
     [
         (
             "m64",
-            219136,
-            "c28aacd475983c72ffe84acac7321a0b2e1c495d7c6e9cdc4a80ada112d76515",
-            None,
-            False,
+            221696,
+            "1cea03f061dd0bcf687f419d3bc5e48b4112374dc31c7f41c1922e6152ca7536",
+            "9a5566f3be",
+            True,
         ),
         (
             "m128",
             227328,
-            "74b249b2616fc837e4bdcab2d4d18f6a6cb3b64a4785d6c124658e7cfcdcf75c",
-            "871d55e77f",
+            "bee12ccbc2c30bfa79ca5f698a2373bda83e6e76cf31988ef25de50dfda526c1",
+            "ea022a2f1f",
             True,
         ),
         (
             "m128_n16",
             219136,
-            "fc03fedff6d899967c6a6e019d834769c29429eb69390f4ca55888634ababe0f",
-            "25af6159e2",
+            "bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c",
+            "ef8b47d690",
+            True,
+        ),
+        (
+            "persistent_m128",
+            221696,
+            "56a16e141ed0aa9844df310739bfdc3b50619c24bec251f6998e8cbfd17b2300",
+            "0f3142c047",
             True,
         ),
     ],
@@ -211,14 +241,20 @@ def test_flash_kda_uri_and_jit_spec(
     )
     flash_kda.gen_flash_kda_module.cache_clear()
 
+    if variant == "persistent_m128" and target == "sm103a":
+        with pytest.raises(ValueError, match="only for exact sm100a"):
+            flash_kda.get_flash_kda_uri(variant, target)
+        return
+
     uri = flash_kda.get_flash_kda_uri(variant, target)
     spec = flash_kda.gen_flash_kda_module(variant, target)
 
-    ident_suffix = f"_{module_ident}" if module_ident is not None else ""
-    assert uri == f"flash_kda_bf16_fused_{variant}{ident_suffix}_{target}"
+    assert uri == f"flash_kda_bf16_{variant}_{module_ident}_{target}"
     assert spec.name == uri
     assert len(spec.sources) == 1
-    assert spec.sources[0].name == f"flashkda_bf16_fused_{variant}_binding.cu"
+    assert spec.sources[0].name == (
+        f"{flash_kda._FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"
+    )
     assert spec.sources[0].is_file()
     assert expected_flag in spec.extra_cuda_cflags
     target_defines = [
@@ -234,13 +270,18 @@ def test_flash_kda_uri_and_jit_spec(
         for flag in spec.extra_cuda_cflags
     )
     assert not any("compute_120" in flag for flag in spec.extra_cuda_cflags)
-    frozen_source = spec.sources[0].parent / f"flashkda_bf16_fused_{variant}.cu"
-    frozen_text = frozen_source.read_text()
-    schedule_variant = "m64" if variant == "m64" else "m128"
-    assert (
-        f"Provenance: generated Loom schedule 'flashkda_bf16_fused_{schedule_variant}'"
-        in frozen_text
+    frozen_source = spec.sources[0].parent / (
+        f"{flash_kda._FLASH_KDA_BINDING_STEMS[variant]}.cu"
     )
+    frozen_text = frozen_source.read_text()
+    schedule_symbol = (
+        "flashkda_bf16_persistent_m128"
+        if variant == "persistent_m128"
+        else "flashkda_bf16_fused_m64"
+        if variant == "m64"
+        else "flashkda_bf16_fused_m128"
+    )
+    assert f"Provenance: generated Loom schedule '{schedule_symbol}'" in frozen_text
     assert f"#define SMEM_TOTAL {smem_bytes}" in frozen_text
     assert frozen_text.count("// clang-format off") == 1
     assert frozen_text.rstrip().endswith("// clang-format on")
@@ -324,7 +365,7 @@ def test_flash_kda_uri_and_jit_spec(
     chunk_tokens = 16 if variant == "m128_n16" else 32
     value_rows = 64 if variant == "m64" else 128
     assert f"EncodeTmaPointers<{value_rows}, {chunk_tokens}>" in binding_text
-    if variant != "m64":
+    if variant in {"m128", "m128_n16"}:
         assert "TensorView state_indices" in binding_text
         assert "TensorView state_checkpoints" in binding_text
         assert "int64_t beta_token_stride" in binding_text
@@ -337,12 +378,13 @@ def test_flash_kda_uri_and_jit_spec(
             "reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())"
             in binding_text
         )
-        assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in (
-            binding_text
-        )
-        assert (
-            "reinterpret_cast<flashkda_generated_LoomTensorMap const*>" in binding_text
-        )
+    if variant == "persistent_m128":
+        assert "TensorView task_ids" in binding_text
+        assert "TensorView task_offsets" in binding_text
+        assert "sm_count == 148" in binding_text
+        assert "kFlashKDATargetMinor == 0" in binding_text
+    assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in binding_text
+    assert "reinterpret_cast<flashkda_generated_LoomTensorMap const*>" in binding_text
 
 
 def test_flash_kda_descriptor_workspace_contract():
@@ -403,6 +445,8 @@ def test_flash_kda_variant_validation_and_public_getter(monkeypatch):
         flash_kda.get_flash_kda_uri("m32", "sm100a")
     with pytest.raises(ValueError, match="unsupported FlashKDA target"):
         flash_kda.get_flash_kda_uri("m128", "sm120a")
+    with pytest.raises(ValueError, match="only for exact sm100a"):
+        flash_kda.get_flash_kda_uri("persistent_m128", "sm103a")
 
     sentinel = object()
     monkeypatch.setattr(
@@ -432,12 +476,12 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     n16_sm103a = flash_kda.gen_flash_kda_module("m128_n16", "sm103a")
 
     assert sm100a is not sm103a
-    assert sm100a.name == "flash_kda_bf16_fused_m128_871d55e77f_sm100a"
-    assert sm103a.name == "flash_kda_bf16_fused_m128_871d55e77f_sm103a"
+    assert sm100a.name == "flash_kda_bf16_m128_ea022a2f1f_sm100a"
+    assert sm103a.name == "flash_kda_bf16_m128_ea022a2f1f_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_25af6159e2_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_25af6159e2_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_m128_n16_ef8b47d690_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_m128_n16_ef8b47d690_sm103a"
 
 
 @pytest.mark.parametrize(
@@ -495,7 +539,7 @@ def test_aot_detects_flash_kda_target_matrix(
         ),
     ],
 )
-def test_aot_registers_three_flash_kda_modules(
+def test_aot_registers_complete_flash_kda_modules(
     monkeypatch, capabilities, expected_targets
 ):
     from flashinfer import aot
@@ -522,6 +566,11 @@ def test_aot_registers_three_flash_kda_modules(
         lambda target: fake_flash_kda("m128_n16", target),
     )
     monkeypatch.setattr(
+        aot,
+        "gen_flash_kda_persistent_m128_module",
+        lambda target: fake_flash_kda("persistent_m128", target),
+    )
+    monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
     )
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
@@ -546,18 +595,16 @@ def test_aot_registers_three_flash_kda_modules(
         False,
     )
 
-    expected_calls = [
-        (variant, target)
-        for target in expected_targets
-        for variant in ("m64", "m128", "m128_n16")
-    ]
+    expected_calls = []
+    for target in expected_targets:
+        expected_calls.extend(
+            (variant, target) for variant in ("m64", "m128", "m128_n16")
+        )
+        if target == "sm100a":
+            expected_calls.append(("persistent_m128", target))
     assert calls == expected_calls
     assert [spec.name for spec in specs] == [
         "spdlog",
-        *[
-            f"flash_kda_{variant}_{target}"
-            for target in expected_targets
-            for variant in ("m64", "m128", "m128_n16")
-        ],
+        *[f"flash_kda_{variant}_{target}" for variant, target in expected_calls],
         "cudnn",
     ]

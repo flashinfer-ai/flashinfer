@@ -66,6 +66,7 @@ from .jit.flash_kda import (
     gen_flash_kda_m64_module,
     gen_flash_kda_m128_module,
     gen_flash_kda_m128_n16_module,
+    gen_flash_kda_persistent_m128_module,
 )
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
@@ -572,6 +573,8 @@ def gen_all_modules(
                     gen_flash_kda_m128_n16_module(flash_kda_target),
                 ]
             )
+            if flash_kda_target == "sm100a":
+                jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
