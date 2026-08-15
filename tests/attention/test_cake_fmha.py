@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import flashinfer
 import flashinfer.cake_fmha as cake_api
@@ -89,6 +90,44 @@ def test_cake_public_symbols_are_top_level() -> None:
         cake_api.cake_batch_context_with_kv_cache
     )
     assert flashinfer.cake_fmha_manifest is cake_api.cake_fmha_manifest
+
+
+def test_cake_fmha_aot_registers_each_exact_blackwell_target(monkeypatch) -> None:
+    from flashinfer import aot
+
+    monkeypatch.setattr(aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog"))
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    monkeypatch.setattr(
+        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_cake_fmha_compat_module",
+        lambda target: SimpleNamespace(name=f"cake-{target}"),
+    )
+
+    specs = aot.gen_all_modules(
+        [torch.bfloat16],
+        [torch.float8_e4m3fn],
+        [(128, 128)],
+        [(128, 128)],
+        [False],
+        [False],
+        {"sm100a_exact": True, "sm103a_exact": True},
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+    assert {spec.name for spec in specs} == {
+        "spdlog",
+        "cudnn",
+        "cake-sm100a",
+        "cake-sm103a",
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
