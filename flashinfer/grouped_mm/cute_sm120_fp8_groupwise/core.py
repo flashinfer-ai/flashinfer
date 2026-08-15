@@ -201,7 +201,7 @@ def moe_gemm_fp8_nt_groupwise(
     m_indptr: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     scale_major_mode: Literal["MN"] = "MN",
-    backend: Literal["cute"] = "cute",
+    backend: Literal["cute", "cutedsl"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     is_gated: bool = False,
@@ -251,8 +251,9 @@ def moe_gemm_fp8_nt_groupwise(
         The layout mode of scale tensors. Currently only ``"MN"`` is supported.
         Defaults to ``"MN"``.
 
-    backend: Literal["cute"]
-        Backend selector. Currently only ``"cute"`` is implemented.
+    backend: Literal["cute", "cutedsl"]
+        Backend selector. ``"cute"`` is the CuTe C++ kernel; ``"cutedsl"`` is the CuteDSL
+        kernel, which shares this ABI but does not implement ``is_gated=True``.
 
     out: Optional[torch.Tensor]
         The output tensor, shape ``(cum_m, n)``. If not specified, an output tensor will be
@@ -285,9 +286,10 @@ def moe_gemm_fp8_nt_groupwise(
     _check_scale_granularity_mnk_fp8(scale_granularity_mnk)
     _check_scale_major_mode_fp8(scale_major_mode)
     _check_m_indptr(m_indptr, num_experts=b.shape[0])
-    if backend != "cute":
+    if backend not in ("cute", "cutedsl"):
         raise NotImplementedError(
-            f'Only backend="cute" is currently implemented; got backend="{backend}"'
+            f'backend must be "cute" (CuTe C++) or "cutedsl" (self-written CuteDSL); '
+            f'got backend="{backend}"'
         )
 
     if out_dtype is None:
@@ -305,6 +307,14 @@ def moe_gemm_fp8_nt_groupwise(
         out = torch.empty((a.shape[0], out_n), dtype=out_dtype, device=a.device)
 
     inputs = [a, b, a_scale, b_scale, m_indptr]
+    if backend == "cutedsl":
+        from ..cutedsl_sm120_fp8 import launch_cutedsl_fp8_moe
+
+        launch_cutedsl_fp8_moe(
+            inputs, out, scale_granularity_mnk, scale_major_mode, is_gated
+        )
+        return out
+
     if not _should_autotune_fp8_moe(a, b):
         _launch_fp8_moe_fallback(
             inputs, out, scale_granularity_mnk, scale_major_mode, is_gated

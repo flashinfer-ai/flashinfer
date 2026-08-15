@@ -127,15 +127,16 @@ def make_inputs(m_per_expert_list, n, k, is_gated=False):
     return a_fp8, b_fp8, a_scale, b_scale, m_indptr, ref
 
 
+@pytest.mark.parametrize("backend", ["cute", "cutedsl"])
 @pytest.mark.parametrize("num_experts", [4, 8])
 @pytest.mark.parametrize("rows_per_expert", [1, 8, 192, 1024])
 @pytest.mark.parametrize("n,k", [(4096, 7168), (7168, 4096)])
-def test_moe_gemm_fp8_nt_groupwise(num_experts, rows_per_expert, n, k):
+def test_moe_gemm_fp8_nt_groupwise(num_experts, rows_per_expert, n, k, backend):
     skip_if_not_sm120()
     a, b, a_scale, b_scale, m_indptr, ref = make_inputs(
         [rows_per_expert] * num_experts, n, k
     )
-    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr)
+    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr, backend=backend)
     diff = calc_diff(out.float(), ref.float())
     assert diff < CALC_DIFF_THRESHOLD, f"calc_diff={diff:.6e}"
 
@@ -184,10 +185,11 @@ def test_moe_gemm_fp8_nt_groupwise_forced_tactic(tactic, is_gated, mpe):
     ],
     ids=["uneven", "empty_expert"],
 )
-def test_moe_gemm_fp8_nt_groupwise_irregular(m_per_expert_list):
+@pytest.mark.parametrize("backend", ["cute", "cutedsl"])
+def test_moe_gemm_fp8_nt_groupwise_irregular(m_per_expert_list, backend):
     skip_if_not_sm120()
     a, b, a_scale, b_scale, m_indptr, ref = make_inputs(m_per_expert_list, 4096, 7168)
-    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr)
+    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr, backend=backend)
     diff = calc_diff(out.float(), ref.float())
     assert diff < CALC_DIFF_THRESHOLD, f"calc_diff={diff:.6e}"
 
