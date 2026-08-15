@@ -17,9 +17,11 @@ from flashinfer.jit.cake_fmha import (
     CAKE_FMHA_MANIFEST_SHA256,
     gen_cake_fmha_compat_module,
     gen_cake_fmha_context_bf16_module,
+    gen_cake_fmha_context_fp8_module,
     gen_cake_fmha_decode_native_bf16_module,
     get_cake_fmha_compat_uri,
     get_cake_fmha_context_bf16_uri,
+    get_cake_fmha_context_fp8_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_manifest,
 )
@@ -43,7 +45,7 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    assert len(manifest["artifacts"]) == 117
+    assert len(manifest["artifacts"]) == 122
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -158,6 +160,45 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
     assert "-DTOK_PER_STAGE=64" in spec.extra_cuda_cflags
 
 
+def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_context_fp8_module(
+        "sm100a",
+        1,
+        32,
+        4,
+        8,
+        64,
+        8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    assert spec.name == get_cake_fmha_context_fp8_uri(
+        "sm100a",
+        1,
+        32,
+        4,
+        8,
+        64,
+        8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "enable_sink0_is_causal1_return_lse0.cu",
+        "cake_fmha_context_fp8_binding.cu",
+        "cake_fmha_context_fp8_jit_binding.cu",
+    }
+    assert "-DNUM_Q_HEADS=32" in spec.extra_cuda_cflags
+    assert "-DHEADS_PER_GROUP=8" in spec.extra_cuda_cflags
+    assert "-DPACK_G=8" in spec.extra_cuda_cflags
+    assert "-DTOK_PER_STAGE=16" in spec.extra_cuda_cflags
+
+
 def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     monkeypatch,
 ) -> None:
@@ -246,6 +287,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
     route = cake_api.select_cake_fmha_context_route(query.device, **kwargs)
     assert route == cake_api.CakeFmhaContextRoute(
         target="sm103a",
+        component="context_bf16",
         num_m_blocks=1,
         num_q_heads=4,
         num_kv_heads=2,
@@ -265,6 +307,46 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
             },
         )
         is None
+    )
+
+    fp8_query = torch.empty((64, 32, 128), dtype=torch.float8_e4m3fn)
+    fp8_key = torch.empty((4, 4, 64, 128), dtype=torch.float8_e4m3fn)
+    fp8_route = cake_api.select_cake_fmha_context_route(
+        fp8_query.device,
+        query=fp8_query,
+        key_cache=fp8_key,
+        value_cache=torch.empty_like(fp8_key),
+        out=torch.empty_like(fp8_query),
+        block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        batch_size=2,
+        max_q_len=32,
+        max_kv_len=64,
+        window_left=-1,
+        bmm1_scale=0.03125,
+        bmm2_scale=0.75,
+        sinks=None,
+        uses_shared_paged_kv_idx=False,
+        cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        is_causal=True,
+        lse=None,
+    )
+    assert fp8_route == cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_fp8",
+        num_m_blocks=1,
+        num_q_heads=32,
+        num_kv_heads=4,
+        pack_g=8,
+        page_size=64,
+        l2_swizzle=8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
     )
 
 
@@ -397,6 +479,39 @@ def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> Non
         device_scale=False,
         head_dim=128,
         uses_shared_paged_kv_idx=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_context_fp8_shared_tables_matches_reference(monkeypatch) -> None:
+    from tests.attention.test_trtllm_gen_attention_prefill import (
+        _test_trtllm_batch_prefill,
+    )
+
+    original = prefill.trtllm_batch_context_with_kv_cache
+
+    def cake_context(*args, **kwargs):
+        return original(*args, backend="cake", **kwargs)
+
+    monkeypatch.setattr(prefill, "trtllm_batch_context_with_kv_cache", cake_context)
+    _test_trtllm_batch_prefill(
+        kv_layout="HND",
+        batch_size=2,
+        page_size=64,
+        num_kv_heads=4,
+        head_grp_size=8,
+        causal=True,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="fp8",
+        enable_pdl=False,
+        enable_sink=False,
+        max_q_len=32,
+        max_kv_len=159,
+        device_scale=False,
+        head_dim=128,
+        uses_shared_paged_kv_idx=True,
     )
 
 

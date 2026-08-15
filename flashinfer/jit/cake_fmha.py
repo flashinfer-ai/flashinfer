@@ -21,16 +21,17 @@ from .core import (
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "e51c6a1580e85b8b093ad0e9056b2ac03fc6125a7e6f936b9d195543c93c69cb"
+    "64ef68043bedb06e7984401c8cffbe1b2a24f42bc86bdcd8c05563d8fdb0cc2e"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "8b16f8134d516b49d5eae5c12f0d1d7c601ef6b6f01a22ad4ebdaff064836f6c"
+    "1a06bc8782c8bea13192b320d412b35c95e5134860cdf85723aada1c853766ae"
 )
 
 _FLASHINFER_BINDINGS = (
     "cake_fmha_jit_binding.cu",
     "jit/cake_fmha_context_bf16_jit_binding.cu",
+    "jit/cake_fmha_context_fp8_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
@@ -44,6 +45,7 @@ _TARGET_FLAGS = {
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
 _CONTEXT_BF16_JIT_BINDING = "jit/cake_fmha_context_bf16_jit_binding.cu"
+_CONTEXT_FP8_JIT_BINDING = "jit/cake_fmha_context_fp8_jit_binding.cu"
 
 
 def get_cake_fmha_csrc_dir() -> Path:
@@ -207,7 +209,7 @@ def _get_component_sources(
     return body, launch_binding, api_binding
 
 
-def _validate_context_bf16_specialization(
+def _validate_context_specialization(
     target: CakeFmhaTarget,
     num_m_blocks: int,
     num_q_heads: int,
@@ -233,7 +235,7 @@ def _validate_context_bf16_specialization(
     if pack_g not in (1, num_q_heads // num_kv_heads):
         raise ValueError("pack_g must be 1 or the complete GQA group")
     if page_size not in (16, 32, 64, 128, 256, 512, 1024):
-        raise ValueError("context BF16 requires a supported page size")
+        raise ValueError("Cake context requires a supported page size")
     if l2_swizzle not in (1, 8):
         raise ValueError("l2_swizzle must be 1 or 8")
     if enable_sink and return_lse:
@@ -258,7 +260,7 @@ def get_cake_fmha_context_bf16_uri(
     return_lse: bool,
     enable_sink: bool,
 ) -> str:
-    selector = _validate_context_bf16_specialization(
+    selector = _validate_context_specialization(
         target,
         num_m_blocks,
         num_q_heads,
@@ -297,7 +299,7 @@ def gen_cake_fmha_context_bf16_module(
 ) -> JitSpec:
     """Build one authenticated context BF16 specialization."""
 
-    selector = _validate_context_bf16_specialization(
+    selector = _validate_context_specialization(
         target,
         num_m_blocks,
         num_q_heads,
@@ -375,6 +377,139 @@ def load_cake_fmha_context_bf16_module(
         enable_sink=enable_sink,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context BF16 module: %s", module)
+    return module
+
+
+def get_cake_fmha_context_fp8_uri(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+    *,
+    is_causal: bool,
+    return_lse: bool,
+    enable_sink: bool,
+) -> str:
+    selector = _validate_context_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+        is_causal=is_causal,
+        return_lse=return_lse,
+        enable_sink=enable_sink,
+    )
+    return (
+        f"cake_fmha_context_fp8_{target}"
+        f"_m{num_m_blocks}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
+        f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
+        f"_sink{selector['ENABLE_SINK']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_context_fp8_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+    *,
+    is_causal: bool,
+    return_lse: bool,
+    enable_sink: bool,
+) -> JitSpec:
+    """Build one authenticated context FP8 specialization."""
+
+    selector = _validate_context_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+        is_causal=is_causal,
+        return_lse=return_lse,
+        enable_sink=enable_sink,
+    )
+    sources = _get_component_sources(
+        "context_fp8", target, selector, _CONTEXT_FP8_JIT_BINDING
+    )
+    heads_per_group = num_q_heads // num_kv_heads
+    tok_per_stage = 128 // pack_g
+    spec = gen_jit_spec(
+        name=get_cake_fmha_context_fp8_uri(
+            target,
+            num_m_blocks,
+            num_q_heads,
+            num_kv_heads,
+            pack_g,
+            page_size,
+            l2_swizzle,
+            is_causal=is_causal,
+            return_lse=return_lse,
+            enable_sink=enable_sink,
+        ),
+        sources=list(sources),
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DNUM_M_BLOCKS={num_m_blocks}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DHEADS_PER_GROUP={heads_per_group}",
+            f"-DPACK_G={pack_g}",
+            f"-DTOK_PER_STAGE={tok_per_stage}",
+            f"-DL2_SWIZZLE={l2_swizzle}",
+            f"-DPAGE_SIZE={page_size}",
+            f"-DCAKE_FMHA_CONTEXT_IS_CAUSAL={selector['IS_CAUSAL']}",
+            f"-DCAKE_FMHA_CONTEXT_RETURN_LSE={selector['RETURN_LSE']}",
+            f"-DCAKE_FMHA_CONTEXT_ENABLE_SINK={selector['ENABLE_SINK']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA context FP8 JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_context_fp8_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+    *,
+    is_causal: bool,
+    return_lse: bool,
+    enable_sink: bool,
+):
+    module = gen_cake_fmha_context_fp8_module(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+        is_causal=is_causal,
+        return_lse=return_lse,
+        enable_sink=enable_sink,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA context FP8 module: %s", module)
     return module
 
 
@@ -546,14 +681,17 @@ __all__ = [
     "CAKE_FMHA_MANIFEST_SHA256",
     "CakeFmhaTarget",
     "gen_cake_fmha_context_bf16_module",
+    "gen_cake_fmha_context_fp8_module",
     "gen_cake_fmha_compat_module",
     "gen_cake_fmha_decode_native_bf16_module",
     "get_cake_fmha_context_bf16_uri",
+    "get_cake_fmha_context_fp8_uri",
     "get_cake_fmha_compat_uri",
     "get_cake_fmha_csrc_dir",
     "get_cake_fmha_decode_native_bf16_uri",
     "get_cake_fmha_manifest",
     "load_cake_fmha_context_bf16_module",
+    "load_cake_fmha_context_fp8_module",
     "load_cake_fmha_compat_module",
     "load_cake_fmha_decode_native_bf16_module",
 ]

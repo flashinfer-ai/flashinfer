@@ -1876,12 +1876,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMa
                 for (int q_xform_row = 0; q_xform_row < TILE_Q; q_xform_row++) {
                     float q_value = smem_q_raw[q_xform_row * HEAD_DIM + q_xform_tid];
                     {
-                        uint16_t _fp8_pair_4170794560;
+                        uint16_t _fp8_pair_3448020784;
                         asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                            : "=h"(_fp8_pair_4170794560) : "f"(0.0f), "f"(q_value));
-                        uint32_t _byte_4170794560 = (uint32_t)(_fp8_pair_4170794560 & 0xFF);
-                        uint32_t _addr_4170794560 = static_cast<uint32_t>((smem_qt_addr + (unsigned int)(q_xform_row * 128 + q_xform_tid ^ (q_xform_row * 128 + q_xform_tid >> 7 & 7) << 4)));
-                        asm volatile("st.shared.u8 [%0], %1;" :: "r"(_addr_4170794560), "r"(_byte_4170794560) : "memory");
+                            : "=h"(_fp8_pair_3448020784) : "f"(0.0f), "f"(q_value));
+                        uint32_t _byte_3448020784 = (uint32_t)(_fp8_pair_3448020784 & 0xFF);
+                        uint32_t _addr_3448020784 = static_cast<uint32_t>((smem_qt_addr + (unsigned int)(q_xform_row * 128 + q_xform_tid ^ (q_xform_row * 128 + q_xform_tid >> 7 & 7) << 4)));
+                        asm volatile("st.shared.u8 [%0], %1;" :: "r"(_addr_3448020784), "r"(_byte_3448020784) : "memory");
                     }
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

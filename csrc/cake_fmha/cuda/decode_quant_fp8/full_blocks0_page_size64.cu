@@ -686,6 +686,7 @@ kernel_cake_fmha_decode_quant_fp8(const void* __restrict__ Qt, const void* __res
                     : "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[3]))
                     : "r"(my_tmem_s_base + 1048576)
                     : "memory");
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (is_wg1 != 0) {
                     mbarrier_arrive(s_empty_1_addr);
                 } else {
@@ -930,6 +931,7 @@ kernel_cake_fmha_decode_quant_fp8(const void* __restrict__ Qt, const void* __res
                             : "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[3]))
                             : "r"(my_tmem_s_base + 1048576)
                             : "memory");
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (is_wg1 != 0) {
                             mbarrier_arrive(s_empty_1_addr);
                         } else {
@@ -1047,6 +1049,7 @@ kernel_cake_fmha_decode_quant_fp8(const void* __restrict__ Qt, const void* __res
                             : "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[3]))
                             : "r"(taddr + 80 + 1048576)
                             : "memory");
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         float o0[8];
                         #pragma unroll
                         for (int h = 0; h < 4; h++) {
@@ -1126,6 +1129,7 @@ kernel_cake_fmha_decode_quant_fp8(const void* __restrict__ Qt, const void* __res
                             : "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[3]))
                             : "r"(taddr + 88 + 1048576)
                             : "memory");
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         float o1[8];
                         #pragma unroll
                         for (int h_2 = 0; h_2 < 4; h_2++) {
@@ -1282,6 +1286,7 @@ kernel_cake_fmha_decode_quant_fp8(const void* __restrict__ Qt, const void* __res
                     : "=r"(*reinterpret_cast<uint32_t*>(&o1_hi_epi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi_epi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi_epi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi_epi[3]))
                     : "r"(taddr + 88 + 1048576)
                     : "memory");
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (num_splits > 1) {
                     float part_vals[8];
                     float pscale0_e = scale0_pair[0] * inv_sum_pair[0];

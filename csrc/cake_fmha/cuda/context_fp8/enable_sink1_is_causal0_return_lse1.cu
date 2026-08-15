@@ -922,22 +922,14 @@ kernel_cake_fmha_context_fp8(const void* __restrict__ Q, const void* __restrict_
                     new_max = _max_0;
                     float new_max_scaled = ((new_max == -LOOM_INF) ? 0.0f : new_max) * softmax_scale_log2;
                     float acc_scale;
-                    float selected_max;
                     float _fma_0 = __fmaf_rn(row_max_val, softmax_scale_log2, -new_max_scaled);
-                    if (_fma_0 >= -8.0f) {
-                        selected_max = row_max_val;
-                        acc_scale = 1.0f;
-                        new_max_scaled = ((row_max_val == -LOOM_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
+                    if (row_max_val > -LOOM_INF) {
+                        float _exp2_0 = approx_exp2(_fma_0);
+                        acc_scale = _exp2_0;
                     } else {
-                        selected_max = new_max;
-                        if (row_max_val > -LOOM_INF) {
-                            float _exp2_0 = approx_exp2(_fma_0);
-                            acc_scale = _exp2_0;
-                        } else {
-                            acc_scale = 1.0f;
-                        }
+                        acc_scale = 1.0f;
                     }
-                    row_max_val = selected_max;
+                    row_max_val = new_max;
                     sScale[warp % 4 * 32 + lane + scale_off] = acc_scale;
                     mbarrier_arrive(corr_sig_addr + (stage) * 8);
                     int p_base = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);
@@ -1278,22 +1270,14 @@ kernel_cake_fmha_context_fp8(const void* __restrict__ Q, const void* __restrict_
                     new_max_1 = _max_1;
                     float new_max_scaled_1 = ((new_max_1 == -LOOM_INF) ? 0.0f : new_max_1) * softmax_scale_log2;
                     float acc_scale_1;
-                    float selected_max_1;
                     float _fma_1 = __fmaf_rn(row_max_val, softmax_scale_log2, -new_max_scaled_1);
-                    if (_fma_1 >= -8.0f) {
-                        selected_max_1 = row_max_val;
-                        acc_scale_1 = 1.0f;
-                        new_max_scaled_1 = ((row_max_val == -LOOM_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
+                    if (row_max_val > -LOOM_INF) {
+                        float _exp2_1 = approx_exp2(_fma_1);
+                        acc_scale_1 = _exp2_1;
                     } else {
-                        selected_max_1 = new_max_1;
-                        if (row_max_val > -LOOM_INF) {
-                            float _exp2_1 = approx_exp2(_fma_1);
-                            acc_scale_1 = _exp2_1;
-                        } else {
-                            acc_scale_1 = 1.0f;
-                        }
+                        acc_scale_1 = 1.0f;
                     }
-                    row_max_val = selected_max_1;
+                    row_max_val = new_max_1;
                     sScale[warp % 4 * 32 + lane + scale_off] = acc_scale_1;
                     mbarrier_arrive(corr_sig_addr + (stage) * 8);
                     int p_base_1 = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);

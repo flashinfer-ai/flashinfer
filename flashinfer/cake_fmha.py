@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -17,6 +17,7 @@ from .jit.cake_fmha import (
     CakeFmhaTarget,
     get_cake_fmha_manifest,
     load_cake_fmha_context_bf16_module,
+    load_cake_fmha_context_fp8_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_module,
 )
@@ -43,6 +44,7 @@ class CakeFmhaContextRoute:
     """One exact manifest-backed optimized context specialization."""
 
     target: CakeFmhaTarget
+    component: Literal["context_bf16", "context_fp8"]
     num_m_blocks: int
     num_q_heads: int
     num_kv_heads: int
@@ -256,16 +258,18 @@ def select_cake_fmha_context_route(
         return None
     if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
         return None
-    if float(bmm2_scale) != 1.0:
-        return None
     if key_block_scales is not None or value_block_scales is not None:
         return None
     if skip_softmax_threshold_scale_factor not in (None, 0.0):
         return None
-    if any(
-        tensor.dtype != torch.bfloat16
-        for tensor in (query, key_cache, value_cache, out)
-    ):
+    tensor_dtypes = {tensor.dtype for tensor in (query, key_cache, value_cache, out)}
+    if tensor_dtypes == {torch.bfloat16}:
+        component: Literal["context_bf16", "context_fp8"] = "context_bf16"
+        if float(bmm2_scale) != 1.0:
+            return None
+    elif tensor_dtypes == {torch.float8_e4m3fn}:
+        component = "context_fp8"
+    else:
         return None
     if query.ndim != 3 or query.shape[2] != 128 or query.stride(2) != 1:
         return None
@@ -334,6 +338,7 @@ def select_cake_fmha_context_route(
     total_bh = batch_size * (num_q_heads // pack_g)
     return CakeFmhaContextRoute(
         target=_cake_fmha_target(device),
+        component=component,
         num_m_blocks=num_m_blocks,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -355,7 +360,12 @@ def get_cake_fmha_context_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
-    return load_cake_fmha_context_bf16_module(
+    loader = (
+        load_cake_fmha_context_bf16_module
+        if route.component == "context_bf16"
+        else load_cake_fmha_context_fp8_module
+    )
+    return loader(
         route.target,
         route.num_m_blocks,
         route.num_q_heads,
