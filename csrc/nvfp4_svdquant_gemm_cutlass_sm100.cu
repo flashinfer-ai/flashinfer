@@ -74,42 +74,43 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic) {
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
                              void const* sfb, float const* alpha, void const* D, void const* L1,
-                             void const* bias, int m, int n, int k, int lora_rank, char* ws,
-                             size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
+                             void const* bias, int m, int n, int k, int lora_rank,
+                             bool alpha_is_per_col, char* ws, size_t wsBytes, cudaStream_t stream,
+                             int tactic, bool enable_pdl) {
   RuntimeTactic const runtime_tactic = resolve_tactic(tactic);
   switch (runtime_tactic.kernel_shape) {
     case KernelShape::k1Sm128x256x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x256x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x256x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x256x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x128x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x128x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x192x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x192x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x64x128:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x64x128Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k1Sm128x128x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic1Sm128x128x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x128x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x128x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
     case KernelShape::k2Sm256x256x256:
       return svdquant_detail::run_tactic<svdquant_detail::Tactic2Sm256x256x256Config>(
-          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
-          runtime_tactic, enable_pdl);
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, alpha_is_per_col, ws,
+          wsBytes, stream, runtime_tactic, enable_pdl);
   }
   throw std::invalid_argument("nvfp4_svdquant_gemm_run: invalid kernel shape");
 }
@@ -133,7 +134,7 @@ inline int64_t swizzled_sf_size(int64_t rows, int64_t sfCols) {
 }  // namespace
 
 // out = alpha * (A @ Bᵀ) + (D @ L1ᵀ) [+ bias]. a = quant(x_hat) [m, k/2] uint8, b [n, k/2] uint8
-// (packed e2m1), a_sf/b_sf swizzled UE4M3 block scales, alpha f32[1] (residual dequant scale).
+// (packed e2m1), a_sf/b_sf swizzled UE4M3 block scales, alpha f32[1] or f32[n].
 // D [m, r] = x_hat @ L2ᵀ (bf16) and L1 [n, r] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
 // the epilogue out = alpha * acc yields the LoRA); the LoRA rank r is inferred from d/l1 and must
 // be a positive multiple of 32. out [m, n] bf16, allocated by the caller.
@@ -166,7 +167,8 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
   TVM_FFI_ICHECK_EQ(b.size(1), kPacked) << "a and b inner dimensions mismatch";
   TVM_FFI_ICHECK(n > 0 && k > 0) << "n and k must be positive";
   TVM_FFI_ICHECK(n % 32 == 0 && k % 32 == 0) << "n and k must be divisible by 32";
-  TVM_FFI_ICHECK_GE(alpha.numel(), 1) << "alpha must contain at least one element";
+  TVM_FFI_ICHECK(alpha.numel() == 1 || alpha.numel() == n)
+      << "alpha must contain one element or n=" << n << " elements";
   TVM_FFI_ICHECK_GE(a_sf.numel(), swizzled_sf_size(m, k / 16))
       << "a_sf is smaller than the required swizzled scale layout";
   TVM_FFI_ICHECK_GE(b_sf.numel(), swizzled_sf_size(n, k / 16))
@@ -212,7 +214,8 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
-        reinterpret_cast<char*>(workspace), requiredWorkspaceBytes, stream, tacticId, enable_pdl);
+        alpha.numel() == n, reinterpret_cast<char*>(workspace), requiredWorkspaceBytes, stream,
+        tacticId, enable_pdl);
   };
 
   int64_t const provided_workspace_size =

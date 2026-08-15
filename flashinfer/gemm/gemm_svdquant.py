@@ -47,6 +47,10 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# Feature flag for downstream integrations that must remain compatible with
+# FlashInfer releases whose native SVDQuant epilogue accepts only scalar alpha.
+SVDQUANT_SUPPORTS_PER_OUTPUT_ALPHA = True
+
 # The fused kernel accumulates the rank-r BF16 LoRA-up into the NVFP4 residual accumulator.
 # The rank is inferred from the d/l1 shapes and must be a positive multiple of the collective's
 # rank granularity (CollectiveMmaLoRA::LoRaK); ranks 32-128 are validated.
@@ -173,6 +177,11 @@ def _check_mm_nvfp4_svdquant_problem(
     k = k_packed * 2
     if n % 32 != 0 or k % 32 != 0:
         raise ValueError(f"n and k must be divisible by 32, got n={n}, k={k}")
+    if alpha.dtype != torch.float32 or alpha.numel() not in (1, n):
+        raise ValueError(
+            f"alpha must be float32 with one element or n={n} elements, "
+            f"got dtype={alpha.dtype} and numel={alpha.numel()}"
+        )
     if d.ndim != 2 or d.shape[0] != m:
         raise ValueError(
             f"d must have shape [m, r] (rank-r LoRA-down output), got {tuple(d.shape)}"
@@ -217,9 +226,10 @@ def mm_nvfp4_svdquant(
     ``d @ l1ᵀ``, computed by a second BF16 tcgen05 MMA into the same accumulator after the
     NVFP4 K-loop, plus an optional fused per-column bias. The LoRA rank ``r`` is inferred
     from the ``d``/``l1`` shapes and must be a positive multiple of 32 (ranks 32-128 are
-    validated). ``1/alpha`` must be folded into ``l1`` by the caller
-    (``l1 = svdquant_lora_b / alpha``) so the epilogue ``out = alpha * acc + bias`` yields
-    the correction unscaled.
+    validated). ``alpha`` may be a scalar or a per-output-channel vector. ``1/alpha``
+    must be folded row-wise into ``l1`` by the caller
+    (``l1 = svdquant_lora_b / alpha.reshape(-1, 1)`` for vector ``alpha``) so the
+    epilogue ``out = alpha * acc + bias`` yields the correction unscaled.
 
     Parameters
     ----------
@@ -236,7 +246,8 @@ def mm_nvfp4_svdquant(
     b_sf: torch.Tensor
         Weight block scales, same layout as ``a_sf`` with ``n`` rows.
     alpha: torch.Tensor
-        Per-tensor residual dequantization scale, float32, device scalar (``numel >= 1``).
+        Residual dequantization scale, float32 device scalar or per-output-channel vector
+        with shape ``(n,)``.
     d: torch.Tensor
         LoRA-down output ``x_hat @ L2ᵀ``, shape ``(m, r)`` bf16, contiguous and 16-byte
         aligned (TMA). Compute it as ``x @ (pre_quant_scale[:, None] * L2ᵀ)`` in bf16.
@@ -372,8 +383,9 @@ def svdquant_linear(
 
     The invariant per-layer transforms must be prepared offline by the caller:
     ``l2t_smoothed = (pre_quant_scale[:, None] * svdquant_lora_a.T).to(bf16)`` with shape
-    ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha).to(bf16)`` with shape ``(n, r)``,
-    where the LoRA rank ``r`` is a positive multiple of 32.
+    ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha.reshape(-1, 1)).to(bf16)``
+    with shape ``(n, r)`` for vector ``alpha`` (ordinary broadcasting applies for scalar
+    ``alpha``), where the LoRA rank ``r`` is a positive multiple of 32.
 
     Parameters
     ----------
@@ -384,7 +396,8 @@ def svdquant_linear(
     weight_sf: torch.Tensor
         Weight block scales, uint8 (ue4m3), 128x4 swizzled layout.
     alpha: torch.Tensor
-        Per-tensor residual dequantization scale, float32 device scalar.
+        Residual dequantization scale, float32 device scalar or per-output-channel vector
+        with shape ``(n,)``.
     pre_quant_scale: torch.Tensor
         Per-input-channel smoothing scale, shape ``(k,)`` bf16.
     l2t_smoothed: torch.Tensor

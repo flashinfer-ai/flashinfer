@@ -105,6 +105,7 @@ def _make_gemm_problem(m, n, k, rank=_RANK, device="cuda"):
         "w_sf_flat": w_sf.reshape(-1),
         "alpha": alpha,
         "d": d,
+        "l1": l1,
         "l1_scaled": l1_scaled,
         "bias": bias,
         "ref": ref,
@@ -233,6 +234,39 @@ def test_mm_nvfp4_svdquant_rank_chunks(m, rank, tactic):
     assert sqnr > 40.0, (
         f"tactic={tactic} m={m} rank={rank}: SQNR={sqnr:.2f} dB <= 40 dB"
     )
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_mm_nvfp4_svdquant_per_column_alpha(use_bias):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    m, n, k = 129, 3072, 3072
+    p = _make_gemm_problem(m, n, k)
+
+    channel_scale = (
+        (1.0 + 0.2 * torch.randn(n, dtype=torch.float32, device="cuda"))
+        .abs()
+        .contiguous()
+    )
+    alpha = (p["alpha"] * channel_scale).contiguous()
+    l1_scaled = (p["l1"].float() / alpha[:, None]).to(torch.bfloat16).contiguous()
+    out = mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        alpha,
+        p["d"],
+        l1_scaled,
+        bias=p["bias"] if use_bias else None,
+    )
+
+    correction = p["d"].float() @ p["l1"].float().t()
+    residual = p["ref"] - correction
+    ref = residual * channel_scale + correction
+    if use_bias:
+        ref = ref + p["bias"].float()
+    assert _sqnr_db(ref, out.float()) > 40.0
 
 
 def test_mm_nvfp4_svdquant_rejects_bad_rank():

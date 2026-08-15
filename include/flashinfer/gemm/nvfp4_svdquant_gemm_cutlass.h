@@ -29,10 +29,11 @@ namespace gemm {
 // fused with the rank-r LoRA-up correction D @ L1ᵀ, computed by a 2nd bf16 tcgen05 MMA (K = r)
 // into the SAME TMEM accumulator after the NVFP4 K-loop (a custom CUTLASS SM100 block-scaled
 // collective; the stock nvfp4 GEMM template is untouched). 1/alpha is folded into L1 host-side so
-// the fused epilogue yields alpha * residual + D @ L1ᵀ + bias.
+// the fused epilogue yields alpha * residual + D @ L1ᵀ + bias. Alpha may be a device scalar or
+// a per-output-channel vector with n elements.
 //
 //   A   [m, k]  NVFP4 (e2m1), row-major          SFA/SFB  block scale factors (ue4m3, swizzled)
-//   B   [n, k]  NVFP4 (e2m1), column-major        alpha   per-tensor dequant scale (device f32[1])
+//   B   [n, k]  NVFP4 (e2m1), column-major        alpha   device f32[1] or f32[n]
 //   D   [m, r]  bf16, row-major                   out     [m, n] bf16
 //   L1  [n, r]  bf16, row-major (= svdquant_lora_b / alpha)
 // r is the SVDQuant LoRA rank: any positive multiple of 32 (ranks 32-128 are validated).
@@ -77,9 +78,9 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic = 0);
 
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
                              void const* sfb, float const* alpha, void const* D, void const* L1,
-                             void const* bias, int m, int n, int k, int lora_rank, char* workspace,
-                             size_t workspaceBytes, cudaStream_t stream, int tactic = 0,
-                             bool enable_pdl = false);
+                             void const* bias, int m, int n, int k, int lora_rank,
+                             bool alpha_is_per_col, char* workspace, size_t workspaceBytes,
+                             cudaStream_t stream, int tactic = 0, bool enable_pdl = false);
 
 }  // namespace gemm
 }  // namespace flashinfer
