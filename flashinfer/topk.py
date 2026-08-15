@@ -372,13 +372,6 @@ def get_topk_module():
         row_starts: Optional[torch.Tensor] = None,
         page_table_row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # The binding leaves short rows' output tails untouched; pre-fill with -1
-        # so the padding contract matches the native fused transforms. The fill
-        # kernels are issued here so they are captured with the call under CUDA
-        # graphs.
-        out.fill_(-1)
-        if out_raw_indices is not None:
-            out_raw_indices.fill_(-1)
         module.cub_topk_page_table_transform(
             input,
             out,
@@ -426,10 +419,6 @@ def get_topk_module():
         tie_break: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> None:
-        # The binding leaves short rows' output tails untouched; pre-fill with -1
-        # so the padding contract matches the native fused transforms. The fill
-        # kernel is issued here so it is captured with the call under CUDA graphs.
-        output_indices.fill_(-1)
         module.cub_topk_ragged_transform(
             input,
             output_indices,

@@ -154,6 +154,43 @@ struct CUBMakeRaggedRowOut {
   }
 };
 
+// DeviceBatchedTopK writes only min(max(length, 0), top_k) items for a variable-length
+// segment. Fill the untouched suffix after selection so short and empty rows preserve the
+// transform APIs' -1 padding contract. Keeping this launch in the same C++ entry point as
+// DeviceBatchedTopK avoids the device-idle Python/custom-op gap created by a separate
+// torch.fill_ call. A single launch handles both page-table outputs when raw indices are
+// requested, and rows with length >= top_k perform no global stores.
+__global__ void CUBFillTopKTailsKernel(int32_t* output, int32_t* output_raw_indices,
+                                       const int32_t* lengths, int64_t num_rows, int64_t top_k) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= num_rows) {
+    return;
+  }
+
+  int64_t valid = static_cast<int64_t>(lengths[row]);
+  valid = valid < 0 ? 0 : valid;
+  valid = valid > top_k ? top_k : valid;
+  for (int64_t col = valid + static_cast<int64_t>(threadIdx.x); col < top_k;
+       col += static_cast<int64_t>(blockDim.x)) {
+    const int64_t offset = row * top_k + col;
+    output[offset] = -1;
+    if (output_raw_indices != nullptr) {
+      output_raw_indices[offset] = -1;
+    }
+  }
+}
+
+cudaError_t CUBFillTopKTails(int32_t* output, int32_t* output_raw_indices, const int32_t* lengths,
+                             int64_t num_rows, int64_t top_k, cudaStream_t stream) {
+  if (num_rows == 0) {
+    return cudaSuccess;
+  }
+  constexpr int kThreads = 256;
+  CUBFillTopKTailsKernel<<<static_cast<uint32_t>(num_rows), kThreads, 0, stream>>>(
+      output, output_raw_indices, lengths, num_rows, top_k);
+  return cudaGetLastError();
+}
+
 // Per-segment input rows with a per-row window start: d_keys_in[row] points at
 // input[row, row_starts[row]:] (row_starts read on the device at outer dereference, like the
 // deferred lengths). Used only when row_starts is present; the whole-row case uses a plain
@@ -438,8 +475,8 @@ void CheckCUBTopKArgs(const TensorView& input, const TensorView& lengths, int64_
 //   src_page_table[i, idx / page_size] * page_size + idx % page_size
 // with idx itself optionally duplicated into output_raw_indices. The translation happens
 // inside CUB's own kernel via the output iterators — no epilogue launch. Rows with
-// lengths[i] < top_k leave both output tails untouched; the Python wrapper pre-fills them
-// with -1 (matching the native kernels, which write -1 in-kernel).
+// lengths[i] < top_k leave both output tails untouched; a post-selection tail kernel fills
+// those suffixes with -1 (matching the native kernels, which write -1 in-kernel).
 void cub_topk_page_table_transform(
     TensorView input, TensorView output_page_table, TensorView src_page_table, TensorView lengths,
     Optional<TensorView> maybe_output_raw_indices, Optional<TensorView> maybe_workspace_buffer,
@@ -516,6 +553,10 @@ void cub_topk_page_table_transform(
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cub_topk_page_table_transform failed with error code " << cudaGetErrorString(status);
+  status = CUBFillTopKTails(out_ptr, output_raw_indices, lengths_ptr, num_rows, top_k, stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk_page_table_transform tail fill failed with error code "
+      << cudaGetErrorString(status);
 }
 
 // Workspace query for the transform variant. Must instantiate the same dispatch (same
@@ -571,8 +612,8 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
 // global coordinates happens inside CUB's own kernel via the output iterators, no epilogue
 // launch. row_starts moves the read window only and does not add into the output (matching
 // the native ragged kernel). Rows with lengths[i] < top_k leave the output tail untouched;
-// the Python wrapper pre-fills it with -1 (matching the native kernels, which write -1
-// in-kernel).
+// a post-selection tail kernel fills that suffix with -1 (matching the native kernels,
+// which write -1 in-kernel).
 void cub_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
                                TensorView lengths, Optional<TensorView> maybe_workspace_buffer,
                                int64_t top_k, int64_t tie_break,
@@ -634,6 +675,11 @@ void cub_topk_ragged_transform(TensorView input, TensorView output_indices, Tens
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cub_topk_ragged_transform failed with error code " << cudaGetErrorString(status);
+  status = CUBFillTopKTails(out_ptr, /*output_raw_indices=*/nullptr, lengths_ptr, num_rows, top_k,
+                            stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk_ragged_transform tail fill failed with error code "
+      << cudaGetErrorString(status);
 }
 
 // Workspace query for the ragged variant. Must instantiate the same dispatch (same iterator

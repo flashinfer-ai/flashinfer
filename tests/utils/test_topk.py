@@ -3192,8 +3192,12 @@ def _require_cub_tie_break_support():
         pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
 
 
-@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
-def test_cub_transform_nonpositive_lengths(transform_mode, set_topk_algo):
+@pytest.mark.parametrize(
+    ("transform_mode", "page_size"),
+    [("page_table", 1), ("page_table", 64), ("ragged", 1)],
+    ids=["page_table_wide", "page_table_compact", "ragged"],
+)
+def test_cub_transform_nonpositive_lengths(transform_mode, page_size, set_topk_algo):
     """lengths[i] <= 0 is a valid empty row for the CUB backend (all -1 outputs).
 
     The lengths bounds declared to CUB span the full int32 range, so zero and negative
@@ -3210,26 +3214,73 @@ def test_cub_transform_nonpositive_lengths(transform_mode, set_topk_algo):
         [d, 0, 100, -1, -(2**31), 1], dtype=torch.int32, device="cuda"
     )
 
+    out_raw_indices = None
     if transform_mode == "page_table":
-        pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
-        out = flashinfer.top_k_page_table_transform(scores, pt, lengths, k)
+        pt = torch.randint(
+            0,
+            100000,
+            (num_rows, d // page_size),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        out_raw_indices = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+
+        def run_transform():
+            return flashinfer.top_k_page_table_transform(
+                scores,
+                pt,
+                lengths,
+                k,
+                page_size=page_size,
+                out_raw_indices=out_raw_indices,
+            )
+
     else:
         offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
-        out = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+        def run_transform():
+            return flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    out = run_transform()
     torch.cuda.synchronize()
 
-    for i, length in enumerate(lengths.tolist()):
-        valid = min(k, max(length, 0))
-        assert torch.all(out[i, valid:] == -1), (
-            f"row {i} (length={length}): bad -1 padding"
-        )
-        if valid > 0:
-            _, ref_idx = torch.topk(scores[i, :length], valid)
-            if transform_mode == "page_table":
-                ref = pt[i][ref_idx]
-            else:
-                ref = ref_idx.int() + offsets[i]
-            assert sorted(out[i, :valid].tolist()) == sorted(ref.tolist())
+    def check_output():
+        for i, length in enumerate(lengths.tolist()):
+            valid = min(k, max(length, 0))
+            assert torch.all(out[i, valid:] == -1), (
+                f"row {i} (length={length}): bad -1 padding"
+            )
+            if out_raw_indices is not None:
+                assert torch.all(out_raw_indices[i, valid:] == -1), (
+                    f"row {i} (length={length}): bad raw-index -1 padding"
+                )
+            if valid > 0:
+                _, ref_idx = torch.topk(scores[i, :length], valid)
+                if transform_mode == "page_table":
+                    ref = pt[i][ref_idx // page_size] * page_size + ref_idx % page_size
+                    assert sorted(out_raw_indices[i, :valid].tolist()) == sorted(
+                        ref_idx.int().tolist()
+                    )
+                else:
+                    ref = ref_idx.int() + offsets[i]
+                assert sorted(out[i, :valid].tolist()) == sorted(ref.tolist())
+
+    check_output()
+
+    # Capture with full rows so every slot contains a valid result, then replay after
+    # shrinking rows to short, zero, and negative lengths. This catches stale tails when
+    # the padding implementation changes while preserving graph-dynamic lengths.
+    replay_lengths = lengths.clone()
+    lengths.fill_(d)
+    run_transform()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run_transform()
+    lengths.copy_(replay_lengths)
+    graph.replay()
+    torch.cuda.synchronize()
+    check_output()
 
 
 @pytest.mark.parametrize(
