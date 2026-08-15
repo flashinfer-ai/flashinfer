@@ -342,11 +342,9 @@ class MegaMoEHopperFp8Frontend:
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
-        self._invalidate_compile_cache()
 
     def release(self) -> None:
         self._release_workspace()
-        self._invalidate_compile_cache()
 
     def warmup(
         self,
@@ -649,6 +647,10 @@ class MegaMoEHopperFp8Frontend:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
+        # The cache entry dies with the workspace: if a recompile fails after
+        # the free, a stale (_mega, _mega_key) hit would launch against freed
+        # symmetric memory.
+        self._invalidate_compile_cache()
 
     @staticmethod
     def _resolve_num_tokens(

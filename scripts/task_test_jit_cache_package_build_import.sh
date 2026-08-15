@@ -114,6 +114,7 @@ finish_aot_memory_monitoring() {
     if [ "$exit_code" -ne 0 ]; then
         print_aot_memory_diagnostics
     fi
+    collect_sccache_stats || true
 }
 
 trap finish_aot_memory_monitoring EXIT
@@ -187,8 +188,12 @@ echo ""
 echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
+FLASHINFER_EDITABLE_SPEC="."
+if [[ "${CUDA_VERSION}" == 13* ]]; then
+    FLASHINFER_EDITABLE_SPEC=".[cu13]"
+fi
 run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
-    pip install -e . -v || {
+    pip install --no-build-isolation -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
@@ -254,12 +259,6 @@ run_with_aot_memory_monitor "verify_all_modules_compiled" python scripts/verify_
     exit 1
 }
 echo "✓ All modules verified successfully"
-
-echo ""
-echo "========================================"
-echo "sccache stats"
-echo "========================================"
-sccache --show-stats
 
 echo ""
 echo "========================================"
