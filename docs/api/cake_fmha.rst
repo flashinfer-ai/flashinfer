@@ -21,6 +21,11 @@ matrix was audited.  FlashInfer authenticates every standalone artifact before
 JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive copy
 of that product record.
 
+Optimized routes are fail-closed.  In particular, optimized FP8 decode is
+qualified for HND pages, a shared K/V page table, and GQA group size eight;
+other valid FP8 decode shapes remain Cake-owned and use the authenticated
+complete-domain component.
+
 The distributed-context-parallel feature remains additive.  Supplying
 ``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects
 the authenticated ``cake_fmha_dcp_spec`` profile; ordinary calls continue to

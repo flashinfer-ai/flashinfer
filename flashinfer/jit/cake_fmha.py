@@ -20,7 +20,7 @@ from .core import (
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "cb91d5405db24f79fa60a75e56e08e592a3ec65c09e6a2bae91296de4341d5c8"
+    "854d220ad4884996b9f21af541623022db595b4d39d17d38a5c12a6c4f898ebe"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
@@ -43,13 +43,13 @@ _TARGET_FLAGS = {
 def get_cake_fmha_csrc_dir() -> Path:
     """Resolve the one checked-in source root shared by base and add-ons."""
 
-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha"
-    if installed.exists():
-        return installed
-
     checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     if checkout.exists():
         return checkout
+
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha"
+    if installed.exists():
+        return installed
 
     raise FileNotFoundError(
         f"Cake FMHA sources were not found. Checked:\n  - {installed}\n  - {checkout}"

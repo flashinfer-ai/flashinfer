@@ -1252,7 +1252,7 @@
     "gap_counts": {},
     "raw_cases": 80768,
     "route_counts": {
-      "cake_fmha_compat_v1": 55386,
+      "cake_fmha_compat_v1": 55482,
       "ctx_bf16_hnd_hd128_hgpack_03df_v2": 640,
       "ctx_fp16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_bf16_nhd_hd256_stage16_v1": 40,
@@ -1261,7 +1261,6 @@
       "decode_native_bf16_v1_bece": 120,
       "decode_native_fp16_nhd_v1_f32d": 240,
       "decode_quantized_bf16q_9d8b_v1": 48,
-      "decode_quantized_fp8_8e5b_v1": 96,
       "decode_quantized_nvfp4_8e5b_v1": 24
     },
     "upstream_valid_cases": 57280
@@ -4102,7 +4101,12 @@
       "selected_route": "decode_native_bf16_v1_bece"
     },
     {
-      "label": "correctness_decode_fp8",
+      "label": "correctness_compat_decode_fp8_nhd_separate_group5",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_decode_fp8_hnd_shared_group8",
       "profile": "conventional",
       "selected_route": "decode_quantized_fp8_8e5b_v1"
     },
