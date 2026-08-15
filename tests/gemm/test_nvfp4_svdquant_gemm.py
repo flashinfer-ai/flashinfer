@@ -113,11 +113,11 @@ def _make_gemm_problem(m, n, k, rank=_RANK, device="cuda"):
     }
 
 
-# n=3072 / n=12288 exercise the dedicated fast-path kernels; n=4096 the legacy
-# (generic-width) kernel. m values cover token tails and non-multiple-of-128 rows
-# (SF row padding).
+# n=3072 / n=12288 exercise the Qwen fast paths; n=5376 / n=7168 / n=14336
+# exercise the MiniMax-H3 fast paths; n=4096 covers the legacy (generic-width)
+# kernel. m values cover token tails and non-multiple-of-128 rows (SF row padding).
 @pytest.mark.parametrize("m", [44, 129, 256, 1000])
-@pytest.mark.parametrize("n", [3072, 12288, 4096])
+@pytest.mark.parametrize("n", [3072, 5376, 7168, 12288, 14336, 4096])
 def test_nvfp4_quantize_smooth(m, n):
     _skip_unless_sm100()
     torch.manual_seed(0)

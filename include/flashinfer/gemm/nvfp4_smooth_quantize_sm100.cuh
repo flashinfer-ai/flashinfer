@@ -558,18 +558,32 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
   if (m == 0 || n == 0) return;
 
   bool const enablePDL = enable_pdl;
-  bool const useFastPath = (n == 3072 || n == 12288);
+  bool const useFastPath = (n == 3072 || n == 5376 || n == 7168 || n == 12288 || n == 14336);
   if (useFastPath) {
-    // Same-node SM100 sweeps over the Qwen image-token M values select 192 threads for K=3072
-    // and 256 for K=12288. A grid cap of eight CTAs per SM is best for both.
-    int const blockThreads = n == 3072 ? 192 : 256;
+    // Same-node SM100 sweeps over the Qwen and MiniMax-H3 video-token M values select these CTA
+    // widths. Each work item owns one complete 16-value scale block; the grid remains capped at
+    // eight CTAs per SM to keep the bandwidth-bound quantizer saturated.
+    int const blockThreads = n == 3072    ? 192
+                             : n == 5376  ? 192
+                             : n == 7168  ? 224
+                             : n == 12288 ? 256
+                                          : 448;
     int const blocksPerSm = 8;
 
     if (n == 3072)
       launchSmoothQuantizeFast<3072, 2>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount,
                                         blockThreads, blocksPerSm, enablePDL, stream);
-    else
+    else if (n == 5376)
+      launchSmoothQuantizeFast<5376, 1>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount,
+                                        blockThreads, blocksPerSm, enablePDL, stream);
+    else if (n == 7168)
+      launchSmoothQuantizeFast<7168, 1>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount,
+                                        blockThreads, blocksPerSm, enablePDL, stream);
+    else if (n == 12288)
       launchSmoothQuantizeFast<12288, 1>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount,
+                                         blockThreads, blocksPerSm, enablePDL, stream);
+    else
+      launchSmoothQuantizeFast<14336, 1>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount,
                                          blockThreads, blocksPerSm, enablePDL, stream);
     return;
   }
