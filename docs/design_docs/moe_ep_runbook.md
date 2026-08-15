@@ -194,8 +194,46 @@ Notes:
 - `NPROC_SMOKE` / `NPROC_MULTIRANK` (default 4) override the rank count for
   the `run_tests.sh` targets.
 - UCX/ibverbs are **build-time** deps; the tests set no `NIXL_*`/`UCX_*` env.
+  When UCX lives in a non-default prefix (e.g. `/opt/ucx` from the source
+  build above), put its `lib/` on `LD_LIBRARY_PATH` at **runtime** too —
+  loading a different UCX than the one nixl was built against fails at fleet
+  creation with `registerMem(...) != NIXL_SUCCESS`.
+- **Pin the `nixl-cu13` wheel to the 3rdparty/nixl submodule tag** (currently
+  `==1.3.1`; the build hook installs the pinned version via
+  `_NIXL_WHEEL_VERSION` in `build_backend.py`). `nixl_ep_cpp.so` compiles the
+  submodule's device kernels but loads the wheel's `libnixl.so` at runtime —
+  a skewed pair (e.g. a 1.4.x wheel over the v1.3.1 kernels) builds and
+  imports fine, then dies at the first dispatch with device asserts
+  (`nixlPut(...) == NIXL_IN_PROG` → `cudaErrorIllegalAddress`).
+- **Do not run concurrent `BUILD_NIXL_EP=1` installs from one checkout**
+  (e.g. several SLURM jobs sharing a network-filesystem clone): the build
+  patches `3rdparty/nixl` in place and shares `build_nvep/`, so parallel
+  installs race and fail with `git apply` / meson `Unknown option` errors.
+  Serialize the first build; later installs reuse the staged `_libs/` .so.
+- The install and the launcher must resolve to the **same interpreter**: an
+  editable install into a venv is invisible to a `torchrun` that resolves to
+  the system python (`ModuleNotFoundError: flashinfer` in the spawned ranks
+  while parent-shell imports work). When in doubt, launch with
+  `python -m torch.distributed.run` so the launcher is pinned to the python
+  that owns the install.
 - NIXL-EP coverage today is smoke + multirank + mocked unit tests only; the
   correctness/mega targets are NCCL-EP-only.
+
+### NCCL-EP low-latency device-kernel limits
+
+Two constraints of the `nccl.ep` LL device kernel (probed empirically on
+nccl4py 0.3.1; not enforced by `validate_fleet_params`, so they surface as
+device-side aborts):
+
+- **Per-token row widths are whitelisted**: LL dispatch accepts bf16 rows of
+  {2048, 2560, 4096, 5120, 6144, 7168, 8192} elements only — 3072, sub-2048
+  widths, and all 1-byte payload dtypes are rejected with
+  `low_latency.cu 'Unsupported hidden'`. The sent row may be narrower than
+  `FleetParams.token_hidden_size` (recv buffers mirror the sent row), which
+  is what the split path's packed-MXFP8 dispatch relies on.
+- **top-k is capped at 8** (`numTopk <= kNumMaxTopK`, `low_latency.cu`):
+  top-10 models (e.g. Qwen3.5) abort on NCCL-EP LL; use the HT algorithm or
+  NIXL-EP (which handles top-10 at LL).
 
 ### SM90 mega token sweep
 
