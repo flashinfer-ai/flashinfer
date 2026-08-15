@@ -12,6 +12,64 @@ typedef short int          int16_t;
 
 #include <cuda_bf16.h>
 
+
+template <int kVariant>
+__device__ __forceinline__ uint32_t cake_fmha_qmul4_portable(
+    uint32_t src, uint32_t scale) {
+  static_assert(kVariant >= 0 && kVariant <= 6, "invalid Cake FMHA QMUL4 variant");
+  uint16_t a01;
+  uint16_t a23;
+  if constexpr (kVariant <= 4) {
+    a01 = static_cast<uint16_t>(
+        (src & 0x0000000Fu) | ((src >> 4) & 0x000000F0u));
+    a23 = static_cast<uint16_t>(
+        ((src >> 16) & 0x0000000Fu) | ((src >> 20) & 0x000000F0u));
+  } else if constexpr (kVariant == 5) {
+    a01 = static_cast<uint16_t>(src & 0x000000FFu);
+    a23 = static_cast<uint16_t>((src >> 8) & 0x000000FFu);
+  } else {
+    a01 = static_cast<uint16_t>((src >> 16) & 0x000000FFu);
+    a23 = static_cast<uint16_t>((src >> 24) & 0x000000FFu);
+  }
+
+  uint16_t s01;
+  uint16_t s23;
+  if constexpr (kVariant == 0) {
+    s01 = static_cast<uint16_t>(scale & 0x0000FFFFu);
+    s23 = static_cast<uint16_t>((scale >> 16) & 0x0000FFFFu);
+  } else {
+    constexpr int kByteIndex =
+        kVariant == 1 ? 0 : kVariant == 2 ? 1 : kVariant == 3 ? 2 :
+        kVariant == 4 ? 3 : 0;
+    const uint16_t scale_byte =
+        static_cast<uint16_t>((scale >> (kByteIndex * 8)) & 0xFFu);
+    s01 = static_cast<uint16_t>(scale_byte | (scale_byte << 8));
+    s23 = s01;
+  }
+
+  uint32_t output;
+  asm volatile(
+      "{\n"
+      ".reg .b8 ab0, ab1;\n"
+      ".reg .b32 ah0, ah1, sh0, sh1;\n"
+      ".reg .b16 e0, e1;\n"
+      "mov.b16 {ab0, _}, %1;\n"
+      "mov.b16 {ab1, _}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 ah0, ab0;\n"
+      "cvt.rn.f16x2.e2m1x2 ah1, ab1;\n"
+      "cvt.rn.f16x2.e4m3x2 sh0, %3;\n"
+      "cvt.rn.f16x2.e4m3x2 sh1, %4;\n"
+      "mul.rn.f16x2 ah0, ah0, sh0;\n"
+      "mul.rn.f16x2 ah1, ah1, sh1;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 e0, ah0;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 e1, ah1;\n"
+      "mov.b32 %0, {e0, e1};\n"
+      "}\n"
+      : "=r"(output)
+      : "h"(a01), "h"(a23), "h"(s01), "h"(s23));
+  return output;
+}
+
 #define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 224
 #define TMEM_TMEM_S0_OFFSET 0
@@ -1766,48 +1824,32 @@ kernel_cake_fmha_decode_quant_nvfp4(const void* __restrict__ Qt, const void* __r
                                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&ksf_word1[0])) : "r"(work_sf_base + (ksf_row0 + 8) * 8 + ldsm_stage / 4 * 4));
                                 if (ldsm_stage % 4 == 0) {
                                     {
-                                        uint32_t _qmul4_marker_0;
-                                        asm volatile("lop3.b32 %0, %1, %2, 0x51A7E001, 0x96;" : "=r"(_qmul4_marker_0) : "r"(src_word0), "r"(ksf_word0[0]));
-                                        dst_word0 = _qmul4_marker_0;
+                                        dst_word0 = cake_fmha_qmul4_portable<1>(src_word0, ksf_word0[0]);
                                     }
                                     {
-                                        uint32_t _qmul4_marker_1;
-                                        asm volatile("lop3.b32 %0, %1, %2, 0x51A7E001, 0x96;" : "=r"(_qmul4_marker_1) : "r"(src_word1), "r"(ksf_word1[0]));
-                                        dst_word1 = _qmul4_marker_1;
+                                        dst_word1 = cake_fmha_qmul4_portable<1>(src_word1, ksf_word1[0]);
                                     }
                                 } else if (ldsm_stage % 4 == 1) {
                                     {
-                                        uint32_t _qmul4_marker_2;
-                                        asm volatile("lop3.b32 %0, %1, %2, 0x51A7E002, 0x96;" : "=r"(_qmul4_marker_2) : "r"(src_word0), "r"(ksf_word0[0]));
-                                        dst_word0 = _qmul4_marker_2;
+                                        dst_word0 = cake_fmha_qmul4_portable<2>(src_word0, ksf_word0[0]);
                                     }
                                     {
-                                        uint32_t _qmul4_marker_3;
-                                        asm volatile("lop3.b32 %0, %1, %2, 0x51A7E002, 0x96;" : "=r"(_qmul4_marker_3) : "r"(src_word1), "r"(ksf_word1[0]));
-                                        dst_word1 = _qmul4_marker_3;
+                                        dst_word1 = cake_fmha_qmul4_portable<2>(src_word1, ksf_word1[0]);
                                     }
                                 } else {
                                     if (ldsm_stage % 4 == 2) {
                                         {
-                                            uint32_t _qmul4_marker_4;
-                                            asm volatile("lop3.b32 %0, %1, %2, 0x51A7E003, 0x96;" : "=r"(_qmul4_marker_4) : "r"(src_word0), "r"(ksf_word0[0]));
-                                            dst_word0 = _qmul4_marker_4;
+                                            dst_word0 = cake_fmha_qmul4_portable<3>(src_word0, ksf_word0[0]);
                                         }
                                         {
-                                            uint32_t _qmul4_marker_5;
-                                            asm volatile("lop3.b32 %0, %1, %2, 0x51A7E003, 0x96;" : "=r"(_qmul4_marker_5) : "r"(src_word1), "r"(ksf_word1[0]));
-                                            dst_word1 = _qmul4_marker_5;
+                                            dst_word1 = cake_fmha_qmul4_portable<3>(src_word1, ksf_word1[0]);
                                         }
                                     } else {
                                         {
-                                            uint32_t _qmul4_marker_6;
-                                            asm volatile("lop3.b32 %0, %1, %2, 0x51A7E004, 0x96;" : "=r"(_qmul4_marker_6) : "r"(src_word0), "r"(ksf_word0[0]));
-                                            dst_word0 = _qmul4_marker_6;
+                                            dst_word0 = cake_fmha_qmul4_portable<4>(src_word0, ksf_word0[0]);
                                         }
                                         {
-                                            uint32_t _qmul4_marker_7;
-                                            asm volatile("lop3.b32 %0, %1, %2, 0x51A7E004, 0x96;" : "=r"(_qmul4_marker_7) : "r"(src_word1), "r"(ksf_word1[0]));
-                                            dst_word1 = _qmul4_marker_7;
+                                            dst_word1 = cake_fmha_qmul4_portable<4>(src_word1, ksf_word1[0]);
                                         }
                                     }
                                 }
@@ -1840,14 +1882,10 @@ kernel_cake_fmha_decode_quant_nvfp4(const void* __restrict__ Qt, const void* __r
                                 int vsf_addr = work_sf_base + ldsm_stage_1 * 128 + lane % 4 * 32 + vsf_group * 4;
                                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vsf_word[0])) : "r"(vsf_addr));
                                 {
-                                    uint32_t _qmul4_marker_8;
-                                    asm volatile("lop3.b32 %0, %1, %2, 0x51A7E000, 0x96;" : "=r"(_qmul4_marker_8) : "r"(src_word0_1), "r"(vsf_word[0]));
-                                    dst_word0_1 = _qmul4_marker_8;
+                                    dst_word0_1 = cake_fmha_qmul4_portable<0>(src_word0_1, vsf_word[0]);
                                 }
                                 {
-                                    uint32_t _qmul4_marker_9;
-                                    asm volatile("lop3.b32 %0, %1, %2, 0x51A7E000, 0x96;" : "=r"(_qmul4_marker_9) : "r"(src_word1_1), "r"(vsf_word[0]));
-                                    dst_word1_1 = _qmul4_marker_9;
+                                    dst_word1_1 = cake_fmha_qmul4_portable<0>(src_word1_1, vsf_word[0]);
                                 }
                                 unsigned int store_words_1[2];
                                 store_words_1[0] = dst_word0_1;

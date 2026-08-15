@@ -1223,16 +1223,16 @@
       "sha256": "5d37efd64dc94d7773f98dad6086e30f1c46a158df61fcba5d2483a26d76f91c"
     },
     "cuda/decode_quant_nvfp4/page_size16.cu": {
-      "bytes": 102958,
-      "sha256": "cb55438161084590e1886eaa7ce54c0d5e0fa642f2085ad27682f4add27025f2"
+      "bytes": 103025,
+      "sha256": "e469501ebd33c82d2c7a9275776c9578579a4e4997af10db322e0c4da2842ad3"
     },
     "cuda/decode_quant_nvfp4/page_size32.cu": {
-      "bytes": 102509,
-      "sha256": "b4e89dc530323df105a7a6c9c020c51b44e695acbb78b4abeeab27ea1270e2b8"
+      "bytes": 102576,
+      "sha256": "4c823297d886f7e8ad2588d9bb9095b75e3d1b51e900468dfae954e202b6510a"
     },
     "cuda/decode_quant_nvfp4/page_size64.cu": {
-      "bytes": 102509,
-      "sha256": "1d039346bd20438adf8f55c1c76d0f93f672c7caf1b5676120e5fe81f14c5f6e"
+      "bytes": 102576,
+      "sha256": "838a48ebb8aef1b51a8d31382e76055896c0a2220bdfec317a8f51e2da339bf1"
     },
     "include/cake_fmha.h": {
       "bytes": 9228,
@@ -4036,8 +4036,8 @@
             "PAGE_SIZE": 16
           },
           "sha256": {
-            "sm_100a": "cb55438161084590e1886eaa7ce54c0d5e0fa642f2085ad27682f4add27025f2",
-            "sm_103a": "cb55438161084590e1886eaa7ce54c0d5e0fa642f2085ad27682f4add27025f2"
+            "sm_100a": "e469501ebd33c82d2c7a9275776c9578579a4e4997af10db322e0c4da2842ad3",
+            "sm_103a": "e469501ebd33c82d2c7a9275776c9578579a4e4997af10db322e0c4da2842ad3"
           },
           "sources": {
             "sm_100a": "cuda/decode_quant_nvfp4/page_size16.cu",
@@ -4049,8 +4049,8 @@
             "PAGE_SIZE": 32
           },
           "sha256": {
-            "sm_100a": "b4e89dc530323df105a7a6c9c020c51b44e695acbb78b4abeeab27ea1270e2b8",
-            "sm_103a": "b4e89dc530323df105a7a6c9c020c51b44e695acbb78b4abeeab27ea1270e2b8"
+            "sm_100a": "4c823297d886f7e8ad2588d9bb9095b75e3d1b51e900468dfae954e202b6510a",
+            "sm_103a": "4c823297d886f7e8ad2588d9bb9095b75e3d1b51e900468dfae954e202b6510a"
           },
           "sources": {
             "sm_100a": "cuda/decode_quant_nvfp4/page_size32.cu",
@@ -4062,8 +4062,8 @@
             "PAGE_SIZE": 64
           },
           "sha256": {
-            "sm_100a": "1d039346bd20438adf8f55c1c76d0f93f672c7caf1b5676120e5fe81f14c5f6e",
-            "sm_103a": "1d039346bd20438adf8f55c1c76d0f93f672c7caf1b5676120e5fe81f14c5f6e"
+            "sm_100a": "838a48ebb8aef1b51a8d31382e76055896c0a2220bdfec317a8f51e2da339bf1",
+            "sm_103a": "838a48ebb8aef1b51a8d31382e76055896c0a2220bdfec317a8f51e2da339bf1"
           },
           "sources": {
             "sm_100a": "cuda/decode_quant_nvfp4/page_size64.cu",
