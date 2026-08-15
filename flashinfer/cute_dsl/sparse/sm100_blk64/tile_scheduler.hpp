@@ -102,6 +102,22 @@ struct CLCTileScheduler {
     flash::tcgen05_fence_before_sync();
     cutlass::arch::fence_view_async_tmem_store();
     cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    // SM103: process exactly the CTA's initial tile.  The CLC transition used
+    // by the SM100 persistent path can deadlock after repeated launches on
+    // B300.  All 480 worker threads rendezvous before MMA releases TMEM.
+    //
+    // Barrier choice: CUTLASS offsets integer barrier ids by
+    // ReservedNamedBarrierCount (8).  This kernel's SmStats barriers occupy
+    // user ids 0-7 (hardware 8-15), so any integer id here overflows past 15
+    // and wraps onto hardware barrier 0 -- the __syncthreads barrier -- letting
+    // unrelated arrivals release this rendezvous early and wedge the CTA.
+    // Sm120MainloopBarrier (hardware id 7, reserved-enum ctor applies no
+    // offset) is unused by this SM100/SM103 kernel, so take it directly.
+    cutlass::arch::NamedBarrier(480, cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier)
+        .arrive_and_wait();
+    return {0, 0, 0, false};
+#else
     // Release old CLC result (enables scheduler's next producer_acquire)
     pipeline_clc.consumer_release(cons_state);
     clc_transition_fence();
@@ -117,6 +133,7 @@ struct CLCTileScheduler {
     }
     flash::tcgen05_commit();
     return decode(resp.row_tile, params.num_row_tiles, params.num_heads);
+#endif
   }
 
   // ---- Producer tail: drain pipeline before exit ----

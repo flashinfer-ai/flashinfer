@@ -255,6 +255,15 @@ struct FusedAttnFwdSm100 {
     CollectiveEpilogue epilogue;
 
     if (warp_idx == kSchedWarp) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+      // SM103 uses one statically assigned tile per CTA; worker warps
+      // rendezvous in consumer_advance().  Keep this warp alive until the
+      // worker-side completion flag is visible so the CTA cannot retire early.
+      while (*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready) != 2) {
+      }
+      __threadfence_block();
+      return;
+#else
       // ===== WG3 warp 15: CLC scheduler (lane 0 only) =====
       // Only lane 0 runs the scheduling loop (matching original pattern).
       // producer_tail drains the pipeline on exit.
@@ -273,6 +282,7 @@ struct FusedAttnFwdSm100 {
         }
         // producer_tail intentionally omitted (matches original)
       }
+#endif
     } else if (warp_idx == kMmaWarp) {
       // ===== WG3 warp 12: MMA (TMEM alloc here) =====
       tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
@@ -294,6 +304,13 @@ struct FusedAttnFwdSm100 {
                                  shared_storage, tmem_base, tile_nkv, mma_state);
         work = tile_sched.consumer_advance();
       }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+      if (lane_idx == 0) {
+        __threadfence_block();
+        *reinterpret_cast<volatile int*>(&shared_storage.tmem_ready) = 2;
+      }
+#endif
 
       tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
     } else if (warp_idx == kEpiWarp) {
