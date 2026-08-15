@@ -45,6 +45,10 @@ _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
+_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan]]
+
 
 class _RecurrentKDAPrefillWorkspaceBase:
     def __init__(self, device: torch.device | str) -> None:
@@ -68,10 +72,8 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._descriptor_signatures: dict[str, tuple] = {}
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
-        self._packed_metadata_signature: Optional[
-            tuple[int, int, int, int, bool]
-        ] = None
-        self._packed_metadata = None
+        self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
+        self._packed_metadata: Optional[_PackedTaskMetadata] = None
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
 
@@ -612,10 +614,7 @@ def _cached_packed_task_metadata(
     num_heads: int,
     sm_count: int,
     build_persistent_plan: bool,
-) -> tuple[
-    tuple[int, ...],
-    tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None,
-]:
+) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
     signature = (
@@ -626,19 +625,20 @@ def _cached_packed_task_metadata(
         build_persistent_plan,
     )
     with workspace._packed_metadata_lock:
+        cached_metadata = workspace._packed_metadata
         if (
             workspace._packed_metadata_tensor is cu_seqlens
             and workspace._packed_metadata_signature == signature
+            and cached_metadata is not None
         ):
-            return workspace._packed_metadata
+            return cached_metadata
         offsets = tuple(int(value) for value in cu_seqlens.tolist())
         if (
             not offsets
             or offsets[0] != 0
             or offsets[-1] != total_tokens
             or any(
-                right <= left
-                for left, right in zip(offsets, offsets[1:], strict=False)
+                right <= left for left, right in zip(offsets, offsets[1:], strict=False)
             )
         ):
             raise ValueError(

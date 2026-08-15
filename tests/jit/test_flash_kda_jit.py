@@ -343,9 +343,7 @@ def test_flash_kda_uri_and_jit_spec(
     assert begin_marker == alias_begin
     assert end_marker == alias_end
     if variant == "persistent_m128":
-        assert alias_signature.count(
-            "__nv_bfloat16* __restrict__ initial_state"
-        ) == 1
+        assert alias_signature.count("__nv_bfloat16* __restrict__ initial_state") == 1
     else:
         assert alias_signature.count("__nv_bfloat16* initial_state") == 1
     assert alias_signature.count("__nv_bfloat16* final_state") == 1
@@ -360,8 +358,7 @@ def test_flash_kda_uri_and_jit_spec(
         )
     if variant == "persistent_m128":
         inplace_store = (
-            "/* FLASHINFER INTEGRATION: persistent in-place state */ "
-            "initial_state +"
+            "/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state +"
         )
         assert alias_suffix.count(inplace_store) == 4
         alias_suffix = alias_suffix.replace(inplace_store, "final_state +")
