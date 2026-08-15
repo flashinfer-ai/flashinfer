@@ -277,6 +277,17 @@ def _isolated_collection_groups(test_path: Path) -> list[tuple[str, list[Path]]]
     return groups
 
 
+def _pytest_root(repo_root: Path, test_path: Path) -> Path:
+    """Return the stable pytest root used for collection and execution."""
+    resolved_repo = repo_root.resolve()
+    resolved_test = test_path.resolve()
+    try:
+        resolved_test.relative_to(resolved_repo)
+    except ValueError:
+        return resolved_test if resolved_test.is_dir() else resolved_test.parent
+    return resolved_repo
+
+
 def _collect_partition(
     repo_root: Path,
     test_path: Path,
@@ -292,6 +303,7 @@ def _collect_partition(
 ) -> list[dict[str, Any]]:
     output = directory / f"collection-{partition_index:02d}.json"
     log_path = directory / f"collection-{partition_index:02d}.log"
+    pytest_root = _pytest_root(repo_root, test_path)
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -301,6 +313,7 @@ def _collect_partition(
         sys.executable,
         "-m",
         "pytest",
+        f"--rootdir={pytest_root}",
         "--collect-only",
         "-q",
         "-q",
@@ -1012,6 +1025,7 @@ class _ShardProgress:
 @dataclass
 class _ShardExecutor:
     repo_root: Path
+    pytest_root: Path
     junit_dir: Path
     plan: Plan
     execution: ExecutionSettings
@@ -1263,6 +1277,7 @@ class _ShardExecutor:
                 result = execute_batch(
                     BatchExecutionRequest(
                         repo_root=self.repo_root,
+                        pytest_root=self.pytest_root,
                         junit_dir=self.junit_dir,
                         unit=unit,
                         batch=batch,
@@ -1516,6 +1531,7 @@ def execute_shard(
     plan: Plan,
     execution: ExecutionSettings,
     operation_started_at: float,
+    test_path: Path,
 ) -> int:
     if not 0 <= execution.shard_index < plan.options.shard_count:
         raise RunnerStateError(
@@ -1583,6 +1599,7 @@ def execute_shard(
         )
         shard_executor = _ShardExecutor(
             repo_root=repo_root,
+            pytest_root=_pytest_root(repo_root, test_path),
             junit_dir=junit_dir,
             plan=plan,
             execution=execution,
