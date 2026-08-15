@@ -19,8 +19,13 @@ shapes representing Kimi-K3's per-rank head count under TP8.  ``--case-set``
 can select either group independently.
 
 The FlashInfer candidate is always invoked through the public
-``recurrent_kda`` API. With ``--flash-kda-peer``, two commit-verified
-MoonshotAI/FlashKDA measurements are reported:
+``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
+device/shape policy, while ``nonpersistent`` supplies the same explicit
+workspace and packed sequence order used by the historical benchmark to keep
+B200 on the direct schedule family. The resolved module and exact target are
+recorded by observing the real dispatcher during untimed warmup. With
+``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
+reported:
 
 * the raw ``_fwd_raw`` kernel timing scope;
 * a public-semantics adapter that follows ``_fwd_raw`` with the same-stream
@@ -260,15 +265,13 @@ def _make_state_pool(
     return initial_state.unsqueeze(0).expand(rotations, *initial_state.shape).clone()
 
 
-def _variant_for_case(case: Case) -> str:
-    if case.num_heads == 12:
-        return "m128_n16"
-    if case.name == "h64_fixed8192":
-        return "m64"
-    return "m128"
-
-
-def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedCase:
+def _make_case(
+    case: Case,
+    *,
+    state_rotations: int,
+    candidate_route: str,
+    flash_kda=None,
+) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
     shape = (1, total_tokens, case.num_heads, 128)
     generator = torch.Generator(device="cuda").manual_seed(case.seed)
@@ -303,7 +306,11 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
     ).to(torch.bfloat16)
     candidate_state_pool = _make_state_pool(initial_state, state_rotations)
     candidate_output = torch.empty_like(q)
-    candidate_workspace = RecurrentKDAPrefillWorkspace(q.device)
+    candidate_workspace = (
+        RecurrentKDAPrefillWorkspace(q.device)
+        if candidate_route == "nonpersistent"
+        else None
+    )
     state_cursors = {"pr": [0], "adapted": [0]}
 
     offsets = [0]
@@ -322,7 +329,7 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
             dtype=torch.int32,
             device="cuda",
         )
-        if case.packed
+        if case.packed and candidate_route == "nonpersistent"
         else None
     )
     scale = float(1.0 / np.sqrt(128.0))
@@ -442,13 +449,39 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
             peer_adapted_state_pool.copy_(initial_state.unsqueeze(0))
             state_cursors["adapted"][0] = 0
 
+    # Observe the actual internal module selected by the public API once during
+    # untimed warmup. This avoids duplicating dispatcher policy in the evidence
+    # harness while keeping route logging out of every timed call.
+    kda_prefill_module = import_module("flashinfer.kda_prefill")
+    original_get_module = kda_prefill_module._get_flash_kda_prefill_module
+    resolved_routes = []
+
+    def recording_get_module(variant, target):
+        resolved_routes.append((variant, target))
+        return original_get_module(variant, target)
+
+    kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
+    try:
+        candidate_run()
+        torch.cuda.synchronize()
+    finally:
+        kda_prefill_module._get_flash_kda_prefill_module = original_get_module
+        reset_state_pools()
+    if len(resolved_routes) != 1:
+        raise RuntimeError(
+            f"expected one FlashKDA prefill route during warmup, got {resolved_routes}"
+        )
+    resolved_variant, resolved_target = resolved_routes[0]
+
     metadata = {
         "name": case.name,
         "num_heads": case.num_heads,
         "seq_lens": list(case.seq_lens),
         "total_tokens": total_tokens,
         "layout": "packed" if case.packed else "fixed",
-        "variant": _variant_for_case(case),
+        "variant": resolved_variant,
+        "target": resolved_target,
+        "candidate_route": candidate_route,
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -548,6 +581,15 @@ def main() -> None:
         help="Number of preinitialized same-input state slots per mutable path.",
     )
     parser.add_argument(
+        "--candidate-route",
+        choices=("dispatcher", "nonpersistent"),
+        default="dispatcher",
+        help=(
+            "Measure the natural public dispatcher or force B200 onto its "
+            "non-persistent direct/M64 family with an explicit workspace."
+        ),
+    )
+    parser.add_argument(
         "--flash-kda-peer",
         action="store_true",
         help=(
@@ -626,6 +668,7 @@ def main() -> None:
         prepared = _make_case(
             case,
             state_rotations=args.state_rotations,
+            candidate_route=args.candidate_route,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}
