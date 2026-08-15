@@ -62,6 +62,12 @@ def _require_sm80_for_bf16():
         pytest.skip("BF16 requires SM80+")
 
 
+def _require_cub_tie_break_support():
+    """CUB tie-break requirement configs need SM90+ on any tier."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
+
+
 def verify_topk_correctness(logits, values, indices, k):
     """Verify that all returned values are truly in the top-k.
 
@@ -2300,69 +2306,97 @@ def test_top_k_deterministic_sorted_repeatable_valid_selection_under_ties(
     )
 
 
+def _make_tie_break_test_case(num_rows, width, k, dtype, pattern):
+    """Build exact SMALL/LARGE expectations for shared tie-break API tests."""
+    device = "cuda"
+    if pattern == "all_equal":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        scores = (
+            torch.randn((num_rows, 1), device=device, dtype=dtype, generator=generator)
+            .expand(num_rows, width)
+            .contiguous()
+        )
+        expected_small = torch.arange(k, device=device, dtype=torch.int64)
+        expected_large = torch.arange(
+            width - k, width, device=device, dtype=torch.int64
+        )
+    elif pattern == "boundary_tie":
+        ties = 8
+        if k < 2 or width < k + ties:
+            raise ValueError("boundary_tie requires k >= 2 and room for the tied group")
+        scores = torch.zeros((num_rows, width), device=device, dtype=dtype)
+        scores[:, : k - 1] = torch.linspace(
+            100.0, 50.0, k - 1, device=device, dtype=dtype
+        )
+        tie_start = min(max(k, width // 2), width - ties)
+        tie_positions = torch.arange(
+            tie_start, tie_start + ties, device=device, dtype=torch.int64
+        )
+        scores[:, tie_positions] = 10.0
+        always_selected = torch.arange(k - 1, device=device, dtype=torch.int64)
+        expected_small = torch.cat((always_selected, tie_positions[:1]))
+        expected_large = torch.cat((always_selected, tie_positions[-1:]))
+    else:
+        raise ValueError(f"unknown tie-break test pattern: {pattern}")
+
+    return (
+        scores,
+        expected_small.unsqueeze(0).expand(num_rows, -1),
+        expected_large.unsqueeze(0).expand(num_rows, -1),
+    )
+
+
 @pytest.mark.parametrize(
-    ("algo", "batch_size", "vocab_size", "k"),
+    ("algo", "batch_size", "vocab_size", "k", "pattern"),
     [
-        ("clusters", 2, 128 * 1024, 2048),
-        ("filtered", 2, 128 * 1024, 2048),
-        ("filtered", 1, 1024 * 1024, 1024),
-        ("filtered", 74, 16 * 1024, 512),
+        ("clusters", 2, 128 * 1024, 2048, "all_equal"),
+        ("filtered", 2, 128 * 1024, 2048, "all_equal"),
+        ("filtered", 1, 1024 * 1024, 1024, "all_equal"),
+        ("filtered", 74, 16 * 1024, 512, "all_equal"),
+        ("cub", 4, 4096, 256, "boundary_tie"),
     ],
     ids=[
         "clusters_override_b2_l128k_k2048",
         "filtered_b2_l128k_k2048",
         "filtered_b1_l1m_k1024",
         "filtered_b74_l16k_k512",
+        "cub_b4_l4k_k256_boundary_tie",
     ],
 )
-def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, set_topk_algo):
+def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, pattern, set_topk_algo):
     """tie_break=1|2 should select row-global smallest/largest pivot indices."""
-    if not can_implement_filtered_topk():
+    if algo == "cub":
+        _require_cub_tie_break_support()
+    elif not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
     set_topk_algo(algo)
-    device = "cuda"
-    generator = torch.Generator(device=device)
-    generator.manual_seed(0)
-    logits = (
-        torch.randn(
-            (batch_size, 1), device=device, dtype=torch.float32, generator=generator
-        )
-        .expand(batch_size, vocab_size)
-        .contiguous()
+    logits, expected_small, expected_large = _make_tie_break_test_case(
+        batch_size, vocab_size, k, torch.float32, pattern
     )
 
     values_small, indices_small = flashinfer.top_k(logits, k, tie_break=1)
     values_large, indices_large = flashinfer.top_k(logits, k, tie_break=2)
 
-    expected_small = (
-        torch.arange(k, device=device, dtype=torch.int64)
-        .unsqueeze(0)
-        .expand(batch_size, -1)
-    )
-    expected_large = (
-        torch.arange(vocab_size - k, vocab_size, device=device, dtype=torch.int64)
-        .unsqueeze(0)
-        .expand(batch_size, -1)
-    )
-    expected_values = logits[:, :1].expand(batch_size, k).contiguous()
-
-    torch.testing.assert_close(values_small, expected_values)
-    torch.testing.assert_close(values_large, expected_values)
+    torch.testing.assert_close(values_small, torch.gather(logits, 1, indices_small))
+    torch.testing.assert_close(values_large, torch.gather(logits, 1, indices_large))
     _assert_unordered_indices_match(indices_small, expected_small)
     _assert_unordered_indices_match(indices_large, expected_large)
 
 
 @pytest.mark.parametrize(
-    ("algo", "num_rows", "max_len", "k", "dtype", "page_size"),
+    ("algo", "num_rows", "max_len", "k", "dtype", "page_size", "pattern"),
     [
-        ("clusters", 2, 128 * 1024, 2048, torch.bfloat16, 1),
-        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 1),
-        ("filtered", 1, 1024 * 1024, 1024, torch.float32, 1),
-        ("filtered", 74, 16 * 1024, 512, torch.float32, 1),
-        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 64),
-        ("filtered", 1, 256 * 1024, 1024, torch.float32, 64),
-        ("filtered", 74, 16 * 1024, 512, torch.float32, 64),
+        ("clusters", 2, 128 * 1024, 2048, torch.bfloat16, 1, "all_equal"),
+        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 1, "all_equal"),
+        ("filtered", 1, 1024 * 1024, 1024, torch.float32, 1, "all_equal"),
+        ("filtered", 74, 16 * 1024, 512, torch.float32, 1, "all_equal"),
+        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16, 64, "all_equal"),
+        ("filtered", 1, 256 * 1024, 1024, torch.float32, 64, "all_equal"),
+        ("filtered", 74, 16 * 1024, 512, torch.float32, 64, "all_equal"),
+        ("cub", 4, 4096, 256, torch.float32, 1, "boundary_tie"),
+        ("cub", 4, 4096, 256, torch.float32, 64, "boundary_tie"),
     ],
     ids=[
         "clusters_override_rows2_l128k_k2048",
@@ -2372,24 +2406,24 @@ def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, set_topk_algo):
         "filtered_compact_rows2_l128k_k2048",
         "filtered_compact_rows1_l256k_k1024",
         "filtered_compact_rows74_l16k_k512",
+        "cub_rows4_l4k_k256_boundary_tie",
+        "cub_compact_rows4_l4k_k256_boundary_tie",
     ],
 )
 def test_top_k_tie_break_modes_transform_apis(
-    algo, num_rows, max_len, k, dtype, page_size, set_topk_algo
+    algo, num_rows, max_len, k, dtype, page_size, pattern, set_topk_algo
 ):
     """Transform APIs should honor tie_break selection before remapping outputs."""
-    if not can_implement_filtered_topk():
+    if algo == "cub":
+        _require_cub_tie_break_support()
+    elif not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
     set_topk_algo(algo)
     device = "cuda"
 
-    generator = torch.Generator(device=device)
-    generator.manual_seed(0)
-    scores = (
-        torch.randn((num_rows, 1), device=device, dtype=dtype, generator=generator)
-        .expand(num_rows, max_len)
-        .contiguous()
+    scores, local_small, local_large = _make_tie_break_test_case(
+        num_rows, max_len, k, dtype, pattern
     )
     lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
     row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
@@ -2439,17 +2473,6 @@ def test_top_k_tie_break_modes_transform_apis(
         ragged_large = flashinfer.top_k_ragged_transform(
             scores, offsets, lengths, k, tie_break=2
         )
-
-    local_small = (
-        torch.arange(k, device=device, dtype=torch.int32)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-    )
-    local_large = (
-        torch.arange(max_len - k, max_len, device=device, dtype=torch.int32)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-    )
 
     def translate(local_indices):
         physical_pages = torch.gather(
@@ -3182,14 +3205,7 @@ def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
 # The CUB backend serves top_k_page_table_transform through the dispatcher, so the general
 # transform test grid above already exercises it (and the "cub" entries in the algorithm
 # parametrizations force it explicitly). The tests here cover only what is unique to the
-# CUB backend: its lengths <= 0 semantics, its tie-break modes, and its binding-level
-# workspace contract.
-
-
-def _require_cub_tie_break_support():
-    """CUB tie-break requirement configs need SM90+ on any tier."""
-    if get_compute_capability(torch.device("cuda"))[0] < 9:
-        pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
+# CUB backend: its lengths <= 0 semantics and its binding-level workspace contract.
 
 
 @pytest.mark.parametrize(
@@ -3281,46 +3297,6 @@ def test_cub_transform_nonpositive_lengths(transform_mode, page_size, set_topk_a
     graph.replay()
     torch.cuda.synchronize()
     check_output()
-
-
-@pytest.mark.parametrize(
-    "tie_break", [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE]
-)
-def test_cub_page_table_transform_tie_break(tie_break, set_topk_algo):
-    """Tie-break through the CUB backend pins the selected set by index rule.
-
-    Constructed boundary ties: k-1 distinct large scores plus a tied group straddling the
-    k-th boundary. With an identity page table (page_size=1, pt[i] = arange), the output
-    indices are the selected positions themselves, so the expected set is exact.
-    """
-    _require_cub_tie_break_support()
-    set_topk_algo("cub")
-    num_rows, d, k, ties = 4, 4096, 256, 8
-    scores = torch.zeros(num_rows, d, device="cuda")
-    # Positions [0, k-1) get distinct high scores; positions [1000, 1000+ties) all tie at
-    # a value that puts exactly one of them on the k-th boundary.
-    scores[:, : k - 1] = torch.linspace(100.0, 50.0, k - 1, device="cuda")
-    tie_positions = torch.arange(1000, 1000 + ties, device="cuda")
-    scores[:, tie_positions] = 10.0
-    pt = (
-        torch.arange(d, dtype=torch.int32, device="cuda")
-        .unsqueeze(0)
-        .repeat(num_rows, 1)
-    )
-    lengths = torch.full((num_rows,), d, dtype=torch.int32, device="cuda")
-
-    out = flashinfer.top_k_page_table_transform(
-        scores, pt, lengths, k, tie_break=tie_break
-    )
-    torch.cuda.synchronize()
-
-    if tie_break == flashinfer.TopKTieBreak.SMALL:
-        expected_tie = tie_positions[:1].tolist()
-    else:
-        expected_tie = tie_positions[-1:].tolist()
-    expected = set(range(k - 1)) | set(expected_tie)
-    for i in range(num_rows):
-        assert set(out[i].tolist()) == expected, f"row {i}: tie set mismatch"
 
 
 @pytest.mark.parametrize("transform_mode", ["page_table", "ragged", "top_k"])
