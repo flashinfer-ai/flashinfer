@@ -1841,13 +1841,14 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     The kernel consumes prequantized E4M3 activations and weights. Its calibrated
     activation/weight multipliers are folded into three per-expert FP32 epilogue
     scale vectors, so ``MoEActivationPack.hidden_states_scale`` remains ``None``.
-    Routing can be computed from logits or supplied as packed precomputed
-    ``(global_expert_id << 16) | bf16(weight)`` values.
+    Routing can be computed from logits or supplied as packed or unpacked
+    precomputed expert IDs and weights.
     """
 
     backend_key = "trtllm_fp8_per_tensor"
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
@@ -1915,7 +1916,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self._require_built()
         if self._inner is not None:
             return
-        from ..tllm_enums import WeightLayout
+        from ..tllm_enums import RoutingMethodType, WeightLayout
 
         self._inner = self._module.MoERunner(
             top_k=self.config.routing.top_k,
@@ -1928,7 +1929,9 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             activation_type=self._activation_type,
             use_shuffled_weight=True,
             weight_layout=int(WeightLayout.MajorK),
-            use_per_token_scaling=False,
+            use_per_token_scaling=(
+                self.config.routing.method is RoutingMethodType.Llama4
+            ),
             num_experts=self.config.routing.num_experts,
         )
 
@@ -2045,13 +2048,26 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            # The routed per-tensor op allocates its own expert-weight buffer
-            # and consumes only the packed topk_ids from this generic schema.
-            expert_weights = None
+            expert_weights = act.topk_weights.new_empty(
+                0, dtype=torch.bfloat16, device=act.topk_weights.device
+            )
+        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                type(self).__name__,
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = act.topk_ids
+            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
-                f"{type(self).__name__} supports only FromLogits and "
-                "PackedPrecomputed routing."
+                f"{type(self).__name__} supports only FromLogits, "
+                "PackedPrecomputed, and UnpackedPrecomputed routing."
             )
 
         moe_inputs = MoeRunnerInputs(
@@ -2065,6 +2081,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             per_token_scale=None,
         )
         self._static_kwargs = dict(
+            routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             output1_scales_scalar=view["output1_scales_scalar"],

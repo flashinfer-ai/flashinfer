@@ -81,6 +81,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.hpp",
   "instantiations/*.cu",
 ]
+# Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+# runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
   "*.md",
   "src/a2a/*.cu",
@@ -119,7 +121,7 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "build/",
 ]
@@ -144,7 +146,6 @@ extend-exclude = [
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
 ]
 force-exclude = true
