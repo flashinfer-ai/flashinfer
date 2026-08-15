@@ -58,7 +58,8 @@ from flashinfer.utils import get_compute_capability
 
 FLASH_KDA_PEER_COMMIT = "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
-DEFAULT_STATE_ROTATIONS = 512
+DEFAULT_LEGACY_STATE_ROTATIONS = 1024
+DEFAULT_H12_STATE_ROTATIONS = 4096
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 BENCHMARKS_DIR = Path(__file__).resolve().parent
 H12_PRESET = BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12.json"
@@ -577,8 +578,12 @@ def main() -> None:
     parser.add_argument(
         "--state-rotations",
         type=int,
-        default=DEFAULT_STATE_ROTATIONS,
-        help="Number of preinitialized same-input state slots per mutable path.",
+        help=(
+            "Override the number of preinitialized same-input state slots per "
+            "mutable path. By default legacy cases use "
+            f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
+            f"{DEFAULT_H12_STATE_ROTATIONS} slots."
+        ),
     )
     parser.add_argument(
         "--candidate-route",
@@ -615,7 +620,7 @@ def main() -> None:
 
     if args.warmup_ms <= 0 or args.bench_ms <= 0:
         parser.error("--warmup-ms and --bench-ms must be positive")
-    if args.state_rotations <= 0:
+    if args.state_rotations is not None and args.state_rotations <= 0:
         parser.error("--state-rotations must be positive")
     if args.flash_kda_peer != (args.flash_kda_source_dir is not None):
         parser.error(
@@ -665,9 +670,16 @@ def main() -> None:
     }[args.case_set]
     results = []
     for case in selected_cases:
+        state_rotations = args.state_rotations
+        if state_rotations is None:
+            state_rotations = (
+                DEFAULT_H12_STATE_ROTATIONS
+                if case in H12_CASES
+                else DEFAULT_LEGACY_STATE_ROTATIONS
+            )
         prepared = _make_case(
             case,
-            state_rotations=args.state_rotations,
+            state_rotations=state_rotations,
             candidate_route=args.candidate_route,
             flash_kda=flash_kda,
         )

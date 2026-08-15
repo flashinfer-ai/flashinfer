@@ -53,7 +53,7 @@ _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
     "m128": "ea022a2f1f",
     "m128_n16": "ef8b47d690",
-    "persistent_m128": "0f3142c047",
+    "persistent_m128": "fb536e5df4",
 }
 
 _FLASH_KDA_BINDING_STEMS = {

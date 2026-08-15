@@ -105,9 +105,9 @@ VARIANTS = {
         kernel_symbol="kernel_flashkda_bf16_persistent_m128",
         frozen_filename="flashkda_bf16_persistent_m128.cu",
         binding_filename="flashkda_bf16_persistent_m128_binding.cu",
-        module_ident="flashkda_bf16_persistent_m128_0f3142c047",
-        raw_sha256="56a16e141ed0aa9844df310739bfdc3b50619c24bec251f6998e8cbfd17b2300",
-        raw_bytes=162850,
+        module_ident="flashkda_bf16_persistent_m128_fb536e5df4",
+        raw_sha256="3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
+        raw_bytes=172462,
         smem_bytes=221696,
     ),
 }
@@ -159,7 +159,7 @@ PROFILES = {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-persistent-m128-sm100",
         "profile_path": "loom/export/profiles/flashkda_bf16_persistent_m128_sm100.json",
-        "profile_sha256": "bf07921d9e2c1f9e82aef7c4887f92ab2e56d47cb282fd18f4b6acad7a725527",
+        "profile_sha256": "acdf4879daaebb209e3463b7276d2b0a5ff8fab29d0ba946a5fd7036c8752a70",
         "variant": "persistent",
     },
 }
@@ -233,6 +233,10 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
         )
     if f"#define SMEM_TOTAL {variant.smem_bytes}" not in text:
         raise ValueError(f"{variant.key} raw source has an unexpected SMEM_TOTAL")
+    if variant.key == "persistent" and (
+        "task_ids[" not in text or "task_offsets[" not in text
+    ):
+        raise ValueError("persistent raw source does not consume worker/LPT task bins")
 
     signature_start = text.index(kernel_signature)
     signature_end = text.index("\n{", signature_start) + 1
@@ -293,6 +297,7 @@ def _manifest(frozen: dict[str, bytes]) -> bytes:
         "generated_invariants": [
             "six fence.proxy.tensormap::generic.acquire.sys operations",
             "CTA barrier after tensor-map acquisition",
+            "persistent source consumes worker/LPT task bins",
         ],
         "integration_patches": [
             {

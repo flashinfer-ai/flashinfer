@@ -53,6 +53,10 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     assert [patch["id"] for patch in manifest["integration_patches"]] == [
         "allow_exact_state_alias"
     ]
+    assert (
+        "persistent source consumes worker/LPT task bins"
+        in manifest["generated_invariants"]
+    )
 
     expected_variants = {
         "n16": (
@@ -81,10 +85,10 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         ),
         "persistent": (
             "flashkda_bf16_persistent_m128.cu",
-            "56a16e141ed0aa9844df310739bfdc3b50619c24bec251f6998e8cbfd17b2300",
-            "a78fdbfced65a4aa5e0d91a51735847f3f01a183804a2999d7586da46b4ec8a8",
-            "flashkda_bf16_persistent_m128_0f3142c047",
-            162850,
+            "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
+            "6a34bb07a651d7713de1f7799a6dda77e33b66b32f9d5b9519df8b9ffa02d08f",
+            "flashkda_bf16_persistent_m128_fb536e5df4",
+            172462,
             221696,
         ),
     }
@@ -110,6 +114,9 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         frozen_text = frozen.read_text()
         assert "Frozen generated Loom export" in frozen_text
         assert "raw SHA-256:" in frozen_text
+        if variant == "persistent":
+            assert "task_ids[" in frozen_text
+            assert "task_offsets[" in frozen_text
 
     import_tool = (
         Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
@@ -190,8 +197,8 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
         (
             "persistent_m128",
             221696,
-            "56a16e141ed0aa9844df310739bfdc3b50619c24bec251f6998e8cbfd17b2300",
-            "0f3142c047",
+            "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
+            "fb536e5df4",
             True,
         ),
     ],
