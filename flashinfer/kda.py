@@ -132,10 +132,10 @@ def recurrent_kda(
             int64 outside graph capture; graph capture requires caller-provided
             int64 offsets. For frozen prefill, values must start at zero, be
             strictly increasing, and end at the total token count. This value
-            contract is not normally host-validated. Eager 148-SM B200 calls
-            that are candidates for the persistent schedule read these values
-            once per unchanged offsets tensor to construct cached worker task
-            bins.
+            contract is not normally host-validated. Eager calls without an
+            explicit workspace or ``seq_order`` read these values once per
+            unchanged offsets tensor to schedule longer sequences first;
+            eligible 148-SM B200 calls also cache persistent worker task bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
@@ -167,11 +167,13 @@ def recurrent_kda(
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
-            permutation of shape ``[N]``. Sorting by descending sequence length
-            improves tail utilization. It is only consumed by the frozen
-            FlashKDA prefill backend; supplying it keeps the direct schedule so
-            caller-owned ordering is not replaced by persistent task bins.
-            Prepare it before CUDA graph capture or timed launches.
+            permutation of shape ``[N]``. Eager calls without an explicit
+            workspace automatically sort by descending sequence length and
+            cache that order; this argument overrides the automatic order. It
+            is only consumed by the frozen FlashKDA prefill backend; supplying
+            it keeps the direct schedule so caller-owned ordering is not
+            replaced by persistent task bins. Prepare it before CUDA graph
+            capture or timed launches.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for the frozen SM100-family prefill backend.

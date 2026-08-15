@@ -66,10 +66,12 @@ class _RecurrentKDAPrefillWorkspaceBase:
             for variant in ("m64", "m128", "m128_n16", "persistent_m128")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
-        self._persistent_plan_lock = threading.Lock()
-        self._persistent_plan_tensor: Optional[torch.Tensor] = None
-        self._persistent_plan_signature: Optional[tuple[int, int, int, int]] = None
-        self._persistent_plan = None
+        self._packed_metadata_lock = threading.Lock()
+        self._packed_metadata_tensor: Optional[torch.Tensor] = None
+        self._packed_metadata_signature: Optional[
+            tuple[int, int, int, int, bool]
+        ] = None
+        self._packed_metadata = None
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
 
@@ -602,23 +604,33 @@ def _get_stream_workspace(device: torch.device) -> _FlashKDAStreamWorkspace:
         return workspace
 
 
-def _cached_persistent_task_plan(
+def _cached_packed_task_metadata(
     workspace: _FlashKDAStreamWorkspace,
     cu_seqlens: torch.Tensor,
     *,
     total_tokens: int,
     num_heads: int,
     sm_count: int,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
-    """Cache one host-built plan for an unchanged packed-offset tensor."""
+    build_persistent_plan: bool,
+) -> tuple[
+    tuple[int, ...],
+    tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None,
+]:
+    """Cache host-built sequence order and optional persistent task bins."""
 
-    signature = (int(cu_seqlens._version), total_tokens, num_heads, sm_count)
-    with workspace._persistent_plan_lock:
+    signature = (
+        int(cu_seqlens._version),
+        total_tokens,
+        num_heads,
+        sm_count,
+        build_persistent_plan,
+    )
+    with workspace._packed_metadata_lock:
         if (
-            workspace._persistent_plan_tensor is cu_seqlens
-            and workspace._persistent_plan_signature == signature
+            workspace._packed_metadata_tensor is cu_seqlens
+            and workspace._packed_metadata_signature == signature
         ):
-            return workspace._persistent_plan
+            return workspace._packed_metadata
         offsets = tuple(int(value) for value in cu_seqlens.tolist())
         if (
             not offsets
@@ -636,15 +648,27 @@ def _cached_persistent_task_plan(
         sequence_lengths = tuple(
             right - left for left, right in zip(offsets, offsets[1:], strict=False)
         )
-        plan = _persistent_task_plan(
-            sequence_lengths,
-            num_heads=num_heads,
-            sm_count=sm_count,
+        sequence_order = tuple(
+            sorted(
+                range(len(sequence_lengths)),
+                key=lambda index: sequence_lengths[index],
+                reverse=True,
+            )
         )
-        workspace._persistent_plan_tensor = cu_seqlens
-        workspace._persistent_plan_signature = signature
-        workspace._persistent_plan = plan
-        return plan
+        persistent_plan = (
+            _persistent_task_plan(
+                sequence_lengths,
+                num_heads=num_heads,
+                sm_count=sm_count,
+            )
+            if build_persistent_plan
+            else None
+        )
+        metadata = (sequence_order, persistent_plan)
+        workspace._packed_metadata_tensor = cu_seqlens
+        workspace._packed_metadata_signature = signature
+        workspace._packed_metadata = metadata
+        return metadata
 
 
 def _workspace_buffer(
@@ -947,8 +971,7 @@ def _run_flash_kda_prefill(
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         )
     )
-    persistent_plan = None
-    if (
+    persistent_candidate = (
         _uses_measured_b200_persistent_policy(target=target, sm_count=sm_count)
         and not needs_direct_m128
         and prefill_workspace is None
@@ -956,24 +979,32 @@ def _run_flash_kda_prefill(
         and num_heads != 12
         and not (fixed_layout and num_sequences == 1 and num_heads == 64)
         and num_sequences * num_heads > sm_count
+    )
+    automatic_sequence_order = None
+    persistent_plan = None
+    if (
+        not fixed_layout
+        and seq_order is None
+        and prefill_workspace is None
+        and not capturing
     ):
-        if fixed_layout:
-            sequence_lengths = (seq_len,) * num_sequences
-            persistent_plan = _persistent_task_plan(
-                sequence_lengths,
-                num_heads=num_heads,
-                sm_count=sm_count,
-            )
-        else:
-            assert cu_seqlens is not None
-            assert stream_workspace is not None
-            persistent_plan = _cached_persistent_task_plan(
-                stream_workspace,
-                cu_seqlens,
-                total_tokens=batch_size * seq_len,
-                num_heads=num_heads,
-                sm_count=sm_count,
-            )
+        assert cu_seqlens is not None
+        assert stream_workspace is not None
+        automatic_sequence_order, persistent_plan = _cached_packed_task_metadata(
+            stream_workspace,
+            cu_seqlens,
+            total_tokens=batch_size * seq_len,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            build_persistent_plan=persistent_candidate,
+        )
+    elif persistent_candidate:
+        assert fixed_layout
+        persistent_plan = _persistent_task_plan(
+            (seq_len,) * num_sequences,
+            num_heads=num_heads,
+            sm_count=sm_count,
+        )
     variant = _select_flash_kda_prefill_variant(
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
@@ -1000,12 +1031,19 @@ def _run_flash_kda_prefill(
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
-        seq_order_i32 = _validate_prefill_seq_order(
-            seq_order,
-            fixed_layout=fixed_layout,
-            num_sequences=num_sequences,
-            device=q.device,
-        )
+        if automatic_sequence_order is None:
+            seq_order_i32 = _validate_prefill_seq_order(
+                seq_order,
+                fixed_layout=fixed_layout,
+                num_sequences=num_sequences,
+                device=q.device,
+            )
+        else:
+            seq_order_i32 = _cached_int32_metadata(
+                device=q.device,
+                kind="automatic_seq_order",
+                values=automatic_sequence_order,
+            )
     else:
         sequence_order, task_ids, task_offsets = persistent_plan
         seq_order_i32 = _cached_int32_metadata(
