@@ -663,6 +663,82 @@ def test_b200_uniform_prefill_reaches_persistent_worker_abi(
     assert args[17] == 96
 
 
+def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 0),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 148,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[3, 1],
+        num_heads=96,
+        packed=True,
+        initial_state=False,
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+    )
+    assert routes == [("m128", "sm100a")]
+    (args,) = module.calls
+    assert args[9].tolist() == [0, 1]
+
+
+def test_direct_packed_prefill_automatically_sorts_sequences(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: module,
+    )
+    inputs = _make_inputs(
+        seq_lens=[1, 3, 2],
+        num_heads=96,
+        packed=True,
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+    )
+    (args,) = module.calls
+    assert args[9].tolist() == [1, 2, 0]
+
+
 def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     cuda_device, monkeypatch
 ):

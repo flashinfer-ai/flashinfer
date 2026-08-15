@@ -46,14 +46,14 @@ _FLASH_KDA_TARGET_DEFINE = {
     "sm103a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
 }
 
-# Keep every frozen cache key tied to the exact Loom module identity. This
-# prevents an installed JIT/AOT cache from satisfying a refreshed export after
-# an in-place package upgrade.
+# Keep every frozen cache key tied to its complete generated-plus-integration
+# implementation. This prevents an installed JIT/AOT cache from satisfying a
+# refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
     "m128": "ea022a2f1f",
     "m128_n16": "ef8b47d690",
-    "persistent_m128": "fb536e5df4",
+    "persistent_m128": "64bc19d01c",
 }
 
 _FLASH_KDA_BINDING_STEMS = {

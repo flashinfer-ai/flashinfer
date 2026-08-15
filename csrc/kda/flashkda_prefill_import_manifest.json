@@ -18,6 +18,14 @@
         "initial_state restrict qualifier",
         "final_state restrict qualifier"
       ]
+    },
+    {
+      "id": "persistent_inplace_state",
+      "reason": "preserve the persistent kernel's restrict optimization while updating the public state in place",
+      "scope": [
+        "persistent final-state stores target initial_state",
+        "persistent route requires caller-provided initial_state"
+      ]
     }
   ],
   "profiles": {
@@ -103,7 +111,7 @@
     "persistent": {
       "binding_path": "csrc/kda/flashkda_bf16_persistent_m128_binding.cu",
       "frozen_path": "csrc/kda/flashkda_bf16_persistent_m128.cu",
-      "frozen_sha256": "6a34bb07a651d7713de1f7799a6dda77e33b66b32f9d5b9519df8b9ffa02d08f",
+      "frozen_sha256": "64bc19d01ceb24dda67877a779908276db1734b7e5f677ec47d7b240e6842345",
       "module_ident": "flashkda_bf16_persistent_m128_fb536e5df4",
       "raw_bytes": 172462,
       "raw_sha256": "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",

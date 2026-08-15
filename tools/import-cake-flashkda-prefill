@@ -50,6 +50,9 @@ LICENSE_HEADER = """/*
 
 ALIAS_BEGIN = "// FLASHINFER INTEGRATION BEGIN: allow exact state alias\n"
 ALIAS_END = "// FLASHINFER INTEGRATION END: allow exact state alias\n"
+PERSISTENT_INPLACE_STORE = (
+    "/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state +"
+)
 
 
 @dataclass(frozen=True)
@@ -242,20 +245,30 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     signature_end = text.index("\n{", signature_start) + 1
     signature = text[signature_start:signature_end]
     alias_signature = signature.replace(
-        "__nv_bfloat16* __restrict__ initial_state",
-        "__nv_bfloat16* initial_state",
-    ).replace(
         "__nv_bfloat16* __restrict__ final_state",
         "__nv_bfloat16* final_state",
     )
+    if variant.key != "persistent":
+        alias_signature = alias_signature.replace(
+            "__nv_bfloat16* __restrict__ initial_state",
+            "__nv_bfloat16* initial_state",
+        )
     if alias_signature == signature:
         raise ValueError(f"{variant.key} alias integration made no change")
+    integrated_body = text[signature_end:]
+    if variant.key == "persistent":
+        if integrated_body.count("final_state +") != 4:
+            raise ValueError("persistent raw source has unexpected final-state stores")
+        integrated_body = integrated_body.replace(
+            "final_state +",
+            PERSISTENT_INPLACE_STORE,
+        )
     integrated = (
         text[:signature_start]
         + ALIAS_BEGIN
         + alias_signature
         + ALIAS_END
-        + text[signature_end:]
+        + integrated_body
     )
 
     provenance = (
@@ -307,7 +320,15 @@ def _manifest(frozen: dict[str, bytes]) -> bytes:
                     "initial_state restrict qualifier",
                     "final_state restrict qualifier",
                 ],
-            }
+            },
+            {
+                "id": "persistent_inplace_state",
+                "reason": "preserve the persistent kernel's restrict optimization while updating the public state in place",
+                "scope": [
+                    "persistent final-state stores target initial_state",
+                    "persistent route requires caller-provided initial_state",
+                ],
+            },
         ],
         "profiles": PROFILES,
         "variants": variants,

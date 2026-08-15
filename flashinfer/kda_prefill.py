@@ -884,6 +884,39 @@ def _run_flash_kda_prefill(
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
     target = _select_flash_kda_prefill_target(q.device)
     sm_count = _flash_kda_device_sm_count(q.device)
+    automatic_sequence_order = None
+    sequence_lengths = None
+    if (
+        not fixed_layout
+        and seq_order is None
+        and prefill_workspace is None
+        and not capturing
+    ):
+        assert cu_seqlens is not None
+        offsets = tuple(int(value) for value in cu_seqlens.tolist())
+        if (
+            not offsets
+            or offsets[0] != 0
+            or offsets[-1] != batch_size * seq_len
+            or any(
+                right <= left
+                for left, right in zip(offsets, offsets[1:], strict=False)
+            )
+        ):
+            raise ValueError(
+                "cu_seqlens must start at zero, be strictly increasing, "
+                "and end at the packed token count"
+            )
+        sequence_lengths = tuple(
+            right - left for left, right in zip(offsets, offsets[1:], strict=False)
+        )
+        automatic_sequence_order = tuple(
+            sorted(
+                range(num_sequences),
+                key=lambda index: sequence_lengths[index],
+                reverse=True,
+            )
+        )
     needs_direct_m128 = (
         state_indices is not None
         or checkpoint_every_n_tokens != 0
@@ -900,6 +933,7 @@ def _run_flash_kda_prefill(
         _uses_measured_b200_persistent_policy(target=target, sm_count=sm_count)
         and not needs_direct_m128
         and prefill_workspace is None
+        and initial_state is not None
         and num_heads != 12
         and not (fixed_layout and num_sequences == 1 and num_heads == 64)
         and num_sequences * num_heads > sm_count
@@ -907,24 +941,7 @@ def _run_flash_kda_prefill(
         if fixed_layout:
             sequence_lengths = (seq_len,) * num_sequences
         else:
-            assert cu_seqlens is not None
-            offsets = tuple(int(value) for value in cu_seqlens.tolist())
-            if (
-                not offsets
-                or offsets[0] != 0
-                or offsets[-1] != batch_size * seq_len
-                or any(
-                    right <= left
-                    for left, right in zip(offsets, offsets[1:], strict=False)
-                )
-            ):
-                raise ValueError(
-                    "cu_seqlens must start at zero, be strictly increasing, "
-                    "and end at the packed token count"
-                )
-            sequence_lengths = tuple(
-                right - left for left, right in zip(offsets, offsets[1:], strict=False)
-            )
+            assert sequence_lengths is not None
         persistent_plan = _persistent_task_plan(
             sequence_lengths,
             num_heads=num_heads,
@@ -956,12 +973,19 @@ def _run_flash_kda_prefill(
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
-        seq_order_i32 = _validate_prefill_seq_order(
-            seq_order,
-            fixed_layout=fixed_layout,
-            num_sequences=num_sequences,
-            device=q.device,
-        )
+        if automatic_sequence_order is None:
+            seq_order_i32 = _validate_prefill_seq_order(
+                seq_order,
+                fixed_layout=fixed_layout,
+                num_sequences=num_sequences,
+                device=q.device,
+            )
+        else:
+            seq_order_i32 = _cached_int32_metadata(
+                device=q.device,
+                kind="automatic_seq_order",
+                values=automatic_sequence_order,
+            )
     else:
         sequence_order, task_ids, task_offsets = persistent_plan
         seq_order_i32 = _cached_int32_metadata(

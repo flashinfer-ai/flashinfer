@@ -79,6 +79,8 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
                                   << sm_count << " SMs";
   TVM_FFI_ICHECK(total_tasks > sm_count && worker_count > 0 && worker_count <= sm_count)
       << "persistent FlashKDA requires N * H > 148 and at most one worker per B200 SM";
+  TVM_FFI_ICHECK(use_initial_state == 1 && initial_state.data_ptr() == final_state.data_ptr())
+      << "persistent FlashKDA requires one caller-owned in-place state tensor";
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);

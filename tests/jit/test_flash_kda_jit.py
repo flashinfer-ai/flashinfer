@@ -51,7 +51,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "sm_103a",
     }
     assert [patch["id"] for patch in manifest["integration_patches"]] == [
-        "allow_exact_state_alias"
+        "allow_exact_state_alias",
+        "persistent_inplace_state",
     ]
     assert (
         "persistent source consumes worker/LPT task bins"
@@ -86,7 +87,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "persistent": (
             "flashkda_bf16_persistent_m128.cu",
             "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
-            "6a34bb07a651d7713de1f7799a6dda77e33b66b32f9d5b9519df8b9ffa02d08f",
+            "64bc19d01ceb24dda67877a779908276db1734b7e5f677ec47d7b240e6842345",
             "flashkda_bf16_persistent_m128_fb536e5df4",
             172462,
             221696,
@@ -198,7 +199,7 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
             "persistent_m128",
             221696,
             "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
-            "fb536e5df4",
+            "64bc19d01c",
             True,
         ),
     ],
@@ -341,15 +342,29 @@ def test_flash_kda_uri_and_jit_spec(
     alias_signature, end_marker, alias_suffix = alias_tail.partition(alias_end)
     assert begin_marker == alias_begin
     assert end_marker == alias_end
-    assert alias_signature.count("__nv_bfloat16* initial_state") == 1
+    if variant == "persistent_m128":
+        assert alias_signature.count(
+            "__nv_bfloat16* __restrict__ initial_state"
+        ) == 1
+    else:
+        assert alias_signature.count("__nv_bfloat16* initial_state") == 1
     assert alias_signature.count("__nv_bfloat16* final_state") == 1
     restricted_alias_signature = alias_signature.replace(
-        "__nv_bfloat16* initial_state",
-        "__nv_bfloat16* __restrict__ initial_state",
-    ).replace(
         "__nv_bfloat16* final_state",
         "__nv_bfloat16* __restrict__ final_state",
     )
+    if variant != "persistent_m128":
+        restricted_alias_signature = restricted_alias_signature.replace(
+            "__nv_bfloat16* initial_state",
+            "__nv_bfloat16* __restrict__ initial_state",
+        )
+    if variant == "persistent_m128":
+        inplace_store = (
+            "/* FLASHINFER INTEGRATION: persistent in-place state */ "
+            "initial_state +"
+        )
+        assert alias_suffix.count(inplace_store) == 4
+        alias_suffix = alias_suffix.replace(inplace_store, "final_state +")
     # Keep the exporter output immutable outside the two narrowly marked
     # FlashInfer integration patches.
     normalized_generated_body = alias_prefix + restricted_alias_signature + alias_suffix
@@ -388,6 +403,7 @@ def test_flash_kda_uri_and_jit_spec(
     if variant == "persistent_m128":
         assert "TensorView task_ids" in binding_text
         assert "TensorView task_offsets" in binding_text
+        assert "one caller-owned in-place state tensor" in binding_text
         assert "sm_count == 148" in binding_text
         assert "kFlashKDATargetMinor == 0" in binding_text
     assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in binding_text
