@@ -73,7 +73,7 @@ def recurrent_kda(
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
     gate modes as the backend implementation. On SM100a (B200/GB200) and
     SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
-    prefill is dispatched across the frozen direct-M128, M64, and B200-only
+    prefill is dispatched across the frozen direct-M128, M64, and B200/GB200
     persistent schedules. All existing decode and speculative-decode calls
     retain the CuTe DSL backend.
 
@@ -135,7 +135,7 @@ def recurrent_kda(
             contract is not normally host-validated. Eager calls without an
             explicit workspace or ``seq_order`` read these values once per
             unchanged offsets tensor to schedule longer sequences first;
-            eligible 148-SM B200 calls also cache persistent worker task bins.
+            eligible 148-SM B200 and 152-SM GB200 calls also cache persistent worker task bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
@@ -182,7 +182,7 @@ def recurrent_kda(
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
             capture use direct/M64 schedules; persistent task planning is an
-            eager-only B200 route because its bins depend on host-visible
+            eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
             Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for

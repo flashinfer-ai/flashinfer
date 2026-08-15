@@ -75,10 +75,11 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
   int32_t sm_count = 0;
   CheckCuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id),
             "cudaDeviceGetAttribute(multiProcessorCount)");
-  TVM_FFI_ICHECK(sm_count == 148) << "persistent FlashKDA is validated only on 148-SM B200; got "
-                                  << sm_count << " SMs";
+  TVM_FFI_ICHECK(sm_count == 148 || sm_count == 152)
+      << "persistent FlashKDA is validated only on 148-SM B200 or 152-SM GB200; got "
+      << sm_count << " SMs";
   TVM_FFI_ICHECK(total_tasks > sm_count && worker_count > 0 && worker_count <= sm_count)
-      << "persistent FlashKDA requires N * H > 148 and at most one worker per B200 SM";
+      << "persistent FlashKDA requires N * H > physical SM count and at most one worker per SM";
   TVM_FFI_ICHECK(use_initial_state == 1 && initial_state.data_ptr() == final_state.data_ptr())
       << "persistent FlashKDA requires one caller-owned in-place state tensor";
 

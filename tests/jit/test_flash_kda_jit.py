@@ -401,7 +401,7 @@ def test_flash_kda_uri_and_jit_spec(
         assert "TensorView task_ids" in binding_text
         assert "TensorView task_offsets" in binding_text
         assert "one caller-owned in-place state tensor" in binding_text
-        assert "sm_count == 148" in binding_text
+        assert "sm_count == 148 || sm_count == 152" in binding_text
         assert "kFlashKDATargetMinor == 0" in binding_text
     assert "#define LoomTensorMap flashkda_generated_LoomTensorMap" in binding_text
     assert "reinterpret_cast<flashkda_generated_LoomTensorMap const*>" in binding_text

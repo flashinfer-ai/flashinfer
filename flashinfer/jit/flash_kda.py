@@ -164,7 +164,7 @@ def gen_flash_kda_m128_n16_module(target: FlashKDATarget) -> JitSpec:
 
 
 def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
-    """Generate the B200-only static-binned persistent M128 module."""
+    """Generate the SM100-only static-binned persistent M128 module."""
 
     return gen_flash_kda_module("persistent_m128", target)
 
@@ -197,7 +197,7 @@ def load_flash_kda_m128_n16_module(target: FlashKDATarget):
 
 
 def load_flash_kda_persistent_m128_module(target: FlashKDATarget):
-    """Load the B200-only static-binned persistent M128 module."""
+    """Load the SM100-only static-binned persistent M128 module."""
 
     return load_flash_kda_module("persistent_m128", target)
 

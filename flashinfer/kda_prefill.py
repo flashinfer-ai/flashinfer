@@ -42,6 +42,8 @@ _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
 _FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS = 128
 _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR = 21
 _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
+_FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR = 263
+_FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR = 250
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
@@ -88,7 +90,7 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     workspace owns optional final-state scratch for calls without an initial
     state, beta padding, and schedule-specific M64/M128-N32/M128-N16 TMA
     descriptor storage for the lifetime of the graph. Persistent M128 is an
-    eager-only B200 route; explicit workspaces use direct M128 or M64 so graph
+    eager-only B200/GB200 route; explicit workspaces use direct M128 or M64 so graph
     capture never synchronizes sequence lengths to construct host task bins.
 
     A workspace binds to its first stream. Once it participates in capture it
@@ -362,12 +364,12 @@ def _flash_kda_device_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-def _uses_measured_b200_persistent_policy(
+def _uses_measured_sm100_persistent_policy(
     *,
     target: "FlashKDATarget",
     sm_count: int,
 ) -> bool:
-    return (target, sm_count) == ("sm100a", 148)
+    return target == "sm100a" and sm_count in (148, 152)
 
 
 def _uniform_persistent_worker_count(total_tasks: int, *, sm_count: int) -> int:
@@ -446,10 +448,10 @@ def _persistent_task_plan(
     num_heads: int,
     sm_count: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
-    """Build Cake's measured B200 task plan, or return direct-route evidence."""
+    """Build Cake's measured SM100 task plan, or return direct-route evidence."""
 
     total_tasks = len(sequence_lengths) * num_heads
-    if sm_count != 148 or num_heads == 12 or total_tasks <= sm_count:
+    if sm_count not in (148, 152) or num_heads == 12 or total_tasks <= sm_count:
         return None
     sequence_order = tuple(
         sorted(
@@ -460,6 +462,8 @@ def _persistent_task_plan(
     )
     ordered_lengths = tuple(sequence_lengths[index] for index in sequence_order)
     if len(set(sequence_lengths)) == 1:
+        if num_heads not in (64, 96):
+            return None
         worker_count = _uniform_persistent_worker_count(
             total_tasks,
             sm_count=sm_count,
@@ -470,12 +474,20 @@ def _persistent_task_plan(
             worker_count=worker_count,
         )
         return sequence_order, task_ids, task_offsets
+    if num_heads != 96:
+        return None
     task_ids, task_offsets, loads = _make_lpt_task_bins(
         ordered_lengths,
         num_heads=num_heads,
         sm_count=sm_count,
     )
-    if not _lpt_bins_are_balanced(loads):
+    if sm_count == 152:
+        if not loads or (
+            max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
+            > sum(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR
+        ):
+            return None
+    elif not _lpt_bins_are_balanced(loads):
         return None
     return sequence_order, task_ids, task_offsets
 
@@ -972,7 +984,7 @@ def _run_flash_kda_prefill(
         )
     )
     persistent_candidate = (
-        _uses_measured_b200_persistent_policy(target=target, sm_count=sm_count)
+        _uses_measured_sm100_persistent_policy(target=target, sm_count=sm_count)
         and not needs_direct_m128
         and prefill_workspace is None
         and initial_state is not None

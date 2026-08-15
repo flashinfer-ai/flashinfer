@@ -351,15 +351,15 @@ def test_flash_kda_sm_count_is_cached_per_device(monkeypatch):
         kda_prefill_api._flash_kda_device_sm_count.cache_clear()
 
 
-def test_persistent_policy_is_exact_b200_and_bins_match_cake():
+def test_persistent_policy_is_exact_sm100_and_bins_match_cake():
     for target, sm_count, expected in (
         ("sm100a", 148, True),
-        ("sm100a", 152, False),
+        ("sm100a", 152, True),
         ("sm103a", 148, False),
         ("sm103a", 152, False),
     ):
         assert (
-            kda_prefill_api._uses_measured_b200_persistent_policy(
+            kda_prefill_api._uses_measured_sm100_persistent_policy(
                 target=target,
                 sm_count=sm_count,
             )
@@ -390,11 +390,34 @@ def test_persistent_policy_is_exact_b200_and_bins_match_cake():
     _, mixed_ids, mixed_offsets = mixed
     assert sorted(mixed_ids) == list(range(6 * 96))
     assert len(mixed_offsets) == 149
+    gb200_uniform = kda_prefill_api._persistent_task_plan(
+        (8192,) * 8,
+        num_heads=96,
+        sm_count=152,
+    )
+    assert gb200_uniform is not None
+    assert len(gb200_uniform[2]) == 129
+
+    gb200_mixed = kda_prefill_api._persistent_task_plan(
+        (3063, 2048, 1300, 963, 547, 271),
+        num_heads=96,
+        sm_count=152,
+    )
+    assert gb200_mixed is not None
+    assert len(gb200_mixed[2]) == 153
+    assert (
+        kda_prefill_api._persistent_task_plan(
+            (3063, 2048, 1300, 963, 547, 271),
+            num_heads=64,
+            sm_count=152,
+        )
+        is None
+    )
     assert (
         kda_prefill_api._persistent_task_plan(
             (8192,) * 8,
             num_heads=96,
-            sm_count=152,
+            sm_count=150,
         )
         is None
     )
@@ -610,9 +633,11 @@ def test_frozen_route_and_ffi_abi(
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
 
 
-def test_b200_uniform_prefill_reaches_persistent_worker_abi(
+@pytest.mark.parametrize("sm_count", [148, 152])
+def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     cuda_device,
     monkeypatch,
+    sm_count,
 ):
     monkeypatch.setattr(
         kda_prefill_api,
@@ -627,7 +652,7 @@ def test_b200_uniform_prefill_reaches_persistent_worker_abi(
     monkeypatch.setattr(
         kda_prefill_api,
         "_flash_kda_device_sm_count",
-        lambda device: 148,
+        lambda device: sm_count,
     )
     monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
     module = _RecorderModule()
@@ -655,7 +680,7 @@ def test_b200_uniform_prefill_reaches_persistent_worker_abi(
     assert len(args) == 23
     assert args[9].tolist() == [0, 1]
     assert sorted(args[10].tolist()) == list(range(2 * 96))
-    assert args[11].numel() == 149
+    assert args[11].numel() == sm_count + 1
     assert args[11][0].item() == 0
     assert args[11][-1].item() == 2 * 96
     assert args[15].dtype == torch.uint8
