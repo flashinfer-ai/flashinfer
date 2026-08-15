@@ -13,15 +13,21 @@ The public functions support B200/GB200 (SM100a, CUDA 12.8+) and B300/GB300
 as :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` and
 :func:`flashinfer.prefill.trtllm_batch_context_with_kv_cache`.
 
-The checked-in source product contains the optimized Cake route portfolio plus
-a complete-domain compatibility component.  A content-addressed manifest pins its source
-files, public C ABI, capability matrix, and the FlashInfer revision against
-which the matrix was audited.  FlashInfer authenticates every source artifact
-before JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive
-copy of that product record.
+The checked-in source product contains the optimized Cake route portfolio, a
+complete-domain compatibility component, and the DCP speculative-decode
+add-on.  One content-addressed manifest pins all source files, public C ABIs,
+the base capability matrix, and the FlashInfer revision against which the
+matrix was audited.  FlashInfer authenticates every standalone artifact before
+JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive copy
+of that product record.
 
-The distributed-context-parallel feature is an additive profile.  It does not
-change the conventional entrypoints or their default behavior.
+The distributed-context-parallel feature remains additive.  Supplying
+``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects
+the authenticated ``cake_fmha_dcp_spec`` profile; ordinary calls continue to
+select conventional FMHA.  The DCP JIT cache key includes the same root
+manifest digest plus an authenticated FlashInfer-adapter digest and uses exact
+SM100a or SM103a targets, so the add-on cannot silently drift from the base
+package.
 
 .. currentmodule:: flashinfer.cake_fmha
 
@@ -42,10 +48,6 @@ The same implementation can also be selected on the existing APIs with
         workspace_buffer,
         block_tables,
         seq_lens,
-        max_q_len,
         max_kv_len,
-        bmm1_scale,
-        bmm2_scale,
-        batch_size,
         backend="cake",
     )

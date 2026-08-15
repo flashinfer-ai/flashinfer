@@ -1,8 +1,8 @@
 """Public Cake FMHA product entrypoints.
 
 The conventional decode/context APIs are complete-domain Cake routes.  Issue
-#4323 DCP metadata is registered separately as an additive profile and does
-not change these base entrypoints.
+#4323 DCP metadata selects an authenticated additive profile through the same
+decode entrypoint and does not change ordinary-call behavior.
 """
 
 from __future__ import annotations

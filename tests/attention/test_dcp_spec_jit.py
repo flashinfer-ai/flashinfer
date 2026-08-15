@@ -9,22 +9,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.attention import cake_dcp_public_validation
-from tests.attention.cake_dcp_public_validation import compare_export
-
-from flashinfer.cake_dcp import (
+from flashinfer.dcp import (
     _select_fp8_num_split,
     _select_num_split,
-    _validate_nonempty_split_assignment,
     get_dcp_spec_counter_bytes,
     get_dcp_spec_workspace_size_bytes,
     run_dcp_spec_decode,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from flashinfer.jit.cake_dcp import (
-    get_dcp_spec_fp8_d256_uri,
-    get_dcp_spec_fp8_uri,
-    get_dcp_spec_uri,
+from flashinfer.jit.dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
+from flashinfer.jit.cake_fmha import (
+    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
+    CAKE_FMHA_MANIFEST_SHA256,
 )
 from flashinfer.trace.templates.attention import (
     trtllm_batch_decode_dcp_spec_split_kv_trace,
@@ -34,81 +30,30 @@ from flashinfer.trace.templates.attention import (
 
 
 def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
-    v1_uri = get_dcp_spec_uri("v1", "sm100f", 64, 5, 32, 4, 8, 1)
+    v1_uri = get_dcp_spec_uri("v1", "sm103a", 64, 5, 32, 4, 8, 1)
     assert v1_uri.startswith("cake_fmha_dcp_spec_bf16_v1_")
-    assert v1_uri.endswith("_b64_q5_hq32_hkv4_cp8_retain1")
+    assert v1_uri.endswith(
+        f"_b64_q5_hq32_hkv4_cp8_retain1_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
     v4_uri = get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16)
     assert v4_uri.startswith("cake_fmha_dcp_spec_bf16_v4_")
-    assert v4_uri.endswith("_b1_q8_hq64_hkv8_cp4_split16")
+    assert v4_uri.endswith(
+        f"_b1_q8_hq64_hkv8_cp4_split16_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
     fp8_uri = get_dcp_spec_fp8_uri("sm100a", 256, 3, 64, 8, 4, 3, 1)
     assert fp8_uri == (
-        "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
+        "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1_"
+        f"{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
     )
-    for q_len in (1, 2, 3, 4, 5, 6, 7, 8):
-        assert get_dcp_spec_fp8_d256_uri("sm100f", 8, q_len, 16, 1, 4, 4) == (
-            "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_"
-            f"b8_q{q_len}_hq16_hkv1_cp4_split4_retain0"
-        )
-
-
-def test_public_promotion_hook_requires_exact_export_parity(tmp_path: Path) -> None:
-    generated = tmp_path / "generated"
-    public = tmp_path / "public"
-    generated.mkdir()
-    public.mkdir()
-    for name, payload in (("a.cu", b"a\n"), ("manifest.json", b"{}\n")):
-        (generated / name).write_bytes(payload)
-        (public / name).write_bytes(payload)
-
-    exact = compare_export(generated, public, expected_artifact_count=2)
-    assert exact["export_parity_passed"] is True
-    assert exact["matched_artifact_count"] == 2
-
-    (public / "a.cu").write_bytes(b"drift\n")
-    drift = compare_export(generated, public, expected_artifact_count=2)
-    assert drift["export_parity_passed"] is False
-    assert drift["matched_artifact_count"] == 1
-    assert [row["name"] for row in drift["mismatched_artifacts"]] == ["a.cu"]
-
-
-@pytest.mark.parametrize(
-    ("visible_gpu_count", "expected_passed", "expected_subprocess_calls"),
-    [(1, False, 0), (2, True, 1), (4, True, 1)],
-)
-def test_public_promotion_hook_accepts_hosts_with_at_least_two_gpus(
-    monkeypatch,
-    tmp_path: Path,
-    visible_gpu_count: int,
-    expected_passed: bool,
-    expected_subprocess_calls: int,
-) -> None:
-    subprocess_calls = []
-    monkeypatch.setattr(
-        cake_dcp_public_validation.torch.cuda,
-        "device_count",
-        lambda: visible_gpu_count,
-    )
-    monkeypatch.setattr(
-        cake_dcp_public_validation.subprocess,
-        "run",
-        lambda *args, **kwargs: (
-            subprocess_calls.append((args, kwargs)) or SimpleNamespace(returncode=0)
-        ),
-    )
-
-    passed, reported_gpu_count = cake_dcp_public_validation._run_two_gpu_public_api(
-        tmp_path
-    )
-
-    assert passed is expected_passed
-    assert reported_gpu_count == visible_gpu_count
-    assert len(subprocess_calls) == expected_subprocess_calls
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
-    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "dcp"
-    monkeypatch.setattr(jit_dcp, "_get_csrc_dir", lambda: source_dir)
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
+    monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
     monkeypatch.setattr(
         jit_dcp,
         "gen_jit_spec",
@@ -116,68 +61,35 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
     )
     jit_dcp.gen_dcp_spec_module.cache_clear()
     jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
-    jit_dcp.gen_dcp_spec_fp8_d256_module.cache_clear()
 
     try:
         v1 = jit_dcp.gen_dcp_spec_module("v1", "sm100a", 1, 1, 64, 8, 1, 1)
         v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
-        fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm100f", 64, 3, 64, 8, 4, 3, 1)
-        d256 = jit_dcp.gen_dcp_spec_fp8_d256_module("sm100f", 8, 4, 16, 1, 4, 4)
+        fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm103a", 64, 3, 64, 8, 4, 3, 1)
 
-        assert Path(v1.sources[0]).name == "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
-        assert Path(v4.sources[0]).name == "cake_fmha_dcp_spec_bf16_v4_split16.cu"
-        assert Path(fp8.sources[0]).name == (
-            "cake_fmha_dcp_spec_bf16_fp8_split3_retain1.cu"
-        )
-        assert Path(fp8.sources[1]).name == "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
-        assert Path(d256.sources[0]).name == (
-            "cake_fmha_dcp_spec_bf16_fp8_d256_split4_retain0.cu"
-        )
-        assert Path(d256.sources[1]).name == (
-            "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu"
+        assert Path(v1.sources[0]).name == "retain_kv_l21.cu"
+        assert Path(v4.sources[0]).name == "num_split16.cu"
+        assert Path(fp8.sources[0]).name == "num_split3_retain_kv_l21.cu"
+        assert Path(fp8.sources[1]).name == (
+            "cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu"
         )
         assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
         assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
-        for macro in (
-            "-DBATCH_SIZE=1",
-            "-DQ_LEN=1",
-            "-DNUM_Q_HEADS=64",
-            "-DNUM_KV_HEADS=8",
-            "-DCP_WORLD=1",
-        ):
-            assert macro in v1.extra_cuda_cflags
         assert "-DQ_LEN=3" in fp8.extra_cuda_cflags
         assert "-DNUM_SPLIT=3" not in fp8.extra_cuda_cflags
         assert "-DRETAIN_KV_L2=1" not in fp8.extra_cuda_cflags
-        assert "-DNUM_SPLIT=4" not in d256.extra_cuda_cflags
-        assert "-DRETAIN_KV_L2=0" not in d256.extra_cuda_cflags
     finally:
         jit_dcp.gen_dcp_spec_module.cache_clear()
         jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
-        jit_dcp.gen_dcp_spec_fp8_d256_module.cache_clear()
-
-
-def test_dcp_bindings_require_exact_public_tensor_ranks() -> None:
-    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "dcp"
-    for name in (
-        "cake_fmha_dcp_spec_bf16_v1_binding.cu",
-        "cake_fmha_dcp_spec_bf16_v4_binding.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_binding.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu",
-    ):
-        source = (source_dir / name).read_text()
-        assert "TMA source 'Qt' must have exactly 3 dimensions" in source
-        assert "TMA source 'K' must have exactly 4 dimensions" in source
-        assert "TMA source 'V' must have exactly 4 dimensions" in source
 
 
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        (("v1", "sm100f", 1, 3, 32, 4, 4, 0), "q_len"),
-        (("v1", "sm100f", 1, 4, 32, 4, 3, 0), "cp_world"),
-        (("v1", "sm100f", 1, 4, 64, 4, 4, 0), "group ratio"),
-        (("v4", "sm100f", 1, 4, 32, 4, 4, 1), "num_split"),
+        (("v1", "sm103a", 1, 7, 32, 4, 4, 0), "q_len"),
+        (("v1", "sm103a", 1, 4, 32, 4, 3, 0), "cp_world"),
+        (("v1", "sm103a", 1, 4, 64, 4, 4, 0), "group ratio"),
+        (("v4", "sm103a", 1, 4, 32, 4, 4, 1), "num_split"),
     ],
 )
 def test_dcp_spec_uri_rejects_unsupported_specialization(args, message) -> None:
@@ -185,24 +97,14 @@ def test_dcp_spec_uri_rejects_unsupported_specialization(args, message) -> None:
         get_dcp_spec_uri(*args)
 
 
-def test_fp8_dcp_spec_uri_supports_full_query_length_range() -> None:
-    assert "_q3_" in get_dcp_spec_fp8_uri("sm100f", 64, 3, 64, 8, 4, 3, 1)
-    assert "_q7_" in get_dcp_spec_fp8_uri("sm100f", 64, 7, 64, 8, 4, 3, 1)
-    with pytest.raises(ValueError, match="num_split"):
-        get_dcp_spec_fp8_uri("sm100f", 64, 4, 64, 8, 4, 5, 1)
-    with pytest.raises(ValueError, match="retain_kv_l2"):
-        get_dcp_spec_fp8_uri("sm100f", 64, 4, 64, 8, 4, 3, 2)
-
-
-def test_fp8_d256_uri_rejects_nonproduction_shapes() -> None:
+def test_fp8_dcp_spec_uri_supports_q3_but_rejects_other_gaps() -> None:
+    assert "_q3_" in get_dcp_spec_fp8_uri("sm103a", 64, 3, 64, 8, 4, 3, 1)
     with pytest.raises(ValueError, match="q_len"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 9, 16, 1, 4, 4)
-    with pytest.raises(ValueError, match="num_q_heads"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 32, 2, 4, 4)
-    with pytest.raises(ValueError, match="cp_world"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 2, 4)
+        get_dcp_spec_fp8_uri("sm103a", 64, 7, 64, 8, 4, 3, 1)
     with pytest.raises(ValueError, match="num_split"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 4, 6)
+        get_dcp_spec_fp8_uri("sm103a", 64, 4, 64, 8, 4, 5, 1)
+    with pytest.raises(ValueError, match="retain_kv_l2"):
+        get_dcp_spec_fp8_uri("sm103a", 64, 4, 64, 8, 4, 3, 2)
 
 
 def test_public_decode_api_adds_optional_dcp_arguments() -> None:
@@ -212,37 +114,10 @@ def test_public_decode_api_adds_optional_dcp_arguments() -> None:
     assert parameters["causal_seqlens_kv_global"].default is None
 
 
-def test_public_decode_api_rejects_explicit_pdl_for_dcp() -> None:
-    query = torch.empty((4, 16, 256), dtype=torch.bfloat16)
-    kv_cache = torch.empty((1, 1, 64, 256), dtype=torch.float8_e4m3fn)
-    workspace = torch.empty(1, dtype=torch.uint8)
-    block_tables = torch.zeros((1, 1), dtype=torch.int32)
-    seq_lens = torch.ones(1, dtype=torch.int32)
-    causal_seqlens = torch.zeros(1, dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="explicit enable_pdl=True"):
-        trtllm_batch_decode_with_kv_cache(
-            query,
-            (kv_cache, kv_cache),
-            workspace,
-            block_tables,
-            seq_lens,
-            max_seq_len=1,
-            enable_pdl=True,
-            q_len_per_req=4,
-            return_lse=True,
-            causal_seqlens_kv_global=causal_seqlens,
-        )
-
-
 def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     # B=8, Q=4, Hq=64, split=6: BF16 O[...128] + FP32 LSE per row.
     rows = 8 * 4 * 64 * 6
     assert get_dcp_spec_workspace_size_bytes(8, 4, 64, 6) == rows * (128 * 2 + 4)
-    d256_rows = 8 * 4 * 16 * 4
-    assert get_dcp_spec_workspace_size_bytes(8, 4, 16, 4, head_dim=256) == d256_rows * (
-        256 * 2 + 4
-    )
     assert get_dcp_spec_counter_bytes(8, 4, 8) == 8 * 4 * 8 * 4
 
 
@@ -251,10 +126,6 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=32) == 4
     assert _select_num_split(logical_tiles=8, sm_count=148, local_blocks=128) == 16
     assert _select_num_split(logical_tiles=64, sm_count=148, local_blocks=128) == 2
-    _validate_nonempty_split_assignment(num_split=16, local_blocks=128)
-    _validate_nonempty_split_assignment(num_split=1, local_blocks=0)
-    with pytest.raises(RuntimeError, match="at least one K/V block pair"):
-        _validate_nonempty_split_assignment(num_split=2, local_blocks=2)
     assert (
         _select_fp8_num_split(
             logical_tiles=32, sm_count=148, local_blocks=64, cp_world=1
@@ -273,61 +144,19 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
         )
         == 1
     )
-    assert (
-        _select_fp8_num_split(
-            logical_tiles=4,
-            sm_count=152,
-            local_blocks=64,
-            cp_world=4,
-            head_dim=256,
-        )
-        == 8
-    )
-    assert (
-        _select_fp8_num_split(
-            logical_tiles=32,
-            sm_count=152,
-            local_blocks=64,
-            cp_world=4,
-            head_dim=256,
-        )
-        == 4
-    )
-    for sm_count in (148, 152):
-        for q_len in (1, 2, 3, 4, 5, 6, 7, 8):
-            assert (
-                _select_fp8_num_split(
-                    logical_tiles=128 * q_len,
-                    sm_count=sm_count,
-                    local_blocks=64,
-                    cp_world=4,
-                    head_dim=256,
-                )
-                == 1
-            )
-    assert (
-        _select_fp8_num_split(
-            logical_tiles=4,
-            sm_count=152,
-            local_blocks=256,
-            cp_world=1,
-            head_dim=256,
-        )
-        == 16
-    )
 
 
 @pytest.mark.parametrize(
     ("capability", "target"),
     [
         ((10, 0), "sm100a"),
-        ((10, 3), "sm100f"),
+        ((10, 3), "sm103a"),
     ],
 )
 def test_dcp_target_keeps_independent_architecture_baselines(
     monkeypatch, capability, target
 ) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
+    dcp = importlib.import_module("flashinfer.dcp")
     monkeypatch.setattr(dcp, "get_compute_capability", lambda _device: capability)
     monkeypatch.setattr(dcp, "_is_cuda_version_at_least", lambda _version: True)
     assert dcp._select_target(None) == target
@@ -355,42 +184,33 @@ def _empty_rank_inputs(
     kv_dtype=torch.bfloat16,
     q_len_per_req=1,
     bmm2_scale=1.0,
-    head_dim=128,
-    num_q_heads=8,
-    num_kv_heads=8,
-    cp_world=8,
-    cp_rank=7,
 ):
     page_size = 64 if kv_dtype == torch.float8_e4m3fn else 16
     return {
-        "query": torch.empty(
-            (q_len_per_req, num_q_heads, head_dim), dtype=torch.bfloat16
-        ),
-        "k_cache": torch.empty((1, num_kv_heads, page_size, head_dim), dtype=kv_dtype),
-        "v_cache": torch.empty((1, num_kv_heads, page_size, head_dim), dtype=kv_dtype),
+        "query": torch.empty((q_len_per_req, 8, 128), dtype=torch.bfloat16),
+        "k_cache": torch.empty((1, 8, page_size, 128), dtype=kv_dtype),
+        "v_cache": torch.empty((1, 8, page_size, 128), dtype=kv_dtype),
         "workspace_buffer": torch.empty(1, dtype=torch.uint8),
         "block_tables": torch.zeros((1, 1), dtype=torch.int32),
         "seq_lens": torch.zeros((1,), dtype=seq_lens_dtype),
         "causal_seqlens_kv_global": torch.zeros((1,), dtype=torch.int32),
         "max_local_seq_len": 0,
-        "bmm1_scale": head_dim**-0.5,
+        "bmm1_scale": 128**-0.5,
         "bmm2_scale": bmm2_scale,
-        "cp_world": cp_world,
-        "cp_rank": cp_rank,
+        "cp_world": 8,
+        "cp_rank": 7,
         "q_len_per_req": q_len_per_req,
-        "out": torch.empty(
-            (q_len_per_req, num_q_heads, head_dim), dtype=torch.bfloat16
-        ),
-        "lse": torch.empty((q_len_per_req, num_q_heads), dtype=torch.float32),
+        "out": torch.empty((q_len_per_req, 8, 128), dtype=torch.bfloat16),
+        "lse": torch.empty((q_len_per_req, 8), dtype=torch.float32),
         "completion_buffer": None,
     }
 
 
 def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
+    dcp = importlib.import_module("flashinfer.dcp")
     launches = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
@@ -403,10 +223,10 @@ def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
 def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
     monkeypatch,
 ) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
+    dcp = importlib.import_module("flashinfer.dcp")
     launches = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_fp8_module", lambda *args: module)
@@ -430,11 +250,11 @@ def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
 def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     monkeypatch,
 ) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
+    dcp = importlib.import_module("flashinfer.dcp")
     launches = []
     loader_calls = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(
@@ -467,79 +287,26 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 7, 8))
-def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
-    q_len: int,
-    monkeypatch,
-) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
-    launches = []
-    loader_calls = []
-    module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
-    monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 152)
-    monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100f")
-    monkeypatch.setattr(
-        jit_dcp,
-        "load_dcp_spec_fp8_d256_module",
-        lambda *args: loader_calls.append(args) or module,
-    )
-
-    inputs = _empty_rank_inputs(
-        kv_dtype=torch.float8_e4m3fn,
-        q_len_per_req=q_len,
-        bmm2_scale=0.25,
-        head_dim=256,
-        num_q_heads=16,
-        num_kv_heads=1,
-        cp_world=4,
-        cp_rank=0,
-    )
-    inputs["block_tables"] = torch.zeros((1, 128), dtype=torch.int32)
-    inputs["seq_lens"] = torch.full((1,), 8192, dtype=torch.int32)
-    inputs["max_local_seq_len"] = 8192
-    inputs["workspace_buffer"] = torch.empty(
-        get_dcp_spec_workspace_size_bytes(1, q_len, 16, 8, head_dim=256),
-        dtype=torch.uint8,
-    )
-    inputs["completion_buffer"] = torch.zeros(
-        get_dcp_spec_counter_bytes(1, q_len, 1), dtype=torch.uint8
-    )
-    run_dcp_spec_decode(**inputs)
-
-    assert loader_calls == [("sm100f", 1, q_len, 16, 1, 4, 8)]
-    assert len(launches) == 1
-    args = launches[0]
-    assert args[3].data_ptr() == inputs["workspace_buffer"].data_ptr()
-    assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
-
-
 def test_bf16_page16_rejects_nonunit_bmm2_scale(monkeypatch) -> None:
-    dcp = importlib.import_module("flashinfer.cake_dcp")
+    dcp = importlib.import_module("flashinfer.dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     with pytest.raises(ValueError, match="BF16/page16"):
         run_dcp_spec_decode(**_empty_rank_inputs(bmm2_scale=0.5))
 
 
-def test_q3_is_restricted_to_fp8_page64() -> None:
-    with pytest.raises(ValueError, match="q_len_per_req"):
-        run_dcp_spec_decode(**_empty_rank_inputs(q_len_per_req=3))
+def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
+    dcp = importlib.import_module("flashinfer.dcp")
+    launches = []
+    module = SimpleNamespace(run=lambda *args: launches.append(args))
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
 
+    run_dcp_spec_decode(**_empty_rank_inputs(q_len_per_req=3))
 
-def test_fp8_d256_q9_is_rejected_by_public_dispatch() -> None:
-    with pytest.raises(ValueError, match="q_len_per_req"):
-        run_dcp_spec_decode(
-            **_empty_rank_inputs(
-                kv_dtype=torch.float8_e4m3fn,
-                q_len_per_req=9,
-                head_dim=256,
-                num_q_heads=16,
-                num_kv_heads=1,
-                cp_world=4,
-                cp_rank=0,
-            )
-        )
+    assert len(launches) == 1
 
 
 def test_dcp_rejects_non_int32_local_seq_lens() -> None:

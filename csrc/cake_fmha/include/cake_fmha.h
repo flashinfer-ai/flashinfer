@@ -12,6 +12,8 @@
 
 #include "cake_fmha_hd256_support.h"
 
+struct __align__(128) CakeFmhaTensorMap { uint64_t opaque[16]; };
+
 extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
     const void* Qt,
     const void* K,
@@ -322,6 +324,77 @@ extern "C" cudaError_t cake_fmha_launch_compat_v1(
     long long table_v_s0,
     long long o_s0,
     long long o_s1,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16(
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* page_table,
+    int* causal_seqlens_kv_global,
+    int max_pages_per_seq,
+    int max_local_seq_len,
+    float softmax_scale_log2,
+    int cp_rank,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_v4(
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* split_completion,
+    int* page_table,
+    int* causal_seqlens_kv_global,
+    int max_pages_per_seq,
+    int max_local_seq_len,
+    float softmax_scale_log2,
+    int cp_rank,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8(
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* split_completion,
+    int* page_table,
+    int* seq_lens_kv,
+    int* causal_seqlens_kv_global,
+    int max_pages_per_seq,
+    int max_local_seq_len,
+    float softmax_scale_log2,
+    float output_scale,
+    int cp_rank,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,

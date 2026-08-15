@@ -12,6 +12,7 @@ import flashinfer.prefill as prefill
 import pytest
 import torch
 from flashinfer.jit.cake_fmha import (
+    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
     CAKE_FMHA_MANIFEST_SHA256,
     gen_cake_fmha_compat_module,
@@ -31,10 +32,20 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
     assert manifest["capability"]["cake_covered_cases"] == 57_280
+    assert len(manifest["artifacts"]) == 117
+    dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
+    assert dcp_addon["installed"] is True
+    assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
+    assert set(dcp_addon["manifest"]["families"]) == {
+        "dcp_spec_bf16_fp8",
+        "dcp_spec_bf16_v1",
+        "dcp_spec_bf16_v4",
+    }
     assert manifest["components"]["compat_v1"]["launch_binding"] == (
         "cake_fmha_launch_compat_v1"
     )
     assert len(CAKE_FMHA_MANIFEST_SHA256) == 64
+    assert len(CAKE_FMHA_FLASHINFER_BINDINGS_SHA256) == 64
 
 
 def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
@@ -95,7 +106,9 @@ def test_cake_public_symbols_are_top_level() -> None:
 def test_cake_fmha_aot_registers_each_exact_blackwell_target(monkeypatch) -> None:
     from flashinfer import aot
 
-    monkeypatch.setattr(aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog"))
+    monkeypatch.setattr(
+        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
+    )
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     monkeypatch.setattr(
         aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
@@ -186,3 +199,56 @@ def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> Non
         head_dim=128,
         uses_shared_paged_kv_idx=False,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_base_decode_cuda_graph_capture_replay() -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    device = torch.device("cuda")
+    batch_size, num_q_heads, num_kv_heads = 2, 4, 2
+    query = torch.randn(
+        (batch_size, num_q_heads, 128), dtype=torch.bfloat16, device=device
+    )
+    key = torch.randn((4, num_kv_heads, 16, 128), dtype=torch.bfloat16, device=device)
+    value = torch.randn_like(key)
+    block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([31, 29], dtype=torch.int32, device=device)
+    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+    out = torch.empty_like(query)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_q_heads, get_device_sm_count(device)
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    def run():
+        return cake_api.cake_batch_decode_with_kv_cache(
+            query,
+            (key, value),
+            workspace,
+            block_tables,
+            seq_lens,
+            31,
+            out=out,
+            multi_ctas_kv_counter_buffer=counter,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    expected = out.clone()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
