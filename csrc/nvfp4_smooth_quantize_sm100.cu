@@ -81,6 +81,48 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
       static_cast<float const*>(global_scale.data_ptr()), m, n, smCount, stream, enable_pdl);
 }
 
+void nvfp4_quantize_smooth_swiglu(TensorView gate_up, TensorView pqs, TensorView global_scale,
+                                  TensorView activated, TensorView xq, TensorView sf,
+                                  bool enable_pdl) {
+  CHECK_INPUT_AND_TYPE(gate_up, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
+  CHECK_INPUT_AND_TYPE(activated, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(xq, dl_uint8);
+  CHECK_INPUT_AND_TYPE(sf, dl_uint8);
+  CHECK_DEVICE(pqs, gate_up);
+  CHECK_DEVICE(global_scale, gate_up);
+  CHECK_DEVICE(activated, gate_up);
+  CHECK_DEVICE(xq, gate_up);
+  CHECK_DEVICE(sf, gate_up);
+
+  TVM_FFI_ICHECK_EQ(gate_up.ndim(), 2) << "gate_up must be [m, 2*n]";
+  int const m = static_cast<int>(gate_up.size(0));
+  TVM_FFI_ICHECK_EQ(gate_up.size(1) % 2, 0) << "gate_up's last dimension must be even";
+  int const n = static_cast<int>(gate_up.size(1) / 2);
+  TVM_FFI_ICHECK_EQ(n % 16, 0) << "n must be divisible by 16 (NVFP4 SF vector size)";
+  TVM_FFI_ICHECK_EQ(pqs.numel(), n) << "pqs must have n elements";
+  TVM_FFI_ICHECK_GE(global_scale.numel(), 1) << "global_scale must contain at least one element";
+  TVM_FFI_ICHECK_EQ(activated.ndim(), 2) << "activated must be [m, n]";
+  TVM_FFI_ICHECK_EQ(activated.size(0), m) << "activated must be [m, n]";
+  TVM_FFI_ICHECK_EQ(activated.size(1), n) << "activated must be [m, n]";
+  TVM_FFI_ICHECK_EQ(xq.ndim(), 2) << "xq must be [m, n/2]";
+  TVM_FFI_ICHECK_EQ(xq.size(0), m) << "xq must be [m, n/2]";
+  TVM_FFI_ICHECK_EQ(xq.size(1), n / 2) << "xq must be [m, n/2]";
+  int64_t const sfSize =
+      static_cast<int64_t>((m + 128 - 1) / 128 * 128) * ((n / 16 + 4 - 1) / 4 * 4);
+  TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
+      << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
+
+  int const smCount = getMultiProcessorCount(gate_up.device().device_id);
+  auto stream = get_stream(gate_up.device());
+  flashinfer::gemm::nvfp4_smooth_quantize_swiglu(
+      activated.data_ptr(), xq.data_ptr(), sf.data_ptr(), gate_up.data_ptr(), pqs.data_ptr(),
+      static_cast<float const*>(global_scale.data_ptr()), m, n, smCount, stream, enable_pdl);
+}
+
 }  // namespace torch_ext
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth, torch_ext::nvfp4_quantize_smooth);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_swiglu,
+                              torch_ext::nvfp4_quantize_smooth_swiglu);

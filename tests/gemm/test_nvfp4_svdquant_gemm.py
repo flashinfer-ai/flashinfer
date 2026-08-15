@@ -26,6 +26,7 @@ from flashinfer import (
 from flashinfer.gemm.gemm_svdquant import (
     DEFAULT_WORKSPACE_SIZE,
     SVDQUANT_LORA_RANK_GRANULARITY,
+    _nvfp4_quantize_smooth_swiglu,
     get_nvfp4_svdquant_module,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
@@ -148,6 +149,86 @@ def test_nvfp4_quantize_smooth(m, n):
     assert sf.dtype == torch.uint8 and sf.ndim == 1
     assert torch.equal(xq, xq_ref.view(torch.uint8))
     assert torch.equal(sf, sf_ref.view(torch.uint8).reshape(-1))
+
+
+@pytest.mark.parametrize("m,k", [(17, 256), (129, 14336)])
+def test_nvfp4_quantize_smooth_swiglu(m, k):
+    _skip_unless_sm100()
+    torch.manual_seed(7)
+    gate_up = torch.randn(m, 2 * k, dtype=torch.bfloat16, device="cuda") / 4
+    pqs = (
+        (1.0 + 0.3 * torch.randn(k, dtype=torch.bfloat16, device="cuda"))
+        .abs()
+        .contiguous()
+    )
+
+    gate, up = gate_up.split(k, dim=1)
+    # vLLM's vectorized BF16 kernel rounds SiLU before multiplying by up.
+    silu_bf16 = (gate.float() / (1.0 + torch.exp(-gate.float()))).to(torch.bfloat16)
+    activated_ref = (silu_bf16.float() * up.float()).to(torch.bfloat16)
+    global_sf = (
+        ((448.0 * 6.0) / (activated_ref.float() * pqs.float()).abs().nan_to_num().max())
+        .reshape(1)
+        .contiguous()
+    )
+
+    activated, xq, sf = _nvfp4_quantize_smooth_swiglu(gate_up, pqs, global_sf)
+    # expf implementations may differ by the final BF16 ulp, but the fused
+    # kernel must retain vLLM's two-rounding numerical contract.
+    torch.testing.assert_close(activated, activated_ref, rtol=0.01, atol=0.01)
+
+    # The quantized branch must be byte-identical to applying the existing
+    # smooth quantizer to the BF16 activation emitted by this same kernel.
+    xq_ref, sf_ref = nvfp4_quantize_smooth(activated, pqs, global_sf)
+    assert torch.equal(xq, xq_ref)
+    assert torch.equal(sf, sf_ref)
+
+
+def test_svdquant_linear_fused_swiglu_matches_emitted_activation():
+    _skip_unless_sm100()
+    torch.manual_seed(19)
+    m, n, k, rank = 129, 256, 256, _RANK
+    gate_up = torch.randn(m, 2 * k, dtype=torch.bfloat16, device="cuda") / 4
+    pqs = (
+        (1.0 + 0.3 * torch.randn(k, dtype=torch.bfloat16, device="cuda"))
+        .abs()
+        .contiguous()
+    )
+    global_sf = torch.ones(1, dtype=torch.float32, device="cuda")
+    activated, _, _ = _nvfp4_quantize_smooth_swiglu(gate_up, pqs, global_sf)
+
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") / 4
+    weight_fp4, weight_sf, weight_global_sf = _nvfp4_quantize_128x4(weight)
+    alpha = (1.0 / (global_sf * weight_global_sf)).reshape(1).float()
+    l2t_smoothed = (
+        torch.randn(k, rank, dtype=torch.bfloat16, device="cuda") / 16
+    ).contiguous()
+    l1 = torch.randn(n, rank, dtype=torch.bfloat16, device="cuda") / 16
+    l1_scaled = (l1.float() / alpha).to(torch.bfloat16).contiguous()
+
+    fused = svdquant_linear(
+        gate_up,
+        weight_fp4,
+        weight_sf.reshape(-1),
+        alpha,
+        pqs,
+        l2t_smoothed,
+        l1_scaled,
+        global_sf,
+        fuse_swiglu=True,
+    )
+    reference = svdquant_linear(
+        activated,
+        weight_fp4,
+        weight_sf.reshape(-1),
+        alpha,
+        pqs,
+        l2t_smoothed,
+        l1_scaled,
+        global_sf,
+    )
+
+    assert torch.equal(fused, reference)
 
 
 # Rank 32 (one storage chunk, the original kernel) and rank 128 (the widest validated

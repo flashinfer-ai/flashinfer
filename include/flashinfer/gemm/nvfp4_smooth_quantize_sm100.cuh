@@ -350,6 +350,24 @@ __device__ __forceinline__ void loadBf16x8(Type const* ptr, Bf16x8& result) {
   result.bits = *reinterpret_cast<uint4 const*>(ptr);
 }
 
+__device__ __forceinline__ void siluAndMulBf16x8(Bf16x8 const& gate, Bf16x8 const& up,
+                                                 Bf16x8& result) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float2 gateFloat = __bfloat1622float2(gate.elts[i]);
+    float2 const upFloat = __bfloat1622float2(up.elts[i]);
+
+    // Match vLLM's vectorized BF16 SiluAndMul semantics: SiLU is rounded to
+    // BF16 before the multiplication, then the product is rounded to BF16.
+    gateFloat.x = gateFloat.x / (1.0f + expf(-gateFloat.x));
+    gateFloat.y = gateFloat.y / (1.0f + expf(-gateFloat.y));
+    float2 activated = __bfloat1622float2(__float22bfloat162_rn(gateFloat));
+    activated.x *= upFloat.x;
+    activated.y *= upFloat.y;
+    result.elts[i] = __float22bfloat162_rn(activated);
+  }
+}
+
 __device__ __forceinline__ uint64_t quantizeSmoothed16(Bf16x8& lo, Bf16x8& hi, Bf16x8 const& pqsLo,
                                                        Bf16x8 const& pqsHi, float SFScaleVal,
                                                        uint8_t* SFout) {
@@ -464,6 +482,84 @@ __global__ void __launch_bounds__(512, 4)
 #endif
 }
 
+template <int NumCols, int RowsPerCta>
+__global__ void __launch_bounds__(512, 4)
+    smooth_quantize_swiglu_fast_kernel(int numRows, Type const* __restrict__ gateUp,
+                                       Type const* __restrict__ pqs,
+                                       float const* __restrict__ SFScale,
+                                       Type* __restrict__ activated, uint64_t* __restrict__ out,
+                                       uint8_t* __restrict__ SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(NumCols % (4 * SF_VEC_SIZE) == 0);
+  constexpr int NumSfCols = NumCols / SF_VEC_SIZE;
+  constexpr int NumSfGroups = NumSfCols / 4;
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+  cudaGridDependencySynchronize();
+
+  for (int rowBase = blockIdx.x * RowsPerCta; rowBase < numRows;
+       rowBase += gridDim.x * RowsPerCta) {
+    int const rowsRemaining = numRows - rowBase;
+    int const rowsThisCta = rowsRemaining < RowsPerCta ? rowsRemaining : RowsPerCta;
+    int const workItems = rowsThisCta * NumSfCols;
+    for (int item = threadIdx.x; item < workItems; item += blockDim.x) {
+      int const rowOffset = item / NumSfCols;
+      int const sfCol = item - rowOffset * NumSfCols;
+      int const row = rowBase + rowOffset;
+      int64_t const vecOffset = static_cast<int64_t>(row) * NumSfCols + sfCol;
+      // Keep the row term 64-bit: H3's [M, 2*K] gate/up tensor crosses the
+      // 2^32-element boundary at row 149,796 for K=14,336. A 32-bit product
+      // silently wraps and corrupts the second packed document.
+      int64_t const gateOffset =
+          static_cast<int64_t>(row) * (2 * NumCols) + sfCol * FAST_ELTS_PER_THREAD;
+
+      Bf16x8 gateLo;
+      Bf16x8 gateHi;
+      Bf16x8 upLo;
+      Bf16x8 upHi;
+      Bf16x8 pqsLo;
+      Bf16x8 pqsHi;
+      loadBf16x8(gateUp + gateOffset, gateLo);
+      loadBf16x8(gateUp + gateOffset + 8, gateHi);
+      loadBf16x8(gateUp + gateOffset + NumCols, upLo);
+      loadBf16x8(gateUp + gateOffset + NumCols + 8, upHi);
+      loadBf16x8(pqs + sfCol * FAST_ELTS_PER_THREAD, pqsLo);
+      loadBf16x8(pqs + sfCol * FAST_ELTS_PER_THREAD + 8, pqsHi);
+
+      Bf16x8 actLo;
+      Bf16x8 actHi;
+      siluAndMulBf16x8(gateLo, upLo, actLo);
+      siluAndMulBf16x8(gateHi, upHi, actHi);
+      Type* actPtr = activated + vecOffset * FAST_ELTS_PER_THREAD;
+      *reinterpret_cast<uint4*>(actPtr) = actLo.bits;
+      *reinterpret_cast<uint4*>(actPtr + 8) = actHi.bits;
+
+      int64_t const sfOffset = get_sf_out_offset_128x4(row, sfCol, NumSfCols);
+      out[vecOffset] = quantizeSmoothed16(actLo, actHi, pqsLo, pqsHi, SFScaleVal, SFout + sfOffset);
+    }
+  }
+
+  int const numPaddedRows = padUp(numRows, 128);
+  int64_t const numPaddingStores = static_cast<int64_t>(numPaddedRows - numRows) * NumSfGroups;
+  for (int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < numPaddingStores; item += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int const paddingRow = static_cast<int>(item / NumSfGroups);
+    int const sfGroup = static_cast<int>(item - static_cast<int64_t>(paddingRow) * NumSfGroups);
+    int const row = numRows + paddingRow;
+    int const sfCol = sfGroup * 4;
+    int64_t const sfOffset = get_sf_out_offset_128x4(row, sfCol, NumSfCols);
+    *reinterpret_cast<uint32_t*>(SFout + sfOffset) = 0u;
+  }
+
+  cudaTriggerProgrammaticLaunchCompletion();
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("nvfp4_smooth_quantize_swiglu requires SM100 or newer\n");
+    __trap();
+  }
+#endif
+}
+
 __global__ void __launch_bounds__(512, 4)
     smooth_quantize_legacy_kernel(int numRows, int numCols, int numPaddedCols, Type const* in,
                                   Type const* pqs, float const* SFScale, uint32_t* out,
@@ -512,6 +608,61 @@ __global__ void __launch_bounds__(512, 4)
 #endif
 }
 
+__global__ void __launch_bounds__(512, 4)
+    smooth_quantize_swiglu_legacy_kernel(int numRows, int numCols, Type const* gateUp,
+                                         Type const* pqs, float const* SFScale, Type* activated,
+                                         uint32_t* out, uint32_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  int const numPaddedRowsForSf = padUp(numRows, 128);
+  int const numColsForSf = padUp(numCols, 4 * SF_VEC_SIZE);
+  int const numColThreads = numCols / ELTS_PER_THREAD;
+  int const numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+
+  cudaGridDependencySynchronize();
+  for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
+    bool const isRowPadding = (rowIdx >= numRows);
+    for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
+      auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+          rowIdx, colIdx, numCols / SF_VEC_SIZE, SFout);
+
+      if (isRowPadding || colIdx >= numColThreads) {
+        if (sf_out != nullptr) sf_out[0] = 0x00;
+        continue;
+      }
+
+      int64_t const gateOffset = static_cast<int64_t>(rowIdx) * (2 * numColThreads) + colIdx;
+      Bf16x8 gate;
+      Bf16x8 up;
+      loadBf16x8(gateUp + gateOffset * ELTS_PER_THREAD, gate);
+      loadBf16x8(gateUp + (gateOffset + numColThreads) * ELTS_PER_THREAD, up);
+      Bf16x8 act;
+      siluAndMulBf16x8(gate, up, act);
+      int64_t const outOffset = static_cast<int64_t>(rowIdx) * numColThreads + colIdx;
+      *reinterpret_cast<uint4*>(activated + outOffset * ELTS_PER_THREAD) = act.bits;
+
+      SmoothPackedVec in_vec;
+      in_vec.elts[0] = act.elts[0];
+      in_vec.elts[1] = act.elts[1];
+      in_vec.elts[2] = act.elts[2];
+      in_vec.elts[3] = act.elts[3];
+      SmoothPackedVec p_vec = reinterpret_cast<SmoothPackedVec const*>(pqs)[colIdx];
+#pragma unroll
+      for (int i = 0; i < ELTS_PER_THREAD / 2; i++)
+        in_vec.elts[i] = __hmul2(in_vec.elts[i], p_vec.elts[i]);
+      reinterpret_cast<uint32_t*>(out)[outOffset] =
+          cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, false>(in_vec, SFScaleVal, sf_out);
+    }
+  }
+  cudaTriggerProgrammaticLaunchCompletion();
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("nvfp4_smooth_quantize_swiglu requires SM100 or newer\n");
+    __trap();
+  }
+#endif
+}
+
 template <int NumCols, int RowsPerCta>
 void launchSmoothQuantizeFast(void* out, void* sfOut, void const* in, void const* pqs,
                               float const* sfScale, int numRows, int multiProcessorCount,
@@ -539,6 +690,37 @@ void launchSmoothQuantizeFast(void* out, void* sfOut, void const* in, void const
   auto* kernel = &smooth_quantize_fast_kernel<NumCols, RowsPerCta>;
   cudaLaunchKernelEx(&cfg, kernel, numRows, reinterpret_cast<Type const*>(in),
                      reinterpret_cast<Type const*>(pqs), sfScale, reinterpret_cast<uint64_t*>(out),
+                     reinterpret_cast<uint8_t*>(sfOut));
+}
+
+template <int NumCols, int RowsPerCta>
+void launchSmoothQuantizeSwiGLUFast(void* activated, void* out, void* sfOut, void const* gateUp,
+                                    void const* pqs, float const* sfScale, int numRows,
+                                    int multiProcessorCount, int blockThreads, int blocksPerSm,
+                                    bool enablePDL, cudaStream_t stream) {
+  constexpr int NumSfGroups = NumCols / (4 * SF_VEC_SIZE);
+  int const numPaddedRows = padUp(numRows, 128);
+  int64_t const hotCtas = (static_cast<int64_t>(numRows) + RowsPerCta - 1) / RowsPerCta;
+  int64_t const numPaddingStores = static_cast<int64_t>(numPaddedRows - numRows) * NumSfGroups;
+  int64_t const paddingCtas = (numPaddingStores + blockThreads - 1) / blockThreads;
+  int64_t const wantedCtas = std::max(hotCtas, paddingCtas);
+  int64_t const maxCtas = static_cast<int64_t>(multiProcessorCount) * blocksPerSm;
+
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(static_cast<unsigned int>(std::min(wantedCtas, maxCtas)));
+  cfg.blockDim = dim3(blockThreads);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enablePDL ? 1 : 0;
+  cfg.attrs = attrs;
+  cfg.numAttrs = 1;
+
+  auto* kernel = &smooth_quantize_swiglu_fast_kernel<NumCols, RowsPerCta>;
+  cudaLaunchKernelEx(&cfg, kernel, numRows, reinterpret_cast<Type const*>(gateUp),
+                     reinterpret_cast<Type const*>(pqs), sfScale,
+                     reinterpret_cast<Type*>(activated), reinterpret_cast<uint64_t*>(out),
                      reinterpret_cast<uint8_t*>(sfOut));
 }
 
@@ -605,6 +787,64 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
   cudaLaunchKernelEx(&cfg, smooth_quantize_legacy_kernel, m, n, n,
                      reinterpret_cast<Type const*>(in), reinterpret_cast<Type const*>(pqs),
                      sf_scale, reinterpret_cast<uint32_t*>(out),
+                     reinterpret_cast<uint32_t*>(sf_out));
+}
+
+// Fuses H3's SwiGLU with SVDQuant preprocessing. Besides the packed NVFP4
+// activation and its scales, this writes the BF16 activated tensor required by
+// the low-rank down projection, so both consumers share one pass over gate_up.
+inline void nvfp4_smooth_quantize_swiglu(void* activated, void* out, void* sf_out,
+                                         void const* gate_up, void const* pqs,
+                                         float const* sf_scale, int m, int n,
+                                         int multiProcessorCount, cudaStream_t stream,
+                                         bool enable_pdl) {
+  using namespace smooth_quantize_detail;
+
+  if (m == 0 || n == 0) return;
+
+  int const blockThreads = n == 14336 ? 448 : 224;
+  int const blocksPerSm = 8;
+  if (n == 14336) {
+    launchSmoothQuantizeSwiGLUFast<14336, 1>(activated, out, sf_out, gate_up, pqs, sf_scale, m,
+                                             multiProcessorCount, blockThreads, blocksPerSm,
+                                             enable_pdl, stream);
+    return;
+  }
+  if (n == 7168) {
+    launchSmoothQuantizeSwiGLUFast<7168, 1>(activated, out, sf_out, gate_up, pqs, sf_scale, m,
+                                            multiProcessorCount, blockThreads, blocksPerSm,
+                                            enable_pdl, stream);
+    return;
+  }
+  if (n == 3584) {
+    launchSmoothQuantizeSwiGLUFast<3584, 1>(activated, out, sf_out, gate_up, pqs, sf_scale, m,
+                                            multiProcessorCount, blockThreads, blocksPerSm,
+                                            enable_pdl, stream);
+    return;
+  }
+  if (n == 1792) {
+    launchSmoothQuantizeSwiGLUFast<1792, 1>(activated, out, sf_out, gate_up, pqs, sf_scale, m,
+                                            multiProcessorCount, blockThreads, blocksPerSm,
+                                            enable_pdl, stream);
+    return;
+  }
+
+  dim3 block(std::min(n / ELTS_PER_THREAD, 512));
+  int const numBlocksPerSM = std::max(1, 2048 / int(block.x));
+  dim3 grid(std::min(padUp(m, 128), multiProcessorCount * numBlocksPerSM));
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+  cfg.attrs = attrs;
+  cfg.numAttrs = 1;
+  cudaLaunchKernelEx(&cfg, smooth_quantize_swiglu_legacy_kernel, m, n,
+                     reinterpret_cast<Type const*>(gate_up), reinterpret_cast<Type const*>(pqs),
+                     sf_scale, reinterpret_cast<Type*>(activated), reinterpret_cast<uint32_t*>(out),
                      reinterpret_cast<uint32_t*>(sf_out));
 }
 
