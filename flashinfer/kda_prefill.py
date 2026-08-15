@@ -66,6 +66,10 @@ class _RecurrentKDAPrefillWorkspaceBase:
             for variant in ("m64", "m128", "m128_n16", "persistent_m128")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
+        self._persistent_plan_lock = threading.Lock()
+        self._persistent_plan_tensor: Optional[torch.Tensor] = None
+        self._persistent_plan_signature: Optional[tuple[int, int, int, int]] = None
+        self._persistent_plan = None
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
 
@@ -598,6 +602,51 @@ def _get_stream_workspace(device: torch.device) -> _FlashKDAStreamWorkspace:
         return workspace
 
 
+def _cached_persistent_task_plan(
+    workspace: _FlashKDAStreamWorkspace,
+    cu_seqlens: torch.Tensor,
+    *,
+    total_tokens: int,
+    num_heads: int,
+    sm_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
+    """Cache one host-built plan for an unchanged packed-offset tensor."""
+
+    signature = (int(cu_seqlens._version), total_tokens, num_heads, sm_count)
+    with workspace._persistent_plan_lock:
+        if (
+            workspace._persistent_plan_tensor is cu_seqlens
+            and workspace._persistent_plan_signature == signature
+        ):
+            return workspace._persistent_plan
+        offsets = tuple(int(value) for value in cu_seqlens.tolist())
+        if (
+            not offsets
+            or offsets[0] != 0
+            or offsets[-1] != total_tokens
+            or any(
+                right <= left
+                for left, right in zip(offsets, offsets[1:], strict=False)
+            )
+        ):
+            raise ValueError(
+                "cu_seqlens must start at zero, be strictly increasing, "
+                "and end at the packed token count"
+            )
+        sequence_lengths = tuple(
+            right - left for left, right in zip(offsets, offsets[1:], strict=False)
+        )
+        plan = _persistent_task_plan(
+            sequence_lengths,
+            num_heads=num_heads,
+            sm_count=sm_count,
+        )
+        workspace._persistent_plan_tensor = cu_seqlens
+        workspace._persistent_plan_signature = signature
+        workspace._persistent_plan = plan
+        return plan
+
+
 def _workspace_buffer(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
@@ -884,39 +933,9 @@ def _run_flash_kda_prefill(
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
     target = _select_flash_kda_prefill_target(q.device)
     sm_count = _flash_kda_device_sm_count(q.device)
-    automatic_sequence_order = None
-    sequence_lengths = None
-    if (
-        not fixed_layout
-        and seq_order is None
-        and prefill_workspace is None
-        and not capturing
-    ):
-        assert cu_seqlens is not None
-        offsets = tuple(int(value) for value in cu_seqlens.tolist())
-        if (
-            not offsets
-            or offsets[0] != 0
-            or offsets[-1] != batch_size * seq_len
-            or any(
-                right <= left
-                for left, right in zip(offsets, offsets[1:], strict=False)
-            )
-        ):
-            raise ValueError(
-                "cu_seqlens must start at zero, be strictly increasing, "
-                "and end at the packed token count"
-            )
-        sequence_lengths = tuple(
-            right - left for left, right in zip(offsets, offsets[1:], strict=False)
-        )
-        automatic_sequence_order = tuple(
-            sorted(
-                range(num_sequences),
-                key=lambda index: sequence_lengths[index],
-                reverse=True,
-            )
-        )
+    stream_workspace = (
+        _get_stream_workspace(q.device) if prefill_workspace is None else None
+    )
     needs_direct_m128 = (
         state_indices is not None
         or checkpoint_every_n_tokens != 0
@@ -940,13 +959,21 @@ def _run_flash_kda_prefill(
     ):
         if fixed_layout:
             sequence_lengths = (seq_len,) * num_sequences
+            persistent_plan = _persistent_task_plan(
+                sequence_lengths,
+                num_heads=num_heads,
+                sm_count=sm_count,
+            )
         else:
-            assert sequence_lengths is not None
-        persistent_plan = _persistent_task_plan(
-            sequence_lengths,
-            num_heads=num_heads,
-            sm_count=sm_count,
-        )
+            assert cu_seqlens is not None
+            assert stream_workspace is not None
+            persistent_plan = _cached_persistent_task_plan(
+                stream_workspace,
+                cu_seqlens,
+                total_tokens=batch_size * seq_len,
+                num_heads=num_heads,
+                sm_count=sm_count,
+            )
     variant = _select_flash_kda_prefill_variant(
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
@@ -973,19 +1000,12 @@ def _run_flash_kda_prefill(
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
-        if automatic_sequence_order is None:
-            seq_order_i32 = _validate_prefill_seq_order(
-                seq_order,
-                fixed_layout=fixed_layout,
-                num_sequences=num_sequences,
-                device=q.device,
-            )
-        else:
-            seq_order_i32 = _cached_int32_metadata(
-                device=q.device,
-                kind="automatic_seq_order",
-                values=automatic_sequence_order,
-            )
+        seq_order_i32 = _validate_prefill_seq_order(
+            seq_order,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            device=q.device,
+        )
     else:
         sequence_order, task_ids, task_offsets = persistent_plan
         seq_order_i32 = _cached_int32_metadata(
@@ -1072,7 +1092,8 @@ def _run_flash_kda_prefill(
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase
     if prefill_workspace is None:
-        workspace = _get_stream_workspace(q.device)
+        assert stream_workspace is not None
+        workspace = stream_workspace
     else:
         workspace = prefill_workspace
     # TVM FFI may release the GIL. Serialize the complete shared-workspace

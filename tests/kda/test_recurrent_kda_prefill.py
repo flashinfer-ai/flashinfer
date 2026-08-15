@@ -704,40 +704,25 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
     assert args[9].tolist() == [0, 1]
 
 
-def test_direct_packed_prefill_automatically_sorts_sequences(cuda_device, monkeypatch):
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "get_compute_capability",
-        lambda device: (10, 3),
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_is_cuda_version_at_least",
-        lambda version: True,
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_flash_kda_device_sm_count",
-        lambda device: 152,
-    )
-    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
-    module = _RecorderModule()
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_get_flash_kda_prefill_module",
-        lambda variant, target: module,
-    )
-    inputs = _make_inputs(
-        seq_lens=[1, 3, 2],
+def test_b200_persistent_plan_is_cached_for_unchanged_offsets(cuda_device):
+    workspace = kda_prefill_api._FlashKDAStreamWorkspace(cuda_device)
+    offsets = torch.tensor([0, 3, 6], dtype=torch.int64, device=cuda_device)
+    first = kda_prefill_api._cached_persistent_task_plan(
+        workspace,
+        offsets,
+        total_tokens=6,
         num_heads=96,
-        packed=True,
+        sm_count=148,
     )
-    recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=torch.empty_like(inputs["q"]),
+    second = kda_prefill_api._cached_persistent_task_plan(
+        workspace,
+        offsets,
+        total_tokens=6,
+        num_heads=96,
+        sm_count=148,
     )
-    (args,) = module.calls
-    assert args[9].tolist() == [1, 2, 0]
+    assert first is not None
+    assert first is second
 
 
 def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
