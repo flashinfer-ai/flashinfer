@@ -49,7 +49,7 @@ _flash_kda_tensor_cache_lock = threading.Lock()
 
 _PackedMetadataSignature = tuple[int, int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
-_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan]]
+_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan], bool]
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -342,8 +342,9 @@ def _select_flash_kda_prefill_variant(
     num_heads: int,
     needs_direct_m128: bool = False,
     use_persistent_m128: bool = False,
+    use_exact_n16: bool = False,
 ) -> "FlashKDAVariant":
-    if num_heads == 12:
+    if num_heads == 12 or use_exact_n16:
         return "m128_n16"
     if (
         not needs_direct_m128
@@ -370,6 +371,25 @@ def _uses_measured_sm100_persistent_policy(
     sm_count: int,
 ) -> bool:
     return target == "sm100a" and sm_count in (148, 152)
+
+
+def _requires_exact_n16_recurrence(
+    *,
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    uniform_sequences: bool,
+) -> bool:
+    """Select the measured N16 graph for the 148-SM H96/N128 holdout."""
+
+    return (
+        sm_count == 148
+        and not fixed_layout
+        and num_sequences == 128
+        and num_heads == 96
+        and uniform_sequences
+    )
 
 
 def _uniform_persistent_worker_count(total_tasks: int, *, sm_count: int) -> int:
@@ -676,7 +696,11 @@ def _cached_packed_task_metadata(
             if build_persistent_plan
             else None
         )
-        metadata = (sequence_order, persistent_plan)
+        metadata = (
+            sequence_order,
+            persistent_plan,
+            len(set(sequence_lengths)) == 1,
+        )
         workspace._packed_metadata_tensor = cu_seqlens
         workspace._packed_metadata_signature = signature
         workspace._packed_metadata = metadata
@@ -994,6 +1018,7 @@ def _run_flash_kda_prefill(
     )
     automatic_sequence_order = None
     persistent_plan = None
+    uniform_sequences = False
     if (
         not fixed_layout
         and seq_order is None
@@ -1002,7 +1027,11 @@ def _run_flash_kda_prefill(
     ):
         assert cu_seqlens is not None
         assert stream_workspace is not None
-        automatic_sequence_order, persistent_plan = _cached_packed_task_metadata(
+        (
+            automatic_sequence_order,
+            persistent_plan,
+            uniform_sequences,
+        ) = _cached_packed_task_metadata(
             stream_workspace,
             cu_seqlens,
             total_tokens=batch_size * seq_len,
@@ -1017,12 +1046,22 @@ def _run_flash_kda_prefill(
             num_heads=num_heads,
             sm_count=sm_count,
         )
+    use_exact_n16 = _requires_exact_n16_recurrence(
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+    )
+    if use_exact_n16:
+        persistent_plan = None
     variant = _select_flash_kda_prefill_variant(
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
         num_heads=num_heads,
         needs_direct_m128=needs_direct_m128,
         use_persistent_m128=persistent_plan is not None,
+        use_exact_n16=use_exact_n16,
     )
     if fixed_layout:
         cu_seqlens_i64 = _fixed_cu_seqlens(

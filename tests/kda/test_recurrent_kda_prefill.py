@@ -436,12 +436,33 @@ def test_variant_selector_exposes_persistent_only_when_requested():
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=False,
+            num_sequences=128,
+            num_heads=96,
+            use_persistent_m128=True,
+            use_exact_n16=True,
+        )
+        == "m128_n16"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
             num_sequences=8,
             num_heads=12,
             use_persistent_m128=True,
         )
         == "m128_n16"
     )
+
+
+def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
+    for sm_count in (148, 152):
+        assert kda_prefill_api._requires_exact_n16_recurrence(
+            sm_count=sm_count,
+            fixed_layout=False,
+            num_sequences=128,
+            num_heads=96,
+            uniform_sequences=True,
+        ) is (sm_count == 148)
 
 
 class _RecorderModule:
