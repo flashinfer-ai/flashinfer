@@ -52,6 +52,13 @@ from .cascade import (
 from .cascade import merge_state as merge_state
 from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
+from .cake_fmha import (
+    cake_batch_context_with_kv_cache as cake_batch_context_with_kv_cache,
+)
+from .cake_fmha import (
+    cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
+)
+from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
 from .decode import (
     BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
 )

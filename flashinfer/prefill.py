@@ -5820,6 +5820,7 @@ def trtllm_batch_context_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    backend: str = "trtllm-gen",
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5945,6 +5946,10 @@ def trtllm_batch_context_with_kv_cache(
         zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
         self-resets the counters after each launch, so it does not need to be
         re-zeroed between calls.
+    backend : str = "trtllm-gen"
+        The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
+        selects the separately versioned Cake FMHA product. The default remains
+        the conventional TRTLLM implementation.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -5962,6 +5967,10 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if backend not in ("trtllm-gen", "cake"):
+        raise ValueError(
+            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+        )
     if not causal and window_left >= 0:
         raise NotImplementedError(
             "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
@@ -6007,7 +6016,12 @@ def trtllm_batch_context_with_kv_cache(
             key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
             value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    if backend == "cake":
+        from .cake_fmha import get_cake_fmha_module
+
+        run_func = get_cake_fmha_module(query.device).cake_paged_attention_context
+    else:
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -6085,8 +6099,12 @@ def trtllm_batch_context_with_kv_cache(
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
         bmm1_scale = bmm1_scale * log2e
+        if backend == "cake":
+            bmm1_scale = float(bmm1_scale.item()) / log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
+        if backend == "cake":
+            bmm2_scale = float(bmm2_scale.item())
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
 

@@ -3440,7 +3440,9 @@ def trtllm_batch_decode_with_kv_cache(
         When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
 
     backend : str = "auto"
-        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        The implementation backend, could be ``auto``/``xqa``/``trtllm-gen`` or
+        ``cake``. Defaults to ``auto``. ``cake`` selects the separately versioned
+        Cake FMHA product and never participates in automatic backend selection.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
@@ -3728,8 +3730,10 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-    if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
-        raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
+    if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
+        raise ValueError(
+            "bmm1_scale_log2 is only supported by the trtllm-gen and cake backends"
+        )
     if enable_block_sparse_attention:
         if backend != "trtllm-gen":
             raise ValueError(
@@ -3794,7 +3798,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_scale=o_scale,
             mask=mask,
         )
-    elif backend == "trtllm-gen":
+    elif backend in ("trtllm-gen", "cake"):
         # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
@@ -3810,7 +3814,14 @@ def trtllm_batch_decode_with_kv_cache(
                 k_block_scales = k_block_scales.transpose(-3, -2).contiguous()
                 v_block_scales = v_block_scales.transpose(-3, -2).contiguous()
 
-        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        if backend == "cake":
+            from .cake_fmha import get_cake_fmha_module
+
+            run_func = get_cake_fmha_module(
+                query.device
+            ).cake_paged_attention_decode
+        else:
+            run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
 
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -3907,8 +3918,15 @@ def trtllm_batch_decode_with_kv_cache(
         bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
             bmm1_scale, bmm1_scale_log2, query.device
         )
+        if backend == "cake" and isinstance(bmm1_scale, torch.Tensor):
+            # The TRTLLM ABI passes a precomputed base-2 scale tensor.  The
+            # complete-domain Cake route consumes the equivalent natural-log
+            # scalar.  Materialize it before entering the stable JIT ABI.
+            bmm1_scale = float(bmm1_scale.item()) / log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
+            if backend == "cake":
+                bmm2_scale = float(bmm2_scale.item())
 
         if q_len_per_req is not None:
             max_q_len = q_len_per_req
