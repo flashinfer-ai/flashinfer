@@ -226,10 +226,14 @@ def recurrent_kda(
             Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
             frozen prefill. Row zero for each sequence is its initial state;
             later rows are the states before token blocks beginning at
-            ``N, 2N, ...``. Required when ``checkpoint_every_n_tokens > 0``.
+            ``N, 2N, ...``. ``C`` must be at least
+            ``checkpoint_cu_starts[N_seq]``; this capacity contract is not
+            host-validated. Required when ``checkpoint_every_n_tokens > 0``.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
-            Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
+            The first value must be zero, and each consecutive difference must
+            equal ``ceil(seq_len / checkpoint_every_n_tokens)`` for that
+            sequence.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
