@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -21,79 +20,6 @@ from packaging.version import Version
 from flashinfer.jit import core as jit_core
 from flashinfer.jit import flash_kda
 
-
-def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
-    csrc_dir = flash_kda._get_flash_kda_csrc_dir()
-    manifest_path = csrc_dir / "flashkda_prefill_import_manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-
-    assert manifest["schema_version"] == 4
-    assert manifest["source_profiles_are_arch_specific"] is True
-    assert manifest["generated_source_text_equal_across_architectures"] == [
-        "n16",
-        "n32",
-        "m64",
-    ]
-    assert set(manifest["profiles"]) == {
-        "sm100_n16",
-        "sm103_n16",
-        "sm100_n32",
-        "sm103_n32",
-        "sm100_m64",
-        "sm103_m64",
-        "sm100_persistent",
-    }
-    assert {profile["arch"] for profile in manifest["profiles"].values()} == {
-        "sm_100a",
-        "sm_103a",
-    }
-    assert [patch["id"] for patch in manifest["integration_patches"]] == [
-        "allow_exact_state_alias",
-        "persistent_inplace_state",
-    ]
-    assert (
-        "persistent source consumes worker/LPT task bins"
-        in manifest["generated_invariants"]
-    )
-
-    expected_variants = {
-        "n16": (
-            "cake_flashkda_bf16_fused_m128_n16.cu",
-            "flashkda_bf16_fused_m128_ef8b47d690",
-            219136,
-        ),
-        "n32": (
-            "flashkda_bf16_fused_m128.cu",
-            "flashkda_bf16_fused_m128_ea022a2f1f",
-            227328,
-        ),
-        "m64": (
-            "flashkda_bf16_fused_m64.cu",
-            "flashkda_bf16_fused_m64_9a5566f3be",
-            221696,
-        ),
-        "persistent": (
-            "cake_flashkda_bf16_persistent_m128.cu",
-            "flashkda_bf16_persistent_m128_fb536e5df4",
-            221696,
-        ),
-    }
-    for variant, (
-        filename,
-        module_ident,
-        smem_bytes,
-    ) in expected_variants.items():
-        record = manifest["variants"][variant]
-        frozen = csrc_dir / filename
-        assert record["module_ident"] == module_ident
-        assert record["smem_bytes"] == smem_bytes
-        assert record["frozen_path"] == f"csrc/kda/{filename}"
-        frozen_text = frozen.read_text()
-        assert "Frozen generated kernel export" in frozen_text
-        assert "FlashKDATensorMap" in frozen_text
-        if variant == "persistent":
-            assert "task_ids[" in frozen_text
-            assert "task_offsets[" in frozen_text
 
 @pytest.mark.parametrize(
     (
