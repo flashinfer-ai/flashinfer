@@ -173,7 +173,9 @@ def _standalone_source_names(text: str) -> str:
     text = text.replace(f"{source_name}Pack", "FlashKDATensorMapPack")
     text = text.replace(source_name, "FlashKDATensorMap")
 
-    infinity_macro = re.search(r"#define (?P<name>[A-Z][A-Z0-9_]*_INF) CUDART_INF_F", text)
+    infinity_macro = re.search(
+        r"#define (?P<name>[A-Z][A-Z0-9_]*_INF) CUDART_INF_F", text
+    )
     if infinity_macro is None:
         raise ValueError("raw source is missing its generated infinity macro")
     return text.replace(infinity_macro.group("name"), "FLASH_KDA_INF")
@@ -207,7 +209,9 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     if f"#define SMEM_TOTAL {variant.smem_bytes}" not in text:
         raise ValueError(f"{variant.key} raw source has an unexpected SMEM_TOTAL")
     if "FlashKDATensorMap" not in text or "FLASH_KDA_INF" not in text:
-        raise ValueError(f"{variant.key} raw source does not use standalone FlashKDA names")
+        raise ValueError(
+            f"{variant.key} raw source does not use standalone FlashKDA names"
+        )
     if variant.key == "persistent" and (
         "task_ids[" not in text or "task_offsets[" not in text
     ):

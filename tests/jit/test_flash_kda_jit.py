@@ -134,9 +134,7 @@ def test_flash_kda_import_tool_constants_and_structural_validation(tmp_path):
     corrupt_source = tmp_path / "kernel.cu"
     corrupt_source.write_text("not a sealed Cake export\n")
     with pytest.raises(ValueError, match="tensor-map type"):
-        namespace["_freeze"](
-            corrupt_source.read_bytes(), namespace["VARIANTS"]["n16"]
-        )
+        namespace["_freeze"](corrupt_source.read_bytes(), namespace["VARIANTS"]["n16"])
 
 
 @pytest.mark.parametrize(
@@ -362,8 +360,12 @@ def test_flash_kda_uri_and_jit_spec(
         assert "one caller-owned in-place state tensor" in binding_text
         assert "sm_count == 148 || sm_count == 152" in binding_text
         assert "CheckFlashKDAPersistentDevice(device_id)" in binding_text
-    assert "#define FlashKDATensorMap flashkda_generated_FlashKDATensorMap" in binding_text
-    assert "reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>" in binding_text
+    assert (
+        "#define FlashKDATensorMap flashkda_generated_FlashKDATensorMap" in binding_text
+    )
+    assert (
+        "reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>" in binding_text
+    )
 
 
 def test_flash_kda_descriptor_workspace_contract():
@@ -382,7 +384,7 @@ def test_flash_kda_descriptor_workspace_contract():
     assert "cudaMemcpyAsync(TMA descriptors)" not in common_text
     assert "defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)" in common_text
     assert "defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)" in common_text
-    assert 'kFlashKDATargetMinor == 0' in common_text
+    assert "kFlashKDATargetMinor == 0" in common_text
     assert "kFlashKDATargetFamily == 100" in common_text
     assert "minor == 0 || minor == 3" in common_text
     assert "major == 10 && minor == kFlashKDATargetMinor" in common_text
