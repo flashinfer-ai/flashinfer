@@ -104,7 +104,7 @@ def test_pipe_ep_size_validation_uses_guarded_handshake_with_a_comm() -> None:
             return [value, (None, None)]
 
     comm = TwoRankComm()
-    with pytest.raises(RuntimeError, match="all ranks abort together.*ep_size"):
+    with pytest.raises(RuntimeError, match=r"all ranks abort together.*ep_size"):
         Sm90PushPipe(**arguments, comm_backend=comm)
     assert comm.allgather_calls == 1
 

@@ -55,6 +55,9 @@ MAX_CLUSTER_DIM_X = 16
 # overhead does not dominate tiny per-split K ranges.
 MIN_LOOP_ITERS_PER_SPLIT = 2
 
+# The maximum number of warp groups per CTA.
+MAX_WARP_GROUPS = 4
+
 # Auto launch selection uses the default decode KV tile size; explicit profile
 # validation owns non-default tile sizes.
 AUTO_LAUNCH_TILE_SIZE_KV = 128

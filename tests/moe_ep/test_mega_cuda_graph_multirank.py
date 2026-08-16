@@ -28,7 +28,7 @@ _REPLAYS = 4
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 def test_nvfp4_mega_two_rank_graph_replay_lockstep():
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 2:
@@ -44,7 +44,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         MoEEpLayer,
         MoEEpMegaLayer,
         MoEEpTensors,
-        Nvfp4CutedslMegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         MoEWeightPack,
         ensure_moe_ep_cuda_device,
     )
@@ -62,7 +62,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         ),
         weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
         backend=MegaConfig(
-            megakernel=Nvfp4CutedslMegaMoeConfig(
+            megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],
