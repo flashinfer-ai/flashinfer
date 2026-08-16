@@ -1687,8 +1687,8 @@ class TestCuteDslFusedMoeFunctional:
     )
     @pytest.mark.parametrize(
         "situ_beta,situ_linear_beta",
-        [(1.75, None), (0.8, 1.5)],
-        ids=["gate-clamp", "gate-and-up-clamp"],
+        [(1.75, None), (0.8, 1.5), (4.0, 25.0)],
+        ids=["gate-clamp", "gate-and-up-clamp", "kimi-k3"],
     )
     def test_situ_accuracy(
         self,
