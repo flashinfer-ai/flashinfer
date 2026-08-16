@@ -35,6 +35,7 @@ import torch
 from .utils import get_compute_capability
 
 if TYPE_CHECKING:
+    from .jit.cake_kda import CakeKDATarget, CakeKDAVariant
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
@@ -187,6 +188,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "bt16_chain_m64_s7",
                 "bt16_chain_m64_s8",
                 "bt16_chain_m64_s9",
+                "m128_unbounded_softplus",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -360,9 +362,10 @@ def _flash_kda_prefill_is_eligible(
         use_qk_l2norm_in_kernel
         and use_gate_in_kernel
         and beta_is_logit
-        and lower_bound is not None
-        and math.isfinite(float(lower_bound))
-        and float(lower_bound) < 0.0
+        and (
+            lower_bound is None
+            or (math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0)
+        )
     ):
         return False
     if (
@@ -486,7 +489,10 @@ def _select_flash_kda_prefill_variant(
     use_persistent_m128: bool = False,
     use_small_bh_m128: bool = False,
     use_exact_n16: bool = False,
-) -> "FlashKDAVariant":
+    unbounded_softplus: bool = False,
+) -> "FlashKDAVariant | CakeKDAVariant":
+    if unbounded_softplus:
+        return "m128_unbounded_softplus"
     if num_heads == 12 or use_exact_n16:
         return "m128_n16"
     if (
@@ -1942,6 +1948,29 @@ def _select_flash_kda_prefill_target(device: torch.device) -> "FlashKDATarget":
     return "sm100f"
 
 
+def _select_cake_kda_prefill_target(device: torch.device) -> "CakeKDATarget":
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+        raise RuntimeError(
+            "Cake recurrent-KDA prefill requires compute capability 10.0 "
+            "(SM100a; B200/GB200) or 10.3 (SM103a; B300/GB300); got "
+            f"{compute_capability[0]}.{compute_capability[1]}"
+        )
+    if compute_capability == (10, 0):
+        if not _is_cuda_version_at_least("12.8"):
+            raise RuntimeError(
+                "Cake recurrent-KDA prefill on compute capability 10.0 "
+                "requires CUDA 12.8 or newer"
+            )
+        return "sm100a"
+    if not _is_cuda_version_at_least("12.9"):
+        raise RuntimeError(
+            "Cake recurrent-KDA prefill on compute capability 10.3 requires "
+            "CUDA 12.9 or newer"
+        )
+    return "sm103a"
+
+
 def _get_flash_kda_prefill_module(variant: "FlashKDAVariant", target: "FlashKDATarget"):
     from .jit.flash_kda import get_flash_kda_prefill_module
 
@@ -2168,6 +2197,12 @@ def _run_bt16_prepare_chain(
             workspace._descriptor_signatures[variant] = signatures[variant]
 
 
+def _get_cake_kda_prefill_module(variant: "CakeKDAVariant", target: "CakeKDATarget"):
+    from .jit.cake_kda import get_cake_kda_prefill_module
+
+    return get_cake_kda_prefill_module(variant, target)
+
+
 def _run_flash_kda_prefill(
     *,
     q: torch.Tensor,
@@ -2180,7 +2215,7 @@ def _run_flash_kda_prefill(
     scale: Optional[float],
     initial_state: Optional[torch.Tensor],
     output_final_state: bool,
-    lower_bound: float,
+    lower_bound: Optional[float],
     cu_seqlens: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
     seq_order: Optional[torch.Tensor],
@@ -2189,13 +2224,10 @@ def _run_flash_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
-    backend: Literal["cake"] = "cake",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
 ):
-    if backend != "cake":
-        raise ValueError(f"backend must be 'cake', got {backend!r}")
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(
@@ -2206,7 +2238,9 @@ def _run_flash_kda_prefill(
     batch_size, seq_len, num_heads, _ = q.shape
     fixed_layout = cu_seqlens is None
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
-    target = _select_flash_kda_prefill_target(q.device)
+    flash_target = (
+        None if lower_bound is None else _select_flash_kda_prefill_target(q.device)
+    )
     compute_capability = get_compute_capability(q.device)
     sm_count = _flash_kda_device_sm_count(q.device)
     stream_workspace = (
@@ -2233,6 +2267,7 @@ def _run_flash_kda_prefill(
             compute_capability=compute_capability,
             sm_count=sm_count,
         )
+        and lower_bound is not None
         and not needs_direct_m128
         and prefill_workspace is None
         and seq_order is None
@@ -2393,6 +2428,14 @@ def _run_flash_kda_prefill(
         )
     else:
         variant = "m128"
+    if lower_bound is None:
+        variant = _select_flash_kda_prefill_variant(
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            unbounded_softplus=True,
+        )
+        persistent_plan = None
     if checkpoint_every_n_tokens and variant == "m128_n16":
         variant = "m128_n16_checkpoint"
     piece_plan = None
@@ -2689,7 +2732,13 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        module = _get_flash_kda_prefill_module(variant, target)
+        if variant == "m128_unbounded_softplus":
+            module = _get_cake_kda_prefill_module(
+                variant, _select_cake_kda_prefill_target(q.device)
+            )
+        else:
+            assert flash_target is not None
+            module = _get_flash_kda_prefill_module(variant, flash_target)
         try:
             if variant == "m64":
                 module.run(
@@ -2712,7 +2761,7 @@ def _run_flash_kda_prefill(
                     int(use_initial_state),
                     int(store_final_state),
                     scale_value,
-                    float(lower_bound),
+                    float(lower_bound if lower_bound is not None else 0.0),
                     stream_ptr,
                 )
             elif variant == "small_bh_m128":
@@ -2853,7 +2902,7 @@ def _run_flash_kda_prefill(
                     int(store_final_state),
                     checkpoint_every_n_tokens,
                     scale_value,
-                    float(lower_bound),
+                    float(lower_bound if lower_bound is not None else 0.0),
                     stream_ptr,
                 )
         except Exception:

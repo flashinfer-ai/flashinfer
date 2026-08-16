@@ -99,6 +99,11 @@ def recurrent_kda(
     contracts and keeps Cake as the feature-complete fallback; use
     ``backend="cake"`` to select and benchmark the generated portfolio
     explicitly.
+    Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
+    frozen Cake specialization automatically. The Cake path accepts any
+    positive runtime head count, so Kimi-Linear tensor parallelism maps global
+    H32 to per-rank H32/H16/H8/H4 without an adapter. Other decode and
+    speculative-decode calls retain the CuTe DSL backend.
 
     Args:
         q (torch.Tensor):
@@ -148,7 +153,9 @@ def recurrent_kda(
             ``g``. Default: ``False``.
         lower_bound (Optional[float]):
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula instead of softplus. Must be negative.
+            gate formula. If ``None``, uses
+            ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
+            negative.
         cu_seqlens (Optional[torch.Tensor]):
             Contiguous CUDA cumulative sequence lengths of shape ``[N+1]``.
             May be int32 or int64. Frozen prefill converts int32 offsets to
@@ -422,7 +429,6 @@ def recurrent_kda(
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None
-        assert lower_bound is not None
         return _kda_prefill._run_flash_kda_prefill(
             q=q,
             k=k,
@@ -443,7 +449,6 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            backend="cake",
         )
 
     if backend == "cake" and is_plain_prefill:
@@ -496,7 +501,7 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
-        backend="cake" if backend == "cake" else "cute-dsl",
+        backend=backend,
     )
 
 

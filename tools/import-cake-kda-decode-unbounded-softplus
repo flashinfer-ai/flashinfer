@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Import exact Cake T1 unbounded-softplus decode exports."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+import re
+import sys
+
+
+LICENSE_HEADER = """/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+"""
+
+_VOLATILE_TEMP = re.compile(r"\b_(bval|bits|addr)_([0-9]{6,})\b")
+
+
+@dataclass(frozen=True)
+class Variant:
+    split: int
+    raw_sha256: str
+    normalized_sha256: str
+    raw_bytes: int
+    module_ident: str
+    frozen_filename: str
+
+
+VARIANTS = {
+    "split8": Variant(
+        split=8,
+        raw_sha256="9f26543ff5ef868becb8b098919f0e3a2a375075fca1385fb73bffde0b5ee337",
+        normalized_sha256="92fd02b9de1f34745843976a2d68d95fefd525c68f0634e29df714efa318dcff",
+        raw_bytes=12335,
+        module_ident="flashinfer_recurrent_kda_t1_unbounded_softplus_91c7ba9402",
+        frozen_filename="cake_kda_decode_d128_t1_unbounded_softplus_direct_split8.cu",
+    ),
+    "split16": Variant(
+        split=16,
+        raw_sha256="a008739fd7545ea53855d6499b3b3c0efbec0c8e84518a6debe42da603fb0d58",
+        normalized_sha256="8a86356048ed592bf005532b1e43fbef39d07d1c8fbd35a92ce8ad75de651185",
+        raw_bytes=12336,
+        module_ident="flashinfer_recurrent_kda_t1_unbounded_softplus_bde9c7553e",
+        frozen_filename="cake_kda_decode_d128_t1_unbounded_softplus_direct_split16.cu",
+    ),
+}
+
+PROFILES = {
+    "sm100_split8": {
+        "arch": "sm_100a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm100",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
+        "profile_sha256": "55b0b573103646825d2e4ab067394f55ac51a9895f30ae76b7603e67fca84678",
+        "variant": "split8",
+    },
+    "sm103_split8": {
+        "arch": "sm_103a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm103",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
+        "profile_sha256": "645f5f57d1e80e4a4ba86d29a8ef7aa5ac7104b6b45405d0d835f7f797387032",
+        "variant": "split8",
+    },
+    "sm100_split16": {
+        "arch": "sm_100a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm100",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
+        "profile_sha256": "437c78ae48fa829ab02e3dfb7d0a8303c588c49d74f018c36173ffee281d9344",
+        "variant": "split16",
+    },
+    "sm103_split16": {
+        "arch": "sm_103a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm103",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
+        "profile_sha256": "c1a5e0dc53f83f3bea86cdd9a8c60e921a4015bc76d1d4924c93bb26e30ab40c",
+        "variant": "split16",
+    },
+}
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _normalize_generated_body(source: str) -> str:
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    volatile_ids = {}
+
+    def replace_volatile_temp(match):
+        kind, identity = match.groups()
+        ordinal = volatile_ids.setdefault(identity, f"{len(volatile_ids) + 1:04d}")
+        return f"_{kind}_volatile{ordinal}"
+
+    source = _VOLATILE_TEMP.sub(replace_volatile_temp, source)
+    source = "\n".join(line.rstrip() for line in source.splitlines())
+    return source.rstrip() + "\n"
+
+
+def _read_verified(path: Path, variant: Variant, arch: str) -> bytes:
+    data = path.read_bytes()
+    actual_sha256 = _sha256(data)
+    if len(data) != variant.raw_bytes or actual_sha256 != variant.raw_sha256:
+        raise ValueError(
+            f"{arch} split{variant.split} export identity mismatch: "
+            f"bytes={len(data)} sha256={actual_sha256}; expected "
+            f"bytes={variant.raw_bytes} sha256={variant.raw_sha256}"
+        )
+    return data
+
+
+def _verify_profile(path: Path, profile: dict[str, str], variant: Variant) -> None:
+    data = path.read_bytes()
+    if _sha256(data) != profile["profile_sha256"]:
+        raise ValueError(f"{profile['profile']} profile identity mismatch")
+    payload = json.loads(data)
+    expected_fields = {
+        "profile": profile["profile"],
+        "arch": profile["arch"],
+        "module_ident": variant.module_ident,
+        "expected_source_sha256": variant.raw_sha256,
+    }
+    for field, expected in expected_fields.items():
+        if payload.get(field) != expected:
+            raise ValueError(
+                f"{profile['profile']} {field} mismatch: "
+                f"{payload.get(field)!r} != {expected!r}"
+            )
+
+
+def _freeze(raw: bytes, variant: Variant) -> bytes:
+    text = raw.decode("utf-8")
+    if not text.endswith("\n"):
+        raise ValueError("raw source must end with a newline")
+    if text.count("kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(") != 1:
+        raise ValueError("raw source has an unexpected kernel signature")
+    for required in (
+        "float* __restrict__ A_log",
+        "float* __restrict__ dt_bias",
+        "float biased_gate",
+        "log1pf(",
+        "__expf((-gate_a) * softplus)",
+        "int g_stride_token",
+        "int state_stride_slot",
+    ):
+        if required not in text:
+            raise ValueError(f"raw source is missing {required!r}")
+    normalized = _normalize_generated_body(text)
+    if _sha256(normalized.encode("utf-8")) != variant.normalized_sha256:
+        raise ValueError("normalized generated source identity mismatch")
+    metadata = (
+        "// Generated from a recurrent-KDA Loom schedule.\n"
+        f"// Raw generated body SHA256: {variant.raw_sha256}\n"
+        f"// Normalized generated SHA256: {variant.normalized_sha256}\n"
+        "// BEGIN FROZEN GENERATED BODY\n"
+    )
+    return (
+        LICENSE_HEADER
+        + "\n// clang-format off\n"
+        + metadata
+        + text
+        + "// END FROZEN GENERATED BODY\n"
+        + "// clang-format on\n"
+    ).encode("utf-8")
+
+
+def _manifest(frozen: dict[str, bytes]) -> bytes:
+    payload = {
+        "schema_version": 1,
+        "architecture_artifacts_are_separate": True,
+        "generated_source_text_equal_across_architectures": True,
+        "profiles": PROFILES,
+        "variants": {
+            key: {
+                "frozen_path": f"csrc/kda/{variant.frozen_filename}",
+                "frozen_sha256": _sha256(frozen[key]),
+                "module_ident": variant.module_ident,
+                "normalized_sha256": variant.normalized_sha256,
+                "raw_bytes": variant.raw_bytes,
+                "raw_sha256": variant.raw_sha256,
+                "value_split": variant.split,
+            }
+            for key, variant in VARIANTS.items()
+        },
+    }
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _write_or_check(path: Path, expected: bytes, check: bool) -> bool:
+    if check:
+        if not path.is_file() or path.read_bytes() != expected:
+            print(f"out of date: {path}", file=sys.stderr)
+            return False
+        print(f"verified: {path}")
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(expected)
+    print(f"wrote: {path}")
+    return True
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for arch in ("sm100", "sm103"):
+        for split in (8, 16):
+            parser.add_argument(
+                f"--{arch}-split{split}-source", type=Path, required=True
+            )
+            parser.add_argument(
+                f"--{arch}-split{split}-profile", type=Path, required=True
+            )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "csrc" / "kda",
+    )
+    parser.add_argument("--check", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    raw = {}
+    for profile_key, profile in PROFILES.items():
+        arch_key = "sm100" if profile["arch"] == "sm_100a" else "sm103"
+        variant = VARIANTS[profile["variant"]]
+        source_path = getattr(args, f"{arch_key}_split{variant.split}_source")
+        profile_path = getattr(args, f"{arch_key}_split{variant.split}_profile")
+        _verify_profile(profile_path, profile, variant)
+        raw[profile_key] = _read_verified(source_path, variant, profile["arch"])
+    for split in (8, 16):
+        if raw[f"sm100_split{split}"] != raw[f"sm103_split{split}"]:
+            raise ValueError(f"split{split} SM100 and SM103 source text differs")
+    frozen = {
+        f"split{split}": _freeze(raw[f"sm100_split{split}"], VARIANTS[f"split{split}"])
+        for split in (8, 16)
+    }
+    outputs = {
+        args.output_dir / variant.frozen_filename: frozen[key]
+        for key, variant in VARIANTS.items()
+    }
+    outputs[
+        args.output_dir / "cake_kda_decode_unbounded_softplus_import_manifest.json"
+    ] = _manifest(frozen)
+    matched = True
+    for path, data in outputs.items():
+        matched = _write_or_check(path, data, args.check) and matched
+    return 0 if matched else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

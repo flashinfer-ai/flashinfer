@@ -1,0 +1,55 @@
+{
+  "architecture_artifacts_are_separate": true,
+  "generated_source_text_equal_across_architectures": true,
+  "profiles": {
+    "sm100_split16": {
+      "arch": "sm_100a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm100",
+      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
+      "profile_sha256": "437c78ae48fa829ab02e3dfb7d0a8303c588c49d74f018c36173ffee281d9344",
+      "variant": "split16"
+    },
+    "sm100_split8": {
+      "arch": "sm_100a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm100",
+      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
+      "profile_sha256": "55b0b573103646825d2e4ab067394f55ac51a9895f30ae76b7603e67fca84678",
+      "variant": "split8"
+    },
+    "sm103_split16": {
+      "arch": "sm_103a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm103",
+      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
+      "profile_sha256": "c1a5e0dc53f83f3bea86cdd9a8c60e921a4015bc76d1d4924c93bb26e30ab40c",
+      "variant": "split16"
+    },
+    "sm103_split8": {
+      "arch": "sm_103a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm103",
+      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
+      "profile_sha256": "645f5f57d1e80e4a4ba86d29a8ef7aa5ac7104b6b45405d0d835f7f797387032",
+      "variant": "split8"
+    }
+  },
+  "schema_version": 1,
+  "variants": {
+    "split16": {
+      "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split16.cu",
+      "frozen_sha256": "fbdc91e7c9577d37a039dc051a258160b938216888c8919f2cd8cb69cbfccf63",
+      "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_bde9c7553e",
+      "normalized_sha256": "8a86356048ed592bf005532b1e43fbef39d07d1c8fbd35a92ce8ad75de651185",
+      "raw_bytes": 12336,
+      "raw_sha256": "a008739fd7545ea53855d6499b3b3c0efbec0c8e84518a6debe42da603fb0d58",
+      "value_split": 16
+    },
+    "split8": {
+      "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split8.cu",
+      "frozen_sha256": "d38802834f2a254f2893fdfe6f224819cbef28297832d11c7febdd38d50027ae",
+      "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_91c7ba9402",
+      "normalized_sha256": "92fd02b9de1f34745843976a2d68d95fefd525c68f0634e29df714efa318dcff",
+      "raw_bytes": 12335,
+      "raw_sha256": "9f26543ff5ef868becb8b098919f0e3a2a375075fca1385fb73bffde0b5ee337",
+      "value_split": 8
+    }
+  }
+}
