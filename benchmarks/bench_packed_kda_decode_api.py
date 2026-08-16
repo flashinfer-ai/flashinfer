@@ -32,11 +32,11 @@ from pathlib import Path
 import torch
 
 import flashinfer
-from flashinfer.jit.flash_kda_packed_t1 import _variant_for_batch
-from flashinfer.jit.flash_kda_packed_t1 import (
+from flashinfer.jit.cake_flash_kda_packed_t1 import _variant_for_batch
+from flashinfer.jit.cake_flash_kda_packed_t1 import (
     _get_csrc_dir as _get_packed_kda_csrc_dir,
 )
-from flashinfer.jit.flash_kda_packed_t1 import gen_flash_kda_packed_t1_module
+from flashinfer.jit.cake_flash_kda_packed_t1 import gen_flash_kda_packed_t1_module
 from flashinfer.kda_decode import packed_kda_decode
 from flashinfer.testing import bench_gpu_time
 

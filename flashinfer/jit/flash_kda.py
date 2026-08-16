@@ -59,8 +59,8 @@ _FLASH_KDA_MODULE_IDENTS = {
 _FLASH_KDA_BINDING_STEMS = {
     "m64": "flashkda_bf16_fused_m64",
     "m128": "flashkda_bf16_fused_m128",
-    "m128_n16": "flashkda_bf16_fused_m128_n16",
-    "persistent_m128": "flashkda_bf16_persistent_m128",
+    "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
+    "persistent_m128": "cake_flashkda_bf16_persistent_m128",
 }
 
 

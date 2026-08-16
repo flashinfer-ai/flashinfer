@@ -30,7 +30,7 @@ Exported:
 
 import torch as _torch
 
-from .packed_kda_decode import run_packed_kda_decode
+from .cake_packed_kda_decode import run_packed_kda_decode
 
 packed_kda_decode = run_packed_kda_decode
 

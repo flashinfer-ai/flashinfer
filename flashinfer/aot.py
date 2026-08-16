@@ -73,7 +73,7 @@ from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_VARIANTS,
     gen_flash_kda_decode_module,
 )
-from .jit.flash_kda_packed_t1 import (
+from .jit.cake_flash_kda_packed_t1 import (
     FLASH_KDA_PACKED_T1_VARIANTS,
     gen_flash_kda_packed_t1_module,
 )

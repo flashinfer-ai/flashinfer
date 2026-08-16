@@ -151,11 +151,11 @@ def _get_binding_cu(
  * limitations under the License.
  */
 
-#define FLASHKDA_PACKED_T1_BODY_FILE "flashkda_packed_t1_{variant}.cu"
+#define FLASHKDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"
 #define FLASHKDA_PACKED_T1_KERNEL {metadata.symbol}
 #define FLASHKDA_PACKED_T1_VALUE_SPLITS {metadata.value_splits}
 
-#include "flashkda_packed_t1_binding.cuh"
+#include "cake_flashkda_packed_t1_binding.cuh"
 """
 
 
@@ -172,10 +172,10 @@ def gen_flash_kda_packed_t1_module(
         raise ValueError(f"unsupported packed KDA T=1 target: {target}")
 
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / f"flashkda_packed_t1_{variant}.cu"
+    body = csrc_dir / f"cake_flashkda_packed_t1_{variant}.cu"
     if not body.exists():
         raise FileNotFoundError(f"frozen packed KDA T=1 body not found: {body}")
-    binding_header = csrc_dir / "flashkda_packed_t1_binding.cuh"
+    binding_header = csrc_dir / "cake_flashkda_packed_t1_binding.cuh"
     if not binding_header.exists():
         raise FileNotFoundError(
             f"packed KDA T=1 binding header not found: {binding_header}"
@@ -183,7 +183,9 @@ def gen_flash_kda_packed_t1_module(
 
     metadata = FLASH_KDA_PACKED_T1_VARIANT_METADATA[variant]
     uri = get_flash_kda_packed_t1_uri(variant, target)
-    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "flashkda_packed_t1_binding.cu"
+    binding = (
+        jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_flashkda_packed_t1_binding.cu"
+    )
     write_if_different(binding, _get_binding_cu(variant, metadata))
 
     spec = gen_jit_spec(

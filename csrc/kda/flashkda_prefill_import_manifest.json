@@ -91,8 +91,8 @@
       "smem_bytes": 221696
     },
     "n16": {
-      "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
-      "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
+      "binding_path": "csrc/kda/cake_flashkda_bf16_fused_m128_n16_binding.cu",
+      "frozen_path": "csrc/kda/cake_flashkda_bf16_fused_m128_n16.cu",
       "frozen_sha256": "5a701fc2cc38a24b3c46498859d96ec62cacc8a8c011514d3297416f92a34470",
       "module_ident": "flashkda_bf16_fused_m128_ef8b47d690",
       "raw_bytes": 167472,
@@ -109,8 +109,8 @@
       "smem_bytes": 227328
     },
     "persistent": {
-      "binding_path": "csrc/kda/flashkda_bf16_persistent_m128_binding.cu",
-      "frozen_path": "csrc/kda/flashkda_bf16_persistent_m128.cu",
+      "binding_path": "csrc/kda/cake_flashkda_bf16_persistent_m128_binding.cu",
+      "frozen_path": "csrc/kda/cake_flashkda_bf16_persistent_m128.cu",
       "frozen_sha256": "64bc19d01ceb24dda67877a779908276db1734b7e5f677ec47d7b240e6842345",
       "module_ident": "flashkda_bf16_persistent_m128_fb536e5df4",
       "raw_bytes": 172462,

@@ -61,7 +61,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
 
     expected_variants = {
         "n16": (
-            "flashkda_bf16_fused_m128_n16.cu",
+            "cake_flashkda_bf16_fused_m128_n16.cu",
             "bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c",
             "5a701fc2cc38a24b3c46498859d96ec62cacc8a8c011514d3297416f92a34470",
             "flashkda_bf16_fused_m128_ef8b47d690",
@@ -85,7 +85,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
             221696,
         ),
         "persistent": (
-            "flashkda_bf16_persistent_m128.cu",
+            "cake_flashkda_bf16_persistent_m128.cu",
             "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
             "64bc19d01ceb24dda67877a779908276db1734b7e5f677ec47d7b240e6842345",
             "flashkda_bf16_persistent_m128_fb536e5df4",
@@ -451,7 +451,8 @@ def test_flash_kda_descriptor_workspace_contract():
     assert "EncodeTmaPointers<128, 32>" in m128_binding
 
     m128_n16_binding = (
-        flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_n16_binding.cu"
+        flash_kda._get_flash_kda_csrc_dir()
+        / "cake_flashkda_bf16_fused_m128_n16_binding.cu"
     ).read_text()
     assert (
         "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);"

@@ -19,7 +19,7 @@ import pytest
 from packaging.version import Version
 
 from flashinfer.jit import core as jit_core
-from flashinfer.jit import flash_kda_packed_t1
+from flashinfer.jit import cake_flash_kda_packed_t1 as flash_kda_packed_t1
 
 
 FROZEN_GENERATED_BODY_SHA256 = {
@@ -90,7 +90,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
 
     assert uri == f"flash_kda_packed_t1_{variant}_{target}"
     assert spec.name == uri
-    assert spec.sources == [tmp_path / uri / "flashkda_packed_t1_binding.cu"]
+    assert spec.sources == [tmp_path / uri / "cake_flashkda_packed_t1_binding.cu"]
     assert spec.sources[0].is_file()
     assert expected_flag in spec.extra_cuda_cflags
     assert (
@@ -103,7 +103,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     assert not any("compute_100f" in flag for flag in spec.extra_cuda_cflags)
 
     csrc_dir = flash_kda_packed_t1._get_csrc_dir()
-    frozen_text = (csrc_dir / f"flashkda_packed_t1_{variant}.cu").read_text()
+    frozen_text = (csrc_dir / f"cake_flashkda_packed_t1_{variant}.cu").read_text()
     assert f"Canonical typed source SHA256: {TYPED_SOURCE_SHA256}" in frozen_text
     assert (
         f"Frozen generated body SHA256: {FROZEN_GENERATED_BODY_SHA256[variant]}"
@@ -122,7 +122,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     metadata = flash_kda_packed_t1.FLASH_KDA_PACKED_T1_VARIANT_METADATA[variant]
     binding_text = spec.sources[0].read_text()
     assert (
-        f'#define FLASHKDA_PACKED_T1_BODY_FILE "flashkda_packed_t1_{variant}.cu"'
+        f'#define FLASHKDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"'
         in binding_text
     )
     assert f"#define FLASHKDA_PACKED_T1_KERNEL {metadata.symbol}" in binding_text
@@ -130,7 +130,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
         f"#define FLASHKDA_PACKED_T1_VALUE_SPLITS {metadata.value_splits}"
         in binding_text
     )
-    assert '#include "flashkda_packed_t1_binding.cuh"' in binding_text
+    assert '#include "cake_flashkda_packed_t1_binding.cuh"' in binding_text
     flash_kda_packed_t1.gen_flash_kda_packed_t1_module.cache_clear()
 
 
@@ -184,7 +184,7 @@ def test_flash_kda_packed_t1_variant_validation_and_getter(monkeypatch):
 
 def test_flash_kda_packed_t1_binding_contract():
     binding = (
-        flash_kda_packed_t1._get_csrc_dir() / "flashkda_packed_t1_binding.cuh"
+        flash_kda_packed_t1._get_csrc_dir() / "cake_flashkda_packed_t1_binding.cuh"
     ).read_text()
 
     assert "#include FLASHKDA_PACKED_T1_BODY_FILE" in binding

@@ -16,12 +16,12 @@ limitations under the License.
 Serving-native packed Kimi K3 recurrent decode for exact SM100a and SM103a.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
 from ..jit.cpp_ext import is_cuda_version_at_least
-from ..jit.flash_kda_packed_t1 import (
+from ..jit.cake_flash_kda_packed_t1 import (
     FlashKDAPackedT1Target,
     _variant_for_batch,
     get_flash_kda_packed_t1_module,
@@ -65,6 +65,8 @@ def run_packed_kda_decode(
     state: torch.Tensor,
     state_indices: torch.Tensor,
     output: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["cake"] = "cake",
 ) -> torch.Tensor:
     """Launch one packed recurrent update on the caller's current stream.
 
@@ -76,6 +78,8 @@ def run_packed_kda_decode(
     caller-owned output is supplied.
     """
 
+    if backend != "cake":
+        raise ValueError(f"backend must be 'cake', got {backend!r}")
     if not isinstance(mixed_qkv, torch.Tensor):
         raise TypeError("mixed_qkv must be a torch.Tensor")
     if not mixed_qkv.is_cuda:

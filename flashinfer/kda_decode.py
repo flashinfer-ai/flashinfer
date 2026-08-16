@@ -168,7 +168,7 @@ def recurrent_kda(
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
 
-    return _run_recurrent_kda(
+    run_kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -190,8 +190,10 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
-        backend=backend,
     )
+    if backend == "cake":
+        return _run_recurrent_kda(**run_kwargs, backend="cake")
+    return _run_recurrent_kda(**run_kwargs, backend="cute-dsl")
 
 
 @flashinfer_api(trace=packed_kda_decode_trace)
@@ -261,6 +263,7 @@ def packed_kda_decode(
         state=state,
         state_indices=state_indices,
         output=output,
+        backend="cake",
     )
 
 

@@ -27,7 +27,7 @@
 #define LoomTensorMap flashkda_generated_LoomTensorMap
 #define LoomTensorMapPack flashkda_generated_LoomTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#include "flashkda_bf16_fused_m128_n16.cu"
+#include "cake_flashkda_bf16_fused_m128_n16.cu"
 #undef CUtensorMap
 #undef LoomTensorMapPack
 #undef LoomTensorMap

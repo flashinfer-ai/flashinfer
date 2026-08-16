@@ -229,6 +229,16 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     assert "Generated from a recurrent-KDA Loom schedule." in frozen_text
     assert f"Raw generated body SHA256: {raw_sha256}" in frozen_text
     assert f"Normalized generated SHA256: {normalized_sha256}" in frozen_text
+    # Public sources describe the generator and immutable body, without
+    # publishing private GitLab URLs, internal merge-request IDs, or commits.
+    for private_provenance in (
+        "gitlab-master.nvidia.com",
+        "merge_requests/",
+        "Cake commit",
+        "CAKE commit",
+        "MR !",
+    ):
+        assert private_provenance not in frozen_text
 
     before_body, begin_marker, remainder = frozen_text.partition(_FROZEN_BODY_BEGIN)
     generated_body, end_marker, after_body = remainder.partition(_FROZEN_BODY_END)

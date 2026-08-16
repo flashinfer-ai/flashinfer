@@ -26,7 +26,7 @@ support for recurrent KDA prefill.  The stable public dispatcher remains in
 import functools
 import math
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
@@ -977,10 +977,13 @@ def _run_flash_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
+    backend: Literal["cake"] = "cake",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
 ):
+    if backend != "cake":
+        raise ValueError(f"backend must be 'cake', got {backend!r}")
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(

@@ -257,6 +257,7 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            backend="cake",
         )
 
     if (

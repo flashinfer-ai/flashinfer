@@ -619,7 +619,9 @@ class _FakeCudaTensor:
 def test_kernel_facade_selects_variant_and_caller_stream_cpu(
     monkeypatch, batch, target, variant
 ):
-    packed_module = importlib.import_module("flashinfer.kda_kernels.packed_kda_decode")
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
     stream_handle = 0x12345678
     fake_torch = SimpleNamespace(
         Tensor=_FakeCudaTensor,
@@ -664,7 +666,9 @@ def test_kernel_facade_selects_variant_and_caller_stream_cpu(
 def test_kernel_facade_selects_exact_physical_target_cpu(
     monkeypatch, capability, cuda_at_least, expected
 ):
-    packed_module = importlib.import_module("flashinfer.kda_kernels.packed_kda_decode")
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
     monkeypatch.setattr(
         packed_module, "get_compute_capability", lambda device: capability
     )
