@@ -155,7 +155,8 @@ inline void CheckCompactTokenRows(const TensorView& tensor, const char* name, in
   TVM_FFI_ICHECK(tensor.ndim() == 4) << name << " must be rank 4";
   TVM_FFI_ICHECK(tensor.stride(3) == 1 && tensor.stride(2) == head_dim)
       << name << " must be compact in its trailing [H, D] dimensions";
-  CheckedInt32(tensor.stride(1), name, true);
+  TVM_FFI_ICHECK(tensor.stride(1) >= 1 && tensor.stride(1) <= std::numeric_limits<int32_t>::max())
+      << name << " token stride is outside the supported int32 range: " << tensor.stride(1);
   TVM_FFI_ICHECK(tensor.stride(1) >= num_heads * head_dim)
       << name << " token stride must not overlap adjacent tokens";
   if (vector_aligned_stride) {
