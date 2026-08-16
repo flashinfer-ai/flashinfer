@@ -275,5 +275,63 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
         )
 
 
+@pytest.mark.parametrize("m", [1, 8, 24, 128, 256])
+def test_mm_fp4_does_not_allocate_per_call(m):
+    """mm_fp4 must run out of its shared workspace, not allocate one per call.
+
+    The CUTLASS FP4 GEMM sizes its workspace from the problem shape. When the
+    shared buffer is smaller than that, csrc/fp4_gemm_cutlass_sm120.cu allocates
+    a private workspace for the call and releases it immediately after an
+    asynchronous launch, which puts a device allocation on the model's hot path
+    and inside CUDA graph capture. The shapes below are a 27B model's fused
+    gate/up projection, which asks for 34 MiB on SM120 at every M up to 256.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    cc_number = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_fp4.is_backend_supported("cutlass", cc_number):
+        pytest.skip(f"cutlass mm_fp4 unsupported on compute capability {cc_number}")
+
+    k, n = 5120, 34816
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) / 10
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            1.0 / (g_in * g_w),
+            torch.bfloat16,
+            out=out,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+            use_nvfp4=True,
+        )
+
+    run()  # first call sizes the shared workspace and warms the memo table
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    run()
+    torch.cuda.synchronize()
+    transient = torch.cuda.max_memory_allocated() - before
+    assert transient < 1 << 20, (
+        f"mm_fp4 allocated {transient / 2**20:.2f} MiB during the call; the "
+        "shared workspace is too small for this shape and the kernel took the "
+        "per-call allocation fallback"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
