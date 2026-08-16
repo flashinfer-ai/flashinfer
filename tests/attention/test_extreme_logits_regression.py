@@ -60,6 +60,9 @@ def ref_single_prefill(q, k, v, causal=False):
 
     row_max = scores.amax(dim=-1)
     weights = torch.softmax(scores, dim=-1)
+    # softmax yields NaN on fully masked rows (all -inf scores); their output
+    # must be the zero vector.
+    weights = torch.nan_to_num(weights, nan=0.0)
     out = torch.einsum("hqk,khd->qhd", weights.to(torch.float64), v64)
     sum_exp = torch.exp(scores - row_max[..., None]).sum(dim=-1)
     lse = row_max + torch.log2(sum_exp)
