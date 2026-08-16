@@ -547,8 +547,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
   // Custom (packed-bitmask) mask: element-wise mask read inside the mainloop's
   // masking loops. Treat it like the non-causal tile schedule (no diagonal).
   constexpr bool USE_CUSTOM_MASK = MASK_MODE == MaskMode::kCustom;
-  constexpr auto CTA_TILE_SIZE =
-      getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXTEND>();
+  constexpr auto CTA_TILE_SIZE = getCTATileSize < HEAD_DIM_QK, HEAD_DIM_VO,
+                 CAUSAL || BLOCK_EXTEND > ();
   SinglePrefillWithKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
@@ -570,8 +570,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool BLOCK_EXTEND = MASK_MODE == MaskMode::kBlockExtend;
-  constexpr auto CTA_TILE_SIZE =
-      getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXTEND>();
+  constexpr auto CTA_TILE_SIZE = getCTATileSize < HEAD_DIM_QK, HEAD_DIM_VO,
+                 CAUSAL || BLOCK_EXTEND > ();
   BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),

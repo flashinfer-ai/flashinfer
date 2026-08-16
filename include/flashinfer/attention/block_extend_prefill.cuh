@@ -34,10 +34,9 @@ __device__ __forceinline__ uint64_t block_extend_kv_valid_end(uint32_t q_tile_en
   return (q_block_id + 1) * dllm_block_size;
 }
 
-__device__ __forceinline__ uint32_t
-block_extend_num_iterations(uint32_t q_tile_end, uint32_t chunk_start, uint32_t chunk_size,
-                            uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint64_t q_offset = 0,
-                            uint64_t kv_offset = 0) {
+__device__ __forceinline__ uint32_t block_extend_num_iterations(
+    uint32_t q_tile_end, uint32_t chunk_start, uint32_t chunk_size, uint32_t dllm_block_size,
+    uint32_t CTA_TILE_KV, uint64_t q_offset = 0, uint64_t kv_offset = 0) {
   const uint64_t kv_valid_end_global =
       block_extend_kv_valid_end(q_tile_end, dllm_block_size, q_offset);
   const uint64_t kv_valid_end =

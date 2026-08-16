@@ -509,7 +509,9 @@ def run(
     print("  - B/Cas: batch Block Extend speedup vs SGLang Cascade")
     print("  - B/CM : batch Block Extend speedup vs custom mask")
     print("  - S/CM : single Block Extend speedup vs custom mask")
-    print("  - plan : batch Block Extend scheduler decision (pad=padding, skv=split_kv)")
+    print(
+        "  - plan : batch Block Extend scheduler decision (pad=padding, skv=split_kv)"
+    )
 
     return results
 
