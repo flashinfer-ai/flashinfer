@@ -33,15 +33,38 @@ disable it.
 
 Optional dependency
 -------------------
-Requires a compatible CuTe DSL package that provides ``cutlass.experimental``.
+Requires ``nvidia-cutlass-dsl>=4.7.0`` and ``cutlass.experimental``. The
+version is checked only when the SM120 backend is used.
 """
 
 import math
 import os
+from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
 import torch
 from cutlass.cute.typing import Float32, Int32
+from packaging.version import Version
+
+
+_MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
+
+
+@lru_cache(maxsize=1)
+def _check_cutlass_dsl_version() -> None:
+    """Require the CuTe DSL version used by the SM120 FMHA kernels."""
+    try:
+        installed_version = version("nvidia-cutlass-dsl")
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            "SM120 FMHA requires nvidia-cutlass-dsl>=4.7.0, but the package "
+            "is not installed"
+        ) from exc
+    if Version(installed_version) < _MIN_CUTLASS_DSL_VERSION:
+        raise RuntimeError(
+            f"SM120 FMHA requires nvidia-cutlass-dsl>=4.7.0; found {installed_version}"
+        )
 
 
 def _cutlass_dtype(torch_dtype: torch.dtype):
@@ -136,6 +159,8 @@ def sm120_fmha_fp8_ragged_prefill(
     RuntimeError
         If the GPU is not SM120 or the configuration is not supported.
     """
+    _check_cutlass_dsl_version()
+
     from flashinfer.cute_dsl.attention.fmha.sm120 import (
         SM120FusedMultiHeadAttentionFP8ForwardTMA,
         compile_sm120_fmha_fp8_ragged_kernel,
@@ -290,6 +315,8 @@ def sm120_fmha_fp8_paged_prefill(
     ValueError
         If required arguments are missing or shapes are inconsistent.
     """
+    _check_cutlass_dsl_version()
+
     from flashinfer.cute_dsl.attention.fmha.sm120 import (
         SM120FusedMultiHeadAttentionFP8ForwardTMA,
         compile_sm120_fmha_fp8_paged_kernel,
@@ -404,6 +431,7 @@ class SM120PrimsBatchPrefillBackend:
     _OUT_DTYPES = (torch.float16, torch.bfloat16)
 
     def __init__(self, device: torch.device) -> None:
+        _check_cutlass_dsl_version()
         self.device = torch.device(device)
         self._mode: Optional[str] = None
         self._with_lse_compiled = False

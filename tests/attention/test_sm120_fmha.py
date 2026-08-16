@@ -14,6 +14,7 @@ import math
 import pytest
 import torch
 
+import flashinfer.attention.cute_dsl.sm120_fmha as sm120_fmha
 from flashinfer.cute_dsl.utils import is_sm120_dsl_available
 from flashinfer.utils import get_compute_capability
 
@@ -31,6 +32,30 @@ from flashinfer.attention.cute_dsl.sm120_fmha import (
     sm120_fmha_fp8_paged_prefill,
     sm120_fmha_fp8_ragged_prefill,
 )
+
+
+@pytest.fixture
+def clear_cutlass_dsl_version_check_cache():
+    sm120_fmha._check_cutlass_dsl_version.cache_clear()
+    yield
+    sm120_fmha._check_cutlass_dsl_version.cache_clear()
+
+
+@pytest.mark.parametrize("installed_version", ["4.7.0", "4.8.0"])
+def test_cutlass_dsl_runtime_version_check_accepts_supported_versions(
+    monkeypatch, installed_version, clear_cutlass_dsl_version_check_cache
+):
+    monkeypatch.setattr(sm120_fmha, "version", lambda _: installed_version)
+    sm120_fmha._check_cutlass_dsl_version()
+
+
+def test_cutlass_dsl_runtime_version_check_rejects_older_version(
+    monkeypatch, clear_cutlass_dsl_version_check_cache
+):
+    monkeypatch.setattr(sm120_fmha, "version", lambda _: "4.6.1")
+    with pytest.raises(RuntimeError, match=r"nvidia-cutlass-dsl>=4\.7\.0.*4\.6\.1"):
+        sm120_fmha._check_cutlass_dsl_version()
+
 
 # ---------------------------------------------------------------------------
 # Float32 reference
