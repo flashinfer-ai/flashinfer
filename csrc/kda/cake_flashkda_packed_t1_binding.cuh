@@ -98,8 +98,8 @@ inline void CheckTarget(int32_t device_id) {
         << major << "." << minor;
   } else {
     TVM_FFI_ICHECK(major == 10 && minor == 0)
-        << "this packed KDA T=1 module requires exact compute capability 10.0, got " << major
-        << "." << minor;
+        << "this packed KDA T=1 module requires exact compute capability 10.0, got " << major << "."
+        << minor;
   }
 }
 

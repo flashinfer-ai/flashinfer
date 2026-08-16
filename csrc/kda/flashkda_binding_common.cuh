@@ -141,8 +141,7 @@ inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char*
       << " must either be disjoint or exactly alias the same storage";
 }
 
-#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR) == \
-    defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
+#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR) == defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
 #error "exactly one FlashKDA target kind must be defined by the JIT/AOT spec"
 #endif
 
