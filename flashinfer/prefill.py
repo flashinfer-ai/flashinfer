@@ -1144,8 +1144,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     )
 
 
-@flashinfer_api
-def single_prefill_with_kv_cache_with_jit_module(
+def _single_prefill_with_kv_cache_with_jit_module_impl(
     jit_module: Any,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1217,6 +1216,57 @@ def single_prefill_with_kv_cache_with_jit_module(
         *args,
     )
     return (o, lse) if return_lse else o
+
+
+@flashinfer_api
+def single_prefill_with_kv_cache_with_jit_module(
+    jit_module: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *args,
+    kv_layout: str = "NHD",
+    mask_mode: int = MaskMode.NON_CAUSAL.value,
+    window_left: int = -1,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Run a pre-compiled JIT module with the legacy public signature.
+
+    The output dtype follows ``q.dtype``.  Internal block-extend dispatch uses
+    the private implementation above when a distinct output dtype is required.
+
+    Parameters
+    ----------
+    jit_module : Any
+        Compiled JIT module to execute.
+    q : torch.Tensor
+        Query tensor.
+    k : torch.Tensor
+        Key tensor.
+    v : torch.Tensor
+        Value tensor.
+    *args
+        Extra positional arguments forwarded to the JIT module.
+    kv_layout : str
+        Key/value layout (``"NHD"`` or ``"HND"``).
+    mask_mode : int
+        Attention mask mode.
+    window_left : int
+        Left sliding-window size; ``-1`` disables it.
+    return_lse : bool
+        Whether to return log-sum-exp values.
+    """
+    return _single_prefill_with_kv_cache_with_jit_module_impl(
+        jit_module,
+        q,
+        k,
+        v,
+        *args,
+        kv_layout=kv_layout,
+        mask_mode=mask_mode,
+        window_left=window_left,
+        return_lse=return_lse,
+    )
 
 
 @overload
@@ -1524,7 +1574,7 @@ def single_prefill_with_kv_cache(
             backend=_bd_backend,
             device=q.device,
         )
-        return single_prefill_with_kv_cache_with_jit_module(
+        return _single_prefill_with_kv_cache_with_jit_module_impl(
             module,
             q,
             k,
@@ -3897,14 +3947,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_item_len_ptr: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
-        q_offsets: Optional[torch.Tensor] = None,
-        kv_offsets: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         seq_lens_q: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        q_offsets: Optional[torch.Tensor] = None,
+        kv_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
