@@ -16,7 +16,8 @@
 
 #include "flashkda_binding_common.cuh"
 
-// See the M64 binding for why the frozen standalone typedefs are isolated.
+// Keep standalone generated typedefs and tensor-map wrappers out of the
+// binding translation unit's CUDA/standard-library namespaces.
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
 #define uint32_t flashkda_generated_uint32_t
@@ -26,7 +27,7 @@
 #define FlashKDATensorMap flashkda_generated_FlashKDATensorMap
 #define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#include "flashkda_bf16_fused_m128.cu"
+#include "cake_flashkda_bf16_fused_m128_n16.cu"
 #undef CUtensorMap
 #undef FlashKDATensorMapPack
 #undef FlashKDATensorMap
@@ -41,17 +42,17 @@ namespace flashinfer {
 namespace flash_kda {
 
 static_assert(THREADS == 1024);
-static_assert(SMEM_TOTAL == 227328);
+static_assert(SMEM_TOTAL == 219136);
 
-void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
-             TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
-             TensorView seq_order, TensorView state_indices, TensorView initial_state,
-             TensorView out, TensorView final_state, TensorView state_checkpoints,
-             TensorView checkpoint_cu_starts, TensorView descriptor_storage,
-             int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
-             int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
-             int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale,
-             double lower_bound, int64_t cuda_stream) {
+void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
+                TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
+                TensorView seq_order, TensorView state_indices, TensorView initial_state,
+                TensorView out, TensorView final_state, TensorView state_checkpoints,
+                TensorView checkpoint_cu_starts, TensorView descriptor_storage,
+                int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
+                int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
+                int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale,
+                double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -80,15 +81,15 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
 
   CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128)");
+            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128 N16)");
 
   const int64_t grid_x_i64 = num_seqs * num_heads;
   TVM_FFI_ICHECK(grid_x_i64 > 0 && grid_x_i64 <= std::numeric_limits<uint32_t>::max())
-      << "M128 FlashKDA grid.x is out of range: " << grid_x_i64;
+      << "M128 N16 FlashKDA grid.x is out of range: " << grid_x_i64;
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(THREADS, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128, 32>(q, k, v, g, beta_tma, out, descriptor_storage,
+  const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
                                                      prepare_descriptors, stream);
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
 
@@ -117,10 +118,10 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())),
       static_cast<int64_t>(beta_token_stride), static_cast<int64_t>(state_slot_stride),
       static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens));
-  CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 launch");
+  CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 N16 launch");
 }
 
 }  // namespace flash_kda
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM128);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM128N16);
