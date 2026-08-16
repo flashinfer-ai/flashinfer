@@ -55,12 +55,16 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 
+from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
     fmin,
+    gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
+    situ_f32,
+    tanh_f32,
 )
 
 
@@ -84,6 +88,8 @@ class Sm100W4A16GroupedGemmKernel:
         swiglu_alpha: float,
         swiglu_beta: float,
         swiglu_limit: float,
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
         use_fused_finalize: bool,
         enable_pdl: bool,
         use_clc_scheduler: bool,
@@ -99,6 +105,7 @@ class Sm100W4A16GroupedGemmKernel:
         if activation_type not in (
             None,
             ActivationType.Swiglu.value,
+            ActivationType.GegluTanh.value,
             ActivationType.Relu2.value,
         ):
             raise ValueError(
@@ -108,10 +115,23 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_clc_scheduler = use_clc_scheduler
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
-        self.gated = activation_type == ActivationType.Swiglu.value
+        if activation_type is None:
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError("SiTU parameters require an activation")
+        else:
+            validate_cute_dsl_moe_situ_config(
+                ActivationType(activation_type), situ_beta, situ_linear_beta
+            )
+        self.activation_type = activation_type
+        self.gated = activation_type in (
+            ActivationType.Swiglu.value,
+            ActivationType.GegluTanh.value,
+        )
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.parameterized_swiglu = (
             swiglu_alpha != DEFAULT_SWIGLU_ALPHA
             or swiglu_beta != DEFAULT_SWIGLU_BETA
@@ -1963,47 +1983,86 @@ class Sm100W4A16GroupedGemmKernel:
                                 (gate[i], gate[i + 1]),
                                 (gated_alpha_f32, gated_alpha_f32),
                             )
-                            if cutlass.const_expr(self.parameterized_swiglu):
-                                gate_pair = (
-                                    fmin(gate_pair[0], swiglu_limit, nan=True),
-                                    fmin(gate_pair[1], swiglu_limit, nan=True),
+                            if cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                                and self.situ_beta is not None
+                            ):
+                                situ_beta = cutlass.Float32(self.situ_beta)
+                                situ_gate_pair = (
+                                    situ_f32(gate_pair[0], situ_beta, fastmath=True),
+                                    situ_f32(gate_pair[1], situ_beta, fastmath=True),
                                 )
-                                up_pair = (
-                                    -fmin(
-                                        -fmin(up_pair[0], swiglu_limit, nan=True),
-                                        swiglu_limit,
-                                        nan=True,
+                                if cutlass.const_expr(
+                                    self.situ_linear_beta is not None
+                                ):
+                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                    up_pair = (
+                                        linear_beta
+                                        * tanh_f32(
+                                            up_pair[0] / linear_beta, fastmath=True
+                                        ),
+                                        linear_beta
+                                        * tanh_f32(
+                                            up_pair[1] / linear_beta, fastmath=True
+                                        ),
+                                    )
+                                result = cute.arch.mul_packed_f32x2(
+                                    up_pair, situ_gate_pair
+                                )
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.GegluTanh.value
+                            ):
+                                result = cute.arch.mul_packed_f32x2(
+                                    up_pair,
+                                    (
+                                        gelu_tanh_f32(gate_pair[0], fastmath=True),
+                                        gelu_tanh_f32(gate_pair[1], fastmath=True),
                                     ),
-                                    -fmin(
-                                        -fmin(up_pair[1], swiglu_limit, nan=True),
-                                        swiglu_limit,
-                                        nan=True,
+                                )
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                            ):
+                                if cutlass.const_expr(self.parameterized_swiglu):
+                                    gate_pair = (
+                                        fmin(gate_pair[0], swiglu_limit, nan=True),
+                                        fmin(gate_pair[1], swiglu_limit, nan=True),
+                                    )
+                                    up_pair = (
+                                        -fmin(
+                                            -fmin(up_pair[0], swiglu_limit, nan=True),
+                                            swiglu_limit,
+                                            nan=True,
+                                        ),
+                                        -fmin(
+                                            -fmin(up_pair[1], swiglu_limit, nan=True),
+                                            swiglu_limit,
+                                            nan=True,
+                                        ),
+                                    )
+                                gate_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_pair,
+                                    (
+                                        neg_swiglu_alpha_log2_e,
+                                        neg_swiglu_alpha_log2_e,
                                     ),
                                 )
-                            gate_log2e = cute.arch.mul_packed_f32x2(
-                                gate_pair,
-                                (
-                                    neg_swiglu_alpha_log2_e,
-                                    neg_swiglu_alpha_log2_e,
-                                ),
-                            )
-                            sigmoid = cute.arch.add_packed_f32x2(
-                                (
-                                    cute.math.exp2(gate_log2e[0], fastmath=True),
-                                    cute.math.exp2(gate_log2e[1], fastmath=True),
-                                ),
-                                (1.0, 1.0),
-                            )
-                            sigmoid = (
-                                cute.arch.rcp_approx(sigmoid[0]),
-                                cute.arch.rcp_approx(sigmoid[1]),
-                            )
-                            silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
-                            if cutlass.const_expr(self.parameterized_swiglu):
-                                up_pair = cute.arch.add_packed_f32x2(
-                                    up_pair, (swiglu_beta, swiglu_beta)
+                                sigmoid = cute.arch.add_packed_f32x2(
+                                    (
+                                        cute.math.exp2(gate_log2e[0], fastmath=True),
+                                        cute.math.exp2(gate_log2e[1], fastmath=True),
+                                    ),
+                                    (1.0, 1.0),
                                 )
-                            result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                                sigmoid = (
+                                    cute.arch.rcp_approx(sigmoid[0]),
+                                    cute.arch.rcp_approx(sigmoid[1]),
+                                )
+                                silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
+                                if cutlass.const_expr(self.parameterized_swiglu):
+                                    up_pair = cute.arch.add_packed_f32x2(
+                                        up_pair, (swiglu_beta, swiglu_beta)
+                                    )
+                                result = cute.arch.mul_packed_f32x2(up_pair, silu)
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]

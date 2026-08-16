@@ -921,6 +921,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
+        if cutlass.const_expr(cfg.use_fp8_qkv):
+            # Since P is scaled to [0, 448] for Fused GMEM/cluster FP8-Q,
+            # divide the partial O by 448 before narrowing it to 16 bits,
+            # and restore after the partials have been reduced in FP32.
+            norm_scale *= Float32(448.0)
         physical_dst_row_idx = _q_physical_output_row_from_logical(
             cfg,
             self.h_r,
@@ -2333,6 +2338,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             partial_norm_scale = Float32(1.0)
             if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                 partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
+            elif cutlass.const_expr(cfg.use_fp8_qkv):
+                partial_norm_scale = Float32(1.0 / 448.0)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
@@ -2380,10 +2387,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                                 ),
                             ),
                         )
-                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                    if cutlass.const_expr(
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                    ):
                         partial_pair = fmul2(
                             (partial_norm_scale, partial_norm_scale), partial_pair
                         )
+                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                         regs_o_chunk[chunk_idx] = self._pack_separate_partial_o_pair(
                             partial_pair[0], partial_pair[1]
                         )
@@ -2914,11 +2924,13 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = self._separate_partial_norm_scale(
-                        reduced_sum[scale_idx]
-                    )
+                    norm_scale = Float32(1.0 / 448.0)
+                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                        norm_scale = self._separate_partial_norm_scale(
+                            reduced_sum[scale_idx]
+                        )
                     final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
                     final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -2932,12 +2944,16 @@ class TmemCorrResource(DecodeGenResourceBase):
                 reg_base = pair_idx * 2
                 partial_scale0 = (
                     (final_scale0[scale_base], final_scale0[scale_base + 1])
-                    if cutlass.const_expr(cfg.use_separate_reduction_kernel)
+                    if cutlass.const_expr(
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                    )
                     else (exp_scale0[scale_base], exp_scale0[scale_base + 1])
                 )
                 partial_scale1 = (
                     (final_scale1[scale_base], final_scale1[scale_base + 1])
-                    if cutlass.const_expr(cfg.use_separate_reduction_kernel)
+                    if cutlass.const_expr(
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                    )
                     else (exp_scale1[scale_base], exp_scale1[scale_base + 1])
                 )
                 partial_pair = ffma2(
@@ -3373,11 +3389,13 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = self._separate_partial_norm_scale(
-                        reduced_sum[scale_idx]
-                    )
+                    norm_scale = Float32(1.0 / 448.0)
+                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                        norm_scale = self._separate_partial_norm_scale(
+                            reduced_sum[scale_idx]
+                        )
                     final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
                     final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -3390,12 +3408,16 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             partial_scale0_pair = (
                 (final_scale0[0], final_scale0[1])
-                if cutlass.const_expr(cfg.use_separate_reduction_kernel)
+                if cutlass.const_expr(
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                )
                 else (exp_scale0[0], exp_scale0[1])
             )
             partial_scale1_pair = (
                 (final_scale1[0], final_scale1[1])
-                if cutlass.const_expr(cfg.use_separate_reduction_kernel)
+                if cutlass.const_expr(
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                )
                 else (exp_scale1[0], exp_scale1[1])
             )
             for reg_idx in cutlass.range_constexpr(cfg.num_fp16_output_regs):

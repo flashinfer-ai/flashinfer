@@ -718,7 +718,10 @@ def _make_per_tensor_fp8_case(
             routing_logits=logits,
         )
     else:
-        assert routing_input_mode is RoutingInputMode.PackedPrecomputed
+        assert routing_input_mode in (
+            RoutingInputMode.PackedPrecomputed,
+            RoutingInputMode.UnpackedPrecomputed,
+        )
         act = MoEActivationPack(
             hidden_states_q=x_q,
             hidden_states_scale=x_scale,
@@ -764,8 +767,12 @@ def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -782,8 +789,12 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -808,8 +819,12 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -843,7 +858,8 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
     runner = _build_per_tensor_fp8_runner(config)
     moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
     packed = moe_inputs.topk_ids
-    assert moe_inputs.expert_weights is None
+    assert moe_inputs.expert_weights is not None
+    assert moe_inputs.expert_weights.numel() == 0
     assert torch.equal(packed >> 16, expected_ids)
     assert torch.equal(packed & 0xFFFF, expected_bits)
 
@@ -884,8 +900,12 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(

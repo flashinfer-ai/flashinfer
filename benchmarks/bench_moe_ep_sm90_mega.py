@@ -263,10 +263,10 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
 
 
 def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
-    from flashinfer.moe_ep import Sm90PullFp8MegaMoeConfig
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
     swap_ab = operand_order == "swap_ab"
-    return Sm90PullFp8MegaMoeConfig(
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=args.intermediate,
         top_k=args.top_k,
         kind=args.kind,
@@ -498,7 +498,7 @@ def _emit_row(
         print(CSV_HEADER, flush=True)
     if result.status != "pass":
         print(
-            f"BENCH_CSV,sm90_pull_fp8,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
+            f"BENCH_CSV,sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
             f"{tokens},{args.top_k},{world_size},{args.num_experts},"
             f"{args.num_experts // world_size},{args.hidden},{args.intermediate},"
             f"{2 * args.intermediate},{args.warmup},{args.iters},{result.status},"
@@ -529,7 +529,7 @@ def _emit_row(
     tflops_e2e = _tflops(total, e2e_max)
     tok_s = tokens * world_size / (e2e_max * 1e-6)
     print(
-        f"BENCH_CSV,sm90_pull_fp8,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
+        f"BENCH_CSV,sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
         f"{tokens},{args.top_k},{world_size},{args.num_experts},"
         f"{args.num_experts // world_size},{args.hidden},{args.intermediate},"
         f"{2 * args.intermediate},{args.warmup},{args.iters},pass,"

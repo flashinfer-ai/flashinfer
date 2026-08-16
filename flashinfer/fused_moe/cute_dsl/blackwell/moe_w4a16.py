@@ -23,6 +23,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -128,6 +129,8 @@ def _get_compiled_kernel(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
     use_fused_finalize: bool,
     enable_pdl: bool,
     use_clc_scheduler: bool,
@@ -146,6 +149,8 @@ def _get_compiled_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
         use_fused_finalize,
         enable_pdl,
         use_clc_scheduler,
@@ -170,6 +175,8 @@ def _get_compiled_kernel(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             use_clc_scheduler=use_clc_scheduler,
@@ -214,6 +221,8 @@ def _run_grouped_gemm(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
     use_fused_finalize: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
@@ -332,6 +341,8 @@ def _run_grouped_gemm(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
         use_fused_finalize,
         enable_pdl,
         use_clc_scheduler,
@@ -379,6 +390,8 @@ def launch_w4a16_moe(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     tactic: Optional[W4A16MoeTactic] = None,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
@@ -386,6 +399,7 @@ def launch_w4a16_moe(
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
     gemm1_output_size = intermediate_size * (2 if gated else 1)
     if int(w1_weight.size(1)) != gemm1_output_size:
         raise ValueError(
@@ -462,6 +476,8 @@ def launch_w4a16_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         use_fused_finalize=False,
         permuted_idx_to_expanded_idx=None,
         token_final_scales=None,
@@ -485,6 +501,8 @@ def launch_w4a16_moe(
         swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
         swiglu_beta=DEFAULT_SWIGLU_BETA,
         swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+        situ_beta=None,
+        situ_linear_beta=None,
         use_fused_finalize=use_fused_finalize,
         permuted_idx_to_expanded_idx=(
             permuted_idx_to_expanded_idx if use_fused_finalize else None

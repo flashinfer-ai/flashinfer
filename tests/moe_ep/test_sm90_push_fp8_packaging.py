@@ -104,11 +104,15 @@ def test_sm90_push_backend_imports_kernel_package_through_public_boundaries():
         / "backends"
         / "mega"
         / "kernel"
-        / "sm90_push_fp8"
+        / "sm90"
+        / "fp8_fp8_bf16_push_cuda"
     )
     package_marker = "kernel_src.sm90.push_style_megamoe"
 
-    for path in backend_root.rglob("*.py"):
+    assert backend_root.is_dir(), f"backend package not found: {backend_root}"
+    sources = sorted(backend_root.rglob("*.py"))
+    assert sources, f"no Python modules under {backend_root}"
+    for path in sources:
         source = path.read_text(encoding="utf-8")
         assert f"{package_marker}.src" not in source
         tree = ast.parse(source, filename=str(path))
@@ -136,7 +140,7 @@ def test_sm90_push_weight_helpers_defer_kernel_package_import():
             sys.executable,
             "-c",
             "import sys; "
-            "import flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.weights; "
+            "import flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.weights; "
             "assert 'flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe' "
             "not in sys.modules",
         ],

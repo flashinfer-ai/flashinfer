@@ -8,6 +8,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
+finish_sccache_stats() {
+  local exit_code=$?
+  collect_sccache_stats || true
+  return "${exit_code}"
+}
+
+trap finish_sccache_stats EXIT
+
 PYTHON_VERSION_FILE="${SCRIPT_DIR}/../.python-version"
 PYTHON_VERSION="$(tr -d '[:space:]' < "${PYTHON_VERSION_FILE}")"
 if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
@@ -92,13 +100,6 @@ if [ -n "${OUTPUT_DIR}" ]; then
     echo "Copying wheels to output directory: ${OUTPUT_DIR}"
     mkdir -p "${OUTPUT_DIR}"
     cp -v dist/*.whl "${OUTPUT_DIR}/"
-fi
-
-# Print sccache stats if enabled
-if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::sccache stats"
-  sccache --show-stats
-  echo "::endgroup::"
 fi
 
 echo ""
