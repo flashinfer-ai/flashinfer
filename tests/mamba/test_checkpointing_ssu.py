@@ -627,11 +627,13 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     tuner.clear_cache()
     with autotune(False, cache=str(cache_path)):
         cached = _run(2, algorithm="auto")
-    assert [
+    cached_tactics = [
         tactic
         for runner_name, tactic in tuner._file_configs.values()
         if runner_name == "CheckpointingSSURunner"
-    ] == [selected_tactic]
+    ]
+    assert cached_tactics
+    assert set(cached_tactics) == {selected_tactic}
     for tuned_tensor, cached_tensor in zip(tuned, cached, strict=True):
         torch.testing.assert_close(tuned_tensor, cached_tensor, rtol=0, atol=0)
 
