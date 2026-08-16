@@ -16,6 +16,7 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.mamba.checkpointing_ssu import (
     CheckpointingSSURunner,
     _checkpointing_ssu_tuning_config,
+    allocate_checkpointing_ssu_scratch,
     checkpointing_ssu,
 )
 from flashinfer.utils import is_cvt_rs_supported
@@ -111,10 +112,6 @@ def _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x_tok, B_tok, dt_pr
 # standalone in its two modes (the merged non-TMA copy was removed with the
 # old 4D kernel, 2026-07-10).
 _TRITON_IMPLS = ["tma_pd", "tma_pm"]
-
-# fragA-native cb_scaled layout for the two-kernel CUDA path (.plans/ssu_split.md):
-# per (batch, head), one PackedAligned<bf16> per lane = WARP_SIZE lanes ×
-# MMA_FRAG_SIZE bf16 (the mma.m16n8k16 A fragment, 16 B/lane).
 WARP_SIZE = 32
 MMA_FRAG_SIZE = 8
 
@@ -125,17 +122,29 @@ def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
     Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
     Forces algorithm="two-kernel": test batches sit below the wrapper's auto
     threshold (batch*nheads >= sm_count) and would silently run the monolith."""
-    k_old = ((max_window + 7) // 8) * 8
+    cb_scaled, cumAdt_vec, cb_old = allocate_checkpointing_ssu_scratch(
+        batch, nheads, 1, max_window, dtype, device
+    )
     return dict(
-        cb_scaled=torch.empty(
-            batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-        ),
-        cumAdt_vec=torch.empty(batch, nheads, 16, device=device, dtype=torch.float32),
-        cb_old=torch.empty(
-            batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-        ),
+        cb_scaled=cb_scaled,
+        cumAdt_vec=cumAdt_vec,
+        cb_old=cb_old,
         algorithm="two-kernel",
     )
+
+
+def test_allocate_checkpointing_ssu_scratch():
+    scratch = allocate_checkpointing_ssu_scratch(4, 16, 1, 13, torch.bfloat16, "cpu")
+    assert [tensor.shape for tensor in scratch] == [
+        (4, 16, 32, 8),
+        (4, 16, 16),
+        (4, 16, 32, 8),
+    ]
+    assert [tensor.dtype for tensor in scratch] == [
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+    ]
 
 
 def _make_replay_work_items(

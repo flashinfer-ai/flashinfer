@@ -113,6 +113,50 @@ def _make_tactics(heads_per_group: int) -> tuple[_CheckpointingSSUTactic, ...]:
     )
 
 
+def allocate_checkpointing_ssu_scratch(
+    batch_size: int,
+    num_heads: int,
+    num_predicted_tokens: int,
+    max_window: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate CUDA-graph-safe scratch for the two-kernel ReplaySSM path."""
+    if batch_size <= 0 or num_heads <= 0:
+        raise ValueError("batch_size and num_heads must be positive")
+    if not 0 < num_predicted_tokens <= 16:
+        raise ValueError("num_predicted_tokens must be in [1, 16]")
+    if not 0 < max_window <= 16:
+        raise ValueError("max_window must be in [1, 16]")
+
+    token_pad = ((num_predicted_tokens + 15) // 16) * 16
+    old_token_pad = ((max_window + 7) // 8) * 8
+    cb_scaled = torch.empty(
+        batch_size,
+        num_heads,
+        32,
+        token_pad // 2,
+        dtype=dtype,
+        device=device,
+    )
+    cumAdt_vec = torch.empty(
+        batch_size,
+        num_heads,
+        token_pad,
+        dtype=torch.float32,
+        device=device,
+    )
+    cb_old = torch.empty(
+        batch_size,
+        num_heads,
+        32,
+        old_token_pad // 2,
+        dtype=dtype,
+        device=device,
+    )
+    return cb_scaled, cumAdt_vec, cb_old
+
+
 def _profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
     """Use one private padding slot beyond the bucketed dense batch."""
     return shapes[1][0] + 1

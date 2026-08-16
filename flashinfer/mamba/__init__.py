@@ -15,9 +15,16 @@ limitations under the License.
 """
 
 from .selective_state_update import selective_state_update
-from .checkpointing_ssu import checkpointing_ssu
+from .checkpointing_ssu import (
+    allocate_checkpointing_ssu_scratch,
+    checkpointing_ssu,
+)
 
-__all__ = ["selective_state_update", "checkpointing_ssu"]
+__all__ = [
+    "selective_state_update",
+    "checkpointing_ssu",
+    "allocate_checkpointing_ssu_scratch",
+]
 
 try:
     from .ssd_combined import SSDCombined
