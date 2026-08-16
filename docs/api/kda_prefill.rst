@@ -42,7 +42,7 @@ T=1 decode and speculative decode are not rerouted.
 
 JIT and AOT keep CC 10.0 and CC 10.3 as separate artifacts. B200 uses exact
 ``sm_100a`` URIs, JIT specifications, and cubins; B300 uses distinct exact
-``sm_103a`` identities. The two M128 cache keys also include their frozen Loom
+``sm_103a`` identities. The two M128 cache keys also include their frozen
 module identities so an older N32 module cannot satisfy the refreshed N32 or
 H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.

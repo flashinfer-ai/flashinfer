@@ -63,7 +63,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n16": (
             "cake_flashkda_bf16_fused_m128_n16.cu",
             "bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c",
-            "5a701fc2cc38a24b3c46498859d96ec62cacc8a8c011514d3297416f92a34470",
+            "29afd5c3e638501476e339f3d0894746b3a00e40f5d0f636678978eefd100f86",
             "flashkda_bf16_fused_m128_ef8b47d690",
             167472,
             219136,
@@ -71,7 +71,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "n32": (
             "flashkda_bf16_fused_m128.cu",
             "bee12ccbc2c30bfa79ca5f698a2373bda83e6e76cf31988ef25de50dfda526c1",
-            "1eccb8096762b69abd2fbdf445e9da2faf6981f23606d78a368f946ee35d7987",
+            "490d1f14452341c7f5cc1ed1756eeecbc745854ecfdd53bca02ba87f7ce68de9",
             "flashkda_bf16_fused_m128_ea022a2f1f",
             166197,
             227328,
@@ -79,7 +79,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "m64": (
             "flashkda_bf16_fused_m64.cu",
             "1cea03f061dd0bcf687f419d3bc5e48b4112374dc31c7f41c1922e6152ca7536",
-            "758d319df9cc56fb9bb37d40c7876e2855fbfbc198fabe8623157541ccf635f5",
+            "64a56435d14a4762c1593fce1d293cdb1f4b79ba1ef3254bcd9daa10e3675903",
             "flashkda_bf16_fused_m64_9a5566f3be",
             169546,
             221696,
@@ -87,7 +87,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "persistent": (
             "cake_flashkda_bf16_persistent_m128.cu",
             "3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
-            "64bc19d01ceb24dda67877a779908276db1734b7e5f677ec47d7b240e6842345",
+            "0b317ae20d3064e4b17d76b4885ce9627c971ab31b3535011f4304107e98acd1",
             "flashkda_bf16_persistent_m128_fb536e5df4",
             172462,
             221696,
@@ -113,7 +113,7 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
             hashlib.sha256(frozen.read_bytes()).hexdigest() == record["frozen_sha256"]
         )
         frozen_text = frozen.read_text()
-        assert "Frozen generated Loom export" in frozen_text
+        assert "Frozen generated kernel export" in frozen_text
         assert "raw SHA-256:" in frozen_text
         if variant == "persistent":
             assert "task_ids[" in frozen_text
@@ -289,7 +289,7 @@ def test_flash_kda_uri_and_jit_spec(
         if variant == "m64"
         else "flashkda_bf16_fused_m128"
     )
-    assert f"Provenance: generated Loom schedule '{schedule_symbol}'" in frozen_text
+    assert f"Generated schedule '{schedule_symbol}'" in frozen_text
     assert f"#define SMEM_TOTAL {smem_bytes}" in frozen_text
     assert frozen_text.count("// clang-format off") == 1
     assert frozen_text.rstrip().endswith("// clang-format on")

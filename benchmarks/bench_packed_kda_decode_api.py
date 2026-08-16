@@ -17,7 +17,7 @@
 This harness measures the GPU activity span of exactly one
 ``flashinfer.packed_kda_decode`` call. It reports absolute kernel timings; it
 does not label them as serving E2E latency or infer speedup against a different
-adapter. Run it only inside a Slurm GPU allocation.
+adapter. Run it only on a supported GPU system.
 """
 
 import argparse

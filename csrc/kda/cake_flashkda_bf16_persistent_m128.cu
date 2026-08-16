@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-// Frozen generated Loom export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_persistent_m128'; module
+// Frozen generated kernel export; do not edit by hand.
+// Generated schedule 'flashkda_bf16_persistent_m128'; module
 // flashkda_bf16_persistent_m128_fb536e5df4; raw SHA-256:
 // 3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3.
 // clang-format off

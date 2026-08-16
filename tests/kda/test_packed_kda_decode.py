@@ -15,8 +15,7 @@
 """Correctness gates for serving-native packed Kimi K3 T=1 decode.
 
 The large GPU cases intentionally reproduce the exported Cake acceptance
-contract. They must run in a Slurm allocation on exact CC 10.0 or 10.3, never
-on a login node.
+contract. They must run on a GPU system with exact CC 10.0 or 10.3.
 """
 
 import importlib

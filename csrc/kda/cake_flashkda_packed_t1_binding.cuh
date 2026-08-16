@@ -40,7 +40,7 @@
 
 #include "tvm_ffi_utils.h"
 
-// The frozen Loom bodies provide private fixed-width aliases and a private
+// The frozen kernel bodies provide private fixed-width aliases and a private
 // CUtensorMap stand-in. Rename those declarations at the include boundary so
 // they cannot collide with CUDA and libc headers pulled in by TVM-FFI. The
 // generated body remains byte-for-byte frozen in its own translation unit.
