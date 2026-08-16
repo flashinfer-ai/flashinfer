@@ -2933,7 +2933,16 @@ def execute_cudnn_gemm_fp4_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace_buffer.device
+        )
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3168,7 +3177,16 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(
@@ -3252,7 +3270,16 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
 
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace_buffer.device
+        )
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3475,7 +3502,16 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(
@@ -3594,7 +3630,16 @@ def execute_cudnn_gemm_fp8_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3733,7 +3778,16 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(
@@ -4028,7 +4082,16 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -4204,7 +4267,16 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        # Never resize_() the shared workspace: its device address may be
+        # baked into captured CUDA graphs and referenced by in-flight
+        # launches, and resize_() frees the old storage, leaving those
+        # consumers reading and writing freed (soon re-allocated) memory.
+        # Satisfy oversized requests with a call-local buffer instead;
+        # stream-ordered allocation keeps eager mode safe, and during
+        # capture the buffer is owned by the capturing graph's pool.
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=workspace.device
+        )
 
     if plan_index < 0:
         graph.execute(
