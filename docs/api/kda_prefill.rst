@@ -5,8 +5,7 @@ flashinfer.kda_prefill
 
 Optimized recurrent Kimi Delta Attention (KDA) prefill support. The
 :func:`flashinfer.kda.recurrent_kda` facade dispatches a strict ordinary
-multi-token prefill subset to frozen FlashKDA-compatible exact-SM100a and
-exact-SM103a kernels.
+multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
 
 .. currentmodule:: flashinfer.kda_prefill
 
@@ -40,17 +39,16 @@ every condition below holds:
 Calls outside that subset retain the existing CuTe-DSL path. In particular,
 T=1 decode and speculative decode are not rerouted.
 
-JIT and AOT keep CC 10.0 and CC 10.3 as separate artifacts. B200 uses exact
-``sm_100a`` URIs, JIT specifications, and cubins; B300 uses distinct exact
-``sm_103a`` identities. The two M128 cache keys also include their frozen
-module identities so an older N32 module cannot satisfy the refreshed N32 or
-H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
-12.9 or newer.
+CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
+``sm_100a`` modules. With CUDA 12.9 or newer, JIT and AOT compile one
+``sm_100f`` module per schedule for both CC 10.0 and CC 10.3. Cache keys also
+include the frozen module identity so an older schedule cannot satisfy a
+refreshed request. Runtime routing remains device-specific: persistent M128
+is restricted to measured 148/152-SM CC 10.0 devices, while CC 10.3 uses the
+direct schedules.
 
-The frozen H12 N16 schedule is immutable module
-``flashkda_bf16_fused_m128_5527c05f05`` with raw source SHA-256
-``6e0e4c9a17a803e2e13ac4d86ac11061f70cbdb0e9f374994c67430a46ef2b98``.
-Its residual recurrence rounds four intermediates through BF16: the state/K
+The frozen H12 N16 schedule's residual recurrence rounds four intermediates
+through BF16: the state/K
 prediction, the V-minus-prediction delta, sigmoid beta, and the post-beta
 update carrier. The final-state contraction starts from a zero accumulator;
 the old BF16 state is multiplied by the total decay and explicitly added to
@@ -58,9 +56,7 @@ that product in FP32 before the 16-token chunk boundary rounds back to BF16.
 The N16 prepare carrier also matches the source-visible BF16 arithmetic graph:
 normalized Q/K, positive and inverse prefix decay, and every chained Qd/Kd/Ki/Kr
 multiplication round through BF16 at their respective boundaries.
-The N32 schedule comes from the same sealed export as module
-``flashkda_bf16_fused_m128_123cfd2bfa`` with raw source SHA-256
-``872a0543e0e55f6af5c8c00722511728d899cc2965bc1a6ec36d128d1fc2dacf``.
+The N32 schedule comes from the same generated export.
 
 Fixed input omits ``cu_seqlens``. Packed input has ``B=1`` and accepts a
 contiguous CUDA int32 or int64 ``cu_seqlens``. The frozen binding consumes

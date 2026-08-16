@@ -39,7 +39,6 @@ build/JIT, and state-pool reset are outside the measured region.
 """
 
 import argparse
-import hashlib
 import json
 import subprocess
 from dataclasses import dataclass
@@ -180,14 +179,6 @@ def _hardware_metadata(device: torch.device) -> dict:
     }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _git_output(root: Path, *args: str) -> str:
     try:
         return subprocess.check_output(
@@ -253,9 +244,7 @@ def _verify_peer_provenance(flash_kda, source_dir: Path) -> dict:
         "source_commit": source_commit,
         "cutlass_commit": cutlass_commit,
         "package_path": str(package_path),
-        "package_sha256": _sha256(package_path),
         "extension_path": str(extension_path),
-        "extension_sha256": _sha256(extension_path),
     }
 
 

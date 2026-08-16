@@ -16,8 +16,7 @@
 
 // Frozen generated kernel export; do not edit by hand.
 // Generated schedule 'flashkda_bf16_fused_m64'; module
-// flashkda_bf16_fused_m64_9a5566f3be; raw SHA-256:
-// 1cea03f061dd0bcf687f419d3bc5e48b4112374dc31c7f41c1922e6152ca7536.
+// flashkda_bf16_fused_m64_9a5566f3be.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -25,15 +24,15 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(128) FlashKDATensorMap { uint64_t opaque[16]; };
 template <int N>
-struct __align__(128) LoomTensorMapPack { LoomTensorMap maps[N]; };
+struct __align__(128) FlashKDATensorMapPack { FlashKDATensorMap maps[N]; };
 
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define FLASH_KDA_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_TMEM_STATE_OFFSET 64
 #define TMEM_TMEM_STATE_INP_OFFSET 0
@@ -495,7 +494,7 @@ extern "C" {
 
 __global__ __launch_bounds__(1024) void
 // FLASHINFER INTEGRATION BEGIN: allow exact state alias
-kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, LoomTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, LoomTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, LoomTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, LoomTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, LoomTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, LoomTensorMap const* out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
+kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, FlashKDATensorMap const* q_tma, __nv_bfloat16* __restrict__ k, FlashKDATensorMap const* k_tma, __nv_bfloat16* __restrict__ v, FlashKDATensorMap const* v_tma, __nv_bfloat16* __restrict__ g, FlashKDATensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, FlashKDATensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, FlashKDATensorMap const* out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
 // FLASHINFER INTEGRATION END: allow exact state alias
 {
     const int tid = threadIdx.x;

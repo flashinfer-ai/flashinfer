@@ -141,16 +141,18 @@ inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char*
       << " must either be disjoint or exactly alias the same storage";
 }
 
-#if !defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
-#error "FLASHINFER_FLASH_KDA_TARGET_MINOR must be defined by the JIT/AOT spec"
-#endif
-#if defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
-#error "FlashKDA prefill requires an exact-SM target, not a family target"
+#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR) == \
+    defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
+#error "exactly one FlashKDA target kind must be defined by the JIT/AOT spec"
 #endif
 
+#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
 constexpr int kFlashKDATargetMinor = FLASHINFER_FLASH_KDA_TARGET_MINOR;
-static_assert(kFlashKDATargetMinor == 0 || kFlashKDATargetMinor == 3,
-              "FlashKDA target must be exact SM100a or exact SM103a");
+static_assert(kFlashKDATargetMinor == 0, "legacy exact FlashKDA target must be SM100a");
+#else
+constexpr int kFlashKDATargetFamily = FLASHINFER_FLASH_KDA_TARGET_FAMILY;
+static_assert(kFlashKDATargetFamily == 100, "FlashKDA family target must be SM100f");
+#endif
 
 inline void CheckFlashKDATarget(int32_t device_id) {
   int major = 0;
@@ -159,9 +161,28 @@ inline void CheckFlashKDATarget(int32_t device_id) {
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
+#if defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
+      << "this FlashKDA module was compiled for the SM100 family "
+         "(compute capability 10.0 or 10.3), got "
+      << major << "." << minor;
+#else
   TVM_FFI_ICHECK(major == 10 && minor == kFlashKDATargetMinor)
       << "this FlashKDA module was compiled for exact compute capability 10."
       << kFlashKDATargetMinor << ", got " << major << "." << minor;
+#endif
+}
+
+inline void CheckFlashKDAPersistentDevice(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
+  TVM_FFI_ICHECK(major == 10 && minor == 0)
+      << "persistent FlashKDA is validated only on compute capability 10.0, got " << major << "."
+      << minor;
 }
 
 inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const TensorView& v,

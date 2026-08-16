@@ -26,7 +26,7 @@
 #error "FLASHKDA_PACKED_T1_VALUE_SPLITS must describe the frozen value tiling"
 #endif
 #ifndef FLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND
-#error "FLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND must identify the exact target"
+#error "FLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND must identify the target"
 #endif
 
 #include <cuda.h>
@@ -50,8 +50,8 @@
 #define uint64_t flashkda_packed_generated_uint64_t
 #define int32_t flashkda_packed_generated_int32_t
 #define int16_t flashkda_packed_generated_int16_t
-#define LoomTensorMap flashkda_packed_generated_LoomTensorMap
-#define LoomTensorMapPack flashkda_packed_generated_LoomTensorMapPack
+#define FlashKDATensorMap flashkda_packed_generated_FlashKDATensorMap
+#define FlashKDATensorMapPack flashkda_packed_generated_FlashKDATensorMapPack
 #define CUtensorMap flashkda_packed_generated_CUtensorMap
 #include FLASHKDA_PACKED_T1_BODY_FILE
 #undef uint8_t
@@ -60,8 +60,8 @@
 #undef uint64_t
 #undef int32_t
 #undef int16_t
-#undef LoomTensorMap
-#undef LoomTensorMapPack
+#undef FlashKDATensorMap
+#undef FlashKDATensorMapPack
 #undef CUtensorMap
 
 namespace flashinfer {
@@ -71,12 +71,12 @@ constexpr int32_t kHeads = 12;
 constexpr int32_t kHeadDim = 128;
 constexpr int32_t kMixedWidth = 3 * kHeads * kHeadDim;
 constexpr int32_t kGateWidth = kHeads * kHeadDim;
+constexpr int32_t kTargetFamily = 100;
 constexpr int32_t kTargetSM100a = 1000;
-constexpr int32_t kTargetSM103a = 1003;
 constexpr int32_t kTargetKind = FLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND;
 
-static_assert(kTargetKind == kTargetSM100a || kTargetKind == kTargetSM103a,
-              "packed KDA T=1 must be compiled for exact SM100a or SM103a");
+static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a,
+              "packed KDA T=1 must be compiled for SM100f or legacy exact SM100a");
 static_assert(FLASHKDA_PACKED_T1_VALUE_SPLITS == 8 || FLASHKDA_PACKED_T1_VALUE_SPLITS == 16,
               "packed KDA T=1 exports only tile16 or tile8");
 
@@ -91,27 +91,16 @@ inline void CheckTarget(int32_t device_id) {
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  const int expected_minor = kTargetKind == kTargetSM100a ? 0 : 3;
-  TVM_FFI_ICHECK(major == 10 && minor == expected_minor)
-      << "this packed KDA T=1 module requires exact compute capability 10." << expected_minor
-      << ", got " << major << "." << minor;
-}
-
-inline void CheckCudaTensor(const TensorView& tensor, const char* name, int32_t device_id) {
-  TVM_FFI_ICHECK(tensor.device().device_type == kDLCUDA) << name << " must be a CUDA tensor";
-  TVM_FFI_ICHECK(tensor.device().device_id == device_id)
-      << name << " must be on CUDA device " << device_id << ", got " << tensor.device().device_id;
-}
-
-inline void CheckDtype(const TensorView& tensor, const char* name, DLDataType expected) {
-  const DLDataType actual = tensor.dtype();
-  TVM_FFI_ICHECK(actual.code == expected.code && actual.bits == expected.bits &&
-                 actual.lanes == expected.lanes)
-      << name << " has the wrong dtype";
-}
-
-inline void CheckContiguous(const TensorView& tensor, const char* name) {
-  TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
+  if (kTargetKind == kTargetFamily) {
+    TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
+        << "this packed KDA T=1 module requires the SM100 family "
+           "(compute capability 10.0 or 10.3), got "
+        << major << "." << minor;
+  } else {
+    TVM_FFI_ICHECK(major == 10 && minor == 0)
+        << "this packed KDA T=1 module requires exact compute capability 10.0, got " << major
+        << "." << minor;
+  }
 }
 
 inline std::pair<uintptr_t, uintptr_t> TensorByteRange(const TensorView& tensor, const char* name) {
@@ -158,63 +147,66 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
          TensorView dt_bias, TensorView state, TensorView state_indices, TensorView out,
          int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
-  TVM_FFI_ICHECK(mixed_qkv.device().device_type == kDLCUDA) << "mixed_qkv must be a CUDA tensor";
+  CHECK_CUDA(mixed_qkv);
   const int32_t device_id = mixed_qkv.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckTarget(device_id);
 
-  const std::pair<const TensorView*, const char*> tensors[] = {
-      {&mixed_qkv, "mixed_qkv"},
-      {&raw_gate, "raw_gate"},
-      {&raw_beta, "raw_beta"},
-      {&A_log, "A_log"},
-      {&dt_bias, "dt_bias"},
-      {&state, "state"},
-      {&state_indices, "state_indices"},
-      {&out, "output"},
-  };
-  for (const auto& named : tensors) {
-    CheckCudaTensor(*named.first, named.second, device_id);
-  }
+  CHECK_CUDA(raw_gate);
+  CHECK_CUDA(raw_beta);
+  CHECK_CUDA(A_log);
+  CHECK_CUDA(dt_bias);
+  CHECK_CUDA(state);
+  CHECK_CUDA(state_indices);
+  CHECK_CUDA(out);
+  CHECK_DEVICE(mixed_qkv, raw_gate);
+  CHECK_DEVICE(mixed_qkv, raw_beta);
+  CHECK_DEVICE(mixed_qkv, A_log);
+  CHECK_DEVICE(mixed_qkv, dt_bias);
+  CHECK_DEVICE(mixed_qkv, state);
+  CHECK_DEVICE(mixed_qkv, state_indices);
+  CHECK_DEVICE(mixed_qkv, out);
 
-  CheckDtype(mixed_qkv, "mixed_qkv", dl_bfloat16);
-  CheckDtype(raw_gate, "raw_gate", dl_bfloat16);
-  CheckDtype(raw_beta, "raw_beta", dl_bfloat16);
-  CheckDtype(A_log, "A_log", dl_float32);
-  CheckDtype(dt_bias, "dt_bias", dl_float32);
-  CheckDtype(state, "state", dl_bfloat16);
-  CheckDtype(state_indices, "state_indices", dl_int32);
-  CheckDtype(out, "output", dl_bfloat16);
+  CHECK_INPUT_TYPE(mixed_qkv, dl_bfloat16);
+  CHECK_INPUT_TYPE(raw_gate, dl_bfloat16);
+  CHECK_INPUT_TYPE(raw_beta, dl_bfloat16);
+  CHECK_INPUT_TYPE(A_log, dl_float32);
+  CHECK_INPUT_TYPE(dt_bias, dl_float32);
+  CHECK_INPUT_TYPE(state, dl_bfloat16);
+  CHECK_INPUT_TYPE(state_indices, dl_int32);
+  CHECK_INPUT_TYPE(out, dl_bfloat16);
 
   TVM_FFI_ICHECK(mixed_qkv.ndim() == 2 && mixed_qkv.size(0) > 0 && mixed_qkv.size(1) == kMixedWidth)
       << "mixed_qkv must have shape [B, " << kMixedWidth << "]";
   const int64_t batch = mixed_qkv.size(0);
   TVM_FFI_ICHECK(batch <= 65535) << "batch exceeds the CUDA grid.y limit";
-  TVM_FFI_ICHECK(mixed_qkv.stride(1) == 1 && mixed_qkv.stride(0) >= kMixedWidth)
+  CHECK_LAST_DIM_CONTIGUOUS(mixed_qkv);
+  TVM_FFI_ICHECK(mixed_qkv.stride(0) >= kMixedWidth)
       << "mixed_qkv must have a compact last dimension and disjoint rows";
 
   TVM_FFI_ICHECK(raw_gate.ndim() == 2 && raw_gate.size(0) == batch &&
-                 raw_gate.size(1) == kGateWidth && raw_gate.stride(1) == 1 &&
-                 raw_gate.stride(0) >= kGateWidth)
+                 raw_gate.size(1) == kGateWidth && raw_gate.stride(0) >= kGateWidth)
       << "raw_gate must have shape [B, " << kGateWidth
       << "] with a compact last dimension and disjoint rows";
+  CHECK_LAST_DIM_CONTIGUOUS(raw_gate);
   TVM_FFI_ICHECK(raw_beta.ndim() == 2 && raw_beta.size(0) == batch && raw_beta.size(1) == kHeads &&
-                 raw_beta.stride(1) == 1 && raw_beta.stride(0) >= kHeads)
+                 raw_beta.stride(0) >= kHeads)
       << "raw_beta must have shape [B, " << kHeads
       << "] with a compact last dimension and disjoint rows";
+  CHECK_LAST_DIM_CONTIGUOUS(raw_beta);
 
   TVM_FFI_ICHECK(A_log.ndim() == 1 && A_log.numel() == kHeads)
       << "A_log must be one-dimensional with " << kHeads << " elements";
   TVM_FFI_ICHECK(dt_bias.ndim() == 1 && dt_bias.numel() == kGateWidth)
       << "dt_bias must be one-dimensional with " << kGateWidth << " elements";
-  CheckContiguous(A_log, "A_log");
-  CheckContiguous(dt_bias, "dt_bias");
+  CHECK_CONTIGUOUS(A_log);
+  CHECK_CONTIGUOUS(dt_bias);
 
   TVM_FFI_ICHECK(state.ndim() == 4 && state.size(0) > 0 && state.size(1) == kHeads &&
                  state.size(2) == kHeadDim && state.size(3) == kHeadDim)
       << "state must have shape [N, " << kHeads << ", " << kHeadDim << ", " << kHeadDim << "]";
-  TVM_FFI_ICHECK(state.stride(3) == 1 && state.stride(2) == kHeadDim &&
-                 state.stride(1) == kHeadDim * kHeadDim &&
+  CHECK_LAST_DIM_CONTIGUOUS(state);
+  TVM_FFI_ICHECK(state.stride(2) == kHeadDim && state.stride(1) == kHeadDim * kHeadDim &&
                  state.stride(0) >= kHeads * kHeadDim * kHeadDim)
       << "state must have compact [H,V,K] blocks and a positive, disjoint "
          "outer slot stride";
@@ -224,11 +216,11 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
 
   TVM_FFI_ICHECK(state_indices.ndim() == 1 && state_indices.numel() == batch)
       << "state_indices must have shape [B]";
-  CheckContiguous(state_indices, "state_indices");
+  CHECK_CONTIGUOUS(state_indices);
   TVM_FFI_ICHECK(out.ndim() == 3 && out.size(0) == batch && out.size(1) == kHeads &&
                  out.size(2) == kHeadDim)
       << "output must have shape [B, " << kHeads << ", " << kHeadDim << "]";
-  CheckContiguous(out, "output");
+  CHECK_CONTIGUOUS(out);
 
   const std::pair<const TensorView*, const char*> read_tensors[] = {
       {&mixed_qkv, "mixed_qkv"}, {&raw_gate, "raw_gate"}, {&raw_beta, "raw_beta"},

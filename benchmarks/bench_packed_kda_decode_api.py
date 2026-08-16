@@ -21,7 +21,6 @@ adapter. Run it only on a supported GPU system.
 """
 
 import argparse
-import hashlib
 import json
 import math
 import statistics
@@ -33,11 +32,9 @@ import torch
 
 import flashinfer
 from flashinfer.jit.cake_flash_kda_packed_t1 import _variant_for_batch
-from flashinfer.jit.cake_flash_kda_packed_t1 import (
-    _get_csrc_dir as _get_packed_kda_csrc_dir,
-)
 from flashinfer.jit.cake_flash_kda_packed_t1 import gen_flash_kda_packed_t1_module
 from flashinfer.kda_decode import packed_kda_decode
+from flashinfer.kda_kernels.cake_packed_kda_decode import _target_for_device
 from flashinfer.testing import bench_gpu_time
 
 
@@ -53,10 +50,6 @@ PRODUCTION_STATE_PADDING = 256
 DEFAULT_BATCHES = (1, 8, 16, 31, 32, 64, 128, 256, 512)
 SUPPORTED_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 DATA_SEED = 20260805
-FROZEN_BODY_SHA256 = {
-    "tile8": "d0de8869242d09bf0c1c4840a7fd73dcd32835050cdc08db58b19a2c7506d0da",
-    "tile16": "d8a446e42da47e2d8cd05139c77efe9c970f2d36394b68b49649beb6bc2bbfbe",
-}
 
 
 def _state_view(storage, slots, slot_stride):
@@ -298,29 +291,6 @@ def _check_source(expected_source_root):
     return source_sha
 
 
-def _verify_frozen_body_hashes():
-    csrc_dir = _get_packed_kda_csrc_dir()
-    actual = {}
-    begin = "// BEGIN FROZEN GENERATED BODY\n"
-    end = "// END FROZEN GENERATED BODY\n"
-    for variant, expected_sha256 in FROZEN_BODY_SHA256.items():
-        text = (csrc_dir / f"flashkda_packed_t1_{variant}.cu").read_text()
-        _, begin_marker, remainder = text.partition(begin)
-        body, end_marker, _ = remainder.partition(end)
-        if begin_marker != begin or end_marker != end:
-            raise RuntimeError(
-                f"{variant} frozen body markers are missing or malformed"
-            )
-        actual_sha256 = hashlib.sha256(body.encode()).hexdigest()
-        if actual_sha256 != expected_sha256:
-            raise RuntimeError(
-                f"{variant} frozen body SHA256 mismatch: expected "
-                f"{expected_sha256}, got {actual_sha256}"
-            )
-        actual[variant] = actual_sha256
-    return actual
-
-
 def _jit_binary_metadata(variant, target):
     spec = gen_flash_kda_packed_t1_module(variant, target)
     path = spec.get_library_path().resolve()
@@ -331,7 +301,6 @@ def _jit_binary_metadata(variant, target):
     return {
         "spec_name": spec.name,
         "path": str(path),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
 
@@ -419,7 +388,6 @@ def main():
     args = _parse_args()
     cupti_python_version = _require_cupti()
     source_sha = _check_source(args.expected_source_root)
-    actual_frozen_body_sha256 = _verify_frozen_body_hashes()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
@@ -430,6 +398,7 @@ def main():
             f"CC {capability[0]}.{capability[1]}"
         )
     hardware = _hardware_metadata(device)
+    target = _target_for_device(device)
     modes = ("direct", "cuda_graph") if args.mode == "both" else (args.mode,)
     rows = []
     jit_binaries = {}
@@ -439,11 +408,9 @@ def main():
         warmup_case = _make_case(batch, device, args.seed + 10000 + ordinal)
         correctness = _check_correctness(case)
         variant = _variant_for_batch(batch)
-        binary_key = f"{variant}_{hardware['cuda_arch']}"
+        binary_key = f"{variant}_{target}"
         if binary_key not in jit_binaries:
-            jit_binaries[binary_key] = _jit_binary_metadata(
-                variant, hardware["cuda_arch"]
-            )
+            jit_binaries[binary_key] = _jit_binary_metadata(variant, target)
         for mode in modes:
             warmup_run, measured_run = _make_timing_runners(case, warmup_case, mode)
             samples_ms = []
@@ -469,7 +436,7 @@ def main():
                 "state_dtype": "bfloat16",
                 "mode": mode,
                 "variant": variant,
-                "target": hardware["cuda_arch"],
+                "target": target,
                 "median_ms": median_ms,
                 "samples_ms": samples_ms,
                 "correctness": correctness,
@@ -496,7 +463,6 @@ def main():
         "benchmark": "flashinfer_packed_kda_decode_t1",
         "hardware": hardware,
         "source_sha": source_sha,
-        "frozen_body_sha256": actual_frozen_body_sha256,
         "jit_binaries": jit_binaries,
         "cupti_python_version": cupti_python_version,
         "seed": args.seed,

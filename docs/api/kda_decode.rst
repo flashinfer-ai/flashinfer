@@ -84,10 +84,10 @@ CUDA stream.
 
 Two frozen schedules are selected from host-visible batch size only: the
 eight-row value tile for ``B < 32`` and the sixteen-row value tile for
-``B >= 32``. Both are built as exact ``sm_100a`` or ``sm_103a`` modules;
-compute capability 10.0 requires CUDA 12.8 or newer, and compute capability
-10.3 requires CUDA 12.9 or newer. Unsupported devices or contracts raise an
-error without falling back to another KDA implementation.
+``B >= 32``. CUDA 12.8 uses a legacy exact ``sm_100a`` module on CC 10.0;
+CUDA 12.9 or newer uses one ``sm_100f`` module on CC 10.0 and CC 10.3.
+Unsupported devices or contracts raise an error without falling back to
+another KDA implementation.
 
 .. currentmodule:: flashinfer.kda_decode
 

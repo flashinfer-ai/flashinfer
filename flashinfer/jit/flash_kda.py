@@ -24,11 +24,11 @@ from .core import (
     gen_jit_spec,
     logger,
     sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
+    sm100f_nvcc_flags,
 )
 
 FlashKDAVariant = Literal["m64", "m128", "m128_n16", "persistent_m128"]
-FlashKDATarget = Literal["sm100a", "sm103a"]
+FlashKDATarget = Literal["sm100a", "sm100f"]
 
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
@@ -39,11 +39,11 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
 
 _FLASH_KDA_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
+    "sm100f": sm100f_nvcc_flags,
 }
 _FLASH_KDA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
-    "sm103a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
+    "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
 }
 
 # Keep every frozen cache key tied to its complete generated-plus-integration
@@ -104,21 +104,19 @@ def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
     if target not in _FLASH_KDA_NVCC_FLAGS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
-    if variant == "persistent_m128" and target != "sm100a":
-        raise ValueError("persistent FlashKDA is exported only for exact sm100a")
     module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
     return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
 
 
 @functools.cache
 def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> JitSpec:
-    """Generate one exact-SM100a or exact-SM103a JIT module.
+    """Generate one legacy exact-SM100a or SM100-family JIT module.
 
     Each physical schedule is compiled in its own translation unit because the
     checked-in frozen sources intentionally retain generated helper names and
     macros. ``gen_jit_spec`` supplies FlashInfer's standard ``-use_fast_math``
-    flag. B200 and B300 use separate exact targets and therefore separate
-    cubins and cache identities.
+    flag. CUDA 12.8 uses the exact ``sm_100a`` target on B200. CUDA 12.9 and
+    newer use one ``sm_100f`` target validated on CC 10.0 and CC 10.3.
     """
 
     csrc_dir = _get_flash_kda_csrc_dir()

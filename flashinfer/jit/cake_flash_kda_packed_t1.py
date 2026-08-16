@@ -24,12 +24,12 @@ from .core import (
     gen_jit_spec,
     logger,
     sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
+    sm100f_nvcc_flags,
 )
 from .utils import write_if_different
 
 FlashKDAPackedT1Variant = Literal["tile8", "tile16"]
-FlashKDAPackedT1Target = Literal["sm100a", "sm103a"]
+FlashKDAPackedT1Target = Literal["sm100a", "sm100f"]
 
 FLASH_KDA_PACKED_T1_VARIANTS: tuple[FlashKDAPackedT1Variant, ...] = (
     "tile8",
@@ -38,12 +38,12 @@ FLASH_KDA_PACKED_T1_VARIANTS: tuple[FlashKDAPackedT1Variant, ...] = (
 
 _FLASH_KDA_PACKED_T1_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
+    "sm100f": sm100f_nvcc_flags,
 }
 
 _FLASH_KDA_PACKED_T1_TARGET_KIND = {
     "sm100a": 1000,
-    "sm103a": 1003,
+    "sm100f": 100,
 }
 
 
@@ -119,7 +119,7 @@ def get_flash_kda_packed_t1_uri(
     variant: FlashKDAPackedT1Variant,
     target: FlashKDAPackedT1Target,
 ) -> str:
-    """Return the exact-target JIT/AOT key for one packed schedule."""
+    """Return the target-specific JIT/AOT key for one packed schedule."""
 
     if variant not in FLASH_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported packed KDA T=1 variant: {variant}")
@@ -164,7 +164,7 @@ def gen_flash_kda_packed_t1_module(
     variant: FlashKDAPackedT1Variant,
     target: FlashKDAPackedT1Target,
 ) -> JitSpec:
-    """Generate one exact-SM100a or exact-SM103a packed-KDA module."""
+    """Generate one legacy exact-SM100a or SM100-family packed-KDA module."""
 
     if variant not in FLASH_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported packed KDA T=1 variant: {variant}")
@@ -219,7 +219,7 @@ def load_flash_kda_packed_t1_module(
     variant: FlashKDAPackedT1Variant,
     target: FlashKDAPackedT1Target,
 ):
-    """Build or load one exact-target packed-KDA module."""
+    """Build or load one target-specific packed-KDA module."""
 
     module = gen_flash_kda_packed_t1_module(variant, target).build_and_load()
     logger.info("Loaded packed KDA T=1 %s %s module", variant, target)

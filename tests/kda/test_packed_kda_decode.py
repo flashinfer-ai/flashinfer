@@ -613,7 +613,7 @@ class _FakeCudaTensor:
 
 @pytest.mark.parametrize(
     ("batch", "target", "variant"),
-    [(31, "sm100a", "tile8"), (32, "sm103a", "tile16")],
+    [(31, "sm100a", "tile8"), (32, "sm100f", "tile16")],
 )
 def test_kernel_facade_selects_variant_and_caller_stream_cpu(
     monkeypatch, batch, target, variant
@@ -656,7 +656,8 @@ def test_kernel_facade_selects_variant_and_caller_stream_cpu(
     ("capability", "cuda_at_least", "expected"),
     [
         ((10, 0), {"12.8": True}, "sm100a"),
-        ((10, 3), {"12.8": True, "12.9": True}, "sm103a"),
+        ((10, 0), {"12.8": True, "12.9": True}, "sm100f"),
+        ((10, 3), {"12.8": True, "12.9": True}, "sm100f"),
         ((10, 0), {"12.8": False}, None),
         ((10, 3), {"12.8": True, "12.9": False}, None),
         ((10, 1), {"12.8": True, "12.9": True}, None),

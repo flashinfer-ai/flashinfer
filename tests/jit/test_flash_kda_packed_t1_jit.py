@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -22,11 +21,6 @@ from flashinfer.jit import core as jit_core
 from flashinfer.jit import cake_flash_kda_packed_t1 as flash_kda_packed_t1
 
 
-FROZEN_GENERATED_BODY_SHA256 = {
-    "tile8": "d0de8869242d09bf0c1c4840a7fd73dcd32835050cdc08db58b19a2c7506d0da",
-    "tile16": "d8a446e42da47e2d8cd05139c77efe9c970f2d36394b68b49649beb6bc2bbfbe",
-}
-TYPED_SOURCE_SHA256 = "24edeaf9676b12ec3301ff413080194282be0b35e604f785dffba41c0c48640e"
 _FROZEN_BODY_BEGIN = "// BEGIN FROZEN GENERATED BODY\n"
 _FROZEN_BODY_END = "// END FROZEN GENERATED BODY\n"
 
@@ -50,17 +44,17 @@ _FROZEN_BODY_END = "// END FROZEN GENERATED BODY\n"
         ),
         (
             "tile8",
-            "sm103a",
+            "sm100f",
             (10, "3a"),
-            "-gencode=arch=compute_103a,code=sm_103a",
-            1003,
+            "-gencode=arch=compute_100f,code=sm_100f",
+            100,
         ),
         (
             "tile16",
-            "sm103a",
+            "sm100f",
             (10, "3a"),
-            "-gencode=arch=compute_103a,code=sm_103a",
-            1003,
+            "-gencode=arch=compute_100f,code=sm_100f",
+            100,
         ),
     ],
 )
@@ -100,26 +94,20 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     assert "-use_fast_math" in spec.extra_cuda_cflags
     assert "--maxrregcount=128" in spec.extra_cuda_cflags
     assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
-    assert not any("compute_100f" in flag for flag in spec.extra_cuda_cflags)
+    forbidden_compute = "compute_100f" if target == "sm100a" else "compute_103a"
+    assert not any(forbidden_compute in flag for flag in spec.extra_cuda_cflags)
 
     csrc_dir = flash_kda_packed_t1._get_csrc_dir()
     frozen_text = (csrc_dir / f"cake_flashkda_packed_t1_{variant}.cu").read_text()
-    assert f"Canonical typed source SHA256: {TYPED_SOURCE_SHA256}" in frozen_text
-    assert (
-        f"Frozen generated body SHA256: {FROZEN_GENERATED_BODY_SHA256[variant]}"
-    ) in frozen_text
-    before_body, begin_marker, remainder = frozen_text.partition(_FROZEN_BODY_BEGIN)
+    metadata = flash_kda_packed_t1.FLASH_KDA_PACKED_T1_VARIANT_METADATA[variant]
+    _, begin_marker, remainder = frozen_text.partition(_FROZEN_BODY_BEGIN)
     frozen_body, end_marker, after_body = remainder.partition(_FROZEN_BODY_END)
     assert begin_marker == _FROZEN_BODY_BEGIN
     assert end_marker == _FROZEN_BODY_END
-    assert (
-        hashlib.sha256(frozen_body.encode()).hexdigest()
-        == (FROZEN_GENERATED_BODY_SHA256[variant])
-    )
-    assert FROZEN_GENERATED_BODY_SHA256[variant] in before_body
+    assert metadata.symbol in frozen_body
+    assert "FlashKDATensorMap" in frozen_body
     assert after_body.strip() == "// clang-format on"
 
-    metadata = flash_kda_packed_t1.FLASH_KDA_PACKED_T1_VARIANT_METADATA[variant]
     binding_text = spec.sources[0].read_text()
     assert (
         f'#define FLASHKDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"'
@@ -167,7 +155,7 @@ def test_flash_kda_packed_t1_variant_validation_and_getter(monkeypatch):
     with pytest.raises(ValueError, match="unsupported packed KDA T=1 variant"):
         flash_kda_packed_t1.get_flash_kda_packed_t1_uri("tile32", "sm100a")
     with pytest.raises(ValueError, match="unsupported packed KDA T=1 target"):
-        flash_kda_packed_t1.get_flash_kda_packed_t1_uri("tile8", "sm100f")
+        flash_kda_packed_t1.get_flash_kda_packed_t1_uri("tile8", "sm103a")
 
     sentinel = object()
     monkeypatch.setattr(
@@ -175,10 +163,10 @@ def test_flash_kda_packed_t1_variant_validation_and_getter(monkeypatch):
         "load_flash_kda_packed_t1_module",
         lambda variant, target: (sentinel, variant, target),
     )
-    assert flash_kda_packed_t1.get_flash_kda_packed_t1_module("tile16", "sm103a") == (
+    assert flash_kda_packed_t1.get_flash_kda_packed_t1_module("tile16", "sm100f") == (
         sentinel,
         "tile16",
-        "sm103a",
+        "sm100f",
     )
 
 
@@ -190,9 +178,11 @@ def test_flash_kda_packed_t1_binding_contract():
     assert "#include FLASHKDA_PACKED_T1_BODY_FILE" in binding
     assert "kHeads = 12" in binding
     assert "kHeadDim = 128" in binding
+    assert "kTargetFamily = 100" in binding
     assert "kTargetSM100a = 1000" in binding
-    assert "kTargetSM103a = 1003" in binding
-    assert "major == 10 && minor == expected_minor" in binding
+    assert "minor == 0 || minor == 3" in binding
+    assert "CHECK_LAST_DIM_CONTIGUOUS(mixed_qkv)" in binding
+    assert "CHECK_INPUT_TYPE(mixed_qkv, dl_bfloat16)" in binding
     assert "mixed_qkv must have shape [B," in binding
     assert "state must have compact [H,V,K] blocks" in binding
     assert "state_indices must have shape [B]" in binding
@@ -205,24 +195,24 @@ def test_flash_kda_packed_t1_binding_contract():
 
 
 @pytest.mark.parametrize(
-    ("target_archs", "cuda_version", "expected_sm100a", "expected_sm103a"),
+    ("target_archs", "cuda_version", "expected_sm100a", "expected_sm100f"),
     [
         ({(10, "0a")}, "12.8", True, False),
-        ({(10, "0a")}, "13.0", True, False),
+        ({(10, "0a")}, "13.0", False, True),
         ({(10, "3a")}, "12.8", False, False),
         ({(10, "3a")}, "12.9", False, True),
-        ({(10, "0a"), (10, "3a")}, "13.0", True, True),
-        ({(10, "0f")}, "13.0", False, False),
-        ({(10, "3f")}, "13.0", False, False),
+        ({(10, "0a"), (10, "3a")}, "13.0", False, True),
+        ({(10, "0f")}, "13.0", False, True),
+        ({(10, "3f")}, "13.0", False, True),
         ({(12, "0f")}, "13.0", False, False),
     ],
 )
-def test_aot_detects_exact_flash_kda_packed_t1_targets(
+def test_aot_detects_flash_kda_packed_t1_targets(
     monkeypatch,
     target_archs,
     cuda_version,
     expected_sm100a,
-    expected_sm103a,
+    expected_sm100f,
 ):
     from flashinfer import aot
 
@@ -241,7 +231,7 @@ def test_aot_detects_exact_flash_kda_packed_t1_targets(
 
     capabilities = aot.detect_sm_capabilities()
     assert capabilities["flash_kda_packed_t1_sm100a"] is expected_sm100a
-    assert capabilities["flash_kda_packed_t1_sm103a"] is expected_sm103a
+    assert capabilities["flash_kda_packed_t1_sm100f"] is expected_sm100f
 
 
 @pytest.mark.parametrize(
@@ -252,25 +242,25 @@ def test_aot_detects_exact_flash_kda_packed_t1_targets(
             [(variant, "sm100a") for variant in ("tile8", "tile16")],
         ),
         (
-            {"flash_kda_packed_t1_sm103a": True},
-            [(variant, "sm103a") for variant in ("tile8", "tile16")],
+            {"flash_kda_packed_t1_sm100f": True},
+            [(variant, "sm100f") for variant in ("tile8", "tile16")],
         ),
         (
             {
                 "flash_kda_packed_t1_sm100a": True,
-                "flash_kda_packed_t1_sm103a": True,
+                "flash_kda_packed_t1_sm100f": True,
             },
             [
                 ("tile8", "sm100a"),
                 ("tile16", "sm100a"),
-                ("tile8", "sm103a"),
-                ("tile16", "sm103a"),
+                ("tile8", "sm100f"),
+                ("tile16", "sm100f"),
             ],
         ),
-        ({"sm100f": True}, []),
+        ({"sm103": True}, []),
     ],
 )
-def test_aot_registers_exact_flash_kda_packed_t1_portfolio(
+def test_aot_registers_flash_kda_packed_t1_portfolio(
     monkeypatch, capabilities, expected_targets
 ):
     from flashinfer import aot

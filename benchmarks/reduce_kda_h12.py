@@ -135,7 +135,7 @@ def _validate_arch_report(
     return selected
 
 
-def reduce_reports(
+def summarize_reports(
     sm100a: Any,
     sm103a: Any,
     *,
@@ -163,7 +163,7 @@ def main() -> None:
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
 
-    result = reduce_reports(
+    result = summarize_reports(
         _load_json(args.sm100a),
         _load_json(args.sm103a),
         preset=args.preset,

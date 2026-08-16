@@ -367,10 +367,10 @@ def _flash_kda_device_sm_count(device: torch.device) -> int:
 
 def _uses_measured_sm100_persistent_policy(
     *,
-    target: "FlashKDATarget",
+    compute_capability: tuple[int, int],
     sm_count: int,
 ) -> bool:
-    return target == "sm100a" and sm_count in (148, 152)
+    return compute_capability == (10, 0) and sm_count in (148, 152)
 
 
 def _requires_exact_n16_recurrence(
@@ -935,19 +935,19 @@ def _select_flash_kda_prefill_target(device: torch.device) -> "FlashKDATarget":
             "(SM100a; B200/GB200) or 10.3 (SM103a; B300/GB300); got "
             f"{compute_capability[0]}.{compute_capability[1]}"
         )
-    if compute_capability == (10, 0) and _is_cuda_version_at_least("12.8"):
+    if compute_capability == (10, 0) and not _is_cuda_version_at_least("12.9"):
+        if not _is_cuda_version_at_least("12.8"):
+            raise RuntimeError(
+                "frozen recurrent-KDA prefill on compute capability 10.0 "
+                "requires CUDA 12.8 or newer"
+            )
         return "sm100a"
-    if compute_capability == (10, 3) and _is_cuda_version_at_least("12.9"):
-        return "sm103a"
-    if compute_capability == (10, 3):
+    if not _is_cuda_version_at_least("12.9"):
         raise RuntimeError(
             "frozen recurrent-KDA prefill on compute capability 10.3 requires "
-            "CUDA 12.9 or newer for the exact sm_103a target"
+            "CUDA 12.9 or newer for the sm_100f family target"
         )
-    raise RuntimeError(
-        "frozen recurrent-KDA prefill on compute capability 10.0 requires "
-        "CUDA 12.8 or newer"
-    )
+    return "sm100f"
 
 
 def _get_flash_kda_prefill_module(variant: "FlashKDAVariant", target: "FlashKDATarget"):
@@ -995,6 +995,7 @@ def _run_flash_kda_prefill(
     fixed_layout = cu_seqlens is None
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
     target = _select_flash_kda_prefill_target(q.device)
+    compute_capability = get_compute_capability(q.device)
     sm_count = _flash_kda_device_sm_count(q.device)
     stream_workspace = (
         _get_stream_workspace(q.device) if prefill_workspace is None else None
@@ -1011,7 +1012,10 @@ def _run_flash_kda_prefill(
         )
     )
     persistent_candidate = (
-        _uses_measured_sm100_persistent_policy(target=target, sm_count=sm_count)
+        _uses_measured_sm100_persistent_policy(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+        )
         and not needs_direct_m128
         and prefill_workspace is None
         and initial_state is not None

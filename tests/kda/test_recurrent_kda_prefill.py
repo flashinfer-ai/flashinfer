@@ -295,9 +295,9 @@ def flash_kda_device(cuda_device):
     ("compute_capability", "cuda_version", "expected_target", "error_match"),
     [
         ((10, 0), "12.8", "sm100a", None),
-        ((10, 0), "12.9", "sm100a", None),
+        ((10, 0), "12.9", "sm100f", None),
         ((10, 3), "12.8", None, "10.3 requires CUDA 12.9"),
-        ((10, 3), "12.9", "sm103a", None),
+        ((10, 3), "12.9", "sm100f", None),
         ((12, 0), "13.0", None, "requires compute capability 10.0"),
         ((10, 0), "12.7", None, "10.0 requires CUDA 12.8"),
     ],
@@ -351,16 +351,16 @@ def test_flash_kda_sm_count_is_cached_per_device(monkeypatch):
         kda_prefill_api._flash_kda_device_sm_count.cache_clear()
 
 
-def test_persistent_policy_is_exact_sm100_and_bins_match_cake():
-    for target, sm_count, expected in (
-        ("sm100a", 148, True),
-        ("sm100a", 152, True),
-        ("sm103a", 148, False),
-        ("sm103a", 152, False),
+def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
+    for compute_capability, sm_count, expected in (
+        ((10, 0), 148, True),
+        ((10, 0), 152, True),
+        ((10, 3), 148, False),
+        ((10, 3), 152, False),
     ):
         assert (
             kda_prefill_api._uses_measured_sm100_persistent_policy(
-                target=target,
+                compute_capability=compute_capability,
                 sm_count=sm_count,
             )
             is expected
@@ -565,7 +565,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 )
 @pytest.mark.parametrize(
     ("compute_capability", "expected_target"),
-    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+    [((10, 0), "sm100f"), ((10, 3), "sm100f")],
 )
 def test_frozen_route_and_ffi_abi(
     cuda_device,
@@ -696,7 +696,7 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     )
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("persistent_m128", "sm100a")]
+    assert routes == [("persistent_m128", "sm100f")]
     (args,) = module.calls
     assert len(args) == 23
     assert args[9].tolist() == [0, 1]
@@ -745,7 +745,7 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
     )
-    assert routes == [("m128", "sm100a")]
+    assert routes == [("m128", "sm100f")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
 
@@ -871,7 +871,7 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     assert output.shape == inputs["q"].shape
     assert returned_state is state_pool
     assert returned_checkpoints is state_checkpoints
-    assert routes == [("m128_n16", "sm100a")]
+    assert routes == [("m128_n16", "sm100f")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[4].data_ptr() == inputs["beta"].data_ptr()

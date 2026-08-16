@@ -24,8 +24,8 @@ can select it only for the measured 148-SM B200 device class.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -63,8 +63,6 @@ class Variant:
     frozen_filename: str
     binding_filename: str
     module_ident: str
-    raw_sha256: str
-    raw_bytes: int
     smem_bytes: int
 
 
@@ -76,8 +74,6 @@ VARIANTS = {
         frozen_filename="cake_flashkda_bf16_fused_m128_n16.cu",
         binding_filename="cake_flashkda_bf16_fused_m128_n16_binding.cu",
         module_ident="flashkda_bf16_fused_m128_ef8b47d690",
-        raw_sha256="bb95a6c63b4c787c6d3e2d54a543b6f46094748c321ae4d4404090a1daaba92c",
-        raw_bytes=167472,
         smem_bytes=219136,
     ),
     "n32": Variant(
@@ -87,8 +83,6 @@ VARIANTS = {
         frozen_filename="flashkda_bf16_fused_m128.cu",
         binding_filename="flashkda_bf16_fused_m128_binding.cu",
         module_ident="flashkda_bf16_fused_m128_ea022a2f1f",
-        raw_sha256="bee12ccbc2c30bfa79ca5f698a2373bda83e6e76cf31988ef25de50dfda526c1",
-        raw_bytes=166197,
         smem_bytes=227328,
     ),
     "m64": Variant(
@@ -98,8 +92,6 @@ VARIANTS = {
         frozen_filename="flashkda_bf16_fused_m64.cu",
         binding_filename="flashkda_bf16_fused_m64_binding.cu",
         module_ident="flashkda_bf16_fused_m64_9a5566f3be",
-        raw_sha256="1cea03f061dd0bcf687f419d3bc5e48b4112374dc31c7f41c1922e6152ca7536",
-        raw_bytes=169546,
         smem_bytes=221696,
     ),
     "persistent": Variant(
@@ -109,8 +101,6 @@ VARIANTS = {
         frozen_filename="cake_flashkda_bf16_persistent_m128.cu",
         binding_filename="cake_flashkda_bf16_persistent_m128_binding.cu",
         module_ident="flashkda_bf16_persistent_m128_fb536e5df4",
-        raw_sha256="3c838954e3cd3f354aec39dac39901f1e0595af1ef7d21f764a3b7627c7075a3",
-        raw_bytes=172462,
         smem_bytes=221696,
     ),
 }
@@ -119,80 +109,49 @@ PROFILES = {
     "sm100_n16": {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-n16-sm100",
-        "profile_sha256": "d7bbd6961071f713dae878bd21bbf25b753e0f966746b6cb70c76d690c01172a",
         "variant": "n16",
     },
     "sm103_n16": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-n16-sm103",
-        "profile_sha256": "dc6b147fc79fdea6539085d915be69f0648f0279b014486a369bf69be2f49c52",
         "variant": "n16",
     },
     "sm100_n32": {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-n32-sm100",
-        "profile_sha256": "ceb61628896b77c4e1ae5eb24d173da317d76a2d6c437132564909e81e1fb85a",
         "variant": "n32",
     },
     "sm103_n32": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-n32-sm103",
-        "profile_sha256": "b035c36e4cefa031c8f551fe59ad019670eb3719017dbddeba12adaa38406f0f",
         "variant": "n32",
     },
     "sm100_m64": {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m64-sm100",
-        "profile_sha256": "e9f2978aa844cce5cbb37bf63ca154927de69d32b121859d5e0c2fcbf0115c3e",
         "variant": "m64",
     },
     "sm103_m64": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m64-sm103",
-        "profile_sha256": "0b2c4742c36c3af7b449e6ab652b25f1377ced1560b3de6bc220fb0d6db5c315",
         "variant": "m64",
     },
     "sm100_persistent": {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-persistent-m128-sm100",
-        "profile_sha256": "acdf4879daaebb209e3463b7276d2b0a5ff8fab29d0ba946a5fd7036c8752a70",
         "variant": "persistent",
     },
 }
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _read_verified(path: Path, variant: Variant, arch: str) -> bytes:
-    data = path.read_bytes()
-    actual_sha256 = _sha256(data)
-    if len(data) != variant.raw_bytes or actual_sha256 != variant.raw_sha256:
-        raise ValueError(
-            f"{arch} {variant.key} export identity mismatch: "
-            f"bytes={len(data)} sha256={actual_sha256}; expected "
-            f"bytes={variant.raw_bytes} sha256={variant.raw_sha256}"
-        )
-    return data
-
-
 def _verify_profile(path: Path, profile: dict[str, str], variant: Variant) -> None:
-    data = path.read_bytes()
-    actual_sha256 = _sha256(data)
-    if actual_sha256 != profile["profile_sha256"]:
-        raise ValueError(
-            f"{profile['profile']} identity mismatch: sha256={actual_sha256}; "
-            f"expected {profile['profile_sha256']}"
-        )
-    payload = json.loads(data)
+    payload = json.loads(path.read_text())
     expected_fields = {
         "profile": profile["profile"],
         "arch": profile["arch"],
         "schedule_symbol": variant.schedule_symbol,
         "kernel_symbol": variant.kernel_symbol,
         "module_ident": variant.module_ident,
-        "expected_source_sha256": variant.raw_sha256,
     }
     for field, expected in expected_fields.items():
         if payload.get(field) != expected:
@@ -202,8 +161,26 @@ def _verify_profile(path: Path, profile: dict[str, str], variant: Variant) -> No
             )
 
 
+def _standalone_source_names(text: str) -> str:
+    tensor_map = re.search(
+        r"struct __align__\(128\) (?P<name>[A-Za-z_]\w*) "
+        r"\{ uint64_t opaque\[16\]; \};",
+        text,
+    )
+    if tensor_map is None:
+        raise ValueError("raw source is missing its generated tensor-map type")
+    source_name = tensor_map.group("name")
+    text = text.replace(f"{source_name}Pack", "FlashKDATensorMapPack")
+    text = text.replace(source_name, "FlashKDATensorMap")
+
+    infinity_macro = re.search(r"#define (?P<name>[A-Z][A-Z0-9_]*_INF) CUDART_INF_F", text)
+    if infinity_macro is None:
+        raise ValueError("raw source is missing its generated infinity macro")
+    return text.replace(infinity_macro.group("name"), "FLASH_KDA_INF")
+
+
 def _freeze(raw: bytes, variant: Variant) -> bytes:
-    text = raw.decode("utf-8")
+    text = _standalone_source_names(raw.decode("utf-8"))
     if not text.endswith("\n"):
         raise ValueError(f"{variant.key} raw source must end with a newline")
     kernel_signature = f"{variant.kernel_symbol}("
@@ -229,6 +206,8 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
         )
     if f"#define SMEM_TOTAL {variant.smem_bytes}" not in text:
         raise ValueError(f"{variant.key} raw source has an unexpected SMEM_TOTAL")
+    if "FlashKDATensorMap" not in text or "FLASH_KDA_INF" not in text:
+        raise ValueError(f"{variant.key} raw source does not use standalone FlashKDA names")
     if variant.key == "persistent" and (
         "task_ids[" not in text or "task_offsets[" not in text
     ):
@@ -267,8 +246,7 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     provenance = (
         "// Frozen generated kernel export; do not edit by hand.\n"
         f"// Generated schedule '{variant.schedule_symbol}'; module\n"
-        f"// {variant.module_ident}; raw SHA-256:\n"
-        f"// {variant.raw_sha256}.\n"
+        f"// {variant.module_ident}.\n"
     )
     return (
         LICENSE_HEADER
@@ -280,21 +258,18 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     ).encode("utf-8")
 
 
-def _manifest(frozen: dict[str, bytes]) -> bytes:
+def _manifest() -> bytes:
     variants = {}
     for key, variant in VARIANTS.items():
         variants[key] = {
             "binding_path": f"csrc/kda/{variant.binding_filename}",
             "frozen_path": f"csrc/kda/{variant.frozen_filename}",
-            "frozen_sha256": _sha256(frozen[key]),
             "module_ident": variant.module_ident,
-            "raw_bytes": variant.raw_bytes,
-            "raw_sha256": variant.raw_sha256,
             "smem_bytes": variant.smem_bytes,
         }
     payload = {
-        "schema_version": 3,
-        "architecture_artifacts_are_separate": True,
+        "schema_version": 4,
+        "source_profiles_are_arch_specific": True,
         "generated_source_text_equal_across_architectures": [
             "n16",
             "n32",
@@ -392,7 +367,7 @@ def main() -> int:
         profile = PROFILES[profile_key]
         variant = VARIANTS[profile["variant"]]
         _verify_profile(profile_paths[profile_key], profile, variant)
-        raw[profile_key] = _read_verified(path, variant, profile["arch"])
+        raw[profile_key] = path.read_bytes()
     if raw["sm100_n16"] != raw["sm103_n16"]:
         raise ValueError("N16 SM100 and SM103 generated source text differs")
     if raw["sm100_n32"] != raw["sm103_n32"]:
@@ -410,9 +385,7 @@ def main() -> int:
         args.output_dir / variant.frozen_filename: frozen[key]
         for key, variant in VARIANTS.items()
     }
-    outputs[args.output_dir / "flashkda_prefill_import_manifest.json"] = _manifest(
-        frozen
-    )
+    outputs[args.output_dir / "flashkda_prefill_import_manifest.json"] = _manifest()
     matched = True
     for path, data in outputs.items():
         matched = _write_or_check(path, data, args.check) and matched

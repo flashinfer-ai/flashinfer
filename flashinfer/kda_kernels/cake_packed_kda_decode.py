@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Serving-native packed Kimi K3 recurrent decode for exact SM100a and SM103a.
+Serving-native packed Kimi K3 recurrent decode for the SM100 family.
 """
 
 from typing import Literal, Optional
@@ -34,7 +34,7 @@ _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 
 
 def _target_for_device(device: torch.device) -> FlashKDAPackedT1Target:
-    """Select an exact physical target and enforce its CUDA floor."""
+    """Select the legacy exact target or the SM100-family target."""
 
     compute_capability = get_compute_capability(device)
     if compute_capability == (10, 0):
@@ -42,16 +42,16 @@ def _target_for_device(device: torch.device) -> FlashKDAPackedT1Target:
             raise RuntimeError(
                 "packed KDA T=1 on compute capability 10.0 requires CUDA 12.8 or newer"
             )
-        return "sm100a"
+        return "sm100f" if is_cuda_version_at_least("12.9") else "sm100a"
     if compute_capability == (10, 3):
         if not is_cuda_version_at_least("12.9"):
             raise RuntimeError(
                 "packed KDA T=1 on compute capability 10.3 requires CUDA 12.9 or newer"
             )
-        return "sm103a"
+        return "sm100f"
     raise RuntimeError(
-        "packed KDA T=1 requires exact compute capability 10.0 "
-        "(SM100a) or 10.3 (SM103a); got "
+        "packed KDA T=1 requires compute capability 10.0 "
+        "or 10.3 in the SM100 family; got "
         f"{compute_capability[0]}.{compute_capability[1]}"
     )
 
