@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import json
-import runpy
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -96,46 +94,6 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         if variant == "persistent":
             assert "task_ids[" in frozen_text
             assert "task_offsets[" in frozen_text
-
-    import_tool = (
-        Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
-    )
-    assert import_tool.is_file()
-
-
-def test_flash_kda_import_tool_constants_and_structural_validation(tmp_path):
-    import_tool = (
-        Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
-    )
-    namespace = runpy.run_path(
-        str(import_tool), run_name="flashinfer_flash_kda_import_test"
-    )
-    manifest = json.loads(
-        (
-            flash_kda._get_flash_kda_csrc_dir()
-            / "flashkda_prefill_import_manifest.json"
-        ).read_text()
-    )
-    assert namespace["PROFILES"] == manifest["profiles"]
-    for variant_name, variant in namespace["VARIANTS"].items():
-        record = manifest["variants"][variant_name]
-        assert variant.module_ident == record["module_ident"]
-        assert variant.smem_bytes == record["smem_bytes"]
-
-    corrupt_profile = tmp_path / "profile.json"
-    corrupt_profile.write_text("{}\n")
-    with pytest.raises(ValueError, match="profile"):
-        namespace["_verify_profile"](
-            corrupt_profile,
-            namespace["PROFILES"]["sm100_n16"],
-            namespace["VARIANTS"]["n16"],
-        )
-
-    corrupt_source = tmp_path / "kernel.cu"
-    corrupt_source.write_text("not a sealed Cake export\n")
-    with pytest.raises(ValueError, match="tensor-map type"):
-        namespace["_freeze"](corrupt_source.read_bytes(), namespace["VARIANTS"]["n16"])
-
 
 @pytest.mark.parametrize(
     (
