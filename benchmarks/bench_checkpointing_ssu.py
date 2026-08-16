@@ -2039,8 +2039,39 @@ def _spec_tag(args) -> str:
     return "_".join(parts)
 
 
+def _validate_autotune_replayssm_args(args) -> None:
+    """Reject configurations that cannot execute a tunable two-kernel row."""
+    if not args.autotune_replayssm:
+        return
+    if not args.cuda_incr or not args.two_kernel:
+        raise ValueError("--autotune-replayssm requires --cuda-incr and --two-kernel")
+
+    state_dtypes = [
+        parse_state_spec(spec.strip())[0] for spec in args.state_dtypes.split(",")
+    ]
+    act_tokens = [token.strip() for token in args.act_dtypes.split(",")]
+    invalid_act_tokens = [token for token in act_tokens if token not in STATE_DTYPE_MAP]
+    if invalid_act_tokens:
+        raise ValueError(
+            f"invalid --act-dtypes token(s): {invalid_act_tokens!r} "
+            f"(allowed: {sorted(STATE_DTYPE_MAP)})"
+        )
+    act_dtypes = [STATE_DTYPE_MAP[token] for token in act_tokens]
+
+    supported_states = (torch.float16, torch.bfloat16, torch.float32)
+    supported_activations = (torch.float16, torch.bfloat16)
+    if not any(dtype in supported_states for dtype in state_dtypes) or not any(
+        dtype in supported_activations for dtype in act_dtypes
+    ):
+        raise ValueError(
+            "--autotune-replayssm requires at least one two-kernel row with "
+            "f16/bf16/f32 state and f16/bf16 activations"
+        )
+
+
 if __name__ == "__main__":
     _args = _parse_args()
+    _validate_autotune_replayssm_args(_args)
 
     if _args.varlen:
         _forced_off = [

@@ -269,7 +269,12 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
       int const main_stages = [&] {
-        if (main_pipeline_stages > 0) return main_pipeline_stages;
+        if (main_pipeline_stages > 0) {
+          FLASHINFER_CHECK(main_pipeline_stages == 1 || main_pipeline_stages == 2,
+                           "main_pipeline_stages must be 0 (heuristic), 1, or 2, got ",
+                           main_pipeline_stages);
+          return main_pipeline_stages;
+        }
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
         int const v = e ? std::atoi(e) : 0;  // unset → regime default
         FLASHINFER_CHECK(v == 0 || v == 1 || v == 2,

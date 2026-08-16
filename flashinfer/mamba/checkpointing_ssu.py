@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Any, Optional
 
 import torch
@@ -22,6 +23,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
+    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -39,7 +41,7 @@ from ..utils import register_custom_op, register_fake_op
 _ALGORITHM_AUTO = 0
 _ALGORITHM_MONOLITH = 1
 _ALGORITHM_TWO_KERNEL = 2
-_AUTOTUNE_CACHE_SCHEMA_VERSION = 2
+_AUTOTUNE_CACHE_SCHEMA_VERSION = 3
 
 # A tactic is (algorithm, main pipeline stages, main CTAs/SM,
 # precompute heads/CTA).  Monolithic tactics ignore the latter three values.
@@ -89,18 +91,19 @@ def _get_module(
 
 
 def _heads_per_cta_candidates(heads_per_group: int) -> tuple[int, ...]:
-    """Return the complete ``HEADS_PER_GROUP >> k`` launch chain."""
+    """Return valid divisors on the ``HEADS_PER_GROUP >> k`` launch chain."""
     candidates = []
     value = heads_per_group
     while value > 0:
-        candidates.append(value)
+        if heads_per_group % value == 0:
+            candidates.append(value)
         value >>= 1
     return tuple(candidates)
 
 
 def _make_tactics(heads_per_group: int) -> tuple[_CheckpointingSSUTactic, ...]:
-    """Build the exhaustive runtime-only ReplaySSM tactic space."""
-    precompute_tactics = (0, *_heads_per_cta_candidates(heads_per_group))
+    """Build the exhaustive, fully explicit ReplaySSM tactic space."""
+    precompute_tactics = _heads_per_cta_candidates(heads_per_group)
     return (
         (_ALGORITHM_MONOLITH, 0, 0, 0),
         *(
@@ -126,6 +129,16 @@ def _initialize_state_batch_indices(
     return torch.arange(shape[0], dtype=dtype, device=device)
 
 
+def _dense_profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
+    """Use one private padding slot beyond the bucketed dense batch."""
+    return shapes[1][0] + 1
+
+
+def _varlen_profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
+    """``cu_seqlens`` already has the desired ``batch + 1`` length."""
+    return shapes[18][0]
+
+
 def _clone_preserve_strides(tensor: torch.Tensor) -> torch.Tensor:
     clone = torch.empty_strided(
         tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
@@ -141,7 +154,7 @@ def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
     # State, caches, output, quantization scales, and two-kernel scratch are
     # mutated by checkpointing_ssu.  Static inputs otherwise alias the caller's
     # tensors, so give the profiler private copies before trying any tactic.
-    for index in (0, 6, 7, 8, 9, 10, 11, 16, 19, 20, 21):
+    for index in (0, 6, 7, 8, 9, 10, 11, 15, 16, 19, 20, 21):
         tensor = prepared[index]
         if isinstance(tensor, torch.Tensor):
             prepared[index] = _clone_preserve_strides(tensor)
@@ -187,6 +200,27 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     z, state_batch_indices, cu_seqlens = inputs[13], inputs[15], inputs[18]
     dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
     tensor_initializers: list[tuple[int, Any]] = []
+    cache_capacity_infer = (
+        _varlen_profile_cache_capacity
+        if cu_seqlens is not None
+        else _dense_profile_cache_capacity
+    )
+
+    # Serving runtimes can back a small active batch with thousands of cache
+    # slots. Cache capacity does not affect the selected kernel, so synthesize
+    # only the active bucket plus one private padding slot for profiling. The
+    # constraint also wildcards capacity in the persistent autotune key.
+    cache_capacity_inputs = [0, 7, 8, 9, 10, 11]
+    if inputs[16] is not None:
+        cache_capacity_inputs.append(16)
+    constraint_specs = tuple(
+        ConstraintSpec(
+            input_idx=index,
+            dim_idx=0,
+            infer_shape=cache_capacity_infer,
+        )
+        for index in cache_capacity_inputs
+    )
 
     # Dense ReplaySSM has a single linked batch dimension.  Packed varlen calls
     # retain an exact-shape profile because total tokens and batch are separate
@@ -250,6 +284,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
 
     return TuningConfig(
         dynamic_tensor_specs=dynamic_specs,
+        constraint_specs=constraint_specs,
         tensor_initializers=tuple(tensor_initializers),
         use_cold_l2_cache=True,
         use_cuda_graph=True,
@@ -323,6 +358,7 @@ class CheckpointingSSURunner(TunableRunner):
             self._dt_softplus,
             self._pad_slot_id,
             self._requested_d_split,
+            os.environ.get("FLASHINFER_SSU_PRECOMPUTE_NUM_WARPS"),
             tuple(inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)),
             stride_signature,
         )
@@ -639,9 +675,9 @@ def checkpointing_ssu(
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
     precompute_heads_per_cta: int = 0,
+    algorithm: str = "auto",
     main_pipeline_stages: int = 0,
     main_ctas_per_sm: int = 0,
-    algorithm: str = "auto",
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 

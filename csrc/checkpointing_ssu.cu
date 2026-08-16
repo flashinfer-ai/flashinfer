@@ -20,6 +20,8 @@
 #include <flashinfer/mamba/checkpointing_ssu.cuh>
 #include <flashinfer/mamba/launch_checkpointing_ssu.cuh>
 // clang-format on
+#include <limits>
+
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -129,8 +131,9 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(
       main_pipeline_stages == 0 || main_pipeline_stages == 1 || main_pipeline_stages == 2,
       "main_pipeline_stages=", main_pipeline_stages, " must be 0 (heuristic), 1, or 2");
-  FLASHINFER_CHECK(main_ctas_per_sm >= 0, "main_ctas_per_sm=", main_ctas_per_sm,
-                   " must be 0 (heuristic) or positive");
+  FLASHINFER_CHECK(main_ctas_per_sm >= 0 && main_ctas_per_sm <= std::numeric_limits<int>::max(),
+                   "main_ctas_per_sm=", main_ctas_per_sm,
+                   " must be 0 (heuristic) or a positive value representable as int");
 
   // ── Validate x ──
   // Non-varlen: shape (batch, NPREDICTED, nheads, dim).

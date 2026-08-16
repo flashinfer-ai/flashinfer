@@ -13,8 +13,14 @@ import triton
 from einops import repeat
 
 from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
-from flashinfer.utils import is_cvt_rs_supported
+from flashinfer.mamba.checkpointing_ssu import (
+    _checkpointing_ssu_tuning_config,
+    _heads_per_cta_candidates,
+    _make_tactics,
+    _prepare_checkpointing_ssu_profile_inputs,
+    checkpointing_ssu,
+)
+from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
 
 # Triton reference: the standalone TMA persistent kernel only (the old 4D
 # `checkpointing_state_update` and its merged non-TMA replay copy were removed
@@ -605,8 +611,112 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
             )
 
 
+def _make_autotune_config_inputs(cache_size=37, batch=4, T=2, varlen=False):
+    """Small CPU tensors carrying the same dimension links as ReplaySSM."""
+    nheads, head_dim, d_state, ngroups = 2, 2, 3, 1
+    ring_len = 6
+    if varlen:
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32) * T
+        leading_shape = (1, batch * T)
+    else:
+        cu_seqlens = None
+        leading_shape = (batch, T)
+
+    x = torch.empty(*leading_shape, nheads, head_dim)
+    B = torch.empty(*leading_shape, ngroups, d_state)
+    return [
+        torch.empty(cache_size, nheads, head_dim, d_state),  # state
+        x,
+        torch.empty_like(x),  # dt
+        torch.empty(nheads, head_dim, d_state),  # A
+        B,
+        torch.empty_like(B),  # C
+        torch.empty_like(x),  # out
+        torch.empty(cache_size, nheads, ring_len, head_dim),  # x_cache
+        torch.empty(cache_size, ngroups, ring_len, d_state),  # B_cache
+        torch.empty(cache_size, nheads, ring_len),  # dt_cache
+        torch.zeros(cache_size, dtype=torch.int32),  # ring_start
+        torch.zeros(cache_size, dtype=torch.int32),  # previous tokens
+        None,  # D
+        None,  # z
+        None,  # dt_bias
+        torch.arange(batch, dtype=torch.int32),  # state_batch_indices
+        torch.empty(cache_size, nheads, head_dim),  # state_scale
+        None,  # rand_seed
+        cu_seqlens,
+        torch.empty(batch, nheads, 32, 2),  # cb_scaled
+        torch.empty(batch, nheads, 16),  # cumAdt_vec
+        torch.empty(batch, nheads, 32, 8),  # cb_old
+    ]
+
+
+@pytest.mark.parametrize(
+    "heads_per_group, expected", [(16, (16, 8, 4, 2, 1)), (14, (14, 7, 1))]
+)
+def test_autotune_tactics_are_explicit_valid_divisors(heads_per_group, expected):
+    assert _heads_per_cta_candidates(heads_per_group) == expected
+    tactics = _make_tactics(heads_per_group)
+    assert len(tactics) == 1 + 2 * 5 * len(expected)
+    assert tactics[0] == (1, 0, 0, 0)
+    assert all(tactic[3] > 0 for tactic in tactics[1:])
+    assert all(heads_per_group % tactic[3] == 0 for tactic in tactics[1:])
+
+
+@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
+def test_autotune_profiles_compact_cache_capacity(varlen):
+    batch = 4
+    inputs = _make_autotune_config_inputs(batch=batch, varlen=varlen)
+    other_capacity_inputs = _make_autotune_config_inputs(
+        cache_size=73, batch=batch, varlen=varlen
+    )
+    config = _checkpointing_ssu_tuning_config(inputs)
+    other_config = _checkpointing_ssu_tuning_config(other_capacity_inputs)
+    shapes = tuple(
+        tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else (0,)
+        for tensor in inputs
+    )
+    other_shapes = tuple(
+        tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else (0,)
+        for tensor in other_capacity_inputs
+    )
+    nearest = AutoTuner._find_nearest_profile(shapes, config)
+    other_nearest = AutoTuner._find_nearest_profile(other_shapes, other_config)
+    cache_inputs = (0, 7, 8, 9, 10, 11, 16)
+    assert nearest == other_nearest
+    assert all(nearest[index][0] == -1 for index in cache_inputs)
+
+    profiles = AutoTuner.get()._generate_optimization_profiles(config, inputs)
+    profile = (
+        profiles[0]
+        if varlen
+        else next(
+            candidate
+            for candidate in profiles
+            if candidate.get_opt_shapes()[1][0] == batch
+        )
+    )
+    profile_shapes = profile.get_opt_shapes()
+    assert all(profile_shapes[index][0] == batch + 1 for index in cache_inputs)
+
+
+def test_varlen_profile_hook_preserves_live_state_batch_indices():
+    inputs = _make_autotune_config_inputs(varlen=True)
+    live_indices = inputs[15].clone()
+    prepared = _prepare_checkpointing_ssu_profile_inputs(inputs)
+    torch.testing.assert_close(inputs[15], live_indices, rtol=0, atol=0)
+    torch.testing.assert_close(
+        prepared[15], torch.arange(1, 5, dtype=torch.int32), rtol=0, atol=0
+    )
+    assert prepared[15].data_ptr() != inputs[15].data_ptr()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda"))[0] < 8,
+    reason="checkpointing SSU autotuning requires an SM80+ CUDA GPU",
+)
 @pytest.mark.parametrize("T", [1, 6])
-def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
+def test_autotune_cache_hit_matches_tuning_call(tmp_path, request, T):
     """Profiling must not mutate live recurrent state before the selected call.
 
     The first call profiles every runtime tactic and saves its winner.  The
@@ -618,7 +728,7 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     device = "cuda"
     act_dtype = torch.bfloat16
     batch = 2
-    cache_size = batch + 1  # slot zero is reserved for padding
+    cache_size = 17  # much larger than the active batch; profiling stays batch + 1
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     max_window = 16
     ring_len = max_window + T
@@ -652,8 +762,10 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
         cache_size, nheads, ring_len, dtype=torch.float32, device=device
     )
     ring_start0 = torch.arange(cache_size, dtype=torch.int32, device=device)
-    prev0 = torch.tensor([0, max_window, max_window // 2], device=device).to(
-        torch.int32
+    prev0 = (
+        (torch.arange(cache_size, device=device) * (max_window // 2))
+        .remainder(max_window + 1)
+        .to(torch.int32)
     )
     state_batch_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
     x = torch.randn(batch, T, nheads, head_dim, dtype=act_dtype, device=device)
@@ -722,6 +834,7 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
 
     tuner = AutoTuner.get()
     tuner.clear_cache()
+    request.addfinalizer(tuner.clear_cache)
     cache_path = tmp_path / "checkpointing_ssu_autotune.json"
     tuned_args, tuned_kwargs = _inputs()
     warm_args, warm_kwargs = _inputs()
@@ -733,22 +846,27 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     assert len(tuner.profiling_cache) == 1
     selected_tactic = next(iter(tuner.profiling_cache.values()))[0]
     assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
+    assert selected_tactic[0] == 1 or selected_tactic[3] > 0
 
     for tuned, warm in zip(tuned_args[:4], warm_args[:4], strict=True):
-        torch.testing.assert_close(warm, tuned, rtol=2e-2, atol=5e-1)
-    torch.testing.assert_close(
-        warm_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
-    )
+        torch.testing.assert_close(warm, tuned, rtol=0, atol=0)
+    torch.testing.assert_close(warm_kwargs["out"], tuned_kwargs["out"], rtol=0, atol=0)
 
     tuner.clear_cache()
     cached_args, cached_kwargs = _inputs()
     with autotune(False, cache=str(cache_path), tuning_buckets=(batch,)):
         checkpointing_ssu(*cached_args, **cached_kwargs)
+    loaded_tactics = [
+        tactic
+        for runner_name, tactic in tuner._file_configs.values()
+        if runner_name == "CheckpointingSSURunner"
+    ]
+    assert loaded_tactics == [selected_tactic]
 
     for tuned, cached in zip(tuned_args[:4], cached_args[:4], strict=True):
-        torch.testing.assert_close(cached, tuned, rtol=2e-2, atol=5e-1)
+        torch.testing.assert_close(cached, tuned, rtol=0, atol=0)
     torch.testing.assert_close(
-        cached_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
+        cached_kwargs["out"], tuned_kwargs["out"], rtol=0, atol=0
     )
 
 
