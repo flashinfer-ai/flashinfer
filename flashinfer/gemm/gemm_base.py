@@ -2940,7 +2940,14 @@ def execute_cudnn_gemm_fp4_graph(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace_buffer = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace_buffer = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace_buffer.device
         )
 
@@ -3184,7 +3191,14 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
@@ -3277,7 +3291,14 @@ def execute_cudnn_gemm_mxfp8_graph(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace_buffer = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace_buffer = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace_buffer.device
         )
 
@@ -3509,7 +3530,14 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
@@ -3637,7 +3665,14 @@ def execute_cudnn_gemm_fp8_graph(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
@@ -3785,7 +3820,14 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
@@ -4089,7 +4131,14 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
@@ -4274,7 +4323,14 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         # Satisfy oversized requests with a call-local buffer instead;
         # stream-ordered allocation keeps eager mode safe, and during
         # capture the buffer is owned by the capturing graph's pool.
-        workspace = torch.empty(
+        # The buffer must be ZERO-initialized: cuDNN split-K plans keep
+        # completion semaphores in the workspace, and a kernel handed a
+        # recycled dirty block spins on garbage semaphore values (observed
+        # as an indefinite 100%-utilization GPU hang; with
+        # CUDA_LAUNCH_BLOCKING=1 it surfaces as CUDA error 702). During
+        # capture the zero-fill is captured too, so replays re-arm the
+        # semaphores.
+        workspace = torch.zeros(
             workspace_size, dtype=torch.uint8, device=workspace.device
         )
 
