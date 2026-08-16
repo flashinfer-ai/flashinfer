@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from .io import atomic_write_json, atomic_write_text
-from .junit import validate_batch_xml
+from .junit import TIMEOUT_DIAGNOSTIC, validate_batch_xml
 from .models import Batch, Plan, Unit
 from .planner import CapacityMetrics, capacity_metrics
 from .state import AttemptRecord, list_attempts, load_attempt, state_lock
@@ -705,7 +705,16 @@ def _failure_detail_lines(
     if not failed_nodes:
         return []
     lines = [_TERMINAL_SEPARATOR, "FAILED TEST NODES", _TERMINAL_SEPARATOR]
+    timeout_failures: list[FailedNodeSummary] = []
+    regular_failures: list[FailedNodeSummary] = []
     for failure in failed_nodes:
+        diagnostic = str(failure["diagnostic"])
+        if failure["synthetic"] and diagnostic.strip() == TIMEOUT_DIAGNOSTIC:
+            timeout_failures.append(failure)
+        else:
+            regular_failures.append(failure)
+
+    for failure in regular_failures:
         diagnostic = str(failure["diagnostic"])
         encoded = diagnostic.encode("utf-8")
         truncated = len(encoded) > diagnostic_limit
@@ -726,6 +735,10 @@ def _failure_detail_lines(
                 f"    junit: {failure['junit_path']}",
             ]
         )
+    if timeout_failures:
+        count = len(timeout_failures)
+        noun = "node" if count == 1 else "nodes"
+        lines.append(f"  {TIMEOUT_DIAGNOSTIC.capitalize()} ({count} {noun})")
     return lines
 
 

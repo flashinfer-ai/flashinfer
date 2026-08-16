@@ -11,6 +11,9 @@ from .io import atomic_write_xml
 from .models import base_function_for_nodeid, source_file_for_nodeid
 
 
+TIMEOUT_DIAGNOSTIC = "not executed due to timeout"
+
+
 @dataclass(frozen=True)
 class TestCaseResult:
     nodeid: str
@@ -228,9 +231,9 @@ def create_synthetic_batch_xml(
         result = ET.SubElement(
             testcase,
             result_tag,
-            message="not executed due to timeout",
+            message=TIMEOUT_DIAGNOSTIC,
         )
-        result.text = "not executed due to timeout"
+        result.text = TIMEOUT_DIAGNOSTIC
     root = ET.Element(
         "testsuites",
         tests=str(len(nodeids)),
