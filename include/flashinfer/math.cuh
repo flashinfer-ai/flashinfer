@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cuda/std/limits>
 
 namespace flashinfer {
 namespace math {
@@ -30,7 +31,14 @@ constexpr float log2e = 1.44269504088896340736f;
 
 constexpr float loge2 = 0.693147180559945309417f;
 
-constexpr float inf = 5e4;
+// Infinity used to represent masked-out attention logits. True IEEE infinity
+// (rather than a finite sentinel such as the historical -5e4) is required so
+// that a legitimate logit below any fixed threshold still dominates every
+// masked position. Online-softmax code paths that consume -inf masked logits
+// clamp their exponent differences at -inf (see update_mdo_states and
+// state_t::merge) so that a fully masked row contributes zero instead of
+// propagating (-inf) - (-inf) = NaN.
+constexpr float inf = cuda::std::numeric_limits<float>::infinity();
 
 __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&x; }
 

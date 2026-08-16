@@ -101,11 +101,13 @@ __device__ __forceinline__ void compute_qk(
   }
 
   if constexpr (variant.use_softmax) {
-    float o_scale = math::ptx_exp2(m_prev - st.m);
+    // A fully masked tile leaves st.m at -inf; clamp the exponent differences
+    // at -inf so the tile contributes zero instead of (-inf) - (-inf) = NaN.
+    float o_scale = math::ptx_exp2(max(m_prev - st.m, -math::inf));
     st.d *= o_scale;
 #pragma unroll
     for (uint32_t j = 0; j < tile_size; ++j) {
-      s[j] = math::ptx_exp2(s[j] - st.m);
+      s[j] = math::ptx_exp2(max(s[j] - st.m, -math::inf));
       st.d += s[j];
     }
 #pragma unroll
@@ -864,11 +866,13 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     st.m = max(st.m, s[j]);
   }
 
-  float o_scale = math::ptx_exp2(m_prev - st.m);
+  // Clamp at -inf so a fully masked tile contributes zero instead of
+  // (-inf) - (-inf) = NaN (see update_mdo_states in prefill.cuh).
+  float o_scale = math::ptx_exp2(max(m_prev - st.m, -math::inf));
   st.d *= o_scale;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
-    s[j] = math::ptx_exp2(s[j] - st.m);
+    s[j] = math::ptx_exp2(max(s[j] - st.m, -math::inf));
     st.d += s[j];
   }
 #pragma unroll

@@ -576,14 +576,16 @@ __device__ __forceinline__ void update_md_(typename KTraits::SharedStorage* smem
 
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    o_scale[j] = math::ptx_exp2(m_prev[j] * sm_scale - m[j] * sm_scale);
+    // Clamp at -inf so fully masked rows contribute zero instead of
+    // (-inf) - (-inf) = NaN (see update_mdo_states in prefill.cuh).
+    o_scale[j] = math::ptx_exp2(max(m_prev[j] * sm_scale - m[j] * sm_scale, -math::inf));
     float d_local = 0.f;
 #pragma unroll
     for (uint32_t k = 0; k < KTraits::NUM_REGS_S_FRAG / 4; ++k) {
       s_frag[k * 4 + j * 2 + 0] =
-          math::ptx_exp2(s_frag[k * 4 + j * 2 + 0] * sm_scale - m[j] * sm_scale);
+          math::ptx_exp2(max(s_frag[k * 4 + j * 2 + 0] * sm_scale - m[j] * sm_scale, -math::inf));
       s_frag[k * 4 + j * 2 + 1] =
-          math::ptx_exp2(s_frag[k * 4 + j * 2 + 1] * sm_scale - m[j] * sm_scale);
+          math::ptx_exp2(max(s_frag[k * 4 + j * 2 + 1] * sm_scale - m[j] * sm_scale, -math::inf));
 
       d_local += s_frag[k * 4 + j * 2 + 0] + s_frag[k * 4 + j * 2 + 1];
     }
