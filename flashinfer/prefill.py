@@ -4392,9 +4392,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(
-            q, k, v, return_lse_base_on_e=return_lse_base_on_e
-        )
+        return self.run_return_lse(q, k, v, return_lse_base_on_e=return_lse_base_on_e)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

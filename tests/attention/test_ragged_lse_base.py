@@ -60,11 +60,21 @@ def test_ragged_lse_base_on_e(prefix_len):
     extend_len = 16
     sm_scale = head_dim_qk**-0.5
 
-    q = torch.randn(extend_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev)
-    k_pre = torch.randn(prefix_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev)
-    v_pre = torch.randn(prefix_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=dev)
-    k_ext = torch.randn(extend_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev)
-    v_ext = torch.randn(extend_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=dev)
+    q = torch.randn(
+        extend_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev
+    )
+    k_pre = torch.randn(
+        prefix_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev
+    )
+    v_pre = torch.randn(
+        prefix_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=dev
+    )
+    k_ext = torch.randn(
+        extend_len, num_heads, head_dim_qk, dtype=torch.bfloat16, device=dev
+    )
+    v_ext = torch.randn(
+        extend_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=dev
+    )
 
     workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev)
 
@@ -109,7 +119,9 @@ def test_ragged_lse_base_on_e(prefix_len):
     )
     _, lse_ext_true = _torch_attn_lse(q, k_ext, v_ext, True, sm_scale)
     default_vs_ln = (lse_ext_default - lse_ext_true).abs().max().item()
-    default_vs_log2 = (lse_ext_default - lse_ext_true * math.log2(math.e)).abs().max().item()
+    default_vs_log2 = (
+        (lse_ext_default - lse_ext_true * math.log2(math.e)).abs().max().item()
+    )
     assert default_vs_log2 < 1e-3 and default_vs_ln > 0.1, (
         f"default LSE should be base-2 (vs log2 err={default_vs_log2:.2e}, "
         f"vs ln err={default_vs_ln:.2e})"
@@ -117,7 +129,9 @@ def test_ragged_lse_base_on_e(prefix_len):
 
     # 2) with the flag: LSE must be natural-log.
     flag_vs_ln = (lse_ext - lse_ext_true).abs().max().item()
-    assert flag_vs_ln < 1e-2, f"flagged LSE should be natural-log (err={flag_vs_ln:.2e})"
+    assert flag_vs_ln < 1e-2, (
+        f"flagged LSE should be natural-log (err={flag_vs_ln:.2e})"
+    )
 
     # 3) merge with natural-log LSE matches the full-sequence result; merging the
     #    raw base-2 LSE with a base-e merge consumer does not.
