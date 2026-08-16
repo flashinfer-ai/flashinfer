@@ -15,13 +15,35 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..autotuner import (
+    AutoTuner,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+    autotuner_initializer_empty,
+)
+from ..fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
+)
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 from ..utils import register_custom_op, register_fake_op
+
+
+_ALGORITHM_AUTO = 0
+_ALGORITHM_MONOLITH = 1
+_ALGORITHM_TWO_KERNEL = 2
+_AUTOTUNE_CACHE_SCHEMA_VERSION = 2
+
+# A tactic is (algorithm, main pipeline stages, main CTAs/SM,
+# precompute heads/CTA).  Monolithic tactics ignore the latter three values.
+_CheckpointingSSUTactic = tuple[int, int, int, int]
 
 
 @functools.cache
@@ -64,6 +86,338 @@ def _get_module(
         philox_rounds,
         enable_pdl,
     ).build_and_load()
+
+
+def _heads_per_cta_candidates(heads_per_group: int) -> tuple[int, ...]:
+    """Return the complete ``HEADS_PER_GROUP >> k`` launch chain."""
+    candidates = []
+    value = heads_per_group
+    while value > 0:
+        candidates.append(value)
+        value >>= 1
+    return tuple(candidates)
+
+
+def _make_tactics(heads_per_group: int) -> tuple[_CheckpointingSSUTactic, ...]:
+    """Build the exhaustive runtime-only ReplaySSM tactic space."""
+    precompute_tactics = (0, *_heads_per_cta_candidates(heads_per_group))
+    return (
+        (_ALGORITHM_MONOLITH, 0, 0, 0),
+        *(
+            (_ALGORITHM_TWO_KERNEL, stages, ctas_per_sm, heads_per_cta)
+            for stages in (1, 2)
+            for ctas_per_sm in (1, 2, 4, 8, 16)
+            for heads_per_cta in precompute_tactics
+        ),
+    )
+
+
+def _initialize_broadcast_dt(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Create ``dt`` with the production stride-0 head-dimension broadcast."""
+    base = torch.zeros(shape[:-1], dtype=dtype, device=device)
+    return base.unsqueeze(-1).expand(shape)
+
+
+def _initialize_state_batch_indices(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    return torch.arange(shape[0], dtype=dtype, device=device)
+
+
+def _clone_preserve_strides(tensor: torch.Tensor) -> torch.Tensor:
+    clone = torch.empty_strided(
+        tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
+    )
+    clone.copy_(tensor)
+    return clone
+
+
+def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
+    """Detach autotuning from live recurrent state and install a mixed history."""
+    prepared = list(inputs)
+
+    # State, caches, output, quantization scales, and two-kernel scratch are
+    # mutated by checkpointing_ssu.  Static inputs otherwise alias the caller's
+    # tensors, so give the profiler private copies before trying any tactic.
+    for index in (0, 6, 7, 8, 9, 10, 11, 16, 19, 20, 21):
+        tensor = prepared[index]
+        if isinstance(tensor, torch.Tensor):
+            prepared[index] = _clone_preserve_strides(tensor)
+
+    state = prepared[0]
+    x = prepared[1]
+    x_cache = prepared[7]
+    ring_start = prepared[10]
+    prev_num_accepted_tokens = prepared[11]
+    state_batch_indices = prepared[15]
+    cu_seqlens = prepared[18]
+    batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
+
+    if state_batch_indices is not None:
+        # Prefer slots [1, batch] when the cache has a spare slot, matching
+        # serving runtimes that reserve slot zero for padding.  Fall back to
+        # [0, batch) for exact-capacity standalone calls.
+        start = 1 if state.size(0) >= batch + 1 else 0
+        state_batch_indices.copy_(
+            torch.arange(
+                start,
+                start + batch,
+                dtype=state_batch_indices.dtype,
+                device=state_batch_indices.device,
+            )
+        )
+
+    if cu_seqlens is None:
+        ring_len = x_cache.size(2)
+        max_window = ring_len - x.size(1)
+        slots = torch.arange(
+            ring_start.numel(), dtype=torch.int64, device=ring_start.device
+        )
+        ring_start.copy_((slots % ring_len).to(ring_start.dtype))
+        prev_num_accepted_tokens.copy_(
+            ((slots * max_window) % (max_window + 1)).to(prev_num_accepted_tokens.dtype)
+        )
+    return prepared
+
+
+def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
+    """Describe the dense decode batch dimension to the FlashInfer tuner."""
+    z, state_batch_indices, cu_seqlens = inputs[13], inputs[15], inputs[18]
+    dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
+    tensor_initializers: list[tuple[int, Any]] = []
+
+    # Dense ReplaySSM has a single linked batch dimension.  Packed varlen calls
+    # retain an exact-shape profile because total tokens and batch are separate
+    # degrees of freedom encoded by cu_seqlens.
+    if cu_seqlens is None:
+        batch_inputs = [1, 2, 4, 5, 6, 19, 20, 21]
+        if z is not None:
+            batch_inputs.append(13)
+        if state_batch_indices is not None:
+            batch_inputs.append(15)
+        dynamic_specs = (
+            DynamicTensorSpec(
+                input_idx=tuple(batch_inputs),
+                dim_idx=(0,) * len(batch_inputs),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+            ),
+        )
+        tensor_initializers.extend(
+            (
+                (2, _initialize_broadcast_dt),
+                (6, autotuner_initializer_empty),
+                (19, autotuner_initializer_empty),
+                (20, autotuner_initializer_empty),
+                (21, autotuner_initializer_empty),
+            )
+        )
+        if state_batch_indices is not None:
+            tensor_initializers.append((15, _initialize_state_batch_indices))
+
+    # Recurrent state and ring caches can fit in L2 at smaller batches. Reusing
+    # one pointer across all repeats then measures an unrealistically hot state
+    # and can select a tactic that loses after the serving runtime has touched
+    # the rest of the model. Cycle graph-stable, contiguous tensor lanes so the
+    # candidate comparison includes the production-scale cache footprint while
+    # leaving tied stride-0 tensors (dt/A/D/dt_bias) untouched.
+    profile_arena_candidates = (
+        0,
+        1,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        15,
+        16,
+        18,
+        19,
+        20,
+        21,
+    )
+    profile_arena_inputs = tuple(
+        index
+        for index in profile_arena_candidates
+        if isinstance(inputs[index], torch.Tensor) and inputs[index].is_contiguous()
+    )
+
+    return TuningConfig(
+        dynamic_tensor_specs=dynamic_specs,
+        tensor_initializers=tuple(tensor_initializers),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+        profile_arena_input_indices=profile_arena_inputs,
+        inputs_pre_hook=_prepare_checkpointing_ssu_profile_inputs,
+    )
+
+
+class CheckpointingSSURunner(TunableRunner):
+    """Runtime ReplaySSM tactic runner following FlashInfer's tuner contract."""
+
+    def __init__(
+        self,
+        module_base_args: tuple[Any, ...],
+        *,
+        dt_softplus: bool,
+        pad_slot_id: int,
+        requested_algorithm: int,
+        requested_d_split: int,
+        precompute_heads_per_cta: int,
+        main_pipeline_stages: int,
+        main_ctas_per_sm: int,
+        heads_per_group: int,
+    ) -> None:
+        self._module_base_args = module_base_args
+        self._dt_softplus = dt_softplus
+        self._pad_slot_id = pad_slot_id
+        self._requested_algorithm = requested_algorithm
+        self._requested_d_split = requested_d_split
+        self._precompute_heads_per_cta = precompute_heads_per_cta
+        self._main_pipeline_stages = main_pipeline_stages
+        self._main_ctas_per_sm = main_ctas_per_sm
+        self._tactics = _make_tactics(heads_per_group)
+
+    @staticmethod
+    def _batch(inputs: list[Any]) -> int:
+        cu_seqlens = inputs[18]
+        return cu_seqlens.numel() - 1 if cu_seqlens is not None else inputs[1].size(0)
+
+    @staticmethod
+    def _two_kernel_supported(inputs: list[Any]) -> bool:
+        state, x = inputs[0], inputs[1]
+        return (
+            inputs[19] is not None
+            and inputs[20] is not None
+            and inputs[21] is not None
+            and state.element_size() in (2, 4)
+            and x.element_size() == 2
+        )
+
+    def get_valid_tactics(
+        self, inputs: list[torch.Tensor], profile: OptimizationProfile
+    ) -> list[_CheckpointingSSUTactic]:
+        del profile
+        batch = self._batch(inputs)
+        state_capacity = inputs[0].size(0)
+        if batch > state_capacity:
+            return []
+        if not self._two_kernel_supported(inputs):
+            return [self._tactics[0]]
+        return list(self._tactics)
+
+    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        stride_signature = tuple(
+            None if inputs[index] is None else tuple(inputs[index].stride())
+            for index in (1, 2, 4, 5, 6, 13, 15, 19, 20, 21)
+        )
+        return (
+            _AUTOTUNE_CACHE_SCHEMA_VERSION,
+            self._module_base_args,
+            self._dt_softplus,
+            self._pad_slot_id,
+            self._requested_d_split,
+            tuple(inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)),
+            stride_signature,
+        )
+
+    def _resolve_fallback_algorithm(self, inputs: list[Any]) -> int:
+        if self._requested_algorithm != _ALGORITHM_AUTO:
+            return self._requested_algorithm
+        state, x = inputs[0], inputs[1]
+        if self._two_kernel_supported(inputs) and self._batch(inputs) * state.size(
+            1
+        ) >= _sm_count(x.device):
+            return _ALGORITHM_TWO_KERNEL
+        return _ALGORITHM_MONOLITH
+
+    def _resolve_d_split(self, inputs: list[Any], algorithm: int) -> int:
+        if self._requested_d_split != 0:
+            return self._requested_d_split
+        state = inputs[0]
+        dim = state.size(2)
+        d_split = 1
+        if (
+            algorithm == _ALGORITHM_MONOLITH
+            and state.dtype == torch.float32
+            and dim % 2 == 0
+            and dim // 2 >= 32
+            and self._batch(inputs) * state.size(1) <= 8 * _sm_count(state.device)
+        ):
+            d_split = 2
+        return d_split
+
+    def forward(
+        self,
+        inputs: list[Any],
+        tactic: _CheckpointingSSUTactic | int = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        if do_preparation:
+            _get_module(*self._module_base_args)
+            return
+
+        if tactic == -1:
+            algorithm = self._resolve_fallback_algorithm(inputs)
+            precompute_heads_per_cta = self._precompute_heads_per_cta
+            main_pipeline_stages = self._main_pipeline_stages
+            main_ctas_per_sm = self._main_ctas_per_sm
+        else:
+            if not isinstance(tactic, tuple) or tactic not in self._tactics:
+                raise ValueError(f"Unknown checkpointing SSU tactic: {tactic}")
+            (
+                algorithm,
+                main_pipeline_stages,
+                main_ctas_per_sm,
+                precompute_heads_per_cta,
+            ) = tactic
+
+        two_kernel = algorithm == _ALGORITHM_TWO_KERNEL
+        if two_kernel and not self._two_kernel_supported(inputs):
+            raise ValueError(
+                "two-kernel checkpointing SSU requires its scratch trio, "
+                "2-byte input, and 2- or 4-byte state"
+            )
+        d_split = self._resolve_d_split(inputs, algorithm)
+        module = _get_module(*self._module_base_args)
+        module.checkpointing_ssu(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            inputs[6],
+            inputs[7],
+            inputs[8],
+            inputs[9],
+            inputs[10],
+            inputs[11],
+            inputs[12],
+            inputs[13],
+            inputs[14],
+            self._dt_softplus,
+            inputs[15],
+            self._pad_slot_id,
+            inputs[16],
+            inputs[17],
+            d_split,
+            inputs[18],
+            inputs[19] if two_kernel else None,
+            inputs[20] if two_kernel else None,
+            inputs[21] if two_kernel else None,
+            precompute_heads_per_cta,
+            main_pipeline_stages,
+            main_ctas_per_sm,
+        )
 
 
 @register_custom_op(
@@ -110,6 +464,7 @@ def _checkpointing_ssu(
     precompute_heads_per_cta: int,
     main_pipeline_stages: int,
     main_ctas_per_sm: int,
+    algorithm: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -126,7 +481,7 @@ def _checkpointing_ssu(
     num_groups: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
-    module = _get_module(
+    module_base_args = (
         state_dtype,
         input_dtype,
         dt_dtype,
@@ -143,7 +498,7 @@ def _checkpointing_ssu(
         philox_rounds,
         enable_pdl,
     )
-    module.checkpointing_ssu(
+    inputs = [
         state,
         x,
         dt,
@@ -159,20 +514,48 @@ def _checkpointing_ssu(
         D,
         z,
         dt_bias,
-        dt_softplus,
         state_batch_indices,
-        pad_slot_id,
         state_scale,
         rand_seed,
-        d_split,
         cu_seqlens,
         cb_scaled,
         cumAdt_vec,
         cb_old,
-        precompute_heads_per_cta,
-        main_pipeline_stages,
-        main_ctas_per_sm,
+    ]
+    runner = CheckpointingSSURunner(
+        module_base_args,
+        dt_softplus=dt_softplus,
+        pad_slot_id=pad_slot_id,
+        requested_algorithm=algorithm,
+        requested_d_split=d_split,
+        precompute_heads_per_cta=precompute_heads_per_cta,
+        main_pipeline_stages=main_pipeline_stages,
+        main_ctas_per_sm=main_ctas_per_sm,
+        heads_per_group=heads_per_group,
     )
+
+    # Explicit launch controls are an opt-out used by tests and benchmark
+    # sweeps.  Pure "auto" calls with two-kernel scratch follow the same
+    # TunableRunner/choose_one contract as other FlashInfer tuned operations.
+    tune = (
+        algorithm == _ALGORITHM_AUTO
+        and cb_scaled is not None
+        and cumAdt_vec is not None
+        and cb_old is not None
+        and precompute_heads_per_cta == 0
+        and main_pipeline_stages == 0
+        and main_ctas_per_sm == 0
+    )
+    if tune:
+        runner, tactic = AutoTuner.get().choose_one(
+            "checkpointing_ssu",
+            [runner],
+            _checkpointing_ssu_tuning_config(inputs),
+            inputs,
+        )
+        runner(inputs, tactic=tactic)
+    else:
+        runner(inputs, tactic=-1)
 
 
 @register_fake_op("flashinfer::checkpointing_ssu")
@@ -205,6 +588,7 @@ def _checkpointing_ssu_fake(
     precompute_heads_per_cta: int,
     main_pipeline_stages: int,
     main_ctas_per_sm: int,
+    algorithm: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -339,14 +723,15 @@ def checkpointing_ssu(
         Tuning knob — ignored by the monolithic path.
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
-        ``"auto"`` runs the two-kernel split iff the scratch quartet is provided AND
-        ``batch * nheads >= sm_count``.  The crossover collapses in
-        ``batch * nheads`` across nheads (measured at TP 8/4/2) and state widths:
-        the monolith wins <= 128 work-units and the split wins from 256 on a
-        148-SM B200 (mixed-PNAT + conv1d/PDL bench; ties take the split).
-        ``"two-kernel"`` forces the split (scratch quartet required); ``"monolith"``
-        forces the monolith (scratch ignored).  Benches/tests that must pin the
-        path should force it.
+        With the scratch trio and no explicit tuning knobs, ``"auto"`` uses
+        FlashInfer's cached autotuner tactic.  Inside an ``autotune(True)``
+        context, it profiles monolithic against every supported combination of
+        precompute heads/CTA, main pipeline stages, and main CTAs/SM.  Without a
+        cached tactic it retains the production fallback: use the split when
+        ``batch * nheads >= sm_count`` and otherwise use monolithic.
+        ``"two-kernel"`` forces the split (scratch trio required), while
+        ``"monolith"`` forces the monolithic kernel (scratch ignored).
+        Benches and tests that must pin a path should force it.
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
@@ -500,29 +885,20 @@ def checkpointing_ssu(
             f"cb_scaled set={cb_scaled is not None}, "
             f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
         )
-    batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
     nheads = state.size(1)
     assert algorithm in ("auto", "monolith", "two-kernel"), (
         f"algorithm must be one of 'auto', 'monolith', 'two-kernel'; got {algorithm!r}"
     )
-    if algorithm == "auto":
-        # Crossover collapses in batch*nheads across nheads∈{16,32,64} (TP 8/4/2)
-        # and state widths {2,4} B once the main runs its stg1/cps16 default:
-        # monolith wins ≤128 work-units, the split wins from 256 (mixed-PNAT bench
-        # with conv1d+PDL — the production shape; B200, 148 SMs; see
-        # .plans/ssu_persistent_main.md).  Threshold 1 unit/SM splits the gap;
-        # ties take the split.
-        two_kernel = scratch_provided and batch * nheads >= _sm_count(state.device)
-    else:
-        two_kernel = algorithm == "two-kernel"
-        if two_kernel and not scratch_provided:
-            raise ValueError(
-                "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old/"
-                "scratch trio (got none) — allocate them or use "
-                "'auto'/'monolith'"
-            )
-    if not two_kernel:
-        cb_scaled = cumAdt_vec = cb_old = None
+    algorithm_int = {
+        "auto": _ALGORITHM_AUTO,
+        "monolith": _ALGORITHM_MONOLITH,
+        "two-kernel": _ALGORITHM_TWO_KERNEL,
+    }[algorithm]
+    if algorithm_int == _ALGORITHM_TWO_KERNEL and not scratch_provided:
+        raise ValueError(
+            "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old/"
+            "scratch trio (got none) — allocate them or use 'auto'/'monolith'"
+        )
 
     # ── d_split selection (v12 §59) ──
     # Auto-heuristic, measured on B200 (mixed-batch bench): d_split=2 pays
@@ -537,24 +913,20 @@ def checkpointing_ssu(
     #       nheads=16 on 148 SMs → threshold 8 × SM count.
     # d_split=4 is deferred to v12.x (needs warp-count restructure for
     # output MMA).
-    if d_split is None:
-        d_split = 1
-        if (
-            not two_kernel  # monolith only — 2k main measured worse at DS=2 (ncu v30)
-            and state.dtype == torch.float32
-            and dim % 2 == 0
-            and dim // 2 >= 32
-            and batch * nheads <= 8 * _sm_count(state.device)
-        ):
-            d_split = 2
-    assert d_split in (1, 2), (
-        f"d_split must be in {{1, 2}} for v12 (d_split=4 deferred), got {d_split}"
-    )
-    assert dim % d_split == 0, f"dim={dim} must be divisible by d_split={d_split}"
-    assert dim // d_split >= 32, (
-        f"d_split={d_split} gives D_PER_CTA={dim // d_split} < 32 "
-        "(output MMA m16n8 floor with _1×4 warp layout)"
-    )
+    requested_d_split = 0 if d_split is None else d_split
+    if requested_d_split != 0:
+        assert requested_d_split in (1, 2), (
+            "d_split must be in {1, 2} for v12 "
+            f"(d_split=4 deferred), got {requested_d_split}"
+        )
+        assert dim % requested_d_split == 0, (
+            f"dim={dim} must be divisible by d_split={requested_d_split}"
+        )
+        assert dim // requested_d_split >= 32, (
+            f"d_split={requested_d_split} gives "
+            f"D_PER_CTA={dim // requested_d_split} < 32 "
+            "(output MMA m16n8 floor with _1×4 warp layout)"
+        )
 
     stateIndex_dtype = torch.int32
     if state_batch_indices is not None:
@@ -605,7 +977,7 @@ def checkpointing_ssu(
         pad_slot_id,
         state_scale,
         rand_seed,
-        d_split,
+        requested_d_split,
         cu_seqlens,
         cb_scaled,
         cumAdt_vec,
@@ -613,6 +985,7 @@ def checkpointing_ssu(
         precompute_heads_per_cta,
         main_pipeline_stages,
         main_ctas_per_sm,
+        algorithm_int,
         enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,

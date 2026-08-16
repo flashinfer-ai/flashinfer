@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import triton
 from einops import repeat
 
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.utils import is_cvt_rs_supported
 
@@ -602,6 +603,153 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
             )
+
+
+@pytest.mark.parametrize("T", [1, 6])
+def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
+    """Profiling must not mutate live recurrent state before the selected call.
+
+    The first call profiles every runtime tactic and saves its winner.  The
+    second starts from identical tensors, reloads the file cache, and executes
+    only that winner.  Matching postconditions prove the tuning fixture used
+    private state/caches and that the serialized compound tactic is replayed.
+    T=1 covers single-token prediction and T=6 covers an MTP-shaped call.
+    """
+    device = "cuda"
+    act_dtype = torch.bfloat16
+    batch = 2
+    cache_size = batch + 1  # slot zero is reserved for padding
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    max_window = 16
+    ring_len = max_window + T
+
+    torch.manual_seed(123)
+    state0 = torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        d_state,
+        dtype=torch.float32,
+        device=device,
+    )
+    x_cache0 = torch.randn(
+        cache_size,
+        nheads,
+        ring_len,
+        head_dim,
+        dtype=act_dtype,
+        device=device,
+    )
+    B_cache0 = torch.randn(
+        cache_size,
+        ngroups,
+        ring_len,
+        d_state,
+        dtype=act_dtype,
+        device=device,
+    )
+    dt_cache0 = torch.rand(
+        cache_size, nheads, ring_len, dtype=torch.float32, device=device
+    )
+    ring_start0 = torch.arange(cache_size, dtype=torch.int32, device=device)
+    prev0 = torch.tensor([0, max_window, max_window // 2], device=device).to(
+        torch.int32
+    )
+    state_batch_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
+    x = torch.randn(batch, T, nheads, head_dim, dtype=act_dtype, device=device)
+    dt_base = torch.randn(batch, T, nheads, dtype=act_dtype, device=device)
+    B = torch.randn(batch, T, ngroups, d_state, dtype=act_dtype, device=device)
+    C = torch.randn_like(B)
+    A = (
+        (-torch.rand(nheads, dtype=torch.float32, device=device) - 0.5)
+        .view(nheads, 1, 1)
+        .expand(nheads, head_dim, d_state)
+    )
+    D = torch.randn(nheads, 1, dtype=act_dtype, device=device).expand(nheads, head_dim)
+    dt_bias = torch.randn(nheads, 1, dtype=act_dtype, device=device).expand(
+        nheads, head_dim
+    )
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _inputs():
+        state = state0.clone()
+        x_cache = x_cache0.clone()
+        B_cache = B_cache0.clone()
+        dt_cache = dt_cache0.clone()
+        out = torch.empty_like(x)
+        checkpointing_ssu_args = (
+            state,
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start0.clone(),
+            prev0.clone(),
+        )
+        checkpointing_ssu_kwargs = dict(
+            x=x.clone(),
+            dt=dt_base.clone().unsqueeze(-1).expand(batch, T, nheads, head_dim),
+            A=A,
+            B=B.clone(),
+            C=C.clone(),
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices.clone(),
+            pad_slot_id=0,
+            cb_scaled=torch.empty(
+                batch,
+                nheads,
+                WARP_SIZE,
+                MMA_FRAG_SIZE,
+                dtype=act_dtype,
+                device=device,
+            ),
+            cumAdt_vec=torch.empty(
+                batch, nheads, 16, dtype=torch.float32, device=device
+            ),
+            cb_old=torch.empty(
+                batch,
+                nheads,
+                WARP_SIZE,
+                k_old // 2,
+                dtype=act_dtype,
+                device=device,
+            ),
+            algorithm="auto",
+        )
+        return checkpointing_ssu_args, checkpointing_ssu_kwargs
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    cache_path = tmp_path / "checkpointing_ssu_autotune.json"
+    tuned_args, tuned_kwargs = _inputs()
+    warm_args, warm_kwargs = _inputs()
+    with autotune(True, cache=str(cache_path), tuning_buckets=(batch,)):
+        checkpointing_ssu(*tuned_args, **tuned_kwargs)
+        checkpointing_ssu(*warm_args, **warm_kwargs)
+
+    assert cache_path.is_file()
+    assert len(tuner.profiling_cache) == 1
+    selected_tactic = next(iter(tuner.profiling_cache.values()))[0]
+    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
+
+    for tuned, warm in zip(tuned_args[:4], warm_args[:4], strict=True):
+        torch.testing.assert_close(warm, tuned, rtol=2e-2, atol=5e-1)
+    torch.testing.assert_close(
+        warm_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
+    )
+
+    tuner.clear_cache()
+    cached_args, cached_kwargs = _inputs()
+    with autotune(False, cache=str(cache_path), tuning_buckets=(batch,)):
+        checkpointing_ssu(*cached_args, **cached_kwargs)
+
+    for tuned, cached in zip(tuned_args[:4], cached_args[:4], strict=True):
+        torch.testing.assert_close(cached, tuned, rtol=2e-2, atol=5e-1)
+    torch.testing.assert_close(
+        cached_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
+    )
 
 
 def test_two_kernel_d_split2():
