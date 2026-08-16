@@ -33,8 +33,10 @@ def _isolated_capability_state(monkeypatch, tmp_path):
     # changes warning behavior) and from the cached capability probe.
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", tmp_path / "aot-isolated")
     jit_fused_moe.cutlass_fused_moe_fp8_block_scale_supported.cache_clear()
+    jit_fp4_quantization.has_fp4_support.cache_clear()
     yield
     jit_fused_moe.cutlass_fused_moe_fp8_block_scale_supported.cache_clear()
+    jit_fp4_quantization.has_fp4_support.cache_clear()
 
 
 def _set_cuda_version(monkeypatch, version_str: str) -> None:
@@ -256,3 +258,32 @@ def test_fp8_block_scale_supported_with_aot_module_and_old_toolkit(
 
     _set_cuda_version(monkeypatch, "12.4")
     assert jit_fused_moe.cutlass_fused_moe_fp8_block_scale_supported("90") is True
+
+
+def test_has_fp4_support_follows_toolkit_version(monkeypatch, tmp_path):
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", tmp_path / "aot")
+
+    _set_cuda_version(monkeypatch, "12.4")
+    assert jit_fp4_quantization.has_fp4_support("100") is False
+
+    jit_fp4_quantization.has_fp4_support.cache_clear()
+    _set_cuda_version(monkeypatch, "12.8")
+    # No-argument form requested in issue #3951; defaults to arch "100".
+    assert jit_fp4_quantization.has_fp4_support() is True
+
+
+def test_has_fp4_support_with_aot_module_and_old_toolkit(monkeypatch, tmp_path):
+    _make_aot_module(monkeypatch, tmp_path, "fp4_quantization_100")
+
+    _set_cuda_version(monkeypatch, "12.4")
+    assert jit_fp4_quantization.has_fp4_support("100") is True
+    # AOT presence is per-module: other arches still fall back to the
+    # toolkit-version check.
+    assert jit_fp4_quantization.has_fp4_support("90") is False
+
+
+def test_has_fp4_support_is_exported_from_flashinfer_jit():
+    # Issue #3951 asks for flashinfer.jit.has_fp4_support().
+    import flashinfer.jit
+
+    assert flashinfer.jit.has_fp4_support is jit_fp4_quantization.has_fp4_support

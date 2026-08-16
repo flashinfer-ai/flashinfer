@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from typing import List
 
 from .core import JitSpec, gen_jit_spec
@@ -29,7 +30,29 @@ from .core import (
     sm120f_nvcc_flags,
     sm121a_nvcc_flags,
 )
-from .cpp_ext import version_gated_nvcc_flag
+from .cpp_ext import (
+    has_prebuilt_aot_module,
+    is_cuda_version_at_least,
+    version_gated_nvcc_flag,
+)
+
+
+@functools.cache
+def has_fp4_support(device_arch: str = "100") -> bool:
+    """Whether the fp4_quantization module for ``device_arch`` contains the
+    kernels gated by ``-DENABLE_FP4``.
+
+    They are compiled only when ``-DENABLE_FP4`` survives flag generation,
+    i.e. when a CUDA 12.8+ toolkit is used for JIT compilation or when a
+    prebuilt AOT module (built with a 12.8+ toolkit, e.g. from
+    flashinfer-jit-cache) is available. Public capability query requested in
+    issue #3951 so frameworks can gate fp4 paths before committing to a JIT
+    build. ``device_arch`` is the compute capability as a string, e.g. "100"
+    for SM100, matching ``get_fp4_quantization_module``.
+    """
+    if has_prebuilt_aot_module(f"fp4_quantization_{device_arch}"):
+        return True
+    return is_cuda_version_at_least("12.8")
 
 
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:

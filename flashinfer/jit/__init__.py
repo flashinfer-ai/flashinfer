@@ -102,6 +102,7 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .fp4_quantization import has_fp4_support as has_fp4_support
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
 )
