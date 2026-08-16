@@ -13,7 +13,11 @@ import triton
 from einops import repeat
 
 from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
+from flashinfer.mamba.checkpointing_ssu import (
+    CheckpointingSSURunner,
+    _checkpointing_ssu_tuning_config,
+    checkpointing_ssu,
+)
 from flashinfer.utils import is_cvt_rs_supported
 
 # Triton reference: the standalone TMA persistent kernel only (the old 4D
@@ -621,6 +625,56 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     ] == [selected_tactic]
     for tuned_tensor, cached_tensor in zip(tuned, cached, strict=True):
         torch.testing.assert_close(tuned_tensor, cached_tensor, rtol=0, atol=0)
+
+
+def _make_autotune_key_inputs():
+    inputs = [None] * 22
+    dynamic_inputs = (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 19, 20, 21)
+    for index in dynamic_inputs:
+        inputs[index] = torch.empty(4, 3, 2)
+    return inputs, dynamic_inputs
+
+
+def _make_autotune_runner():
+    return CheckpointingSSURunner(
+        (torch.float32,),
+        dt_softplus=True,
+        pad_slot_id=0,
+        requested_algorithm=0,
+        requested_d_split=0,
+        precompute_heads_per_cta=0,
+        heads_per_group=16,
+    )
+
+
+def test_autotune_runner_key_ignores_leading_stride_padding():
+    inputs, dynamic_inputs = _make_autotune_key_inputs()
+    padded_inputs = list(inputs)
+    for index in dynamic_inputs:
+        tensor = inputs[index]
+        stride = tensor.stride()
+        padded_inputs[index] = torch.empty_strided(
+            tensor.shape,
+            (stride[0] + 17, *stride[1:]),
+            dtype=tensor.dtype,
+        )
+
+    runner = _make_autotune_runner()
+    assert hash(runner) == hash(_make_autotune_runner())
+    assert runner.get_cache_key_extras(inputs) == runner.get_cache_key_extras(
+        padded_inputs
+    )
+
+
+def test_autotune_max_batch_populates_dynamic_buckets():
+    inputs, _ = _make_autotune_key_inputs()
+    config = _checkpointing_ssu_tuning_config(inputs)
+    profiles = AutoTuner.get()._generate_optimization_profiles(config, inputs)
+    profile_shapes = [profile.get_opt_shapes() for profile in profiles]
+    batches = {shapes[1][0] for shapes in profile_shapes}
+
+    assert {1, 2, 4}.issubset(batches)
+    assert all(shapes[0][0] == shapes[1][0] + 1 for shapes in profile_shapes)
 
 
 def test_two_kernel_d_split2():

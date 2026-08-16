@@ -23,9 +23,15 @@ from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
+    DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    autotuner_initializer_empty,
+)
+from ..fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
 )
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 from ..utils import register_custom_op, register_fake_op
@@ -34,7 +40,7 @@ from ..utils import register_custom_op, register_fake_op
 _ALGORITHM_AUTO = 0
 _ALGORITHM_MONOLITH = 1
 _ALGORITHM_TWO_KERNEL = 2
-_AUTOTUNE_CACHE_SCHEMA_VERSION = 1
+_AUTOTUNE_CACHE_SCHEMA_VERSION = 3
 
 # A tactic is (main pipeline stages, main CTAs/SM, precompute heads/CTA).
 # The all-zero tuple selects the monolithic kernel.
@@ -116,6 +122,19 @@ def _profile_batch_size(shapes: tuple[tuple[int, ...], ...]) -> int:
     return shapes[1][0]
 
 
+def _initialize_broadcast_dt(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    base = torch.zeros(shape[:-1], dtype=dtype, device=device)
+    return base.unsqueeze(-1).expand(shape)
+
+
+def _initialize_state_batch_indices(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    return torch.arange(1, shape[0] + 1, dtype=dtype, device=device)
+
+
 def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
     """Install valid cache indices and a mixed replay history."""
     state, x, x_cache = inputs[0], inputs[1], inputs[7]
@@ -138,7 +157,7 @@ def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
 
 
 def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
-    """Profile the exact dense shape with a compact private cache."""
+    """Profile dense decode buckets with compact private state caches."""
     cache_capacity_inputs = [0, 7, 8, 9, 10, 11]
     if inputs[16] is not None:
         cache_capacity_inputs.append(16)
@@ -158,6 +177,35 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
                 infer_shape=_profile_batch_size,
             )
         )
+
+    dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
+    tensor_initializers: list[tuple[int, Any]] = []
+    if inputs[18] is None:
+        batch_inputs = [1, 2, 4, 5, 6, 19, 20, 21]
+        if inputs[13] is not None:
+            batch_inputs.append(13)
+        if inputs[15] is not None:
+            batch_inputs.append(15)
+        dynamic_specs = (
+            DynamicTensorSpec(
+                input_idx=tuple(batch_inputs),
+                dim_idx=(0,) * len(batch_inputs),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+            ),
+        )
+        tensor_initializers.extend(
+            (
+                (2, _initialize_broadcast_dt),
+                (6, autotuner_initializer_empty),
+                (19, autotuner_initializer_empty),
+                (20, autotuner_initializer_empty),
+                (21, autotuner_initializer_empty),
+            )
+        )
+        if inputs[15] is not None:
+            tensor_initializers.append((15, _initialize_state_batch_indices))
+
     profile_arena_candidates = (0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 19, 20, 21)
     profile_arena_inputs = tuple(
         index
@@ -166,7 +214,9 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     )
 
     return TuningConfig(
+        dynamic_tensor_specs=dynamic_specs,
         constraint_specs=tuple(constraints),
+        tensor_initializers=tuple(tensor_initializers),
         use_cold_l2_cache=True,
         use_cuda_graph=True,
         profile_arena_input_indices=profile_arena_inputs,
@@ -196,6 +246,19 @@ class CheckpointingSSURunner(TunableRunner):
         self._precompute_heads_per_cta = precompute_heads_per_cta
         self._tactics = _make_tactics(heads_per_group)
 
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self._module_base_args,
+                self._dt_softplus,
+                self._pad_slot_id,
+                self._requested_algorithm,
+                self._requested_d_split,
+                self._precompute_heads_per_cta,
+                tuple(self._tactics),
+            )
+        )
+
     @staticmethod
     def _batch(inputs: list[Any]) -> int:
         cu_seqlens = inputs[18]
@@ -222,8 +285,8 @@ class CheckpointingSSURunner(TunableRunner):
 
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
         stride_signature = tuple(
-            None if inputs[index] is None else tuple(inputs[index].stride())
-            for index in (1, 2, 4, 5, 6, 13, 15, 19, 20, 21)
+            None if inputs[index] is None else tuple(inputs[index].stride()[1:])
+            for index in (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 19, 20, 21)
         )
         return (
             _AUTOTUNE_CACHE_SCHEMA_VERSION,
