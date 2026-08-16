@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-import os
 from typing import Any, Optional
 
 import torch
@@ -24,15 +23,9 @@ from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
-    DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
-    autotuner_initializer_empty,
-)
-from ..fused_moe.utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
 )
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 from ..utils import register_custom_op, register_fake_op
@@ -41,11 +34,11 @@ from ..utils import register_custom_op, register_fake_op
 _ALGORITHM_AUTO = 0
 _ALGORITHM_MONOLITH = 1
 _ALGORITHM_TWO_KERNEL = 2
-_AUTOTUNE_CACHE_SCHEMA_VERSION = 3
+_AUTOTUNE_CACHE_SCHEMA_VERSION = 1
 
-# A tactic is (algorithm, main pipeline stages, main CTAs/SM,
-# precompute heads/CTA).  Monolithic tactics ignore the latter three values.
-_CheckpointingSSUTactic = tuple[int, int, int, int]
+# A tactic is (main pipeline stages, main CTAs/SM, precompute heads/CTA).
+# The all-zero tuple selects the monolithic kernel.
+_CheckpointingSSUTactic = tuple[int, int, int]
 
 
 @functools.cache
@@ -102,180 +95,70 @@ def _heads_per_cta_candidates(heads_per_group: int) -> tuple[int, ...]:
 
 
 def _make_tactics(heads_per_group: int) -> tuple[_CheckpointingSSUTactic, ...]:
-    """Build the exhaustive, fully explicit ReplaySSM tactic space."""
-    precompute_tactics = _heads_per_cta_candidates(heads_per_group)
+    """Build the explicit ReplaySSM tactic space."""
     return (
-        (_ALGORITHM_MONOLITH, 0, 0, 0),
+        (0, 0, 0),
         *(
-            (_ALGORITHM_TWO_KERNEL, stages, ctas_per_sm, heads_per_cta)
+            (stages, ctas_per_sm, heads_per_cta)
             for stages in (1, 2)
             for ctas_per_sm in (1, 2, 4, 8, 16)
-            for heads_per_cta in precompute_tactics
+            for heads_per_cta in _heads_per_cta_candidates(heads_per_group)
         ),
     )
 
 
-def _initialize_broadcast_dt(
-    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Create ``dt`` with the production stride-0 head-dimension broadcast."""
-    base = torch.zeros(shape[:-1], dtype=dtype, device=device)
-    return base.unsqueeze(-1).expand(shape)
-
-
-def _initialize_state_batch_indices(
-    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    return torch.arange(shape[0], dtype=dtype, device=device)
-
-
-def _dense_profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
+def _profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
     """Use one private padding slot beyond the bucketed dense batch."""
     return shapes[1][0] + 1
 
 
-def _varlen_profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
-    """``cu_seqlens`` already has the desired ``batch + 1`` length."""
-    return shapes[18][0]
-
-
-def _clone_preserve_strides(tensor: torch.Tensor) -> torch.Tensor:
-    clone = torch.empty_strided(
-        tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
-    )
-    clone.copy_(tensor)
-    return clone
+def _profile_batch_size(shapes: tuple[tuple[int, ...], ...]) -> int:
+    return shapes[1][0]
 
 
 def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
-    """Detach autotuning from live recurrent state and install a mixed history."""
-    prepared = list(inputs)
-
-    # State, caches, output, quantization scales, and two-kernel scratch are
-    # mutated by checkpointing_ssu.  Static inputs otherwise alias the caller's
-    # tensors, so give the profiler private copies before trying any tactic.
-    for index in (0, 6, 7, 8, 9, 10, 11, 15, 16, 19, 20, 21):
-        tensor = prepared[index]
-        if isinstance(tensor, torch.Tensor):
-            prepared[index] = _clone_preserve_strides(tensor)
-
-    state = prepared[0]
-    x = prepared[1]
-    x_cache = prepared[7]
-    ring_start = prepared[10]
-    prev_num_accepted_tokens = prepared[11]
-    state_batch_indices = prepared[15]
-    cu_seqlens = prepared[18]
-    batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
-
+    """Install valid cache indices and a mixed replay history."""
+    state, x, x_cache = inputs[0], inputs[1], inputs[7]
+    ring_start, prev_num_accepted_tokens = inputs[10], inputs[11]
+    state_batch_indices = inputs[15]
+    batch = x.size(0)
     if state_batch_indices is not None:
-        # Prefer slots [1, batch] when the cache has a spare slot, matching
-        # serving runtimes that reserve slot zero for padding.  Fall back to
-        # [0, batch) for exact-capacity standalone calls.
-        start = 1 if state.size(0) >= batch + 1 else 0
         state_batch_indices.copy_(
-            torch.arange(
-                start,
-                start + batch,
-                dtype=state_batch_indices.dtype,
-                device=state_batch_indices.device,
+            torch.arange(1, batch + 1, device=state.device).to(
+                state_batch_indices.dtype
             )
         )
-
-    if cu_seqlens is None:
-        ring_len = x_cache.size(2)
-        max_window = ring_len - x.size(1)
-        slots = torch.arange(
-            ring_start.numel(), dtype=torch.int64, device=ring_start.device
-        )
-        ring_start.copy_((slots % ring_len).to(ring_start.dtype))
-        prev_num_accepted_tokens.copy_(
-            ((slots * max_window) % (max_window + 1)).to(prev_num_accepted_tokens.dtype)
-        )
-    return prepared
+    slots = torch.arange(state.size(0), device=state.device)
+    ring_start.copy_((slots % x_cache.size(2)).to(ring_start.dtype))
+    max_window = x_cache.size(2) - x.size(1)
+    prev_num_accepted_tokens.copy_(
+        ((slots * max_window) % (max_window + 1)).to(prev_num_accepted_tokens.dtype)
+    )
+    return inputs
 
 
 def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
-    """Describe the dense decode batch dimension to the FlashInfer tuner."""
-    z, state_batch_indices, cu_seqlens = inputs[13], inputs[15], inputs[18]
-    dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
-    tensor_initializers: list[tuple[int, Any]] = []
-    cache_capacity_infer = (
-        _varlen_profile_cache_capacity
-        if cu_seqlens is not None
-        else _dense_profile_cache_capacity
-    )
-
-    # Serving runtimes can back a small active batch with thousands of cache
-    # slots. Cache capacity does not affect the selected kernel, so synthesize
-    # only the active bucket plus one private padding slot for profiling. The
-    # constraint also wildcards capacity in the persistent autotune key.
+    """Profile the exact dense shape with a compact private cache."""
     cache_capacity_inputs = [0, 7, 8, 9, 10, 11]
     if inputs[16] is not None:
         cache_capacity_inputs.append(16)
-    constraint_specs = tuple(
+    constraints = [
         ConstraintSpec(
             input_idx=index,
             dim_idx=0,
-            infer_shape=cache_capacity_infer,
+            infer_shape=_profile_cache_capacity,
         )
         for index in cache_capacity_inputs
-    )
-
-    # Dense ReplaySSM has a single linked batch dimension.  Packed varlen calls
-    # retain an exact-shape profile because total tokens and batch are separate
-    # degrees of freedom encoded by cu_seqlens.
-    if cu_seqlens is None:
-        batch_inputs = [1, 2, 4, 5, 6, 19, 20, 21]
-        if z is not None:
-            batch_inputs.append(13)
-        if state_batch_indices is not None:
-            batch_inputs.append(15)
-        dynamic_specs = (
-            DynamicTensorSpec(
-                input_idx=tuple(batch_inputs),
-                dim_idx=(0,) * len(batch_inputs),
-                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
-                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-            ),
-        )
-        tensor_initializers.extend(
-            (
-                (2, _initialize_broadcast_dt),
-                (6, autotuner_initializer_empty),
-                (19, autotuner_initializer_empty),
-                (20, autotuner_initializer_empty),
-                (21, autotuner_initializer_empty),
+    ]
+    if inputs[15] is not None:
+        constraints.append(
+            ConstraintSpec(
+                input_idx=15,
+                dim_idx=0,
+                infer_shape=_profile_batch_size,
             )
         )
-        if state_batch_indices is not None:
-            tensor_initializers.append((15, _initialize_state_batch_indices))
-
-    # Recurrent state and ring caches can fit in L2 at smaller batches. Reusing
-    # one pointer across all repeats then measures an unrealistically hot state
-    # and can select a tactic that loses after the serving runtime has touched
-    # the rest of the model. Cycle graph-stable, contiguous tensor lanes so the
-    # candidate comparison includes the production-scale cache footprint while
-    # leaving tied stride-0 tensors (dt/A/D/dt_bias) untouched.
-    profile_arena_candidates = (
-        0,
-        1,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        13,
-        15,
-        16,
-        18,
-        19,
-        20,
-        21,
-    )
+    profile_arena_candidates = (0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 19, 20, 21)
     profile_arena_inputs = tuple(
         index
         for index in profile_arena_candidates
@@ -283,9 +166,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     )
 
     return TuningConfig(
-        dynamic_tensor_specs=dynamic_specs,
-        constraint_specs=constraint_specs,
-        tensor_initializers=tuple(tensor_initializers),
+        constraint_specs=tuple(constraints),
         use_cold_l2_cache=True,
         use_cuda_graph=True,
         profile_arena_input_indices=profile_arena_inputs,
@@ -305,8 +186,6 @@ class CheckpointingSSURunner(TunableRunner):
         requested_algorithm: int,
         requested_d_split: int,
         precompute_heads_per_cta: int,
-        main_pipeline_stages: int,
-        main_ctas_per_sm: int,
         heads_per_group: int,
     ) -> None:
         self._module_base_args = module_base_args
@@ -315,8 +194,6 @@ class CheckpointingSSURunner(TunableRunner):
         self._requested_algorithm = requested_algorithm
         self._requested_d_split = requested_d_split
         self._precompute_heads_per_cta = precompute_heads_per_cta
-        self._main_pipeline_stages = main_pipeline_stages
-        self._main_ctas_per_sm = main_ctas_per_sm
         self._tactics = _make_tactics(heads_per_group)
 
     @staticmethod
@@ -339,10 +216,6 @@ class CheckpointingSSURunner(TunableRunner):
         self, inputs: list[torch.Tensor], profile: OptimizationProfile
     ) -> list[_CheckpointingSSUTactic]:
         del profile
-        batch = self._batch(inputs)
-        state_capacity = inputs[0].size(0)
-        if batch > state_capacity:
-            return []
         if not self._two_kernel_supported(inputs):
             return [self._tactics[0]]
         return list(self._tactics)
@@ -358,7 +231,6 @@ class CheckpointingSSURunner(TunableRunner):
             self._dt_softplus,
             self._pad_slot_id,
             self._requested_d_split,
-            os.environ.get("FLASHINFER_SSU_PRECOMPUTE_NUM_WARPS"),
             tuple(inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)),
             stride_signature,
         )
@@ -404,17 +276,16 @@ class CheckpointingSSURunner(TunableRunner):
         if tactic == -1:
             algorithm = self._resolve_fallback_algorithm(inputs)
             precompute_heads_per_cta = self._precompute_heads_per_cta
-            main_pipeline_stages = self._main_pipeline_stages
-            main_ctas_per_sm = self._main_ctas_per_sm
+            main_pipeline_stages = main_ctas_per_sm = 0
         else:
             if not isinstance(tactic, tuple) or tactic not in self._tactics:
                 raise ValueError(f"Unknown checkpointing SSU tactic: {tactic}")
-            (
-                algorithm,
-                main_pipeline_stages,
-                main_ctas_per_sm,
-                precompute_heads_per_cta,
-            ) = tactic
+            main_pipeline_stages, main_ctas_per_sm, precompute_heads_per_cta = tactic
+            algorithm = (
+                _ALGORITHM_MONOLITH
+                if tactic == self._tactics[0]
+                else _ALGORITHM_TWO_KERNEL
+            )
 
         two_kernel = algorithm == _ALGORITHM_TWO_KERNEL
         if two_kernel and not self._two_kernel_supported(inputs):
@@ -425,21 +296,7 @@ class CheckpointingSSURunner(TunableRunner):
         d_split = self._resolve_d_split(inputs, algorithm)
         module = _get_module(*self._module_base_args)
         module.checkpointing_ssu(
-            inputs[0],
-            inputs[1],
-            inputs[2],
-            inputs[3],
-            inputs[4],
-            inputs[5],
-            inputs[6],
-            inputs[7],
-            inputs[8],
-            inputs[9],
-            inputs[10],
-            inputs[11],
-            inputs[12],
-            inputs[13],
-            inputs[14],
+            *inputs[:15],
             self._dt_softplus,
             inputs[15],
             self._pad_slot_id,
@@ -565,8 +422,6 @@ def _checkpointing_ssu(
         requested_algorithm=algorithm,
         requested_d_split=d_split,
         precompute_heads_per_cta=precompute_heads_per_cta,
-        main_pipeline_stages=main_pipeline_stages,
-        main_ctas_per_sm=main_ctas_per_sm,
         heads_per_group=heads_per_group,
     )
 
@@ -581,6 +436,7 @@ def _checkpointing_ssu(
         and precompute_heads_per_cta == 0
         and main_pipeline_stages == 0
         and main_ctas_per_sm == 0
+        and cu_seqlens is None
     )
     if tune:
         runner, tactic = AutoTuner.get().choose_one(
@@ -676,8 +532,6 @@ def checkpointing_ssu(
     cb_old: Optional[torch.Tensor] = None,
     precompute_heads_per_cta: int = 0,
     algorithm: str = "auto",
-    main_pipeline_stages: int = 0,
-    main_ctas_per_sm: int = 0,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -749,14 +603,6 @@ def checkpointing_ssu(
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
         snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
-    main_pipeline_stages : int
-        Two-kernel persistent-main pipeline depth.  0 (default) uses the
-        launcher's regime heuristic; valid explicit values are 1 and 2.
-        Tuning knob — ignored by the monolithic path.
-    main_ctas_per_sm : int
-        Two-kernel persistent-main grid cap in CTAs per SM.  0 (default) uses
-        the launcher's regime heuristic; a positive value overrides it.
-        Tuning knob — ignored by the monolithic path.
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
         With the scratch trio and no explicit tuning knobs, ``"auto"`` uses
@@ -1019,8 +865,8 @@ def checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         precompute_heads_per_cta,
-        main_pipeline_stages,
-        main_ctas_per_sm,
+        0,
+        0,
         algorithm_int,
         enable_pdl,
         philox_rounds=philox_rounds,

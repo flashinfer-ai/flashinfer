@@ -667,7 +667,6 @@ def time_kernel(
     tag: str = "",
     philox_rounds: int = 0,
     rand_seed: torch.Tensor | None = None,
-    autotune_replayssm: bool = False,
 ) -> tuple[float, float, float]:
     """Time one kernel invocation against a (batch,) prev_tokens vector.
 
@@ -706,7 +705,6 @@ def time_kernel(
         inputs=inputs,
         philox_rounds=philox_rounds,
         rand_seed=rand_seed,
-        autotune_replayssm=autotune_replayssm,
     )
     return _time_kernel(timing, run_fn, inputs.reset, tag)
 
@@ -780,7 +778,6 @@ def _make_run_closure(
     rand_seed: torch.Tensor | None,
     with_conv1d: bool = False,
     external_pdl: bool = True,
-    autotune_replayssm: bool = False,
 ) -> Callable[[], None]:
     """Build the per-iteration kernel invocation closure for ``time_kernel``.
 
@@ -844,29 +841,12 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
-        # Ordinarily pin each row.  --autotune-replayssm turns the scratch row
-        # into the native auto path, while retaining the monolithic reference.
-        _tuned = _two and autotune_replayssm
-        _algo = "auto" if _tuned else ("two-kernel" if _two else "monolith")
+        # Pin the path: "auto" would route small batches to the monolith even
+        # with scratch present, silently merging the two rows.
+        _algo = "two-kernel" if _two else "monolith"
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
-        _phc = (
-            0
-            if _tuned
-            else (
-                int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
-            )
-        )
-        _main_stages = (
-            int(os.environ.get("FLASHINFER_SSU_MAIN_PIPELINE_STAGES", "0"))
-            if _two and not _tuned
-            else 0
-        )
-        _main_ctas = (
-            int(os.environ.get("FLASHINFER_SSU_MAIN_CTA_PER_SM", "0"))
-            if _two and not _tuned
-            else 0
-        )
+        _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
         # D-split knob: splits each head's DIM across D_SPLIT CTAs.
         # DS=1 (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
         # DS=2 (D_PER_CTA=32) leaves half the warps idle in the output MMA → they stall at the shared
@@ -905,8 +885,6 @@ def _make_run_closure(
                     # launcher, so it is NOT controlled here.
                     enable_pdl=external_pdl,
                     precompute_heads_per_cta=_phc,
-                    main_pipeline_stages=_main_stages,
-                    main_ctas_per_sm=_main_ctas,
                     d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
@@ -943,8 +921,6 @@ def _make_run_closure(
                     # is active regardless of this flag.
                     enable_pdl=False,
                     precompute_heads_per_cta=_phc,
-                    main_pipeline_stages=_main_stages,
-                    main_ctas_per_sm=_main_ctas,
                     d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
@@ -1574,16 +1550,10 @@ def _bench_config(
                     tag=tag,
                     philox_rounds=philox_rounds,
                     rand_seed=rand_seed,
-                    autotune_replayssm=args.autotune_replayssm,
-                )
-                display_name = (
-                    "cuda-incr-tuned"
-                    if args.autotune_replayssm and kname == "cuda-incr-2k"
-                    else kname
                 )
                 _print_row(
                     show_kernel_col,
-                    display_name,
+                    kname,
                     batch,
                     mtp_len,
                     pnat,
@@ -1903,18 +1873,6 @@ def _parse_args() -> argparse.Namespace:
         "default; --no-two-kernel runs the monolithic kernel instead.",
     )
     parser.add_argument(
-        "--autotune-replayssm",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Profile/load the native checkpointing-SSU compound tactic for "
-        "the scratch-backed CUDA row. The row is labeled cuda-incr-tuned.",
-    )
-    parser.add_argument(
-        "--autotune-cache",
-        default=None,
-        help="Optional JSON path used to persist ReplaySSM autotuner winners.",
-    )
-    parser.add_argument(
         "--cuda-graph",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2030,8 +1988,6 @@ def _spec_tag(args) -> str:
     tag = os.environ.get("SSU_TAG", "").strip()
     if tag:
         parts.append(_clean(tag))
-    if args.autotune_replayssm:
-        parts.append("tuned")
     parts.append("b" + _clean(args.batch_sizes))
     parts.append(_clean(args.state_dtypes))
     parts.append("mtp" + _clean(args.mtp_lengths))
@@ -2039,39 +1995,8 @@ def _spec_tag(args) -> str:
     return "_".join(parts)
 
 
-def _validate_autotune_replayssm_args(args) -> None:
-    """Reject configurations that cannot execute a tunable two-kernel row."""
-    if not args.autotune_replayssm:
-        return
-    if not args.cuda_incr or not args.two_kernel:
-        raise ValueError("--autotune-replayssm requires --cuda-incr and --two-kernel")
-
-    state_dtypes = [
-        parse_state_spec(spec.strip())[0] for spec in args.state_dtypes.split(",")
-    ]
-    act_tokens = [token.strip() for token in args.act_dtypes.split(",")]
-    invalid_act_tokens = [token for token in act_tokens if token not in STATE_DTYPE_MAP]
-    if invalid_act_tokens:
-        raise ValueError(
-            f"invalid --act-dtypes token(s): {invalid_act_tokens!r} "
-            f"(allowed: {sorted(STATE_DTYPE_MAP)})"
-        )
-    act_dtypes = [STATE_DTYPE_MAP[token] for token in act_tokens]
-
-    supported_states = (torch.float16, torch.bfloat16, torch.float32)
-    supported_activations = (torch.float16, torch.bfloat16)
-    if not any(dtype in supported_states for dtype in state_dtypes) or not any(
-        dtype in supported_activations for dtype in act_dtypes
-    ):
-        raise ValueError(
-            "--autotune-replayssm requires at least one two-kernel row with "
-            "f16/bf16/f32 state and f16/bf16 activations"
-        )
-
-
 if __name__ == "__main__":
     _args = _parse_args()
-    _validate_autotune_replayssm_args(_args)
 
     if _args.varlen:
         _forced_off = [
@@ -2115,17 +2040,7 @@ if __name__ == "__main__":
         print(f"# cmd: {' '.join(sys.argv)}")
 
     try:
-        if _args.autotune_replayssm:
-            from flashinfer.autotuner import autotune
-
-            # Each benchmark allocation is sized to its current batch. Let the
-            # operation generate buckets only up to that capacity; forcing all
-            # CLI batches while timing the first allocation leaves larger
-            # profiles intentionally unsupported and uncached at graph capture.
-            with autotune(True, cache=_args.autotune_cache):
-                _run_benchmark(_args)
-        else:
-            _run_benchmark(_args)
+        _run_benchmark(_args)
         # Finalize CUPTI ONCE, after the whole sweep — never per timing call.
         if _args.cupti:
             finalize_cupti()

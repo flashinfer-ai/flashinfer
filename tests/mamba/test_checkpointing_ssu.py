@@ -13,14 +13,8 @@ import triton
 from einops import repeat
 
 from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.mamba.checkpointing_ssu import (
-    _checkpointing_ssu_tuning_config,
-    _heads_per_cta_candidates,
-    _make_tactics,
-    _prepare_checkpointing_ssu_profile_inputs,
-    checkpointing_ssu,
-)
-from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
+from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
+from flashinfer.utils import is_cvt_rs_supported
 
 # Triton reference: the standalone TMA persistent kernel only (the old 4D
 # `checkpointing_state_update` and its merged non-TMA replay copy were removed
@@ -485,11 +479,7 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-@pytest.mark.parametrize(
-    ("main_pipeline_stages", "main_ctas_per_sm"),
-    [(0, 0), (1, 1), (1, 16), (2, 1), (2, 16)],
-)
-def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
+def test_two_kernel_matches_monolithic(tmp_path, request):
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
     the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
@@ -498,7 +488,7 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
     batch = 2
-    cache_size = batch  # non-paged
+    cache_size = batch + 15
     # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
     # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
     # nowrite(prev_k>0 — exercises the dt-ring tail scan), k=T=6 write.
@@ -524,7 +514,7 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
     x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
         cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
     )
-    for slot in range(cache_size):
+    for slot in range(batch):
         _seed_ring(
             x_cache,
             B_cache,
@@ -536,7 +526,7 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
             dt1_proc[slot],
         )
 
-    def _run(k, *, two_kernel, enable_pdl=False):
+    def _run(k, *, algorithm=None, enable_pdl=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -550,7 +540,7 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
         out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
-        if two_kernel:
+        if algorithm is not None:
             # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
             # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; cumAdt_vec is
             # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
@@ -567,9 +557,7 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
-            kw["algorithm"] = "two-kernel"
-            kw["main_pipeline_stages"] = main_pipeline_stages
-            kw["main_ctas_per_sm"] = main_ctas_per_sm
+            kw["algorithm"] = algorithm
         checkpointing_ssu(
             st,
             xc,
@@ -593,8 +581,8 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
 
     names = ("out", "state", "x_cache", "B_cache", "dt_cache")
     for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
-        ref = _run(k, two_kernel=False)
-        test = _run(k, two_kernel=True)
+        ref = _run(k)
+        test = _run(k, algorithm="two-kernel")
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
@@ -604,270 +592,35 @@ def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
         # gdc_waits).  Exercises the trigger's memory-ordering contract — the
         # main must still see every cb_scaled/cumAdt_vec/cb_old the precompute
         # wrote.  Must match the monolithic ref bit-for-bit.
-        test_pdl = _run(k, two_kernel=True, enable_pdl=True)
+        test_pdl = _run(k, algorithm="two-kernel", enable_pdl=True)
         for name, r, t in zip(names, ref, test_pdl, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
             )
 
-
-def _make_autotune_config_inputs(cache_size=37, batch=4, T=2, varlen=False):
-    """Small CPU tensors carrying the same dimension links as ReplaySSM."""
-    nheads, head_dim, d_state, ngroups = 2, 2, 3, 1
-    ring_len = 6
-    if varlen:
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32) * T
-        leading_shape = (1, batch * T)
-    else:
-        cu_seqlens = None
-        leading_shape = (batch, T)
-
-    x = torch.empty(*leading_shape, nheads, head_dim)
-    B = torch.empty(*leading_shape, ngroups, d_state)
-    return [
-        torch.empty(cache_size, nheads, head_dim, d_state),  # state
-        x,
-        torch.empty_like(x),  # dt
-        torch.empty(nheads, head_dim, d_state),  # A
-        B,
-        torch.empty_like(B),  # C
-        torch.empty_like(x),  # out
-        torch.empty(cache_size, nheads, ring_len, head_dim),  # x_cache
-        torch.empty(cache_size, ngroups, ring_len, d_state),  # B_cache
-        torch.empty(cache_size, nheads, ring_len),  # dt_cache
-        torch.zeros(cache_size, dtype=torch.int32),  # ring_start
-        torch.zeros(cache_size, dtype=torch.int32),  # previous tokens
-        None,  # D
-        None,  # z
-        None,  # dt_bias
-        torch.arange(batch, dtype=torch.int32),  # state_batch_indices
-        torch.empty(cache_size, nheads, head_dim),  # state_scale
-        None,  # rand_seed
-        cu_seqlens,
-        torch.empty(batch, nheads, 32, 2),  # cb_scaled
-        torch.empty(batch, nheads, 16),  # cumAdt_vec
-        torch.empty(batch, nheads, 32, 8),  # cb_old
-    ]
-
-
-@pytest.mark.parametrize(
-    "heads_per_group, expected", [(16, (16, 8, 4, 2, 1)), (14, (14, 7, 1))]
-)
-def test_autotune_tactics_are_explicit_valid_divisors(heads_per_group, expected):
-    assert _heads_per_cta_candidates(heads_per_group) == expected
-    tactics = _make_tactics(heads_per_group)
-    assert len(tactics) == 1 + 2 * 5 * len(expected)
-    assert tactics[0] == (1, 0, 0, 0)
-    assert all(tactic[3] > 0 for tactic in tactics[1:])
-    assert all(heads_per_group % tactic[3] == 0 for tactic in tactics[1:])
-
-
-@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
-def test_autotune_profiles_compact_cache_capacity(varlen):
-    batch = 4
-    inputs = _make_autotune_config_inputs(batch=batch, varlen=varlen)
-    other_capacity_inputs = _make_autotune_config_inputs(
-        cache_size=73, batch=batch, varlen=varlen
-    )
-    config = _checkpointing_ssu_tuning_config(inputs)
-    other_config = _checkpointing_ssu_tuning_config(other_capacity_inputs)
-    shapes = tuple(
-        tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else (0,)
-        for tensor in inputs
-    )
-    other_shapes = tuple(
-        tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else (0,)
-        for tensor in other_capacity_inputs
-    )
-    nearest = AutoTuner._find_nearest_profile(shapes, config)
-    other_nearest = AutoTuner._find_nearest_profile(other_shapes, other_config)
-    cache_inputs = (0, 7, 8, 9, 10, 11, 16)
-    assert nearest == other_nearest
-    assert all(nearest[index][0] == -1 for index in cache_inputs)
-
-    profiles = AutoTuner.get()._generate_optimization_profiles(config, inputs)
-    profile = (
-        profiles[0]
-        if varlen
-        else next(
-            candidate
-            for candidate in profiles
-            if candidate.get_opt_shapes()[1][0] == batch
-        )
-    )
-    profile_shapes = profile.get_opt_shapes()
-    assert all(profile_shapes[index][0] == batch + 1 for index in cache_inputs)
-
-
-def test_varlen_profile_hook_preserves_live_state_batch_indices():
-    inputs = _make_autotune_config_inputs(varlen=True)
-    live_indices = inputs[15].clone()
-    prepared = _prepare_checkpointing_ssu_profile_inputs(inputs)
-    torch.testing.assert_close(inputs[15], live_indices, rtol=0, atol=0)
-    torch.testing.assert_close(
-        prepared[15], torch.arange(1, 5, dtype=torch.int32), rtol=0, atol=0
-    )
-    assert prepared[15].data_ptr() != inputs[15].data_ptr()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] < 8,
-    reason="checkpointing SSU autotuning requires an SM80+ CUDA GPU",
-)
-@pytest.mark.parametrize("T", [1, 6])
-def test_autotune_cache_hit_matches_tuning_call(tmp_path, request, T):
-    """Profiling must not mutate live recurrent state before the selected call.
-
-    The first call profiles every runtime tactic and saves its winner.  The
-    second starts from identical tensors, reloads the file cache, and executes
-    only that winner.  Matching postconditions prove the tuning fixture used
-    private state/caches and that the serialized compound tactic is replayed.
-    T=1 covers single-token prediction and T=6 covers an MTP-shaped call.
-    """
-    device = "cuda"
-    act_dtype = torch.bfloat16
-    batch = 2
-    cache_size = 17  # much larger than the active batch; profiling stays batch + 1
-    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
-    max_window = 16
-    ring_len = max_window + T
-
-    torch.manual_seed(123)
-    state0 = torch.randn(
-        cache_size,
-        nheads,
-        head_dim,
-        d_state,
-        dtype=torch.float32,
-        device=device,
-    )
-    x_cache0 = torch.randn(
-        cache_size,
-        nheads,
-        ring_len,
-        head_dim,
-        dtype=act_dtype,
-        device=device,
-    )
-    B_cache0 = torch.randn(
-        cache_size,
-        ngroups,
-        ring_len,
-        d_state,
-        dtype=act_dtype,
-        device=device,
-    )
-    dt_cache0 = torch.rand(
-        cache_size, nheads, ring_len, dtype=torch.float32, device=device
-    )
-    ring_start0 = torch.arange(cache_size, dtype=torch.int32, device=device)
-    prev0 = (
-        (torch.arange(cache_size, device=device) * (max_window // 2))
-        .remainder(max_window + 1)
-        .to(torch.int32)
-    )
-    state_batch_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
-    x = torch.randn(batch, T, nheads, head_dim, dtype=act_dtype, device=device)
-    dt_base = torch.randn(batch, T, nheads, dtype=act_dtype, device=device)
-    B = torch.randn(batch, T, ngroups, d_state, dtype=act_dtype, device=device)
-    C = torch.randn_like(B)
-    A = (
-        (-torch.rand(nheads, dtype=torch.float32, device=device) - 0.5)
-        .view(nheads, 1, 1)
-        .expand(nheads, head_dim, d_state)
-    )
-    D = torch.randn(nheads, 1, dtype=act_dtype, device=device).expand(nheads, head_dim)
-    dt_bias = torch.randn(nheads, 1, dtype=act_dtype, device=device).expand(
-        nheads, head_dim
-    )
-    k_old = ((max_window + 7) // 8) * 8
-
-    def _inputs():
-        state = state0.clone()
-        x_cache = x_cache0.clone()
-        B_cache = B_cache0.clone()
-        dt_cache = dt_cache0.clone()
-        out = torch.empty_like(x)
-        checkpointing_ssu_args = (
-            state,
-            x_cache,
-            B_cache,
-            dt_cache,
-            ring_start0.clone(),
-            prev0.clone(),
-        )
-        checkpointing_ssu_kwargs = dict(
-            x=x.clone(),
-            dt=dt_base.clone().unsqueeze(-1).expand(batch, T, nheads, head_dim),
-            A=A,
-            B=B.clone(),
-            C=C.clone(),
-            out=out,
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            state_batch_indices=state_batch_indices.clone(),
-            pad_slot_id=0,
-            cb_scaled=torch.empty(
-                batch,
-                nheads,
-                WARP_SIZE,
-                MMA_FRAG_SIZE,
-                dtype=act_dtype,
-                device=device,
-            ),
-            cumAdt_vec=torch.empty(
-                batch, nheads, 16, dtype=torch.float32, device=device
-            ),
-            cb_old=torch.empty(
-                batch,
-                nheads,
-                WARP_SIZE,
-                k_old // 2,
-                dtype=act_dtype,
-                device=device,
-            ),
-            algorithm="auto",
-        )
-        return checkpointing_ssu_args, checkpointing_ssu_kwargs
-
     tuner = AutoTuner.get()
     tuner.clear_cache()
     request.addfinalizer(tuner.clear_cache)
     cache_path = tmp_path / "checkpointing_ssu_autotune.json"
-    tuned_args, tuned_kwargs = _inputs()
-    warm_args, warm_kwargs = _inputs()
-    with autotune(True, cache=str(cache_path), tuning_buckets=(batch,)):
-        checkpointing_ssu(*tuned_args, **tuned_kwargs)
-        checkpointing_ssu(*warm_args, **warm_kwargs)
+    with autotune(True, cache=str(cache_path)):
+        tuned = _run(2, algorithm="auto")
+        warm = _run(2, algorithm="auto")
 
-    assert cache_path.is_file()
-    assert len(tuner.profiling_cache) == 1
     selected_tactic = next(iter(tuner.profiling_cache.values()))[0]
-    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
-    assert selected_tactic[0] == 1 or selected_tactic[3] > 0
-
-    for tuned, warm in zip(tuned_args[:4], warm_args[:4], strict=True):
-        torch.testing.assert_close(warm, tuned, rtol=0, atol=0)
-    torch.testing.assert_close(warm_kwargs["out"], tuned_kwargs["out"], rtol=0, atol=0)
+    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 3
+    for tuned_tensor, warm_tensor in zip(tuned, warm, strict=True):
+        torch.testing.assert_close(tuned_tensor, warm_tensor, rtol=0, atol=0)
 
     tuner.clear_cache()
-    cached_args, cached_kwargs = _inputs()
-    with autotune(False, cache=str(cache_path), tuning_buckets=(batch,)):
-        checkpointing_ssu(*cached_args, **cached_kwargs)
-    loaded_tactics = [
+    with autotune(False, cache=str(cache_path)):
+        cached = _run(2, algorithm="auto")
+    assert [
         tactic
         for runner_name, tactic in tuner._file_configs.values()
         if runner_name == "CheckpointingSSURunner"
-    ]
-    assert loaded_tactics == [selected_tactic]
-
-    for tuned, cached in zip(tuned_args[:4], cached_args[:4], strict=True):
-        torch.testing.assert_close(cached, tuned, rtol=0, atol=0)
-    torch.testing.assert_close(
-        cached_kwargs["out"], tuned_kwargs["out"], rtol=0, atol=0
-    )
+    ] == [selected_tactic]
+    for tuned_tensor, cached_tensor in zip(tuned, cached, strict=True):
+        torch.testing.assert_close(tuned_tensor, cached_tensor, rtol=0, atol=0)
 
 
 def test_two_kernel_d_split2():
