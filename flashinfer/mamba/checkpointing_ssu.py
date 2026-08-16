@@ -108,6 +108,8 @@ def _checkpointing_ssu(
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
     precompute_heads_per_cta: int,
+    main_pipeline_stages: int,
+    main_ctas_per_sm: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -168,6 +170,8 @@ def _checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         precompute_heads_per_cta,
+        main_pipeline_stages,
+        main_ctas_per_sm,
     )
 
 
@@ -199,6 +203,8 @@ def _checkpointing_ssu_fake(
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
     precompute_heads_per_cta: int,
+    main_pipeline_stages: int,
+    main_ctas_per_sm: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -249,6 +255,8 @@ def checkpointing_ssu(
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
     precompute_heads_per_cta: int = 0,
+    main_pipeline_stages: int = 0,
+    main_ctas_per_sm: int = 0,
     algorithm: str = "auto",
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
@@ -321,6 +329,14 @@ def checkpointing_ssu(
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
         snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
+    main_pipeline_stages : int
+        Two-kernel persistent-main pipeline depth.  0 (default) uses the
+        launcher's regime heuristic; valid explicit values are 1 and 2.
+        Tuning knob — ignored by the monolithic path.
+    main_ctas_per_sm : int
+        Two-kernel persistent-main grid cap in CTAs per SM.  0 (default) uses
+        the launcher's regime heuristic; a positive value overrides it.
+        Tuning knob — ignored by the monolithic path.
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
         ``"auto"`` runs the two-kernel split iff the scratch quartet is provided AND
@@ -595,6 +611,8 @@ def checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         precompute_heads_per_cta,
+        main_pipeline_stages,
+        main_ctas_per_sm,
         enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,

@@ -478,7 +478,11 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-def test_two_kernel_matches_monolithic():
+@pytest.mark.parametrize(
+    ("main_pipeline_stages", "main_ctas_per_sm"),
+    [(0, 0), (1, 1), (1, 16), (2, 1), (2, 16)],
+)
+def test_two_kernel_matches_monolithic(main_pipeline_stages, main_ctas_per_sm):
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
     the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
@@ -557,6 +561,8 @@ def test_two_kernel_matches_monolithic():
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
             kw["algorithm"] = "two-kernel"
+            kw["main_pipeline_stages"] = main_pipeline_stages
+            kw["main_ctas_per_sm"] = main_ctas_per_sm
         checkpointing_ssu(
             st,
             xc,

@@ -847,6 +847,14 @@ def _make_run_closure(
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
+        _main_stages = (
+            int(os.environ.get("FLASHINFER_SSU_MAIN_PIPELINE_STAGES", "0"))
+            if _two
+            else 0
+        )
+        _main_ctas = (
+            int(os.environ.get("FLASHINFER_SSU_MAIN_CTA_PER_SM", "0")) if _two else 0
+        )
         # D-split knob: splits each head's DIM across D_SPLIT CTAs.
         # DS=1 (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
         # DS=2 (D_PER_CTA=32) leaves half the warps idle in the output MMA → they stall at the shared
@@ -885,6 +893,8 @@ def _make_run_closure(
                     # launcher, so it is NOT controlled here.
                     enable_pdl=external_pdl,
                     precompute_heads_per_cta=_phc,
+                    main_pipeline_stages=_main_stages,
+                    main_ctas_per_sm=_main_ctas,
                     d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
@@ -921,6 +931,8 @@ def _make_run_closure(
                     # is active regardless of this flag.
                     enable_pdl=False,
                     precompute_heads_per_cta=_phc,
+                    main_pipeline_stages=_main_stages,
+                    main_ctas_per_sm=_main_ctas,
                     d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,

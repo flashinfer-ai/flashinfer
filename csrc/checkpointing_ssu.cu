@@ -56,7 +56,9 @@ void checkpointing_ssu(
     Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
     Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
     Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
-    int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    int64_t precompute_heads_per_cta,  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    int64_t main_pipeline_stages,      // two-kernel MAIN: pipeline depth (0 = heuristic)
+    int64_t main_ctas_per_sm) {        // two-kernel MAIN: grid cap (0 = heuristic)
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -121,6 +123,14 @@ void checkpointing_ssu(
                      "state dim 1 (nheads) must be contiguous with dim 2, got stride ", s[1],
                      " expected ", sz[2] * sz[3]);
   }
+
+  // Two-kernel persistent-main runtime tuning knobs.  Zero preserves the
+  // launcher's regime default; positive values override it.
+  FLASHINFER_CHECK(
+      main_pipeline_stages == 0 || main_pipeline_stages == 1 || main_pipeline_stages == 2,
+      "main_pipeline_stages=", main_pipeline_stages, " must be 0 (heuristic), 1, or 2");
+  FLASHINFER_CHECK(main_ctas_per_sm >= 0, "main_ctas_per_sm=", main_ctas_per_sm,
+                   " must be 0 (heuristic) or positive");
 
   // ── Validate x ──
   // Non-varlen: shape (batch, NPREDICTED, nheads, dim).
@@ -606,7 +616,8 @@ void checkpointing_ssu(
   const cudaStream_t stream = get_stream(state.device());
 
   launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
-      p, static_cast<int>(precompute_heads_per_cta), stream);
+      p, static_cast<int>(precompute_heads_per_cta), static_cast<int>(main_pipeline_stages),
+      static_cast<int>(main_ctas_per_sm), stream);
 }
 
 }  // namespace flashinfer::mamba::checkpointing
