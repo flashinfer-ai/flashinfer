@@ -434,6 +434,7 @@ def _prepare_cute_dsl_sm100(
 
     n = int(b.shape[0])
     k = int(b.shape[1]) * 2
+    b_descale = b_descale.contiguous()
     weight_sf = convert_sf_to_mma_layout(
         b_descale,
         m=n,
@@ -606,11 +607,6 @@ _SM100_BF16_FP4_KERNEL_CACHE: Dict[Tuple, object] = {}
 _SM100_BF16_FP4_N_TILES = (8, 16, 32, 64, 128, 192)
 _SM100_BF16_FP4_K_TILE = 256
 _SM100_BF16_FP4_RASTER_ALONG_M = True
-_SM100_BF16_FP4_FALLBACK_TACTIC = (
-    (256, 128, _SM100_BF16_FP4_K_TILE),
-    (2, 1),
-    _SM100_BF16_FP4_RASTER_ALONG_M,
-)
 
 
 def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
@@ -746,6 +742,19 @@ def _launch_cute_dsl_sm100(
     n = int(b.shape[0])
     mma_tiler_mnk, cluster_shape_mn, raster_along_m = tactic
     cluster_size = int(cluster_shape_mn[0]) * int(cluster_shape_mn[1])
+    for name, tensor, align in (
+        ("b", b, 32),
+        ("b_descale", b_descale, 16),
+        ("a", a, 32),
+        ("alpha", alpha_for_launch, 16),
+        ("out", out, 32),
+    ):
+        if tensor.data_ptr() % align:
+            raise ValueError(
+                f"SM100 cute-dsl requires a {align}-byte aligned {name}; "
+                f"got address {tensor.data_ptr():`#x`}. Pass a freshly "
+                "allocated contiguous tensor."
+            )
     stream = current_cuda_stream()
     weight_ptr = make_ptr(
         cutlass.Float4E2M1FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
@@ -853,7 +862,15 @@ def _cute_dsl_sm100_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
         ) -> torch.Tensor:
             a, b, b_descale, alpha_for_launch, _, out, _ = inputs
             if tactic == -1:
-                tactic = _SM100_BF16_FP4_FALLBACK_TACTIC
+                valid = self.get_valid_tactics(inputs, None)
+                if valid:
+                    tactic = valid[0]
+                else:
+                    m, k = map(int, a.shape)
+                    raise ValueError(
+                        "no SM100 cute-dsl w4a16 tactic supports "
+                        f"m={m}, n={int(b.shape[0])}, k={k}"
+                    )
             return _launch_cute_dsl_sm100(
                 a,
                 b,
@@ -885,6 +902,10 @@ def _compute_cute_dsl_sm100(
         )
     if not a.is_contiguous() or not b.is_contiguous():
         raise ValueError("SM100 cute-dsl requires contiguous a and b tensors.")
+    if a.dtype != torch.bfloat16:
+        raise TypeError(
+            f"SM100 cute-dsl currently requires a bfloat16 activation; got {a.dtype}."
+        )
     if b.dtype != torch.uint8:
         raise TypeError(
             "SM100 cute-dsl expects the uint8 NVFP4 weight returned by "
