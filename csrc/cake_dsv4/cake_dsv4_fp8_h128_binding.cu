@@ -303,7 +303,9 @@ void Run_fp8_h128(TensorView arg_tmap_q, TensorView arg_tmap_swa_kv, TensorView 
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;
-  attrs[0].val.clusterDim = dim3(2u, 1u, 1u);
+  attrs[0].val.clusterDim.x = 2u;
+  attrs[0].val.clusterDim.y = 1u;
+  attrs[0].val.clusterDim.z = 1u;
   config.attrs = attrs;
   config.numAttrs = 1;
   status = cudaLaunchKernelExC(
