@@ -642,13 +642,40 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
 
 def _make_autotune_key_inputs():
     inputs = [None] * 22
-    dynamic_inputs = (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 19, 20, 21)
+    dynamic_inputs = (
+        0,  # state
+        1,  # x
+        2,  # dt
+        4,  # B
+        5,  # C
+        6,  # out
+        7,  # x_cache
+        8,  # B_cache
+        9,  # dt_cache
+        10,  # ring_start
+        11,  # prev_num_accepted_tokens
+        13,  # z
+        15,  # state_batch_indices
+        16,  # state_scale
+        19,  # cb_scaled
+        20,  # cumAdt_vec
+        21,  # cb_old
+    )
     for index in dynamic_inputs:
         inputs[index] = torch.empty(4, 3, 2)
     return inputs, dynamic_inputs
 
 
 def _make_autotune_runner(inputs):
+    optional_input_indices = (
+        12,  # D
+        13,  # z
+        14,  # dt_bias
+        15,  # state_batch_indices
+        16,  # state_scale
+        17,  # rand_seed
+        18,  # cu_seqlens
+    )
     return CheckpointingSSURunner(
         (torch.float32,),
         dt_softplus=True,
@@ -658,7 +685,7 @@ def _make_autotune_runner(inputs):
         precompute_heads_per_cta=0,
         heads_per_group=16,
         optional_tensor_presence=tuple(
-            inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)
+            inputs[index] is not None for index in optional_input_indices
         ),
     )
 
@@ -683,7 +710,9 @@ def test_autotune_runner_key_is_synthesis_invariant():
     )
 
     strided_inputs = list(inputs)
-    strided_inputs[2] = torch.empty_strided((4, 3, 2), (30, 5, 1))
+    strided_inputs[2] = torch.empty_strided(  # dt
+        (4, 3, 2), (30, 5, 1)
+    )
     strided_runner = _make_autotune_runner(strided_inputs)
     assert strided_runner.get_cache_key_extras(strided_inputs) == (
         strided_runner.get_cache_key_extras(inputs)
@@ -696,10 +725,13 @@ def test_autotune_max_batch_populates_dynamic_buckets():
     config = _checkpointing_ssu_tuning_config(inputs)
     profiles = AutoTuner.get()._generate_optimization_profiles(config, inputs)
     profile_shapes = [profile.get_opt_shapes() for profile in profiles]
-    batches = {shapes[1][0] for shapes in profile_shapes}
+    batches = {shapes[1][0] for shapes in profile_shapes}  # x.shape[0]
 
     assert {1, 2, 4}.issubset(batches)
-    assert all(shapes[0][0] == shapes[1][0] + 1 for shapes in profile_shapes)
+    assert all(
+        shapes[0][0] == shapes[1][0] + 1  # state.shape[0] == x.shape[0] + 1
+        for shapes in profile_shapes
+    )
     runner = _make_autotune_runner(inputs)
     assert runner.get_tuning_config(inputs) is runner.get_tuning_config(inputs)
     runner_args = ((torch.float16,), True, 0, 0, 0, 0, 16, (False,) * 7)
@@ -724,11 +756,11 @@ def test_autotune_tactic_carries_profile_d_split(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
     monkeypatch.setattr(module, "_sm_count", lambda _device: 148)
     inputs = [None] * 22
-    inputs[0] = torch.empty(1, 16, 64, 1, dtype=torch.float32)
-    inputs[1] = torch.empty(128, 1, 16, 64, dtype=torch.bfloat16)
-    inputs[19] = torch.empty(1, dtype=torch.bfloat16)
-    inputs[20] = torch.empty(1)
-    inputs[21] = torch.empty(1, dtype=torch.bfloat16)
+    inputs[0] = torch.empty(1, 16, 64, 1, dtype=torch.float32)  # state
+    inputs[1] = torch.empty(128, 1, 16, 64, dtype=torch.bfloat16)  # x
+    inputs[19] = torch.empty(1, dtype=torch.bfloat16)  # cb_scaled
+    inputs[20] = torch.empty(1)  # cumAdt_vec
+    inputs[21] = torch.empty(1, dtype=torch.bfloat16)  # cb_old
     runner = _make_autotune_runner(inputs)
 
     tactics = runner.get_valid_tactics(inputs, None)

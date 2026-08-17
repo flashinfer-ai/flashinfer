@@ -164,9 +164,12 @@ def allocate_checkpointing_ssu_scratch(
 
 def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
     """Install valid cache indices and a mixed replay history."""
-    state, x, x_cache = inputs[0], inputs[1], inputs[7]
-    ring_start, prev_num_accepted_tokens = inputs[10], inputs[11]
-    state_batch_indices = inputs[15]
+    state = inputs[0]  # state
+    x = inputs[1]  # x
+    x_cache = inputs[7]  # x_cache
+    ring_start = inputs[10]  # ring_start
+    prev_num_accepted_tokens = inputs[11]  # prev_num_accepted_tokens
+    state_batch_indices = inputs[15]  # state_batch_indices
     batch = x.size(0)
     if state_batch_indices is not None:
         state_batch_indices.copy_(
@@ -220,7 +223,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     if inputs[15] is not None:  # state_batch_indices
         constraints.append(
             ConstraintSpec(
-                input_idx=15,
+                input_idx=15,  # state_batch_indices
                 dim_idx=0,
                 infer_shape=batch_size,
             )
@@ -335,16 +338,21 @@ class CheckpointingSSURunner(TunableRunner):
 
     @staticmethod
     def _batch(inputs: list[Any]) -> int:
-        cu_seqlens = inputs[18]
-        return cu_seqlens.numel() - 1 if cu_seqlens is not None else inputs[1].size(0)
+        cu_seqlens = inputs[18]  # cu_seqlens
+        x = inputs[1]  # x
+        return cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
 
     @staticmethod
     def _two_kernel_supported(inputs: list[Any]) -> bool:
-        state, x = inputs[0], inputs[1]
+        state = inputs[0]  # state
+        x = inputs[1]  # x
+        cb_scaled = inputs[19]  # cb_scaled
+        cumAdt_vec = inputs[20]  # cumAdt_vec
+        cb_old = inputs[21]  # cb_old
         return (
-            inputs[19] is not None
-            and inputs[20] is not None
-            and inputs[21] is not None
+            cb_scaled is not None
+            and cumAdt_vec is not None
+            and cb_old is not None
             and state.element_size() in (2, 4)
             and x.element_size() == 2
         )
@@ -357,7 +365,8 @@ class CheckpointingSSURunner(TunableRunner):
         if not self._two_kernel_supported(inputs):
             return [(0, 0, 0, monolith_d_split)]
         two_kernel_d_split = self._resolve_d_split(inputs, _ALGORITHM_TWO_KERNEL)
-        state, x = inputs[0], inputs[1]
+        state = inputs[0]  # state
+        x = inputs[1]  # x
         return list(
             _make_tactics(
                 self._heads_per_group,
@@ -387,7 +396,8 @@ class CheckpointingSSURunner(TunableRunner):
     def _resolve_fallback_algorithm(self, inputs: list[Any]) -> int:
         if self._requested_algorithm != _ALGORITHM_AUTO:
             return self._requested_algorithm
-        state, x = inputs[0], inputs[1]
+        state = inputs[0]  # state
+        x = inputs[1]  # x
         if self._two_kernel_supported(inputs) and self._batch(inputs) * state.size(
             1
         ) >= _sm_count(x.device):
@@ -398,7 +408,7 @@ class CheckpointingSSURunner(TunableRunner):
         if self._requested_d_split != 0:
             d_split = self._requested_d_split
         else:
-            state = inputs[0]
+            state = inputs[0]  # state
             dim = state.size(2)
             d_split = 1
             if (
@@ -452,17 +462,17 @@ class CheckpointingSSURunner(TunableRunner):
             )
         module = _get_module(*self._module_base_args)
         module.checkpointing_ssu(
-            *inputs[:15],
+            *inputs[:15],  # state through dt_bias
             self._dt_softplus,
-            inputs[15],
+            inputs[15],  # state_batch_indices
             self._pad_slot_id,
-            inputs[16],
-            inputs[17],
+            inputs[16],  # state_scale
+            inputs[17],  # rand_seed
             d_split,
-            inputs[18],
-            inputs[19] if two_kernel else None,
-            inputs[20] if two_kernel else None,
-            inputs[21] if two_kernel else None,
+            inputs[18],  # cu_seqlens
+            inputs[19] if two_kernel else None,  # cb_scaled
+            inputs[20] if two_kernel else None,  # cumAdt_vec
+            inputs[21] if two_kernel else None,  # cb_old
             precompute_heads_per_cta,
             main_pipeline_stages,
             main_ctas_per_sm,
@@ -594,6 +604,15 @@ def _checkpointing_ssu(
         cumAdt_vec,
         cb_old,
     ]
+    optional_input_indices = (
+        12,  # D
+        13,  # z
+        14,  # dt_bias
+        15,  # state_batch_indices
+        16,  # state_scale
+        17,  # rand_seed
+        18,  # cu_seqlens
+    )
     runner = _get_checkpointing_ssu_runner(
         module_base_args,
         dt_softplus,
@@ -602,7 +621,7 @@ def _checkpointing_ssu(
         d_split,
         precompute_heads_per_cta,
         heads_per_group,
-        tuple(inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)),
+        tuple(inputs[index] is not None for index in optional_input_indices),
     )
 
     tune = (
