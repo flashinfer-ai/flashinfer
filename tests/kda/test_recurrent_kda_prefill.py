@@ -1381,9 +1381,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         initial_state=True,
         seed=2048,
     )
-    beta_carrier = torch.empty(
-        (2048, 8), dtype=torch.bfloat16, device=flash_kda_device
-    )
+    beta_carrier = torch.empty((2048, 8), dtype=torch.bfloat16, device=flash_kda_device)
     beta_carrier[:, 3:4].copy_(inputs["beta"][0])
     inputs["beta"] = beta_carrier[None, :, 3:4]
     assert inputs["beta"].stride(-2) == 8
@@ -1434,9 +1432,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         output_final_state=True,
     )
 
-    expected_target = kda_prefill_api._select_flash_kda_prefill_target(
-        flash_kda_device
-    )
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
     assert routes == [
         ("small_bh_m128", expected_target),
         ("m128", expected_target),
