@@ -3445,7 +3445,7 @@ def trtllm_batch_decode_with_kv_cache(
             if lse is not None
             else torch.empty(lse_shape, dtype=torch.float32, device=query.device)
         )
-        from .dcp import run_dcp_spec_decode
+        from .cake_dcp import run_dcp_spec_decode
 
         run_dcp_spec_decode(
             query=query,

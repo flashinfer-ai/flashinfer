@@ -447,7 +447,7 @@ def run_dcp_spec_decode(
     max_pages_per_seq = block_tables.shape[1]
 
     if profile.startswith("fp8_p64"):
-        from .jit.dcp import (
+        from .jit.cake_dcp import (
             load_dcp_spec_fp8_d256_module,
             load_dcp_spec_fp8_module,
         )
@@ -537,7 +537,7 @@ def run_dcp_spec_decode(
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    from .jit.dcp import load_dcp_spec_module
+    from .jit.cake_dcp import load_dcp_spec_module
 
     if num_split == 1:
         retain_kv_l2 = int(local_blocks <= _RETAIN_KV_L2_MAX_BLOCKS)
