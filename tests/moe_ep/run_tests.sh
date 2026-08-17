@@ -6,6 +6,7 @@
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper push FP8
+#   bash tests/moe_ep/run_tests.sh sm90_push_bf16 # Hopper push BF16
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_pull_fp8 mega multirank
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
@@ -94,6 +95,9 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_backend.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_gemm.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_persistent_gemm.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -111,6 +115,27 @@ run_sm90_push() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm90_push_fp8_kernel.py \
     tests/moe_ep/test_sm90_push_fp8_backend.py -v
+}
+
+run_sm90_push_bf16() {
+  local rc=0
+
+  "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_bf16_fc1_fused.py \
+    tests/moe_ep/test_sm90_push_bf16_gemm.py \
+    tests/moe_ep/test_sm90_push_bf16_persistent_gemm_contract.py \
+    tests/moe_ep/test_sm90_push_bf16_persistent_gemm.py \
+    tests/moe_ep/test_sm90_push_bf16_grouped_combine.py \
+    tests/moe_ep/test_sm90_push_bf16_backend_cpu.py \
+    tests/moe_ep/test_sm90_push_bf16_backend.py -v || rc=1
+
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_bf16_grouped_combine.py \
+    tests/moe_ep/test_sm90_push_bf16_backend.py -v || rc=1
+
+  return "${rc}"
 }
 
 run_multirank() {
@@ -351,6 +376,7 @@ case "${1:-all}" in
   oracle_sm90) run_section "sm90_pull_fp8 torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   sm90_push) run_section "SM90 push FP8 (2 GPU)" run_sm90_push; print_summary ;;
+  sm90_push_bf16) run_section "SM90 push BF16" run_sm90_push_bf16; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
@@ -360,7 +386,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|sm90_push_bf16|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

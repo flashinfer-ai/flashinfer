@@ -5,6 +5,7 @@ from . import (
     mxfp8_cutedsl,
     nvfp4_cutedsl,
     sm90_pull_fp8,
+    sm90_push_bf16,
     sm90_push_fp8,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "mxfp8_cutedsl",
     "nvfp4_cutedsl",
     "sm90_pull_fp8",
+    "sm90_push_bf16",
     "sm90_push_fp8",
 ]

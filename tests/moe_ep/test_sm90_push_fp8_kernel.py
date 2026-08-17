@@ -302,13 +302,14 @@ def test_constructor_validation() -> None:
         build(top_k=3)
     with pytest.raises(RuntimeError, match="capacity_factor"):
         build(config=Sm90PushConfig(capacity_factor=0.0))
-    with pytest.raises(RuntimeError, match="grouped_combine"):
-        build(
-            config=Sm90PushConfig(
-                grouped_combine=True,
-                combine_dtype=Sm90PushCombine.BF16,
-            )
+    grouped_bf16 = build(
+        config=Sm90PushConfig(
+            grouped_combine=True,
+            combine_dtype=Sm90PushCombine.BF16,
         )
+    )
+    assert grouped_bf16.combine_t.shape == (TOKEN_CAPACITY, 1, HIDDEN)
+    grouped_bf16.destroy()
 
 
 def test_weight_transform_validation() -> None:

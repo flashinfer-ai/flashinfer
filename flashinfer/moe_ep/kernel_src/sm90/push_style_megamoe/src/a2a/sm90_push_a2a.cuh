@@ -127,6 +127,10 @@ struct PushLayout {
     return reinterpret_cast<__nv_bfloat16*>(window(r) + combine_offset) +
            (static_cast<uint64_t>(token) * top_k + k) * hidden;
   }
+  __device__ __forceinline__ __nv_bfloat16* combine_row_grouped(int r, int token, int src) const {
+    return reinterpret_cast<__nv_bfloat16*>(window(r) + combine_offset) +
+           (static_cast<uint64_t>(token) * ep_size + src) * hidden;
+  }
   // per-route fp8 combine slots: [t_cap][top_k][...] keyed by route k
   __device__ __forceinline__ uint8_t* cfp8_row(int r, int token, int k) const {
     return window(r) + cfp8_offset + (static_cast<uint64_t>(token) * top_k + k) * hidden;
