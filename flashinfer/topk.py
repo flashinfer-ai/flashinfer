@@ -696,10 +696,15 @@ def is_cub_topk_beneficial(
 
     # When the clusters backend is available (SM100, eager, non-deterministic,
     # no tie-break), it beats CUB nearly everywhere; CUB only keeps the fp32
-    # d ~ 8192 band and single-row long-d calls (up to 1.68x fp32, 1.46x 16-bit).
+    # d ~ 8192 band (below batch 256), fp32 small-batch mid-d, and single-row
+    # long-d calls.
     if clusters_eligible:
         if dtype == torch.float32:
-            return (4096 < d <= 8192) or (num_rows == 1 and d > 4096)
+            return (
+                (4096 < d <= 8192 and num_rows < 256)
+                or (num_rows == 1 and d > 4096)
+                or (num_rows <= 32 and 16384 <= d <= 65536)
+            )
         return num_rows == 1 and d >= 262144
 
     # Eager with no clusters backend available: CUB vs the radix backend.
@@ -745,34 +750,55 @@ def is_cub_page_table_transform_beneficial(
         if tie:
             # Tie-break wins at both ends of the d range with a losing pocket in
             # the middle; larger batches enter the pocket earlier and leave later
+            # (single fp32 rows also lose the low-k mid-d cells, so their small-d
+            # window is narrower)
             if fp32:
-                return num_rows < 128 or d <= 2048 or d >= 262144
-            if num_rows < 128:
-                return d < 1024 or d >= 16384
-            return d < 512 or d >= 262144
+                if num_rows == 1:
+                    return d <= 512 or d >= 16384
+                if num_rows < 128:
+                    return d <= 4096 or d >= 16384
+                if num_rows < 256:
+                    return d <= 4096 or d >= 262144
+                return d >= 262144
+
+            return (num_rows < 128 and (d <= 256 or d >= 32768)) or d >= 262144
 
         if fp32:
             return d >= (32768 if num_rows < 128 else 262144)
-        # For 16 bit dtypes, the winning `d` threshold moves up with batch size
-        return (
-            (num_rows < 64 and d >= 32768)
-            or (num_rows < 128 and d >= 65536)
-            or d >= 524288
-        )
+
+        return (num_rows < 128 and d >= 65536) or d >= 524288
 
     # When the clusters backend is available (SM100, eager, non-deterministic,
-    # no tie-break, clusters-compatible arguments), it beats CUB on every
-    # measured transform cell. Check after the graphed branch because the clusters
-    # backend doesn't support graph capture.
+    # no tie-break, clusters-compatible arguments), it beats CUB on nearly every
+    # measured cell; CUB keeps only very wide row counts at long d. Checked
+    # after the graphed branch because the clusters backend doesn't support
+    # graph capture.
     if clusters_eligible:
-        return False
+        return num_rows >= 512 and d >= 65536
 
     if tie:
         if fp32:
-            return (num_rows <= 16 and d >= 262144) or (num_rows <= 32 and d >= 524288)
-        return (num_rows <= 32 and d >= 262144) or (num_rows <= 64 and d >= 524288)
+            return (
+                (d <= 2048 and num_rows < 256)
+                or d <= 1024
+                or (num_rows <= 32 and d >= 16384)
+            )
+        if dtype == torch.float16:
+            return (
+                (d <= 1024 and num_rows < 256)
+                or (num_rows <= 32 and d >= 32768)
+                or (num_rows <= 64 and d >= 131072)
+            )
+        return (
+            (d <= 1024 and num_rows < 256)
+            or (num_rows <= 32 and d >= 32768)
+            or (num_rows <= 64 and d >= 65536)
+            or (num_rows <= 128 and d >= 524288)
+        )
 
-    return False
+    if fp32:
+        return (num_rows == 1 and d >= 32768) or (num_rows <= 32 and d >= 65536)
+    return (num_rows <= 32 and d >= 32768) or (num_rows <= 64 and d >= 262144)
 
 
 def is_cub_ragged_transform_beneficial(
@@ -793,39 +819,41 @@ def is_cub_ragged_transform_beneficial(
     if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
         if tie:
             if fp32:
-                # Small batches win at every d; large batches only lose in the
-                # 16384-32768 pocket
-                return num_rows < 128 or d < 16384 or d > 32768
-            if num_rows < 128:
-                return d >= 8192
-            return 4096 <= d <= 8192 or d >= 65536
+                if num_rows == 1:
+                    return d <= 256 or d >= 4096
+                if num_rows < 128:
+                    return True
+                return d <= 8192 or (num_rows <= 256 and d >= 65536)
+            return (
+                d <= 256
+                or (num_rows == 1 and d >= 16384)
+                or (1 < num_rows < 128 and d >= 8192)
+                or (128 <= num_rows <= 256 and d >= 65536)
+            )
 
-        if fp32:
-            if num_rows < 128:
-                return d >= 8192
-            return 4096 <= d <= 8192 or d >= 65536
-        # For 16 bit dtypes, the winning `d` threshold moves up with batch size
-        # (and fp16 lags bf16 at large batch)
         if num_rows < 128:
             return d >= 32768
-        return d >= (65536 if dtype == torch.bfloat16 else 131072)
+
+        return num_rows <= 256 and d >= (131072 if dtype == torch.float16 else 65536)
 
     # When the clusters backend is available (SM100, eager, non-deterministic,
-    # no tie-break, clusters-compatible arguments), it beats CUB on every
-    # measured transform cell. Check after the graphed branch because the clusters
+    # no tie-break, clusters-compatible arguments), it beats CUB on nearly every
+    # measured cell; CUB keeps only single rows at long d and the fp32 d ~ 8192
+    # band at mid batch. Checked after the graphed branch because the clusters
     # backend doesn't support graph capture.
     if clusters_eligible:
-        return False
+        return num_rows == 1 and d >= 524288
 
     if tie:
         if fp32:
-            return (num_rows <= 16 and d >= 262144) or (num_rows <= 32 and d >= 524288)
+            return (num_rows <= 32 and d >= 16384) or (num_rows <= 64 and d >= 32768)
+        if dtype == torch.float16:
+            return (num_rows <= 64 and d >= 32768) or (num_rows <= 128 and d >= 262144)
+        return (num_rows <= 64 and d >= 16384) or d >= 262144
 
-        if dtype == torch.bfloat16:
-            return (num_rows <= 64 and d >= 262144) or d >= 524288
-        return num_rows <= 64 and d >= 262144
-
-    return False
+    if fp32:
+        return (num_rows <= 32 and d >= 32768) or (num_rows <= 64 and d >= 65536)
+    return (num_rows <= 64 and d >= 32768) or d >= 131072
 
 
 @flashinfer_api
