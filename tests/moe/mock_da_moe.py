@@ -32,7 +32,6 @@ from flashinfer.fused_moe.da_moe import (
     DAPlanMode,
     DAResourceLeaseConflict,
     DAResources,
-    tensor_content_fingerprint,
 )
 from flashinfer.jit.core import gen_jit_spec
 
@@ -307,6 +306,8 @@ class MockDAMoERunner:
         self._last_normal_tactic: int | None = None
         # Latest retryable resource conflict observed by the public warmup path.
         self._last_preparation_conflict: str | None = None
+        # Latest complete-working-set profiling facts exposed by the MVP report.
+        self._last_profile_diagnostics: dict[str, Any] | None = None
 
     @property
     def moe_runner(self) -> MockMoERunner:
@@ -347,6 +348,11 @@ class MockDAMoERunner:
     def last_preparation_conflict(self) -> str | None:
         """Return the latest transient resource conflict, if retry has not succeeded."""
         return self._last_preparation_conflict
+
+    @property
+    def last_profile_diagnostics(self) -> dict[str, Any] | None:
+        """Return the latest user-visible AutoTuner provisioning observations."""
+        return self._last_profile_diagnostics
 
     def resource_counts(self) -> dict[str, int]:
         """Return user-visible prepared and live-graph resource ownership counts."""
@@ -392,31 +398,55 @@ class MockDAMoERunner:
         exemplar_expert_ids: list[torch.Tensor],
     ) -> DAPlan:
         """Profile internal warmup exemplars and publish the resulting DA plan."""
-        # Change both expert IDs and BF16 weights for every value-aware exemplar while reusing all
-        # graph-stable public output tensors.
-        selected_tactics: list[int] = []
         tuner = AutoTuner.get()
+        effective_config, batches = tuner.prepare_profile_schedule(
+            inputs.as_list(),
+            self._tuning_config,
+        )
+        fixed_indices = (0, 3, 4)
+        fixed_pointers = tuple(
+            tuple(batch_inputs[index].data_ptr() for index in fixed_indices)
+            for batch_inputs, _ in batches
+        )
+        working_set_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in batches[0][0]
+        )
+
+        # Change only expert IDs and BF16 routing weights between exemplars. Every tactic sees
+        # the same AutoTuner-owned complete replica schedule and fixed tensor contents.
+        selected_tactics: list[int] = []
+        measurement_count = 0
         for exemplar_index, expert_ids in enumerate(exemplar_expert_ids):
             if expert_ids.shape != inputs.expert_ids.shape:
                 raise ValueError("Every tuning exemplar must match expert_ids shape")
             changed_weights = inputs.expert_weights + float(exemplar_index + 1)
-            profile_inputs = MockMoEInputs(
-                hidden_states=inputs.hidden_states,
-                expert_ids=expert_ids,
-                expert_weights=changed_weights,
-                output=inputs.output,
-                body_trace=inputs.body_trace,
+            for batch_inputs, _ in batches:
+                batch_inputs[1].copy_(expert_ids)
+                batch_inputs[2].copy_(changed_weights)
+            latencies = {
+                tactic: tuner.profile_tactic(
+                    self._moe_runner,
+                    inputs.as_list(),
+                    tactic,
+                    effective_config,
+                    batches,
+                )
+                for tactic in self.valid_tactics
+            }
+            measurement_count += len(latencies)
+            selected_tactics.append(
+                min(latencies, key=lambda tactic: (latencies[tactic], tactic))
             )
-            operation_name = self._value_aware_operation_name(
-                expert_ids, changed_weights
-            )
-            _, tactic = tuner.choose_one(
-                operation_name,
-                [self._moe_runner],
-                self._tuning_config,
-                profile_inputs.as_list(),
-            )
-            selected_tactics.append(tactic)
+
+        # Retain compact public evidence without retaining the provisioned tensor allocations.
+        self._last_profile_diagnostics = {
+            "replica_count": len(batches),
+            "working_set_bytes_per_replica": working_set_bytes,
+            "uses_cold_l2_cache": effective_config.use_cold_l2_cache,
+            "fixed_pointer_schedule": fixed_pointers,
+            "sample_count": len(exemplar_expert_ids),
+            "measurement_count": measurement_count,
+        }
         # Publish only after every exemplar has completed ordinary AutoTuner selection.
         return self.publish_plan(exemplar_expert_ids, selected_tactics)
 
@@ -497,11 +527,8 @@ class MockDAMoERunner:
             run_body=lambda body: self._moe_runner.forward(
                 inputs, tactic=body.tactic, **kwargs
             ),
-            capture_switch=lambda plan,
-            resources,
-            capture_id,
-            previous_node: self._capture_switch(
-                bundle, plan, resources, capture_id, previous_node
+            capture_switch=lambda plan, resources, capture_id, previous_node: (
+                self._capture_switch(bundle, plan, resources, capture_id, previous_node)
             ),
         )
 
@@ -591,10 +618,3 @@ class MockDAMoERunner:
         if resources is None:
             raise RuntimeError("No multi-body DA resources have been prepared")
         return resources
-
-    def _value_aware_operation_name(
-        self, expert_ids: torch.Tensor, expert_weights: torch.Tensor
-    ) -> str:
-        """Build a tuning identity from distribution and weight tensor contents."""
-        fingerprint = tensor_content_fingerprint(expert_ids, expert_weights)
-        return f"{self._moe_runner.operation_family}.value_{fingerprint[:20]}"
