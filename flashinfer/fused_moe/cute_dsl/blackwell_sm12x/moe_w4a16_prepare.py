@@ -152,12 +152,25 @@ def _nvfp4_compute_scale_factor(
 ) -> float:
     if a_dtype == torch.float16:
         return 1.0
-    max_scalar = 0.0
-    for expert in range(int(packed_scales.shape[0])):
-        ws_float = packed_scales[expert].float() * (2**7)
-        nonzero_mask = ws_float > 0
-        if bool(nonzero_mask.any().item()):
-            max_scalar = max(max_scalar, float(ws_float[nonzero_mask].max().item()))
+    if packed_scales.numel() == 0:
+        return 1.0
+
+    # NVFP4 block scales are nonnegative by contract, and nonnegative E4M3
+    # values preserve their ordering in the raw byte representation. PyTorch
+    # does not implement CUDA max for float8, so reduce an aliasing uint8 view
+    # and convert only the resulting scalar. Other source dtypes can use their
+    # native reduction. Neither path creates full-size FP32 copies or masks.
+    if packed_scales.dtype == torch.float8_e4m3fn:
+        max_scale = (
+            packed_scales.view(torch.uint8)
+            .max()
+            .view(torch.float8_e4m3fn)
+            .float()
+            .item()
+        )
+    else:
+        max_scale = packed_scales.max().float().item()
+    max_scalar = float(max_scale) * (2**7)
     if max_scalar > 0.0 and max_scalar < 448 * (2**7):
         return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
     return 1.0
