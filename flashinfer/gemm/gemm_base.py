@@ -8650,6 +8650,43 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     return True
 
 
+def _batch_deepgemm_fp8_nt_groupwise_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int],
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    backend: Literal["deepgemm", "cake"],
+) -> torch.Tensor:
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
+        )
+
+    if backend == "cake":
+        from ..jit.gemm.cake_batch_deepgemm import run_cake_batch_deepgemm_fp8
+
+        run_cake_batch_deepgemm_fp8(a, b, a_scale, b_scale, masked_m, out, expected_m)
+    else:
+        from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
+
+        m_grouped_fp8_gemm_nt_masked(
+            (a, a_scale),
+            (b, b_scale),
+            out,
+            masked_m,
+            expected_m,
+            scale_granularity_mnk,
+        )
+
+    return out
+
+
 @backend_requirement(
     {
         "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise,
@@ -8776,29 +8813,31 @@ def batch_deepgemm_fp8_nt_groupwise(
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
-    if out is None:
-        out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
-        )
-
     if backend == "cake":
-        from ..jit.gemm.cake_batch_deepgemm import run_cake_batch_deepgemm_fp8
-
-        run_cake_batch_deepgemm_fp8(a, b, a_scale, b_scale, masked_m, out, expected_m)
-    else:
-        from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
-
-        m_grouped_fp8_gemm_nt_masked(
-            (a, a_scale),
-            (b, b_scale),
-            out,
+        return _batch_deepgemm_fp8_nt_groupwise_impl(
+            a,
+            b,
+            a_scale,
+            b_scale,
             masked_m,
             expected_m,
             scale_granularity_mnk,
+            out,
+            out_dtype,
+            backend="cake",
         )
-
-    return out
+    return _batch_deepgemm_fp8_nt_groupwise_impl(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk,
+        out,
+        out_dtype,
+        backend="deepgemm",
+    )
 
 
 @functools.cache
