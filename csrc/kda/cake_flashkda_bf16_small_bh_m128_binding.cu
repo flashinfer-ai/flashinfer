@@ -46,8 +46,7 @@ constexpr int64_t kSmallBHPacketRows = 123;
 constexpr int64_t kSmallBHPacketElements = 128;
 constexpr int64_t kSmallBHMinSequenceLength = 2048;
 constexpr size_t kSmallBHTensorMapCount = 7;
-constexpr size_t kSmallBHDescriptorStorageBytes =
-    kSmallBHTensorMapCount * sizeof(CUtensorMap);
+constexpr size_t kSmallBHDescriptorStorageBytes = kSmallBHTensorMapCount * sizeof(CUtensorMap);
 
 static_assert(THREADS == 1024);
 static_assert(SMEM_TOTAL == 227328);
@@ -61,17 +60,16 @@ inline CUtensorMap EncodeSmallBHPacketTma(const TensorView& tensor) {
       << "packet_workspace must contain at least one 123-row packet";
   uint64_t global_dim[2] = {static_cast<uint64_t>(kSmallBHPacketElements),
                             static_cast<uint64_t>(tensor.size(0))};
-  uint64_t global_strides[1] = {
-      static_cast<uint64_t>(tensor.stride(0) * sizeof(__nv_bfloat16))};
+  uint64_t global_strides[1] = {static_cast<uint64_t>(tensor.stride(0) * sizeof(__nv_bfloat16))};
   uint32_t box_dim[2] = {static_cast<uint32_t>(kSmallBHPacketElements),
                          static_cast<uint32_t>(kSmallBHPacketRows)};
   uint32_t elem_strides[2] = {1, 1};
   CUtensorMap tensor_map{};
-  const CUresult result = cuTensorMapEncodeTiled(
-      &tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, tensor.data_ptr(), global_dim,
-      global_strides, box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  const CUresult result =
+      cuTensorMapEncodeTiled(&tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, tensor.data_ptr(),
+                             global_dim, global_strides, box_dim, elem_strides,
+                             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK(result == CUDA_SUCCESS)
       << "cuTensorMapEncodeTiled failed for packet_workspace with CUresult=" << int(result);
   return tensor_map;
@@ -94,20 +92,19 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
                     TensorView cu_seqlens, TensorView seq_order, TensorView initial_state,
                     TensorView out, TensorView final_state, TensorView descriptor_storage,
                     TensorView packet_workspace, TensorView packet_ready,
-                    TensorView packet_consumed, TensorView helper_done,
-                    int64_t prepare_descriptors, int64_t num_heads, int64_t use_initial_state,
-                    int64_t store_final_state, double scale, double lower_bound,
-                    int64_t cuda_stream) {
+                    TensorView packet_consumed, TensorView helper_done, int64_t prepare_descriptors,
+                    int64_t num_heads, int64_t use_initial_state, int64_t store_final_state,
+                    double scale, double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckFlashKDATarget(device_id);
 
-  const int64_t num_seqs = CheckCommonInputs(
-      q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
-      final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
-      store_final_state, scale, lower_bound);
+  const int64_t num_seqs =
+      CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
+                        initial_state, out, final_state, descriptor_storage, prepare_descriptors,
+                        num_heads, use_initial_state, store_final_state, scale, lower_bound);
   TVM_FFI_ICHECK(q.ndim() == 4 && q.size(0) == num_seqs)
       << "small-BH FlashKDA requires fixed [B, T, H, 128] layout";
   TVM_FFI_ICHECK(q.size(1) >= kSmallBHMinSequenceLength)
@@ -131,24 +128,21 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
                  packet_workspace.size(0) == packet_slots * kSmallBHPacketRows &&
                  packet_workspace.size(1) == kSmallBHPacketElements)
       << "packet_workspace has the wrong compact-ring shape";
-  for (const auto& named : {std::pair<const TensorView*, const char*>(&packet_ready, "packet_ready"),
-                            std::pair<const TensorView*, const char*>(&packet_consumed,
-                                                                      "packet_consumed"),
-                            std::pair<const TensorView*, const char*>(&helper_done,
-                                                                      "helper_done")}) {
+  for (const auto& named :
+       {std::pair<const TensorView*, const char*>(&packet_ready, "packet_ready"),
+        std::pair<const TensorView*, const char*>(&packet_consumed, "packet_consumed"),
+        std::pair<const TensorView*, const char*>(&helper_done, "helper_done")}) {
     CheckCudaTensor(*named.first, named.second, device_id);
     CheckDtype(*named.first, named.second, dl_uint32);
     TVM_FFI_ICHECK(named.first->ndim() == 1) << named.second << " must be one-dimensional";
   }
-  TVM_FFI_ICHECK(packet_ready.numel() == packet_slots &&
-                 packet_consumed.numel() == packet_slots)
+  TVM_FFI_ICHECK(packet_ready.numel() == packet_slots && packet_consumed.numel() == packet_slots)
       << "packet generation counters must contain one entry per ring slot";
   TVM_FFI_ICHECK(helper_done.numel() == total_tasks)
       << "helper_done must contain one entry per sequence/head task";
-  TVM_FFI_ICHECK(descriptor_storage.numel() >=
-                 static_cast<int64_t>(kSmallBHDescriptorStorageBytes))
-      << "small-BH descriptor_storage must contain at least "
-      << kSmallBHDescriptorStorageBytes << " bytes";
+  TVM_FFI_ICHECK(descriptor_storage.numel() >= static_cast<int64_t>(kSmallBHDescriptorStorageBytes))
+      << "small-BH descriptor_storage must contain at least " << kSmallBHDescriptorStorageBytes
+      << " bytes";
 
   for (const auto& workspace_named :
        {std::pair<const TensorView*, const char*>(&packet_workspace, "packet_workspace"),
@@ -169,8 +163,7 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
           std::pair<const TensorView*, const char*>(&initial_state, "initial_state"),
           std::pair<const TensorView*, const char*>(&out, "out"),
           std::pair<const TensorView*, const char*>(&final_state, "final_state"),
-          std::pair<const TensorView*, const char*>(&descriptor_storage,
-                                                    "descriptor_storage")}) {
+          std::pair<const TensorView*, const char*>(&descriptor_storage, "descriptor_storage")}) {
       CheckNoOverlap(*workspace_named.first, workspace_named.second, *input_named.first,
                      input_named.second);
     }
@@ -189,16 +182,16 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
             "cudaFuncSetAttribute(kernel_flashkda_bf16_small_bh_m128)");
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128, 32>(
-      q, k, v, g, beta_tma, out, descriptor_storage, prepare_descriptors, stream);
+  const TmaPointers tma = EncodeTmaPointers<128, 32>(q, k, v, g, beta_tma, out, descriptor_storage,
+                                                     prepare_descriptors, stream);
   auto* descriptor_bytes = static_cast<unsigned char*>(descriptor_storage.data_ptr());
   void* packet_tma = descriptor_bytes + kTensorMapCount * sizeof(CUtensorMap);
   if (prepare_descriptors != 0) {
     const CUtensorMap packet_map = EncodeSmallBHPacketTma(packet_workspace);
     SmallBHPacketTensorMapWords words{};
     std::memcpy(words.words, &packet_map, sizeof(packet_map));
-    PublishSmallBHPacketTensorMap<<<1, 32, 0, stream>>>(
-        reinterpret_cast<uint64_t*>(packet_tma), words);
+    PublishSmallBHPacketTensorMap<<<1, 32, 0, stream>>>(reinterpret_cast<uint64_t*>(packet_tma),
+                                                        words);
     CheckCuda(cudaGetLastError(), "PublishSmallBHPacketTensorMap launch");
   }
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta.stride(beta.ndim() - 2), stream);
@@ -225,8 +218,7 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound), 0, 0, 0,
-      static_cast<int64_t>(num_heads),
-      static_cast<int64_t>(num_heads * kHeadDim * kHeadDim), 0, 0,
+      static_cast<int64_t>(num_heads), static_cast<int64_t>(num_heads * kHeadDim * kHeadDim), 0, 0,
       reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(packet_tma),
       reinterpret_cast<unsigned int*>(packet_ready.data_ptr()),
       reinterpret_cast<unsigned int*>(packet_consumed.data_ptr()),
