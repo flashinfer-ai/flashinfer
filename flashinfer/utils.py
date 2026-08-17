@@ -277,26 +277,55 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
         )
 
 
-@functools.cache
-def get_device_properties(device: torch.device):
-    return torch.cuda.get_device_properties(device)
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
-@functools.cache
-def get_compute_capability(device: torch.device) -> Tuple[int, int]:
+def _require_cuda_device_index(device: torch.device) -> int:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
+    return get_device_index(device)
+
+
+@functools.cache
+def _get_device_properties(device_index: int):
+    return torch.cuda.get_device_properties(device_index)
+
+
+def get_device_properties(device: torch.device):
+    return _get_device_properties(_require_cuda_device_index(device))
+
+
+def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     properties = get_device_properties(device)
     return properties.major, properties.minor
 
 
 @functools.cache
-def get_gpu_memory_bandwidth(device: torch.device) -> float:
+def _get_gpu_memory_bandwidth(device_index: int) -> float:
+    """Get GPU memory bandwidth in GB/s for a concrete CUDA device index."""
+    pynvml.nvmlInit()
+    try:
+        device_uuid = str(_get_device_properties(device_index).uuid)
+        if not device_uuid.startswith(("GPU-", "MIG-")):
+            device_uuid = f"GPU-{device_uuid}"
+        handle = pynvml.nvmlDeviceGetHandleByUUID(device_uuid)
+        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_clock = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+
+        # Calculate theoretical peak bandwidth (GB/s)
+        return (mem_clock * bus_width * 2) / 8 / 1000
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def get_gpu_memory_bandwidth(device: Union[torch.device, str]) -> float:
     """
     Get GPU memory bandwidth in GB/s for the specified CUDA device.
 
     Args:
-        device: torch.device object, e.g., torch.device('cuda:0')
+        device: torch.device object or string, e.g., torch.device("cuda:0")
 
     Returns:
         float: GPU memory bandwidth (GB/s)
@@ -308,32 +337,11 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
     if isinstance(device, str):
         device = torch.device(device)
 
-    # Check if it's a CUDA device
-    if device.type != "cuda":
-        raise ValueError(f"Device must be a CUDA device, got {device}")
-
-    # Get device index
-    device_index = device.index if device.index is not None else 0
-
-    # Use pynvml to get bandwidth
-    pynvml.nvmlInit()
-    try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
-        mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
-
-        # Calculate theoretical peak bandwidth (GB/s)
-        bandwidth = (mem_clock * bus_width * 2) / 8 / 1000
-
-        return bandwidth
-    finally:
-        pynvml.nvmlShutdown()
+    return _get_gpu_memory_bandwidth(_require_cuda_device_index(device))
 
 
-@functools.cache
 def get_shared_bytes_per_block_optin(device: torch.device) -> int:
-    cap = get_device_properties(device)
-    return cap.shared_memory_per_block_optin
+    return get_device_properties(device).shared_memory_per_block_optin
 
 
 def _check_cached_qkv_data_type(
@@ -807,7 +815,6 @@ def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
 
 
-@functools.cache
 def device_support_pdl(device: torch.device) -> bool:
     if device.type != "cuda":
         return False
@@ -834,19 +841,12 @@ def round_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-@functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return get_device_properties(device).multi_processor_count
 
 
-@functools.cache
 def get_device_name(device: torch.device) -> str:
     return get_device_properties(device).name
-
-
-def get_device_index(device: torch.device) -> int:
-    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
-    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(
@@ -1447,9 +1447,13 @@ def backend_requirement(
 
 
 @functools.cache
-def get_default_generators(device: torch.device):
+def _get_default_generator(device_index: int):
     torch.cuda.init()
-    return torch.cuda.default_generators[device.index]
+    return torch.cuda.default_generators[device_index]
+
+
+def get_default_generators(device: torch.device):
+    return _get_default_generator(_require_cuda_device_index(device))
 
 
 def prepare_jit_additional_args(
