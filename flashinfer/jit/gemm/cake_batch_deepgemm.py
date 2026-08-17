@@ -106,6 +106,15 @@ def _get_csrc_dir() -> Path:
     raise FileNotFoundError("Cake batch DeepGEMM FP8 sources were not found")
 
 
+def _get_include_dir() -> Path:
+    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+        return jit_env.FLASHINFER_INCLUDE_DIR
+    checkout = Path(__file__).resolve().parents[3] / "include"
+    if checkout.exists():
+        return checkout
+    raise FileNotFoundError("FlashInfer headers were not found")
+
+
 def _binding_source(metadata: CakeBatchDeepGemmMetadata, target: str) -> str:
     return f"""\
 /*
@@ -144,7 +153,7 @@ def gen_cake_batch_deepgemm_module(
         name=uri,
         sources=[binding],
         extra_cuda_cflags=extra_flags,
-        extra_include_paths=[csrc_dir, csrc_dir.parent],
+        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
 
 
