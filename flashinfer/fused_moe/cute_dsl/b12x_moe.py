@@ -623,6 +623,29 @@ class B12xMoEWrapper:
         Set ``reuse_input_storage=True`` only if this wrapper exclusively owns
         the checkpoint weights. Their storage is destructively repacked and
         cannot subsequently be used by another backend or fallback path.
+
+        Parameters
+        ----------
+        w1_weight : torch.Tensor
+            FP4-packed FC1 checkpoint weights.
+        w1_weight_sf : torch.Tensor
+            Block scale factors for ``w1_weight``.
+        w2_weight : torch.Tensor
+            FP4-packed FC2 checkpoint weights.
+        w2_weight_sf : torch.Tensor
+            Block scale factors for ``w2_weight``.
+        w1_alpha : torch.Tensor
+            Per-expert global scale for FC1.
+        w2_alpha : torch.Tensor
+            Per-expert global scale for FC2.
+        reuse_input_storage : bool
+            Whether to destructively repack W1 and W2 into their source
+            allocations. Defaults to ``False``.
+
+        Returns
+        -------
+        W4A16PackedWeights
+            Caller-owned packed weights accepted by :meth:`run_prepared`.
         """
         if self.quant_mode != "w4a16":
             raise ValueError(
@@ -684,7 +707,24 @@ class B12xMoEWrapper:
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Run W4A16 MoE from an explicit caller-owned prepared object."""
+        r"""Run W4A16 MoE from an explicit caller-owned prepared object.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input activations of shape ``[num_tokens, hidden_size]``.
+        prepared_weights : W4A16PackedWeights
+            Packed weights returned by :meth:`prepare_weights`.
+        token_selected_experts : torch.Tensor
+            Expert assignments of shape ``[num_tokens, top_k]``.
+        token_final_scales : torch.Tensor
+            Routing weights of shape ``[num_tokens, top_k]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``[num_tokens, hidden_size]``.
+        """
         if self.quant_mode != "w4a16":
             raise ValueError("run_prepared is only available when quant_mode='w4a16'")
         self._validate_prepared_weights(prepared_weights)
