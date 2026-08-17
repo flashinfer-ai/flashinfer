@@ -124,7 +124,7 @@ def _preload_libnixl() -> None:
         raise MoEEpNotBuiltError(
             f"libnixl.so is missing from the NIXL wheel lib dir at "
             f"{nixl_lib_dir}. Reinstall: "
-            "uv pip install --no-deps 'nixl-cu13==1.3.1'"
+            "uv pip install --force-reinstall --no-deps 'nixl-cu13==1.3.1'"
         )
     for libname in _NIXL_BASE_LIBS:
         libpath = nixl_lib_dir / libname
