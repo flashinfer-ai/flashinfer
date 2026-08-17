@@ -52,12 +52,18 @@ fi
 # and installed here for CI only. The blk128 backend supports SM100/SM103, so we
 # install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
 # The correct PyPI distribution name is quack-kernels (top-level package: quack).
+# --no-deps: quack-kernels 0.6.4 hard-pins nvidia-cutlass-dsl==4.6.2, which would
+# downgrade the DSL this job just pinned and leave libs-cu13 skewed (#4555). Its
+# remaining deps are either already installed (torch, apache-tvm-ffi, einops) or
+# listed alongside it here.
 SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
 if [ "${SM_MAJOR}" = "10" ]; then
   echo "========================================"
   echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
   echo "========================================"
-  pip install "quack-kernels==0.6.4"
+  pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext"
+  # Fail here rather than as a confusing test error if --no-deps left a gap.
+  python -c "import quack"
   echo "quack-kernels install complete."
   echo ""
 fi
