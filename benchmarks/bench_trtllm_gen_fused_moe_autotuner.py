@@ -54,6 +54,64 @@ BACKENDS = ("trtllm", "prims_ts")
 
 
 @dataclass(frozen=True)
+class MoeModelPreset:
+    quant_mode: str
+    num_tokens: tuple[int, ...]
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    routed_scaling_factor: float
+    swiglu_limit: float
+
+
+# These presets benchmark the routed-expert fused kernel only.  V4's router and
+# shared expert are intentionally excluded so both backends receive identical
+# precomputed routing decisions and execute the same FC1/SwiGLU/FC2 workload.
+MODEL_PRESETS = {
+    "deepseek-v4-flash": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+    ),
+    "deepseek-v4-pro": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=384,
+        hidden_size=7168,
+        intermediate_size=3072,
+        top_k=6,
+        routed_scaling_factor=2.5,
+        swiglu_limit=10.0,
+    ),
+}
+
+
+def _apply_model_preset(args: argparse.Namespace) -> None:
+    if args.model == "custom":
+        return
+
+    preset = MODEL_PRESETS[args.model]
+    args.quant_mode = preset.quant_mode
+    if args.num_tokens is None:
+        args.num_tokens = list(preset.num_tokens)
+    args.num_experts = preset.num_experts
+    args.hidden_size = preset.hidden_size
+    args.intermediate_size = preset.intermediate_size
+    args.top_k = preset.top_k
+    args.use_bias = False
+    args.routed = True
+    args.activation_type = ActivationType.Swiglu
+    args.routed_scaling_factor = preset.routed_scaling_factor
+    args.swiglu_limit = preset.swiglu_limit
+
+
+@dataclass(frozen=True)
 class BenchmarkSetup:
     batch_size: int
     backend: str
@@ -70,11 +128,18 @@ class BenchmarkResult:
 
 
 def _pack_topk(
-    num_tokens: int, top_k: int, num_experts: int, device: torch.device
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    device: torch.device,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
     raw_w = torch.rand(num_tokens, top_k, device=device)
-    weights = (raw_w / raw_w.sum(-1, keepdim=True)).to(torch.bfloat16)
+    weights = raw_w / raw_w.sum(-1, keepdim=True)
+    if routed_scaling_factor is not None:
+        weights *= routed_scaling_factor
+    weights = weights.to(torch.bfloat16)
     return (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
 
 
@@ -819,6 +884,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     tuning_buckets: Optional[list[int]] = None,
     use_bias: bool = True,
     routed: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
+    model: str = "custom",
     cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
@@ -917,6 +985,16 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         [hidden_states_global_scale * w2_global_scale] * local_num_experts,
         device=device,
     )
+    gemm1_clamp_limit = (
+        torch.full(
+            (local_num_experts,),
+            swiglu_limit,
+            dtype=torch.float32,
+            device=device,
+        )
+        if swiglu_limit is not None
+        else None
+    )
 
     shuffled = _shuffle_fp4_major_k(
         w13,
@@ -935,7 +1013,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         routing_bias=None,
         gemm1_alpha=None,
         gemm1_beta=None,
-        gemm1_clamp_limit=None,
+        gemm1_clamp_limit=gemm1_clamp_limit,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
@@ -946,7 +1024,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         intermediate_size=intermediate_size,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
-        routed_scaling_factor=None,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
         enable_pdl=enable_pdl,
@@ -982,7 +1060,13 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
 
         if routed:
             common_fn_kwargs = dict(
-                topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
+                topk_ids=_pack_topk(
+                    batch_size,
+                    top_k,
+                    num_experts,
+                    device,
+                    routed_scaling_factor,
+                ),
                 **fp4_kwargs,
             )
         else:
@@ -1018,10 +1102,12 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         setups,
         warmups,
         iterations,
-        f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
+        f"model={model}  quant_mode={quant_mode}  routing={mode_str}"
+        f"  experts={num_experts}"
         f"  local_experts={local_num_experts}  local_offset={local_expert_offset}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
-        f"  bias={use_bias}",
+        f"  bias={use_bias}  routed_scale={routed_scaling_factor}"
+        f"  swiglu_limit={swiglu_limit}",
         tuning_buckets=tuning_buckets,
         cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
@@ -1113,6 +1199,18 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="custom",
+        choices=["custom", *MODEL_PRESETS],
+        help=(
+            "MoE model preset. DeepSeek-V4 presets select the checkpoint's "
+            "MXFP4-weight/MXFP8-activation routed-expert shape, Top-K, routing "
+            "scale, no-bias path, and SwiGLU clamp. --num-tokens and TP remain "
+            "configurable."
+        ),
+    )
     parser.add_argument(
         "--quant-mode",
         type=str,
@@ -1233,8 +1331,21 @@ if __name__ == "__main__":
         default=None,
         help="Write configuration, environment, and raw median results as JSON.",
     )
+    parser.add_argument(
+        "--routed-scaling-factor",
+        type=float,
+        default=None,
+        help="Optional routing-weight scale applied by the fused MoE operation.",
+    )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Optional per-expert SwiGLU clamp limit for FP4 MoE.",
+    )
     args = parser.parse_args()
 
+    _apply_model_preset(args)
     torch.manual_seed(args.seed)
 
     if args.num_tokens is None:
@@ -1328,6 +1439,9 @@ if __name__ == "__main__":
             tuning_buckets=args.tuning_buckets,
             use_bias=args.use_bias,
             routed=args.routed,
+            routed_scaling_factor=args.routed_scaling_factor,
+            swiglu_limit=args.swiglu_limit,
+            model=args.model,
             cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
 

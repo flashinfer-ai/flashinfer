@@ -312,9 +312,7 @@ class GmemCResource(MemoryResource):
 
     def _use_swap_ab_quant_tma_store(self) -> bool:
         """Whether the swapAB quantized epilogue should stage C through TMA."""
-        return self.cfg.use_tma_store and not (
-            self.cfg.use_tile256_tmem_overlap and self.cfg.uses_mxfp8_output_quant
-        )
+        return self.cfg.use_tma_store
 
     @cute.jit
     def _quick_gelu(self, x, scale_gate):
@@ -603,15 +601,38 @@ class GmemCResource(MemoryResource):
     def _clamp_swiglu_oai_linear(self, val):
         if cutlass.const_expr(self.cfg.has_gemm1_clamp_limit):
             limit = self.tile_gemm1_clamp_limit
-            val = cute.math.max(val, -limit)
-            val = cute.math.min(val, limit)
+            # Match TRT-LLM Gen's ordered-comparison clamp.  cute.math.min/max
+            # preserve NaNs through explicit isnan/select sequences, whereas
+            # Gen's ternaries naturally retain NaN when both comparisons are
+            # false.  Emit that sequence directly to avoid the extra checks in
+            # the SwiGLU epilogue hot path.
+            val = prims.inline_ptx_hl(
+                "{\n"
+                ".reg .pred below, above;\n"
+                ".reg .f32 tmp;\n"
+                "setp.lt.f32 below, {$r0}, {$r1};\n"
+                "selp.f32 tmp, {$r1}, {$r0}, below;\n"
+                "setp.gt.f32 above, tmp, {$r2};\n"
+                "selp.f32 {$w0}, {$r2}, tmp, above;\n"
+                "}",
+                write_only_types=[Float32],
+                read_only_args=[Float32(val), Float32(-limit), Float32(limit)],
+            )
         return val
 
     @cute.jit
     def _clamp_swiglu_oai_gate(self, val):
         if cutlass.const_expr(self.cfg.has_gemm1_clamp_limit):
             limit = self.tile_gemm1_clamp_limit
-            val = cute.math.min(val, limit)
+            val = prims.inline_ptx_hl(
+                "{\n"
+                ".reg .pred above;\n"
+                "setp.gt.f32 above, {$r0}, {$r1};\n"
+                "selp.f32 {$w0}, {$r1}, {$r0}, above;\n"
+                "}",
+                write_only_types=[Float32],
+                read_only_args=[Float32(val), Float32(limit)],
+            )
         return val
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -1357,9 +1378,11 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _absmax_scratch_idx(self, warpgroup_idx, warp_in_epi4, lane_id, scale_slot):
-        lane_col = (lane_id % Int32(4)) * Int32(2)
+        lane_col = (lane_id & Int32(3)) << Int32(1)
         scratch_warp_stride = Int32(max(1, self.cfg.epi_tile_n // 8) * 8)
-        slot_col = (scale_slot // Int32(2)) * Int32(8) + (scale_slot % Int32(2))
+        slot_col = (scale_slot >> Int32(1)) * Int32(8) + (
+            scale_slot & Int32(1)
+        )
         return (
             self._absmax_scratch_base(warpgroup_idx)
             + warp_in_epi4 * scratch_warp_stride
@@ -1371,7 +1394,7 @@ class GmemCResource(MemoryResource):
     def _absmax_scratch_pair_idx(
         self, warpgroup_idx, warp_in_epi4, lane_id, scale_pair
     ):
-        lane_col = (lane_id % Int32(4)) * Int32(2)
+        lane_col = (lane_id & Int32(3)) << Int32(1)
         scratch_warp_stride = Int32(max(1, self.cfg.epi_tile_n // 8) * 8)
         return (
             self._absmax_scratch_base(warpgroup_idx)
@@ -1392,7 +1415,7 @@ class GmemCResource(MemoryResource):
         smem_idx = self._absmax_scratch_idx(
             warpgroup_idx, warp_in_epi4, lane_id, scale_slot
         )
-        if (lane_id // Int32(4)) == Int32(0):
+        if (lane_id >> Int32(2)) == Int32(0):
             self.sCFloat.subview(smem_idx).store(warp_absmax)
 
     @cute.jit
@@ -1404,7 +1427,7 @@ class GmemCResource(MemoryResource):
         smem_idx = self._absmax_scratch_pair_idx(
             warpgroup_idx, warp_in_epi4, lane_id, scale_pair
         )
-        if (lane_id // Int32(4)) == Int32(0):
+        if (lane_id >> Int32(2)) == Int32(0):
             self.sCFloat.store(
                 (warp_absmax0, warp_absmax1),
                 smem_idx,
@@ -1472,8 +1495,8 @@ class GmemCResource(MemoryResource):
                 cute.arch.fmax(own_vec[1], partner_vec[1]),
             )
         return (
-            cute.math.max(own_vec[0], partner_vec[0]),
-            cute.math.max(own_vec[1], partner_vec[1]),
+            self._fmax_ftz(own_vec[0], partner_vec[0]),
+            self._fmax_ftz(own_vec[1], partner_vec[1]),
         )
 
     @cute.jit
@@ -1615,16 +1638,14 @@ class GmemCResource(MemoryResource):
     def _sf_c_index(self, m_row, n_col, output_m):
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
-        if cutlass.const_expr(
-            self.cfg.uses_fp4_output_quant
-            and not self.cfg.uses_mx_output_quant
-            and self.cfg.output_sf_block_size_c == 16
-        ):
+        if cutlass.const_expr(self.cfg.output_sf_block_size_c in (16, 32)):
             # These coordinates are non-negative.  Spell out the power-of-two
             # arithmetic so the DSL does not lower Python's signed // and %
             # semantics into correction branches.
-            m_block = m_row >> Int32(4)
-            m_groups = (output_m + Int32(63)) >> Int32(6)
+            block_shift = 4 if self.cfg.output_sf_block_size_c == 16 else 5
+            group_shift = block_shift + 2
+            m_block = m_row >> Int32(block_shift)
+            m_groups = (output_m + group_m - Int32(1)) >> Int32(group_shift)
             if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
                 return (
                     (n_col >> Int32(3)) * (m_groups * Int32(32))
@@ -1668,7 +1689,7 @@ class GmemCResource(MemoryResource):
     def _mxfp8_tma_smem_byte_offset(self, m_local_row, n_local_col):
         output_tile_m = Int32(self.cfg.tile_m // 2)
         linear = n_local_col * output_tile_m + m_local_row
-        swizzle_mask = ((linear // Int32(128)) % Int32(4)) * Int32(16)
+        swizzle_mask = ((linear >> Int32(7)) & Int32(3)) << Int32(4)
         return linear ^ swizzle_mask
 
     @cute.jit
@@ -2090,6 +2111,46 @@ class GmemCResource(MemoryResource):
                 self.gSfCBytes.subview(sf_idx).store(sf_packed)
 
     @cute.jit
+    def _store_swap_ab_quant_sf_epi64(
+        self,
+        sf_values,
+        m_tile_base,
+        n_tile_base,
+        n_subtile_offset,
+        token_limit,
+        output_m,
+        lane_id,
+        warp_in_epi4,
+    ):
+        """Store an epi-N64 SF-C fragment as two coalesced warp stores."""
+
+        selector = lane_id >> Int32(2)
+        lane_col = (
+            (selector >> Int32(1)) * Int32(8)
+            + (lane_id & Int32(3)) * Int32(2)
+            + (selector & Int32(1))
+        )
+        m_row = (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16)
+        for half in cutlass.range_constexpr(2):
+            value_base = half * 8
+            sf_packed = self._select_int8_from_8(
+                sf_values[value_base : value_base + 8], selector
+            )
+            n_local_col = lane_col + Int32(half * 32)
+            n_col = n_tile_base + n_local_col
+            sf_idx = self._sf_c_index(m_row, n_col, output_m)
+            output_in_bounds = (n_col < self.problem_n) & (m_row < output_m)
+            if output_in_bounds:
+                if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                    token_in_bounds = (
+                        n_subtile_offset + n_local_col
+                    ) < token_limit
+                    if token_in_bounds:
+                        self.gSfCBytes.subview(sf_idx).store(sf_packed)
+                else:
+                    self.gSfCBytes.subview(sf_idx).store(sf_packed)
+
+    @cute.jit
     def _mx_output_write_absmax_phase(
         self,
         result0,
@@ -2104,7 +2165,7 @@ class GmemCResource(MemoryResource):
 
         Call for every (group, col_sub) BEFORE the batched bar.sync 9.
         """
-        local_absmax = cute.math.max(
+        local_absmax = self._fmax_ftz(
             cute.math.abs(result0),
             cute.math.abs(result1),
         )
@@ -2127,11 +2188,11 @@ class GmemCResource(MemoryResource):
         warp_in_epi4,
         scale_pair,
     ):
-        local_absmax0 = cute.math.max(
+        local_absmax0 = self._fmax_ftz(
             cute.math.abs(result00),
             cute.math.abs(result01),
         )
-        local_absmax1 = cute.math.max(
+        local_absmax1 = self._fmax_ftz(
             cute.math.abs(result10),
             cute.math.abs(result11),
         )
@@ -2191,7 +2252,10 @@ class GmemCResource(MemoryResource):
         scale_pair,
     ):
         block_absmax0, block_absmax1 = self._read_absmax_scratch_pair(
-            warpgroup_idx, warp_in_epi4, lane_id, scale_pair
+            warpgroup_idx,
+            warp_in_epi4,
+            lane_id,
+            scale_pair,
         )
         max_pow2_rcp = Float32(1.0 / 256.0)
         if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
@@ -2259,16 +2323,16 @@ class GmemCResource(MemoryResource):
                 smem_offset0 = self._mxfp8_tma_smem_byte_offset(
                     m_local_row0, n_local_col
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
-                self.sCInt16.subview(smem_offset0 // Int32(2)).store(packed)
+                self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
             flat_idx0 = n_col * output_m + m_row0
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                     if token_in_bounds:
-                        self.gCBytes.subview(flat_idx0 // Int32(2)).store(packed)
+                        self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
                 else:
-                    self.gCBytes.subview(flat_idx0 // Int32(2)).store(packed)
+                    self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
             else:
                 fp8_0 = scaled0.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
                 fp8_1 = scaled1.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
@@ -2280,8 +2344,8 @@ class GmemCResource(MemoryResource):
                     self.gCBytes.subview(flat_idx0).store(fp8_0)
                     self.gCBytes.subview(flat_idx0 + Int32(1)).store(fp8_1)
 
-        if ((lane_id // Int32(4)) == Int32(0)) & (
-            (warp_in_epi4 % Int32(2)) == Int32(0)
+        if ((lane_id >> Int32(2)) == Int32(0)) & (
+            (warp_in_epi4 & Int32(1)) == Int32(0)
         ):
             if cutlass.const_expr(store_sf_c):
                 sf_idx = self._sf_c_index(m_row0, n_col, output_m)
@@ -2535,7 +2599,7 @@ class GmemCResource(MemoryResource):
                                 lane_id,
                                 m_local_row0,
                                 tmem_col_even,
-                                self.cfg.epi_tile_n != 32,
+                                self.cfg.epi_tile_n not in (32, 64),
                             )
                             if cutlass.const_expr(self.cfg.epi_tile_n == 32):
                                 fp4_sf_c_vals.append(sf_packed)
@@ -2604,7 +2668,7 @@ class GmemCResource(MemoryResource):
                             pair_idx2 = group2 * 2 + col_sub2
                             tmem_col_even2 = base_tmem_col + col_off2 + Int32(col_sub2)
                             m_local_row0_2 = base_row_idx
-                            m_row0_2 = m_tile_base // Int32(2) + m_local_row0_2
+                            m_row0_2 = (m_tile_base >> Int32(1)) + m_local_row0_2
                             m_row1_2 = m_row0_2 + Int32(1)
                             n_col2 = n_tile_base + tmem_col_even2
                             token_ib2 = (
@@ -2634,8 +2698,20 @@ class GmemCResource(MemoryResource):
                         # Select one of its eight scale registers per four-lane
                         # group and emit one coalesced store, matching Gen,
                         # instead of eight separately predicated stores.
-                        if (warp_in_epi4 % Int32(2)) == Int32(0):
+                        if (warp_in_epi4 & Int32(1)) == Int32(0):
                             self._store_swap_ab_quant_sf_epi32(
+                                mx_sf_c_vals,
+                                m_tile_base,
+                                n_tile_base,
+                                n_subtile_offset,
+                                token_limit,
+                                output_m,
+                                lane_id,
+                                warp_in_epi4,
+                            )
+                    elif cutlass.const_expr(self.cfg.epi_tile_n == 64):
+                        if (warp_in_epi4 & Int32(1)) == Int32(0):
+                            self._store_swap_ab_quant_sf_epi64(
                                 mx_sf_c_vals,
                                 m_tile_base,
                                 n_tile_base,
