@@ -20,12 +20,16 @@ Import from ``flashinfer.gemm`` for the public kernel APIs.
 
 from .gemm_alpha_beta_cutile import gemm_alpha_beta
 from .masked_bmm_cutile import masked_bmm
+from .masked_scaled_bmm_cutile import masked_scaled_bmm
 from .ragged_block_scaled_bmm_cutile import ragged_block_scaled_bmm
 from .ragged_bmm_cutile import ragged_bmm
+from .ragged_scaled_bmm_cutile import ragged_scaled_bmm
 
 __all__ = [
     "gemm_alpha_beta",
     "masked_bmm",
+    "masked_scaled_bmm",
     "ragged_block_scaled_bmm",
     "ragged_bmm",
+    "ragged_scaled_bmm",
 ]
