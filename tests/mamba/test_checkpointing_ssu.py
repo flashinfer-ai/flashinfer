@@ -114,18 +114,16 @@ def _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x_tok, B_tok, dt_pr
 # standalone in its two modes (the merged non-TMA copy was removed with the
 # old 4D kernel, 2026-07-10).
 _TRITON_IMPLS = ["tma_pd", "tma_pm"]
-WARP_SIZE = 32
-MMA_FRAG_SIZE = 8
 
 
-def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
+def _two_kernel_scratch(batch, nheads, num_predicted_tokens, max_window, dtype, device):
     """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
 
     Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
     Forces algorithm="two-kernel": test batches sit below the wrapper's auto
     threshold (batch*nheads >= sm_count) and would silently run the monolith."""
     cb_scaled, cumAdt_vec, cb_old = allocate_checkpointing_ssu_scratch(
-        batch, nheads, 1, max_window, dtype, device
+        batch, nheads, num_predicted_tokens, max_window, dtype, device
     )
     return dict(
         cb_scaled=cb_scaled,
@@ -503,7 +501,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
     batch = 2
-    cache_size = batch + 15
+    cache_size = batch + 15  # Exercise cache capacity > active batch during tuning.
     # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
     # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
     # nowrite(prev_k>0 — exercises the dt-ring tail scan), k=T=6 write.
@@ -556,22 +554,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
         if algorithm is not None:
-            # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
-            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; cumAdt_vec is
-            # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
-            T_pad = 16  # next_multiple_of<MMA::M=16>(T) for T <= 16
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            # cb_old (C6, no-write): m16n8k{K_old} fragA, K_old =
-            # next_multiple_of<MMA::K_SMALL=8>(max_window); REGS = K_old/2.
-            k_old = ((max_window + 7) // 8) * 8
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
             kw["algorithm"] = algorithm
         checkpointing_ssu(
             st,
@@ -813,9 +796,6 @@ def test_two_kernel_d_split2():
             dt1_proc[slot],
         )
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(k, *, d_split):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -846,16 +826,7 @@ def test_two_kernel_d_split2():
             dt_bias=dt_bias,
             dt_softplus=True,
             d_split=d_split,
-            cb_scaled=torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            ),
-            cumAdt_vec=torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            ),
-            cb_old=torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            ),
-            algorithm="two-kernel",
+            **_two_kernel_scratch(batch, nheads, T, max_window, dtype, device),
         )
         return out, st, xc, bc, dtc
 
@@ -907,9 +878,6 @@ def test_persistent_main_matches_monolithic(monkeypatch):
         cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
     )
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(k, *, two_kernel):
         torch.manual_seed(k + 300)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -925,16 +893,7 @@ def test_persistent_main_matches_monolithic(monkeypatch):
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["algorithm"] = "two-kernel"
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
         checkpointing_ssu(
             st,
             xc,
@@ -1010,9 +969,6 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
     )
     assert (prev_mixed + T > max_window).any() and (prev_mixed + T <= max_window).any()
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(*, two_kernel):
         torch.manual_seed(300)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -1028,16 +984,7 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["algorithm"] = "two-kernel"
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
         checkpointing_ssu(
             st,
             xc,
@@ -1123,8 +1070,6 @@ def _run_two_kernel_state_dtype_case(
         )
 
     rand_seed = torch.tensor([1234], device=device, dtype=torch.int64)
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
 
     def _run(k, *, two_kernel):
         torch.manual_seed((int(k.sum().item()) if torch.is_tensor(k) else k) + 100)
@@ -1144,16 +1089,9 @@ def _run_two_kernel_state_dtype_case(
             kw["philox_rounds"] = philox_rounds
             kw["rand_seed"] = rand_seed
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=act_dtype
+            kw.update(
+                _two_kernel_scratch(batch, nheads, T, max_window, act_dtype, device)
             )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
-            )
-            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             xc,
@@ -1832,7 +1770,9 @@ def test_checkpointing_ssu_philox_no_checkpoint(
             rand_seed=rand_seed,
             philox_rounds=10,
             **(
-                _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+                _two_kernel_scratch(
+                    batch, nheads, npredicted, max_window, dtype, device
+                )
                 if two_kernel
                 else {}
             ),
@@ -2076,7 +2016,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         rand_seed=rand_seed,
         philox_rounds=10,
         **(
-            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
             if two_kernel
             else {}
         ),
@@ -3004,7 +2944,7 @@ def test_checkpointing_ssu_philox(
     )
     if two_kernel:
         # Window == T in this test; the scratch reroutes both runs to the split.
-        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, dtype, device))
+        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, T, dtype, device))
 
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
@@ -4771,7 +4711,7 @@ def _run_varlen_and_compare(
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted,
         **(
-            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
             if two_kernel
             else {}
         ),
