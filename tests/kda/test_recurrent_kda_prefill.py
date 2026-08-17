@@ -453,6 +453,15 @@ def test_variant_selector_exposes_specialized_routes_only_when_requested():
         )
         == "m128_n16"
     )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=8,
+            num_heads=12,
+            use_persistent_m128=True,
+        )
+        == "m128_n16"
+    )
 
 
 @pytest.mark.parametrize(
@@ -497,15 +506,6 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         )
         is expected
     )
-    assert (
-        kda_prefill_api._select_flash_kda_prefill_variant(
-            fixed_layout=False,
-            num_sequences=8,
-            num_heads=12,
-            use_persistent_m128=True,
-        )
-        == "m128_n16"
-    )
 
 
 def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
@@ -527,21 +527,19 @@ class _RecorderModule:
     def run(self, *args):
         self.calls.append(args)
         if self.final_value is not None:
-            store_final_state = (
-                args[17]
-                if len(args) == 21
-                else args[19]
-                if len(args) == 23
-                else args[23]
-            )
+            if len(args) == 21:
+                store_final_state = args[17]
+                final_state = args[12]
+            elif len(args) == 23:
+                store_final_state = args[19]
+                final_state = args[14]
+            elif len(args) == 25:
+                store_final_state = args[21]
+                final_state = args[12]
+            else:
+                store_final_state = args[23]
+                final_state = args[13]
             if bool(store_final_state):
-                final_state = (
-                    args[12]
-                    if len(args) == 21
-                    else args[14]
-                    if len(args) == 23
-                    else args[13]
-                )
                 final_state.fill_(self.final_value)
 
 
@@ -830,7 +828,7 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
         lambda device: sm_count,
     )
     monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
-    module = _RecorderModule()
+    module = _RecorderModule(final_value=0.5)
     routes = []
 
     def get_module(variant, target):
@@ -846,10 +844,12 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     output, state = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
     )
 
     assert output.shape == inputs["q"].shape
-    assert state is None
+    assert state is not None
+    assert torch.all(state == 0.5)
     assert routes == [("small_bh_m128", "sm100f")]
     (args,) = module.calls
     assert len(args) == 25
@@ -865,6 +865,7 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     assert args[17].shape == (1,)
     assert args[18] == 1
     assert args[19] == 1
+    assert args[21] == 1
     assert math.isclose(args[22], 128**-0.5)
     assert args[23] == -5.0
     assert args[24] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
@@ -1380,6 +1381,12 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         initial_state=True,
         seed=2048,
     )
+    beta_carrier = torch.empty(
+        (2048, 8), dtype=torch.bfloat16, device=flash_kda_device
+    )
+    beta_carrier[:, 3:4].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 3:4]
+    assert inputs["beta"].stride(-2) == 8
     direct_inputs = {
         **inputs,
         "initial_state": inputs["initial_state"].clone(),
@@ -1427,7 +1434,13 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         output_final_state=True,
     )
 
-    assert routes == [("small_bh_m128", "sm100f"), ("m128", "sm100f")]
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(
+        flash_kda_device
+    )
+    assert routes == [
+        ("small_bh_m128", expected_target),
+        ("m128", expected_target),
+    ]
     assert actual_output.data_ptr() == small_output.data_ptr()
     assert actual_state is inputs["initial_state"]
     assert expected_output.data_ptr() == direct_output.data_ptr()

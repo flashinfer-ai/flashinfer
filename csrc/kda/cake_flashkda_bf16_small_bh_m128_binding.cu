@@ -194,7 +194,8 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
                                                         words);
     CheckCuda(cudaGetLastError(), "PublishSmallBHPacketTensorMap launch");
   }
-  PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta.stride(beta.ndim() - 2), stream);
+  const int64_t beta_token_stride = beta.stride(beta.ndim() - 2);
+  PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
 
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(THREADS, 1, 1);
@@ -218,7 +219,8 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound), 0, 0, 0,
-      static_cast<int64_t>(num_heads), static_cast<int64_t>(num_heads * kHeadDim * kHeadDim), 0, 0,
+      static_cast<int64_t>(beta_token_stride),
+      static_cast<int64_t>(num_heads * kHeadDim * kHeadDim), 0, 0,
       reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(packet_tma),
       reinterpret_cast<unsigned int*>(packet_ready.data_ptr()),
       reinterpret_cast<unsigned int*>(packet_consumed.data_ptr()),
