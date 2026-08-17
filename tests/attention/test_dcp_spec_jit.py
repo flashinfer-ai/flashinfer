@@ -41,8 +41,7 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
     assert get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 4, 4) == (
-        "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_b8_q4_hq16_hkv1_cp4_"
-        "split4_retain0"
+        "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_b8_q4_hq16_hkv1_cp4_split4_retain0"
     )
 
 
@@ -63,9 +62,7 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
         v1 = jit_dcp.gen_dcp_spec_module("v1", "sm100a", 1, 1, 64, 8, 1, 1)
         v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
         fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm100f", 64, 3, 64, 8, 4, 3, 1)
-        d256 = jit_dcp.gen_dcp_spec_fp8_d256_module(
-            "sm100f", 8, 4, 16, 1, 4, 4
-        )
+        d256 = jit_dcp.gen_dcp_spec_fp8_d256_module("sm100f", 8, 4, 16, 1, 4, 4)
 
         assert Path(v1.sources[0]).name == "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
         assert Path(v4.sources[0]).name == "cake_fmha_dcp_spec_bf16_v4_split16.cu"
@@ -139,9 +136,9 @@ def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     rows = 8 * 4 * 64 * 6
     assert get_dcp_spec_workspace_size_bytes(8, 4, 64, 6) == rows * (128 * 2 + 4)
     d256_rows = 8 * 4 * 16 * 4
-    assert get_dcp_spec_workspace_size_bytes(
-        8, 4, 16, 4, head_dim=256
-    ) == d256_rows * (256 * 2 + 4)
+    assert get_dcp_spec_workspace_size_bytes(8, 4, 16, 4, head_dim=256) == d256_rows * (
+        256 * 2 + 4
+    )
     assert get_dcp_spec_counter_bytes(8, 4, 8) == 8 * 4 * 8 * 4
 
 
@@ -249,12 +246,8 @@ def _empty_rank_inputs(
         "query": torch.empty(
             (q_len_per_req, num_q_heads, head_dim), dtype=torch.bfloat16
         ),
-        "k_cache": torch.empty(
-            (1, num_kv_heads, page_size, head_dim), dtype=kv_dtype
-        ),
-        "v_cache": torch.empty(
-            (1, num_kv_heads, page_size, head_dim), dtype=kv_dtype
-        ),
+        "k_cache": torch.empty((1, num_kv_heads, page_size, head_dim), dtype=kv_dtype),
+        "v_cache": torch.empty((1, num_kv_heads, page_size, head_dim), dtype=kv_dtype),
         "workspace_buffer": torch.empty(1, dtype=torch.uint8),
         "block_tables": torch.zeros((1, 1), dtype=torch.int32),
         "seq_lens": torch.zeros((1,), dtype=seq_lens_dtype),

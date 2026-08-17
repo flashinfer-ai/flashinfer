@@ -362,9 +362,7 @@ def gen_dcp_spec_fp8_d256_module(
         num_split,
     )
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / (
-        f"cake_fmha_dcp_spec_bf16_fp8_d256_split{num_split}_retain0.cu"
-    )
+    body = csrc_dir / (f"cake_fmha_dcp_spec_bf16_fp8_d256_split{num_split}_retain0.cu")
     binding = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu"
     for source in (body, binding):
         if not source.exists():
