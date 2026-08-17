@@ -124,7 +124,7 @@ def _rank_reference(
     cp_world: int,
     sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size, q_len, num_q_heads, head_dim = query.shape
+    batch_size, q_len, num_q_heads, _head_dim = query.shape
     num_kv_heads = global_k.shape[2]
     group_size = num_q_heads // num_kv_heads
     output = torch.zeros_like(query)
@@ -282,6 +282,8 @@ def test_fp8_page64_q3_public_api_rank_correctness_and_merge() -> None:
     prefix_tensor = torch.tensor(prefix_lens, dtype=torch.int32, device="cuda")
 
     partials = []
+    # This short-shard fixture is intentionally split1, so no partial buffer
+    # or completion counter is required.
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
     for rank in range(cp_world):
         k_cache, v_cache, block_tables, seq_lens, max_local = _pack_rank_cache(

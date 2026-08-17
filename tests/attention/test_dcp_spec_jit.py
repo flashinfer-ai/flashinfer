@@ -79,6 +79,14 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
         )
         assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
         assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
+        for macro in (
+            "-DBATCH_SIZE=1",
+            "-DQ_LEN=1",
+            "-DNUM_Q_HEADS=64",
+            "-DNUM_KV_HEADS=8",
+            "-DCP_WORLD=1",
+        ):
+            assert macro in v1.extra_cuda_cflags
         assert "-DQ_LEN=3" in fp8.extra_cuda_cflags
         assert "-DNUM_SPLIT=3" not in fp8.extra_cuda_cflags
         assert "-DRETAIN_KV_L2=1" not in fp8.extra_cuda_cflags
