@@ -160,8 +160,15 @@ struct CUBMakeRaggedRowOut {
 // DeviceBatchedTopK avoids the device-idle Python/custom-op gap created by a separate
 // torch.fill_ call. A single launch handles both page-table outputs when raw indices are
 // requested, and rows with length >= top_k perform no global stores.
-__global__ void CUBFillTopKTailsKernel(int32_t* output, int32_t* output_raw_indices,
-                                       const int32_t* lengths, int64_t num_rows, int64_t top_k) {
+//
+// Note: this kernel writes only [valid, top_k) and reads only `lengths`, while selection
+// writes [0, valid) — the two are disjoint, so the after-selection ordering is convention,
+// not a data dependency (it could equally run before selection or overlap it via PDL).
+constexpr int kFillTailsThreads = 256;
+
+__global__ void __launch_bounds__(kFillTailsThreads)
+    CUBFillTopKTailsKernel(int32_t* __restrict__ output, int32_t* __restrict__ output_raw_indices,
+                           const int32_t* __restrict__ lengths, int64_t num_rows, int64_t top_k) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
   if (row >= num_rows) {
     return;
@@ -185,8 +192,7 @@ cudaError_t CUBFillTopKTails(int32_t* output, int32_t* output_raw_indices, const
   if (num_rows == 0) {
     return cudaSuccess;
   }
-  constexpr int kThreads = 256;
-  CUBFillTopKTailsKernel<<<static_cast<uint32_t>(num_rows), kThreads, 0, stream>>>(
+  CUBFillTopKTailsKernel<<<static_cast<uint32_t>(num_rows), kFillTailsThreads, 0, stream>>>(
       output, output_raw_indices, lengths, num_rows, top_k);
   return cudaGetLastError();
 }
