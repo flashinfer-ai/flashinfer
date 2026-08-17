@@ -3502,6 +3502,111 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 # ==============================================================================
+# Cache-step stride regression: cache_steps may be larger than processed T.
+# ==============================================================================
+
+
+@pytest.mark.parametrize(
+    "state_dtype,batch_size,num_v_heads",
+    [
+        pytest.param(torch.float32, 2, 64, id="fp32-inline"),
+        pytest.param(torch.float32, 3, 64, id="fp32-warp"),
+        pytest.param(torch.bfloat16, 2, 32, id="bf16-ilp4"),
+        pytest.param(torch.bfloat16, 2, 64, id="bf16-wide-vec"),
+    ],
+)
+def test_gdn_decode_mtp_cache_steps_stride(
+    state_dtype: torch.dtype,
+    batch_size: int,
+    num_v_heads: int,
+):
+    """Honor the physical cache stride when ``cache_steps > T``.
+
+    The old flat index used ``i_n * T * HV`` even though the public API accepts
+    a larger second cache dimension. For B > 1 that packed batch 1 into batch
+    0's trailing slots and left batch 1's requested slots unwritten. Compare
+    against an exact-T cache and require the padded trailing slots to remain
+    bit-exact sentinels across every FP32/BF16 MTP kernel route.
+    """
+    _skip_if_not_sm90_or_later()
+    if state_dtype == torch.bfloat16 and not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = batch_size, 2, 4
+    H, HV, K, V = 16, num_v_heads, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    initial_state = torch.randn(B, HV, V, K, dtype=state_dtype, device=device)
+    initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+
+    cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
+    sentinel = 7.0
+    cache_padded = torch.full(
+        (B, cache_steps, HV, V, K), sentinel, dtype=state_dtype, device=device
+    )
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_indices=initial_state_indices,
+        scale=K**-0.5,
+        disable_state_update=False,
+    )
+
+    if state_dtype == torch.float32:
+        out_exact, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm=True,
+        )
+        out_padded, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_padded,
+            use_qk_l2norm=True,
+        )
+    else:
+        out_exact = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_padded,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        cache_padded[:, :T], cache_exact, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        cache_padded[:, T:],
+        torch.full_like(cache_padded[:, T:], sentinel),
+        atol=0,
+        rtol=0,
+    )
+
+
+# ==============================================================================
 # BF16 state FLA-style per-token pool scatter (ssm_state_indices)
 # ==============================================================================
 # vLLM-compatible API: when `ssm_state_indices` (shape [B, T] int32) is passed,

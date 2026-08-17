@@ -695,7 +695,8 @@ def gated_delta_rule_mtp(
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape ``[B, T, HV, V]``.
     intermediate_states_buffer : torch.Tensor, optional
-        Buffer for caching intermediate states, shape ``[B, T, HV, V, K]``
+        Buffer for caching intermediate states, shape
+        ``[B, cache_steps, HV, V, K]`` with ``cache_steps >= T``
         (first dim is indexed per-batch, not per-pool-slot — buffer must
         be at least ``B`` rows and contiguous; must be float32 when
         provided). When ``None``, intermediate states are not cached.
@@ -827,7 +828,8 @@ def gated_delta_rule_mtp(
         h0_source = initial_state.reshape(pool_size * HV, V, K)
 
     # Handle intermediate states. The kernel indexes the buffer by batch (i_n),
-    # not by pool slot — see `flat_idx = i_n * T * HV + i_t * HV + i_hv` inside
+    # not by pool slot — see
+    # `flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv` inside
     # the kernel. So the buffer's first dim MUST be at least B, and the buffer
     # MUST be contiguous so the reshape returns a free view. We make both
     # contracts explicit here to fail loudly on caller mistakes (the pre-existing
