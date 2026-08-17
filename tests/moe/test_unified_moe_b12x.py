@@ -625,44 +625,49 @@ class TestUnifiedB12xConformance:
             max_num_tokens=8,
         )
 
+        prior_cache = dict(moe_dispatch._W4A16_WEIGHT_CACHE)
         moe_dispatch._W4A16_WEIGHT_CACHE.clear()
-        prepared = wrapper.prepare_weights(
-            tensors["w1_weight"],
-            tensors["w1_weight_sf"],
-            tensors["w2_weight"],
-            tensors["w2_weight_sf"],
-            w1_alpha=tensors["w1_alpha"],
-            w2_alpha=tensors["w2_alpha"],
-            reuse_input_storage=True,
-        )
-        assert not moe_dispatch._W4A16_WEIGHT_CACHE
-        assert prepared.w13.data_ptr() == tensors["w1_weight"].data_ptr()
-        assert prepared.w2.data_ptr() == tensors["w2_weight"].data_ptr()
+        try:
+            prepared = wrapper.prepare_weights(
+                tensors["w1_weight"],
+                tensors["w1_weight_sf"],
+                tensors["w2_weight"],
+                tensors["w2_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                w2_alpha=tensors["w2_alpha"],
+                reuse_input_storage=True,
+            )
+            assert not moe_dispatch._W4A16_WEIGHT_CACHE
+            assert prepared.w13.data_ptr() == tensors["w1_weight"].data_ptr()
+            assert prepared.w2.data_ptr() == tensors["w2_weight"].data_ptr()
 
-        actual = wrapper.run_prepared(
-            x=tensors["x_bf16"],
-            prepared_weights=prepared,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-        )
-        passed, percent_within, atol = check_b12x_accuracy(actual, expected)
-        assert passed, (
-            f"explicit prepared W4A16: {percent_within * 100:.2f}% within "
-            f"tolerance (atol={atol:.4f})"
-        )
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = wrapper.run_prepared(
+            actual = wrapper.run_prepared(
                 x=tensors["x_bf16"],
                 prepared_weights=prepared,
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
+            ).clone()
+            passed, percent_within, atol = check_b12x_accuracy(actual, expected)
+            assert passed, (
+                f"explicit prepared W4A16: {percent_within * 100:.2f}% within "
+                f"tolerance (atol={atol:.4f})"
             )
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(graph_output, actual)
-        assert not moe_dispatch._W4A16_WEIGHT_CACHE
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = wrapper.run_prepared(
+                    x=tensors["x_bf16"],
+                    prepared_weights=prepared,
+                    token_selected_experts=tensors["token_selected_experts"],
+                    token_final_scales=tensors["token_final_scales"],
+                )
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(graph_output, actual)
+            assert not moe_dispatch._W4A16_WEIGHT_CACHE
+        finally:
+            moe_dispatch._W4A16_WEIGHT_CACHE.clear()
+            moe_dispatch._W4A16_WEIGHT_CACHE.update(prior_cache)
 
     def test_w4a16_can_destructively_reuse_checkpoint_weight_storage(self):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
