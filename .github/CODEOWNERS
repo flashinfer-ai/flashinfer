@@ -1,84 +1,100 @@
-# CODEOWNERS — manually maintained, not auto-generated.
-#
-# Rules:
-#   - Last matching pattern wins (GitHub semantics).
-#   - Catch-all ensures every PR gets at least one core-maintainer review.
-#   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
+# Code Owners File
+# Generated automatically from git history analysis
+# Analysis period: 180 days
+# Minimum commits threshold: 1
+# Manual overrides applied from overrides file
 
-# ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka
+benchmarks/ @bkryu @jiahanc @dhiraj113 @jimmyzho @Anerudhan
+benchmarks/routines/ @bkryu @jiahanc @dhiraj113 @jimmyzho @saltyminty
+ci/ @dierksen
+csrc/ @jimmyzho @IwakuraRein @jiahanc @aleozlx @qsang-nv
+csrc/fmha_v2/ @flashinfer-ai/attention-owners @jimmyzho
+csrc/fmha_v2/fmha/ @jimmyzho
+csrc/fused_moe/ @flashinfer-ai/moe-owners @jiahanc @nv-yunzheq @aleozlx @jimmyzho
+csrc/fused_moe/cutlass_backend/ @bkryu @jimmyzho @IwakuraRein @nv-yunzheq @yzh119
+csrc/fused_moe/monomoe/ @aleozlx
+csrc/fused_moe/trtllm_backend/ @jiahanc @nv-yunzheq @kahyunnam
+csrc/nv_internal/ @IwakuraRein @jimmyzho @bkryu
+csrc/nv_internal/cpp/ @IwakuraRein
+csrc/nv_internal/tensorrt_llm/ @IwakuraRein @jimmyzho @bkryu
+csrc/nvfp4_attention_sm120/ @bkryu
+csrc/xqa/ @flashinfer-ai/attention-owners @qsang-nv
+docs/ @Anerudhan @aleozlx @bkryu @djmmoss @dierksen
+flashinfer/ @bkryu @kahyunnam @jiahanc @IwakuraRein @jimmyzho
+flashinfer-jit-cache/ @kahyunnam @aleozlx
+flashinfer/attention/ @IwakuraRein @bkryu
+flashinfer/attention/prims_ts/ @IwakuraRein
+flashinfer/autotuner/ @jiahanc
+flashinfer/comm/ @flashinfer-ai/comm-owners @IwakuraRein @jiahanc @Amir-19 @nv-yunzheq
+flashinfer/cute_dsl/ @bkryu @jimmyzho @kahyunnam @saltyminty
+flashinfer/cute_dsl/attention/ @jimmyzho @saltyminty
+flashinfer/cutile/ @jimmyzho
+flashinfer/diffusion_ops/ @kahyunnam
+flashinfer/fused_moe/ @flashinfer-ai/moe-owners @jiahanc @bkryu @IwakuraRein @nv-yunzheq
+flashinfer/fused_moe/cute_dsl/ @bkryu @jimmyzho @kahyunnam @nv-yunzheq
+flashinfer/gdn_kernels/ @flashinfer-ai/misc-op-owners @kahyunnam @jiahanc @kaixih
+flashinfer/gdn_kernels/blackwell/ @jiahanc
+flashinfer/gemm/ @flashinfer-ai/gemm-owners @bkryu @jiahanc @jimmyzho @kahyunnam
+flashinfer/gemm/kernels/ @bkryu @jiahanc @kahyunnam @nv-yunzheq
+flashinfer/jit/ @jimmyzho @bkryu @kahyunnam @IwakuraRein @dierksen
+flashinfer/jit/attention/ @jimmyzho @bkryu @yzh119
+flashinfer/jit/gemm/ @jimmyzho @yzh119 @aleozlx
+flashinfer/kda_kernels/ @djmmoss @jimmyzho
+flashinfer/logits_processor/ @qsang-nv
+flashinfer/mamba/ @jimmyzho
+flashinfer/mla/ @saltyminty @qsang-nv @djmmoss @jimmyzho @aleozlx
+flashinfer/moe_ep/ @Anerudhan
+flashinfer/moe_ep/backends/ @Anerudhan
+flashinfer/moe_ep/core/ @Anerudhan
+flashinfer/moe_ep/modes/ @Anerudhan
+flashinfer/norm/ @bkryu @yzh119 @kahyunnam @jimmyzho @aleozlx
+flashinfer/norm/kernels/ @bkryu @yzh119
+flashinfer/quantization/ @bkryu @jimmyzho @kahyunnam @IwakuraRein
+flashinfer/quantization/kernels/ @bkryu @kahyunnam
+flashinfer/topk_varlen/ @dhiraj113
+flashinfer/topk_varlen/kernels/ @dhiraj113
+flashinfer/trace/ @jiahanc @djmmoss @dhiraj113 @yongwww @qsang-nv
+flashinfer/trace/templates/ @jiahanc @djmmoss @dhiraj113 @qsang-nv @saltyminty
+flashinfer/trace_apply/ @yongwww
+flashinfer/trace_apply/loaders/ @yongwww
+include/ @jiahanc @djmmoss @jimmyzho @kahyunnam @bkryu
+include/flashinfer/ @jiahanc @djmmoss @jimmyzho @kahyunnam @bkryu
+include/flashinfer/attention/ @flashinfer-ai/attention-owners @qsang-nv @bkryu @saltyminty
+include/flashinfer/comm/ @flashinfer-ai/comm-owners @jiahanc @aleozlx
+include/flashinfer/gemm/ @flashinfer-ai/gemm-owners @bkryu
+include/flashinfer/norm/ @kahyunnam
+include/flashinfer/trtllm/ @jiahanc @jimmyzho @djmmoss @nv-yunzheq
+scripts/ @dierksen @bkryu @Anerudhan @kahyunnam @aleozlx
+tests/ @bkryu @jimmyzho @kahyunnam @jiahanc @qsang-nv
+tests/attention/ @flashinfer-ai/attention-owners @jimmyzho @bkryu @qsang-nv @saltyminty
+tests/autotuner/ @bkryu @saltyminty @jiahanc @nv-yunzheq @kahyunnam
+tests/cli/ @dierksen
+tests/comm/ @flashinfer-ai/comm-owners @IwakuraRein @jimmyzho @jiahanc @Amir-19
+tests/gdn/ @flashinfer-ai/misc-op-owners @kahyunnam @jimmyzho @bkryu @kaixih
+tests/gemm/ @flashinfer-ai/gemm-owners @bkryu @jiahanc @jimmyzho @kahyunnam
+tests/jit/ @bkryu
+tests/kda/ @djmmoss
+tests/mamba/ @jimmyzho @bkryu
+tests/model_optimizations/ @jimmyzho @nv-yunzheq @aleozlx
+tests/moe/ @flashinfer-ai/moe-owners @jiahanc @jimmyzho @bkryu @IwakuraRein
+tests/moe_ep/ @Anerudhan
+tests/moe_ep/nccl_ep/ @Anerudhan
+tests/moe_ep/nixl_ep/ @Anerudhan
+tests/msa_ops/ @jimmyzho
+tests/norm/ @flashinfer-ai/misc-op-owners @kahyunnam @jimmyzho
+tests/test_helpers/ @IwakuraRein
+tests/test_sharding/ @bkryu
+tests/topk_varlen/ @dhiraj113
+tests/trace/ @bkryu @djmmoss @dhiraj113 @jimmyzho @qsang-nv
+tests/trace_apply/ @yongwww
+tests/utils/ @bkryu @kahyunnam @jimmyzho @IwakuraRein @qsang-nv
 
-# ── Attention ──
-csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
-csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
-
-# ── GEMM ──
-flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
-include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
-tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
-
-# ── Grouped GEMM ──
-flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
-include/flashinfer/grouped_mm/   @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
-tests/grouped_mm/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
-
-# ── MOE ──
-csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-
-# ── MOE_EP ──
-flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
-tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
-
-# ── Communication ──
-flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
-include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
-tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
-
-# ── Norm ──
-flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
-tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
-
-# ── GDN ──
-benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-
-# ── MAMBA ──
-csrc/checkpointing_ssu*         @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-csrc/selective_state_update*    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-flashinfer/jit/mamba/           @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-flashinfer/mamba/               @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-
-# ── KDA ──
-benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho
-csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho
-tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho
-tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho
-
-# ── Autotuner ──
-flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx
-tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx
+# File-level overrides (must come last for precedence)
+csrc/gdn_prefill_launcher.cu @flashinfer-ai/misc-op-owners @kahyunnam
+csrc/gdn_prefill_sm90_kernel_inst.jinja @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/attention.py @flashinfer-ai/attention-owners
+flashinfer/gdn_decode.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/gdn_prefill.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/jit/gdn.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/norm.py @flashinfer-ai/misc-op-owners @kahyunnam
+scripts/codeowner_overrides.json @ci-users
