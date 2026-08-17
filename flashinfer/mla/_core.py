@@ -1037,8 +1037,10 @@ def _check_dsv4_sparse_mla_inputs(
 
 def _resolve_dsv4_sparse_mla_backend(
     device: torch.device,
-    requested_backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
-) -> Literal["trtllm-gen", "cute-dsl", "sparse"]:
+    requested_backend: Literal[
+        "auto", "trtllm-gen", "cute-dsl", "sparse", "cake"
+    ] = "auto",
+) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
@@ -1051,10 +1053,10 @@ def _resolve_dsv4_sparse_mla_backend(
             "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
             f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
         )
-    if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse"):
+    if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse", "cake"):
         raise ValueError(
-            "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', or "
-            f"'sparse', got {requested_backend!r}"
+            "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', "
+            f"'sparse', or 'cake', got {requested_backend!r}"
         )
     if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
         raise ValueError(
@@ -1062,7 +1064,9 @@ def _resolve_dsv4_sparse_mla_backend(
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    return cast(Literal["trtllm-gen", "cute-dsl", "sparse"], requested_backend)
+    if requested_backend == "cake" and cc != (10, 3):
+        raise ValueError(f"backend='cake' requires SM103, got SM{cc[0]}{cc[1]}")
+    return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1503,7 +1507,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
-    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse", "cake"] = "auto",
     hca_swa_indices: Optional[torch.Tensor] = None,
     hca_compressed_block_tables: Optional[torch.Tensor] = None,
     hca_seq_lens: Optional[torch.Tensor] = None,
@@ -1602,10 +1606,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32.
-    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse"}
+    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
         TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
-        only when ``"cute-dsl"`` is requested explicitly.
+        only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
+        kernels are selected only when ``"cake"`` is requested explicitly on
+        SM103.
     hca_swa_indices : Optional[torch.Tensor]
         Absolute SWA token-row indices, shape ``[B * Q, 128]`` INT32. Ring
         rotation and wraparound are supported. Every entry, including masked
@@ -1801,7 +1807,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             + ", ".join(unexpected_hca_input_names)
         )
 
-    if enable_pdl is None:
+    if backend == "cake":
+        if enable_pdl:
+            raise ValueError("backend='cake' does not support enable_pdl")
+        enable_pdl = False
+    elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
         if backend == "sparse":
@@ -1810,7 +1820,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             )
         if bmm1_scale.dtype != torch.float32:
             raise TypeError("bmm1_scale tensor must have dtype torch.float32")
-        bmm1_scale = bmm1_scale * log2e
+        if backend == "trtllm-gen":
+            bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         if backend == "sparse":
             raise ValueError(
@@ -1849,11 +1860,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
     if sparse_topk_lens is None or compressed_kv_cache is None or seq_lens is None:
         raise ValueError(
-            "backend='trtllm-gen' requires compressed_kv_cache, sparse_topk_lens, "
-            "and seq_lens"
+            f"backend={backend!r} requires compressed_kv_cache, "
+            "sparse_topk_lens, and seq_lens"
         )
     if sparse_indices is None:
-        raise ValueError("backend='trtllm-gen' requires sparse_indices")
+        raise ValueError(f"backend={backend!r} requires sparse_indices")
 
     (
         swa_kv_cache,
@@ -1892,6 +1903,25 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         raise ValueError(
             "seq_lens must be greater than or equal to the per-request query "
             "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
+        )
+
+    if backend == "cake":
+        from ._cake_dsv4 import run_cake_dsv4
+
+        return run_cake_dsv4(
+            query=query_flat,
+            swa_kv_cache=swa_kv_cache,
+            compressed_kv_cache=compressed_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            sparse_topk_lens=sparse_topk_lens,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            max_q_len=q_len_per_request,
+            cum_seq_lens_q=cum_seq_lens_q,
+            backend="cake",
         )
 
     primary_kv_cache = compressed_kv_cache
