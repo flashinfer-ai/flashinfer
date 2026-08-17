@@ -65,6 +65,8 @@ _EXPORTED_SOURCE_SHA256 = {
     "n4096_k7168": "5d3917f4108bb4260410989b2913304c2df4e89bb0a4e371ebf0a2aac0467acb",
     "n7168_k2048": "5f59bd3cf2a7062e5445ec183934cdb476a7b2072c9fcbc4130a812b33f6e3be",
 }
+_FROZEN_BODY_BEGIN = "// BEGIN FROZEN CAKE EXPORT\n"
+_FROZEN_BODY_END = "// END FROZEN CAKE EXPORT\n"
 
 
 def test_cake_batch_deepgemm_metadata_and_exported_source_hashes():
@@ -73,11 +75,17 @@ def test_cake_batch_deepgemm_metadata_and_exported_source_hashes():
     for shape, metadata in _EXPECTED_METADATA.items():
         source = csrc_dir / metadata.source
         assert source.is_file()
+        source_text = source.read_text()
+        _, begin_marker, remainder = source_text.partition(_FROZEN_BODY_BEGIN)
+        frozen_body, end_marker, after_body = remainder.partition(_FROZEN_BODY_END)
+        assert begin_marker == _FROZEN_BODY_BEGIN
+        assert end_marker == _FROZEN_BODY_END
         assert (
-            hashlib.sha256(source.read_bytes()).hexdigest()
+            hashlib.sha256(frozen_body.encode()).hexdigest()
             == _EXPORTED_SOURCE_SHA256[shape]
         )
-        assert metadata.symbol in source.read_text()
+        assert metadata.symbol in frozen_body
+        assert after_body.strip() == "// clang-format on"
 
 
 @pytest.mark.parametrize("shape", tuple(_EXPECTED_METADATA))
