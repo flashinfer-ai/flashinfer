@@ -646,7 +646,7 @@ def can_use_clusters_topk(algo, device, deterministic, tie_break, dsa_graph_safe
     return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
 
 
-def can_use_cub_topk(algo, input, tie_break, deterministic, sorted_output=False):
+def can_use_cub_topk(algo, input_tensor, tie_break, deterministic, sorted_output=False):
     """Whether the CUB (DeviceBatchedTopK) backend can serve this call."""
 
     # CUB returns unsorted results and has no reproducible-ordering mode, so
@@ -655,15 +655,15 @@ def can_use_cub_topk(algo, input, tie_break, deterministic, sorted_output=False)
         return False
     if algo is not None and algo != "cub":
         return False  # user forced another backend
-    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    if input_tensor.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
-    d = input.size(1)
+    d = input_tensor.size(1)
     if d > (1 << 21):
         return False  # DeviceBatchedTopK per-segment limit
     # Pre-SM90 devices only have the single-block backend (d <= 8192) and no
     # tie-break support (the tie-break requirement configs need SM90+).
     if (d > 8192 or tie_break != TopKTieBreak.NONE) and (
-        get_compute_capability(input.device)[0] < 9
+        get_compute_capability(input_tensor.device)[0] < 9
     ):
         return False
     return True
