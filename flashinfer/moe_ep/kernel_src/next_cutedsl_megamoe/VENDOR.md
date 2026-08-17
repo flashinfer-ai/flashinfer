@@ -17,39 +17,36 @@ kernel-component model).
   (`ci/requirements.txt`); the kernels need `cutlass.utils.rubin_helpers`.
   Validated here on 4.7.0.
 
-## Scope of this drop (fprop only)
+## Scope of this drop (inference only)
 
-Only the **Rubin training forward (fprop) mxfp8 GLU mega kernel** closure is
-vendored — `sources/kernel_src/rubin/training/mega/fwd_glu/`
-(`Sm107MegaMoEMxfp8GluKernel`, `Sm107Mxfp8GluFc12Kernel`) plus the shared
-runtime it imports (`sources/{api,quant_def}.py`, `sources/helpers/`,
-`sources/communication/`, `sources/kernel_src/{schedulers,function_mapping}`).
+Only the **Rubin inference block-scaled swap-AB MegaMoE kernel** closure is
+vendored — `sources/kernel_src/rubin/inference/mega/`
+(`BlockScaledSwapAbMegaMoeKernel` + its FC12 mainloop / gated-act epilogue /
+extension / dynamic mainloop / topk reduce) plus the shared runtime it imports
+(`sources/{api,quant_def}.py`, `sources/helpers/`, `sources/communication/`,
+`sources/kernel_src/{schedulers,function_mapping}`).
+
+The kernel is generic over `QuantKind` (nvfp4, mxfp4, mxfp8_e4m3, mxfp8_e5m2,
+mxfp4_mxfp8); the flashinfer backends currently wire up nvfp4 and mxfp8.
 
 Deliberately NOT vendored (future migrations extend this same directory):
-`rubin/inference/`, `rubin/training/mega/bwd_dglu/` (dgrad),
-`rubin/training/traditional/` (wgrad), and the whole
-`kernel_src/blackwell/` tree.
+`rubin/training/` (the fwd_glu fprop / bwd_dglu dgrad / traditional wgrad
+training kernels — an earlier revision of this drop vendored the fwd_glu
+subtree; it was removed when the flashinfer backends moved to the inference
+kernel) and the whole `kernel_src/blackwell/` tree.
 
 ## Pending local diffs vs upstream
 
 Per `kernel_src/README.md`, `src/` is verbatim except for the following
-recorded diffs (all consequences of the fprop-only scope):
+recorded diff (a consequence of the inference-only scope):
 
-1. `src/sources/kernel_src/rubin/training/__init__.py` — upstream re-exports
-   the `.traditional` wgrad kernels; the import is removed because that
-   subtree is not vendored. Restore verbatim when wgrad migrates.
-2. `src/sources/kernel_src/rubin/training/mega/topk_reduce.py` and
-   `.../tmem_transpose.py` — upstream ships these as
-   `<<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>` marker shims importing from
-   `blackwell/inference/mega/`; upstream's `kernel_export` script inlines the
-   blackwell source at export time. The same inline was performed at vendor
-   time (topk_reduce: whole-file copy of
-   `blackwell/inference/mega/topk_reduce.py`, whose relative imports resolve
-   identically at this depth; tmem_transpose: verbatim extraction of
-   `_TmemTranspose16x32Core` from
-   `blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py` lines
-   521-741). If the blackwell tree is ever vendored, these can revert to the
-   marker-shim form.
+1. `src/sources/kernel_src/rubin/inference/mega/topk_reduce.py` — upstream
+   ships this as a `<<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>` marker shim
+   importing from `blackwell/inference/mega/topk_reduce.py`; upstream's
+   `kernel_export` script inlines the blackwell source at export time. The
+   same inline was performed at vendor time (whole-file copy — its relative
+   imports resolve identically at this depth). If the blackwell tree is ever
+   vendored, this can revert to the marker-shim form.
 
 ## Layout
 
