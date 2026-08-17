@@ -98,6 +98,20 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
         jit_dcp.gen_dcp_spec_fp8_d256_module.cache_clear()
 
 
+def test_dcp_bindings_require_exact_public_tensor_ranks() -> None:
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "dcp"
+    for name in (
+        "cake_fmha_dcp_spec_bf16_v1_binding.cu",
+        "cake_fmha_dcp_spec_bf16_v4_binding.cu",
+        "cake_fmha_dcp_spec_bf16_fp8_binding.cu",
+        "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu",
+    ):
+        source = (source_dir / name).read_text()
+        assert "TMA source 'Qt' must have exactly 3 dimensions" in source
+        assert "TMA source 'K' must have exactly 4 dimensions" in source
+        assert "TMA source 'V' must have exactly 4 dimensions" in source
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [

@@ -63,6 +63,25 @@ def get_dcp_spec_workspace_size_bytes(
 
     Pass ``head_dim=256`` for the FP8/page64 D256 ratio-16 production profile;
     the default remains the D128 profile.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of requests in the batch.
+    q_len_per_req : int
+        Number of speculative query rows per request.
+    num_qo_heads : int
+        Number of rank-local query/output heads.
+    num_split : int
+        Maximum Split-KV fanout to reserve, in the inclusive range [2, 16].
+    head_dim : int
+        Keyword-only query/output head dimension; supported values are 128 and
+        256.
+
+    Returns
+    -------
+    int
+        Required caller-owned workspace size in bytes.
     """
 
     if min(batch_size, q_len_per_req, num_qo_heads, head_dim) <= 0:
@@ -83,7 +102,22 @@ def get_dcp_spec_counter_bytes(
     q_len_per_req: int,
     num_kv_heads: int,
 ) -> int:
-    """Bytes for the v4 completion tickets, zeroed once then self-reset."""
+    """Bytes for the v4 completion tickets, zeroed once then self-reset.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of requests in the batch.
+    q_len_per_req : int
+        Number of speculative query rows per request.
+    num_kv_heads : int
+        Number of rank-local KV heads.
+
+    Returns
+    -------
+    int
+        Required caller-owned completion-buffer size in bytes.
+    """
 
     if min(batch_size, q_len_per_req, num_kv_heads) <= 0:
         raise ValueError("batch_size, q_len_per_req, and num_kv_heads must be positive")

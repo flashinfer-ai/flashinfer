@@ -160,8 +160,8 @@ static inline void* TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStre
 // 3D TMA descriptor for buffer 'Qt' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_Qt(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'Qt' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() == 3, ValueError)
+      << "TMA source 'Qt' must have exactly 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'Qt' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
@@ -196,8 +196,8 @@ inline CUtensorMap EncodeTma_Qt(const TensorView& t) {
 // 5D TMA descriptor for buffer 'K' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_K(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 4, ValueError)
-      << "TMA source 'K' must have at least 4 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() == 4, ValueError)
+      << "TMA source 'K' must have exactly 4 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'K' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
@@ -245,8 +245,8 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
 // 5D TMA descriptor for buffer 'V' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_V(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 4, ValueError)
-      << "TMA source 'V' must have at least 4 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() == 4, ValueError)
+      << "TMA source 'V' must have exactly 4 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'V' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
