@@ -182,7 +182,10 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
     runner = MockDAMoERunner(
         num_experts=args.num_experts,
         dtype=dtype,
-        tuning_config=TuningConfig(use_cuda_graph=not args.no_cuda_graph),
+        tuning_config=TuningConfig(
+            use_cuda_graph=not args.no_cuda_graph,
+            use_cold_l2_cache=True,
+        ),
     )
     inputs = runner.moe_runner.allocate_inputs(
         args.num_tokens, args.hidden_size, args.top_k
@@ -216,6 +219,7 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
             "published_body_tactics": [body.tactic for body in plan.bodies],
             "resources_prepared": runner.dispatcher.resources is not None,
             "uses_fixed_candidate_cuda_graphs": not args.no_cuda_graph,
+            "profile_diagnostics": runner.last_profile_diagnostics,
         },
     }
 
@@ -319,6 +323,16 @@ def test_mock_da_moe_cuda_graph_reference_design() -> None:
     )
 
     assert report["phase_sequence"] == ["autotune_warmup", "capture", "replay"]
+    warmup = report["autotune_warmup"]
+    assert isinstance(warmup, dict)
+    profile = warmup["profile_diagnostics"]
+    assert isinstance(profile, dict)
+    assert profile["sample_count"] == 2
+    assert profile["measurement_count"] == 6
+    assert profile["replica_count"] == 1
+    assert profile["uses_cold_l2_cache"] is False
+    assert len(profile["fixed_pointer_schedule"]) == profile["replica_count"]
+
     capture = report["capture"]
     assert isinstance(capture, dict)
     topology = capture["topology"]
