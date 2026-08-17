@@ -20,12 +20,12 @@ typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int int32_t;
 typedef short int int16_t;
-struct __align__(128) LoomTensorMap {
+struct __align__(128) CakeTensorMap {
   uint64_t opaque[16];
 };
 template <int N>
-struct __align__(128) LoomTensorMapPack {
-  LoomTensorMap maps[N];
+struct __align__(128) CakeTensorMapPack {
+  CakeTensorMap maps[N];
 };
 
 typedef struct __align__(64) {
@@ -34,7 +34,7 @@ typedef struct __align__(64) {
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 160
 #define TMEM_TMEM_S0_OFFSET 0
 #define TMEM_TMEM_S1_OFFSET 16
@@ -385,7 +385,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d256(
-    LoomTensorMap const* Qt, LoomTensorMap const* K, LoomTensorMap const* V,
+    CakeTensorMap const* Qt, CakeTensorMap const* K, CakeTensorMap const* V,
     __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr,
     __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr,
     int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv,
@@ -613,7 +613,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
           num_pairs = base_pairs + 1;
           split_start_pair = split_idx * (base_pairs + 1);
         }
-        float owned_row_max = -LOOM_INF;
+        float owned_row_max = -CAKE_INF;
         float owned_row_sum = 0.0f;
 #pragma unroll 1
         for (int pair = 0; pair < num_pairs; pair++) {
@@ -668,7 +668,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
           float owned_new_max = _max_3;
           float owned_delta = softmax_scale_log2 * (owned_row_max - owned_new_max);
           float _exp2_0 = approx_exp2(owned_delta);
-          float owned_acc_scale = ((owned_row_max > -LOOM_INF) ? _exp2_0 : 1.0f);
+          float owned_acc_scale = ((owned_row_max > -CAKE_INF) ? _exp2_0 : 1.0f);
           float acc_scale[16];
 #pragma unroll
           for (int h_2 = 0; h_2 < 16; h_2++) {
@@ -694,7 +694,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
           for (int h_3 = 0; h_3 < 16; h_3++) {
             float _shfl_1 = __shfl_sync(0xFFFFFFFF, owned_new_max, h_3);
             float new_max_h = _shfl_1;
-            float safe_max = ((new_max_h == -LOOM_INF) ? 0.0f : new_max_h);
+            float safe_max = ((new_max_h == -CAKE_INF) ? 0.0f : new_max_h);
             float _exp2_1 = approx_exp2(_tmem_load_0[h_3] * softmax_scale_log2 -
                                         safe_max * softmax_scale_log2 + 8.8073549f);
             float exp_value = ((key_is_visible != 0) ? _exp2_1 : 0.0f);
@@ -707,23 +707,21 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
               owned_row_sum = owned_row_sum * owned_acc_scale + warp_sum_h;
             }
             {
-              uint16_t _fp8_pair_3493672032;
+              uint16_t _fp8_pair_31570336;
               asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                  : "=h"(_fp8_pair_3493672032)
+                  : "=h"(_fp8_pair_31570336)
                   : "f"(0.0f), "f"(exp_value));
-              uint32_t _byte_3493672032 = (uint32_t)(_fp8_pair_3493672032 & 0xFF);
-              const void* _ptr_3493672032 = reinterpret_cast<const void*>(
+              uint32_t _byte_31570336 = (uint32_t)(_fp8_pair_31570336 & 0xFF);
+              const void* _ptr_31570336 = reinterpret_cast<const void*>(
                   (reinterpret_cast<uint8_t*>(my_p_base) +
                    (h_3 * 128 + wg_tid ^ (h_3 * 128 + wg_tid >> 7 & 7) << 4)));
-              uint64_t _addr64_3493672032;
+              uint64_t _addr64_31570336;
               asm volatile("cvta.to.shared.u64 %0, %1;"
-                           : "=l"(_addr64_3493672032)
-                           : "l"(_ptr_3493672032));
-              uint32_t _addr_3493672032;
-              asm volatile("cvt.u32.u64 %0, %1;"
-                           : "=r"(_addr_3493672032)
-                           : "l"(_addr64_3493672032));
-              asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_3493672032), "r"(_byte_3493672032)
+                           : "=l"(_addr64_31570336)
+                           : "l"(_ptr_31570336));
+              uint32_t _addr_31570336;
+              asm volatile("cvt.u32.u64 %0, %1;" : "=r"(_addr_31570336) : "l"(_addr64_31570336));
+              asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_31570336), "r"(_byte_31570336)
                            : "memory");
             }
           }
@@ -849,16 +847,16 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
 #pragma unroll
             for (int pair_elem = 0; pair_elem < 2; pair_elem++) {
               {
-                uint16_t _fp8_pair_3494181136;
+                uint16_t _fp8_pair_31636592;
                 asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                    : "=h"(_fp8_pair_3494181136)
+                    : "=h"(_fp8_pair_31636592)
                     : "f"(0.0f), "f"(q_hi_packed_f32[pair_elem]));
-                uint32_t _byte_3494181136 = (uint32_t)(_fp8_pair_3494181136 & 0xFF);
-                uint32_t _addr_3494181136 = static_cast<uint32_t>(
+                uint32_t _byte_31636592 = (uint32_t)(_fp8_pair_31636592 & 0xFF);
+                uint32_t _addr_31636592 = static_cast<uint32_t>(
                     (smem_q_hi_addr +
                      (unsigned int)(q_head * 128 + (q_pair_col + pair_elem) ^
                                     (q_head * 128 + (q_pair_col + pair_elem) >> 7 & 7) << 4)));
-                asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_3494181136), "r"(_byte_3494181136)
+                asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_31636592), "r"(_byte_31636592)
                              : "memory");
               }
             }
@@ -891,16 +889,16 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
 #pragma unroll
             for (int pair_elem_1 = 0; pair_elem_1 < 2; pair_elem_1++) {
               {
-                uint16_t _fp8_pair_3493620864;
+                uint16_t _fp8_pair_31502352;
                 asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                    : "=h"(_fp8_pair_3493620864)
+                    : "=h"(_fp8_pair_31502352)
                     : "f"(0.0f), "f"(q_lo_packed_f32[pair_elem_1]));
-                uint32_t _byte_3493620864 = (uint32_t)(_fp8_pair_3493620864 & 0xFF);
-                uint32_t _addr_3493620864 = static_cast<uint32_t>((
+                uint32_t _byte_31502352 = (uint32_t)(_fp8_pair_31502352 & 0xFF);
+                uint32_t _addr_31502352 = static_cast<uint32_t>((
                     smem_q_lo_addr +
                     (unsigned int)(q_head_1 * 128 + (q_pair_col_1 + pair_elem_1) ^
                                    (q_head_1 * 128 + (q_pair_col_1 + pair_elem_1) >> 7 & 7) << 4)));
-                asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_3493620864), "r"(_byte_3493620864)
+                asm volatile("st.shared.u8 [%0], %1;" ::"r"(_addr_31502352), "r"(_byte_31502352)
                              : "memory");
               }
             }
@@ -985,7 +983,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
         float owner_scale0 = 0.0f;
         float owner_scale1 = 0.0f;
         float owner_inv_sum = 0.0f;
-        float owner_lse = -LOOM_INF;
+        float owner_lse = -CAKE_INF;
         int owner_valid = 0;
         if (group_ratio_rt > lane) {
           float owner_m0 = smem_exch0[lane];
@@ -995,9 +993,9 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
           float _max_4 = max_noftz(owner_m0, owner_m1);
           float owner_max = _max_4;
           float _exp2_2 = approx_exp2(softmax_scale_log2 * (owner_m0 - owner_max));
-          owner_scale0 = ((owner_m0 == -LOOM_INF) ? 0.0f : _exp2_2);
+          owner_scale0 = ((owner_m0 == -CAKE_INF) ? 0.0f : _exp2_2);
           float _exp2_3 = approx_exp2(softmax_scale_log2 * (owner_m1 - owner_max));
-          owner_scale1 = ((owner_m1 == -LOOM_INF) ? 0.0f : _exp2_3);
+          owner_scale1 = ((owner_m1 == -CAKE_INF) ? 0.0f : _exp2_3);
           float owner_sum = owner_s0 * owner_scale0 + owner_s1 * owner_scale1;
           if (owner_sum > 0.0f && owner_sum == owner_sum) {
             float _rcp_0 = approx_rcp(owner_sum);
@@ -1127,8 +1125,8 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
                 ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head) * NUM_SPLIT;
             int split0 = reduce_lane;
             int split1 = reduce_lane + 8;
-            float lse0 = -LOOM_INF;
-            float lse1 = -LOOM_INF;
+            float lse0 = -CAKE_INF;
+            float lse1 = -CAKE_INF;
             if (split0 < NUM_SPLIT) {
               lse0 = partial_LSE_ptr[reduce_stat_base + split0];
             }
@@ -1138,7 +1136,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
             float _max_5 = max_noftz(lse0, lse1);
             float lane_max = _max_5;
             int subgroup_lane_base = lane / 8 * 8;
-            float merged_max = -LOOM_INF;
+            float merged_max = -CAKE_INF;
 #pragma unroll
             for (int source_lane = 0; source_lane < 8; source_lane++) {
               float _shfl_10 = __shfl_sync(0xFFFFFFFF, lane_max, subgroup_lane_base + source_lane);
@@ -1148,11 +1146,11 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
             }
             float weight0 = 0.0f;
             float weight1 = 0.0f;
-            if (lse0 != -LOOM_INF) {
+            if (lse0 != -CAKE_INF) {
               float _exp2_4 = approx_exp2(lse0 - merged_max);
               weight0 = _exp2_4;
             }
-            if (lse1 != -LOOM_INF) {
+            if (lse1 != -CAKE_INF) {
               float _exp2_5 = approx_exp2(lse1 - merged_max);
               weight1 = _exp2_5;
             }
@@ -1173,7 +1171,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_fmha_dcp_spec_bf16_fp8_d25
               split_weights[split1 * TILE_Q + reduce_head_in_group] = weight1 * inv_weight_sum;
             }
             if (reduce_lane == 0) {
-              float merged_lse = -LOOM_INF;
+              float merged_lse = -CAKE_INF;
               if (weight_sum > 0.0f) {
                 float _log2_1;
                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(weight_sum));
