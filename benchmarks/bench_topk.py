@@ -208,17 +208,23 @@ def cub_topk_metrics(
     return metrics
 
 
-def append_cub_header(header: str, tie_break_enabled: bool) -> str:
+def append_cub_header(
+    header: str, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
     header += f" {'CUB':>12} {'CUBvsFI':>10}"
     if tie_break_enabled:
         header += (
             f" {'CUB(tie-small)':>15} {'CUBvsFI(tie-s)':>15}"
             f" {'CUB(tie-large)':>15} {'CUBvsFI(tie-l)':>15}"
         )
+    if show_clusters:
+        header += f" {'CUBvsClusters':>14}"
     return header
 
 
-def append_cub_columns(line: str, result: dict, tie_break_enabled: bool) -> str:
+def append_cub_columns(
+    line: str, result: dict, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
     if "cub_us" in result:
         line += (
             f" {result['cub_us']:>10.2f}us {result['speedup_cub_vs_flashinfer']:>9.2f}x"
@@ -237,6 +243,15 @@ def append_cub_columns(line: str, result: dict, tie_break_enabled: bool) -> str:
                 line += f" {fi_tie / cub_tie:>14.2f}x"
             else:
                 line += f" {'n/a':>15}"
+    if show_clusters:
+        # Clusters time / CUB time (>= 1.0x means CUB wins); n/a when either backend
+        # was not measured (pre-SM100, CUDA graphs, clusters-incompatible arguments).
+        clusters_us = result.get("clusters_us")
+        cub_us = result.get("cub_us")
+        if clusters_us is not None and cub_us is not None:
+            line += f" {clusters_us / cub_us:>13.2f}x"
+        else:
+            line += f" {'n/a':>14}"
     return line
 
 
@@ -1419,7 +1434,7 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break)
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1484,7 +1499,9 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
-                line = append_cub_columns(line, result, args.tie_break)
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1542,7 +1559,7 @@ def main():
             )
         if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break)
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1619,7 +1636,9 @@ def main():
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
                     )
-                line = append_cub_columns(line, result, args.tie_break)
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1664,7 +1683,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break)
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1728,7 +1747,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
-                        line = append_cub_columns(line, result, args.tie_break)
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1772,7 +1793,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break)
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1836,7 +1857,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
-                        line = append_cub_columns(line, result, args.tie_break)
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1931,7 +1954,7 @@ def main():
             if show_clusters:
                 header += f" {'Clusters':>12} {'vsClusters':>10}"
             header += f" {'torch(mask)':>13} {'Speedup':>9}"
-        header = append_cub_header(header, args.tie_break)
+        header = append_cub_header(header, args.tie_break, show_clusters)
         print(header)
         print("-" * len(header))
 
@@ -2003,7 +2026,9 @@ def main():
                             f" {result['torch_us']:>11.2f}us "
                             f"{result['speedup_vs_torch']:>8.2f}x"
                         )
-                    line = append_cub_columns(line, result, args.tie_break)
+                    line = append_cub_columns(
+                        line, result, args.tie_break, show_clusters
+                    )
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)
