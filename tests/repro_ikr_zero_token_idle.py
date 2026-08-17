@@ -105,7 +105,10 @@ def main() -> None:
     top_k = 8
     num_local_experts = num_experts // world_size
 
-    log(rank, f"world_size={world_size} real_tokens={real_tokens} ikr={ikr} num_iters={num_iters}")
+    log(
+        rank,
+        f"world_size={world_size} real_tokens={real_tokens} ikr={ikr} num_iters={num_iters}",
+    )
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -119,15 +122,25 @@ def main() -> None:
 
     g = torch.Generator(device="cuda").manual_seed(13 + rank)
     w13 = torch.randn(
-        num_local_experts, 2 * intermediate, hidden,
-        dtype=torch.bfloat16, device="cuda", generator=g,
+        num_local_experts,
+        2 * intermediate,
+        hidden,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=g,
     )
     w2 = torch.randn(
-        num_local_experts, hidden, intermediate,
-        dtype=torch.bfloat16, device="cuda", generator=g,
+        num_local_experts,
+        hidden,
+        intermediate,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=g,
     )
     megakernel_config = Mxfp8CutedslMegaMoeConfig(
-        intermediate_size=intermediate, top_k=top_k, kind="mxfp8_e4m3",
+        intermediate_size=intermediate,
+        top_k=top_k,
+        kind="mxfp8_e4m3",
         in_kernel_fc2_reduce=ikr,
     )
 
@@ -135,7 +148,8 @@ def main() -> None:
     mega = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
         fleet_params=FleetParams(
-            num_experts=num_experts, max_tokens_per_rank=max_tokens,
+            num_experts=num_experts,
+            max_tokens_per_rank=max_tokens,
             token_hidden_size=hidden,
         ),
         weights=MoEWeightPack(w13=w13, w2=w2),
@@ -168,8 +182,11 @@ def main() -> None:
     if dist.is_initialized():
         dist.barrier()
 
-    log(rank, "starting loop: rank0 always real; ranks>=1 randomly zero-token "
-              "or real each iter, independently, no barrier")
+    log(
+        rank,
+        "starting loop: rank0 always real; ranks>=1 randomly zero-token "
+        "or real each iter, independently, no barrier",
+    )
 
     rnd = random.Random(4242 + rank)
     progress = {"iter": 0, "phase": "start", "n_tokens": None}
@@ -190,7 +207,10 @@ def main() -> None:
         torch.cuda.synchronize()
         progress["phase"] = "done"
         if it % 10 == 0 or it == num_iters - 1:
-            log(rank, f"iter {it}/{num_iters} ok, n_tokens={n}, y.shape={tuple(y.shape)}")
+            log(
+                rank,
+                f"iter {it}/{num_iters} ok, n_tokens={n}, y.shape={tuple(y.shape)}",
+            )
 
     log(rank, "ALL ITERATIONS COMPLETE")
     if dist.is_initialized():

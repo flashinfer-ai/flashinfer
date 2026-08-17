@@ -761,7 +761,9 @@ def _run_mega_layer_zero_token_ikr_regression(
     warmup_hidden_states, warmup_topk_weights, warmup_topk_ids = _make_inputs(
         rank, num_tokens=real_tokens, hidden=hidden, num_experts=num_experts, topk=topk
     )
-    fc1_alpha, fc2_alpha, fc1_norm_const = _make_epilogue_params(rank, num_local_experts)
+    fc1_alpha, fc2_alpha, fc1_norm_const = _make_epilogue_params(
+        rank, num_local_experts
+    )
     megakernel_config = _megakernel_config(
         dict(
             intermediate=intermediate,
@@ -1387,4 +1389,3 @@ def test_autotune_nvfp4_candidates_cover_ikr():
 
     pinned = nvfp4_candidates(allow_in_kernel_fc2_reduce=False)
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
-

@@ -875,9 +875,22 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     # override that conflicts with the (unrelated, untouched) in_kernel_fc2_reduce
     # field raises immediately inside with_knobs(), before any post-hoc fixup
     # here could run.
-    if in_kernel_fc2_reduce and knobs and knobs.get("token_back_mode") not in (
-        None,
-        "epi_warps",
+    # The knobs dict may itself carry in_kernel_fc2_reduce (e.g. a verbatim
+    # tuned-cache entry); the effective value after with_knobs() is the knob,
+    # not the argument, so sanitize against whichever will win.
+    effective_ikr = (
+        knobs.get("in_kernel_fc2_reduce", in_kernel_fc2_reduce)
+        if knobs
+        else in_kernel_fc2_reduce
+    )
+    if (
+        effective_ikr
+        and knobs
+        and knobs.get("token_back_mode")
+        not in (
+            None,
+            "epi_warps",
+        )
     ):
         knobs = {**knobs, "token_back_mode": "epi_warps"}
     cfg = with_knobs(cfg, knobs)

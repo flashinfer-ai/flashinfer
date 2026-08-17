@@ -586,7 +586,8 @@ def _run_mega_layer_zero_token_ikr_regression(
     regression.
 
     This exact scenario (matched shapes, matched random schedule, even a
-    deliberate timing nudge on real rounds, 2000 iterations) was confirmed to
+    deliberate timing nudge on real rounds, NUM_ITERS=2000 -- the script
+    defaults to 60) was confirmed to
     reliably livelock pre-fix when run as a plain torchrun-launched script
     (tests/moe_ep/../repro_ikr_zero_token_idle.py -- the authoritative
     regression artifact for this bug) but passes vacuously pre-fix when run
