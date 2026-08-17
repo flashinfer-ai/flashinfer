@@ -40,7 +40,6 @@ from ..utils import register_custom_op, register_fake_op
 _ALGORITHM_AUTO = 0
 _ALGORITHM_MONOLITH = 1
 _ALGORITHM_TWO_KERNEL = 2
-_AUTOTUNE_CACHE_SCHEMA_VERSION = 4
 
 # A tactic is (main pipeline stages, main CTAs/SM, precompute heads/CTA,
 # d_split).  All-zero launch controls select the monolithic kernel.
@@ -89,27 +88,6 @@ def _get_module(
     ).build_and_load()
 
 
-def _heads_per_cta_candidates(heads_per_group: int) -> tuple[int, ...]:
-    """Return valid divisors on the ``HEADS_PER_GROUP >> k`` launch chain."""
-    candidates = []
-    value = heads_per_group
-    while value > 0:
-        if heads_per_group % value == 0:
-            candidates.append(value)
-        value >>= 1
-    return tuple(candidates)
-
-
-def _validate_d_split(dim: int, d_split: int) -> int:
-    assert d_split in (1, 2), f"d_split must be in {{1, 2}}, got {d_split}"
-    assert dim % d_split == 0, f"dim={dim} must be divisible by d_split={d_split}"
-    assert dim // d_split >= 32, (
-        f"d_split={d_split} gives D_PER_CTA={dim // d_split} < 32 "
-        "(output MMA m16n8 floor with _1×4 warp layout)"
-    )
-    return d_split
-
-
 @functools.cache
 def _make_tactics(
     heads_per_group: int,
@@ -120,13 +98,18 @@ def _make_tactics(
     two_kernel_d_split: int,
 ) -> tuple[_CheckpointingSSUTactic, ...]:
     """Build distinct ReplaySSM launches for one optimization profile."""
+    heads_per_cta_candidates = tuple(
+        heads_per_group >> shift
+        for shift in range(heads_per_group.bit_length())
+        if heads_per_group % (heads_per_group >> shift) == 0
+    )
     tactics = [(0, 0, 0, monolith_d_split)]
     total_work = two_kernel_d_split * batch * num_heads
     seen_launches: set[tuple[int, int, int]] = set()
     for stages in (1, 2):
         for ctas_per_sm in (1, 2, 4, 8, 16):
             grid = min(ctas_per_sm * num_sms, total_work)
-            for heads_per_cta in _heads_per_cta_candidates(heads_per_group):
+            for heads_per_cta in heads_per_cta_candidates:
                 launch = (stages, grid, heads_per_cta)
                 if launch in seen_launches:
                     continue
@@ -179,28 +162,6 @@ def allocate_checkpointing_ssu_scratch(
     return cb_scaled, cumAdt_vec, cb_old
 
 
-def _profile_cache_capacity(shapes: tuple[tuple[int, ...], ...]) -> int:
-    """Use one private padding slot beyond the bucketed dense batch."""
-    return shapes[1][0] + 1
-
-
-def _profile_batch_size(shapes: tuple[tuple[int, ...], ...]) -> int:
-    return shapes[1][0]
-
-
-def _initialize_broadcast_dt(
-    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    base = torch.zeros(shape[:-1], dtype=dtype, device=device)
-    return base.unsqueeze(-1).expand(shape)
-
-
-def _initialize_state_batch_indices(
-    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    return torch.arange(1, shape[0] + 1, dtype=dtype, device=device)
-
-
 def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
     """Install valid cache indices and a mixed replay history."""
     state, x, x_cache = inputs[0], inputs[1], inputs[7]
@@ -224,55 +185,98 @@ def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
 
 def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     """Profile dense decode buckets with compact private state caches."""
-    cache_capacity_inputs = [0, 7, 8, 9, 10, 11]
-    if inputs[16] is not None:
-        cache_capacity_inputs.append(16)
+
+    def batch_size(shapes: tuple[tuple[int, ...], ...]) -> int:
+        return shapes[1][0]  # x.shape[0]
+
+    def initialize_broadcast_dt(
+        shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        base = torch.zeros(shape[:-1], dtype=dtype, device=device)
+        return base.unsqueeze(-1).expand(shape)
+
+    # These inputs have a leading dimension equal to the number of state/cache
+    # buffers (not the temporal ring length).  That capacity does not affect
+    # the launch, so profile only the active batch plus one spare buffer.
+    # Indices follow the positional ``inputs`` list in ``_checkpointing_ssu``.
+    buffer_sized_inputs = [
+        0,  # state
+        7,  # x_cache
+        8,  # B_cache
+        9,  # dt_cache
+        10,  # ring_start
+        11,  # prev_num_accepted_tokens
+    ]
+    if inputs[16] is not None:  # state_scale
+        buffer_sized_inputs.append(16)
     constraints = [
         ConstraintSpec(
             input_idx=index,
             dim_idx=0,
-            infer_shape=_profile_cache_capacity,
+            infer_shape=lambda shapes: batch_size(shapes) + 1,
         )
-        for index in cache_capacity_inputs
+        for index in buffer_sized_inputs
     ]
-    if inputs[15] is not None:
+    if inputs[15] is not None:  # state_batch_indices
         constraints.append(
             ConstraintSpec(
                 input_idx=15,
                 dim_idx=0,
-                infer_shape=_profile_batch_size,
+                infer_shape=batch_size,
             )
         )
 
-    dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
-    tensor_initializers: list[tuple[int, Any]] = []
-    if inputs[18] is None:
-        batch_inputs = [1, 2, 4, 5, 6, 19, 20, 21]
-        if inputs[13] is not None:
-            batch_inputs.append(13)
-        if inputs[15] is not None:
-            batch_inputs.append(15)
-        dynamic_specs = (
-            DynamicTensorSpec(
-                input_idx=tuple(batch_inputs),
-                dim_idx=(0,) * len(batch_inputs),
-                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
-                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-            ),
-        )
-        tensor_initializers.extend(
-            (
-                (2, _initialize_broadcast_dt),
-                (6, autotuner_initializer_empty),
-                (19, autotuner_initializer_empty),
-                (20, autotuner_initializer_empty),
-                (21, autotuner_initializer_empty),
-            )
-        )
-        if inputs[15] is not None:
-            tensor_initializers.append((15, _initialize_state_batch_indices))
+    # One maximum-batch warmup populates the smaller dense serving buckets.
+    # Every tensor below has the same leading active-batch dimension.
+    batch_inputs = [
+        1,  # x
+        2,  # dt
+        4,  # B
+        5,  # C
+        6,  # out
+        19,  # cb_scaled
+        20,  # cumAdt_vec
+        21,  # cb_old
+    ]
+    if inputs[13] is not None:  # z
+        batch_inputs.append(13)
+    if inputs[15] is not None:  # state_batch_indices
+        batch_inputs.append(15)
+    dynamic_specs = (
+        DynamicTensorSpec(
+            input_idx=tuple(batch_inputs),
+            dim_idx=(0,) * len(batch_inputs),
+            # Powers of two through 256, steps of 256 through 2048, steps of
+            # 512 through 4096, then powers of two; always include max batch.
+            gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+            map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+        ),
+    )
+    tensor_initializers = (
+        (2, initialize_broadcast_dt),  # dt: preserve stride-zero broadcast
+        (6, autotuner_initializer_empty),  # out: fully overwritten
+        (19, autotuner_initializer_empty),  # cb_scaled: scratch
+        (20, autotuner_initializer_empty),  # cumAdt_vec: scratch
+        (21, autotuner_initializer_empty),  # cb_old: scratch
+    )
 
-    profile_arena_candidates = (0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 19, 20, 21)
+    profile_arena_candidates = (
+        0,  # state
+        1,  # x
+        4,  # B
+        5,  # C
+        6,  # out
+        7,  # x_cache
+        8,  # B_cache
+        9,  # dt_cache
+        10,  # ring_start
+        11,  # prev_num_accepted_tokens
+        15,  # state_batch_indices
+        16,  # state_scale
+        19,  # cb_scaled
+        20,  # cumAdt_vec
+        21,  # cb_old
+    )
     profile_arena_inputs = tuple(
         index
         for index in profile_arena_candidates
@@ -282,7 +286,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     return TuningConfig(
         dynamic_tensor_specs=dynamic_specs,
         constraint_specs=tuple(constraints),
-        tensor_initializers=tuple(tensor_initializers),
+        tensor_initializers=tensor_initializers,
         use_cold_l2_cache=True,
         use_cuda_graph=True,
         profile_arena_input_indices=profile_arena_inputs,
@@ -368,7 +372,6 @@ class CheckpointingSSURunner(TunableRunner):
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
         del inputs
         return (
-            _AUTOTUNE_CACHE_SCHEMA_VERSION,
             self._module_base_args,
             self._dt_softplus,
             self._pad_slot_id,
@@ -406,7 +409,7 @@ class CheckpointingSSURunner(TunableRunner):
                 and self._batch(inputs) * state.size(1) <= 8 * _sm_count(state.device)
             ):
                 d_split = 2
-        return _validate_d_split(inputs[0].size(2), d_split)
+        return d_split
 
     def forward(
         self,
@@ -439,15 +442,7 @@ class CheckpointingSSURunner(TunableRunner):
                 and main_ctas_per_sm == 0
                 and precompute_heads_per_cta == 0
             )
-            if not monolithic and (
-                main_pipeline_stages not in (1, 2)
-                or main_ctas_per_sm not in (1, 2, 4, 8, 16)
-                or precompute_heads_per_cta
-                not in _heads_per_cta_candidates(self._heads_per_group)
-            ):
-                raise ValueError(f"Unknown checkpointing SSU tactic: {tactic}")
             algorithm = _ALGORITHM_MONOLITH if monolithic else _ALGORITHM_TWO_KERNEL
-            _validate_d_split(inputs[0].size(2), d_split)
 
         two_kernel = algorithm == _ALGORITHM_TWO_KERNEL
         if two_kernel and not self._two_kernel_supported(inputs):
@@ -978,7 +973,6 @@ def checkpointing_ssu(
     # d_split=4 is deferred to v12.x (needs warp-count restructure for
     # output MMA).
     requested_d_split = 0 if d_split is None else d_split
-    _validate_d_split(dim, requested_d_split or 1)
 
     stateIndex_dtype = torch.int32
     if state_batch_indices is not None:

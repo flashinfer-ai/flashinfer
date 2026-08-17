@@ -714,6 +714,9 @@ def test_autotune_tactics_deduplicate_identical_small_batch_grids():
     assert len(tactics) == 11
     assert {tactic[1] for tactic in tactics[1:]} == {1}
 
+    non_power_of_two_tactics = _make_tactics(14, 32, 14, 148, 1, 1)
+    assert {tactic[2] for tactic in non_power_of_two_tactics[1:]} == {14, 7, 1}
+
 
 def test_autotune_tactic_carries_profile_d_split(monkeypatch):
     import importlib
@@ -731,15 +734,6 @@ def test_autotune_tactic_carries_profile_d_split(monkeypatch):
     tactics = runner.get_valid_tactics(inputs, None)
     assert tactics[0] == (0, 0, 0, 1)
     assert all(tactic[-1] == 1 for tactic in tactics)
-
-
-def test_default_d_split_rejects_unsupported_head_dim():
-    inputs = [None] * 22
-    inputs[0] = torch.empty(1, 2, 16, 4)
-    inputs[1] = torch.empty(1, 1, 2, 16)
-    runner = _make_autotune_runner(inputs)
-    with pytest.raises(AssertionError, match="D_PER_CTA=16 < 32"):
-        runner._resolve_d_split(inputs, 1)
 
 
 def test_two_kernel_d_split2():
