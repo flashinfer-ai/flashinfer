@@ -524,7 +524,6 @@ class B12xMoEWrapper:
             return self._dynamic_workspace
         return self._static_workspace
 
-    @flashinfer_api
     def prepare_weights(
         self,
         w1_weight: torch.Tensor,
@@ -622,7 +621,6 @@ class B12xMoEWrapper:
                 f"got {actual}, expected {expected}"
             )
 
-    @flashinfer_api
     def run_prepared(
         self,
         x: torch.Tensor,
@@ -648,6 +646,9 @@ class B12xMoEWrapper:
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
+        # fi_trace cannot currently flatten W4A16PackedWeights into tensor
+        # inputs. Keep this structured ownership API undecorated rather than
+        # emit an incomplete trace that omits the prepared weights.
         if self.quant_mode != "w4a16":
             raise ValueError("run_prepared is only available when quant_mode='w4a16'")
         self._validate_prepared_weights(prepared_weights)
