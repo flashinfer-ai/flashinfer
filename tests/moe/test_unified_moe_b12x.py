@@ -401,6 +401,7 @@ def _make_b12x_layer_and_packs(
     num_experts: int,
     top_k: int,
     source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
 ):
     activation_config = _B12X_ACTIVATIONS[activation]
     hidden_size = tensors["x_bf16"].shape[1]
@@ -431,6 +432,7 @@ def _make_b12x_layer_and_packs(
             w2_alpha,
             activation=activation_config,
             source_format=source_format,
+            reuse_input_storage=reuse_input_storage,
         )
         backend_key = "b12x_w4a16"
 
@@ -567,6 +569,133 @@ _B12X_DISPATCH_CASES = (
 @sm120_required
 @cuda_13_required
 class TestUnifiedB12xConformance:
+    def test_w4a16_explicit_prepared_lifecycle_bypasses_source_cache(self):
+        from flashinfer.fused_moe import B12xMoEWrapper
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        tensors = _make_b12x_tensors(
+            activation="silu",
+            num_tokens=8,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            seed=49031,
+        )
+        expected = _b12x_reference(
+            tensors,
+            variant=QuantVariant.W4A16,
+            activation="silu",
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+        )
+        wrapper = B12xMoEWrapper(
+            num_experts=8,
+            top_k=2,
+            hidden_size=256,
+            intermediate_size=512,
+            quant_mode="w4a16",
+            use_cuda_graph=True,
+            max_num_tokens=8,
+        )
+
+        moe_dispatch._W4A16_WEIGHT_CACHE.clear()
+        prepared = wrapper.prepare_weights(
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_alpha=tensors["w2_alpha"],
+            reuse_input_storage=True,
+        )
+        assert not moe_dispatch._W4A16_WEIGHT_CACHE
+        assert prepared.w13.data_ptr() == tensors["w1_weight"].data_ptr()
+        assert prepared.w2.data_ptr() == tensors["w2_weight"].data_ptr()
+
+        actual = wrapper.run_prepared(
+            x=tensors["x_bf16"],
+            prepared_weights=prepared,
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        passed, percent_within, atol = check_b12x_accuracy(actual, expected)
+        assert passed, (
+            f"explicit prepared W4A16: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = wrapper.run_prepared(
+                x=tensors["x_bf16"],
+                prepared_weights=prepared,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output, actual)
+        assert not moe_dispatch._W4A16_WEIGHT_CACHE
+
+    def test_w4a16_can_destructively_reuse_checkpoint_weight_storage(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        tensors = _make_b12x_tensors(
+            activation="silu",
+            num_tokens=8,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+        )
+        w1_ptr = tensors["w1_weight"].data_ptr()
+        w2_ptr = tensors["w2_weight"].data_ptr()
+        moe_dispatch._W4A16_WEIGHT_CACHE.clear()
+        try:
+            B12xW4A16Config.prepare_weights(
+                tensors["w1_weight"],
+                tensors["w1_weight_sf"],
+                tensors["w1_alpha"],
+                tensors["w2_weight"],
+                tensors["w2_weight_sf"],
+                tensors["w2_alpha"],
+            )
+            copied = next(iter(moe_dispatch._W4A16_WEIGHT_CACHE.values()))
+            assert copied.w13.data_ptr() != w1_ptr
+            assert copied.w2.data_ptr() != w2_ptr
+
+            layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
+                tensors,
+                variant=QuantVariant.W4A16,
+                activation="silu",
+                intermediate_size=512,
+                num_experts=8,
+                top_k=2,
+                reuse_input_storage=True,
+            )
+            prepared = next(iter(moe_dispatch._W4A16_WEIGHT_CACHE.values()))
+            assert prepared.w13.data_ptr() == w1_ptr
+            assert prepared.w2.data_ptr() == w2_ptr
+
+            actual = _run_b12x_unified(layer, act_pack, weight_pack)
+            expected = _b12x_reference(
+                tensors,
+                variant=QuantVariant.W4A16,
+                activation="silu",
+                intermediate_size=512,
+                num_experts=8,
+                top_k=2,
+            )
+            passed, percent_within, atol = check_b12x_accuracy(actual, expected)
+            assert passed, (
+                f"in-place W4A16: {percent_within * 100:.2f}% within "
+                f"tolerance (atol={atol:.4f})"
+            )
+        finally:
+            moe_dispatch._W4A16_WEIGHT_CACHE.clear()
+
     @pytest.mark.parametrize(
         "variant,activation,num_tokens,top_k,num_experts,hidden_size,intermediate_size",
         _B12X_DISPATCH_CASES,

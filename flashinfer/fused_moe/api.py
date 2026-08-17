@@ -741,11 +741,16 @@ class B12xW4A16Config:
         *,
         activation: ActivationConfig = ActivationConfig.swiglu,
         source_format: str = "modelopt",
+        reuse_input_storage: bool = False,
     ):
         """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("b12x_w4a16", ...)``.
         See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
+
+        Set ``reuse_input_storage=True`` only when the checkpoint tensors are
+        owned exclusively by this backend. It destructively replaces their
+        contents with the b12x packed layout to avoid a persistent duplicate.
         """
         from .prepare import prepare_b12x_w4a16_weights
         from .utils import get_b12x_activation_name
@@ -759,6 +764,7 @@ class B12xW4A16Config:
             w2_global_scale,
             activation=get_b12x_activation_name(activation.type),
             source_format=source_format,
+            reuse_input_storage=reuse_input_storage,
         )
 
     def __repr__(self) -> str:

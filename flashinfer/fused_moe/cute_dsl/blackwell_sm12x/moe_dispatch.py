@@ -2652,6 +2652,7 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
 ) -> W4A16PackedWeights:
     key = (
         activation,
@@ -2671,7 +2672,11 @@ def _get_w4a16_packed_weights(
         w2_alpha.data_ptr(),
     )
     cached = _W4A16_WEIGHT_CACHE.get(key)
-    if cached is not None:
+    cached_reuses_input = cached is not None and (
+        cached.w13.data_ptr() == w1_weight.data_ptr()
+        and cached.w2.data_ptr() == w2_weight.data_ptr()
+    )
+    if cached is not None and (not reuse_input_storage or cached_reuses_input):
         return cached
     if _is_cuda_graph_capturing():
         raise RuntimeError(
@@ -2688,6 +2693,7 @@ def _get_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        reuse_input_storage=reuse_input_storage,
     )
     _W4A16_WEIGHT_CACHE[key] = prepared
     _register_cache_eviction(
@@ -2824,6 +2830,52 @@ def _launch_sm120_w4a16_moe(
         expert_offsets=workspace.expert_offsets,
         expert_map=workspace.expert_map,
         fast_math=fast_math,
+    )
+
+
+def launch_sm120_w4a16_moe_prepared(
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    prepared_weights: W4A16PackedWeights,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    scatter_output: torch.Tensor,
+    fast_math: bool = True,
+    activation: str = "silu",
+    _workspace=None,
+) -> torch.Tensor:
+    """Launch W4A16 MoE from caller-owned prepared weights.
+
+    This path deliberately bypasses the process-global source-tensor cache.
+    The caller owns ``prepared_weights`` and must keep it alive for the
+    duration of execution and any CUDA graph that captures the launch.
+    """
+    if not isinstance(prepared_weights, W4A16PackedWeights):
+        raise TypeError("prepared_weights must be a W4A16PackedWeights instance")
+    return _launch_sm120_w4a16_moe(
+        a=a,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        # These packed tensors are ignored by the explicit prepared path. Keep
+        # the internal launch signature shared with the legacy cached path.
+        w1_weight=prepared_weights.w13,
+        w1_weight_sf=prepared_weights.w13_scale,
+        w1_alpha=prepared_weights.w13_global_scale,
+        w2_weight=prepared_weights.w2,
+        w2_weight_sf=prepared_weights.w2_scale,
+        w2_alpha=prepared_weights.w2_global_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        scatter_output=scatter_output,
+        fast_math=fast_math,
+        activation=activation,
+        source_format=prepared_weights.source_format,
+        _workspace=_workspace,
+        _prepared_weights=prepared_weights,
     )
 
 

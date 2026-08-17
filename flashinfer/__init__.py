@@ -107,6 +107,7 @@ with contextlib.suppress(ImportError):
         CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        W4A16PackedWeights as W4A16PackedWeights,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
