@@ -1,4 +1,20 @@
-"""Independent fused FC1 tactic for the SM90 push BF16 backend."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Independent fused FC1 tactic for the SM90 push BF16 backend.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +52,18 @@ _DEPENDENCY_NAMES = (
     "csrc/tvm_ffi_utils.h",
     "include/flashinfer/layout.cuh",
 )
+_ARCHIVED_ENGINE_ENV = "SM90_PUSH_BF16_ENABLE_ARCHIVED"
+_ARCHIVED_ENGINE_QUALIFICATION = "bf16_single_gpu_20260817"
+
+
+def _require_archived_engine_opt_in(allow_archived_engine: bool) -> None:
+    if allow_archived_engine or os.environ.get(_ARCHIVED_ENGINE_ENV) == "1":
+        return
+    raise RuntimeError(
+        "SM90 push fused WMMA BF16 FC1 is archived after "
+        f"{_ARCHIVED_ENGINE_QUALIFICATION} measured 0.127x of CUTLASS; pass "
+        "allow_archived_engine=True or set SM90_PUSH_BF16_ENABLE_ARCHIVED=1"
+    )
 
 
 def _canonical_source(path: Path) -> bytes:
@@ -191,7 +219,9 @@ class Sm90PushBf16FusedFc1:
         intermediate_size: int,
         k: int,
         device: Union[torch.device, str],
+        allow_archived_engine: bool = False,
     ) -> None:
+        _require_archived_engine_opt_in(allow_archived_engine)
         self.max_rows = int(max_rows)
         self.num_experts = int(num_experts)
         self.intermediate_size = int(intermediate_size)
@@ -302,6 +332,8 @@ class Sm90PushBf16FusedFc1:
         return {
             "tactic": "wmma_16x16_fused_fc1",
             "default_enabled": False,
+            "archived_engine": True,
+            "qualification": _ARCHIVED_ENGINE_QUALIFICATION,
             "accumulator_dtype": "float32",
             "output_dtype": "bfloat16",
             "rounding_boundary": "after_fp32_silu_mul",
@@ -318,6 +350,7 @@ def create_sm90_push_bf16_fused_fc1_runner(
     intermediate_size: int,
     k: int,
     device: Union[torch.device, str],
+    allow_archived_engine: bool = False,
 ) -> Sm90PushBf16FusedFc1:
     """Create one independently selectable fused FC1 tactic."""
     return Sm90PushBf16FusedFc1(
@@ -326,4 +359,5 @@ def create_sm90_push_bf16_fused_fc1_runner(
         intermediate_size=intermediate_size,
         k=k,
         device=device,
+        allow_archived_engine=allow_archived_engine,
     )

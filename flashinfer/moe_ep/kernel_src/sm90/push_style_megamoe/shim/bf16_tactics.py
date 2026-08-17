@@ -1,4 +1,20 @@
-"""Internal SM90 BF16 grouped-GEMM tactic matrix and selector."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Internal SM90 BF16 grouped-GEMM tactic matrix and selector.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +28,13 @@ SUPPORTED_BLOCK_N: tuple[Literal[64, 128], ...] = (64, 128)
 SUPPORTED_BLOCK_K: tuple[Literal[64, 128], ...] = (64, 128)
 SUPPORTED_STAGES: tuple[Literal[2, 3, 4], ...] = (2, 3, 4)
 SUPPORTED_CLUSTER_M: tuple[Literal[1, 2], ...] = (1, 2)
+
+_SELECTOR_CALIBRATION = "bf16_ep4_20260817_r3"
+_SELECTOR_CALIBRATION_ROUTING = "balanced"
+_M64_MAX_EXPECTED_M = 64.0
+_M128_MAX_EXPECTED_M = 128.0
+_SELECTOR_STAGES: Literal[3] = 3
+_LARGE_CLUSTER_ENABLED = False
 
 
 @dataclass(frozen=True)
@@ -204,7 +227,7 @@ if len(_TACTICS_BY_TAG) != len(SUPPORTED_BF16_GEMM_TACTICS):
 DEFAULT_BF16_GEMM_TACTIC = Bf16GemmTactic(
     "dual",
     m64=Bf16GemmFamilyTactic(64, 128, 128, 3, 1, "pingpong"),
-    m128=Bf16GemmFamilyTactic(128, 128, 128, 3, 2, "cooperative"),
+    m128=Bf16GemmFamilyTactic(128, 128, 128, 3, 1, "pingpong"),
 )
 
 
@@ -239,6 +262,11 @@ CORE_BF16_GEMM_TACTICS = _unique_tactics(
     ),
     Bf16GemmTactic(
         "m128",
+        m128=Bf16GemmFamilyTactic(128, 128, 128, 3, 2, "cooperative"),
+    ),
+    Bf16GemmTactic(
+        "dual",
+        m64=Bf16GemmFamilyTactic(64, 128, 128, 3, 1, "pingpong"),
         m128=Bf16GemmFamilyTactic(128, 128, 128, 3, 2, "cooperative"),
     ),
     DEFAULT_BF16_GEMM_TACTIC,
@@ -312,16 +340,22 @@ def select_sm90_push_bf16_gemm_tactic(
     if sm_count <= 0:
         raise ValueError(f"sm_count must be positive, got {sm_count}")
 
-    if expected_m <= 64:
+    # Random and Zipf routing use the balanced-routing calibration conservatively.
+    if expected_m <= _M64_MAX_EXPECTED_M:
         family_mode: FamilyMode = "m64"
-    elif expected_m <= 128:
+    elif expected_m <= _M128_MAX_EXPECTED_M:
         family_mode = "m128"
     else:
         family_mode = "dual"
     block_n: Literal[64, 128] = 64 if n <= 2048 or n % 128 != 0 else 128
     block_k: Literal[64, 128] = 64 if k <= 2048 or k % 128 != 0 else 128
-    stages: Literal[2, 3, 4] = 2 if expected_m <= 32 else 3
-    use_large_cluster = family_mode != "m64" and expected_m >= 96 and sm_count >= 100
+    stages: Literal[2, 3, 4] = _SELECTOR_STAGES
+    use_large_cluster = (
+        _LARGE_CLUSTER_ENABLED
+        and family_mode != "m64"
+        and expected_m >= 96
+        and sm_count >= 100
+    )
     m128_cluster: Literal[1, 2] = 2 if use_large_cluster else 1
     m128_schedule: KernelSchedule = "cooperative" if use_large_cluster else "pingpong"
     swap_ab = family_mode != "dual" and expected_m <= 32 and n >= 4096
@@ -337,7 +371,8 @@ def select_sm90_push_bf16_gemm_tactic(
     reason = (
         f"expected_m={expected_m:g} selected {family_mode}; N={n} selected N{block_n}; "
         f"K={k} selected K{block_k}; SMs={sm_count} selected "
-        f"S{stages}/C{m128_cluster}/{m128_schedule}; swap_ab={int(swap_ab)}"
+        f"S{stages}/C{m128_cluster}/{m128_schedule}; swap_ab={int(swap_ab)}; "
+        f"calibration={_SELECTOR_CALIBRATION}/{_SELECTOR_CALIBRATION_ROUTING}"
     )
     return tactic, reason
 

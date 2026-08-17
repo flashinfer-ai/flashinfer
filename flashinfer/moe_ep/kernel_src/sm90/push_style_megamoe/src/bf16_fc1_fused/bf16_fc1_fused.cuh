@@ -1,5 +1,9 @@
 // Copyright (c) 2026 FlashInfer team.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Archived experimental engine, disabled by default. Qualification data
+// bf16_single_gpu_20260817 measured 0.127x of the CUTLASS path because the
+// 16x16 WMMA implementation does not provide sufficient FC1 throughput.
 
 #pragma once
 

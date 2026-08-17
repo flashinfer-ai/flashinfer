@@ -1,4 +1,20 @@
-"""Correctness gates for the public SM90 push BF16 mega-MoE backend."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Correctness gates for the public SM90 push BF16 mega-MoE backend.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +51,7 @@ requires_dist = pytest.mark.skipif(
     _WORLD < 2 or not _sm90_cuda_12_available(),
     reason="requires torchrun with at least two SM90 GPUs and CUDA Toolkit 12.0+",
 )
+archived_engine = pytest.mark.skip(reason="archived engine")
 
 HIDDEN = 256
 INTERMEDIATE = 384
@@ -309,6 +326,7 @@ def test_public_ep1_forward_matches_staged_oracle(
 
 
 @requires_sm90
+@archived_engine
 @pytest.mark.parametrize("num_tokens", [0, 73])
 def test_internal_persistent_ep1_matches_staged_oracle(num_tokens: int) -> None:
     device = torch.device("cuda", 0)
@@ -328,6 +346,7 @@ def test_internal_persistent_ep1_matches_staged_oracle(num_tokens: int) -> None:
 
 
 @requires_sm90
+@archived_engine
 def test_internal_persistent_ep1_graph_replay_after_eager_warmup() -> None:
     device = torch.device("cuda", 0)
     layer, w13, w2 = _build_layer(1, 0, device)
@@ -387,6 +406,7 @@ def test_public_ep1_two_wave_matches_staged_oracle(
 
 
 @requires_sm90
+@archived_engine
 def test_public_ep1_fused_fc1_matches_staged_oracle() -> None:
     device = torch.device("cuda", 0)
     layer, w13, w2 = _build_layer(
@@ -709,7 +729,10 @@ def test_transformed_weight_validation_requires_cutlass_alignment() -> None:
 
 
 @requires_sm90
-@pytest.mark.parametrize("fuse_fc1_epilogue", [False, True])
+@pytest.mark.parametrize(
+    "fuse_fc1_epilogue",
+    [False, pytest.param(True, marks=archived_engine)],
+)
 @pytest.mark.parametrize("grouped_combine", [False, True])
 def test_public_ep1_validation_output_identity_and_graph_replay(
     fuse_fc1_epilogue: bool,
@@ -812,9 +835,9 @@ def _dist_setup() -> tuple[int, int]:
         (True, "all_remote", "mono", True, False),
         (True, "random", "serial2", False, False),
         (True, "all_remote", "pipe2", True, False),
-        (True, "random", "mono", False, True),
-        (True, "all_remote", "mono", True, True),
-        (True, "random", "pipe2", False, True),
+        pytest.param(True, "random", "mono", False, True, marks=archived_engine),
+        pytest.param(True, "all_remote", "mono", True, True, marks=archived_engine),
+        pytest.param(True, "random", "pipe2", False, True, marks=archived_engine),
     ],
 )
 def test_public_multirank_forward_configs(

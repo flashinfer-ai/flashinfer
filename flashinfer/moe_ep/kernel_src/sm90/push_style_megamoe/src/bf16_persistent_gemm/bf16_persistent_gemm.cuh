@@ -1,5 +1,9 @@
 // Copyright (c) 2026 FlashInfer team.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Archived experimental engine, disabled by default. Qualification data
+// bf16_single_gpu_20260817 measured 0.606x of the CUTLASS path; the phase-locked
+// pipeline and single-thread K16 TMA issue path limit throughput.
 
 #pragma once
 

@@ -1,4 +1,20 @@
-"""CPU-only contracts for the SM90 push BF16 mega-MoE backend."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+CPU-only contracts for the SM90 push BF16 mega-MoE backend.
+"""
 
 from __future__ import annotations
 
@@ -719,16 +735,16 @@ def test_sm90_push_bf16_gemm_tactic_matrix_is_finite_and_roundtrips() -> None:
         "swap_ab",
     ),
     [
-        (0.0, 64, 64, 132, "m64", 64, 64, 2, 1, False),
-        (32.0, 4096, 2048, 132, "m64", 128, 64, 2, 1, True),
+        (0.0, 64, 64, 132, "m64", 64, 64, 3, 1, False),
+        (32.0, 4096, 2048, 132, "m64", 128, 64, 3, 1, True),
         (64.0, 7168, 2048, 132, "m64", 128, 64, 3, 1, False),
         (64.01, 7168, 2048, 132, "m128", 128, 64, 3, 1, False),
-        (96.0, 2048, 2048, 132, "m128", 64, 64, 3, 2, False),
+        (96.0, 2048, 2048, 132, "m128", 64, 64, 3, 1, False),
         (96.0, 2049, 2049, 78, "m128", 64, 64, 3, 1, False),
         (96.0, 2880, 4096, 78, "m128", 64, 128, 3, 1, False),
         (96.0, 4096, 2880, 78, "m128", 128, 64, 3, 1, False),
-        (128.0, 7168, 3072, 114, "m128", 128, 128, 3, 2, False),
-        (128.01, 7168, 2048, 132, "dual", 128, 64, 3, 2, False),
+        (128.0, 7168, 3072, 114, "m128", 128, 128, 3, 1, False),
+        (128.01, 7168, 2048, 132, "dual", 128, 64, 3, 1, False),
     ],
 )
 def test_sm90_push_bf16_auto_selector_is_deterministic_at_boundaries(

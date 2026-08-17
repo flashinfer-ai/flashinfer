@@ -1,4 +1,20 @@
-"""Private persistent-offset BF16 GEMM adapter for SM90 push MegaMoE."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Private persistent-offset BF16 GEMM adapter for SM90 push MegaMoE.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +66,18 @@ _DEPENDENCY_NAMES = (
     "include/flashinfer/mma.cuh",
     "include/flashinfer/permuted_smem.cuh",
 )
+_ARCHIVED_ENGINE_ENV = "SM90_PUSH_BF16_ENABLE_ARCHIVED"
+_ARCHIVED_ENGINE_QUALIFICATION = "bf16_single_gpu_20260817"
+
+
+def _require_archived_engine_opt_in(allow_archived_engine: bool) -> None:
+    if allow_archived_engine or os.environ.get(_ARCHIVED_ENGINE_ENV) == "1":
+        return
+    raise RuntimeError(
+        "SM90 push persistent BF16 GEMM is archived after "
+        f"{_ARCHIVED_ENGINE_QUALIFICATION} measured 0.606x of CUTLASS; pass "
+        "allow_archived_engine=True or set SM90_PUSH_BF16_ENABLE_ARCHIVED=1"
+    )
 
 
 def _canonical_source(path: Path) -> bytes:
@@ -285,7 +313,9 @@ class Sm90PushBf16PersistentGroupedGemm:
         expected_m: float | None = None,
         sm_count: int | None = None,
         trusted_offsets: bool = False,
+        allow_archived_engine: bool = False,
     ) -> None:
+        _require_archived_engine_opt_in(allow_archived_engine)
         self.max_rows = int(max_rows)
         self.num_experts = int(num_experts)
         self.n, self.k = _normalize_shape(n, k)
@@ -320,7 +350,7 @@ class Sm90PushBf16PersistentGroupedGemm:
                 k=self.k,
                 sm_count=self.sm_count,
             )
-            self.selector_kind = "shape_load_sm_count_v1"
+            self.selector_kind = "shape_load_sm_count_v2"
         else:
             self.tactic = normalize_bf16_gemm_tactic(tactic)
             self.selector_kind = "forced"
@@ -454,6 +484,8 @@ class Sm90PushBf16PersistentGroupedGemm:
         """Describe the persistent-offset implementation and compiled tactic."""
         return {
             "implementation": "persistent_offsets",
+            "archived_engine": True,
+            "qualification": _ARCHIVED_ENGINE_QUALIFICATION,
             "selector": self.selector_kind,
             "selected_tactic": self.tactic.as_dict(),
             "selection_reason": self.selection_reason,
@@ -482,6 +514,7 @@ def create_sm90_push_bf16_persistent_gemm_runner(
     expected_m: float | None = None,
     sm_count: int | None = None,
     trusted_offsets: bool = False,
+    allow_archived_engine: bool = False,
 ) -> Sm90PushBf16PersistentGroupedGemm:
     """Create a persistent BF16 GEMM runner for one shape envelope and device."""
     return Sm90PushBf16PersistentGroupedGemm(
@@ -494,4 +527,5 @@ def create_sm90_push_bf16_persistent_gemm_runner(
         expected_m=expected_m,
         sm_count=sm_count,
         trusted_offsets=trusted_offsets,
+        allow_archived_engine=allow_archived_engine,
     )

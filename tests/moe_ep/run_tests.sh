@@ -127,6 +127,7 @@ run_sm90_push_bf16() {
     tests/moe_ep/test_sm90_push_bf16_persistent_gemm_contract.py \
     tests/moe_ep/test_sm90_push_bf16_persistent_gemm.py \
     tests/moe_ep/test_sm90_push_bf16_grouped_combine.py \
+    tests/moe_ep/test_sm90_push_bf16_tactics_selection.py \
     tests/moe_ep/test_sm90_push_bf16_backend_cpu.py \
     tests/moe_ep/test_sm90_push_bf16_backend.py -v || rc=1
 
