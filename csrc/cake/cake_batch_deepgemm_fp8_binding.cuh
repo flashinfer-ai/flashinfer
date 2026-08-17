@@ -214,7 +214,9 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   const uint32_t clusters = std::max<uint32_t>(1, std::min<uint32_t>(num_sms / 2, max_chunks));
   config.gridDim = dim3(clusters * 2, 1, 1);
   attrs[0].id = cudaLaunchAttributeClusterDimension;
-  attrs[0].val.clusterDim = dim3(2, 1, 1);
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   config.attrs = attrs;
@@ -249,7 +251,9 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
       1, std::min<uint32_t>(num_sms / 2, static_cast<uint32_t>(scheduled_tiles)));
   config.gridDim = dim3(clusters * 2, 1, 1);
   attrs[0].id = cudaLaunchAttributeClusterDimension;
-  attrs[0].val.clusterDim = dim3(2, 1, 1);
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   config.attrs = attrs;
