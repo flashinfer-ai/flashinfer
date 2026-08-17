@@ -240,12 +240,14 @@ run_mega() {
 }
 
 # Single-GPU Rubin (SM107) torch-oracle correctness: the next_cutedsl_megamoe
-# fprop kernel vs the shim's pure-torch reference.  Own pytest process (the
+# inference kernel vs the shim's pure-torch reference.  Own pytest process (the
 # tree bootstraps its own sys.path root); MEGA_NO_DIST=1 single-rank.
 run_oracle_sm107() {
+  # -s: the oracle tests print their rel_l2 / max|d| margins; keep them in the
+  # log instead of pytest's capture buffer.
   MEGA_NO_DIST=1 "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v \
+    tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
     -m arch_rubin
 }
 
@@ -261,8 +263,8 @@ run_mega_sm90() {
     -m "gpu_4 and arch_hopper"
 }
 
-# 4-GPU Rubin (SM107) mxfp8 GLU mega multirank (MoEEpLayer vs torch oracle on
-# real cross-rank EP traffic).  Own torchrun pytest process.
+# 4-GPU Rubin (SM107) block-scaled mega multirank (MoEEpLayer vs torch oracle
+# on real cross-rank EP traffic).  Own torchrun pytest process.
 run_mega_sm107() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
