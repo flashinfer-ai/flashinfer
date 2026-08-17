@@ -17,7 +17,11 @@ from flashinfer.dcp import (
     run_dcp_spec_decode,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from flashinfer.jit.dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
+from flashinfer.jit.dcp import (
+    get_dcp_spec_fp8_d256_uri,
+    get_dcp_spec_fp8_uri,
+    get_dcp_spec_uri,
+)
 from flashinfer.trace.templates.attention import (
     trtllm_batch_decode_dcp_spec_split_kv_trace,
     trtllm_batch_decode_dcp_spec_trace,
@@ -36,6 +40,10 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     assert fp8_uri == (
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
+    assert get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 4, 4) == (
+        "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_b8_q4_hq16_hkv1_cp4_"
+        "split4_retain0"
+    )
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
@@ -49,11 +57,15 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
     )
     jit_dcp.gen_dcp_spec_module.cache_clear()
     jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
+    jit_dcp.gen_dcp_spec_fp8_d256_module.cache_clear()
 
     try:
         v1 = jit_dcp.gen_dcp_spec_module("v1", "sm100a", 1, 1, 64, 8, 1, 1)
         v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
         fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm100f", 64, 3, 64, 8, 4, 3, 1)
+        d256 = jit_dcp.gen_dcp_spec_fp8_d256_module(
+            "sm100f", 8, 4, 16, 1, 4, 4
+        )
 
         assert Path(v1.sources[0]).name == "cake_fmha_dcp_spec_bf16_v1_retain1.cu"
         assert Path(v4.sources[0]).name == "cake_fmha_dcp_spec_bf16_v4_split16.cu"
@@ -61,14 +73,23 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
             "cake_fmha_dcp_spec_bf16_fp8_split3_retain1.cu"
         )
         assert Path(fp8.sources[1]).name == "cake_fmha_dcp_spec_bf16_fp8_binding.cu"
+        assert Path(d256.sources[0]).name == (
+            "cake_fmha_dcp_spec_bf16_fp8_d256_split4_retain0.cu"
+        )
+        assert Path(d256.sources[1]).name == (
+            "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu"
+        )
         assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
         assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
         assert "-DQ_LEN=3" in fp8.extra_cuda_cflags
         assert "-DNUM_SPLIT=3" not in fp8.extra_cuda_cflags
         assert "-DRETAIN_KV_L2=1" not in fp8.extra_cuda_cflags
+        assert "-DNUM_SPLIT=4" not in d256.extra_cuda_cflags
+        assert "-DRETAIN_KV_L2=0" not in d256.extra_cuda_cflags
     finally:
         jit_dcp.gen_dcp_spec_module.cache_clear()
         jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
+        jit_dcp.gen_dcp_spec_fp8_d256_module.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -95,6 +116,17 @@ def test_fp8_dcp_spec_uri_supports_q3_but_rejects_other_gaps() -> None:
         get_dcp_spec_fp8_uri("sm100f", 64, 4, 64, 8, 4, 3, 2)
 
 
+def test_fp8_d256_uri_rejects_nonproduction_shapes() -> None:
+    with pytest.raises(ValueError, match="q_len"):
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 3, 16, 1, 4, 4)
+    with pytest.raises(ValueError, match="num_q_heads"):
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 32, 2, 4, 4)
+    with pytest.raises(ValueError, match="cp_world"):
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 2, 4)
+    with pytest.raises(ValueError, match="num_split"):
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 4, 6)
+
+
 def test_public_decode_api_adds_optional_dcp_arguments() -> None:
     parameters = inspect.signature(trtllm_batch_decode_with_kv_cache).parameters
     assert parameters["cp_world"].default == 1
@@ -106,6 +138,10 @@ def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     # B=8, Q=4, Hq=64, split=6: BF16 O[...128] + FP32 LSE per row.
     rows = 8 * 4 * 64 * 6
     assert get_dcp_spec_workspace_size_bytes(8, 4, 64, 6) == rows * (128 * 2 + 4)
+    d256_rows = 8 * 4 * 16 * 4
+    assert get_dcp_spec_workspace_size_bytes(
+        8, 4, 16, 4, head_dim=256
+    ) == d256_rows * (256 * 2 + 4)
     assert get_dcp_spec_counter_bytes(8, 4, 8) == 8 * 4 * 8 * 4
 
 
@@ -131,6 +167,36 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
             logical_tiles=148, sm_count=148, local_blocks=64, cp_world=4
         )
         == 1
+    )
+    assert (
+        _select_fp8_num_split(
+            logical_tiles=4,
+            sm_count=152,
+            local_blocks=64,
+            cp_world=4,
+            head_dim=256,
+        )
+        == 8
+    )
+    assert (
+        _select_fp8_num_split(
+            logical_tiles=32,
+            sm_count=152,
+            local_blocks=64,
+            cp_world=4,
+            head_dim=256,
+        )
+        == 4
+    )
+    assert (
+        _select_fp8_num_split(
+            logical_tiles=4,
+            sm_count=152,
+            local_blocks=256,
+            cp_world=1,
+            head_dim=256,
+        )
+        == 16
     )
 
 
@@ -172,24 +238,37 @@ def _empty_rank_inputs(
     kv_dtype=torch.bfloat16,
     q_len_per_req=1,
     bmm2_scale=1.0,
+    head_dim=128,
+    num_q_heads=8,
+    num_kv_heads=8,
+    cp_world=8,
+    cp_rank=7,
 ):
     page_size = 64 if kv_dtype == torch.float8_e4m3fn else 16
     return {
-        "query": torch.empty((q_len_per_req, 8, 128), dtype=torch.bfloat16),
-        "k_cache": torch.empty((1, 8, page_size, 128), dtype=kv_dtype),
-        "v_cache": torch.empty((1, 8, page_size, 128), dtype=kv_dtype),
+        "query": torch.empty(
+            (q_len_per_req, num_q_heads, head_dim), dtype=torch.bfloat16
+        ),
+        "k_cache": torch.empty(
+            (1, num_kv_heads, page_size, head_dim), dtype=kv_dtype
+        ),
+        "v_cache": torch.empty(
+            (1, num_kv_heads, page_size, head_dim), dtype=kv_dtype
+        ),
         "workspace_buffer": torch.empty(1, dtype=torch.uint8),
         "block_tables": torch.zeros((1, 1), dtype=torch.int32),
         "seq_lens": torch.zeros((1,), dtype=seq_lens_dtype),
         "causal_seqlens_kv_global": torch.zeros((1,), dtype=torch.int32),
         "max_local_seq_len": 0,
-        "bmm1_scale": 128**-0.5,
+        "bmm1_scale": head_dim**-0.5,
         "bmm2_scale": bmm2_scale,
-        "cp_world": 8,
-        "cp_rank": 7,
+        "cp_world": cp_world,
+        "cp_rank": cp_rank,
         "q_len_per_req": q_len_per_req,
-        "out": torch.empty((q_len_per_req, 8, 128), dtype=torch.bfloat16),
-        "lse": torch.empty((q_len_per_req, 8), dtype=torch.float32),
+        "out": torch.empty(
+            (q_len_per_req, num_q_heads, head_dim), dtype=torch.bfloat16
+        ),
+        "lse": torch.empty((q_len_per_req, num_q_heads), dtype=torch.float32),
         "completion_buffer": None,
     }
 
@@ -269,6 +348,51 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
 
     assert len(loader_calls) == 1
     assert loader_calls[0][-2:] == (3, 0)
+    assert len(launches) == 1
+    args = launches[0]
+    assert args[3].data_ptr() == inputs["workspace_buffer"].data_ptr()
+    assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
+
+
+def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
+    monkeypatch,
+) -> None:
+    dcp = importlib.import_module("flashinfer.dcp")
+    launches = []
+    loader_calls = []
+    module = SimpleNamespace(run=lambda *args: launches.append(args))
+    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 152)
+    monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100f")
+    monkeypatch.setattr(
+        jit_dcp,
+        "load_dcp_spec_fp8_d256_module",
+        lambda *args: loader_calls.append(args) or module,
+    )
+
+    inputs = _empty_rank_inputs(
+        kv_dtype=torch.float8_e4m3fn,
+        q_len_per_req=4,
+        bmm2_scale=0.25,
+        head_dim=256,
+        num_q_heads=16,
+        num_kv_heads=1,
+        cp_world=4,
+        cp_rank=0,
+    )
+    inputs["block_tables"] = torch.zeros((1, 128), dtype=torch.int32)
+    inputs["seq_lens"] = torch.full((1,), 8192, dtype=torch.int32)
+    inputs["max_local_seq_len"] = 8192
+    inputs["workspace_buffer"] = torch.empty(
+        get_dcp_spec_workspace_size_bytes(1, 4, 16, 8, head_dim=256),
+        dtype=torch.uint8,
+    )
+    inputs["completion_buffer"] = torch.zeros(
+        get_dcp_spec_counter_bytes(1, 4, 1), dtype=torch.uint8
+    )
+    run_dcp_spec_decode(**inputs)
+
+    assert loader_calls == [("sm100f", 1, 4, 16, 1, 4, 8)]
     assert len(launches) == 1
     args = launches[0]
     assert args[3].data_ptr() == inputs["workspace_buffer"].data_ptr()

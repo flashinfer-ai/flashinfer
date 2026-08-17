@@ -30,7 +30,8 @@ from .utils import (
 )
 
 _BLOCK_N = 128
-_HEAD_DIM = 128
+_D128_HEAD_DIM = 128
+_D256_HEAD_DIM = 256
 _BF16_PAGE_SIZE = 16
 _FP8_PAGE_SIZE = 64
 _MAX_NUM_SPLIT = 16
@@ -38,7 +39,10 @@ _MIN_SPLIT_LOCAL_BLOCKS = 16
 _TARGET_PAIRS_PER_SPLIT = 3
 _RETAIN_KV_L2_MAX_BLOCKS = 9
 _FP8_MAX_NUM_SPLIT = 4
+_FP8_D256_MAX_NUM_SPLIT = 16
 _FP8_MIN_SPLIT_LOCAL_BLOCKS = 4
+_FP8_D256_CP1_MIN_LOCAL_BLOCKS = 128
+_FP8_D256_CP4_MIN_LOCAL_BLOCKS = 64
 _FP8_RETAIN_KV_L2_MAX_BLOCKS = 18
 _BF16_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
@@ -50,15 +54,25 @@ def get_dcp_spec_workspace_size_bytes(
     q_len_per_req: int,
     num_qo_heads: int,
     num_split: int = _MAX_NUM_SPLIT,
+    *,
+    head_dim: int = _D128_HEAD_DIM,
 ) -> int:
-    """Bytes for Cake FMHA Split-KV BF16 partial-O and FP32 partial-LSE scratch."""
+    """Bytes for Cake FMHA Split-KV BF16 partial-O and FP32 partial-LSE scratch.
 
-    if min(batch_size, q_len_per_req, num_qo_heads) <= 0:
-        raise ValueError("batch_size, q_len_per_req, and num_qo_heads must be positive")
+    Pass ``head_dim=256`` for the FP8/page64 D256 ratio-16 production profile;
+    the default remains the D128 profile.
+    """
+
+    if min(batch_size, q_len_per_req, num_qo_heads, head_dim) <= 0:
+        raise ValueError(
+            "batch_size, q_len_per_req, num_qo_heads, and head_dim must be positive"
+        )
+    if head_dim not in (_D128_HEAD_DIM, _D256_HEAD_DIM):
+        raise ValueError("Cake FMHA workspace head_dim must be 128 or 256")
     if not 2 <= num_split <= _MAX_NUM_SPLIT:
         raise ValueError(f"num_split must be in [2, {_MAX_NUM_SPLIT}]")
     partial_rows = batch_size * q_len_per_req * num_qo_heads * num_split
-    return partial_rows * (_HEAD_DIM * 2 + 4)
+    return partial_rows * (head_dim * 2 + 4)
 
 
 def get_dcp_spec_counter_bytes(
@@ -82,6 +96,7 @@ def _split_workspace_views(
     q_len_per_req: int,
     num_qo_heads: int,
     num_kv_heads: int,
+    head_dim: int,
     num_split: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bind caller-owned Split-KV scratch without allocating during launch."""
@@ -115,6 +130,7 @@ def _split_workspace_views(
         q_len_per_req,
         num_qo_heads,
         num_split,
+        head_dim=head_dim,
     )
     workspace_u8 = workspace_buffer.view(torch.uint8).reshape(-1)
     if workspace_u8.numel() < required_workspace:
@@ -123,7 +139,7 @@ def _split_workspace_views(
             f"got {workspace_u8.numel()} bytes, need {required_workspace}"
         )
     partial_rows = batch_size * q_len_per_req * num_qo_heads * num_split
-    partial_o_bytes = partial_rows * _HEAD_DIM * 2
+    partial_o_bytes = partial_rows * head_dim * 2
     partial_lse_bytes = partial_rows * 4
     partial_o = workspace_u8[:partial_o_bytes].view(torch.bfloat16)
     partial_lse = workspace_u8[
@@ -157,6 +173,7 @@ def _select_fp8_num_split(
     sm_count: int,
     local_blocks: int,
     cp_world: int,
+    head_dim: int = _D128_HEAD_DIM,
 ) -> int:
     """Fill one SM wave while retaining two FP8 K/V block pairs per CTA."""
 
@@ -165,12 +182,29 @@ def _select_fp8_num_split(
     total_pairs = (local_blocks + 1) // 2
     work_cap = (total_pairs + 1) // 2
     max_num_split = 3 if cp_world > 1 else _FP8_MAX_NUM_SPLIT
+    if (
+        head_dim == _D256_HEAD_DIM
+        and cp_world == 1
+        and local_blocks >= _FP8_D256_CP1_MIN_LOCAL_BLOCKS
+    ):
+        max_num_split = _FP8_D256_MAX_NUM_SPLIT
+    elif (
+        head_dim == _D256_HEAD_DIM
+        and cp_world == 4
+        and local_blocks >= _FP8_D256_CP4_MIN_LOCAL_BLOCKS
+    ):
+        max_num_split = 8
     num_split = min(
         max_num_split,
         total_pairs,
         work_cap,
         sm_count // logical_tiles,
     )
+    if head_dim == _D256_HEAD_DIM:
+        for supported_split in (16, 8, 4, 3, 2):
+            if num_split >= supported_split:
+                return supported_split
+        return 1
     return num_split if num_split >= 2 else 1
 
 
@@ -243,15 +277,21 @@ def _validate_core_inputs(
     if query.ndim != 3:
         raise ValueError(
             "DCP speculative FMHA query must have shape "
-            "[batch_size * q_len_per_req, num_qo_heads, 128]"
+            "[batch_size * q_len_per_req, num_qo_heads, head_dim]"
         )
     num_tokens, num_qo_heads, head_dim = query.shape
-    if num_tokens != batch_size * q_len_per_req or head_dim != _HEAD_DIM:
+    if num_tokens != batch_size * q_len_per_req:
         raise ValueError(
             "query shape does not match the DCP specialization: "
-            f"got {tuple(query.shape)}, expected tokens={batch_size * q_len_per_req} "
-            f"and head_dim={_HEAD_DIM}"
+            f"got {tuple(query.shape)}, expected tokens={batch_size * q_len_per_req}"
         )
+    if profile == "bf16_p16" and head_dim != _D128_HEAD_DIM:
+        raise ValueError("the BF16/page16 DCP profile requires head_dim=128")
+    if profile == "fp8_p64" and head_dim not in (_D128_HEAD_DIM, _D256_HEAD_DIM):
+        raise ValueError("the FP8/page64 DCP profile requires head_dim=128 or 256")
+    if head_dim == _D256_HEAD_DIM:
+        profile = "fp8_p64_d256"
+        supported_q_lens = (4,)
     if q_len_per_req not in supported_q_lens:
         raise ValueError(
             f"q_len_per_req must be one of {supported_q_lens} for the {profile} profile"
@@ -263,22 +303,35 @@ def _validate_core_inputs(
     if k_cache.ndim != 4 or v_cache.ndim != 4:
         raise ValueError(
             "DCP speculative FMHA HND caches must have shape "
-            "[num_pages, num_kv_heads, page_size, 128]"
+            "[num_pages, num_kv_heads, page_size, head_dim]"
         )
     if k_cache.shape != v_cache.shape:
         raise ValueError("key and value cache shapes must match")
     _, num_kv_heads, page_size, kv_head_dim = k_cache.shape
-    if page_size != page_size_required or kv_head_dim != _HEAD_DIM:
+    if page_size != page_size_required or kv_head_dim != head_dim:
         raise ValueError(
             f"DCP speculative FMHA {profile} requires HND "
-            f"page_size={page_size_required} and head_dim=128, "
+            f"page_size={page_size_required} and head_dim={head_dim}, "
             f"got page_size={page_size}, head_dim={kv_head_dim}"
         )
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
     group_ratio = num_qo_heads // num_kv_heads
-    if not 1 <= group_ratio <= 8:
-        raise ValueError(f"DCP head group ratio must be in [1, 8], got {group_ratio}")
+    if head_dim == _D128_HEAD_DIM:
+        if not 1 <= group_ratio <= 8:
+            raise ValueError(
+                f"DCP D128 head group ratio must be in [1, 8], got {group_ratio}"
+            )
+    elif (
+        num_qo_heads != 16
+        or num_kv_heads != 1
+        or group_ratio != 16
+        or cp_world not in (1, 4)
+    ):
+        raise ValueError(
+            "DCP D256 production profile requires Hq=16, Hkv=1, "
+            "head group ratio 16, and cp_world in {1,4}"
+        )
 
     device = query.device
     for name, tensor in (
@@ -388,8 +441,11 @@ def run_dcp_spec_decode(
     softmax_scale_log2 = float(bmm1_scale) / math.log(2.0)
     max_pages_per_seq = block_tables.shape[1]
 
-    if profile == "fp8_p64":
-        from .jit.dcp import load_dcp_spec_fp8_module
+    if profile.startswith("fp8_p64"):
+        from .jit.dcp import (
+            load_dcp_spec_fp8_d256_module,
+            load_dcp_spec_fp8_module,
+        )
 
         local_blocks = max(1, (max_local_seq_len + _BLOCK_N - 1) // _BLOCK_N)
         num_split = _select_fp8_num_split(
@@ -397,20 +453,33 @@ def run_dcp_spec_decode(
             sm_count=sm_count,
             local_blocks=local_blocks,
             cp_world=cp_world,
+            head_dim=query.shape[-1],
         )
-        retain_kv_l2 = int(
-            cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
-        )
-        module = load_dcp_spec_fp8_module(
-            target,
-            batch_size,
-            q_len_per_req,
-            num_qo_heads,
-            num_kv_heads,
-            cp_world,
-            num_split,
-            retain_kv_l2,
-        )
+        head_dim = query.shape[-1]
+        if head_dim == _D256_HEAD_DIM:
+            module = load_dcp_spec_fp8_d256_module(
+                target,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                num_kv_heads,
+                cp_world,
+                num_split,
+            )
+        else:
+            retain_kv_l2 = int(
+                cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
+            )
+            module = load_dcp_spec_fp8_module(
+                target,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                num_kv_heads,
+                cp_world,
+                num_split,
+                retain_kv_l2,
+            )
         if num_split == 1:
             partial_o = out
             partial_lse = lse
@@ -424,6 +493,7 @@ def run_dcp_spec_decode(
                 q_len_per_req=q_len_per_req,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
                 num_split=num_split,
             )
         grid = min(sm_count, logical_tiles * num_split)
@@ -506,6 +576,7 @@ def run_dcp_spec_decode(
         q_len_per_req=q_len_per_req,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
+        head_dim=query.shape[-1],
         num_split=num_split,
     )
 

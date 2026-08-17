@@ -38,6 +38,7 @@ _DCP_SPEC_NVCC_FLAGS = {
 }
 _SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
+_FP8_D256_SUPPORTED_SPLITS = (1, 2, 3, 4, 8, 16)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
@@ -186,6 +187,60 @@ def get_dcp_spec_fp8_uri(
     )
 
 
+def _validate_fp8_d256_specialization(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+    num_split: int,
+) -> None:
+    if target not in _DCP_SPEC_NVCC_FLAGS:
+        raise ValueError(f"unsupported DCP speculative FMHA target: {target}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if q_len != 4:
+        raise ValueError(f"D256 q_len must be 4, got {q_len}")
+    if (num_q_heads, num_kv_heads) != (16, 1):
+        raise ValueError(
+            "D256 production specialization requires num_q_heads=16 and "
+            f"num_kv_heads=1, got {num_q_heads} and {num_kv_heads}"
+        )
+    if cp_world not in (1, 4):
+        raise ValueError(f"D256 cp_world must be 1 or 4, got {cp_world}")
+    if num_split not in _FP8_D256_SUPPORTED_SPLITS:
+        raise ValueError(
+            f"D256 num_split must be one of {_FP8_D256_SUPPORTED_SPLITS}, "
+            f"got {num_split}"
+        )
+
+
+def get_dcp_spec_fp8_d256_uri(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+    num_split: int,
+) -> str:
+    _validate_fp8_d256_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+        num_split,
+    )
+    return (
+        f"cake_fmha_dcp_spec_bf16_fp8_d256_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}_cp{cp_world}"
+        f"_split{num_split}_retain0"
+    )
+
+
 @functools.cache
 def gen_dcp_spec_module(
     variant: DcpSpecVariant,
@@ -286,6 +341,56 @@ def gen_dcp_spec_fp8_module(
 
 
 @functools.cache
+def gen_dcp_spec_fp8_d256_module(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+    num_split: int,
+) -> JitSpec:
+    """Generate one D256/ratio16 BF16-Q/FP8-KV Cake FMHA module."""
+
+    uri = get_dcp_spec_fp8_d256_uri(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+        num_split,
+    )
+    csrc_dir = _get_csrc_dir()
+    body = csrc_dir / (
+        f"cake_fmha_dcp_spec_bf16_fp8_d256_split{num_split}_retain0.cu"
+    )
+    binding = csrc_dir / "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu"
+    for source in (body, binding):
+        if not source.exists():
+            raise FileNotFoundError(
+                f"D256 DCP speculative FMHA source not found: {source}"
+            )
+
+    spec = gen_jit_spec(
+        name=uri,
+        sources=[body, binding],
+        extra_cuda_cflags=[
+            *_DCP_SPEC_NVCC_FLAGS[target],
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DQ_LEN={q_len}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCP_WORLD={cp_world}",
+        ],
+        extra_include_paths=[csrc_dir],
+        extra_ldflags=["-lcuda"],
+    )
+    logger.info(f"Generated D256 FP8 DCP speculative FMHA JIT spec: {spec.name}")
+    return spec
+
+
+@functools.cache
 def load_dcp_spec_module(
     variant: DcpSpecVariant,
     target: DcpSpecTarget,
@@ -335,13 +440,39 @@ def load_dcp_spec_fp8_module(
     return module
 
 
+@functools.cache
+def load_dcp_spec_fp8_d256_module(
+    target: DcpSpecTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    cp_world: int,
+    num_split: int,
+):
+    module = gen_dcp_spec_fp8_d256_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        cp_world,
+        num_split,
+    ).build_and_load()
+    logger.info(f"Loaded D256 FP8 DCP speculative FMHA module: {module}")
+    return module
+
+
 __all__ = [
     "DcpSpecTarget",
     "DcpSpecVariant",
+    "gen_dcp_spec_fp8_d256_module",
     "gen_dcp_spec_fp8_module",
     "gen_dcp_spec_module",
+    "get_dcp_spec_fp8_d256_uri",
     "get_dcp_spec_fp8_uri",
     "get_dcp_spec_uri",
+    "load_dcp_spec_fp8_d256_module",
     "load_dcp_spec_fp8_module",
     "load_dcp_spec_module",
 ]

@@ -546,3 +546,131 @@ def test_fp8_page64_b256_public_api_cuda_graph_capture_replay() -> None:
     torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
     assert torch.isfinite(out).all()
     assert torch.isfinite(lse).all()
+
+
+def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
+    _require_blackwell_dcp()
+    torch.manual_seed(17)
+    batch_size, q_len = 1, 4
+    num_q_heads, num_kv_heads, head_dim = 16, 1, 256
+    cp_world = 4
+    prefix_len = 32764
+    global_len = prefix_len + q_len
+    sm_scale = head_dim**-0.5
+    query = (
+        torch.randn(
+            batch_size,
+            q_len,
+            num_q_heads,
+            head_dim,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    k_source = (
+        torch.randn(
+            batch_size,
+            global_len,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    v_source = torch.randn_like(k_source) * 0.2
+    k_storage, k_scale = _quantize_fp8(k_source)
+    v_storage, v_scale = _quantize_fp8(v_source)
+    represented_k = k_storage.float() * k_scale
+    represented_v = v_storage.float() * v_scale
+    prefix_lens = torch.full(
+        (batch_size,), prefix_len, dtype=torch.int32, device="cuda"
+    )
+    workspace = torch.empty(
+        get_dcp_spec_workspace_size_bytes(
+            batch_size, q_len, num_q_heads, 8, head_dim=head_dim
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    counter = torch.zeros(
+        get_dcp_spec_counter_bytes(batch_size, q_len, num_kv_heads),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    partials = []
+    for rank in range(cp_world):
+        k_cache, v_cache, block_tables, seq_lens, max_local = _pack_rank_cache(
+            k_storage,
+            v_storage,
+            [global_len],
+            rank=rank,
+            cp_world=cp_world,
+        )
+        assert max_local == 8192
+        out = torch.empty_like(query)
+        lse = torch.empty(
+            (batch_size, q_len, num_q_heads),
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        def run():
+            return _run_public_rank(
+                query,
+                k_cache,
+                v_cache,
+                block_tables,
+                seq_lens,
+                prefix_lens,
+                workspace,
+                counter,
+                max_local_seq_len=max_local,
+                q_len=q_len,
+                cp_world=cp_world,
+                cp_rank=rank,
+                bmm1_scale=sm_scale * k_scale,
+                bmm2_scale=v_scale,
+                out=out,
+                lse=lse,
+            )
+
+        expected_o, expected_lse = _rank_reference(
+            query,
+            represented_k,
+            represented_v,
+            [prefix_len],
+            rank=rank,
+            cp_world=cp_world,
+            sm_scale=sm_scale,
+        )
+        run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected_o, atol=0.1, rtol=0.1)
+        torch.testing.assert_close(lse, expected_lse, atol=0.1, rtol=0.1)
+        assert torch.count_nonzero(counter) == 0
+
+        if rank == 0:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            captured_o = out.clone()
+            captured_lse = lse.clone()
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, captured_o, atol=0, rtol=0)
+            torch.testing.assert_close(lse, captured_lse, atol=0, rtol=0)
+            assert torch.count_nonzero(counter) == 0
+
+        partials.append((out.clone(), lse.clone()))
+
+    merged_o, merged_lse = _merge_partials(partials)
+    dense_o, dense_lse = _dense_reference(
+        query, represented_k, represented_v, [prefix_len], sm_scale
+    )
+    torch.testing.assert_close(merged_o, dense_o, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)

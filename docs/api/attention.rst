@@ -99,6 +99,8 @@ DCP Speculative Decode Workspace
 The native Cake FMHA DCP speculative route of
 :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
 scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+The production D256 FP8/page64 ratio-16 profile passes ``head_dim=256`` to the
+workspace-size helper; D128 remains the default.
 
 .. currentmodule:: flashinfer
 

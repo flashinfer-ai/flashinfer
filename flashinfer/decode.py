@@ -3297,22 +3297,27 @@ def trtllm_batch_decode_with_kv_cache(
         ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
         enables DCP + speculative decoding without a per-row length tensor.
 
-        The native Cake FMHA path requires BF16 Q/O, head dimension 128,
-        causal HND paging, ``return_lse=True`` (or a caller-owned ``lse``), and
+        The native Cake FMHA path requires BF16 Q/O, causal HND paging, and
+        ``return_lse=True`` (or a caller-owned ``lse``). The D128 profile uses
         head group ratio in ``[1,8]``. BF16 KV uses page size 16 and
         ``q_len_per_req`` in ``{1,2,4,5,6,8}``; FP8 e4m3 KV uses page size 64
-        and also supports ``q_len_per_req=3``. ``bmm1_scale`` is the fused QK
-        scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV requires
-        ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing TRT-LLM
-        backend contract. Here ``max_seq_len`` is the maximum compact
+        and also supports ``q_len_per_req=3``. The D256 production profile is
+        FP8/page64 with ``q_len_per_req=4``, ``num_qo_heads=16``,
+        ``num_kv_heads=1``, and ``cp_world`` 1 or 4. ``bmm1_scale`` is the
+        fused QK scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV
+        requires ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing
+        TRT-LLM backend contract. Here ``max_seq_len`` is the maximum compact
         rank-local stored length; it may be zero for an entirely empty rank,
         while ``block_tables`` still supplies one masked physical page slot.
         Long-context BF16 and underfilled FP8 Split-KV routes use
         ``workspace_buffer`` for partials and require a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
-        completion tickets after every launch. The FP8 route specializes
-        split1--4 and short-shard K/V retention in its JIT cache key. Prewarm a
-        fixed tensor/layout binding before CUDA Graph capture.
+        completion tickets after every launch. The D128 FP8 route specializes
+        split1--4 and short-shard K/V retention in its JIT cache key. D256 uses
+        retain0 split1/2/3/4/8/16 bodies and measured B1/B8/B16/B32+ routing.
+        Size its workspace with ``get_dcp_spec_workspace_size_bytes(...,
+        head_dim=256)``. Prewarm a fixed tensor/layout binding before CUDA Graph
+        capture.
 
     Returns
     -------
