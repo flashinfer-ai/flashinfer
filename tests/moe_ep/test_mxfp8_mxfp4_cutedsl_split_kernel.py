@@ -29,6 +29,12 @@ def _require_gpu_backend():
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
+    from flashinfer.utils import is_sm100a_supported
+
+    # is_sm100a_supported() adds the CUDA>=12.8 toolkit gate but accepts any
+    # 10.x capability, so keep the exact SM100/SM103 check alongside it.
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("sm100_mxfp8_mxfp4_bf16_cutedsl needs SM100a (CUDA >= 12.8)")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("sm100_mxfp8_mxfp4_bf16_cutedsl needs an SM100-family GPU")
     from flashinfer.cute_dsl import is_cute_dsl_available
