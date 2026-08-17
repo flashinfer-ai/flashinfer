@@ -14,7 +14,7 @@ _scale_cache: dict[tuple[int, float], torch.Tensor] = {}
 _scale_cache_lock = threading.Lock()
 
 
-def _module(kind: Literal["pointer", "grid_constant"]):
+def _module(kind: Literal["pointer", "pointer_uumn", "grid_constant"]):
     from ..jit.cake_dsv4 import get_cake_dsv4_module
 
     return get_cake_dsv4_module(kind)
@@ -248,7 +248,7 @@ def run_cake_dsv4(
         sparse_topk=indices.shape[1],
     )
     stream = _stream_ptr(query.device)
-    pointer = _module("pointer")
+    pointer = _module("pointer_uumn" if route == "bf16_h64_prefill" else "pointer")
 
     if route == "bf16_h8_h32":
         _run_bf16_split(

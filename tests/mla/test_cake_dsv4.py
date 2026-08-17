@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from flashinfer.jit.cake_dsv4 import _CAKE_DSV4_VARIANTS
 from flashinfer.mla._cake_dsv4 import _route
 
 
@@ -34,3 +35,8 @@ def test_cake_dsv4_semantic_routes(
         )
         == expected
     )
+
+
+def test_h64_prefill_keeps_its_measured_uumn_compile_module():
+    assert _CAKE_DSV4_VARIANTS["pointer_uumn"] == ("bf16_h64_prefill",)
+    assert "bf16_h64_prefill" not in _CAKE_DSV4_VARIANTS["pointer"]

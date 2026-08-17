@@ -10,7 +10,7 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, logger, sm103a_nvcc_flags
 
 
-CakeDSV4Module = Literal["pointer", "grid_constant"]
+CakeDSV4Module = Literal["pointer", "pointer_uumn", "grid_constant"]
 
 _CAKE_DSV4_VARIANTS = {
     "pointer": (
@@ -20,7 +20,6 @@ _CAKE_DSV4_VARIANTS = {
         "bf16_h64_compressed_reduce",
         "bf16_h64_fixed_q",
         "bf16_h64_fixed_q_reduce",
-        "bf16_h64_prefill",
         "bf16_h128_swa128",
         "bf16_h128_topk128x",
         "bf16_h128_topk128x_reduce",
@@ -28,6 +27,7 @@ _CAKE_DSV4_VARIANTS = {
         "fp8_lowhead_decode",
         "fp8_lowhead_prefill",
     ),
+    "pointer_uumn": ("bf16_h64_prefill",),
     "grid_constant": (
         "bf16_h128_prefill",
         "bf16_h128_topk4x",
@@ -81,7 +81,7 @@ def gen_cake_dsv4_module(module: CakeDSV4Module) -> JitSpec:
         )
     flags = list(sm103a_nvcc_flags)
     flags.append("--use_fast_math")
-    if module == "grid_constant":
+    if module in ("pointer_uumn", "grid_constant"):
         flags.append("-Xptxas=-uumn")
     spec = gen_jit_spec(
         name=f"cake_dsv4_{module}_sm103a",
