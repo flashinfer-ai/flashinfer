@@ -2347,7 +2347,9 @@ def _make_tie_break_test_case(num_rows, width, k, dtype, pattern):
     )
 
 
-@pytest.mark.parametrize("algo", ["filtered", "cub"])
+# "clusters" pins a backend that declines tie-break: the dispatcher must ignore the
+# override and fall back to the native radix path with identical results.
+@pytest.mark.parametrize("algo", ["filtered", "cub", "clusters"])
 @pytest.mark.parametrize(
     ("batch_size", "vocab_size", "k"),
     [
@@ -2386,7 +2388,9 @@ def test_top_k_tie_break_modes(
     _assert_unordered_indices_match(indices_large, expected_large)
 
 
-@pytest.mark.parametrize("algo", ["filtered", "cub"])
+# "clusters" pins a backend that declines tie-break: the dispatcher must ignore the
+# override and fall back to the native radix path with identical results.
+@pytest.mark.parametrize("algo", ["filtered", "cub", "clusters"])
 @pytest.mark.parametrize(
     ("num_rows", "max_len", "k"),
     [
