@@ -306,9 +306,7 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
         runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
         tactics = tuple(
             enumerate(
-                _bf16_fp4_cute_dsl_tactic_configs(
-                    n, k, get_device_sm_count(device)
-                )
+                _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
             )
         )
         sf_for_launch = sf_p.view(torch.uint8).contiguous()
@@ -513,9 +511,7 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
     n, k = 192, 192
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
-    b_p, sf_p, _ = prepare_bf16_fp4_weights(
-        b_fp4, b_sf, alpha, backend="cute-dsl"
-    )
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
     major, minor = get_compute_capability(device)
     if major * 10 + minor in (100, 103):
         assert b_p.dtype == torch.uint8

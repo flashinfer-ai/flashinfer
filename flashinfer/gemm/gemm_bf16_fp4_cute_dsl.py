@@ -22,7 +22,6 @@ from ..fused_moe.utils import (
 from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
-from ..utils import get_compute_capability
 
 _BF16_FP4_ALPHA_ONE_CACHE: dict = {}
 

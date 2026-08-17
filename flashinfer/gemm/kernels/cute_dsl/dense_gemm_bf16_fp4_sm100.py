@@ -1225,9 +1225,7 @@ class Sm100DenseGemmBf16Fp4Kernel:
                             cluster_tile_coord_mnl[0]
                             < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
                         )
-                        is_dense_tile = has_work and (
-                            route_tile_idx < dense_num_tiles
-                        )
+                        is_dense_tile = has_work and (route_tile_idx < dense_num_tiles)
 
                         if is_dense_tile or not has_work:
                             tile_info_pipeline.producer_acquire(
