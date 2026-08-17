@@ -19,9 +19,12 @@ import math
 import pytest
 import torch
 
+from flashinfer.utils import is_sm12x_supported
+
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA device"
+    not (torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda"))),
+    reason="requires an SM12x CUDA device",
 )
 
 
