@@ -399,9 +399,14 @@ def run_dcp_spec_decode(
     out: torch.Tensor,
     lse: torch.Tensor,
     completion_buffer: Optional[torch.Tensor],
+    backend: str = "cake",
 ) -> None:
     """Run one rank-local Cake FMHA DCP speculative specialization."""
 
+    if backend != "cake":
+        raise ValueError(
+            f"DCP speculative decode requires backend='cake', got {backend!r}"
+        )
     if q_len_per_req <= 0 or query.shape[0] % q_len_per_req != 0:
         raise ValueError("query token count must be divisible by q_len_per_req")
     batch_size = query.shape[0] // q_len_per_req

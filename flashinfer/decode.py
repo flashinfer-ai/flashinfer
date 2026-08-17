@@ -3464,6 +3464,7 @@ def trtllm_batch_decode_with_kv_cache(
             out=out,
             lse=lse,
             completion_buffer=multi_ctas_kv_counter_buffer,
+            backend="cake",
         )
         return (out, lse) if return_lse else out
 
