@@ -423,7 +423,17 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     )
 
 
-def test_variant_selector_exposes_persistent_only_when_requested():
+def test_variant_selector_exposes_specialized_routes_only_when_requested():
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=True,
+            num_sequences=1,
+            num_heads=8,
+            use_persistent_m128=True,
+            use_small_bh_m128=True,
+        )
+        == "small_bh_m128"
+    )
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=False,
@@ -442,6 +452,50 @@ def test_variant_selector_exposes_persistent_only_when_requested():
             use_exact_n16=True,
         )
         == "m128_n16"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "compute_capability",
+        "sm_count",
+        "fixed_layout",
+        "num_sequences",
+        "num_heads",
+        "sequence_length",
+        "expected",
+    ),
+    [
+        ((10, 0), 148, True, 1, 8, 2048, True),
+        ((10, 3), 152, True, 2, 4, 65536, True),
+        ((10, 3), 64, True, 8, 1, 131072, True),
+        ((10, 0), 63, True, 8, 1, 2048, False),
+        ((10, 0), 148, False, 1, 8, 2048, False),
+        ((10, 0), 148, True, 1, 8, 2047, False),
+        ((10, 0), 148, True, 3, 3, 2048, False),
+        ((10, 0), 148, True, 1, 9, 2048, False),
+        ((12, 0), 148, True, 1, 8, 2048, False),
+    ],
+)
+def test_small_bh_owner_helper_policy_matches_residency_contract(
+    compute_capability,
+    sm_count,
+    fixed_layout,
+    num_sequences,
+    num_heads,
+    sequence_length,
+    expected,
+):
+    assert (
+        kda_prefill_api._should_use_small_bh_owner_helper(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            sequence_length=sequence_length,
+        )
+        is expected
     )
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
@@ -748,6 +802,72 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
     assert routes == [("m128", "sm100f")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "sm_count"),
+    [((10, 0), 148), ((10, 3), 152)],
+)
+def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
+    cuda_device,
+    monkeypatch,
+    compute_capability,
+    sm_count,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: compute_capability,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: sm_count,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=1,
+        packed=False,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("small_bh_m128", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 25
+    assert args[13].dtype == torch.uint8
+    assert args[13].shape == (896,)
+    assert args[14].dtype == torch.bfloat16
+    assert args[14].shape == (35 * 123, 128)
+    assert args[15].dtype == torch.uint32
+    assert args[15].shape == (35,)
+    assert args[16].dtype == torch.uint32
+    assert args[16].shape == (35,)
+    assert args[17].dtype == torch.uint32
+    assert args[17].shape == (1,)
+    assert args[18] == 1
+    assert args[19] == 1
+    assert math.isclose(args[22], 128**-0.5)
+    assert args[23] == -5.0
+    assert args[24] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
 
 
 def test_b200_packed_metadata_is_cached_for_unchanged_offsets(cuda_device):
@@ -1245,6 +1365,153 @@ def test_flash_kda_jit_getter_is_importable():
 
     assert callable(get_flash_kda_prefill_module)
     assert flashinfer.RecurrentKDAPrefillWorkspace is RecurrentKDAPrefillWorkspace
+
+
+@pytest.mark.parametrize("non_default_stream", [False, True])
+def test_frozen_small_bh_prefill_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+    non_default_stream,
+):
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=1,
+        packed=False,
+        initial_state=True,
+        seed=2048,
+    )
+    direct_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    small_output = torch.empty_like(inputs["q"])
+    direct_output = torch.empty_like(inputs["q"])
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append((variant, target))
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+
+    if non_default_stream:
+        stream = torch.cuda.Stream(device=flash_kda_device)
+        stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+        with torch.cuda.stream(stream):
+            actual_output, actual_state = recurrent_kda(
+                **_strict_prefill_kwargs(inputs),
+                output=small_output,
+                output_final_state=True,
+            )
+        stream.synchronize()
+    else:
+        actual_output, actual_state = recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=small_output,
+            output_final_state=True,
+        )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_small_bh_owner_helper",
+        lambda **kwargs: False,
+    )
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(direct_inputs),
+        output=direct_output,
+        output_final_state=True,
+    )
+
+    assert routes == [("small_bh_m128", "sm100f"), ("m128", "sm100f")]
+    assert actual_output.data_ptr() == small_output.data_ptr()
+    assert actual_state is inputs["initial_state"]
+    assert expected_output.data_ptr() == direct_output.data_ptr()
+    assert expected_state is direct_inputs["initial_state"]
+    torch.testing.assert_close(
+        actual_output.float(),
+        expected_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_state.float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_frozen_small_bh_prefill_cuda_graph_replay_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=1,
+        packed=False,
+        initial_state=False,
+        seed=2049,
+    )
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_small_bh_owner_helper",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+    )
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
+    torch.testing.assert_close(
+        replay_output.float(),
+        direct_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        replay_state.float(),
+        direct_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.parametrize("packed", [False, True])

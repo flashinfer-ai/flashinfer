@@ -27,6 +27,7 @@ from flashinfer.jit import flash_kda
         "smem_bytes",
         "module_ident",
         "generated_tensor_map_acquire",
+        "tensor_map_count",
     ),
     [
         (
@@ -34,24 +35,35 @@ from flashinfer.jit import flash_kda
             221696,
             "9a5566f3be",
             True,
+            6,
         ),
         (
             "m128",
             227328,
             "ea022a2f1f",
             True,
+            6,
         ),
         (
             "m128_n16",
             219136,
             "ef8b47d690",
             True,
+            6,
         ),
         (
             "persistent_m128",
             221696,
             "64bc19d01c",
             True,
+            6,
+        ),
+        (
+            "small_bh_m128",
+            227328,
+            "73369168de",
+            True,
+            7,
         ),
     ],
 )
@@ -86,6 +98,7 @@ def test_flash_kda_uri_and_jit_spec(
     smem_bytes,
     module_ident,
     generated_tensor_map_acquire,
+    tensor_map_count,
     target,
     target_arch,
     expected_flag,
@@ -128,7 +141,9 @@ def test_flash_kda_uri_and_jit_spec(
     )
     frozen_text = frozen_source.read_text()
     schedule_symbol = (
-        "flashkda_bf16_persistent_m128"
+        "flashkda_bf16_small_bh_m128"
+        if variant == "small_bh_m128"
+        else "flashkda_bf16_persistent_m128"
         if variant == "persistent_m128"
         else "flashkda_bf16_fused_m64"
         if variant == "m64"
@@ -145,7 +160,10 @@ def test_flash_kda_uri_and_jit_spec(
         assert "FLASHINFER INTEGRATION BEGIN: acquire global tensor maps" not in (
             generated_body
         )
-        assert generated_body.count("fence.proxy.tensormap::generic.acquire.sys") == 6
+        assert (
+            generated_body.count("fence.proxy.tensormap::generic.acquire.sys")
+            == tensor_map_count
+        )
         assert generated_body.count("__syncthreads();") >= 1
         generated_body_without_tma_integration = generated_body
     else:
@@ -244,6 +262,13 @@ def test_flash_kda_uri_and_jit_spec(
         assert "one caller-owned in-place state tensor" in binding_text
         assert "sm_count == 148 || sm_count == 152" in binding_text
         assert "CheckFlashKDAPersistentDevice(device_id)" in binding_text
+    if variant == "small_bh_m128":
+        assert "TensorView packet_workspace" in binding_text
+        assert "TensorView packet_ready" in binding_text
+        assert "TensorView packet_consumed" in binding_text
+        assert "TensorView helper_done" in binding_text
+        assert "kSmallBHGroupSize * total_tasks" in binding_text
+        assert "EncodeSmallBHPacketTma(packet_workspace)" in binding_text
     assert (
         "#define FlashKDATensorMap flashkda_generated_FlashKDATensorMap" in binding_text
     )
@@ -341,6 +366,8 @@ def test_flash_kda_legacy_and_family_targets_have_independent_cache_keys(monkeyp
     sm100f_cached = flash_kda.gen_flash_kda_module("m128", "sm100f")
     n16_sm100a = flash_kda.gen_flash_kda_module("m128_n16", "sm100a")
     n16_sm100f = flash_kda.gen_flash_kda_module("m128_n16", "sm100f")
+    small_sm100a = flash_kda.gen_flash_kda_module("small_bh_m128", "sm100a")
+    small_sm100f = flash_kda.gen_flash_kda_module("small_bh_m128", "sm100f")
 
     assert sm100a is not sm100f
     assert sm100a.name == "flash_kda_bf16_m128_ea022a2f1f_sm100a"
@@ -349,6 +376,9 @@ def test_flash_kda_legacy_and_family_targets_have_independent_cache_keys(monkeyp
     assert n16_sm100a is not n16_sm100f
     assert n16_sm100a.name == "flash_kda_bf16_m128_n16_ef8b47d690_sm100a"
     assert n16_sm100f.name == "flash_kda_bf16_m128_n16_ef8b47d690_sm100f"
+    assert small_sm100a is not small_sm100f
+    assert small_sm100a.name == "flash_kda_bf16_small_bh_m128_73369168de_sm100a"
+    assert small_sm100f.name == "flash_kda_bf16_small_bh_m128_73369168de_sm100f"
 
 
 @pytest.mark.parametrize(
@@ -438,6 +468,11 @@ def test_aot_registers_complete_flash_kda_modules(
         lambda target: fake_flash_kda("persistent_m128", target),
     )
     monkeypatch.setattr(
+        aot,
+        "gen_flash_kda_small_bh_m128_module",
+        lambda target: fake_flash_kda("small_bh_m128", target),
+    )
+    monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
     )
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
@@ -465,7 +500,8 @@ def test_aot_registers_complete_flash_kda_modules(
     expected_calls = []
     for target in expected_targets:
         expected_calls.extend(
-            (variant, target) for variant in ("m64", "m128", "m128_n16")
+            (variant, target)
+            for variant in ("m64", "m128", "m128_n16", "small_bh_m128")
         )
         expected_calls.append(("persistent_m128", target))
     assert calls == expected_calls
