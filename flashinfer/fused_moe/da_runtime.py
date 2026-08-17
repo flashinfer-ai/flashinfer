@@ -567,8 +567,8 @@ class DaMoeOperationState:
         )
 
         # FromLogits bodies require the fused multi-tile preamble during candidate profiling.
-        # Reject unsupported large-token shapes before staging any routing values or allocating
-        # profiling arenas, and publish an explicit ordinary fixed-tactic fallback policy.
+        # Reject unsupported large-token shapes before staging any routing values or provisioning
+        # profiling buffers, and publish an explicit ordinary fixed-tactic fallback policy.
         if self.key.routing_input_mode == RoutingInputMode.FromLogits:
             max_tokens = runtime.max_multi_tile_tokens(self.key.num_experts)
             if self.key.num_tokens > max_tokens:
@@ -607,6 +607,70 @@ class DaMoeOperationState:
             )
             profile_runner = runtime.make_from_logits_profile_runner(canonical_profile)
 
+        # Provision the complete candidate invocation once. Tensor-valued keyword operands,
+        # including exact caller model weights and scales, participate in the same replica ring
+        # as positional activations, routing, outputs, and scratch tensors.
+        (
+            effective_config,
+            profile_batches,
+        ) = runtime.prepare_profile_schedule(
+            tuner,
+            profile_inputs,
+            profile_kwargs,
+            profile_tuning_config,
+        )
+        baseline_profile_runner = profile_runner
+        baseline_profile_inputs = profile_inputs
+        baseline_config = effective_config
+        baseline_batches = profile_batches
+        if canonical_profile is not None and config.baseline_guard_enabled:
+            (
+                baseline_config,
+                baseline_batches,
+            ) = runtime.prepare_profile_schedule(
+                tuner,
+                inputs,
+                runner_kwargs,
+                tuning_config,
+            )
+            baseline_profile_runner = runner
+            baseline_profile_inputs = inputs
+            if not (
+                effective_config.use_cold_l2_cache and baseline_config.use_cold_l2_cache
+            ):
+                # Keep the guard matched when either distinct FromLogits ABI cannot afford its
+                # complete cold working set; both sides use their first provisioned replica.
+                effective_config = replace(effective_config, use_cold_l2_cache=False)
+                baseline_config = replace(baseline_config, use_cold_l2_cache=False)
+                profile_batches = profile_batches[:1]
+                baseline_batches = baseline_batches[:1]
+
+        def stage_profile_batches(realization: RoutingRealization) -> torch.Tensor:
+            """Restage only routing values into the reusable candidate and baseline rings."""
+            # Preserve the caller-visible routing tensors and the existing restoration contract.
+            routing_adapter.stage(inputs, realization)
+            selection_ids = realization.expert_ids
+            if canonical_profile is None:
+                for batch_inputs, _ in profile_batches:
+                    routing_adapter.stage(batch_inputs, realization)
+                return selection_ids
+
+            # FromLogits canonicalization remains outside candidate timing. Candidate bodies
+            # receive only the resulting ID/weight pair, while the matched ordinary baseline
+            # receives the equivalent logits realization in its separate exact-ABI ring.
+            runtime.refresh_canonical_routing(
+                canonical_profile,
+                inputs,
+                runner_kwargs,
+            )
+            selection_ids = canonical_profile.routing_replay_ids.clone()
+            for batch_inputs, _ in profile_batches:
+                runtime.stage_canonical_profile_routing(batch_inputs, canonical_profile)
+            if baseline_profile_runner is not profile_runner:
+                for batch_inputs, _ in baseline_batches:
+                    routing_adapter.stage(batch_inputs, realization)
+            return selection_ids
+
         # Candidate selection and guard admission share measurements but remain separate phases.
         compiler = DAPlanCompiler(
             num_experts=self.key.num_experts,
@@ -623,18 +687,7 @@ class DaMoeOperationState:
                 for _ in range(config.samples_per_distribution):
                     realization_key = self._realization_key(distribution, sample_index)
                     realization = self._realizations.get_or_create(realization_key)
-                    routing_adapter.stage(inputs, realization)
-                    selection_ids = realization.expert_ids
-                    if canonical_profile is not None:
-                        runtime.refresh_canonical_routing(
-                            canonical_profile,
-                            inputs,
-                            runner_kwargs,
-                        )
-                        selection_ids = canonical_profile.routing_replay_ids.clone()
-                    effective_config, batches = tuner.prepare_tactic_profile(
-                        profile_inputs, profile_tuning_config
-                    )
+                    selection_ids = stage_profile_batches(realization)
 
                     def measure(tactic: FactorizedTactic, decisive: bool) -> float:
                         """Measure one complete factorization on the shared input schedule."""
@@ -643,17 +696,12 @@ class DaMoeOperationState:
 
                         def profile_candidate() -> float:
                             """Prepare all lanes, then time preamble and typed body together."""
-                            if canonical_profile is not None:
-                                profile_runner.prepare_batches(  # type: ignore[attr-defined]
-                                    batches, identity, **profile_kwargs
-                                )
                             return tuner.profile_tactic(
                                 profile_runner,
                                 profile_inputs,
                                 list(identity),
                                 effective_config,
-                                batches,
-                                **profile_kwargs,
+                                profile_batches,
                             )
 
                         return self._measurements.measure(
@@ -681,18 +729,14 @@ class DaMoeOperationState:
                     ):
                         baseline_latency = candidate_latency
                     else:
-                        baseline_config, baseline_batches = (
-                            tuner.prepare_tactic_profile(inputs, tuning_config)
-                        )
                         baseline_latency = self._measurements.measure(
                             (realization_key, "noda", normalized_baseline),
                             lambda: tuner.profile_tactic(
-                                runner,
-                                inputs,
+                                baseline_profile_runner,
+                                baseline_profile_inputs,
                                 list(normalized_baseline),
                                 baseline_config,
                                 baseline_batches,
-                                **runner_kwargs,
                             ),
                         )
                     selections.append(
@@ -717,32 +761,18 @@ class DaMoeOperationState:
                     realization = self._realizations.get_or_create(
                         selection.realization_key
                     )
-                    routing_adapter.stage(inputs, realization)
-                    if canonical_profile is not None:
-                        runtime.refresh_canonical_routing(
-                            canonical_profile,
-                            inputs,
-                            runner_kwargs,
-                        )
-                    effective_config, batches = tuner.prepare_tactic_profile(
-                        profile_inputs, profile_tuning_config
-                    )
+                    stage_profile_batches(realization)
                     for body in candidate_bodies:
                         identity = tuple(int(value) for value in body.tactic)
 
                         def profile_candidate() -> float:
                             """Prepare retained-body lanes before full-operation timing."""
-                            if canonical_profile is not None:
-                                profile_runner.prepare_batches(  # type: ignore[attr-defined]
-                                    batches, identity, **profile_kwargs
-                                )
                             return tuner.profile_tactic(
                                 profile_runner,
                                 profile_inputs,
                                 list(identity),
                                 effective_config,
-                                batches,
-                                **profile_kwargs,
+                                profile_batches,
                             )
 
                         candidate_latencies[

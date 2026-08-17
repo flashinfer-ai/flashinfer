@@ -51,8 +51,8 @@ def test_nvfp4_da_public_graph_lifecycle(monkeypatch, routing_input_mode):
     """Routed and FromLogits PrimsTS NVFP4 DA must match their NoDA graphs."""
     if not torch.cuda.is_available():
         pytest.skip("PrimsTS DA requires CUDA")
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
-        pytest.skip("This PrimsTS DA runtime test requires SM100a/B200")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This PrimsTS DA runtime test requires SM100 or SM103")
     if not is_prims_ts_available():
         pytest.skip("PrimsTS dependencies are unavailable")
 
@@ -102,8 +102,8 @@ def test_prims_ts_supported_dtype_da_graph_lifecycle(monkeypatch, precision):
     """Every ordinary PrimsTS dtype must tune and replay through its public DA API."""
     if not torch.cuda.is_available():
         pytest.skip("PrimsTS DA requires CUDA")
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
-        pytest.skip("This PrimsTS DA runtime test requires SM100a/B200")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This PrimsTS DA runtime test requires SM100 or SM103")
     if not is_prims_ts_available():
         pytest.skip("PrimsTS dependencies are unavailable")
 
@@ -143,8 +143,8 @@ def test_nvfp4_da_public_eager_uses_ddist_1_1_tactic(monkeypatch):
     """PrimsTS eager dispatch uses the DA-preferred tactic for its token bucket."""
     if not torch.cuda.is_available():
         pytest.skip("PrimsTS DA requires CUDA")
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
-        pytest.skip("This PrimsTS DA runtime test requires SM100a/B200")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This PrimsTS DA runtime test requires SM100 or SM103")
     if not is_prims_ts_available():
         pytest.skip("PrimsTS dependencies are unavailable")
 

@@ -524,6 +524,12 @@ class TuningConfig:
             replay starts from a cold L2, and give every launch in the graph its
             own input copy. Requires ``use_cuda_graph``; the eviction also
             requires ``use_cold_l2_cache``.
+        value_aware_input_indices: Positional tensor indices whose values may
+            vary between profiling samples while shape and dtype stay fixed.
+        profile_replica_input_indices: Positional tensor indices cloned into
+            each profiling replica. Use this to replicate mutable inputs and
+            outputs without cloning large immutable tensors such as weights.
+            When omitted, ``value_aware_input_indices`` is used.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -536,6 +542,9 @@ class TuningConfig:
                 ...         (1, autotuner_initializer_ones),
                 ...     )
                 ... )
+        profile_retained_tensor_kwargs: Names of immutable tensor keyword
+            arguments that require one stable owned address across a complete
+            tuning call.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -547,13 +556,16 @@ class TuningConfig:
     profiling_repeat: int | None = None
     use_cold_l2_graph_replay: bool = False
     value_aware_input_indices: tuple[int, ...] = ()
-    profile_arena_input_indices: tuple[int, ...] = ()
+    profile_replica_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
     # list. Use this to inject deterministic representative contents for
     # inputs whose default tensor initializer is not meaningful.
     inputs_pre_hook: Callable | None = None
+    # Immutable tensor kwargs whose owned clone must retain one address across
+    # every optimization profile and profiling replica in one tuning call.
+    profile_retained_tensor_kwargs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -571,6 +583,7 @@ class DynamicDim:
 
 
 Dim = DynamicDim | StaticDim
+_ProfileInvocation: TypeAlias = tuple[list[Any], dict[str, Any]]
 
 
 def _get_opt(dim: Dim) -> int:
@@ -2026,8 +2039,11 @@ class AutoTuner:
             profiling_repeat=tuning_config.profiling_repeat,
             use_cold_l2_graph_replay=tuning_config.use_cold_l2_graph_replay,
             value_aware_input_indices=tuning_config.value_aware_input_indices,
-            profile_arena_input_indices=tuning_config.profile_arena_input_indices,
+            profile_replica_input_indices=tuning_config.profile_replica_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
+            profile_retained_tensor_kwargs=(
+                tuning_config.profile_retained_tensor_kwargs
+            ),
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -2200,6 +2216,7 @@ class AutoTuner:
             race_default = self._in_v2_context
 
             pbar = None
+            retained_kwarg_clones: dict[int, torch.Tensor] = {}
             for _step, p in enumerate(profiles):
                 tensors = None
                 prepared_input_batches = None
@@ -2249,16 +2266,25 @@ class AutoTuner:
                                 effective_tuning_config,
                                 prepared_input_batches,
                             ) = self._prepare_input_tensors_with_batches(
-                                tensors, tuning_config
+                                tensors,
+                                tuning_config,
+                                alias_templates=inputs,
+                                kwargs=kwargs,
+                                retained_kwarg_clones=retained_kwarg_clones,
+                            )
+                            preparation_inputs, preparation_kwargs = (
+                                prepared_input_batches[0]
                             )
                         except (torch.cuda.OutOfMemoryError, MemoryError):
                             input_preparation_oom = True
                             tensors = None
                             prepared_input_batches = None
+                            retained_kwarg_clones.clear()
 
                         if _sync_oom_across_tune_group(input_preparation_oom):
                             tensors = None
                             prepared_input_batches = None
+                            retained_kwarg_clones.clear()
                             torch.cuda.empty_cache()
                             logger.warning(
                                 "[Autotuner]: OOM detected, falling back to default tactic"
@@ -2365,7 +2391,10 @@ class AutoTuner:
                                     # one-time fallback preparation before the first measurement.
                                     if runner_handles_precompile is not False:
                                         handled = r.precompile_tactics(
-                                            tensors, [public_tactic], p, **kwargs
+                                            preparation_inputs,
+                                            [public_tactic],
+                                            p,
+                                            **preparation_kwargs,
                                         )
                                         if runner_handles_precompile is None:
                                             runner_handles_precompile = handled
@@ -2373,10 +2402,10 @@ class AutoTuner:
                                                 "do_preparation" in runner_arg_names
                                             ):
                                                 r(
-                                                    tensors,
+                                                    preparation_inputs,
                                                     tactic=-1,
                                                     do_preparation=True,
-                                                    **kwargs,
+                                                    **preparation_kwargs,
                                                 )
                                     time_measured = self._profile_single_kernel(
                                         r,
@@ -2384,7 +2413,6 @@ class AutoTuner:
                                         public_tactic,
                                         effective_tuning_config,
                                         input_tensor_batches=prepared_input_batches,
-                                        **kwargs,
                                     )
                                     factorized_timings[identity] = time_measured
                                     self.stats.profiled_tactic_count[custom_op] = (
@@ -2426,14 +2454,17 @@ class AutoTuner:
                                     and len(valid_tactics) > 0
                                 ):
                                     handled = r.precompile_tactics(
-                                        tensors, valid_tactics, p, **kwargs
+                                        preparation_inputs,
+                                        valid_tactics,
+                                        p,
+                                        **preparation_kwargs,
                                     )
                                     if not handled:
                                         r(
-                                            tensors,
+                                            preparation_inputs,
                                             tactic=-1,
                                             do_preparation=True,
-                                            **kwargs,
+                                            **preparation_kwargs,
                                         )
                             except (torch.cuda.OutOfMemoryError, MemoryError):
                                 runner_preparation_oom = True
@@ -2463,7 +2494,6 @@ class AutoTuner:
                                         tac,
                                         effective_tuning_config,
                                         input_tensor_batches=prepared_input_batches,
-                                        **kwargs,
                                     )
                                 except (torch.cuda.OutOfMemoryError, MemoryError):
                                     # Distributed autotuning: the per-tactic
@@ -2710,7 +2740,13 @@ class AutoTuner:
                 (
                     effective_tuning_config,
                     input_tensor_batches,
-                ) = self._prepare_input_tensors_with_batches(tensors, tuning_config)
+                ) = self._prepare_input_tensors_with_batches(
+                    tensors,
+                    tuning_config,
+                    alias_templates=inputs,
+                    kwargs=kwargs,
+                )
+                preparation_inputs, preparation_kwargs = input_tensor_batches[0]
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
                     raise
@@ -2733,10 +2769,10 @@ class AutoTuner:
                 valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
                 if valid_tactics and "do_preparation" in runner_arg_names:
                     runner(
-                        input_tensor_batches[0],
+                        preparation_inputs,
                         tactic=-1,
                         do_preparation=True,
-                        **kwargs,
+                        **preparation_kwargs,
                     )
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
@@ -2762,7 +2798,6 @@ class AutoTuner:
                         tac,
                         effective_tuning_config,
                         input_tensor_batches=input_tensor_batches,
-                        **kwargs,
                     )
                 except Exception as e:
                     logger.debug(
@@ -2805,8 +2840,7 @@ class AutoTuner:
         inputs: list[Any],
         tactic: Any,
         tuning_config: TuningConfig,
-        input_tensor_batches: list[list[Any]],
-        **kwargs,
+        input_tensor_batches: list[_ProfileInvocation],
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
 
@@ -2815,7 +2849,7 @@ class AutoTuner:
             inputs (List[Any]): Logical inputs whose shapes identify the profile.
             tactic (int): Tactic ID to use for this profiling run
             tuning_config (TuningConfig): Tuning configuration
-            input_tensor_batches: Previously provisioned iteration schedule.
+            input_tensor_batches: Previously provisioned complete invocation schedule.
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
@@ -2852,8 +2886,13 @@ class AutoTuner:
         # both the routing decision and pure_profile's delay-kernel skip
         # see the same policy.
         measure_policy = self._effective_measure_policy
-
         profiling_repeat = self._get_profiling_repeat(tuning_config)
+        # Bind optional runner-owned workspaces to every cloned positional/keyword pair before
+        # graph capture; preparation remains outside the measured region.
+        prepare_batches = getattr(runner, "prepare_batches", None)
+        if prepare_batches is not None:
+            for batch_inputs, batch_kwargs in input_tensor_batches:
+                prepare_batches([batch_inputs], tactic, **batch_kwargs)
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
 
@@ -2891,8 +2930,9 @@ class AutoTuner:
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
 
-            def _run_once(profile_inputs):
-                runner(profile_inputs, tactic=tactic, **kwargs)
+            def _run_once(invocation: _ProfileInvocation) -> None:
+                batch_inputs, batch_kwargs = invocation
+                runner(batch_inputs, tactic=tactic, **batch_kwargs)
 
             with torch.cuda.stream(stream):
                 if graph is not None:
@@ -2974,10 +3014,13 @@ class AutoTuner:
 
             def _run_kernels():
                 for r in range(repeat):
+                    batch_inputs, batch_kwargs = input_tensor_batches[
+                        r % len(input_tensor_batches)
+                    ]
                     runner(
-                        input_tensor_batches[r % len(input_tensor_batches)],
+                        batch_inputs,
                         tactic=tactic,
-                        **kwargs,
+                        **batch_kwargs,
                     )
 
             with torch.cuda.stream(stream):
@@ -3071,8 +3114,13 @@ class AutoTuner:
             )
             if use_cupti:
                 try:
+                    batch_inputs, batch_kwargs = input_tensor_batches[-1]
                     avg_time = self._profile_single_kernel_cupti(
-                        runner, inputs, tactic, tuning_config, **kwargs
+                        runner,
+                        batch_inputs,
+                        tactic,
+                        tuning_config,
+                        **batch_kwargs,
                     )
                 except _CuptiInfraError as e:
                     # Legacy CUPTI activity tracing is single-subscriber; an
@@ -3089,24 +3137,15 @@ class AutoTuner:
                         f"profiler for faithful measurements."
                     )
             if not use_cupti:
-                # Rotating input batches (up to ~3x L2 of clones under
-                # cold_l2) are only used by the event path; allocating them
-                # before the routing decision would double the transient
-                # footprint alongside the CUPTI path's own flush buffer.
-                if input_tensor_batches is None:
-                    uses_profile_arena = bool(
-                        tuning_config.profile_arena_input_indices
-                        or tuning_config.value_aware_input_indices
-                    )
-                    input_tensor_batches = (
-                        self._prepare_input_tensors_with_batches(inputs, tuning_config)
-                        if uses_profile_arena or not tuning_config.use_cold_l2_cache
-                        else [inputs]
-                    )
                 with _profile_measurement_scope():
                     # warm up, no timing
                     for _ in range(self.warmup):
-                        runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+                        batch_inputs, batch_kwargs = input_tensor_batches[-1]
+                        runner(
+                            batch_inputs,
+                            tactic=tactic,
+                            **batch_kwargs,
+                        )
 
                     avg_time = (
                         cold_l2_profile(stream, profiling_repeat)
@@ -3152,11 +3191,13 @@ class AutoTuner:
         self,
         inputs: list[Any],
         tuning_config: TuningConfig,
-    ) -> tuple[TuningConfig, list[list[Any]]]:
+        **kwargs: Any,
+    ) -> tuple[TuningConfig, list[_ProfileInvocation]]:
         """Build a retained maximum-profile schedule for explicit profiling.
 
         ``_prepare_input_tensors`` materializes the logical maximum profile;
-        ``_prepare_input_tensors_with_batches`` owns its physical storage.
+        ``_prepare_input_tensors_with_batches`` owns the complete positional and
+        keyword invocation storage.
         The returned configuration supersedes ``tuning_config`` because memory
         or iteration limits may disable cold-L2 profiling. This method does not
         invoke ``inputs_pre_hook``; retained-schedule callers own value restaging
@@ -3180,11 +3221,16 @@ class AutoTuner:
                     "[Autotuner] Maximum-profile backing does not fit; "
                     "provisioning the current invocation for non-cold profiling"
                 )
-                return self._prepare_input_tensors_with_batches(inputs, fallback_config)
+                return self._prepare_input_tensors_with_batches(
+                    inputs,
+                    fallback_config,
+                    kwargs=kwargs,
+                )
             return self._prepare_input_tensors_with_batches(
                 backing_inputs,
                 tuning_config,
                 view_templates=inputs,
+                kwargs=kwargs,
             )
 
     def profile_tactic(
@@ -3193,10 +3239,9 @@ class AutoTuner:
         inputs: list[Any],
         tactic: Any,
         tuning_config: TuningConfig,
-        input_batches: list[list[Any]],
-        **kwargs,
+        input_batches: list[_ProfileInvocation],
     ) -> float:
-        """Measure one tactic against a caller-retained prepared input schedule."""
+        """Measure one tactic against a caller-retained complete invocation schedule."""
         with self._lock:
             return self._profile_single_kernel(
                 runner,
@@ -3204,7 +3249,6 @@ class AutoTuner:
                 tactic,
                 tuning_config,
                 input_tensor_batches=input_batches,
-                **kwargs,
             )
 
     def _profile_single_kernel_cupti(
@@ -3894,22 +3938,120 @@ class AutoTuner:
         tuning_config: TuningConfig,
         *,
         view_templates: list[Any] | None = None,
-    ) -> tuple[TuningConfig, list[list[Any]]]:
-        """Own and batch one complete profiling working set.
+        alias_templates: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        retained_kwarg_clones: dict[int, torch.Tensor] | None = None,
+    ) -> tuple[TuningConfig, list[_ProfileInvocation]]:
+        """Own and batch one complete positional-and-keyword working set.
 
         ``backing_inputs`` determines allocated storage, while optional
-        ``view_templates`` determines the shapes passed to the runner. When
-        cold-L2 coverage cannot be guaranteed, the returned configuration
-        explicitly selects non-cold profiling. Non-tensor entries are treated
-        as immutable and shared across replicas.
+        ``view_templates`` determines the shapes passed to the runner. Optional
+        ``alias_templates`` maps caller tensors to dynamically synthesized
+        positional tensors. When cold-L2 coverage cannot be guaranteed, the
+        returned configuration explicitly selects non-cold profiling.
+        Tensor-valued keyword arguments join the same replica ring; immutable
+        values are shared. Repeated references to one tensor object preserve
+        their alias in every replica.
+        Tensor kwargs named by ``profile_retained_tensor_kwargs`` receive one
+        owned clone that is reused through a caller-supplied profile series.
+        When profile-replica indices are present, only those positional aliases
+        and explicitly retained keyword aliases are cloned; other tensors keep
+        their caller-owned addresses.
         """
         profiling_repeat = self._get_profiling_repeat(tuning_config)
         if view_templates is None:
             view_templates = backing_inputs
+        if alias_templates is None:
+            alias_templates = view_templates
         if len(backing_inputs) != len(view_templates):
             raise ValueError("Backing inputs and view templates must have equal length")
+        if len(backing_inputs) != len(alias_templates):
+            raise ValueError(
+                "Backing inputs and alias templates must have equal length"
+            )
 
-        def clone_input(backing: Any, template: Any) -> Any:
+        # Normalize foreign tensor handles once so repeated keyword references retain aliasing.
+        normalized_kwargs: dict[str, Any] = {}
+        normalized_foreign: dict[int, torch.Tensor] = {}
+        for name, value in (kwargs or {}).items():
+            if isinstance(value, torch.Tensor) or not hasattr(value, "__dlpack__"):
+                normalized_kwargs[name] = value
+                continue
+            normalized = normalized_foreign.get(id(value))
+            if normalized is None:
+                normalized = torch.from_dlpack(value)
+                normalized_foreign[id(value)] = normalized
+            normalized_kwargs[name] = normalized
+
+        retained_names = tuning_config.profile_retained_tensor_kwargs
+        if len(set(retained_names)) != len(retained_names):
+            raise ValueError("Retained profile tensor kwarg names must be unique")
+        for name in retained_names:
+            if name not in normalized_kwargs:
+                raise ValueError(f"Retained profile tensor kwarg {name!r} is missing")
+            if not isinstance(normalized_kwargs[name], torch.Tensor):
+                raise TypeError(f"Retained profile kwarg {name!r} must be a tensor")
+
+        # Positional backing wins for a tensor repeated in kwargs. This is important for
+        # dynamically synthesized tensors such as per-token scales: both ABI references must
+        # point at the same maximum-profile allocation rather than unrelated clones.
+        backing_by_alias: dict[int, Any] = {}
+        view_by_alias: dict[int, Any] = {}
+        canonical_alias: dict[int, int] = {}
+        for backing, template, alias_template in zip(
+            backing_inputs, view_templates, alias_templates, strict=True
+        ):
+            alias = (
+                id(alias_template)
+                if isinstance(alias_template, torch.Tensor)
+                else id(template)
+            )
+            if isinstance(template, torch.Tensor):
+                canonical_alias[id(template)] = alias
+                backing_by_alias.setdefault(alias, backing)
+                view_by_alias.setdefault(alias, template)
+            if isinstance(alias_template, torch.Tensor):
+                canonical_alias[id(alias_template)] = alias
+        for value in normalized_kwargs.values():
+            if isinstance(value, torch.Tensor):
+                alias = canonical_alias.setdefault(id(value), id(value))
+                backing_by_alias.setdefault(alias, value)
+                view_by_alias.setdefault(alias, value)
+
+        retained_aliases = {
+            canonical_alias[id(normalized_kwargs[name])] for name in retained_names
+        }
+        replica_indices = (
+            tuning_config.profile_replica_input_indices
+            or tuning_config.value_aware_input_indices
+        )
+        if len(set(replica_indices)) != len(replica_indices):
+            raise ValueError("Profile-replica input indices must be unique")
+        if not set(tuning_config.value_aware_input_indices).issubset(replica_indices):
+            raise ValueError(
+                "Value-aware inputs must be included in profile-replica inputs"
+            )
+        selected_aliases: set[int] | None = None
+        if replica_indices:
+            selected_aliases = set(retained_aliases)
+            for input_index in replica_indices:
+                if input_index < 0 or input_index >= len(view_templates):
+                    raise IndexError(
+                        f"Profile-replica input index {input_index} is invalid"
+                    )
+                template = view_templates[input_index]
+                if not isinstance(template, torch.Tensor):
+                    raise TypeError(
+                        f"Profile-replica input {input_index} must be a tensor"
+                    )
+                selected_aliases.add(canonical_alias[id(template)])
+        if retained_kwarg_clones is None:
+            retained_kwarg_clones = {}
+
+        def clone_input(
+            backing: Any,
+            template: Any,
+        ) -> Any:
             """Clone one tensor backing or preserve one immutable non-tensor value."""
             if not isinstance(backing, torch.Tensor):
                 return backing
@@ -3918,54 +4060,95 @@ class AutoTuner:
                 and backing.numel() < template.numel()
             ):
                 # A runtime shape beyond the largest tuning bucket remains authoritative.
-                return template.clone()
+                backing = template
             return backing.clone()
 
-        def clone_backing_inputs() -> list[Any]:
-            """Clone every tensor in one complete profiling working set."""
-            return [
-                clone_input(backing, template)
-                for backing, template in zip(
-                    backing_inputs, view_templates, strict=True
-                )
-            ]
+        def current_view(backing: Any, template: Any) -> Any:
+            """Return the caller-visible shape while retaining maximum-profile storage."""
+            if (
+                isinstance(backing, torch.Tensor)
+                and isinstance(template, torch.Tensor)
+                and backing.shape != template.shape
+            ):
+                return backing.view(-1)[: template.numel()].view(template.shape)
+            return backing
 
-        def current_views(owned_backing: list[Any]) -> list[Any]:
-            """Return requested-shape views while retaining backing storage."""
-            return [
-                (
-                    backing.view(-1)[: template.numel()].view(template.shape)
-                    if isinstance(backing, torch.Tensor)
-                    and isinstance(template, torch.Tensor)
-                    and backing.shape != template.shape
-                    else backing
-                )
-                for backing, template in zip(owned_backing, view_templates, strict=True)
-            ]
+        def clone_invocation() -> _ProfileInvocation:
+            """Clone every unique tensor once and reconstruct both ABI collections."""
+            owned_by_alias: dict[int, torch.Tensor] = {}
+
+            def clone_value(template: Any) -> Any:
+                if not isinstance(template, torch.Tensor):
+                    return template
+                alias = canonical_alias[id(template)]
+                if selected_aliases is not None and alias not in selected_aliases:
+                    return current_view(backing_by_alias[alias], view_by_alias[alias])
+                retained = retained_kwarg_clones.get(alias)
+                if retained is not None:
+                    return retained
+                owned = owned_by_alias.get(alias)
+                if owned is None:
+                    view_template = view_by_alias[alias]
+                    backing = clone_input(backing_by_alias[alias], view_template)
+                    owned = current_view(backing, view_template)
+                    owned_by_alias[alias] = owned
+                    if alias in retained_aliases:
+                        retained_kwarg_clones[alias] = owned
+                return owned
+
+            cloned_kwargs = {
+                name: clone_value(value) for name, value in normalized_kwargs.items()
+            }
+            return (
+                [clone_value(value) for value in view_templates],
+                cloned_kwargs,
+            )
 
         try:
-            first_backing = clone_backing_inputs()
+            first_invocation = clone_invocation()
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             logger.warning(
                 "[Autotuner] One owned profiling replica does not fit; "
                 "using caller buffers for non-cold profiling"
             )
-            return replace(tuning_config, use_cold_l2_cache=False), [view_templates]
-        first_views = current_views(first_backing)
+            fallback_by_alias = {
+                alias: retained_kwarg_clones.get(
+                    alias, current_view(backing, view_by_alias[alias])
+                )
+                for alias, backing in backing_by_alias.items()
+            }
+
+            def fallback_value(template: Any) -> Any:
+                if not isinstance(template, torch.Tensor):
+                    return template
+                return fallback_by_alias[canonical_alias[id(template)]]
+
+            return replace(tuning_config, use_cold_l2_cache=False), [
+                (
+                    [fallback_value(value) for value in view_templates],
+                    {
+                        name: fallback_value(value)
+                        for name, value in normalized_kwargs.items()
+                    },
+                )
+            ]
         if not tuning_config.use_cold_l2_cache:
-            return tuning_config, [first_views]
+            return tuning_config, [first_invocation]
 
         # Count the current invocation rather than unused maximum-profile capacity. This makes
         # the ring guarantee describe bytes actually touched during each measured iteration.
         working_set_bytes = sum(
-            value.numel() * value.element_size()
-            if isinstance(value, torch.Tensor)
-            else 0
-            for value in view_templates
+            view_by_alias[alias].numel() * view_by_alias[alias].element_size()
+            for alias in (
+                selected_aliases
+                if selected_aliases is not None
+                else view_by_alias.keys()
+            )
+            if isinstance(view_by_alias[alias], torch.Tensor)
         )
         if working_set_bytes <= 0:
-            return replace(tuning_config, use_cold_l2_cache=False), [first_views]
+            return replace(tuning_config, use_cold_l2_cache=False), [first_invocation]
 
         l2_cache_bytes = self._get_l2_cache_size_in_bytes()
         num_replicas = 2 * l2_cache_bytes // working_set_bytes + 1
@@ -3977,12 +4160,12 @@ class AutoTuner:
                 f"working set ({working_set_bytes} bytes/replica, "
                 f"{l2_cache_bytes} L2 bytes); using non-cold profiling"
             )
-            return replace(tuning_config, use_cold_l2_cache=False), [first_views]
+            return replace(tuning_config, use_cold_l2_cache=False), [first_invocation]
 
-        batches = [first_views]
+        batches = [first_invocation]
         try:
             for _ in range(num_replicas - 1):
-                batches.append(current_views(clone_backing_inputs()))
+                batches.append(clone_invocation())
         except torch.cuda.OutOfMemoryError:
             allocated_replicas = len(batches)
             del batches[1:]
