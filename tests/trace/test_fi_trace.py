@@ -214,6 +214,38 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_packed_kda_decode_fi_trace_resolves_singleton_without_output():
+    import flashinfer.kda_decode
+
+    batch_size, num_heads, head_dim = 4, 12, 128
+    hidden_size = num_heads * head_dim
+    defn = flashinfer.kda_decode.packed_kda_decode.fi_trace(
+        mixed_qkv=torch.empty(batch_size, 3 * hidden_size, dtype=torch.bfloat16),
+        raw_gate=torch.empty(batch_size, hidden_size, dtype=torch.bfloat16),
+        raw_beta=torch.empty(batch_size, num_heads, dtype=torch.bfloat16),
+        A_log=torch.empty(num_heads, dtype=torch.float32),
+        dt_bias=torch.empty(hidden_size, dtype=torch.float32),
+        state=torch.empty(
+            batch_size, num_heads, head_dim, head_dim, dtype=torch.bfloat16
+        ),
+        state_indices=torch.arange(batch_size, dtype=torch.int32),
+    )
+
+    _check_defn(defn, "kda", "flashinfer.kda_decode.packed_kda_decode")
+    assert defn["name"] == "packed_kda_decode_h12_d128"
+    assert defn["axes"]["singleton"] == {
+        "type": "const",
+        "value": 1,
+        "description": "Fixed single-token output dimension.",
+    }
+    assert defn["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "singleton",
+        "num_heads",
+        "head_dim",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # rmsnorm
 # ---------------------------------------------------------------------------
