@@ -290,6 +290,12 @@ def get_rubin_moe_valid_tactics() -> List[Tuple]:
 ALL_BLACKWELL_MOE_TACTICS = get_blackwell_moe_valid_tactics()
 ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 
+# Backwards-compatible alias.  Before the tactic space became
+# architecture-dependent, the Blackwell list was simply ALL_MOE_TACTICS;
+# tests/moe/test_cute_dsl_mxfp8_mxfp4_fused_moe.py and mixed_tuner's docs
+# still refer to it by that name.  Use _get_arch_tactics() for new code.
+ALL_MOE_TACTICS = ALL_BLACKWELL_MOE_TACTICS
+
 
 DEFAULT_BLACKWELL_MOE_TACTIC = (
     128,
