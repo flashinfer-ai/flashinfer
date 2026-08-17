@@ -12,6 +12,7 @@ import torch
 from flashinfer.cake_dcp import (
     _select_fp8_num_split,
     _select_num_split,
+    _validate_nonempty_split_assignment,
     get_dcp_spec_counter_bytes,
     get_dcp_spec_workspace_size_bytes,
     run_dcp_spec_decode,
@@ -131,6 +132,29 @@ def test_public_decode_api_adds_optional_dcp_arguments() -> None:
     assert parameters["causal_seqlens_kv_global"].default is None
 
 
+def test_public_decode_api_rejects_explicit_pdl_for_dcp() -> None:
+    query = torch.empty((4, 16, 256), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 1, 64, 256), dtype=torch.float8_e4m3fn)
+    workspace = torch.empty(1, dtype=torch.uint8)
+    block_tables = torch.zeros((1, 1), dtype=torch.int32)
+    seq_lens = torch.ones(1, dtype=torch.int32)
+    causal_seqlens = torch.zeros(1, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="explicit enable_pdl=True"):
+        trtllm_batch_decode_with_kv_cache(
+            query,
+            (kv_cache, kv_cache),
+            workspace,
+            block_tables,
+            seq_lens,
+            max_seq_len=1,
+            enable_pdl=True,
+            q_len_per_req=4,
+            return_lse=True,
+            causal_seqlens_kv_global=causal_seqlens,
+        )
+
+
 def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     # B=8, Q=4, Hq=64, split=6: BF16 O[...128] + FP32 LSE per row.
     rows = 8 * 4 * 64 * 6
@@ -147,6 +171,10 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=32) == 4
     assert _select_num_split(logical_tiles=8, sm_count=148, local_blocks=128) == 16
     assert _select_num_split(logical_tiles=64, sm_count=148, local_blocks=128) == 2
+    _validate_nonempty_split_assignment(num_split=16, local_blocks=128)
+    _validate_nonempty_split_assignment(num_split=1, local_blocks=0)
+    with pytest.raises(RuntimeError, match="at least one K/V block pair"):
+        _validate_nonempty_split_assignment(num_split=2, local_blocks=2)
     assert (
         _select_fp8_num_split(
             logical_tiles=32, sm_count=148, local_blocks=64, cp_world=1

@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from .api_logging import flashinfer_api
 from .utils import (
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
@@ -49,6 +50,7 @@ _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
+@flashinfer_api
 def get_dcp_spec_workspace_size_bytes(
     batch_size: int,
     q_len_per_req: int,
@@ -75,6 +77,7 @@ def get_dcp_spec_workspace_size_bytes(
     return partial_rows * (head_dim * 2 + 4)
 
 
+@flashinfer_api
 def get_dcp_spec_counter_bytes(
     batch_size: int,
     q_len_per_req: int,
@@ -206,6 +209,22 @@ def _select_fp8_num_split(
                 return supported_split
         return 1
     return num_split if num_split >= 2 else 1
+
+
+def _validate_nonempty_split_assignment(*, num_split: int, local_blocks: int) -> None:
+    """Reject a Split-KV launch that would assign no K/V pair to a split."""
+
+    if local_blocks == 0 and num_split == 1:
+        # A completely empty rank is a valid DCP input.  The single-CTA path
+        # materializes its exact O=0/LSE=-inf identity without a K/V pair.
+        return
+    total_pairs = (local_blocks + 1) // 2
+    if num_split > total_pairs:
+        raise RuntimeError(
+            "Cake FMHA DCP Split-KV requires at least one K/V block pair per "
+            f"split, got num_split={num_split}, local_blocks={local_blocks}, "
+            f"total_pairs={total_pairs}"
+        )
 
 
 def _is_cuda_version_at_least(version: str) -> bool:
@@ -460,6 +479,9 @@ def run_dcp_spec_decode(
             cp_world=cp_world,
             head_dim=query.shape[-1],
         )
+        _validate_nonempty_split_assignment(
+            num_split=num_split, local_blocks=local_blocks
+        )
         head_dim = query.shape[-1]
         if head_dim == _D256_HEAD_DIM:
             module = load_dcp_spec_fp8_d256_module(
@@ -536,6 +558,9 @@ def run_dcp_spec_decode(
         logical_tiles=logical_tiles,
         sm_count=sm_count,
         local_blocks=local_blocks,
+    )
+    _validate_nonempty_split_assignment(
+        num_split=num_split, local_blocks=local_blocks
     )
     from .jit.cake_dcp import load_dcp_spec_module
 

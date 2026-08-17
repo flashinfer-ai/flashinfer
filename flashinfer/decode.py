@@ -3306,9 +3306,11 @@ def trtllm_batch_decode_with_kv_cache(
         ``num_kv_heads=1``, and ``cp_world`` 1 or 4. ``bmm1_scale`` is the
         fused QK scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV
         requires ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing
-        TRT-LLM backend contract. Here ``max_seq_len`` is the maximum compact
-        rank-local stored length; it may be zero for an entirely empty rank,
-        while ``block_tables`` still supplies one masked physical page slot.
+        TRT-LLM backend contract. Explicit ``enable_pdl=True`` is unsupported;
+        leave it at its default for this path. Here ``max_seq_len`` is the
+        maximum compact rank-local stored length; it may be zero for an
+        entirely empty rank, while ``block_tables`` still supplies one masked
+        physical page slot.
         Long-context BF16 and underfilled FP8 Split-KV routes use
         ``workspace_buffer`` for partials and require a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
@@ -3327,6 +3329,7 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
+    explicit_enable_pdl = enable_pdl is True
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
@@ -3377,6 +3380,10 @@ def trtllm_batch_decode_with_kv_cache(
             "DCP speculative decode path"
         )
     if dcp_spec_enabled:
+        if explicit_enable_pdl:
+            raise ValueError(
+                "DCP speculative decode does not support an explicit enable_pdl=True"
+            )
         if backend not in ("auto", "trtllm-gen"):
             raise ValueError(
                 "DCP speculative decode is only available through backend='auto' "

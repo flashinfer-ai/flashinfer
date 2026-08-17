@@ -12,6 +12,7 @@ from flashinfer.cake_dcp import (
     get_dcp_spec_workspace_size_bytes,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+from flashinfer.utils import is_sm100a_supported
 
 
 _HEAD_DIM = 128
@@ -22,8 +23,7 @@ _LOG2_E = math.log2(math.e)
 def _require_blackwell_dcp() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
+    if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Cake FMHA DCP requires SM100 or SM103")
 
 
@@ -617,7 +617,25 @@ def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
             device="cuda",
         )
 
-        def run():
+        def run(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            workspace=workspace,
+            counter=counter,
+            max_local=max_local,
+            q_len=q_len,
+            cp_world=cp_world,
+            rank=rank,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out,
+            lse=lse,
+        ):
             return _run_public_rank(
                 query,
                 k_cache,
@@ -674,3 +692,91 @@ def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
     )
     torch.testing.assert_close(merged_o, dense_o, atol=0.1, rtol=0.1)
     torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)
+
+
+def test_fp8_page64_d256_initializes_dynamic_smem_on_each_device() -> None:
+    _require_blackwell_dcp()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required for per-device host-shim coverage")
+
+    batch_size, q_len = 1, 4
+    num_q_heads, num_kv_heads, head_dim = 16, 1, 256
+    prefix_len = 60
+    global_len = prefix_len + q_len
+    sm_scale = head_dim**-0.5
+
+    for device_index in (0, 1):
+        with torch.cuda.device(device_index):
+            torch.manual_seed(41 + device_index)
+            query = (
+                torch.randn(
+                    batch_size,
+                    q_len,
+                    num_q_heads,
+                    head_dim,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                * 0.2
+            ).to(torch.bfloat16)
+            k_source = (
+                torch.randn(
+                    batch_size,
+                    global_len,
+                    num_kv_heads,
+                    head_dim,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                * 0.2
+            ).to(torch.bfloat16)
+            v_source = torch.randn_like(k_source) * 0.2
+            k_storage, k_scale = _quantize_fp8(k_source)
+            v_storage, v_scale = _quantize_fp8(v_source)
+            represented_k = k_storage.float() * k_scale
+            represented_v = v_storage.float() * v_scale
+            prefix_lens = torch.full(
+                (batch_size,), prefix_len, dtype=torch.int32, device="cuda"
+            )
+            k_cache, v_cache, block_tables, seq_lens, max_local = _pack_rank_cache(
+                k_storage,
+                v_storage,
+                [global_len],
+                rank=0,
+                cp_world=1,
+            )
+            out = torch.empty_like(query)
+            lse = torch.empty(
+                (batch_size, q_len, num_q_heads),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+
+            _run_public_rank(
+                query,
+                k_cache,
+                v_cache,
+                block_tables,
+                seq_lens,
+                prefix_lens,
+                workspace,
+                max_local_seq_len=max_local,
+                q_len=q_len,
+                cp_world=1,
+                cp_rank=0,
+                bmm1_scale=sm_scale * k_scale,
+                bmm2_scale=v_scale,
+                out=out,
+                lse=lse,
+            )
+            torch.cuda.synchronize(device_index)
+            expected_o, expected_lse = _dense_reference(
+                query,
+                represented_k,
+                represented_v,
+                [prefix_len],
+                sm_scale,
+            )
+            torch.testing.assert_close(out, expected_o, atol=0.1, rtol=0.1)
+            torch.testing.assert_close(lse, expected_lse, atol=0.1, rtol=0.1)

@@ -2636,6 +2636,11 @@ trtllm_batch_decode_trace.axes["max_pages_per_seq"] = Var(
 
 _TRTLLM_DCP_INPUTS = {
     **trtllm_batch_decode_trace.inputs,
+    "bmm2_scale": Scalar(
+        "float32",
+        optional=True,
+        description="FP8 V/output scale; must be 1.0 for BF16 KV.",
+    ),
     "causal_seqlens_kv_global": Tensor(
         ["batch_size"],
         dtype="int32",
