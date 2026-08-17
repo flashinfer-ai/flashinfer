@@ -650,18 +650,20 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
     return indices
 
 
-def can_use_clusters_topk(device, deterministic, tie_break, dsa_graph_safe):
+def can_use_clusters_topk(algo, device, deterministic, tie_break, dsa_graph_safe):
     if dsa_graph_safe or tie_break != TopKTieBreak.NONE:
         return False
-    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     cap = get_compute_capability(device)
     return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
 
 
-def can_use_cub_topk(input, tie_break):
+def can_use_cub_topk(algo, input, tie_break, deterministic, sorted_output=False):
     """Whether the CUB (DeviceBatchedTopK) backend can serve this call."""
 
-    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    # CUB returns unsorted results and has no reproducible-ordering mode, so
+    # sorted / deterministic calls fall through to the native backends.
+    if sorted_output or deterministic:
+        return False
     if algo is not None and algo != "cub":
         return False  # user forced another backend
     if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
@@ -678,25 +680,46 @@ def can_use_cub_topk(input, tie_break):
     return True
 
 
-def is_cub_topk_beneficial(num_rows, d, k, dtype, tie_break, dsa_graph_safe):
+def is_cub_topk_beneficial(
+    algo, num_rows, d, k, dtype, tie_break, dsa_graph_safe, clusters_eligible
+):
     """Whether the CUB backend is expected to outperform the native backends for a
     plain top_k call. Based on benchmarks collected from `bench_topk.py` on a
     B200. See https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
     for the benchmark results.
+
+    ``clusters_eligible`` states whether the clusters backend could serve this
+    call (``can_use_clusters_topk``); it selects between the clusters-calibrated
+    and radix-calibrated thresholds. Returning False falls through to the
+    clusters / radix dispatch below the CUB branch.
     """
-    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+    if algo == "cub":
         return True
 
+    # If replaying in a CUDA graph, CUB wins for larger values of `d`. This is
+    # checked before clusters eligibility: an unflagged caller capturing a graph
+    # should get CUB's graph-calibrated (and capture-validated) path, not fall
+    # through to the never-captured clusters backend.
+    if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
+        if num_rows < 128 or d <= 8192:
+            return True
+        return d >= (32768 if dtype == torch.float32 else 65536)
+
+    # When the clusters backend is available (SM100, eager, non-deterministic,
+    # no tie-break), it beats CUB nearly everywhere; CUB only keeps the fp32
+    # d ~ 8192 band and single-row long-d calls (up to 1.68x fp32, 1.46x 16-bit).
+    if clusters_eligible:
+        if dtype == torch.float32:
+            return (4096 < d <= 8192) or (num_rows == 1 and d > 4096)
+        return num_rows == 1 and d >= 262144
+
+    # Eager with no clusters backend available: CUB vs the radix backend.
     # CUB always wins under these conditions
     if num_rows < 128 or d <= 8192:
         return True
 
-    # If replaying in a CUDA graph, CUB wins for larger values of `d`
-    if dsa_graph_safe or torch.cuda.is_current_stream_capturing():
-        return d >= (32768 if dtype == torch.float32 else 65536)
-
-    # For eager execution, CUB wins for 16 bit dtypes and larger values of `d`
-    # only under certain conditions
+    # CUB wins for 16 bit dtypes and larger values of `d` only under certain
+    # conditions
     if dtype != torch.float32 and d >= 131072:
         if tie_break == TopKTieBreak.NONE or num_rows < 256:
             return True
@@ -715,7 +738,7 @@ def is_cub_topk_beneficial(num_rows, d, k, dtype, tie_break, dsa_graph_safe):
 
 
 def is_cub_page_table_transform_beneficial(
-    num_rows, d, dtype, tie_break, dsa_graph_safe
+    algo, num_rows, d, dtype, tie_break, dsa_graph_safe, clusters_eligible
 ):
     """Whether the CUB backend is expected to outperform the native backends for a
     fused page-table transform call. Based on benchmarks collected from
@@ -723,7 +746,7 @@ def is_cub_page_table_transform_beneficial(
     https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
     for benchmark results.
     """
-    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+    if algo == "cub":
         return True
 
     fp32 = dtype == torch.float32
@@ -748,6 +771,13 @@ def is_cub_page_table_transform_beneficial(
             or d >= 524288
         )
 
+    # When the clusters backend is available (SM100, eager, non-deterministic,
+    # no tie-break, clusters-compatible arguments), it beats CUB on every
+    # measured transform cell. Check after the graphed branch because the clusters
+    # backend doesn't support graph capture.
+    if clusters_eligible:
+        return False
+
     if tie:
         if fp32:
             return (num_rows <= 16 and d >= 262144) or (num_rows <= 32 and d >= 524288)
@@ -756,14 +786,16 @@ def is_cub_page_table_transform_beneficial(
     return False
 
 
-def is_cub_ragged_transform_beneficial(num_rows, d, dtype, tie_break, dsa_graph_safe):
+def is_cub_ragged_transform_beneficial(
+    algo, num_rows, d, dtype, tie_break, dsa_graph_safe, clusters_eligible
+):
     """Whether the CUB backend is expected to outperform the native backends for a
     fused ragged transform call. Based on benchmarks collected from
     `bench_topk.py` on a B200. See
     https://gist.github.com/NaderAlAwar/4038e4c44365b93737a55add0e6ec1b5
     for the benchmark results.
     """
-    if os.environ.get("FLASHINFER_TOPK_ALGO") == "cub":
+    if algo == "cub":
         return True
 
     fp32 = dtype == torch.float32
@@ -788,6 +820,13 @@ def is_cub_ragged_transform_beneficial(num_rows, d, dtype, tie_break, dsa_graph_
         if num_rows < 128:
             return d >= 32768
         return d >= (65536 if dtype == torch.bfloat16 else 131072)
+
+    # When the clusters backend is available (SM100, eager, non-deterministic,
+    # no tie-break, clusters-compatible arguments), it beats CUB on every
+    # measured transform cell. Check after the graphed branch because the clusters
+    # backend doesn't support graph capture.
+    if clusters_eligible:
+        return False
 
     if tie:
         if fp32:
@@ -903,17 +942,22 @@ def top_k(
     batch_size = input.size(0)
     device = input.device
 
-    # The CUB backend returns unsorted results and has no reproducible-ordering
-    # mode, so sorted / deterministic calls fall through to the native backends.
-    # dsa_graph_safe is honored by serving the call: CUB's kernel selection depends
-    # only on shape (static under a graph), so it is graph-safe by construction.
-    if (
-        not sorted
-        and not deterministic
-        and can_use_cub_topk(input, tie_break)
-        and is_cub_topk_beneficial(
-            batch_size, input.size(1), k, input.dtype, tie_break, dsa_graph_safe
-        )
+    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    clusters_eligible = can_use_clusters_topk(
+        algo, input.device, deterministic, tie_break, dsa_graph_safe
+    )
+
+    if can_use_cub_topk(
+        algo, input, tie_break, deterministic, sorted
+    ) and is_cub_topk_beneficial(
+        algo,
+        batch_size,
+        input.size(1),
+        k,
+        input.dtype,
+        tie_break,
+        dsa_graph_safe,
+        clusters_eligible,
     ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
@@ -937,7 +981,7 @@ def top_k(
 
         return output_values, indices
 
-    if can_use_clusters_topk(input.device, deterministic, tie_break, dsa_graph_safe):
+    if clusters_eligible:
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -1148,12 +1192,30 @@ def top_k_page_table_transform(
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
 
-    if (
-        can_use_cub_topk(input, tie_break)
-        and not deterministic
-        and is_cub_page_table_transform_beneficial(
-            input.size(0), input.size(1), input.dtype, tie_break, dsa_graph_safe
+    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    clusters_eligible = (
+        can_use_clusters_topk(
+            algo, input.device, deterministic, tie_break, dsa_graph_safe
         )
+        and row_to_batch is None
+        and row_starts is None
+        and page_table_row_starts is None
+        and page_size == 1
+        and out is None
+        and out_raw_indices is None
+        and input.is_contiguous()
+    )
+
+    if can_use_cub_topk(
+        algo, input, tie_break, deterministic
+    ) and is_cub_page_table_transform_beneficial(
+        algo,
+        input.size(0),
+        input.size(1),
+        input.dtype,
+        tie_break,
+        dsa_graph_safe,
+        clusters_eligible,
     ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
@@ -1182,21 +1244,7 @@ def top_k_page_table_transform(
             page_table_row_starts,
         )
 
-    if (
-        can_use_clusters_topk(
-            input.device,
-            deterministic,
-            tie_break,
-            dsa_graph_safe,
-        )
-        and row_to_batch is None
-        and row_starts is None
-        and page_table_row_starts is None
-        and page_size == 1
-        and out is None
-        and out_raw_indices is None
-        and input.is_contiguous()
-    ):
+    if clusters_eligible:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -1324,12 +1372,24 @@ def top_k_ragged_transform(
     device = input.device
     num_rows = input.size(0)
 
-    if (
-        can_use_cub_topk(input, tie_break)
-        and not deterministic
-        and is_cub_ragged_transform_beneficial(
-            input.size(0), input.size(1), input.dtype, tie_break, dsa_graph_safe
+    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    clusters_eligible = (
+        can_use_clusters_topk(
+            algo, input.device, deterministic, tie_break, dsa_graph_safe
         )
+        and row_starts is None
+    )
+
+    if can_use_cub_topk(
+        algo, input, tie_break, deterministic
+    ) and is_cub_ragged_transform_beneficial(
+        algo,
+        input.size(0),
+        input.size(1),
+        input.dtype,
+        tie_break,
+        dsa_graph_safe,
+        clusters_eligible,
     ):
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
@@ -1354,15 +1414,7 @@ def top_k_ragged_transform(
         )
         return output_indices
 
-    if (
-        can_use_clusters_topk(
-            input.device,
-            deterministic,
-            tie_break,
-            dsa_graph_safe,
-        )
-        and row_starts is None
-    ):
+    if clusters_eligible:
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path
