@@ -1,16 +1,17 @@
-"""4-GPU SM107 (Rubin) mxfp8 GLU mega multirank: MoEEpLayer vs torch oracle.
+"""4-GPU SM107 (Rubin) block-scaled mega multirank: MoEEpLayer vs torch oracle.
 
 Runs ONLY under its own torchrun invocation (``run_tests.sh mega_sm107``)::
 
     torchrun --nproc_per_node=4 -m pytest \
-        tests/moe_ep/test_moe_ep_sm107_mxfp8_glu_mega_multirank.py -v \
+        tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
         -m "gpu_4 and arch_rubin"
 
 Every rank builds the SAME global expert bank (fixed seed), the layer routes
 real cross-rank EP traffic over the NVLink symmetric heap, and each rank's
 output is checked against the pure-torch oracle evaluated over the full bank
 for that rank's tokens (tolerance bands: the oracle emulates but does not
-bit-match the in-kernel FC2-input requantization).
+bit-match the in-kernel FC2-input requantization).  Covers BOTH sm107
+backends (mxfp8_e4m3 and nvfp4).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from flashinfer.moe_ep import (  # noqa: E402
     MoEEpTensors,
     MoEWeightPack,
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     bootstrap_moe_ep_runtime,
     ensure_moe_ep_cuda_device,
     finalize_moe_ep_runtime,
@@ -46,6 +48,10 @@ NUM_EXPERTS = 8
 TOP_K = 4
 NUM_TOKENS = 96
 MAX_TOKENS = 128
+
+# The nvfp4 wire is much coarser (4-bit data, per-16 fp8 scales through TWO
+# GEMMs); the mxfp8 band matches the previous GLU-kernel test.
+_REL_L2_BAND = {"mxfp8_e4m3": 0.02, "nvfp4": 0.06}
 
 
 def _require_cuda() -> None:
@@ -124,73 +130,103 @@ def _global_problem(world_size: int):
     return w13, w2, x, topk_ids, topk_weights
 
 
-def _megakernel_config(**overrides) -> Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
+def _megakernel_config(quant_kind: str, **overrides):
+    if quant_kind == "nvfp4":
+        return Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
+        )
     return Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
     )
 
 
-def _torch_oracle(x_rank, topk_ids_rank, topk_weights_rank, w13, w2, apply_topk_in_fc1):
+def _torch_oracle(
+    x_rank, topk_ids_rank, topk_weights_rank, w13, w2, quant_kind, apply_topk_at_fc1
+):
     """Full-bank oracle for one rank's tokens over the layer's exact quant path."""
-    from flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe import (
-        compute_megamoe_reference_sm107_glu,
-        interleave_gate_up_32,
-        quantize_mxfp8_block32,
-    )
+    import flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe as pkg
 
-    x_q, x_sf = quantize_mxfp8_block32(x_rank.to(torch.float32), torch.float8_e4m3fn)
-    w13_q, w13_sf = quantize_mxfp8_block32(
-        interleave_gate_up_32(
-            w13.to(torch.float32), intermediate_size=INTERMEDIATE
-        ).contiguous(),
-        torch.float8_e4m3fn,
-    )
-    w2_q, w2_sf = quantize_mxfp8_block32(
-        w2.to(torch.float32).contiguous(), torch.float8_e4m3fn
-    )
-    return compute_megamoe_reference_sm107_glu(
+    w13_interleaved = pkg.interleave_gate_up_16(
+        w13.to(torch.float32), intermediate_size=INTERMEDIATE
+    ).contiguous()
+    w2_f32 = w2.to(torch.float32).contiguous()
+    if quant_kind == "nvfp4":
+        x_q, x_sf = pkg.quantize_nvfp4_block16(x_rank.to(torch.float32))
+        w13_q, w13_sf = pkg.quantize_nvfp4_block16(w13_interleaved)
+        w2_q, w2_sf = pkg.quantize_nvfp4_block16(w2_f32)
+    else:
+        x_q, x_sf = pkg.quantize_mxfp8_block32(
+            x_rank.to(torch.float32), torch.float8_e4m3fn
+        )
+        w13_q, w13_sf = pkg.quantize_mxfp8_block32(w13_interleaved, torch.float8_e4m3fn)
+        w2_q, w2_sf = pkg.quantize_mxfp8_block32(w2_f32, torch.float8_e4m3fn)
+    return pkg.compute_megamoe_reference_sm107_block_scaled(
         x_q,
         x_sf,
         topk_ids_rank,
         topk_weights_rank,
-        w13_q.permute(0, 2, 1),
+        w13_q,
         w13_sf,
-        w2_q.permute(0, 2, 1),
+        w2_q,
         w2_sf,
+        quant_kind=quant_kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_topk_at_fc1=apply_topk_at_fc1,
     )
 
 
-def test_sm107_mega_kernel_is_registered():
+def test_sm107_mega_kernels_are_registered():
     assert "sm107_mxfp8_mxfp8_bf16_cutedsl" in _MEGA_KERNEL_REGISTRY
-    backend = create_mega_kernel(_megakernel_config())
-    assert backend.kernel_name() == "sm107_mxfp8_mxfp8_bf16_cutedsl"
+    assert "sm107_nvfp4_nvfp4_bf16_cutedsl" in _MEGA_KERNEL_REGISTRY
+    for kind in ("mxfp8_e4m3", "nvfp4"):
+        backend = create_mega_kernel(_megakernel_config(kind))
+        assert backend.kernel_name().startswith("sm107_")
 
 
 @pytest.mark.arch_rubin
-def test_sm107_preprocess_mega_weights_from_bf16():
+@pytest.mark.parametrize("quant_kind", ["mxfp8_e4m3", "nvfp4"])
+def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
     _require_cuda()
-    from flashinfer.moe_ep import preprocess_sm107_mxfp8_glu_mega_weights
+    from flashinfer.moe_ep import (
+        preprocess_sm107_mxfp8_mega_weights,
+        preprocess_sm107_nvfp4_mega_weights,
+    )
 
     w13 = torch.randn(2, 2 * INTERMEDIATE, HIDDEN, device="cuda", dtype=torch.bfloat16)
     w2 = torch.randn(2, HIDDEN, INTERMEDIATE, device="cuda", dtype=torch.bfloat16)
-    (fc1_w, fc1_sf), (fc2_w, fc2_sf) = preprocess_sm107_mxfp8_glu_mega_weights(
-        MoEWeightPack(w13=w13, w2=w2),
-        intermediate_size=INTERMEDIATE,
-        hidden_size=HIDDEN,
-    )
-    assert fc1_w.shape == (2, HIDDEN, 2 * INTERMEDIATE)
-    assert fc2_w.shape == (2, INTERMEDIATE, HIDDEN)
-    assert fc1_w.dtype == torch.float8_e4m3fn
-    assert fc1_sf.dtype == torch.float8_e8m0fnu
+    pack = MoEWeightPack(w13=w13, w2=w2)
+    if quant_kind == "nvfp4":
+        (fc1_w, fc1_sf), (fc2_w, fc2_sf) = preprocess_sm107_nvfp4_mega_weights(
+            pack, intermediate_size=INTERMEDIATE, hidden_size=HIDDEN
+        )
+        assert fc1_w.shape == (2, HIDDEN // 2, 2 * INTERMEDIATE)
+        assert fc2_w.shape == (2, INTERMEDIATE // 2, HIDDEN)
+        assert fc1_sf.dtype == torch.float8_e4m3fn
+    else:
+        (fc1_w, fc1_sf), (fc2_w, fc2_sf) = preprocess_sm107_mxfp8_mega_weights(
+            pack, intermediate_size=INTERMEDIATE, hidden_size=HIDDEN
+        )
+        assert fc1_w.shape == (2, HIDDEN, 2 * INTERMEDIATE)
+        assert fc2_w.shape == (2, INTERMEDIATE, HIDDEN)
+        assert fc1_w.dtype == torch.float8_e4m3fn
+        assert fc1_sf.dtype == torch.float8_e8m0fnu
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
-def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
+@pytest.mark.parametrize(
+    "quant_kind, in_kernel_fc2_reduce",
+    [
+        ("mxfp8_e4m3", False),
+        ("mxfp8_e4m3", True),
+        ("nvfp4", False),
+        ("nvfp4", True),
+    ],
+)
+def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
+    quant_kind, in_kernel_fc2_reduce
+):
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 2:
@@ -202,7 +238,7 @@ def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     experts_per_rank = NUM_EXPERTS // world_size
     local = slice(rank * experts_per_rank, (rank + 1) * experts_per_rank)
 
-    cfg = _megakernel_config(in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+    cfg = _megakernel_config(quant_kind, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)
@@ -222,6 +258,7 @@ def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
         )
         assert isinstance(mega, MoEEpMegaLayer)
 
+        band = _REL_L2_BAND[quant_kind]
         for iteration in range(2):  # second forward = stale-state regression guard
             y = mega.forward(
                 MoEEpTensors(
@@ -236,18 +273,21 @@ def test_moe_ep_sm107_glu_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
                 topk_weights[rank],
                 w13,
                 w2,
-                apply_topk_in_fc1=cfg.apply_topk_in_fc1,
+                quant_kind,
+                apply_topk_at_fc1=cfg.apply_topk_in_fc1,
             )[:NUM_TOKENS]
             yk = y[:NUM_TOKENS].to(torch.float32)
             yr = y_ref.to(torch.float32)
             rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
             print(
-                f"[sm107 multirank] rank={rank} ikr={in_kernel_fc2_reduce} "
-                f"iter={iteration} rel_l2={rel_l2.item():.5f} "
+                f"[sm107 multirank] rank={rank} kind={quant_kind} "
+                f"ikr={in_kernel_fc2_reduce} iter={iteration} "
+                f"rel_l2={rel_l2.item():.5f} "
                 f"max|d|={(yk - yr).abs().max().item():.5f}"
             )
-            assert rel_l2.item() < 0.02, (
-                f"rank {rank} iter {iteration}: rel_l2 {rel_l2.item()} out of band"
+            assert rel_l2.item() < band, (
+                f"rank {rank} iter {iteration}: rel_l2 {rel_l2.item()} out of "
+                f"band {band}"
             )
         mega.destroy()
     finally:

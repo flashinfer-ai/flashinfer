@@ -193,7 +193,8 @@ process (the SM90/SM100 kernel trees are mutually exclusive per process):
 
 ### SM107 (Rubin) mega tests
 
-Rubin-only (`sm107_mxfp8_mxfp8_bf16_cutedsl`, the `next_cutedsl_megamoe` fprop
+Rubin-only (`sm107_{mxfp8_mxfp8,nvfp4_nvfp4}_bf16_cutedsl`, the
+`next_cutedsl_megamoe` inference
 drop) targets, also in their own pytest processes:
 `bash tests/moe_ep/run_tests.sh oracle_sm107` (1 GPU, `MEGA_NO_DIST=1`) and
 `bash tests/moe_ep/run_tests.sh mega_sm107` (4 GPUs). Tests are gated on the
@@ -678,8 +679,9 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo; a push-style tree will be added later)
 - `kernel_src/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
-  greenfield tree (mxfp8 GLU fprop only so far; other archs/kernels from the
-  same tree migrate into this directory later — see its `VENDOR.md`)
+  greenfield tree (the block-scaled swap-AB inference kernel only so far;
+  other archs/kernels from the same tree migrate into this directory later —
+  see its `VENDOR.md`)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
