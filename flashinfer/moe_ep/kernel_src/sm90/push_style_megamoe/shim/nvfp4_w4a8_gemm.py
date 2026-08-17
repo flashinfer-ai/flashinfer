@@ -3,10 +3,10 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -15,23 +15,23 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 from ......jit.cpp_ext import is_cuda_version_at_least
 
 
-KERNEL_VERSION = 1
+KERNEL_VERSION = 2
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 SUPPORTED_RESIDUAL_SCHEMES = ("generic", "pow2")
 SUPPORTED_BLOCK_M = (64, 128)
 SUPPORTED_BLOCK_N = (64, 128)
+# Layout 3 is the legacy cell layout, retained ONLY as the bitwise oracle for
+# layout-4 tests (requires allow_legacy_layout=True); not AOT-registered.
+SUPPORTED_PAYLOAD_LAYOUTS = (3, 4)
+# Optimized kernels can retain a small compiler-managed ABI frame without
+# spilling their accumulator state. Larger frames are rejected before launch.
+_MAX_LOCAL_MEMORY_BYTES_PER_THREAD = 64
 _KNOB_SPECS = (
     ("decode_vector", "dv", "W4A8_DECODE_VECTOR", 1),
     ("generic_decode_lut", "dl", "W4A8_GENERIC_DECODE_LUT", 1),
-    ("overlap", "ov", "W4A8_OVERLAP", 0),
+    ("overlap", "ov", "W4A8_OVERLAP", 1),
     ("single_ready", "sr", "W4A8_SINGLE_READY", 0),
     ("residual_tma", "rt", "W4A8_RESIDUAL_TMA", 1),
-    (
-        "group_scale_tma",
-        "gt",
-        "W4A8_GROUP_SCALE_TMA",
-        0,
-    ),
     (
         "cross_stage_retire",
         "cr",
@@ -45,12 +45,20 @@ _KNOB_SPECS = (
         "W4A8_SPLIT_M64_TAIL",
         1,
     ),
+    ("expert_n_major", "en", "W4A8_EXPERT_N_MAJOR", 0),
+    (
+        "empty_family_early_exit",
+        "ef",
+        "W4A8_EMPTY_FAMILY_EARLY_EXIT",
+        0,
+    ),
 )
 STATIC_VARIANT_COUNT = (
     len(SUPPORTED_GROUP_SIZES)
     * len(SUPPORTED_RESIDUAL_SCHEMES)
     * len(SUPPORTED_BLOCK_M)
     * len(SUPPORTED_BLOCK_N)
+    * 2
 )
 _INSTANTIATION_UNIT_NAMES = (
     "kernel_inst_m64_n64.cu",
@@ -81,10 +89,16 @@ class _OptimizationKnobs:
     overlap: int
     single_ready: int
     residual_tma: int
-    group_scale_tma: int
     cross_stage_retire: int
     single_partial: int
     split_m64_tail: int
+    expert_n_major: int
+    empty_family_early_exit: int
+    payload_layout: int
+    prefer_n64_main: int
+    m64_stages: int
+    m128_stages: int
+    tma_cache_capacity: int
 
 
 def _optimization_knobs(
@@ -93,10 +107,16 @@ def _optimization_knobs(
     overlap: bool | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
-    group_scale_tma: bool | None = None,
     cross_stage_retire: bool | None = None,
     single_partial: bool | None = None,
     split_m64_tail: bool | None = None,
+    expert_n_major: bool | None = None,
+    empty_family_early_exit: bool | None = None,
+    payload_layout: int | None = None,
+    prefer_n64_main: bool | None = None,
+    m64_stages: int | None = None,
+    m128_stages: int | None = None,
+    tma_cache_capacity: int | None = None,
 ) -> _OptimizationKnobs:
     explicit = {
         "decode_vector": decode_vector,
@@ -104,10 +124,11 @@ def _optimization_knobs(
         "overlap": overlap,
         "single_ready": single_ready,
         "residual_tma": residual_tma,
-        "group_scale_tma": group_scale_tma,
         "cross_stage_retire": cross_stage_retire,
         "single_partial": single_partial,
         "split_m64_tail": split_m64_tail,
+        "expert_n_major": expert_n_major,
+        "empty_family_early_exit": empty_family_early_exit,
     }
     values = {
         name: default if explicit[name] is None else int(bool(explicit[name]))
@@ -119,28 +140,60 @@ def _optimization_knobs(
         overlap=values["overlap"],
         single_ready=values["single_ready"],
         residual_tma=values["residual_tma"],
-        group_scale_tma=values["group_scale_tma"],
         cross_stage_retire=values["cross_stage_retire"],
         single_partial=values["single_partial"],
         split_m64_tail=values["split_m64_tail"],
+        expert_n_major=values["expert_n_major"],
+        empty_family_early_exit=values["empty_family_early_exit"],
+        payload_layout=4 if payload_layout is None else int(payload_layout),
+        prefer_n64_main=int(bool(prefer_n64_main)),
+        m64_stages=3 if m64_stages is None else int(m64_stages),
+        m128_stages=4 if m128_stages is None else int(m128_stages),
+        tma_cache_capacity=(
+            128 if tma_cache_capacity is None else int(tma_cache_capacity)
+        ),
     )
     if knobs.single_partial and knobs.cross_stage_retire:
         raise ValueError("single_partial requires cross_stage_retire=0")
     if knobs.generic_decode_lut and not knobs.decode_vector:
         raise ValueError("generic_decode_lut requires decode_vector=True")
+    if knobs.m64_stages not in (2, 3):
+        raise ValueError("m64_stages must be 2 or 3")
+    if knobs.m128_stages not in (3, 4):
+        raise ValueError("m128_stages must be 3 or 4")
+    if knobs.payload_layout not in SUPPORTED_PAYLOAD_LAYOUTS:
+        raise ValueError(
+            f"payload_layout must be one of {SUPPORTED_PAYLOAD_LAYOUTS}, "
+            f"got {knobs.payload_layout}"
+        )
+    if not 1 <= knobs.tma_cache_capacity <= 128:
+        raise ValueError("tma_cache_capacity must be in [1, 128]")
     return knobs
 
 
 def _knob_tag(knobs: _OptimizationKnobs) -> str:
-    return "_".join(
+    boolean_tag = "_".join(
         f"{tag}{getattr(knobs, name)}" for name, tag, _macro, _default in _KNOB_SPECS
     )
+    return f"{boolean_tag}_pv{knobs.payload_layout}"
 
 
-def _knob_arguments(knobs: _OptimizationKnobs) -> dict[str, bool]:
-    return {
+def _knob_arguments(knobs: _OptimizationKnobs) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
         name: bool(getattr(knobs, name)) for name, _tag, _macro, _default in _KNOB_SPECS
     }
+    arguments["payload_layout"] = knobs.payload_layout
+    return arguments
+
+
+def _compilation_knobs(knobs: _OptimizationKnobs) -> _OptimizationKnobs:
+    return replace(
+        knobs,
+        prefer_n64_main=0,
+        m64_stages=3,
+        m128_stages=4,
+        tma_cache_capacity=128,
+    )
 
 
 @dataclass(frozen=True)
@@ -322,6 +375,7 @@ def _cuda_flags(knobs: _OptimizationKnobs | None = None) -> tuple[str, ...]:
             f"-D{macro}={getattr(knobs, name)}"
             for name, _tag, macro, _default in _KNOB_SPECS
         )
+        + (f"-DW4A8_PAYLOAD_V4={int(knobs.payload_layout == 4)}",)
     )
 
 
@@ -359,7 +413,10 @@ def _source_digest(
 def _uri(knobs: _OptimizationKnobs, source_digest: str | None = None) -> str:
     if source_digest is None:
         source_digest = _source_digest(knobs=knobs)
-    return f"sm90_push_nvfp4_w4a8_gemm_v{KERNEL_VERSION}_{_knob_tag(knobs)}_{source_digest}"
+    return (
+        f"sm90_push_nvfp4_w4a8_gemm_v{KERNEL_VERSION}_"
+        f"{_knob_tag(knobs)}_{source_digest}"
+    )
 
 
 def get_sm90_push_nvfp4_w4a8_gemm_uri(
@@ -367,25 +424,35 @@ def get_sm90_push_nvfp4_w4a8_gemm_uri(
     decode_vector: bool | None = None,
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
+    payload_layout: int | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
-    group_scale_tma: bool | None = None,
     cross_stage_retire: bool | None = None,
     single_partial: bool | None = None,
     split_m64_tail: bool | None = None,
+    expert_n_major: bool | None = None,
+    empty_family_early_exit: bool | None = None,
+    prefer_n64_main: bool | None = None,
+    m64_stages: int | None = None,
+    m128_stages: int | None = None,
 ) -> str:
     knobs = _optimization_knobs(
         decode_vector=decode_vector,
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
+        payload_layout=payload_layout,
         single_ready=single_ready,
         residual_tma=residual_tma,
-        group_scale_tma=group_scale_tma,
         cross_stage_retire=cross_stage_retire,
         single_partial=single_partial,
         split_m64_tail=split_m64_tail,
+        expert_n_major=expert_n_major,
+        empty_family_early_exit=empty_family_early_exit,
+        prefer_n64_main=prefer_n64_main,
+        m64_stages=m64_stages,
+        m128_stages=m128_stages,
     )
-    return _uri(knobs)
+    return _uri(_compilation_knobs(knobs))
 
 
 def _make_jit_spec(
@@ -417,25 +484,35 @@ def gen_sm90_push_nvfp4_w4a8_gemm_module(
     decode_vector: bool | None = None,
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
+    payload_layout: int | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
-    group_scale_tma: bool | None = None,
     cross_stage_retire: bool | None = None,
     single_partial: bool | None = None,
     split_m64_tail: bool | None = None,
+    expert_n_major: bool | None = None,
+    empty_family_early_exit: bool | None = None,
+    prefer_n64_main: bool | None = None,
+    m64_stages: int | None = None,
+    m128_stages: int | None = None,
 ) -> JitSpec:
     knobs = _optimization_knobs(
         decode_vector=decode_vector,
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
+        payload_layout=payload_layout,
         single_ready=single_ready,
         residual_tma=residual_tma,
-        group_scale_tma=group_scale_tma,
         cross_stage_retire=cross_stage_retire,
         single_partial=single_partial,
         split_m64_tail=split_m64_tail,
+        expert_n_major=expert_n_major,
+        empty_family_early_exit=empty_family_early_exit,
+        prefer_n64_main=prefer_n64_main,
+        m64_stages=m64_stages,
+        m128_stages=m128_stages,
     )
-    return _make_jit_spec(knobs)
+    return _make_jit_spec(_compilation_knobs(knobs))
 
 
 @functools.cache
@@ -452,24 +529,35 @@ def load_sm90_push_nvfp4_w4a8_gemm_module(
     decode_vector: bool | None = None,
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
+    payload_layout: int | None = None,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
-    group_scale_tma: bool | None = None,
     cross_stage_retire: bool | None = None,
     single_partial: bool | None = None,
     split_m64_tail: bool | None = None,
+    expert_n_major: bool | None = None,
+    empty_family_early_exit: bool | None = None,
+    prefer_n64_main: bool | None = None,
+    m64_stages: int | None = None,
+    m128_stages: int | None = None,
 ):
     knobs = _optimization_knobs(
         decode_vector=decode_vector,
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
+        payload_layout=payload_layout,
         single_ready=single_ready,
         residual_tma=residual_tma,
-        group_scale_tma=group_scale_tma,
         cross_stage_retire=cross_stage_retire,
         single_partial=single_partial,
         split_m64_tail=split_m64_tail,
+        expert_n_major=expert_n_major,
+        empty_family_early_exit=empty_family_early_exit,
+        prefer_n64_main=prefer_n64_main,
+        m64_stages=m64_stages,
+        m128_stages=m128_stages,
     )
+    knobs = _compilation_knobs(knobs)
     source_snapshot = _capture_source_snapshot()
     source_digest = _source_digest(source_snapshot, knobs=knobs)
     return _load_sm90_push_nvfp4_w4a8_gemm_module_cached(
@@ -495,7 +583,7 @@ def _validate_static_configuration(
 
 
 class Sm90W4A8GroupedGemm:
-    """Grouped SM90 push NVFP4 W4A8 runner bound to one version-three weight view."""
+    """Grouped SM90 push NVFP4 W4A8 runner bound to one layout-matched view."""
 
     def __init__(
         self,
@@ -506,30 +594,42 @@ class Sm90W4A8GroupedGemm:
         decode_vector: bool | None = None,
         generic_decode_lut: bool | None = None,
         overlap: bool | None = None,
+        payload_layout: int | None = None,
+        allow_legacy_layout: bool = False,
         single_ready: bool | None = None,
         residual_tma: bool | None = None,
-        group_scale_tma: bool | None = None,
         cross_stage_retire: bool | None = None,
         single_partial: bool | None = None,
         split_m64_tail: bool | None = None,
+        expert_n_major: bool | None = None,
+        empty_family_early_exit: bool | None = None,
+        prefer_n64_main: bool | None = None,
+        m64_stages: int | None = None,
+        m128_stages: int | None = None,
+        tma_cache_capacity: int | None = None,
         shared_schedule_workspace: Optional[_W4A8ScheduleWorkspace] = None,
         counter_bank: int = 0,
     ) -> None:
-        from ......fused_moe.sm90_nvfp4_repack import NVFP4SM90WeightViewV3
+        from ......fused_moe.sm90_nvfp4_repack import (
+            NVFP4SM90WeightViewV3,
+            NVFP4SM90WeightViewV4,
+        )
 
-        if not isinstance(weight_view, NVFP4SM90WeightViewV3):
-            raise TypeError("weight_view must be NVFP4SM90WeightViewV3")
+        if not isinstance(weight_view, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)):
+            raise TypeError("weight_view must be an NVFP4 SM90 W4A8 view")
         weight_view.verify_checksums()
         self.max_m = int(max_m)
         if self.max_m < 0:
             raise ValueError("max_m must be non-negative")
         self.weight_view = weight_view
-        (
-            self.bucket_experts,
-            self.logical_n,
-            self.logical_k,
-        ) = weight_view.manifest.logical_shape
-        padded_experts, self.padded_n, self.padded_k = weight_view.manifest.padded_shape
+        logical_shape = weight_view.manifest.logical_shape
+        self.bucket_experts = int(logical_shape[0])
+        self.logical_n = int(logical_shape[1])
+        self.logical_k = int(logical_shape[2])
+        padded_shape = weight_view.manifest.padded_shape
+        padded_experts = int(padded_shape[0])
+        self.padded_n = int(padded_shape[1])
+        self.padded_k = int(padded_shape[2])
         if padded_experts != self.bucket_experts:
             raise ValueError("logical and padded expert counts must match")
         if self.padded_n % 64 != 0 or self.padded_k % 128 != 0:
@@ -556,13 +656,31 @@ class Sm90W4A8GroupedGemm:
             decode_vector=decode_vector,
             generic_decode_lut=generic_decode_lut,
             overlap=overlap,
+            payload_layout=payload_layout,
             single_ready=single_ready,
             residual_tma=residual_tma,
-            group_scale_tma=group_scale_tma,
             cross_stage_retire=cross_stage_retire,
             single_partial=single_partial,
             split_m64_tail=split_m64_tail,
+            expert_n_major=expert_n_major,
+            empty_family_early_exit=empty_family_early_exit,
+            prefer_n64_main=prefer_n64_main,
+            m64_stages=m64_stages,
+            m128_stages=m128_stages,
+            tma_cache_capacity=tma_cache_capacity,
         )
+        if self.optimization_knobs.payload_layout == 3 and not allow_legacy_layout:
+            raise ValueError(
+                "payload_layout=3 is a legacy oracle and requires "
+                "allow_legacy_layout=True"
+            )
+        if (
+            weight_view.manifest.layout_version
+            != self.optimization_knobs.payload_layout
+        ):
+            raise ValueError(
+                "W4A8 weight layout does not match the compiled payload layout"
+            )
         device = weight_view.packed_e2m1.device
         if device.type != "cuda":
             raise ValueError("SM90 W4A8 weights must be on CUDA")
@@ -582,7 +700,8 @@ class Sm90W4A8GroupedGemm:
                 )
             if shared_schedule_workspace.signature != self.schedule_signature:
                 raise ValueError(
-                    "shared W4A8 schedule requires identical row capacity, experts, mapping, device, and M-tail policy"
+                    "shared W4A8 schedule requires identical row capacity, experts, "
+                    "mapping, device, and M-tail policy"
                 )
             workspace = shared_schedule_workspace.tensor
             if workspace.device != device:
@@ -596,7 +715,20 @@ class Sm90W4A8GroupedGemm:
         self._compiled_module = load_sm90_push_nvfp4_w4a8_gemm_module(
             **_knob_arguments(self.optimization_knobs)
         )
-        self.ffi_runner = self._compiled_module.init()
+        if (
+            self.optimization_knobs.m64_stages == 3
+            and self.optimization_knobs.m128_stages == 4
+            and not self.optimization_knobs.prefer_n64_main
+            and self.optimization_knobs.tma_cache_capacity == 128
+        ):
+            self.ffi_runner = self._compiled_module.init()
+        else:
+            self.ffi_runner = self._compiled_module.init_with_tactics(
+                self.optimization_knobs.m64_stages,
+                self.optimization_knobs.m128_stages,
+                bool(self.optimization_knobs.prefer_n64_main),
+                self.optimization_knobs.tma_cache_capacity,
+            )
         self.workspace_size = int(
             self.ffi_runner.get_workspace_size(
                 self.max_m,
@@ -625,6 +757,14 @@ class Sm90W4A8GroupedGemm:
             self.schedule_workspace = shared_schedule_workspace
             self.workspace = workspace
             self.ffi_runner.configure_workspace_bank(workspace, self.counter_bank)
+        self.resource_status = self._resource_status()
+        self.required_resource_variants = self._required_resource_variants()
+        for name, entry in self.resource_status.items():
+            entry["required"] = name in self.required_resource_variants
+        self.usable = all(
+            self.resource_status[name]["usable"]
+            for name in self.required_resource_variants
+        )
 
     def _allocate_output(
         self, activation: torch.Tensor, dtype: torch.dtype
@@ -655,6 +795,73 @@ class Sm90W4A8GroupedGemm:
             result[output_kind] = variants
         return result
 
+    def _resource_status(self) -> dict[str, dict[str, int | str | bool | None]]:
+        status: dict[str, dict[str, int | str | bool | None]] = {}
+        for block_m in SUPPORTED_BLOCK_M:
+            for block_n in SUPPORTED_BLOCK_N:
+                (
+                    registers,
+                    local_bytes,
+                    stack_bytes,
+                    producer_registers,
+                    consumer_register_cap,
+                    register_limit,
+                    blocks_per_sm,
+                ) = map(
+                    int,
+                    self.ffi_runner.kernel_resources(block_m, block_n, False),
+                )
+                reason = None
+                if local_bytes > _MAX_LOCAL_MEMORY_BYTES_PER_THREAD:
+                    reason = (
+                        f"local memory is {local_bytes} bytes per thread, exceeding "
+                        f"the {_MAX_LOCAL_MEMORY_BYTES_PER_THREAD}-byte limit"
+                    )
+                # numRegs is the whole-kernel maximum across specialized warp
+                # roles, while consumer_registers is a per-warp setmaxnreg target.
+                status[f"m{block_m}_n{block_n}"] = {
+                    "usable": reason is None,
+                    "reason": reason,
+                    "num_regs": registers,
+                    "local_size_bytes": local_bytes,
+                    "stack_bytes": None if stack_bytes < 0 else stack_bytes,
+                    "producer_registers": producer_registers,
+                    "consumer_register_cap": consumer_register_cap,
+                    "consumer_registers": register_limit,
+                    "blocks_per_sm": blocks_per_sm,
+                }
+        return status
+
+    def _required_resource_variants(self) -> tuple[str, ...]:
+        block_ms: tuple[int, ...] = (
+            (64, 128) if self.optimization_knobs.split_m64_tail else (128,)
+        )
+        block_ns: tuple[int, ...]
+        if self.optimization_knobs.prefer_n64_main:
+            block_ns = (64,)
+        else:
+            block_ns = tuple(
+                block_n
+                for block_n, enabled in (
+                    (128, self.padded_n >= 128),
+                    (64, self.padded_n % 128 != 0),
+                )
+                if enabled
+            )
+        return tuple(
+            f"m{block_m}_n{block_n}" for block_m in block_ms for block_n in block_ns
+        )
+
+    def _require_usable_resources(self) -> None:
+        if self.usable:
+            return
+        reasons = ", ".join(
+            f"{name}: {self.resource_status[name]['reason']}"
+            for name in self.required_resource_variants
+            if not self.resource_status[name]["usable"]
+        )
+        raise RuntimeError(f"SM90 W4A8 kernel resource guard rejected {reasons}")
+
     def _prepared_schedule(
         self, activation: torch.Tensor, offsets: torch.Tensor
     ) -> _PreparedSchedule:
@@ -677,6 +884,7 @@ class Sm90W4A8GroupedGemm:
         trusted_offsets: bool = False,
         prepare_schedule: bool = True,
     ) -> torch.Tensor:
+        self._require_usable_resources()
         if out is None:
             out = self._allocate_output(activation, torch.bfloat16)
         if prepare_schedule:
@@ -723,9 +931,9 @@ class Sm90W4A8GroupedGemm:
     def debug_decode(self, *, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Decode one operand image for internal correctness tests."""
         if out is None:
-            packed_shape = tuple(self.weight_view.packed_e2m1.shape)
+            experts, padded_n, padded_k = self.weight_view.manifest.padded_shape
             out = torch.empty(
-                (*packed_shape[:-1], packed_shape[-1] * 2),
+                (experts, padded_k // 32, padded_n // 64, 64, 32),
                 dtype=torch.uint8,
                 device=self.weight_view.packed_e2m1.device,
             )
@@ -746,6 +954,7 @@ class Sm90W4A8GroupedGemm:
         trusted_offsets: bool = False,
     ) -> torch.Tensor:
         """Run the FP32-output path for internal correctness tests."""
+        self._require_usable_resources()
         if out is None:
             out = self._allocate_output(activation, torch.float32)
         if self.counter_bank != 0:
@@ -782,12 +991,19 @@ def create_sm90_push_nvfp4_w4a8_gemm(
     decode_vector: bool | None = None,
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
+    payload_layout: int | None = None,
+    allow_legacy_layout: bool = False,
     single_ready: bool | None = None,
     residual_tma: bool | None = None,
-    group_scale_tma: bool | None = None,
     cross_stage_retire: bool | None = None,
     single_partial: bool | None = None,
     split_m64_tail: bool | None = None,
+    expert_n_major: bool | None = None,
+    empty_family_early_exit: bool | None = None,
+    prefer_n64_main: bool | None = None,
+    m64_stages: int | None = None,
+    m128_stages: int | None = None,
+    tma_cache_capacity: int | None = None,
     shared_schedule_workspace: Optional[_W4A8ScheduleWorkspace] = None,
     counter_bank: int = 0,
 ) -> Sm90W4A8GroupedGemm:
@@ -798,12 +1014,19 @@ def create_sm90_push_nvfp4_w4a8_gemm(
         decode_vector=decode_vector,
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
+        payload_layout=payload_layout,
+        allow_legacy_layout=allow_legacy_layout,
         single_ready=single_ready,
         residual_tma=residual_tma,
-        group_scale_tma=group_scale_tma,
         cross_stage_retire=cross_stage_retire,
         single_partial=single_partial,
         split_m64_tail=split_m64_tail,
+        expert_n_major=expert_n_major,
+        empty_family_early_exit=empty_family_early_exit,
+        prefer_n64_main=prefer_n64_main,
+        m64_stages=m64_stages,
+        m128_stages=m128_stages,
+        tma_cache_capacity=tma_cache_capacity,
         shared_schedule_workspace=shared_schedule_workspace,
         counter_bank=counter_bank,
     )

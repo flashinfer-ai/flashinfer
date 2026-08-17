@@ -13,13 +13,18 @@ from flashinfer.fused_moe.nvfp4_checkpoint import (
     reference_dequantize_nvfp4,
 )
 from flashinfer.fused_moe.sm90_nvfp4_repack import (
+    _build_w4a8_v3_legacy_oracle,
     NVFP4_RS_LAYOUT_VERSION,
     NVFP4_SM90_K_ALIGNMENT,
     NVFP4_SM90_LAYOUT_VERSION,
+    NVFP4_SM90_STAGE_LAYOUT_VERSION,
+    NVFP4SM90WeightViewV4,
     NVFP4V3Manifest,
     build_nvfp4_rs_weight_view,
+    build_w4a8_v4_views,
     convert_nvfp4_rs_v2_to_v3,
     reference_dequantize_nvfp4_sm90_v3_promoted,
+    repack_nvfp4_sm90_w4a8,
     repack_nvfp4_sm90_v3,
     repack_nvfp4_sm90_v3_selected,
     unpack_nvfp4_payload_v2,
@@ -202,6 +207,78 @@ def test_v3_semantic_roundtrip_and_determinism(group_size, residual_scheme):
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("residual_scheme", ["generic", "pow2"])
+def test_v4_stage_layout_is_a_byte_exact_reorder(group_size, residual_scheme):
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(physical_k=128, logical_k=113),
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+    )
+    first = build_w4a8_v4_views(v3)
+    second = build_w4a8_v4_views(v3)
+    restored = _build_w4a8_v3_legacy_oracle(first)
+
+    assert first.manifest.layout_version == NVFP4_SM90_STAGE_LAYOUT_VERSION
+    assert first.manifest.source_manifest.to_dict() == v3.manifest.to_dict()
+    assert first.manifest.metadata_dict() == second.manifest.metadata_dict()
+    assert first.manifest.checksums == second.manifest.checksums
+    assert torch.equal(first.packed_e2m1, second.packed_e2m1)
+    assert torch.equal(first.promotion_residual, second.promotion_residual)
+    assert torch.equal(restored.packed_e2m1, v3.packed_e2m1)
+    assert torch.equal(restored.promotion_residual, v3.promotion_residual)
+    assert torch.equal(
+        restored.scale_e4m3_per16.view(torch.uint8),
+        v3.scale_e4m3_per16.view(torch.uint8),
+    )
+    assert torch.equal(restored.promotion_group_scale, v3.promotion_group_scale)
+    assert torch.equal(restored.global_alpha, v3.global_alpha)
+    assert restored.manifest.to_dict() == v3.manifest.to_dict()
+
+
+def test_w4a8_production_repack_defaults_to_v4_and_gates_v3_oracle():
+    checkpoint = _checkpoint(physical_k=128, logical_k=113)
+    default = repack_nvfp4_sm90_w4a8(
+        checkpoint,
+        group_size=64,
+        residual_scheme="generic",
+    )
+
+    assert isinstance(default, NVFP4SM90WeightViewV4)
+    assert default.manifest.layout_version == NVFP4_SM90_STAGE_LAYOUT_VERSION
+    with pytest.raises(ValueError, match="allow_legacy_layout"):
+        repack_nvfp4_sm90_w4a8(
+            checkpoint,
+            group_size=64,
+            residual_scheme="generic",
+            payload_layout=3,
+        )
+    legacy = repack_nvfp4_sm90_w4a8(
+        checkpoint,
+        group_size=64,
+        residual_scheme="generic",
+        payload_layout=3,
+        allow_legacy_layout=True,
+    )
+    assert legacy.manifest.layout_version == NVFP4_SM90_LAYOUT_VERSION
+
+
+@pytest.mark.parametrize("residual_scheme", ["generic", "pow2"])
+def test_v4_checksum_rejects_reordered_storage_corruption(residual_scheme):
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(physical_k=128, logical_k=113),
+        group_size=128,
+        residual_scheme=residual_scheme,
+    )
+    v4 = build_w4a8_v4_views(v3)
+    payload = v4.packed_e2m1.clone()
+    payload.view(-1)[0] ^= 1
+    corrupted = replace(v4, packed_e2m1=payload)
+
+    with pytest.raises(ValueError, match="checksum"):
+        corrupted.verify_checksums()
 
 
 @pytest.mark.parametrize("group_size", [32, 64, 128])

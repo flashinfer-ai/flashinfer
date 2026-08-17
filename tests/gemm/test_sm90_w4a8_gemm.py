@@ -17,13 +17,17 @@ limitations under the License.
 import subprocess
 import sys
 from dataclasses import fields, replace
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
-from flashinfer.fused_moe.sm90_nvfp4_repack import repack_nvfp4_sm90_v3
+from flashinfer.fused_moe.sm90_nvfp4_repack import (
+    build_w4a8_v4_views,
+    repack_nvfp4_sm90_v3,
+)
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_w4a8_gemm import (
     STATIC_VARIANT_COUNT,
@@ -160,7 +164,7 @@ def _nonuniform_activation_scales(
 
 
 def test_sm90_w4a8_static_variant_matrix_and_uri():
-    assert STATIC_VARIANT_COUNT == 24
+    assert STATIC_VARIANT_COUNT == 48
     assert SUPPORTED_BLOCK_M == (64, 128)
     assert SUPPORTED_BLOCK_N == (64, 128)
     assert SUPPORTED_GROUP_SIZES == (32, 64, 128)
@@ -171,13 +175,12 @@ def test_sm90_w4a8_static_variant_matrix_and_uri():
         overlap=False,
         single_ready=False,
         residual_tma=True,
-        group_scale_tma=False,
         cross_stage_retire=False,
         single_partial=True,
         split_m64_tail=True,
     )
     assert uri.startswith(
-        "sm90_push_nvfp4_w4a8_gemm_v1_dv1_dl1_ov0_sr0_rt1_gt0_cr0_sp1_mt1_"
+        "sm90_push_nvfp4_w4a8_gemm_v2_dv1_dl1_ov0_sr0_rt1_cr0_sp1_mt1_en0_ef0_pv4_"
     )
 
 
@@ -189,14 +192,9 @@ def test_sm90_w4a8_optimization_flags_are_content_addressed():
     axis_contract = (
         ("decode_vector", "W4A8_DECODE_VECTOR", 1),
         ("generic_decode_lut", "W4A8_GENERIC_DECODE_LUT", 1),
-        ("overlap", "W4A8_OVERLAP", 0),
+        ("overlap", "W4A8_OVERLAP", 1),
         ("single_ready", "W4A8_SINGLE_READY", 0),
         ("residual_tma", "W4A8_RESIDUAL_TMA", 1),
-        (
-            "group_scale_tma",
-            "W4A8_GROUP_SCALE_TMA",
-            0,
-        ),
         (
             "cross_stage_retire",
             "W4A8_CROSS_STAGE_RETIRE",
@@ -208,16 +206,26 @@ def test_sm90_w4a8_optimization_flags_are_content_addressed():
             "W4A8_SPLIT_M64_TAIL",
             1,
         ),
+        ("expert_n_major", "W4A8_EXPERT_N_MAJOR", 0),
+        ("empty_family_early_exit", "W4A8_EMPTY_FAMILY_EARLY_EXIT", 0),
     )
-    assert tuple(field.name for field in fields(w4a8_gemm._OptimizationKnobs)) == tuple(
-        name for name, _macro, _default in axis_contract
+    runtime_fields = (
+        "payload_layout",
+        "prefer_n64_main",
+        "m64_stages",
+        "m128_stages",
+        "tma_cache_capacity",
+    )
+    assert (
+        tuple(field.name for field in fields(w4a8_gemm._OptimizationKnobs))
+        == tuple(name for name, _macro, _default in axis_contract) + runtime_fields
     )
     assert (
         tuple(
             (name, tag, macro, default)
             for (name, macro, default), tag in zip(
                 axis_contract,
-                ("dv", "dl", "ov", "sr", "rt", "gt", "cr", "sp", "mt"),
+                ("dv", "dl", "ov", "sr", "rt", "cr", "sp", "mt", "en", "ef"),
                 strict=True,
             )
         )
@@ -227,13 +235,19 @@ def test_sm90_w4a8_optimization_flags_are_content_addressed():
     assert defaults == w4a8_gemm._OptimizationKnobs(
         decode_vector=1,
         generic_decode_lut=1,
-        overlap=0,
+        overlap=1,
         single_ready=0,
         residual_tma=1,
-        group_scale_tma=0,
         cross_stage_retire=0,
         single_partial=1,
         split_m64_tail=1,
+        expert_n_major=0,
+        empty_family_early_exit=0,
+        payload_layout=4,
+        prefer_n64_main=0,
+        m64_stages=3,
+        m128_stages=4,
+        tma_cache_capacity=128,
     )
     flags = w4a8_gemm._cuda_flags(defaults)
     for name, macro, default in axis_contract:
@@ -293,13 +307,14 @@ def test_sm90_w4a8_loaded_module_cache_tracks_optimization_knobs(monkeypatch):
     default_kwargs = {
         "decode_vector": True,
         "generic_decode_lut": True,
-        "overlap": False,
+        "overlap": True,
         "single_ready": False,
         "residual_tma": True,
-        "group_scale_tma": True,
-        "cross_stage_retire": True,
-        "single_partial": False,
+        "cross_stage_retire": False,
+        "single_partial": True,
         "split_m64_tail": True,
+        "expert_n_major": False,
+        "empty_family_early_exit": False,
     }
     variants = [default_kwargs]
     for name in default_kwargs:
@@ -309,6 +324,8 @@ def test_sm90_w4a8_loaded_module_cache_tracks_optimization_knobs(monkeypatch):
             variant["generic_decode_lut"] = False
         if name == "single_partial":
             variant["cross_stage_retire"] = False
+        if name == "cross_stage_retire":
+            variant["single_partial"] = False
         variants.append(variant)
 
     modules = []
@@ -358,14 +375,11 @@ def test_sm90_w4a8_decoded_stage_publication_is_switchable():
     assert initialization in kernel
     assert "#if!W4A8_SINGLE_READYtemplate<intBlockN>" in kernel
     publication = (
-        "if(wrote){fence_decoded_writer();"
-        "#if!W4A8_SINGLE_READY"
-        "decoded_ready->arrive();"
-        "#endif"
-        "}"
+        "if(wrote){fence_decoded_writer();}"
         "cutlass::arch::NamedBarrier(kProducerThreads,kProducerNamedBarrier).sync();"
         "#ifW4A8_SINGLE_READY"
         "if(producer_thread==0){decoded_ready->arrive();}"
+        "#elseif(wrote){decoded_ready->arrive();}"
         "#endif"
     )
     assert publication in kernel
@@ -394,7 +408,7 @@ def test_sm90_w4a8_generic_decode_lut_keeps_scalar_and_pow2_fallbacks():
     assert "run_scalar_task" in decode
 
 
-def test_sm90_w4a8_tma_axes_control_storage_transactions_and_arguments():
+def test_sm90_w4a8_residual_tma_and_global_scale_contract():
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
         nvfp4_w4a8_gemm as w4a8_gemm,
     )
@@ -409,16 +423,15 @@ def test_sm90_w4a8_tma_axes_control_storage_transactions_and_arguments():
     binding = "".join(sources["binding.cu"].split())
 
     assert (
-        "#ifW4A8_RESIDUAL_TMA"
+        "#ifW4A8_RESIDUAL_TMA#ifW4A8_PAYLOAD_V4"
         "alignas(1024)ResidualStorageresidual"
+        "[kStages][BlockN][kBlockK/kV3ResidualBlockK];"
+        "#elsealignas(1024)ResidualStorageresidual"
         "[kStages][kBlockK/kV3PayloadTileK][BlockN][kV3ResidualsPerPayloadTile];"
-        "#endif" in kernel
+        "#endif#endif" in kernel
     )
-    assert (
-        "#ifW4A8_GROUP_SCALE_TMA"
-        "alignas(1024)floatgroup_scales[kStages][kGroupsPerStage][BlockN];"
-        "#endif" in kernel
-    )
+    assert "W4A8_GROUP_SCALE_TMA" not in kernel
+    assert "W4A8_GROUP_SCALE_STAGING" not in kernel
     assert (
         "#ifW4A8_RESIDUAL_TMA"
         "constexprintkResidualStageBytes="
@@ -426,13 +439,8 @@ def test_sm90_w4a8_tma_axes_control_storage_transactions_and_arguments():
         "#elseconstexprintkResidualStageBytes=0;#endif" in kernel
     )
     assert (
-        "#ifW4A8_GROUP_SCALE_TMA"
-        "constexprintkGroupScaleStageBytes=BlockN*kGroupsPerStage*sizeof(float);"
-        "#elseconstexprintkGroupScaleStageBytes=0;#endif" in kernel
-    )
-    assert (
-        "kActivationStageBytes+kRawStageBytes+kResidualStageBytes+"
-        "kGroupScaleStageBytes" in kernel
+        "kExpectedBytes=kActivationStageBytes+kRawStageBytes+"
+        "kResidualStageBytes" in kernel
     )
     assert "arrive_and_expect_tx(kExpectedBytes)" in kernel
     assert "producer_decode_global_stage<BlockN,Scheme>" in kernel
@@ -442,17 +450,15 @@ def test_sm90_w4a8_tma_axes_control_storage_transactions_and_arguments():
     assert "#ifW4A8_RESIDUAL_TMA" in instantiation
     assert "params.residual_map" in instantiation
     assert "params.residual" in instantiation
-    assert "#ifW4A8_GROUP_SCALE_TMA" in instantiation
-    assert "params.group_scale_map" in instantiation
     assert "params.group_scales" in instantiation
     assert "#if!W4A8_RESIDUAL_TMAconstvoid*residual;#endif" in launchers
-    assert "#if!W4A8_GROUP_SCALE_TMAconstfloat*group_scales;#endif" in launchers
+    assert "constfloat*group_scales;" in launchers
     assert "#ifW4A8_RESIDUAL_TMACUtensorMapresidual_map;#endif" in launchers
-    assert "#ifW4A8_GROUP_SCALE_TMACUtensorMapgroup_scale_map;#endif" in launchers
-    assert "#if!W4A8_RESIDUAL_TMAresidual_ptr_=residual.data_ptr();#endif" in binding
     assert (
-        "#if!W4A8_GROUP_SCALE_TMA"
-        "group_scales_ptr_=static_cast<constfloat*>(group_scales.data_ptr());#endif"
+        "#if!W4A8_RESIDUAL_TMAresolved.residual=residual.data_ptr();#endif" in binding
+    )
+    assert (
+        "resolved.group_scales=static_cast<constfloat*>(group_scales.data_ptr());"
         in binding
     )
 
@@ -509,7 +515,7 @@ def test_sm90_w4a8_retirement_and_tail_axes_keep_complete_fallbacks():
         "constint64_ttiles_m128=ceil_div_nonnegative(rows,128);"
         "#endif" in binding
     )
-    assert binding.count("#ifW4A8_SPLIT_M64_TAILlaunch_tile_family<DebugFp32,64,") == 2
+    assert binding.count("#ifW4A8_SPLIT_M64_TAILlaunch_tile_family<DebugFp32,64,") == 3
 
 
 def test_sm90_w4a8_split_tus_flags_and_launch_bounds_are_source_visible():
@@ -568,8 +574,14 @@ def test_sm90_w4a8_split_tus_flags_and_launch_bounds_are_source_visible():
     binding = "".join(sources["binding.cu"].split())
     assert 'if(name=="kernel_resource_usage")' in binding
     assert "resource.local_memory_bytes" in binding
-    assert "bf16_resources->num_regs,variant.register_footprint_target" in binding
+    assert 'if(name=="kernel_resources")' in binding
+    assert "variant.consumer_register_cap" in binding
     assert "fp32_resources->blocks_per_sm,1" in binding
+    shim = "".join(
+        (Path(w4a8_gemm.__file__).resolve()).read_text(encoding="utf-8").split()
+    )
+    assert "def_require_usable_resources(self)->None:" in shim
+    assert "self._require_usable_resources()" in shim
     kernel_source = sources["kernel.cuh"]
     bf16_declaration = "".join(
         kernel_source.split("grouped_w4a8_bf16_kernel", 1)[0]
@@ -586,15 +598,23 @@ def test_sm90_w4a8_split_tus_flags_and_launch_bounds_are_source_visible():
     assert "#defineW4A8_DECODE_VECTOR1" in compile_switches
     assert "#defineW4A8_GENERIC_DECODE_LUT1" in compile_switches
     assert "#defineW4A8_OVERLAP0" in compile_switches
-    assert "W4A8LaunchTraits<BlockM,BlockN>::kThreads" in kernel
+    assert "-DW4A8_OVERLAP=1" in w4a8_gemm._cuda_flags(w4a8_gemm._optimization_knobs())
+    assert "W4A8LaunchTraits<BlockM,BlockN,PipelineStages>::kThreads" in kernel
     assert (
         "ifconstexpr(!std::is_same_v<Output,float>){"
         "if(is_consumer){cutlass::arch::warpgroup_reg_alloc<kConsumerRegisters>();}"
-        "else{cutlass::arch::warpgroup_reg_dealloc<40>();}}" in kernel
+        "else{cutlass::arch::warpgroup_reg_dealloc<"
+        "Traits::kProducerRegisters>();}}" in kernel
     )
-    assert "W4A8LaunchTraits<BlockM,BlockN>::kMinBlocksPerSm" in bf16_declaration
+    assert (
+        "W4A8LaunchTraits<BlockM,BlockN,PipelineStages>::kMinBlocksPerSm"
+        in bf16_declaration
+    )
     assert "kDebugMinBlocksPerSm" not in bf16_declaration
-    assert "W4A8LaunchTraits<BlockM,BlockN>::kDebugMinBlocksPerSm" in fp32_declaration
+    assert (
+        "W4A8LaunchTraits<BlockM,BlockN,PipelineStages>::kDebugMinBlocksPerSm"
+        in fp32_declaration
+    )
     assert "kMinBlocksPerSm" not in fp32_declaration.replace("kDebugMinBlocksPerSm", "")
 
 
@@ -697,6 +717,8 @@ def test_sm90_w4a8_operand_byte_gate(decode_vector, group_size, residual_scheme)
         decode_vector=decode_vector,
         generic_decode_lut=decode_vector,
         overlap=True,
+        payload_layout=3,
+        allow_legacy_layout=True,
     )
     actual = runner.debug_decode()
     expected = simulate_w4a8_operand_bytes(
@@ -705,6 +727,125 @@ def test_sm90_w4a8_operand_byte_gate(decode_vector, group_size, residual_scheme)
         residual_scheme=residual_scheme,
     )
     assert torch.equal(actual, expected)
+
+
+@requires_sm90
+@pytest.mark.parametrize("decode_vector", (False, True), ids=("scalar", "vector"))
+@pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
+@pytest.mark.parametrize("residual_scheme", SUPPORTED_RESIDUAL_SCHEMES)
+def test_sm90_w4a8_v4_operand_byte_gate(decode_vector, group_size, residual_scheme):
+    device = torch.device("cuda")
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(device, rows=192, columns=256),
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+    )
+    v4 = build_w4a8_v4_views(v3)
+    runner = create_sm90_push_nvfp4_w4a8_gemm(
+        1,
+        v4,
+        decode_vector=decode_vector,
+        generic_decode_lut=decode_vector,
+        overlap=True,
+        payload_layout=4,
+    )
+
+    actual = runner.debug_decode()
+    expected = simulate_w4a8_operand_bytes(
+        v3.packed_e2m1,
+        v3.promotion_residual,
+        residual_scheme=residual_scheme,
+    )
+    assert torch.equal(actual, expected)
+
+
+@requires_sm90
+@pytest.mark.parametrize("residual_scheme", SUPPORTED_RESIDUAL_SCHEMES)
+def test_sm90_w4a8_v4_vector_residual_index_keeps_each_n64_block(
+    residual_scheme,
+):
+    device = torch.device("cuda")
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(device, rows=192, columns=256),
+        group_size=128,
+        residual_scheme=residual_scheme,
+    )
+    for n64 in range(v3.promotion_residual.shape[2]):
+        if residual_scheme == "generic":
+            v3.promotion_residual[:, :, n64].fill_(0.5 + n64)
+        else:
+            v3.promotion_residual[:, :, n64].fill_(n64 - 1)
+    v4 = build_w4a8_v4_views(v3, verify_checksums=False)
+    runner = create_sm90_push_nvfp4_w4a8_gemm(
+        1,
+        v4,
+        decode_vector=True,
+        generic_decode_lut=True,
+        overlap=True,
+        payload_layout=4,
+    )
+
+    actual = runner.debug_decode()
+    expected = simulate_w4a8_operand_bytes(
+        v3.packed_e2m1,
+        v3.promotion_residual,
+        residual_scheme=residual_scheme,
+    )
+    assert torch.equal(actual, expected)
+
+
+@requires_sm90
+@pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
+@pytest.mark.parametrize("residual_scheme", SUPPORTED_RESIDUAL_SCHEMES)
+def test_sm90_w4a8_v4_matches_v3_grouped_gemm(group_size, residual_scheme):
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    rows = 129
+    columns = 256
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(device, experts=2, rows=192, columns=columns),
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+    )
+    v4 = build_w4a8_v4_views(v3)
+    activation = torch.randn(rows, columns, device=device).to(torch.float8_e4m3fn)
+    activation_scales = _nonuniform_activation_scales(
+        columns // 128,
+        (rows + 2 * 31) // 32 * 32,
+        device,
+    )
+    offsets = torch.tensor([0, 65, rows], dtype=torch.int64, device=device)
+    v3_runner = create_sm90_push_nvfp4_w4a8_gemm(
+        rows, v3, payload_layout=3, allow_legacy_layout=True
+    )
+    v4_runner = create_sm90_push_nvfp4_w4a8_gemm(rows, v4, payload_layout=4)
+
+    assert torch.equal(
+        v4_runner.run_debug_fp32(activation, activation_scales, offsets),
+        v3_runner.run_debug_fp32(activation, activation_scales, offsets),
+    )
+    assert torch.equal(
+        v4_runner.run(activation, activation_scales, offsets),
+        v3_runner.run(activation, activation_scales, offsets),
+    )
+
+
+@requires_sm90
+def test_sm90_w4a8_payload_layout_mismatch_fails_before_launch():
+    device = torch.device("cuda")
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(device), group_size=128, residual_scheme="generic"
+    )
+    v4 = build_w4a8_v4_views(v3)
+
+    with pytest.raises(ValueError, match="allow_legacy_layout"):
+        create_sm90_push_nvfp4_w4a8_gemm(1, v3, payload_layout=3)
+    with pytest.raises(ValueError, match="layout"):
+        create_sm90_push_nvfp4_w4a8_gemm(1, v3, payload_layout=4)
+    with pytest.raises(ValueError, match="layout"):
+        create_sm90_push_nvfp4_w4a8_gemm(
+            1, v4, payload_layout=3, allow_legacy_layout=True
+        )
 
 
 @requires_sm90
@@ -725,6 +866,7 @@ def test_sm90_w4a8_generic_lut_matches_scalar_for_all_bf16_residual_bits():
         module = load_sm90_push_nvfp4_w4a8_gemm_module(
             decode_vector=decode_vector,
             generic_decode_lut=generic_decode_lut,
+            payload_layout=3,
         )
         ffi_runner = module.init()
         workspace_size = int(
@@ -764,6 +906,7 @@ def test_sm90_w4a8_pow2_operand_gate_exhausts_int8_exponents(decode_vector):
         decode_vector=decode_vector,
         generic_decode_lut=decode_vector,
         overlap=True,
+        payload_layout=3,
     )
     ffi_runner = module.init()
     workspace_size = int(
@@ -798,7 +941,9 @@ def test_sm90_w4a8_output_gates(group_size, residual_scheme, logical_n):
         columns // 128, padded_stride, device
     )
     offsets = torch.tensor([0, rows], dtype=torch.int64, device=device)
-    runner = create_sm90_push_nvfp4_w4a8_gemm(rows, view)
+    runner = create_sm90_push_nvfp4_w4a8_gemm(
+        rows, view, payload_layout=3, allow_legacy_layout=True
+    )
     expected = _grouped_reference(activation, activation_scales, view, offsets)
 
     debug_output = runner.run_debug_fp32(activation, activation_scales, offsets)
@@ -832,6 +977,8 @@ def test_sm90_w4a8_m_boundaries(rows, split_m64_tail):
         rows,
         view,
         split_m64_tail=split_m64_tail,
+        payload_layout=3,
+        allow_legacy_layout=True,
     )
 
     debug_output = runner.run_debug_fp32(activation, activation_scales, offsets)
@@ -874,6 +1021,8 @@ def test_sm90_w4a8_m_tail_strategies_cover_multiple_experts(split_m64_tail):
         total_rows,
         view,
         split_m64_tail=split_m64_tail,
+        payload_layout=3,
+        allow_legacy_layout=True,
     )
 
     expected = _grouped_reference(activation, activation_scales, view, offsets)
@@ -888,39 +1037,16 @@ def test_sm90_w4a8_m_tail_strategies_cover_multiple_experts(split_m64_tail):
     "optimization",
     (
         {"decode_vector": False, "generic_decode_lut": False},
-        {"overlap": True},
+        {"overlap": False},
         {"single_ready": True},
         {"single_ready": True, "residual_tma": False},
-        {"group_scale_tma": False},
-        {
-            "single_ready": True,
-            "residual_tma": False,
-            "group_scale_tma": False,
-        },
-        {
-            "single_ready": True,
-            "residual_tma": False,
-            "group_scale_tma": False,
-            "cross_stage_retire": False,
-        },
-        {
-            "single_ready": True,
-            "residual_tma": False,
-            "group_scale_tma": False,
-            "cross_stage_retire": False,
-            "single_partial": True,
-        },
         {"split_m64_tail": False},
     ),
     ids=(
         "scalar_decode",
-        "overlap",
+        "no_overlap",
         "single_ready",
         "global_residual",
-        "global_group_scale_only",
-        "global_group_scale",
-        "per_stage_double_partial",
-        "per_stage_single_partial",
         "m128_tail",
     ),
 )
@@ -945,6 +1071,8 @@ def test_sm90_w4a8_optimization_switch_matrix(optimization):
     runner = create_sm90_push_nvfp4_w4a8_gemm(
         rows,
         view,
+        payload_layout=3,
+        allow_legacy_layout=True,
         **optimization,
     )
 
@@ -976,6 +1104,8 @@ def _assert_sm90_w4a8_delayed_retirement_case(
         view,
         decode_vector=decode_vector,
         generic_decode_lut=decode_vector,
+        payload_layout=3,
+        allow_legacy_layout=True,
     )
 
     # Delayed retirement must prevent stage reuse until that stage's final WGMMA group retires.
@@ -1023,7 +1153,13 @@ def test_sm90_w4a8_sparse_expert_mapping_uses_source_offsets_and_scale_rows():
     activation = torch.randn(97, 128, device=device).to(torch.float8_e4m3fn)
     padded_stride = (97 + 2 * 31) // 32 * 32
     activation_scales = _nonuniform_activation_scales(1, padded_stride, device)
-    runner = create_sm90_push_nvfp4_w4a8_gemm(97, view, total_experts=2)
+    runner = create_sm90_push_nvfp4_w4a8_gemm(
+        97,
+        view,
+        total_experts=2,
+        payload_layout=3,
+        allow_legacy_layout=True,
+    )
     expected = _grouped_reference(activation, activation_scales, view, offsets)
     output = torch.zeros(97, 64, dtype=torch.float32, device=device)
 
@@ -1055,7 +1191,9 @@ checkpoint = NVFP4Checkpoint(
     payload, scales, torch.ones(1, device="cuda"), (1, 64, 128), (0,), "test"
 )
 view = repack_nvfp4_sm90_v3(checkpoint, group_size=128, residual_scheme="generic")
-runner = create_sm90_push_nvfp4_w4a8_gemm(rows, view)
+runner = create_sm90_push_nvfp4_w4a8_gemm(
+    rows, view, payload_layout=3, allow_legacy_layout=True
+)
 activation = torch.randn(rows, 128, device="cuda").to(torch.float8_e4m3fn)
 activation_scales = torch.ones(1, 32, dtype=torch.float32, device="cuda")
 offsets = torch.tensor([0, rows + 1], dtype=torch.int64, device="cuda")
@@ -1092,7 +1230,9 @@ def test_sm90_w4a8_large_k_soak_uses_independent_operand_reference():
         columns // 128, padded_stride, device
     )
     offsets = torch.tensor([0, rows], dtype=torch.int64, device=device)
-    runner = create_sm90_push_nvfp4_w4a8_gemm(rows, view)
+    runner = create_sm90_push_nvfp4_w4a8_gemm(
+        rows, view, payload_layout=3, allow_legacy_layout=True
+    )
 
     for shot in range(50):
         generator = torch.Generator(device=device).manual_seed(1000 + shot)

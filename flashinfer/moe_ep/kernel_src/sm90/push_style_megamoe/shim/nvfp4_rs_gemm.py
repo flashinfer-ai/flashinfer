@@ -1,6 +1,10 @@
 # Copyright (c) 2026 FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Experimental: the RS (W4A16) track is pending dedicated performance
+validation and is not wired into any default policy.
+"""
+
 import functools
 import hashlib
 import json

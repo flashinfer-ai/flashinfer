@@ -27,16 +27,21 @@ def _make_w4a8_bundle():
         Sm90PushNvFp4Weights,
     )
 
+    w13 = object.__new__(NVFP4SM90WeightViewV3)
+    w2 = object.__new__(NVFP4SM90WeightViewV3)
+    object.__setattr__(w13, "manifest", SimpleNamespace(expert_mapping=(0, 1)))
+    object.__setattr__(w2, "manifest", SimpleNamespace(expert_mapping=(0, 1)))
     bundle = object.__new__(Sm90PushNvFp4Weights)
     object.__setattr__(bundle, "nvfp4_mode", "w4a8")
-    object.__setattr__(bundle, "w13", object.__new__(NVFP4SM90WeightViewV3))
-    object.__setattr__(bundle, "w2", object.__new__(NVFP4SM90WeightViewV3))
+    object.__setattr__(bundle, "w13", w13)
+    object.__setattr__(bundle, "w2", w2)
     return bundle
 
 
 def _make_w4a8_runner(weights):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_runner import (
         Sm90PushNvFp4MoERunner,
+        _LegacyW4A8PairEngine,
     )
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.runner import (
         _RunnerState,
@@ -48,8 +53,11 @@ def _make_w4a8_runner(weights):
     runner._validated_weights = {id(weights): weakref.ref(weights)}
     runner.nvfp4_mode = "w4a8"
     runner.weights = weights
-    runner.fc1 = mock.Mock()
-    runner.fc2 = mock.Mock()
+    engine = object.__new__(_LegacyW4A8PairEngine)
+    engine.total_experts = 2
+    engine.fc1 = mock.Mock()
+    engine.fc2 = mock.Mock()
+    runner._w4a8_engine = engine
     return runner
 
 
@@ -235,6 +243,15 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
             replace(config, rs_stage_k=128),
             replace(config, allow_unverified_p2p=True),
             replace(config, init_timeout_s=30.0),
+            replace(config, tma_cache_capacity=1),
+            replace(config, n64_expected_m_per_sm=2.0),
+            replace(config, payload_layout=3, allow_legacy_layout=True),
+            replace(config, allow_legacy_layout=True),
+            replace(
+                config,
+                weight_policy="dual",
+                acknowledge_dual_residency=True,
+            ),
         )
         assert all(
             _make_backend(value, process_group=group)._workspace_pool_key(fleet)
@@ -284,6 +301,192 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
         )
 
 
+def test_nvfp4_dual_policy_requires_explicit_residency_acknowledgement():
+    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        Sm90PushNvFp4MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        backend as backend_module,
+    )
+
+    fleet = SimpleNamespace(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=128,
+    )
+    bootstrap = SimpleNamespace(world_size=2, stream=0)
+    config = Sm90PushNvFp4MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        weight_policy="dual",
+    )
+    with (
+        mock.patch.object(backend_module, "_validate_sm90_arch"),
+        mock.patch.object(backend_module, "validate_mega_fleet_params"),
+    ):
+        with pytest.raises(MoEEpConfigError, match="acknowledge_dual_residency"):
+            _make_backend(config).validate_init(bootstrap, fleet)
+        _make_backend(replace(config, acknowledge_dual_residency=True)).validate_init(
+            bootstrap, fleet
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"tma_cache_capacity": 0}, "tma_cache_capacity"),
+        ({"tma_cache_capacity": 129}, "tma_cache_capacity"),
+        ({"n64_expected_m_per_sm": 0.0}, "n64_expected_m_per_sm"),
+        ({"n64_expected_m_per_sm": float("nan")}, "n64_expected_m_per_sm"),
+        ({"payload_layout": 2}, "payload_layout"),
+        ({"allow_legacy_layout": 1}, "allow_legacy_layout"),
+    ),
+)
+def test_nvfp4_rejects_invalid_w4a8_tuning_config(changes, message):
+    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        Sm90PushNvFp4MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        backend as backend_module,
+    )
+
+    fleet = SimpleNamespace(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=128,
+    )
+    bootstrap = SimpleNamespace(world_size=2, stream=0)
+    config = replace(
+        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2),
+        **changes,
+    )
+    with (
+        mock.patch.object(backend_module, "_validate_sm90_arch"),
+        mock.patch.object(backend_module, "validate_mega_fleet_params"),
+        pytest.raises(MoEEpConfigError, match=message),
+    ):
+        _make_backend(config).validate_init(bootstrap, fleet)
+
+
+def test_nvfp4_rs_ignores_the_w4a8_payload_layout_selector():
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        Sm90PushNvFp4MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        backend as backend_module,
+    )
+
+    fleet = SimpleNamespace(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=128,
+    )
+    bootstrap = SimpleNamespace(world_size=2, stream=0)
+    config = Sm90PushNvFp4MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        nvfp4_mode="w4a16_rs",
+        payload_layout=4,
+        combine_dtype="bf16",
+        grouped_combine=False,
+        fuse_act=False,
+    )
+    with (
+        mock.patch.object(backend_module, "_validate_sm90_arch"),
+        mock.patch.object(backend_module, "validate_mega_fleet_params"),
+    ):
+        _make_backend(config).validate_init(bootstrap, fleet)
+
+
+def test_nvfp4_w4a8_legacy_layout_requires_explicit_opt_in():
+    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        Sm90PushNvFp4MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        backend as backend_module,
+    )
+
+    fleet = SimpleNamespace(
+        num_experts=8,
+        max_tokens_per_rank=64,
+        token_hidden_size=128,
+    )
+    bootstrap = SimpleNamespace(world_size=2, stream=0)
+    config = Sm90PushNvFp4MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        payload_layout=3,
+    )
+    with (
+        mock.patch.object(backend_module, "_validate_sm90_arch"),
+        mock.patch.object(backend_module, "validate_mega_fleet_params"),
+        pytest.raises(MoEEpConfigError, match="allow_legacy_layout"),
+    ):
+        _make_backend(config).validate_init(bootstrap, fleet)
+
+    with (
+        mock.patch.object(backend_module, "_validate_sm90_arch"),
+        mock.patch.object(backend_module, "validate_mega_fleet_params"),
+    ):
+        _make_backend(replace(config, allow_legacy_layout=True)).validate_init(
+            bootstrap, fleet
+        )
+
+
+def test_nvfp4_residency_estimate_separates_policy_components():
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        estimate_residency,
+    )
+
+    arguments = dict(
+        local_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        group_size=128,
+        residual_scheme="generic",
+    )
+    packed = estimate_residency(policy="packed", **arguments)
+    folded = estimate_residency(policy="folded", **arguments)
+    hybrid = estimate_residency(
+        policy="hot_folded",
+        hot_expert_count=3,
+        **arguments,
+    )
+    dual = estimate_residency(policy="dual", **arguments)
+
+    assert packed.hot_experts == 0
+    assert packed.folded_bytes == 0
+    assert folded.hot_experts == 8
+    assert folded.packed_bytes == 0
+    assert hybrid.hot_experts == 3
+    assert hybrid.packed_bytes == packed.packed_bytes * 5 // 8
+    assert hybrid.folded_bytes == folded.folded_bytes * 3 // 8
+    assert dual.packed_bytes == packed.packed_bytes
+    assert dual.folded_bytes == folded.folded_bytes
+    assert dual.total_bytes == packed.total_bytes + folded.total_bytes
+
+    model_shape = dict(
+        local_experts=8,
+        hidden_size=7168,
+        intermediate_size=2048,
+        group_size=128,
+        residual_scheme="generic",
+    )
+    model_packed = estimate_residency(policy="packed", **model_shape)
+    model_hybrid = estimate_residency(
+        policy="hot_folded",
+        hot_expert_count=1,
+        **model_shape,
+    )
+    incremental_mib = (model_hybrid.total_bytes - model_packed.total_bytes) / float(
+        1 << 20
+    )
+    assert 11.8 < incremental_mib < 11.9
+
+
 def test_nvfp4_destroy_uses_workspace_pool_refcount(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
         Sm90PushNvFp4MegaKernelBackend,
@@ -320,16 +523,17 @@ def test_w4a8_bind_validates_both_views_before_mutating_either_layer():
     new_weights = _make_w4a8_bundle()
     runner = _make_w4a8_runner(old_weights)
     events = []
-    runner.fc1._validate_weight_view.side_effect = lambda view: events.append(
+    engine = runner._w4a8_engine
+    engine.fc1._validate_weight_view.side_effect = lambda view: events.append(
         ("validate_fc1", view)
     )
-    runner.fc2._validate_weight_view.side_effect = lambda view: events.append(
+    engine.fc2._validate_weight_view.side_effect = lambda view: events.append(
         ("validate_fc2", view)
     )
-    runner.fc1._bind_weight_view.side_effect = lambda view: events.append(
+    engine.fc1._bind_weight_view.side_effect = lambda view: events.append(
         ("bind_fc1", view)
     )
-    runner.fc2._bind_weight_view.side_effect = lambda view: events.append(
+    engine.fc2._bind_weight_view.side_effect = lambda view: events.append(
         ("bind_fc2", view)
     )
 
@@ -349,14 +553,15 @@ def test_w4a8_fc2_validation_failure_leaves_fc1_and_bundle_unchanged():
     old_weights = _make_w4a8_bundle()
     new_weights = _make_w4a8_bundle()
     runner = _make_w4a8_runner(old_weights)
-    runner.fc2._validate_weight_view.side_effect = ValueError("invalid FC2")
+    engine = runner._w4a8_engine
+    engine.fc2._validate_weight_view.side_effect = ValueError("invalid FC2")
 
     with pytest.raises(ValueError, match="invalid FC2"):
         runner.bind_weights(new_weights)
 
-    runner.fc1._validate_weight_view.assert_called_once_with(new_weights.w13)
-    runner.fc1._bind_weight_view.assert_not_called()
-    runner.fc2._bind_weight_view.assert_not_called()
+    engine.fc1._validate_weight_view.assert_called_once_with(new_weights.w13)
+    engine.fc1._bind_weight_view.assert_not_called()
+    engine.fc2._bind_weight_view.assert_not_called()
     assert runner.weights is old_weights
     assert runner._bound_weights is old_weights
     assert id(new_weights) not in runner._validated_weights
@@ -375,7 +580,7 @@ def test_w4a8_bind_rejects_staged_runner_before_validation():
     with pytest.raises(RuntimeError, match="only be rebound while idle"):
         runner.bind_weights(new_weights)
 
-    runner.fc1._validate_weight_view.assert_not_called()
-    runner.fc2._validate_weight_view.assert_not_called()
+    runner._w4a8_engine.fc1._validate_weight_view.assert_not_called()
+    runner._w4a8_engine.fc2._validate_weight_view.assert_not_called()
     assert runner.weights is old_weights
     assert runner._bound_weights is old_weights

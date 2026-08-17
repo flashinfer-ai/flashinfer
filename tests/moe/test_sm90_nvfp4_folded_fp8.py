@@ -20,9 +20,11 @@ import pytest
 import torch
 
 from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
+from flashinfer.fused_moe.sm90_nvfp4_repack import NVFP4SM90WeightViewV4
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
     fold_nvfp4_checkpoint_to_fp8_blockscale,
     make_sm90_push_folded_fp8_weights_from_checkpoints,
+    make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints,
 )
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
     nvfp4_weights as nvfp4_weight_impl,
@@ -206,6 +208,38 @@ def test_folded_fp8_zero_blocks_use_positive_unit_scale() -> None:
         quantized.view(torch.uint8), torch.zeros_like(quantized.view(torch.uint8))
     )
     assert torch.equal(scales, torch.ones_like(scales))
+
+
+@pytest.mark.parametrize("residual_scheme", ["generic", "pow2"])
+def test_hot_folded_v4_keeps_cold_suffix_expert_mapping(residual_scheme) -> None:
+    generator = torch.Generator().manual_seed(43)
+    w13 = _checkpoint(
+        torch.randint(0, 16, (2, 256, 128), dtype=torch.uint8, generator=generator),
+        torch.ones(2, 256, 8),
+        torch.tensor((0.75, 1.25)),
+    )
+    w2 = _checkpoint(
+        torch.randint(0, 16, (2, 128, 128), dtype=torch.uint8, generator=generator),
+        torch.ones(2, 128, 8),
+        torch.tensor((0.75, 1.25)),
+    )
+
+    weights = make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints(
+        w13,
+        w2,
+        hot_experts=1,
+        residual_scheme=residual_scheme,
+        payload_layout=4,
+    )
+
+    assert weights.hot_fp8 is not None
+    assert weights.cold_nvfp4 is not None
+    assert isinstance(weights.cold_nvfp4.w13, NVFP4SM90WeightViewV4)
+    assert isinstance(weights.cold_nvfp4.w2, NVFP4SM90WeightViewV4)
+    assert weights.cold_nvfp4.w13.manifest.expert_mapping == (1,)
+    assert weights.cold_nvfp4.w2.manifest.expert_mapping == (1,)
+    assert weights.cold_nvfp4.w13.manifest.logical_shape == (1, 256, 128)
+    assert weights.cold_nvfp4.w2.manifest.logical_shape == (1, 128, 128)
 
 
 @pytest.mark.parametrize(

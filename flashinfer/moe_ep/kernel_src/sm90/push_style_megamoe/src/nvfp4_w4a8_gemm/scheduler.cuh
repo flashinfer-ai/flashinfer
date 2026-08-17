@@ -6,6 +6,26 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+
+#ifndef W4A8_EXPERT_N_MAJOR
+#define W4A8_EXPERT_N_MAJOR 0
+#endif
+
+#if W4A8_EXPERT_N_MAJOR != 0 && W4A8_EXPERT_N_MAJOR != 1
+#error "W4A8_EXPERT_N_MAJOR must be 0 or 1"
+#endif
+
+#ifndef SM90_PUSH_W4A8_PRODUCER_REGS
+// Keep production at 40 so N64 variants remain spill-free while preserving
+// the consumer register budget.
+#define SM90_PUSH_W4A8_PRODUCER_REGS 40
+#endif
+
+#if SM90_PUSH_W4A8_PRODUCER_REGS != 40 && SM90_PUSH_W4A8_PRODUCER_REGS != 64 && \
+    SM90_PUSH_W4A8_PRODUCER_REGS != 80
+#error "SM90_PUSH_W4A8_PRODUCER_REGS must be 40, 64, or 80"
+#endif
 
 namespace flashinfer {
 namespace sm90_w4a8 {
@@ -19,15 +39,33 @@ inline constexpr int kConsumerThreadsFor = (BlockM / 64) * 128;
 template <int BlockM>
 inline constexpr int kThreadsFor = kConsumerThreadsFor<BlockM> + kProducerThreads;
 
-template <int BlockM, int BlockN>
+template <int BlockM, int BlockN, int PipelineStages = 0>
 struct W4A8LaunchTraits {
   static_assert(BlockM == 64 || BlockM == 128);
   static_assert(BlockN == 64 || BlockN == 128);
+  static_assert((BlockM == 64 && (PipelineStages == 2 || PipelineStages == 3)) ||
+                (BlockM == 128 && (PipelineStages == 3 || PipelineStages == 4)));
   static constexpr int kThreads = kThreadsFor<BlockM>;
-  static constexpr int kPipelineStages = BlockM == 64 ? 3 : 4;
+  static constexpr int kPipelineStages = PipelineStages;
   static constexpr int kMinBlocksPerSm = BlockM == 64 && BlockN == 64 ? 2 : 1;
   static constexpr int kDebugMinBlocksPerSm = 1;
-  static constexpr int kRegisterFootprintTarget = BlockM == 64 && BlockN == 64 ? 128 : 0;
+  static constexpr int kProducerRegisters = SM90_PUSH_W4A8_PRODUCER_REGS;
+  static constexpr int kConsumerThreads = kConsumerThreadsFor<BlockM>;
+  static constexpr int kConsumerRegisterCap =
+      ((65536 - kProducerThreads * kProducerRegisters) / kConsumerThreads / 8) * 8;
+  static_assert(kConsumerRegisterCap >= 152,
+                "producer register budget leaves too few consumer registers");
+  static constexpr int kUncappedConsumerRegisters = BlockM == 64 && BlockN == 64 ? 128 : 232;
+  static constexpr int kConsumerRegisters = kUncappedConsumerRegisters < kConsumerRegisterCap
+                                                ? kUncappedConsumerRegisters
+                                                : kConsumerRegisterCap;
+  static constexpr int kRegisterFootprintTarget = kConsumerRegisters;
+};
+
+template <int BlockM, int BlockN>
+struct W4A8LaunchTraits<BlockM, BlockN, 0>
+    : W4A8LaunchTraits<BlockM, BlockN, BlockM == 64 ? 3 : 4> {
+  static constexpr int kPipelineStages = BlockM == 64 ? 3 : 4;
 };
 
 enum class MTileFamily : int32_t {
@@ -167,6 +205,62 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
     return result;
   }
 
+#if W4A8_EXPERT_N_MAJOR
+  const uint64_t n_tile_count = static_cast<uint64_t>(n_tiles);
+  const int64_t signed_total_m_tiles = tile_prefix[bucket_experts];
+  if (signed_total_m_tiles < 0) {
+    return result;
+  }
+  const uint64_t total_m_tiles = static_cast<uint64_t>(signed_total_m_tiles);
+  if (total_m_tiles > std::numeric_limits<uint64_t>::max() / n_tile_count) {
+    return result;
+  }
+  const uint64_t total_tasks = total_m_tiles * n_tile_count;
+  if (task_index >= total_tasks) {
+    return result;
+  }
+
+  int32_t low = 0;
+  int32_t high = bucket_experts;
+  while (low < high) {
+    const int32_t middle = low + (high - low) / 2;
+    const int64_t signed_m_end = tile_prefix[middle + 1];
+    if (signed_m_end < 0) {
+      return result;
+    }
+    const uint64_t m_end = static_cast<uint64_t>(signed_m_end);
+    if (m_end > total_m_tiles || m_end > std::numeric_limits<uint64_t>::max() / n_tile_count) {
+      return result;
+    }
+    if (m_end * n_tile_count <= task_index) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  const int32_t bucket_expert = low;
+  const int64_t signed_m_begin = tile_prefix[bucket_expert];
+  const int64_t signed_m_end = tile_prefix[bucket_expert + 1];
+  if (signed_m_begin < 0 || signed_m_end <= signed_m_begin) {
+    return result;
+  }
+  const uint64_t m_begin = static_cast<uint64_t>(signed_m_begin);
+  const uint64_t m_tiles = static_cast<uint64_t>(signed_m_end - signed_m_begin);
+  if (m_begin > total_m_tiles || m_begin > std::numeric_limits<uint64_t>::max() / n_tile_count) {
+    return result;
+  }
+  const uint64_t expert_task_begin = m_begin * n_tile_count;
+  if (task_index < expert_task_begin) {
+    return result;
+  }
+  const uint64_t local_task = task_index - expert_task_begin;
+  const uint64_t local_n_tile = local_task / m_tiles;
+  const uint64_t local_m_tile = local_task % m_tiles;
+  if (local_n_tile >= n_tile_count) {
+    return result;
+  }
+#else
   const uint64_t row_task = task_index / static_cast<uint64_t>(n_tiles);
   if (row_task >= static_cast<uint64_t>(tile_prefix[bucket_experts])) {
     return result;
@@ -186,6 +280,9 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
   }
 
   const int32_t bucket_expert = low;
+  const uint64_t local_m_tile = row_task - static_cast<uint64_t>(tile_prefix[bucket_expert]);
+  const uint64_t local_n_tile = task_index % static_cast<uint64_t>(n_tiles);
+#endif
   const int32_t source_expert = expert_mapping[bucket_expert];
   if (source_expert < 0) {
     return result;
@@ -196,8 +293,6 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
     return result;
   }
 
-  const uint64_t local_m_tile = row_task - static_cast<uint64_t>(tile_prefix[bucket_expert]);
-  const uint64_t local_n_tile = task_index % static_cast<uint64_t>(n_tiles);
   int64_t local_m_begin = 0;
   if constexpr (BlockM == 64) {
     if (local_m_tile != 0) {

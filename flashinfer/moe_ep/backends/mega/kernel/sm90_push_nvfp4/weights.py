@@ -11,16 +11,30 @@ from .....weights import MoEWeightPack
 if TYPE_CHECKING:
     import torch
 
-    from .....kernel_src.sm90.push_style_megamoe import Sm90PushNvFp4Weights
+    from .....kernel_src.sm90.push_style_megamoe import (
+        Sm90PushNvFp4DualWeights,
+        Sm90PushNvFp4HotFoldedWeights,
+        Sm90PushNvFp4Weights,
+    )
 
-    TransformedMegaWeights: TypeAlias = Sm90PushNvFp4Weights
+    TransformedMegaWeights: TypeAlias = (
+        Sm90PushNvFp4Weights | Sm90PushNvFp4HotFoldedWeights | Sm90PushNvFp4DualWeights
+    )
 
 
 def __getattr__(name: str) -> object:
     if name == "TransformedMegaWeights":
-        from .....kernel_src.sm90.push_style_megamoe import Sm90PushNvFp4Weights
+        from .....kernel_src.sm90.push_style_megamoe import (
+            Sm90PushNvFp4DualWeights,
+            Sm90PushNvFp4HotFoldedWeights,
+            Sm90PushNvFp4Weights,
+        )
 
-        return Sm90PushNvFp4Weights
+        return (
+            Sm90PushNvFp4Weights
+            | Sm90PushNvFp4HotFoldedWeights
+            | Sm90PushNvFp4DualWeights
+        )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -131,6 +145,7 @@ def make_transformed_weights_from_checkpoints(
     nvfp4_mode: Literal["w4a8", "w4a16_rs"],
     group_size: int,
     residual_scheme: str,
+    payload_layout: Literal[3, 4] = 4,
 ):
     from .....kernel_src.sm90.push_style_megamoe import (
         make_sm90_push_nvfp4_weights_from_checkpoints,
@@ -142,6 +157,7 @@ def make_transformed_weights_from_checkpoints(
         nvfp4_mode=nvfp4_mode,
         group_size=group_size,
         residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
     )
 
 
@@ -171,6 +187,93 @@ def make_folded_fp8_weights_from_checkpoints(
     )
 
 
+def make_hot_folded_weights_from_checkpoints(
+    w13_checkpoint,
+    w2_checkpoint,
+    *,
+    hot_experts: int,
+    group_size: int = 128,
+    residual_scheme: str = "generic",
+    payload_layout: Literal[3, 4] = 4,
+):
+    """Build a static hot-prefix FP8 and cold-suffix online-W4A8 bundle.
+
+    Folding happens once in this constructor. The folded prefix and packed
+    suffix remain resident, and forward calls select them by the frozen local-
+    expert prefix without host-side routing decisions.
+
+    Use ``MegaConfig(megakernel=Sm90PushNvFp4MegaMoeConfig(
+    nvfp4_mode="w4a8"), preprocess_weights=False,
+    transformed_weights=bundle)`` and construct the layer with ``weights=None``.
+    """
+
+    from .....kernel_src.sm90.push_style_megamoe import (
+        make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints,
+    )
+
+    return make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints(
+        w13_checkpoint,
+        w2_checkpoint,
+        hot_experts=hot_experts,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+    )
+
+
+def make_dual_weights_from_checkpoints(
+    w13_checkpoint,
+    w2_checkpoint,
+    *,
+    group_size: int = 128,
+    residual_scheme: str = "generic",
+    payload_layout: Literal[3, 4] = 4,
+):
+    """Keep full packed W4A8 and folded FP8 weights resident together.
+
+    Use this bundle with ``weight_policy="dual"`` and
+    ``acknowledge_dual_residency=True``. The explicit acknowledgement prevents
+    selecting the doubled representation accidentally.
+    """
+
+    from .....kernel_src.sm90.push_style_megamoe import (
+        make_sm90_push_nvfp4_dual_weights_from_checkpoints,
+    )
+
+    return make_sm90_push_nvfp4_dual_weights_from_checkpoints(
+        w13_checkpoint,
+        w2_checkpoint,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+    )
+
+
+def estimate_residency(
+    local_experts: int,
+    policy: Literal["packed", "folded", "hot_folded", "dual"],
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    group_size: int = 128,
+    residual_scheme: str = "generic",
+    hot_expert_count: int = 0,
+):
+    """Return geometry-derived packed and folded resident byte counts."""
+
+    from .....kernel_src.sm90.push_style_megamoe import estimate_nvfp4_residency
+
+    return estimate_nvfp4_residency(
+        local_experts,
+        policy,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        hot_expert_count=hot_expert_count,
+    )
+
+
 def load_modelopt_transformed_weights(
     state_dict: Mapping[str, "torch.Tensor"],
     *,
@@ -179,6 +282,7 @@ def load_modelopt_transformed_weights(
     nvfp4_mode: Literal["w4a8", "w4a16_rs"] = "w4a8",
     group_size: int = 128,
     residual_scheme: str = "generic",
+    payload_layout: Literal[3, 4] = 4,
     device: "torch.device | str | None" = None,
 ):
     from .....kernel_src.sm90.push_style_megamoe import (
@@ -192,6 +296,7 @@ def load_modelopt_transformed_weights(
         nvfp4_mode=nvfp4_mode,
         group_size=group_size,
         residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
         device=device,
     )
 
@@ -228,6 +333,75 @@ def load_modelopt_folded_fp8_weights(
     )
 
 
+def load_modelopt_hot_folded_weights(
+    state_dict: Mapping[str, "torch.Tensor"],
+    *,
+    w13_prefix: str,
+    w2_prefix: str,
+    hot_experts: int,
+    group_size: int = 128,
+    residual_scheme: str = "generic",
+    payload_layout: Literal[3, 4] = 4,
+    device: "torch.device | str | None" = None,
+):
+    """Load a static hot-prefix FP8 and cold-suffix online-W4A8 bundle.
+
+    Source layers are moved and transformed one at a time when ``device`` is
+    provided. The returned folded prefix and packed suffix remain resident;
+    forward calls perform no folding or host-side expert selection.
+
+    Use ``MegaConfig(megakernel=Sm90PushNvFp4MegaMoeConfig(
+    nvfp4_mode="w4a8"), preprocess_weights=False,
+    transformed_weights=bundle)`` and construct the layer with ``weights=None``.
+    """
+
+    from .....kernel_src.sm90.push_style_megamoe import (
+        load_sm90_push_nvfp4_modelopt_hot_folded_weights,
+    )
+
+    return load_sm90_push_nvfp4_modelopt_hot_folded_weights(
+        state_dict,
+        w13_prefix=w13_prefix,
+        w2_prefix=w2_prefix,
+        hot_experts=hot_experts,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+        device=device,
+    )
+
+
+def load_modelopt_dual_weights(
+    state_dict: Mapping[str, "torch.Tensor"],
+    *,
+    w13_prefix: str,
+    w2_prefix: str,
+    group_size: int = 128,
+    residual_scheme: str = "generic",
+    payload_layout: Literal[3, 4] = 4,
+    device: "torch.device | str | None" = None,
+):
+    """Load ModelOpt weights into explicit dual-residency W4A8/FP8 storage.
+
+    The matching backend config requires ``weight_policy="dual"`` and
+    ``acknowledge_dual_residency=True``.
+    """
+
+    from .....kernel_src.sm90.push_style_megamoe import (
+        load_sm90_push_nvfp4_modelopt_dual_weights,
+    )
+
+    return load_sm90_push_nvfp4_modelopt_dual_weights(
+        state_dict,
+        w13_prefix=w13_prefix,
+        w2_prefix=w2_prefix,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+        device=device,
+    )
+
+
 def validate_transformed_mega_weights(
     transformed_weights: object,
     *,
@@ -237,18 +411,147 @@ def validate_transformed_mega_weights(
     nvfp4_mode: str,
     group_size: int,
     residual_scheme: str,
+    payload_layout: int = 4,
+    weight_policy: str = "packed",
+    hot_expert_count: int = 0,
 ) -> None:
     from ......fused_moe.sm90_nvfp4_repack import (
         NVFP4RSWeightView,
         NVFP4SM90WeightViewV3,
+        NVFP4SM90WeightViewV4,
     )
-    from .....kernel_src.sm90.push_style_megamoe import Sm90PushNvFp4Weights
+    from .....kernel_src.sm90.push_style_megamoe import (
+        Sm90PushNvFp4DualWeights,
+        Sm90PushNvFp4HotFoldedWeights,
+        Sm90PushNvFp4Weights,
+    )
+
+    w4a8_view_types = (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)
+
+    if isinstance(transformed_weights, Sm90PushNvFp4DualWeights):
+        if weight_policy != "dual":
+            raise MoEEpConfigError("dual weights require weight_policy='dual'")
+        if transformed_weights.total_experts != num_local_experts:
+            raise MoEEpConfigError("dual weights do not match the local expert count")
+        validate_transformed_mega_weights(
+            transformed_weights.packed_nvfp4,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            num_local_experts=num_local_experts,
+            nvfp4_mode=nvfp4_mode,
+            group_size=group_size,
+            residual_scheme=residual_scheme,
+            payload_layout=payload_layout,
+            weight_policy="packed",
+        )
+        from ..sm90_push_fp8.weights import (
+            validate_transformed_mega_weights as validate_fp8_weights,
+        )
+
+        validate_fp8_weights(
+            transformed_weights.folded_fp8,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            num_local_experts=num_local_experts,
+            fuse_fc1_epilogue=False,
+        )
+        return
+
+    if isinstance(transformed_weights, Sm90PushNvFp4HotFoldedWeights):
+        if weight_policy not in ("folded", "hot_folded"):
+            raise MoEEpConfigError(
+                "hot-prefix weights require folded or hot_folded weight_policy"
+            )
+        if nvfp4_mode != "w4a8":
+            raise MoEEpConfigError("hot-folded weights require nvfp4_mode='w4a8'")
+        if transformed_weights.total_experts != num_local_experts:
+            raise MoEEpConfigError(
+                "hot-folded total_experts does not match the local expert count"
+            )
+        expected_hot = (
+            num_local_experts if weight_policy == "folded" else hot_expert_count
+        )
+        if transformed_weights.hot_experts != expected_hot:
+            raise MoEEpConfigError(
+                "hot-folded weight prefix does not match the configured policy"
+            )
+        try:
+            transformed_weights.__post_init__()
+        except (TypeError, ValueError) as exc:
+            raise MoEEpConfigError(f"invalid hot-folded weight bundle: {exc}") from exc
+        if transformed_weights.hot_fp8 is not None:
+            hot = transformed_weights.hot_fp8
+            expected_hot = transformed_weights.hot_experts
+            from ..sm90_push_fp8.weights import (
+                validate_transformed_mega_weights as validate_fp8_weights,
+            )
+
+            validate_fp8_weights(
+                hot,
+                intermediate_size=intermediate_size,
+                hidden_size=hidden_size,
+                num_local_experts=expected_hot,
+                fuse_fc1_epilogue=False,
+            )
+        if transformed_weights.cold_nvfp4 is not None:
+            cold = transformed_weights.cold_nvfp4
+            expected_cold = num_local_experts - transformed_weights.hot_experts
+            for label, view, shape in zip(
+                ("cold w13", "cold w2"),
+                (cold.w13, cold.w2),
+                (
+                    (expected_cold, 2 * intermediate_size, hidden_size),
+                    (expected_cold, hidden_size, intermediate_size),
+                ),
+                strict=True,
+            ):
+                if not isinstance(view, w4a8_view_types):
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} is not a W4A8 view"
+                    )
+                if view.manifest.layout_version != payload_layout:
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} payload layout does not match config"
+                    )
+                if tuple(view.manifest.logical_shape) != shape:
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} logical shape must be {shape}"
+                    )
+                if view.manifest.group_size != group_size:
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} group_size does not match config"
+                    )
+                if view.manifest.residual_scheme != residual_scheme:
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} residual_scheme does not match config"
+                    )
+                if not view.packed_e2m1.is_cuda:
+                    raise MoEEpConfigError(
+                        f"sm90_push_nvfp4 {label} must be on a CUDA device"
+                    )
+            cold_w13 = cast("NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4", cold.w13)
+            cold_w2 = cast("NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4", cold.w2)
+            if cold_w13.packed_e2m1.device != cold_w2.packed_e2m1.device:
+                raise MoEEpConfigError(
+                    "sm90_push_nvfp4 cold weights must share a CUDA device"
+                )
+            if (
+                transformed_weights.hot_fp8 is not None
+                and cold_w13.packed_e2m1.device
+                != transformed_weights.hot_fp8.w13_fp8.device
+            ):
+                raise MoEEpConfigError(
+                    "sm90_push_nvfp4 hot and cold weights must share a CUDA device"
+                )
+        return
 
     if not isinstance(transformed_weights, Sm90PushNvFp4Weights):
         raise MoEEpConfigError(
             "sm90_push_nvfp4 transformed weights must be "
             f"Sm90PushNvFp4Weights, got {type(transformed_weights).__name__}"
         )
+    if weight_policy != "packed":
+        raise MoEEpConfigError("packed NVFP4 weights require weight_policy='packed'")
     if transformed_weights.nvfp4_mode != nvfp4_mode:
         raise MoEEpConfigError(
             "sm90_push_nvfp4 weight mode does not match config: "
@@ -265,8 +568,12 @@ def validate_transformed_mega_weights(
             expected_shapes,
             strict=True,
         ):
-            if not isinstance(view, NVFP4SM90WeightViewV3):
-                raise MoEEpConfigError(f"sm90_push_nvfp4 {label} is not a v3 view")
+            if not isinstance(view, w4a8_view_types):
+                raise MoEEpConfigError(f"sm90_push_nvfp4 {label} is not a W4A8 view")
+            if view.manifest.layout_version != payload_layout:
+                raise MoEEpConfigError(
+                    f"sm90_push_nvfp4 {label} payload layout does not match config"
+                )
             if tuple(view.manifest.logical_shape) != shape:
                 raise MoEEpConfigError(
                     f"sm90_push_nvfp4 {label} logical shape must be {shape}, got "
@@ -288,8 +595,14 @@ def validate_transformed_mega_weights(
                 raise MoEEpConfigError(
                     f"sm90_push_nvfp4 {label} must be on a CUDA device"
                 )
-        w13_view = cast("NVFP4SM90WeightViewV3", transformed_weights.w13)
-        w2_view = cast("NVFP4SM90WeightViewV3", transformed_weights.w2)
+        w13_view = cast(
+            "NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4",
+            transformed_weights.w13,
+        )
+        w2_view = cast(
+            "NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4",
+            transformed_weights.w2,
+        )
         if w13_view.packed_e2m1.device != w2_view.packed_e2m1.device:
             raise MoEEpConfigError("sm90_push_nvfp4 weights must share a CUDA device")
         return
@@ -323,6 +636,9 @@ def preprocess_mega_weights(
     nvfp4_mode: str,
     group_size: int,
     residual_scheme: str,
+    payload_layout: int = 4,
+    weight_policy: str = "packed",
+    hot_expert_count: int = 0,
 ) -> Any:
     import torch
 
@@ -332,7 +648,8 @@ def preprocess_mega_weights(
         )
     if not isinstance(weights, MoEWeightPack):
         raise MoEEpConfigError(
-            f"sm90_push_nvfp4 weights must be MoEWeightPack, got {type(weights).__name__}"
+            "sm90_push_nvfp4 weights must be MoEWeightPack, got "
+            f"{type(weights).__name__}"
         )
     if weights.w13_scale is not None or weights.w2_scale is not None:
         raise MoEEpConfigError(
@@ -355,13 +672,39 @@ def preprocess_mega_weights(
             )
     if weights.w13.device != weights.w2.device:
         raise MoEEpConfigError("sm90_push_nvfp4 w13 and w2 must share a device")
-    transformed = make_transformed_weights_from_checkpoints(
-        quantize_bf16_to_nvfp4_checkpoint(weights.w13),
-        quantize_bf16_to_nvfp4_checkpoint(weights.w2),
-        nvfp4_mode=cast('Literal["w4a8", "w4a16_rs"]', nvfp4_mode),
-        group_size=group_size,
-        residual_scheme=residual_scheme,
-    )
+    w13_checkpoint = quantize_bf16_to_nvfp4_checkpoint(weights.w13)
+    w2_checkpoint = quantize_bf16_to_nvfp4_checkpoint(weights.w2)
+    if weight_policy == "packed":
+        transformed = make_transformed_weights_from_checkpoints(
+            w13_checkpoint,
+            w2_checkpoint,
+            nvfp4_mode=cast("Literal['w4a8', 'w4a16_rs']", nvfp4_mode),
+            group_size=group_size,
+            residual_scheme=residual_scheme,
+            payload_layout=cast("Literal[3, 4]", payload_layout),
+        )
+    elif weight_policy in ("folded", "hot_folded"):
+        hot_experts = (
+            num_local_experts if weight_policy == "folded" else hot_expert_count
+        )
+        transformed = make_hot_folded_weights_from_checkpoints(
+            w13_checkpoint,
+            w2_checkpoint,
+            hot_experts=hot_experts,
+            group_size=group_size,
+            residual_scheme=residual_scheme,
+            payload_layout=cast("Literal[3, 4]", payload_layout),
+        )
+    elif weight_policy == "dual":
+        transformed = make_dual_weights_from_checkpoints(
+            w13_checkpoint,
+            w2_checkpoint,
+            group_size=group_size,
+            residual_scheme=residual_scheme,
+            payload_layout=cast("Literal[3, 4]", payload_layout),
+        )
+    else:
+        raise MoEEpConfigError(f"unsupported NVFP4 weight_policy {weight_policy!r}")
     validate_transformed_mega_weights(
         transformed,
         intermediate_size=intermediate_size,
@@ -370,15 +713,23 @@ def preprocess_mega_weights(
         nvfp4_mode=nvfp4_mode,
         group_size=group_size,
         residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+        weight_policy=weight_policy,
+        hot_expert_count=hot_expert_count,
     )
     return transformed
 
 
 __all__ = [
     "TransformedMegaWeights",
+    "estimate_residency",
+    "load_modelopt_dual_weights",
     "load_modelopt_folded_fp8_weights",
+    "load_modelopt_hot_folded_weights",
     "load_modelopt_transformed_weights",
     "make_folded_fp8_weights_from_checkpoints",
+    "make_dual_weights_from_checkpoints",
+    "make_hot_folded_weights_from_checkpoints",
     "make_transformed_weights_from_checkpoints",
     "preprocess_mega_weights",
     "quantize_bf16_to_nvfp4_checkpoint",

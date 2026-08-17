@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <list>
+#include <mutex>
 #include <vector>
 
 #include "kernel.cuh"
@@ -60,10 +62,22 @@ inline CUtensorMap make_activation_tma_map(void* address, uint64_t rows, int32_t
   return tensor_map;
 }
 
-inline CUtensorMap make_payload_tma_map(void* address, int32_t bucket_experts, int32_t k_tiles,
-                                        int32_t n_tiles,
+inline CUtensorMap make_payload_tma_map(void* address, int32_t bucket_experts, int32_t padded_n,
+                                        int32_t padded_k, int32_t block_n,
                                         PFN_cuTensorMapEncodeTiled_v12000 encoder) {
   CUtensorMap tensor_map{};
+#if W4A8_PAYLOAD_V4
+  const uint64_t cells = static_cast<uint64_t>(bucket_experts) * (padded_k / kBlockK);
+  const uint64_t global_dims[3] = {static_cast<uint64_t>(kBlockK / 2),
+                                   static_cast<uint64_t>(padded_n), cells};
+  const uint64_t global_strides[2] = {
+      static_cast<uint64_t>(kBlockK / 2),
+      static_cast<uint64_t>(kBlockK / 2) * static_cast<uint64_t>(padded_n)};
+  const uint32_t box_dims[3] = {static_cast<uint32_t>(kBlockK / 2), static_cast<uint32_t>(block_n),
+                                1};
+#else
+  const int32_t k_tiles = padded_k / kV3PayloadTileK;
+  const int32_t n_tiles = padded_n / kV3PayloadTileN;
   const uint64_t tile_bytes = static_cast<uint64_t>(kV3PackedBytesPerRow) * kV3PayloadTileN;
   const uint64_t cells = static_cast<uint64_t>(bucket_experts) * k_tiles * n_tiles;
   const uint64_t global_dims[3] = {static_cast<uint64_t>(kV3PackedBytesPerRow),
@@ -71,6 +85,7 @@ inline CUtensorMap make_payload_tma_map(void* address, int32_t bucket_experts, i
   const uint64_t global_strides[2] = {static_cast<uint64_t>(kV3PackedBytesPerRow), tile_bytes};
   const uint32_t box_dims[3] = {static_cast<uint32_t>(kV3PackedBytesPerRow),
                                 static_cast<uint32_t>(kV3PayloadTileN), 1};
+#endif
   const uint32_t element_strides[3] = {1, 1, 1};
   const CUresult result =
       encoder(&tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, address,
@@ -84,22 +99,40 @@ inline CUtensorMap make_payload_tma_map(void* address, int32_t bucket_experts, i
   return tensor_map;
 }
 
-inline CUtensorMap make_residual_tma_map(void* address, int32_t bucket_experts, int32_t k_tiles,
-                                         int32_t n_tiles, ResidualScheme scheme,
+inline CUtensorMap make_residual_tma_map(void* address, int32_t bucket_experts, int32_t padded_n,
+                                         int32_t padded_k, int32_t block_n, ResidualScheme scheme,
                                          PFN_cuTensorMapEncodeTiled_v12000 encoder) {
   CUtensorMap tensor_map{};
   const uint64_t element_bytes = scheme == ResidualScheme::kGeneric ? 2 : 1;
+#if W4A8_PAYLOAD_V4
+  const uint64_t cells = static_cast<uint64_t>(bucket_experts) * (padded_k / kBlockK);
+  constexpr uint64_t kElementsPerRow = kBlockK / kV3ResidualBlockK;
+  const uint64_t rows_per_tma_row = scheme == ResidualScheme::kPow2 ? 2 : 1;
+  const uint64_t elements_per_tma_row = kElementsPerRow * rows_per_tma_row;
+  const uint64_t global_dims[3] = {elements_per_tma_row,
+                                   static_cast<uint64_t>(padded_n) / rows_per_tma_row, cells};
+  const uint64_t global_strides[2] = {
+      elements_per_tma_row * element_bytes,
+      kElementsPerRow * element_bytes * static_cast<uint64_t>(padded_n)};
+  const uint32_t box_dims[3] = {static_cast<uint32_t>(elements_per_tma_row),
+                                static_cast<uint32_t>(block_n / rows_per_tma_row), 1};
+  constexpr int kRank = 3;
+#else
+  const int32_t k_tiles = padded_k / kV3PayloadTileK;
+  const int32_t n_tiles = padded_n / kV3PayloadTileN;
   const uint64_t cells = static_cast<uint64_t>(bucket_experts) * k_tiles * n_tiles;
   constexpr uint64_t kElementsPerCell = kV3PayloadTileN * kV3ResidualsPerPayloadTile;
   const uint64_t global_dims[2] = {kElementsPerCell, cells};
   const uint64_t global_strides[1] = {kElementsPerCell * element_bytes};
   const uint32_t box_dims[2] = {static_cast<uint32_t>(kElementsPerCell), 1};
-  const uint32_t element_strides[2] = {1, 1};
+  constexpr int kRank = 2;
+#endif
+  const uint32_t element_strides[3] = {1, 1, 1};
   const auto data_type = scheme == ResidualScheme::kGeneric
                              ? CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
                              : CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8;
   const CUresult result =
-      encoder(&tensor_map, data_type, 2, address, global_dims, global_strides, box_dims,
+      encoder(&tensor_map, data_type, kRank, address, global_dims, global_strides, box_dims,
               element_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
               CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
               CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
@@ -109,26 +142,62 @@ inline CUtensorMap make_residual_tma_map(void* address, int32_t bucket_experts, 
   return tensor_map;
 }
 
-inline CUtensorMap make_group_scale_tma_map(void* address, int32_t bucket_experts, int32_t k_groups,
-                                            int32_t n_tiles,
-                                            PFN_cuTensorMapEncodeTiled_v12000 encoder) {
-  CUtensorMap tensor_map{};
-  const uint64_t cells = static_cast<uint64_t>(bucket_experts) * k_groups * n_tiles;
-  const uint64_t global_dims[2] = {static_cast<uint64_t>(kV3PayloadTileN), cells};
-  const uint64_t global_strides[1] = {static_cast<uint64_t>(kV3PayloadTileN) * sizeof(float)};
-  const uint32_t box_dims[2] = {static_cast<uint32_t>(kV3PayloadTileN), 1};
-  const uint32_t element_strides[2] = {1, 1};
-  const CUresult result =
-      encoder(&tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, address,
-              global_dims, global_strides, box_dims, element_strides,
-              CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-              CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-              CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-              CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
-      << "make_group_scale_tma_map: cuTensorMapEncodeTiled failed: " << static_cast<int>(result);
-  return tensor_map;
-}
+constexpr size_t kMaxWeightTmaCacheCapacity = 128;
+
+struct W4A8ActivationTmaCacheKey {
+  uintptr_t address = 0;
+  int64_t rows = 0;
+  int32_t padded_k = 0;
+
+  bool operator==(const W4A8ActivationTmaCacheKey& other) const {
+    return address == other.address && rows == other.rows && padded_k == other.padded_k;
+  }
+};
+
+struct W4A8ActivationTmaMaps {
+  CUtensorMap m64{};
+  CUtensorMap m128{};
+};
+
+struct W4A8WeightTmaCacheKey {
+  uintptr_t payload_address = 0;
+  uintptr_t residual_address = 0;
+  int32_t bucket_experts = 0;
+  int32_t padded_n = 0;
+  int32_t padded_k = 0;
+  int32_t group_size = 0;
+  ResidualScheme residual_scheme = ResidualScheme::kGeneric;
+
+  bool operator==(const W4A8WeightTmaCacheKey& other) const {
+    return payload_address == other.payload_address && residual_address == other.residual_address &&
+           bucket_experts == other.bucket_experts && padded_n == other.padded_n &&
+           padded_k == other.padded_k && group_size == other.group_size &&
+           residual_scheme == other.residual_scheme;
+  }
+};
+
+struct W4A8WeightTmaMaps {
+  CUtensorMap payload_n64{};
+  CUtensorMap payload_n128{};
+#if W4A8_RESIDUAL_TMA
+  CUtensorMap residual_n64{};
+  CUtensorMap residual_n128{};
+#endif
+};
+
+struct W4A8WeightTmaCacheEntry {
+  W4A8WeightTmaCacheKey key{};
+  W4A8WeightTmaMaps maps{};
+};
+
+struct W4A8ResolvedTmaMaps {
+  W4A8ActivationTmaMaps activation{};
+  W4A8WeightTmaMaps weight{};
+#if !W4A8_RESIDUAL_TMA
+  const void* residual = nullptr;
+#endif
+  const float* group_scales = nullptr;
+};
 
 // One thread validates the inputs and builds exact prefixes for the disjoint
 // M64-tail and M128 queues.
@@ -222,6 +291,22 @@ __global__ void prepare_grouped_schedule_kernel(
 
 class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
  public:
+  Sm90W4A8GroupedGemmRunner(int64_t m64_stages, int64_t m128_stages, bool prefer_n64_main,
+                            int64_t tma_cache_capacity) {
+    TVM_FFI_ICHECK(m64_stages == 2 || m64_stages == 3)
+        << "init: M64 pipeline stages must be 2 or 3";
+    TVM_FFI_ICHECK(m128_stages == 3 || m128_stages == 4)
+        << "init: M128 pipeline stages must be 3 or 4";
+    m64_stages_ = static_cast<int32_t>(m64_stages);
+    m128_stages_ = static_cast<int32_t>(m128_stages);
+    prefer_n64_main_ = prefer_n64_main;
+    TVM_FFI_ICHECK_GE(tma_cache_capacity, 1)
+        << "init: TMA descriptor cache capacity must be in [1, 128]";
+    TVM_FFI_ICHECK_LE(tma_cache_capacity, static_cast<int64_t>(kMaxWeightTmaCacheCapacity))
+        << "init: TMA descriptor cache capacity must be in [1, 128]";
+    tma_cache_capacity_ = static_cast<size_t>(tma_cache_capacity);
+  }
+
   const char* type_key() const { return "flashinfer.Sm90W4A8GroupedGemmRunner"; }
 
   const char* kind() const final { return "sm90_w4a8_grouped_gemm_runner"; }
@@ -248,6 +333,18 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
       return Function::FromTyped([this](int64_t block_m, int64_t block_n, bool debug_fp32) {
         return kernel_resource_usage(block_m, block_n, debug_fp32);
       });
+    }
+    if (name == "kernel_resources") {
+      return Function::FromTyped([this](int64_t block_m, int64_t block_n, bool debug_fp32) {
+        return kernel_resources(block_m, block_n, debug_fp32);
+      });
+    }
+    if (name == "tma_cache_stats") {
+      return Function::FromTyped([this]() { return tma_cache_stats(); });
+    }
+    if (name == "selected_pipeline_stage") {
+      return Function::FromTyped(
+          [this](int64_t block_m) { return selected_pipeline_stage(block_m); });
     }
     if (name == "grouped_run") {
       return Function::FromTyped(
@@ -317,19 +414,18 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     }
     uint64_t payload_cells = static_cast<uint64_t>(bucket_experts);
     constexpr uint64_t kMaxPayloadCells = std::numeric_limits<int32_t>::max();
+#if W4A8_PAYLOAD_V4
+    TVM_FFI_ICHECK_LE(payload_cells, kMaxPayloadCells / static_cast<uint64_t>(padded_k / kBlockK))
+        << "get_workspace_size: stage-contiguous payload TMA dimension exceeds int32";
+    payload_cells *= static_cast<uint64_t>(padded_k / kBlockK);
+#else
     for (const uint64_t factor : {static_cast<uint64_t>(padded_k / kV3PayloadTileK),
                                   static_cast<uint64_t>(padded_n / kV3PayloadTileN)}) {
       TVM_FFI_ICHECK_LE(payload_cells, kMaxPayloadCells / factor)
           << "get_workspace_size: flattened payload TMA dimension exceeds int32";
       payload_cells *= factor;
     }
-    uint64_t group_scale_cells = static_cast<uint64_t>(bucket_experts);
-    for (const uint64_t factor : {static_cast<uint64_t>(padded_k / group_size),
-                                  static_cast<uint64_t>(padded_n / kV3PayloadTileN)}) {
-      TVM_FFI_ICHECK_LE(group_scale_cells, kMaxPayloadCells / factor)
-          << "get_workspace_size: flattened group-scale TMA dimension exceeds int32";
-      group_scale_cells *= factor;
-    }
+#endif
     TVM_FFI_ICHECK_LE(total_experts, (std::numeric_limits<int64_t>::max() - max_m) / 31)
         << "get_workspace_size: activation scale stride overflows";
 
@@ -355,7 +451,12 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
   template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme>
   void configure_kernel_variant(int opt_in_smem, W4A8KernelResources* bf16_resources,
                                 W4A8KernelResources* fp32_resources) {
-    const auto& variant = get_w4a8_kernel_variant<BlockM, BlockN, GroupSize, Scheme>();
+    const int32_t pipeline_stages = BlockM == 64 ? m64_stages_ : m128_stages_;
+    const auto* selected =
+        find_w4a8_kernel_variant(BlockM, BlockN, GroupSize, Scheme, pipeline_stages);
+    TVM_FFI_ICHECK(selected != nullptr) << "configure_workspace: no W4A8 M" << BlockM << "N"
+                                        << BlockN << " S" << pipeline_stages << " kernel variant";
+    const auto& variant = *selected;
     TVM_FFI_ICHECK_LE(variant.dynamic_smem_bytes, static_cast<size_t>(std::max(opt_in_smem, 0)))
         << "configure_workspace: W4A8 M" << BlockM << "N" << BlockN << " kernel requires "
         << variant.dynamic_smem_bytes << " shared-memory bytes, device permits " << opt_in_smem;
@@ -366,15 +467,6 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK_GE(bf16_resources->blocks_per_sm, variant.min_blocks_per_sm)
         << "configure_workspace: BF16 W4A8 M" << BlockM << "N" << BlockN << " requires "
         << variant.min_blocks_per_sm << " blocks per SM, got " << bf16_resources->blocks_per_sm;
-    if (variant.register_footprint_target > 0) {
-      TVM_FFI_ICHECK_LE(bf16_resources->num_regs, variant.register_footprint_target)
-          << "configure_workspace: BF16 W4A8 M" << BlockM << "N" << BlockN << " uses "
-          << bf16_resources->num_regs << " registers per thread, target is "
-          << variant.register_footprint_target;
-    }
-    // local_memory_bytes is recorded (kernel_resource_usage, bench provenance)
-    // but not gated: cudaFuncGetAttributes reports it inconsistently across
-    // toolchain/driver versions; the precise spill gate is the ptxas -v log.
     TVM_FFI_ICHECK_GE(fp32_resources->blocks_per_sm, 1)
         << "configure_workspace: FP32 debug W4A8 M" << BlockM << "N" << BlockN
         << " has zero occupancy";
@@ -469,7 +561,10 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     workspace_device_ = workspace.device();
     sm_count_ = properties.multiProcessorCount;
     tma_encoder_ = get_tma_encoder();
-    tma_cache_valid_ = false;
+    {
+      std::lock_guard<std::mutex> lock(tma_cache_mutex_);
+      clear_tma_descriptor_caches();
+    }
     counter_bank_ = static_cast<int32_t>(counter_bank);
     workspace_configured_ = true;
   }
@@ -488,6 +583,60 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
         resource.blocks_per_sm,
         resource.num_regs,
         static_cast<int64_t>(resource.local_memory_bytes),
+    };
+    return Array(values);
+  }
+
+  const W4A8KernelVariant& selected_variant(int64_t block_m, int64_t block_n) const {
+    const int32_t stages = block_m == 64 ? m64_stages_ : m128_stages_;
+    const auto* variant =
+        find_w4a8_kernel_variant(static_cast<int32_t>(block_m), static_cast<int32_t>(block_n),
+                                 group_size_, residual_scheme_, stages);
+    TVM_FFI_ICHECK(variant != nullptr) << "kernel_resources: selected variant is unavailable";
+    return *variant;
+  }
+
+  Array<int64_t> kernel_resources(int64_t block_m, int64_t block_n, bool debug_fp32) const {
+    TVM_FFI_ICHECK(workspace_configured_) << "kernel_resources: configure workspace first";
+    TVM_FFI_ICHECK(block_m == 64 || block_m == 128)
+        << "kernel_resources: block_m must be 64 or 128";
+    TVM_FFI_ICHECK(block_n == 64 || block_n == 128)
+        << "kernel_resources: block_n must be 64 or 128";
+    const int m_index = block_m == 64 ? 0 : 1;
+    const int n_index = block_n == 64 ? 0 : 1;
+    const auto& resource =
+        debug_fp32 ? fp32_resources_[m_index][n_index] : bf16_resources_[m_index][n_index];
+    const auto& variant = selected_variant(block_m, block_n);
+    // cudaFuncGetAttributes exposes aggregate local memory, not a separate
+    // stack-frame size. -1 preserves that distinction in the runtime report.
+    std::vector<int64_t> values = {
+        resource.num_regs,
+        static_cast<int64_t>(resource.local_memory_bytes),
+        -1,
+        variant.producer_registers,
+        variant.consumer_register_cap,
+        variant.register_footprint_target,
+        resource.blocks_per_sm,
+    };
+    return Array(values);
+  }
+
+  int64_t selected_pipeline_stage(int64_t block_m) const {
+    TVM_FFI_ICHECK(block_m == 64 || block_m == 128)
+        << "selected_pipeline_stage: block_m must be 64 or 128";
+    return block_m == 64 ? m64_stages_ : m128_stages_;
+  }
+
+  Array<int64_t> tma_cache_stats() {
+    std::lock_guard<std::mutex> lock(tma_cache_mutex_);
+    std::vector<int64_t> values = {
+        static_cast<int64_t>(activation_tma_cache_hits_),
+        static_cast<int64_t>(activation_tma_cache_misses_),
+        static_cast<int64_t>(weight_tma_cache_hits_),
+        static_cast<int64_t>(weight_tma_cache_misses_),
+        static_cast<int64_t>(weight_tma_cache_evictions_),
+        static_cast<int64_t>(weight_tma_cache_.size()),
+        static_cast<int64_t>(tma_cache_capacity_),
     };
     return Array(values);
   }
@@ -540,8 +689,13 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     CHECK_DIM(2, output);
     CHECK_DIM(2, activation);
     CHECK_DIM(2, activation_scales);
+#if W4A8_PAYLOAD_V4
+    CHECK_DIM(4, payload);
+    CHECK_DIM(4, residual);
+#else
     CHECK_DIM(5, payload);
     CHECK_DIM(5, residual);
+#endif
     CHECK_DIM(4, group_scales);
     CHECK_DIM(1, expert_mapping);
     CHECK_DIM(1, offsets);
@@ -558,9 +712,23 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK_EQ(activation_scales.size(1), padded_scale_stride_)
         << "grouped_run: activation scale padded stride mismatch";
 
-    const int32_t k_tiles = padded_k_ / kV3PayloadTileK;
     const int32_t n_tiles = padded_n_ / kV3PayloadTileN;
     TVM_FFI_ICHECK_EQ(payload.size(0), bucket_experts_) << "grouped_run: payload expert mismatch";
+#if W4A8_PAYLOAD_V4
+    TVM_FFI_ICHECK_EQ(payload.size(1), padded_k_ / kBlockK)
+        << "grouped_run: v4 payload K-stage mismatch";
+    TVM_FFI_ICHECK_EQ(payload.size(2), padded_n_) << "grouped_run: v4 payload N mismatch";
+    TVM_FFI_ICHECK_EQ(payload.size(3), kBlockK / 2)
+        << "grouped_run: v4 payload stage-byte mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(0), bucket_experts_)
+        << "grouped_run: v4 residual expert mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(1), padded_k_ / kBlockK)
+        << "grouped_run: v4 residual K-stage mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(2), padded_n_) << "grouped_run: v4 residual N mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(3), kBlockK / kV3ResidualBlockK)
+        << "grouped_run: v4 residual stage mismatch";
+#else
+    const int32_t k_tiles = padded_k_ / kV3PayloadTileK;
     TVM_FFI_ICHECK_EQ(payload.size(1), k_tiles) << "grouped_run: payload K-tile mismatch";
     TVM_FFI_ICHECK_EQ(payload.size(2), n_tiles) << "grouped_run: payload N-tile mismatch";
     TVM_FFI_ICHECK_EQ(payload.size(3), kV3PayloadTileN) << "grouped_run: payload tile N mismatch";
@@ -572,6 +740,7 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     }
     TVM_FFI_ICHECK_EQ(residual.size(4), kV3ResidualsPerPayloadTile)
         << "grouped_run: residual K-block mismatch";
+#endif
     TVM_FFI_ICHECK_EQ(group_scales.size(0), bucket_experts_)
         << "grouped_run: group-scale expert mismatch";
     TVM_FFI_ICHECK_EQ(group_scales.size(1), padded_k_ / group_size_)
@@ -633,82 +802,103 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     return static_cast<int32_t>(std::max<uint64_t>(1, std::min(task_upper, resident_blocks)));
   }
 
-  void update_tma_maps(const TensorView& activation, const TensorView& payload,
-                       const TensorView& residual, const TensorView& group_scales) {
+  W4A8ResolvedTmaMaps resolve_tma_maps(const TensorView& activation, const TensorView& payload,
+                                       const TensorView& residual, const TensorView& group_scales) {
     TVM_FFI_ICHECK(tma_encoder_ != nullptr) << "grouped_run: TMA encoder is unavailable";
+    W4A8ResolvedTmaMaps resolved{};
 #if !W4A8_RESIDUAL_TMA
-    residual_ptr_ = residual.data_ptr();
+    resolved.residual = residual.data_ptr();
 #endif
-#if !W4A8_GROUP_SCALE_TMA
-    group_scales_ptr_ = static_cast<const float*>(group_scales.data_ptr());
-#endif
+    resolved.group_scales = static_cast<const float*>(group_scales.data_ptr());
     const uintptr_t activation_address = reinterpret_cast<uintptr_t>(activation.data_ptr());
     const uintptr_t payload_address = reinterpret_cast<uintptr_t>(payload.data_ptr());
 #if W4A8_RESIDUAL_TMA
     const uintptr_t residual_address = reinterpret_cast<uintptr_t>(residual.data_ptr());
-#endif
-#if W4A8_GROUP_SCALE_TMA
-    const uintptr_t group_scale_address = reinterpret_cast<uintptr_t>(group_scales.data_ptr());
+#else
+    constexpr uintptr_t residual_address = 0;
 #endif
     const int64_t rows = activation.size(0);
-    if (!tma_cache_valid_ || activation_address != cached_activation_address_ ||
-        payload_address != cached_payload_address_ ||
-#if W4A8_RESIDUAL_TMA
-        residual_address != cached_residual_address_ ||
-#endif
-#if W4A8_GROUP_SCALE_TMA
-        group_scale_address != cached_group_scale_address_ ||
-#endif
-        rows != cached_activation_rows_ || group_size_ != cached_group_size_ ||
-        residual_scheme_ != cached_residual_scheme_ || padded_n_ != cached_padded_n_ ||
-        padded_k_ != cached_padded_k_ || bucket_experts_ != cached_bucket_experts_) {
-      activation_map_m64_ = make_activation_tma_map(
+    const W4A8ActivationTmaCacheKey activation_key{activation_address, rows, padded_k_};
+    if (!activation_tma_cache_valid_ || !(activation_tma_cache_key_ == activation_key)) {
+      activation_tma_cache_maps_.m64 = make_activation_tma_map(
           const_cast<uint8_t*>(static_cast<const uint8_t*>(activation.data_ptr())),
           static_cast<uint64_t>(rows), padded_k_, 64, tma_encoder_);
-      activation_map_m128_ = make_activation_tma_map(
+      activation_tma_cache_maps_.m128 = make_activation_tma_map(
           const_cast<uint8_t*>(static_cast<const uint8_t*>(activation.data_ptr())),
           static_cast<uint64_t>(rows), padded_k_, 128, tma_encoder_);
-      payload_map_ = make_payload_tma_map(
-          const_cast<uint8_t*>(static_cast<const uint8_t*>(payload.data_ptr())), bucket_experts_,
-          padded_k_ / kV3PayloadTileK, padded_n_ / kV3PayloadTileN, tma_encoder_);
-#if W4A8_RESIDUAL_TMA
-      residual_map_ = make_residual_tma_map(
-          const_cast<uint8_t*>(static_cast<const uint8_t*>(residual.data_ptr())), bucket_experts_,
-          padded_k_ / kV3PayloadTileK, padded_n_ / kV3PayloadTileN, residual_scheme_, tma_encoder_);
-#endif
-#if W4A8_GROUP_SCALE_TMA
-      group_scale_map_ = make_group_scale_tma_map(
-          const_cast<uint8_t*>(static_cast<const uint8_t*>(group_scales.data_ptr())),
-          bucket_experts_, padded_k_ / group_size_, padded_n_ / kV3PayloadTileN, tma_encoder_);
-#endif
-      cached_activation_address_ = activation_address;
-      cached_payload_address_ = payload_address;
-#if W4A8_RESIDUAL_TMA
-      cached_residual_address_ = residual_address;
-#endif
-#if W4A8_GROUP_SCALE_TMA
-      cached_group_scale_address_ = group_scale_address;
-#endif
-      cached_activation_rows_ = rows;
-      cached_group_size_ = group_size_;
-      cached_residual_scheme_ = residual_scheme_;
-      cached_padded_n_ = padded_n_;
-      cached_padded_k_ = padded_k_;
-      cached_bucket_experts_ = bucket_experts_;
-      tma_cache_valid_ = true;
+      activation_tma_cache_key_ = activation_key;
+      activation_tma_cache_valid_ = true;
+      ++activation_tma_cache_misses_;
+    } else {
+      ++activation_tma_cache_hits_;
     }
+    resolved.activation = activation_tma_cache_maps_;
+
+    const W4A8WeightTmaCacheKey weight_key{payload_address, residual_address, bucket_experts_,
+                                           padded_n_,       padded_k_,        group_size_,
+                                           residual_scheme_};
+    auto cached = std::find_if(
+        weight_tma_cache_.begin(), weight_tma_cache_.end(),
+        [&weight_key](const W4A8WeightTmaCacheEntry& entry) { return entry.key == weight_key; });
+    if (cached == weight_tma_cache_.end()) {
+      W4A8WeightTmaCacheEntry entry{};
+      entry.key = weight_key;
+      entry.maps.payload_n64 = make_payload_tma_map(
+          const_cast<uint8_t*>(static_cast<const uint8_t*>(payload.data_ptr())), bucket_experts_,
+          padded_n_, padded_k_, 64, tma_encoder_);
+      entry.maps.payload_n128 = make_payload_tma_map(
+          const_cast<uint8_t*>(static_cast<const uint8_t*>(payload.data_ptr())), bucket_experts_,
+          padded_n_, padded_k_, 128, tma_encoder_);
+#if W4A8_RESIDUAL_TMA
+      entry.maps.residual_n64 = make_residual_tma_map(
+          const_cast<uint8_t*>(static_cast<const uint8_t*>(residual.data_ptr())), bucket_experts_,
+          padded_n_, padded_k_, 64, residual_scheme_, tma_encoder_);
+      entry.maps.residual_n128 = make_residual_tma_map(
+          const_cast<uint8_t*>(static_cast<const uint8_t*>(residual.data_ptr())), bucket_experts_,
+          padded_n_, padded_k_, 128, residual_scheme_, tma_encoder_);
+#endif
+      weight_tma_cache_.push_front(entry);
+      ++weight_tma_cache_misses_;
+      if (weight_tma_cache_.size() > tma_cache_capacity_) {
+        weight_tma_cache_.pop_back();
+        ++weight_tma_cache_evictions_;
+      }
+      cached = weight_tma_cache_.begin();
+    } else {
+      weight_tma_cache_.splice(weight_tma_cache_.begin(), weight_tma_cache_, cached);
+      cached = weight_tma_cache_.begin();
+      ++weight_tma_cache_hits_;
+    }
+    resolved.weight = cached->maps;
+    return resolved;
+  }
+
+  void clear_tma_descriptor_caches() {
+    activation_tma_cache_valid_ = false;
+    weight_tma_cache_.clear();
+    activation_tma_cache_hits_ = 0;
+    activation_tma_cache_misses_ = 0;
+    weight_tma_cache_hits_ = 0;
+    weight_tma_cache_misses_ = 0;
+    weight_tma_cache_evictions_ = 0;
   }
 
   template <bool DebugFp32, int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme>
   void launch_tile_family(const TensorView& output, const TensorView& activation_scales,
                           const TensorView& alpha, const TensorView& expert_mapping,
                           const TensorView& offsets, int32_t n_tiles, int32_t n_tile_begin,
-                          int32_t active_blocks_per_sm, cudaStream_t stream) {
+                          int32_t active_blocks_per_sm, const W4A8ResolvedTmaMaps& tma_maps,
+                          cudaStream_t stream) {
     const int32_t blocks = grid_blocks<BlockM>(n_tiles, active_blocks_per_sm, output.size(0));
     if (blocks == 0) return;
     constexpr MTileFamily kMFamily = m_tile_family<BlockM>();
     constexpr NTileFamily kNFamily = n_tile_family<BlockN>();
-    const auto& variant = get_w4a8_kernel_variant<BlockM, BlockN, GroupSize, Scheme>();
+    const int32_t pipeline_stages = BlockM == 64 ? m64_stages_ : m128_stages_;
+    const auto* selected =
+        find_w4a8_kernel_variant(BlockM, BlockN, GroupSize, Scheme, pipeline_stages);
+    TVM_FFI_ICHECK(selected != nullptr) << "grouped_run: no W4A8 M" << BlockM << "N" << BlockN
+                                        << " S" << pipeline_stages << " kernel variant";
+    const auto& variant = *selected;
     W4A8KernelLaunchParams params{
         output.data_ptr(),
         static_cast<const float*>(activation_scales.data_ptr()),
@@ -727,18 +917,13 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
         padded_scale_stride_,
         alpha.ndim() == 1,
 #if !W4A8_RESIDUAL_TMA
-        residual_ptr_,
+        tma_maps.residual,
 #endif
-#if !W4A8_GROUP_SCALE_TMA
-        group_scales_ptr_,
-#endif
-        BlockM == 64 ? activation_map_m64_ : activation_map_m128_,
-        payload_map_,
+        tma_maps.group_scales,
+        BlockM == 64 ? tma_maps.activation.m64 : tma_maps.activation.m128,
+        BlockN == 64 ? tma_maps.weight.payload_n64 : tma_maps.weight.payload_n128,
 #if W4A8_RESIDUAL_TMA
-        residual_map_,
-#endif
-#if W4A8_GROUP_SCALE_TMA
-        group_scale_map_,
+        BlockN == 64 ? tma_maps.weight.residual_n64 : tma_maps.weight.residual_n128,
 #endif
     };
     // An empty M-family prefix makes every persistent block exit at its first task mapping.
@@ -751,26 +936,39 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
   template <bool DebugFp32, int GroupSize, ResidualScheme Scheme>
   void launch_group_scheme(const TensorView& output, const TensorView& activation_scales,
                            const TensorView& alpha, const TensorView& expert_mapping,
-                           const TensorView& offsets, cudaStream_t stream) {
+                           const TensorView& offsets, const W4A8ResolvedTmaMaps& tma_maps,
+                           cudaStream_t stream) {
+    const auto& resources = DebugFp32 ? fp32_resources_ : bf16_resources_;
+    if (prefer_n64_main_) {
+      const int32_t n64_tiles = padded_n_ / 64;
+      launch_tile_family<DebugFp32, 128, 64, GroupSize, Scheme>(
+          output, activation_scales, alpha, expert_mapping, offsets, n64_tiles, 0,
+          resources[1][0].blocks_per_sm, tma_maps, stream);
+#if W4A8_SPLIT_M64_TAIL
+      launch_tile_family<DebugFp32, 64, 64, GroupSize, Scheme>(
+          output, activation_scales, alpha, expert_mapping, offsets, n64_tiles, 0,
+          resources[0][0].blocks_per_sm, tma_maps, stream);
+#endif
+      return;
+    }
     const int32_t n128_tiles = padded_n_ / 128;
     const bool has_n64_tail = padded_n_ % 128 != 0;
-    const auto& resources = DebugFp32 ? fp32_resources_ : bf16_resources_;
     launch_tile_family<DebugFp32, 128, 128, GroupSize, Scheme>(
         output, activation_scales, alpha, expert_mapping, offsets, n128_tiles, 0,
-        resources[1][1].blocks_per_sm, stream);
+        resources[1][1].blocks_per_sm, tma_maps, stream);
 #if W4A8_SPLIT_M64_TAIL
     launch_tile_family<DebugFp32, 64, 128, GroupSize, Scheme>(
         output, activation_scales, alpha, expert_mapping, offsets, n128_tiles, 0,
-        resources[0][1].blocks_per_sm, stream);
+        resources[0][1].blocks_per_sm, tma_maps, stream);
 #endif
     if (has_n64_tail) {
       launch_tile_family<DebugFp32, 128, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, 1, n128_tiles * 2,
-          resources[1][0].blocks_per_sm, stream);
+          resources[1][0].blocks_per_sm, tma_maps, stream);
 #if W4A8_SPLIT_M64_TAIL
       launch_tile_family<DebugFp32, 64, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, 1, n128_tiles * 2,
-          resources[0][0].blocks_per_sm, stream);
+          resources[0][0].blocks_per_sm, tma_maps, stream);
 #endif
     }
   }
@@ -778,25 +976,26 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
   template <bool DebugFp32>
   void dispatch_launch(const TensorView& output, const TensorView& activation_scales,
                        const TensorView& alpha, const TensorView& expert_mapping,
-                       const TensorView& offsets, cudaStream_t stream) {
+                       const TensorView& offsets, const W4A8ResolvedTmaMaps& tma_maps,
+                       cudaStream_t stream) {
     if (residual_scheme_ == ResidualScheme::kGeneric) {
       if (group_size_ == 32)
         return launch_group_scheme<DebugFp32, 32, ResidualScheme::kGeneric>(
-            output, activation_scales, alpha, expert_mapping, offsets, stream);
+            output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
       if (group_size_ == 64)
         return launch_group_scheme<DebugFp32, 64, ResidualScheme::kGeneric>(
-            output, activation_scales, alpha, expert_mapping, offsets, stream);
+            output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
       return launch_group_scheme<DebugFp32, 128, ResidualScheme::kGeneric>(
-          output, activation_scales, alpha, expert_mapping, offsets, stream);
+          output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
     }
     if (group_size_ == 32)
       return launch_group_scheme<DebugFp32, 32, ResidualScheme::kPow2>(
-          output, activation_scales, alpha, expert_mapping, offsets, stream);
+          output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
     if (group_size_ == 64)
       return launch_group_scheme<DebugFp32, 64, ResidualScheme::kPow2>(
-          output, activation_scales, alpha, expert_mapping, offsets, stream);
+          output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
     return launch_group_scheme<DebugFp32, 128, ResidualScheme::kPow2>(
-        output, activation_scales, alpha, expert_mapping, offsets, stream);
+        output, activation_scales, alpha, expert_mapping, offsets, tma_maps, stream);
   }
 
   template <bool DebugFp32>
@@ -815,8 +1014,11 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
       prepare_schedule(activation, expert_mapping, offsets, trusted_offsets, stream);
     }
     if (activation.size(0) == 0) return;
-    update_tma_maps(activation, payload, residual, group_scales);
-    dispatch_launch<DebugFp32>(output, activation_scales, alpha, expert_mapping, offsets, stream);
+    std::lock_guard<std::mutex> cache_lock(tma_cache_mutex_);
+    const W4A8ResolvedTmaMaps tma_maps =
+        resolve_tma_maps(activation, payload, residual, group_scales);
+    dispatch_launch<DebugFp32>(output, activation_scales, alpha, expert_mapping, offsets, tma_maps,
+                               stream);
   }
 
   void grouped_run(const TensorView& output, const TensorView& activation,
@@ -891,8 +1093,13 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK_EQ(workspace_device_.device_id, payload.device().device_id)
         << "debug_decode: workspace device mismatch";
     CHECK_DIM(5, output);
+#if W4A8_PAYLOAD_V4
+    CHECK_DIM(4, payload);
+    CHECK_DIM(4, residual);
+#else
     CHECK_DIM(5, payload);
     CHECK_DIM(5, residual);
+#endif
     const int32_t k_tiles = padded_k_ / kV3PayloadTileK;
     const int32_t n_tiles = padded_n_ / kV3PayloadTileN;
     TVM_FFI_ICHECK_EQ(output.size(0), bucket_experts_) << "debug_decode: output expert mismatch";
@@ -901,6 +1108,20 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK_EQ(output.size(3), kV3PayloadTileN) << "debug_decode: output tile N mismatch";
     TVM_FFI_ICHECK_EQ(output.size(4), kV3PayloadTileK) << "debug_decode: output tile K mismatch";
     TVM_FFI_ICHECK_EQ(payload.size(0), bucket_experts_) << "debug_decode: payload expert mismatch";
+#if W4A8_PAYLOAD_V4
+    TVM_FFI_ICHECK_EQ(payload.size(1), padded_k_ / kBlockK)
+        << "debug_decode: v4 payload K-stage mismatch";
+    TVM_FFI_ICHECK_EQ(payload.size(2), padded_n_) << "debug_decode: v4 payload N mismatch";
+    TVM_FFI_ICHECK_EQ(payload.size(3), kBlockK / 2)
+        << "debug_decode: v4 payload stage-byte mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(0), bucket_experts_)
+        << "debug_decode: v4 residual expert mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(1), padded_k_ / kBlockK)
+        << "debug_decode: v4 residual K-stage mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(2), padded_n_) << "debug_decode: v4 residual N mismatch";
+    TVM_FFI_ICHECK_EQ(residual.size(3), kBlockK / kV3ResidualBlockK)
+        << "debug_decode: v4 residual stage mismatch";
+#else
     TVM_FFI_ICHECK_EQ(payload.size(1), k_tiles) << "debug_decode: payload K-tile mismatch";
     TVM_FFI_ICHECK_EQ(payload.size(2), n_tiles) << "debug_decode: payload N-tile mismatch";
     TVM_FFI_ICHECK_EQ(payload.size(3), kV3PayloadTileN) << "debug_decode: payload tile N mismatch";
@@ -912,6 +1133,7 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     }
     TVM_FFI_ICHECK_EQ(residual.size(4), kV3ResidualsPerPayloadTile)
         << "debug_decode: residual K-block mismatch";
+#endif
     ffi::CUDADeviceGuard device_guard(payload.device().device_id);
     const cudaStream_t stream = get_stream(payload.device());
     if (residual_scheme_ == ResidualScheme::kGeneric) {
@@ -929,6 +1151,10 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
   int32_t total_experts_ = 0;
   int32_t group_size_ = 0;
   int32_t counter_bank_ = 0;
+  int32_t m64_stages_ = 3;
+  int32_t m128_stages_ = 4;
+  bool prefer_n64_main_ = false;
+  size_t tma_cache_capacity_ = kMaxWeightTmaCacheCapacity;
   int64_t padded_scale_stride_ = 0;
   ResidualScheme residual_scheme_ = ResidualScheme::kGeneric;
   int64_t required_workspace_bytes_ = 0;
@@ -940,46 +1166,36 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
   std::array<std::array<W4A8KernelResources, 2>, 2> fp32_resources_{};
   int32_t debug_decode_blocks_per_sm_ = 0;
   PFN_cuTensorMapEncodeTiled_v12000 tma_encoder_ = nullptr;
-  CUtensorMap activation_map_m64_{};
-  CUtensorMap activation_map_m128_{};
-  CUtensorMap payload_map_{};
-#if W4A8_RESIDUAL_TMA
-  CUtensorMap residual_map_{};
-#endif
-#if W4A8_GROUP_SCALE_TMA
-  CUtensorMap group_scale_map_{};
-#endif
-#if !W4A8_RESIDUAL_TMA
-  const void* residual_ptr_ = nullptr;
-#endif
-#if !W4A8_GROUP_SCALE_TMA
-  const float* group_scales_ptr_ = nullptr;
-#endif
-  uintptr_t cached_activation_address_ = 0;
-  uintptr_t cached_payload_address_ = 0;
-#if W4A8_RESIDUAL_TMA
-  uintptr_t cached_residual_address_ = 0;
-#endif
-#if W4A8_GROUP_SCALE_TMA
-  uintptr_t cached_group_scale_address_ = 0;
-#endif
-  int64_t cached_activation_rows_ = 0;
-  int32_t cached_group_size_ = 0;
-  int32_t cached_padded_n_ = 0;
-  int32_t cached_padded_k_ = 0;
-  int32_t cached_bucket_experts_ = 0;
-  ResidualScheme cached_residual_scheme_ = ResidualScheme::kGeneric;
-  bool tma_cache_valid_ = false;
+  W4A8ActivationTmaCacheKey activation_tma_cache_key_{};
+  W4A8ActivationTmaMaps activation_tma_cache_maps_{};
+  std::list<W4A8WeightTmaCacheEntry> weight_tma_cache_{};
+  std::mutex tma_cache_mutex_;
+  uint64_t activation_tma_cache_hits_ = 0;
+  uint64_t activation_tma_cache_misses_ = 0;
+  uint64_t weight_tma_cache_hits_ = 0;
+  uint64_t weight_tma_cache_misses_ = 0;
+  uint64_t weight_tma_cache_evictions_ = 0;
+  bool activation_tma_cache_valid_ = false;
   bool workspace_queried_ = false;
   bool workspace_configured_ = false;
 };
 
-tvm::ffi::Module init() {
-  auto runner = tvm::ffi::make_object<Sm90W4A8GroupedGemmRunner>();
+inline tvm::ffi::Module make_runner(int64_t m64_stages, int64_t m128_stages, bool prefer_n64_main,
+                                    int64_t tma_cache_capacity) {
+  auto runner = tvm::ffi::make_object<Sm90W4A8GroupedGemmRunner>(
+      m64_stages, m128_stages, prefer_n64_main, tma_cache_capacity);
   return tvm::ffi::Module(runner);
+}
+
+tvm::ffi::Module init() { return make_runner(3, 4, false, kMaxWeightTmaCacheCapacity); }
+
+tvm::ffi::Module init_with_tactics(int64_t m64_stages, int64_t m128_stages, bool prefer_n64_main,
+                                   int64_t tma_cache_capacity) {
+  return make_runner(m64_stages, m128_stages, prefer_n64_main, tma_cache_capacity);
 }
 
 }  // namespace sm90_w4a8
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, flashinfer::sm90_w4a8::init);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_with_tactics, flashinfer::sm90_w4a8::init_with_tactics);

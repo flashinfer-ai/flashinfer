@@ -36,6 +36,7 @@ NVFP4_RS_THREADS = 128
 NVFP4_RS_BYTES_PER_THREAD = 4
 
 NVFP4_SM90_LAYOUT_VERSION = 3
+NVFP4_SM90_STAGE_LAYOUT_VERSION = 4
 NVFP4_SM90_TILE_N = 64
 NVFP4_SM90_TILE_K = 32
 NVFP4_SM90_K_ALIGNMENT = 128
@@ -44,6 +45,10 @@ NVFP4_SM90_RESIDUAL_SCHEMES = ("generic", "pow2")
 NVFP4_SM90_NIBBLE_ORDER = "low_even_high_odd"
 NVFP4_SM90_BYTE_ORDER = "little"
 NVFP4_SM90_GLOBAL_LAYOUT = "kmajor_k32_n64_contiguous"
+NVFP4_SM90_STAGE_GLOBAL_LAYOUT = "expert_k128_n_stage_contiguous"
+NVFP4_SM90_STAGE_PACKED_BYTES = 64
+NVFP4_SM90_STAGE_RESIDUAL_ELEMENTS = 8
+NVFP4_SM90_STAGE_RESIDUAL_BYTES = {"generic": 16, "pow2": 8}
 NVFP4_SM90_W13_LAYOUT = "gate_then_up"
 NVFP4_SM90_ALPHA_SCOPES = ("per_tensor", "per_expert")
 NVFP4_SM90_ROUNDING_MODE = "rne"
@@ -257,9 +262,13 @@ def _canonical_metadata_bytes(metadata: Mapping[str, Any]) -> bytes:
 
 
 def _tensor_sha256(
-    tensor: torch.Tensor, *, tensor_name: str, metadata: Mapping[str, Any]
+    tensor: torch.Tensor,
+    *,
+    tensor_name: str,
+    metadata: Mapping[str, Any],
+    domain: bytes = b"flashinfer.nvfp4.v3\0",
 ) -> str:
-    """Hash the stable v3 tensor preimage.
+    """Hash a stable, domain-separated NVFP4 tensor preimage.
 
     The preimage is the domain tag, canonical JSON metadata, tensor name,
     explicit dtype tag, comma-separated decimal shape, and C-contiguous raw
@@ -268,21 +277,21 @@ def _tensor_sha256(
 
     if sys.byteorder != NVFP4_SM90_BYTE_ORDER:
         raise RuntimeError(
-            "NVFP4 v3 checksums support only little-endian hosts; canonical "
+            "NVFP4 checksums support only little-endian hosts; canonical "
             "byte swapping is not implemented"
         )
     if metadata.get("byte_order") != NVFP4_SM90_BYTE_ORDER:
         raise ValueError(
-            f"NVFP4 v3 checksum metadata byte_order must be {NVFP4_SM90_BYTE_ORDER!r}"
+            f"NVFP4 checksum metadata byte_order must be {NVFP4_SM90_BYTE_ORDER!r}"
         )
     if not tensor.is_contiguous():
-        raise ValueError(f"NVFP4 v3 checksum tensor {tensor_name!r} must be contiguous")
+        raise ValueError(f"NVFP4 checksum tensor {tensor_name!r} must be contiguous")
     dtype_tag = _NVFP4_SM90_CHECKSUM_DTYPE_TAGS.get(tensor.dtype)
     if dtype_tag is None:
-        raise TypeError(f"unsupported NVFP4 v3 checksum dtype {tensor.dtype}")
+        raise TypeError(f"unsupported NVFP4 checksum dtype {tensor.dtype}")
     shape = ",".join(str(size) for size in tensor.shape).encode("ascii")
     digest = hashlib.sha256(
-        b"flashinfer.nvfp4.v3\0"
+        domain
         + _canonical_metadata_bytes(metadata)
         + b"\0"
         + tensor_name.encode("ascii")
@@ -741,6 +750,172 @@ def _validate_nvfp4_sm90_v3_values(view: NVFP4SM90WeightViewV3) -> None:
             positive=False,
             reject_bfloat16_negative_zero=True,
         )
+
+
+@dataclass(frozen=True)
+class NVFP4V4Manifest:
+    """Stage-contiguous derivative of one immutable layout-v3 manifest."""
+
+    source_manifest: NVFP4V3Manifest
+    checksums: NVFP4V3Checksums
+    layout_version: int = NVFP4_SM90_STAGE_LAYOUT_VERSION
+    global_layout: str = NVFP4_SM90_STAGE_GLOBAL_LAYOUT
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_manifest, NVFP4V3Manifest):
+            raise TypeError("source_manifest must be NVFP4V3Manifest")
+        if self.layout_version != NVFP4_SM90_STAGE_LAYOUT_VERSION:
+            raise ValueError("NVFP4 stage layout version must be 4")
+        if self.global_layout != NVFP4_SM90_STAGE_GLOBAL_LAYOUT:
+            raise ValueError("NVFP4 stage layout name mismatch")
+        if not isinstance(self.checksums, NVFP4V3Checksums):
+            raise TypeError("checksums must be NVFP4V3Checksums")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source_manifest, name)
+
+    def metadata_dict(self) -> dict[str, Any]:
+        metadata = self.source_manifest.metadata_dict()
+        metadata["layout_version"] = self.layout_version
+        metadata["global_layout"] = self.global_layout
+        return metadata
+
+
+def _v4_checksums(
+    metadata: Mapping[str, Any],
+    payload: torch.Tensor,
+    scales: torch.Tensor,
+    group_scales: torch.Tensor,
+    residuals: torch.Tensor,
+    alpha: torch.Tensor,
+) -> NVFP4V3Checksums:
+    domain = b"flashinfer.nvfp4.v4\0"
+    return NVFP4V3Checksums(
+        payload_sha256=_tensor_sha256(
+            payload, tensor_name="payload", metadata=metadata, domain=domain
+        ),
+        scale_sha256=_tensor_sha256(
+            scales, tensor_name="scale", metadata=metadata, domain=domain
+        ),
+        group_scale_sha256=_tensor_sha256(
+            group_scales,
+            tensor_name="group_scale",
+            metadata=metadata,
+            domain=domain,
+        ),
+        residual_sha256=_tensor_sha256(
+            residuals, tensor_name="residual", metadata=metadata, domain=domain
+        ),
+        alpha_sha256=_tensor_sha256(
+            alpha, tensor_name="alpha", metadata=metadata, domain=domain
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class NVFP4SM90WeightViewV4:
+    """K128-stage-contiguous SM90 W4A8 operand view."""
+
+    packed_e2m1: torch.Tensor
+    scale_e4m3_per16: torch.Tensor
+    promotion_group_scale: torch.Tensor
+    promotion_residual: torch.Tensor
+    global_alpha: torch.Tensor
+    manifest: NVFP4V4Manifest
+
+    def __post_init__(self) -> None:
+        self.validate_layout()
+        _validate_e4m3_scale_values(self.scale_e4m3_per16)
+        _validate_floating_values(
+            self.promotion_group_scale,
+            name="v4 promotion group scales",
+            positive=True,
+        )
+        _validate_floating_values(
+            self.global_alpha,
+            name="v4 global alpha",
+            positive=True,
+        )
+        if self.manifest.residual_scheme == "generic":
+            _validate_floating_values(
+                self.promotion_residual,
+                name="v4 generic promotion residuals",
+                positive=False,
+                reject_bfloat16_negative_zero=True,
+            )
+
+    def validate_layout(self) -> None:
+        if not isinstance(self.manifest, NVFP4V4Manifest):
+            raise TypeError("manifest must be NVFP4V4Manifest")
+        experts, padded_n, padded_k = self.manifest.padded_shape
+        expected_residual_dtype = (
+            torch.bfloat16 if self.manifest.residual_scheme == "generic" else torch.int8
+        )
+        expected_shapes = {
+            "payload": (
+                self.packed_e2m1,
+                (experts, padded_k // 128, padded_n, NVFP4_SM90_STAGE_PACKED_BYTES),
+                torch.uint8,
+            ),
+            "scale": (
+                self.scale_e4m3_per16,
+                (experts, padded_k // 32, padded_n // 64, 64, 2),
+                torch.float8_e4m3fn,
+            ),
+            "group scale": (
+                self.promotion_group_scale,
+                (
+                    experts,
+                    padded_k // self.manifest.group_size,
+                    padded_n // 64,
+                    64,
+                ),
+                torch.float32,
+            ),
+            "residual": (
+                self.promotion_residual,
+                (
+                    experts,
+                    padded_k // 128,
+                    padded_n,
+                    NVFP4_SM90_STAGE_RESIDUAL_ELEMENTS,
+                ),
+                expected_residual_dtype,
+            ),
+        }
+        for name, (tensor, shape, dtype) in expected_shapes.items():
+            if tensor.dtype != dtype or tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"v4 {name} must be contiguous {dtype} {shape}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}"
+                )
+        tensors = (
+            self.packed_e2m1,
+            self.scale_e4m3_per16,
+            self.promotion_group_scale,
+            self.promotion_residual,
+            self.global_alpha,
+        )
+        if not all(tensor.is_contiguous() for tensor in tensors):
+            raise ValueError("v4 tensors must be contiguous")
+        if len({tensor.device for tensor in tensors}) != 1:
+            raise ValueError("v4 tensors must share a device")
+
+    def verify_checksums(self) -> None:
+        self.validate_layout()
+        actual = _v4_checksums(
+            self.manifest.metadata_dict(),
+            self.packed_e2m1,
+            self.scale_e4m3_per16,
+            self.promotion_group_scale,
+            self.promotion_residual,
+            self.global_alpha,
+        )
+        for name, digest in actual.to_dict().items():
+            if digest != getattr(self.manifest.checksums, name):
+                raise ValueError(
+                    f"NVFP4 v4 checksum mismatch for {name.removesuffix('_sha256')}"
+                )
 
 
 @dataclass(frozen=True)
@@ -1229,6 +1404,140 @@ def unpack_nvfp4_sm90_v3(
         expert_mapping=view.manifest.expert_mapping,
         source_format_version=view.manifest.source_format_version,
     )
+
+
+@torch.no_grad()
+def build_w4a8_v4_views(
+    view: NVFP4SM90WeightViewV3,
+    *,
+    verify_checksums: bool = True,
+) -> NVFP4SM90WeightViewV4:
+    """Reorder a v3 W4A8 view into one-TMA-per-K128-stage storage."""
+
+    if not isinstance(view, NVFP4SM90WeightViewV3):
+        raise TypeError("view must be NVFP4SM90WeightViewV3")
+    if verify_checksums:
+        view.verify_checksums()
+    else:
+        view.validate_layout()
+    experts, padded_n, padded_k = view.manifest.padded_shape
+    k_stages = padded_k // 128
+    n_tiles = padded_n // 64
+    payload = (
+        view.packed_e2m1.view(experts, k_stages, 4, n_tiles, 64, 16)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .view(experts, k_stages, padded_n, NVFP4_SM90_STAGE_PACKED_BYTES)
+    )
+    residual = (
+        view.promotion_residual.view(experts, k_stages, 4, n_tiles, 64, 2)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .view(experts, k_stages, padded_n, NVFP4_SM90_STAGE_RESIDUAL_ELEMENTS)
+    )
+    metadata = view.manifest.metadata_dict()
+    metadata["layout_version"] = NVFP4_SM90_STAGE_LAYOUT_VERSION
+    metadata["global_layout"] = NVFP4_SM90_STAGE_GLOBAL_LAYOUT
+    checksums = _v4_checksums(
+        metadata,
+        payload,
+        view.scale_e4m3_per16,
+        view.promotion_group_scale,
+        residual,
+        view.global_alpha,
+    )
+    return NVFP4SM90WeightViewV4(
+        packed_e2m1=payload,
+        scale_e4m3_per16=view.scale_e4m3_per16,
+        promotion_group_scale=view.promotion_group_scale,
+        promotion_residual=residual,
+        global_alpha=view.global_alpha,
+        manifest=NVFP4V4Manifest(view.manifest, checksums),
+    )
+
+
+@torch.no_grad()
+def _build_w4a8_v3_legacy_oracle(
+    view: NVFP4SM90WeightViewV4,
+    *,
+    verify_checksums: bool = True,
+) -> NVFP4SM90WeightViewV3:
+    """Restore the canonical v3 byte order from a stage-contiguous v4 view."""
+
+    if not isinstance(view, NVFP4SM90WeightViewV4):
+        raise TypeError("view must be NVFP4SM90WeightViewV4")
+    if verify_checksums:
+        view.verify_checksums()
+    else:
+        view.validate_layout()
+    experts, padded_n, padded_k = view.manifest.padded_shape
+    k_stages = padded_k // 128
+    n_tiles = padded_n // 64
+    payload = (
+        view.packed_e2m1.view(experts, k_stages, n_tiles, 64, 4, 16)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .view(experts, padded_k // 32, n_tiles, 64, 16)
+    )
+    residual = (
+        view.promotion_residual.view(experts, k_stages, n_tiles, 64, 4, 2)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .view(experts, padded_k // 32, n_tiles, 64, 2)
+    )
+    manifest = view.manifest.source_manifest
+    checksums = _v3_checksums(
+        manifest.metadata_dict(),
+        payload,
+        view.scale_e4m3_per16,
+        view.promotion_group_scale,
+        residual,
+        view.global_alpha,
+    )
+    manifest = NVFP4V3Manifest.from_dict(
+        {**manifest.metadata_dict(), "checksums": checksums.to_dict()}
+    )
+    return NVFP4SM90WeightViewV3(
+        packed_e2m1=payload,
+        scale_e4m3_per16=view.scale_e4m3_per16,
+        promotion_group_scale=view.promotion_group_scale,
+        promotion_residual=residual,
+        global_alpha=view.global_alpha,
+        manifest=manifest,
+    )
+
+
+@torch.no_grad()
+def repack_nvfp4_sm90_w4a8(
+    checkpoint: NVFP4Checkpoint,
+    *,
+    group_size: int,
+    residual_scheme: str,
+    payload_layout: int = 4,
+    allow_legacy_layout: bool = False,
+    sm_target: str = "sm90a",
+    rounding_mode: str = NVFP4_SM90_ROUNDING_MODE,
+) -> NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4:
+    """Build the production stage-contiguous W4A8 view.
+
+    Layout v3 remains available only as an explicit byte-oracle input for
+    validating layout transforms and kernel compatibility.
+    """
+
+    if payload_layout not in (3, 4):
+        raise ValueError("payload_layout must be 3 or 4")
+    if payload_layout == 3 and not allow_legacy_layout:
+        raise ValueError(
+            "payload_layout=3 is a legacy oracle and requires allow_legacy_layout=True"
+        )
+    legacy = repack_nvfp4_sm90_v3(
+        checkpoint,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        sm_target=sm_target,
+        rounding_mode=rounding_mode,
+    )
+    return legacy if payload_layout == 3 else build_w4a8_v4_views(legacy)
 
 
 def _cast_promoted_e4m3(values: torch.Tensor) -> torch.Tensor:

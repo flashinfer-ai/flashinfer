@@ -126,6 +126,76 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "sm90_push_nvfp4 nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
             )
+        if config.weight_policy not in ("packed", "folded", "hot_folded", "dual"):
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 weight_policy must be packed, folded, "
+                "hot_folded, or dual"
+            )
+        local_experts = fleet_params.num_experts // bootstrap.world_size
+        if type(config.hot_expert_count) is not int or not (
+            0 <= config.hot_expert_count <= local_experts
+        ):
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 hot_expert_count must be in the local expert range"
+            )
+        if config.weight_policy == "packed" and config.hot_expert_count != 0:
+            raise MoEEpConfigError("packed weight_policy requires hot_expert_count=0")
+        if config.weight_policy == "folded" and config.hot_expert_count not in (
+            0,
+            local_experts,
+        ):
+            raise MoEEpConfigError(
+                "folded weight_policy uses every local expert; hot_expert_count "
+                "must be 0 or the local expert count"
+            )
+        if config.weight_policy == "hot_folded" and not (
+            0 < config.hot_expert_count < local_experts
+        ):
+            raise MoEEpConfigError(
+                "hot_folded weight_policy requires a nonempty proper hot prefix"
+            )
+        if config.weight_policy == "dual":
+            if config.hot_expert_count != 0:
+                raise MoEEpConfigError("dual weight_policy requires hot_expert_count=0")
+            if config.acknowledge_dual_residency is not True:
+                raise MoEEpConfigError(
+                    "dual weight_policy retains both packed and folded weights "
+                    "(577.6 MiB measured versus 241.5 MiB packed and 336.1 MiB "
+                    "folded) and requires acknowledge_dual_residency=True"
+                )
+        if config.nvfp4_mode != "w4a8" and config.weight_policy != "packed":
+            raise MoEEpConfigError(
+                "non-packed weight policies require nvfp4_mode='w4a8'"
+            )
+        if type(config.tma_cache_capacity) is not int or not (
+            1 <= config.tma_cache_capacity <= 128
+        ):
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 tma_cache_capacity must be in [1, 128]"
+            )
+        try:
+            n64_expected_m_per_sm = float(config.n64_expected_m_per_sm)
+        except (TypeError, ValueError) as exc:
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 n64_expected_m_per_sm must be finite and positive"
+            ) from exc
+        if not math.isfinite(n64_expected_m_per_sm) or n64_expected_m_per_sm <= 0.0:
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 n64_expected_m_per_sm must be finite and positive"
+            )
+        if config.payload_layout not in (3, 4):
+            raise MoEEpConfigError("sm90_push_nvfp4 payload_layout must be 3 or 4")
+        if type(config.allow_legacy_layout) is not bool:
+            raise MoEEpConfigError("sm90_push_nvfp4 allow_legacy_layout must be a bool")
+        if (
+            config.nvfp4_mode == "w4a8"
+            and config.payload_layout == 3
+            and not config.allow_legacy_layout
+        ):
+            raise MoEEpConfigError(
+                "sm90_push_nvfp4 payload_layout=3 is a legacy oracle and requires "
+                "allow_legacy_layout=True"
+            )
         if config.payload_dtype not in ("fp8", "bf16"):
             raise MoEEpConfigError(
                 "sm90_push_nvfp4 payload_dtype must be 'fp8' or 'bf16'"
@@ -212,6 +282,9 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             nvfp4_mode=config.nvfp4_mode,
             group_size=config.group_size,
             residual_scheme=config.residual_scheme,
+            payload_layout=config.payload_layout,
+            weight_policy=config.weight_policy,
+            hot_expert_count=config.hot_expert_count,
         )
         self._transformed_weights = transformed
         return transformed
@@ -232,6 +305,9 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             nvfp4_mode=config.nvfp4_mode,
             group_size=config.group_size,
             residual_scheme=config.residual_scheme,
+            payload_layout=config.payload_layout,
+            weight_policy=config.weight_policy,
+            hot_expert_count=config.hot_expert_count,
         )
         self._transformed_weights = transformed_weights
 
@@ -302,6 +378,10 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
                 rs_n_tactic=config.rs_n_tactic,
                 rs_stages=config.rs_stages,
                 rs_stage_k=config.rs_stage_k,
+                tma_cache_capacity=config.tma_cache_capacity,
+                n64_expected_m_per_sm=float(config.n64_expected_m_per_sm),
+                payload_layout=config.payload_layout,
+                allow_legacy_layout=config.allow_legacy_layout,
             )
         except Exception:
             pipe.destroy()
@@ -314,6 +394,20 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
+        transformed_weights = self._transformed_weights
+        from .....kernel_src.sm90.push_style_megamoe import (
+            Sm90PushNvFp4DualWeights,
+            Sm90PushNvFp4HotFoldedWeights,
+        )
+
+        execution_identity = (
+            transformed_weights.execution_identity
+            if isinstance(
+                transformed_weights,
+                (Sm90PushNvFp4HotFoldedWeights, Sm90PushNvFp4DualWeights),
+            )
+            else (config.nvfp4_mode,)
+        )
         return (
             "sm90_push_nvfp4",
             torch.cuda.current_device(),
@@ -326,6 +420,10 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.nvfp4_mode,
+            config.weight_policy,
+            config.hot_expert_count,
+            config.acknowledge_dual_residency,
+            execution_identity,
             config.group_size,
             config.residual_scheme,
             config.payload_dtype,
@@ -337,6 +435,10 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             config.rs_n_tactic,
             config.rs_stages,
             config.rs_stage_k,
+            config.tma_cache_capacity,
+            float(config.n64_expected_m_per_sm),
+            config.payload_layout,
+            config.allow_legacy_layout,
             config.allow_unverified_p2p,
             float(config.init_timeout_s),
         )
