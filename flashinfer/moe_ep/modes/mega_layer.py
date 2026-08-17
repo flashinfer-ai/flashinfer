@@ -220,20 +220,22 @@ class MoEEpMegaLayer(nn.Module):
 
         workspace = self._ensure_workspace()
 
-        self._kernel.stage_inputs(
-            t,
-            workspace,
-            quantize_input=quantize_input,
-        )
-
         y = None
         if not return_workspace_view:
+            # Owned-output allocation must stay ahead of the staging round
+            # (allocator work between stage and compute can sync the device
+            # mid-round).
             y = torch.empty(
                 t.num_tokens,
                 self._fleet_params.token_hidden_size,
                 dtype=torch.bfloat16,
                 device=t.hidden_states.device,
             )
+        self._kernel.stage_inputs(
+            t,
+            workspace,
+            quantize_input=quantize_input,
+        )
         return self._kernel.compute(
             workspace,
             self._transformed,
