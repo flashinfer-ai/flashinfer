@@ -246,7 +246,9 @@ def append_cub_columns(
     if show_clusters:
         # Clusters time / CUB time (>= 1.0x means CUB wins); n/a when either backend
         # was not measured (pre-SM100, CUDA graphs, clusters-incompatible arguments).
-        clusters_us = result.get("clusters_us")
+        # The grid sections store the clusters timing under the legacy "fast_topk_us"
+        # key; the varlen runner uses "clusters_us".
+        clusters_us = result.get("clusters_us", result.get("fast_topk_us"))
         cub_us = result.get("cub_us")
         if clusters_us is not None and cub_us is not None:
             line += f" {clusters_us / cub_us:>13.2f}x"
