@@ -7,7 +7,10 @@ import torch
 
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
-from flashinfer.autotuner.initializers import autotuner_initializer_randn
+from flashinfer.autotuner.initializers import (
+    autotuner_initializer_ones,
+    autotuner_initializer_randn,
+)
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
 from flashinfer.fused_moe.shared.tuning import (
     make_moe_tuning_config,
@@ -492,6 +495,80 @@ def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     assert tactic == 1
 
 
+@pytest.mark.parametrize("entrypoint", ["choose_one", "rank_tactics"])
+def test_tuning_preparation_preserves_dynamic_positional_kwarg_alias(
+    monkeypatch, entrypoint
+):
+    """Preparation observes the same complete invocation as timed profiling."""
+    tuner = reset_autotuner()
+    original = torch.ones((12, 4), dtype=torch.float32)
+    observations = []
+
+    class PreparationAliasRunner(TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [0, 1]
+
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            observations.append(("precompile", inputs[0], kwargs["repeated"]))
+            return False
+
+        def forward(
+            self,
+            inputs,
+            tactic: int = -1,
+            do_preparation: bool = False,
+            *,
+            repeated=None,
+        ):
+            if do_preparation:
+                observations.append(("prepare", inputs[0], repeated))
+            return inputs[0]
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(16,),
+                map_to_tuning_buckets=lambda value: 16,
+            ),
+        ),
+    )
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        batch_inputs, batch_kwargs = kwargs["input_tensor_batches"][0]
+        assert batch_inputs[0] is batch_kwargs["repeated"]
+        return float(tactic)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    runner = PreparationAliasRunner()
+    with autotune(tune_mode=True):
+        if entrypoint == "choose_one":
+            tuner.choose_one(
+                "dummy_prepare_alias", [runner], config, [original], repeated=original
+            )
+        else:
+            tuner.rank_tactics(
+                "dummy_prepare_alias",
+                [runner],
+                config,
+                [original],
+                k=2,
+                repeated=original,
+            )
+
+    expected_stages = (
+        ["precompile", "prepare"] if entrypoint == "choose_one" else ["prepare"]
+    )
+    assert [stage for stage, _, _ in observations] == expected_stages
+    for _, positional, keyword in observations:
+        assert positional is keyword
+        assert positional is not original
+        assert positional.shape == (16, 4)
+
+
 def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
@@ -557,20 +634,38 @@ def test_rank_tactics_uses_mapped_dynamic_profile(monkeypatch):
             ),
         )
     )
-    profiled_shapes = []
+    profiled_invocations = []
 
     def fake_profile(
-        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+        self,
+        runner_obj,
+        prof_inputs,
+        tactic,
+        tuning_config=None,
+        input_tensor_batches=None,
+        **kwargs,
     ):
-        profiled_shapes.append(tuple(prof_inputs[0].shape))
+        assert input_tensor_batches is not None
+        batch_inputs, batch_kwargs = input_tensor_batches[0]
+        profiled_invocations.append((batch_inputs[0], batch_kwargs["repeated"]))
         return float(tactic)
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
     with autotune(tune_mode=True):
-        ranked = tuner.rank_tactics("dummy_rank_dynamic", [runner], config, inputs, k=2)
+        ranked = tuner.rank_tactics(
+            "dummy_rank_dynamic",
+            [runner],
+            config,
+            inputs,
+            k=2,
+            repeated=inputs[0],
+        )
 
     assert ranked == [0, 1]
-    assert profiled_shapes == [(16, 4), (16, 4)]
+    assert len(profiled_invocations) == 2
+    for profiled_input, profiled_kwarg in profiled_invocations:
+        assert profiled_input is profiled_kwarg
+        assert profiled_input.shape == (16, 4)
 
 
 def test_rank_tactics_outside_tuning_returns_single_cached_or_fallback():
@@ -971,7 +1066,11 @@ def test_tuning_config_profiling_repeat_override(monkeypatch):
 
     assert tuner._get_profiling_repeat(default_config) == 10
     assert tuner._get_profiling_repeat(override_config) == 3
-    assert len(tuner._prepare_input_tensors_with_batches(inputs, override_config)) == 4
+    effective_config, batches = tuner._prepare_input_tensors_with_batches(
+        inputs, override_config
+    )
+    assert not effective_config.use_cold_l2_cache
+    assert len(batches) == 1
 
     default_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), default_config)
     override_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), override_config)
@@ -1003,42 +1102,49 @@ def test_tuning_config_profiling_repeat_controls_measurement(monkeypatch):
     runner = CountingRunner()
     config = TuningConfig(profiling_repeat=3)
 
-    tuner._profile_single_kernel(runner, [torch.zeros(1, device="cuda")], 0, config)
+    inputs = [torch.zeros(1, device="cuda")]
+    tuner._profile_single_kernel(runner, inputs, 0, config, [(inputs, {})])
 
     assert runner.calls == 3
 
 
-def test_tuning_config_profiling_repeat_reuses_bounded_cuda_arena(monkeypatch):
+def test_tuning_config_profiling_repeat_bounds_complete_invocations(monkeypatch):
     if not torch.cuda.is_available():
-        pytest.skip("profile arena requires CUDA")
+        pytest.skip("complete-invocation profiling requires CUDA")
 
     tuner = reset_autotuner()
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 768)
-    inputs = [torch.zeros(256, dtype=torch.float32, device="cuda")]
+    inputs = [
+        torch.zeros(256, dtype=torch.float32, device="cuda"),
+        torch.zeros(4096, dtype=torch.float32, device="cuda"),
+    ]
     config = TuningConfig(
         use_cold_l2_cache=True,
         profiling_repeat=100,
-        profile_arena_input_indices=(0,),
+        profile_replica_input_indices=(0,),
     )
 
-    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+    effective_config, batches = tuner._prepare_input_tensors_with_batches(
+        inputs, config
+    )
 
-    # One lane carries 1024 bytes and the cold-L2 target is 1792 bytes, so two
-    # lanes per A/B arena suffice. All 100 timed replays remain scheduled and
-    # traverse A0, B0, A1, B1 instead of skipping half the lanes when the lane
-    # count is even.
-    assert len(batches) == 100
-    data_ptrs = [batch[0].data_ptr() for batch in batches]
-    assert data_ptrs[:4] == data_ptrs[4:8]
-    assert len(set(data_ptrs)) == 4
+    # One invocation carries 1024 bytes, so two replicas exceed the 1536-byte
+    # cold-L2 target without allocating one replica per profiling repeat.
+    assert effective_config.use_cold_l2_cache
+    assert len(batches) == 2
+    data_ptrs = [batch_inputs[0].data_ptr() for batch_inputs, _ in batches]
+    assert len(set(data_ptrs)) == 2
+    assert all(batch_inputs[1] is inputs[1] for batch_inputs, _ in batches)
 
     storages = {
-        batch[0].untyped_storage().data_ptr(): batch[0].untyped_storage().nbytes()
-        for batch in batches
+        batch_inputs[0].untyped_storage().data_ptr(): batch_inputs[0]
+        .untyped_storage()
+        .nbytes()
+        for batch_inputs, _ in batches
     }
     assert len(storages) == 2
-    assert sum(storages.values()) == 2 * 2 * 1024
-    assert sum(storages.values()) < 2 * 100 * 1024
+    assert sum(storages.values()) == 2 * 1024
+    assert sum(storages.values()) < 100 * 1024
 
 
 def test_autotune_context_overrides_cuda_graph_profile_replays(monkeypatch):
@@ -1109,6 +1215,7 @@ def test_cuda_graph_profile_replay_change_reprofiles(monkeypatch):
 
 def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
     tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     runner = DummyRunner(valid_tactics=(0,))
     inputs = [torch.empty((128, 32), dtype=torch.float32)]
     hot_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=False)
@@ -1170,7 +1277,13 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
 
-    latency = tuner._profile_single_kernel(runner, inputs, 0, config)
+    latency = tuner._profile_single_kernel(
+        runner,
+        inputs,
+        0,
+        config,
+        input_tensor_batches=[(inputs, {})],
+    )
 
     assert latency >= 0
     assert allocations == [(8192, inputs[0].device)]
@@ -1397,8 +1510,6 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
 
     config = TuningConfig(
         use_cold_l2_cache=True,
-        value_aware_input_indices=(1, 2),
-        profile_arena_input_indices=(0, 1, 2, 3),
         inputs_pre_hook=stage_routing_distribution,
     )
     observed_schedules = []
@@ -1433,36 +1544,35 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
     assert len(observed_schedules) == 2
     assert observed_schedules[0] is observed_schedules[1]
 
-    # Arena-backed call tensors get stable lane views, while the omitted read-only model tensor
-    # keeps its original pointer across all tactic measurements.
+    # Every tensor in the complete invocation uses owned schedule storage, and every tactic
+    # receives the same schedule object.
     schedule = observed_schedules[0]
-    assert len(schedule) == tuner.repeat
-    expected_ids = sampled_expert_ids.to(schedule[0][1].device, torch.int32)
-    expected_weights = sampled_routing_weights.to(schedule[0][2].device, torch.bfloat16)
-    for batch in schedule:
-        assert torch.equal(batch[1], expected_ids)
-        assert torch.equal(batch[2], expected_weights)
-        assert batch[4] is inputs[4]
-        for input_index in (0, 1, 2, 3):
-            assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
-    for input_index in (0, 1, 2, 3):
-        pointers = [batch[input_index].data_ptr() for batch in schedule]
-        num_physical_buffers = len(set(pointers))
-        assert 2 <= num_physical_buffers <= tuner.repeat
-        assert num_physical_buffers % 2 == 0
-        assert pointers == [
-            pointers[index % num_physical_buffers] for index in range(tuner.repeat)
-        ]
+    assert schedule
+    expected_ids = sampled_expert_ids.to(schedule[0][0][1].device, torch.int32)
+    expected_weights = sampled_routing_weights.to(
+        schedule[0][0][2].device, torch.bfloat16
+    )
+    for batch_inputs, _ in schedule:
+        assert torch.equal(batch_inputs[1], expected_ids)
+        assert torch.equal(batch_inputs[2], expected_weights)
+        for input_index in (0, 1, 2, 3, 4):
+            assert (
+                batch_inputs[input_index].data_ptr() != inputs[input_index].data_ptr()
+            )
+    for input_index in (0, 1, 2, 3, 4):
+        assert len(
+            {batch_inputs[input_index].data_ptr() for batch_inputs, _ in schedule}
+        ) == len(schedule)
     assert torch.count_nonzero(inputs[1]).item() == 0
     assert torch.count_nonzero(inputs[2]).item() == 0
-    sorted_ids = schedule[0][1].sort(dim=1).values
+    sorted_ids = schedule[0][0][1].sort(dim=1).values
     assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
 
 
 def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatch):
     """One tuning transaction must restage distributions into one stable schedule."""
     if not torch.cuda.is_available():
-        pytest.skip("value-aware profiling arenas require CUDA")
+        pytest.skip("complete working-set profiling requires CUDA")
 
     tuner = reset_autotuner()
     runner = ValueAwareCudaRunner()
@@ -1484,22 +1594,53 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
         torch.full((num_tokens, 4), 2.0, device="cuda"),
     ]
     config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 2, 3),
+                dim_idx=(0, 0, 0, 0),
+                gen_tuning_buckets=(num_tokens, 2 * num_tokens),
+                map_to_tuning_buckets=lambda value: value,
+            ),
+        ),
         use_cold_l2_cache=True,
-        value_aware_input_indices=(1, 2),
-        profile_arena_input_indices=(0, 1, 2, 3),
     )
 
-    # Allocate one A/B arena pair for the operation, then retain its lane addresses for every
+    # Provision one complete working-set schedule, then retain its addresses for every
     # distribution and every tactic in this single tuning transaction.
     input_shapes = tuple(tuple(tensor.shape) for tensor in inputs)
     profile_records = []
     observed_histograms = {}
-    # TODO: Let AutoTuner orchestrate multiple same-shaped value samples within one tuning transaction.
     with autotune(tune_mode=True):
-        effective_config, shared_schedule = tuner.prepare_tactic_profile(inputs, config)
+        effective_config, shared_schedule = tuner.prepare_profile_schedule(
+            inputs,
+            config,
+        )
         pointer_order = tuple(
-            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
-            for batch in shared_schedule
+            tuple(batch_inputs[index].data_ptr() for index in range(len(inputs)))
+            for batch_inputs, _ in shared_schedule
+        )
+        assert effective_config.use_cold_l2_cache is True
+        assert (
+            sum(
+                tensor.numel() * tensor.element_size()
+                for batch_inputs, _ in shared_schedule
+                for tensor in batch_inputs
+            )
+            > 2 * 1024
+        )
+        assert all(
+            batch_inputs[index].data_ptr() != inputs[index].data_ptr()
+            for batch_inputs, _ in shared_schedule
+            for index in range(len(inputs))
+        )
+        assert all(
+            batch_inputs[0].shape == inputs[0].shape
+            for batch_inputs, _ in shared_schedule
+        )
+        assert all(
+            batch_inputs[0].untyped_storage().nbytes()
+            >= 2 * inputs[0].numel() * inputs[0].element_size()
+            for batch_inputs, _ in shared_schedule
         )
 
         for distribution_index, distribution_name in enumerate(
@@ -1535,13 +1676,13 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
                 dim=1, keepdim=True
             )
 
-            # Restage only values. Every tactic sees the same A/B lane order, and the next
+            # Restage only values. Every tactic sees the same replica order, and the next
             # distribution overwrites those exact graph-stable addresses rather than reallocating.
             inputs[1].copy_(expert_ids.to(inputs[1].device, torch.int32))
             inputs[2].copy_(routing_weights.to(inputs[2].device, torch.bfloat16))
-            for batch in shared_schedule:
-                batch[1].copy_(inputs[1])
-                batch[2].copy_(inputs[2])
+            for batch_inputs, _ in shared_schedule:
+                batch_inputs[1].copy_(inputs[1])
+                batch_inputs[2].copy_(inputs[2])
             for tactic in (0, 1):
                 time_ms = tuner.profile_tactic(
                     runner,
@@ -1558,8 +1699,11 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
                         tactic,
                         time_ms,
                         tuple(
-                            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
-                            for batch in shared_schedule
+                            tuple(
+                                batch_inputs[index].data_ptr()
+                                for index in range(len(inputs))
+                            )
+                            for batch_inputs, _ in shared_schedule
                         ),
                     )
                 )
@@ -1572,12 +1716,13 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
                 expert_ids.flatten(), minlength=num_experts
             ).double()
             observed_histograms[distribution_name] = histogram / histogram.sum()
-            expected_output = (
-                inputs[0] + inputs[1].float().mean() + inputs[2].mean() + inputs[4]
-            )
-            for batch in shared_schedule:
+            for batch, _ in shared_schedule:
+                expected_output = (
+                    batch[0] + batch[1].float().mean() + batch[2].mean() + batch[4]
+                )
                 torch.testing.assert_close(batch[3], expected_output)
-                assert batch[4] is inputs[4]
+                assert batch[4] is not inputs[4]
+                torch.testing.assert_close(batch[4], inputs[4])
 
     assert len(profile_records) == 6
     assert {record[0] for record in profile_records} == {operation_key}
@@ -1646,16 +1791,196 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     inputs = [torch.ones(1), non_tensor]
 
-    batches = tuner._prepare_input_tensors_with_batches(
+    effective_config, batches = tuner._prepare_input_tensors_with_batches(
         inputs, TuningConfig(use_cold_l2_cache=True)
     )
 
-    assert batches[0] is inputs
+    assert effective_config.use_cold_l2_cache is True
+    assert batches[0] is not inputs
+    assert batches[0][0][0] is not inputs[0]
+    torch.testing.assert_close(batches[0][0][0], inputs[0])
     assert len(batches) > 1
-    for batch in batches[1:]:
-        assert batch[0] is not inputs[0]
-        torch.testing.assert_close(batch[0], inputs[0])
-        assert batch[1] is non_tensor
+    for batch_inputs, _ in batches[1:]:
+        assert batch_inputs[0] is not inputs[0]
+        torch.testing.assert_close(batch_inputs[0], inputs[0])
+        assert batch_inputs[1] is non_tensor
+
+
+def test_prepare_profile_schedule_clones_kwargs_and_preserves_aliases(monkeypatch):
+    """The complete arena owns tensor kwargs without duplicating repeated tensors."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 2)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    shared = torch.ones(1)
+    weight = torch.full((1,), 2.0)
+
+    effective_config, schedule = tuner.prepare_profile_schedule(
+        [shared],
+        TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0,),
+                    dim_idx=(0,),
+                    gen_tuning_buckets=(1, 2),
+                    map_to_tuning_buckets=lambda value: value,
+                ),
+            ),
+            tensor_initializers=((0, autotuner_initializer_ones),),
+            use_cold_l2_cache=True,
+        ),
+        weight=weight,
+        repeated=shared,
+        flag=True,
+    )
+
+    # Unique bytes are shared(4) + weight(4), requiring two replicas for >2x a 4-byte L2.
+    assert effective_config.use_cold_l2_cache is True
+    assert len(schedule) == 2
+    for batch_inputs, batch_kwargs in schedule:
+        assert batch_inputs[0] is batch_kwargs["repeated"]
+        assert batch_inputs[0] is not shared
+        assert batch_kwargs["weight"] is not weight
+        assert batch_kwargs["flag"] is True
+        torch.testing.assert_close(batch_inputs[0], shared)
+        torch.testing.assert_close(batch_kwargs["weight"], weight)
+        assert batch_inputs[0].untyped_storage().nbytes() >= 2 * shared.element_size()
+    assert schedule[0][0][0] is not schedule[1][0][0]
+    assert schedule[0][1]["weight"] is not schedule[1][1]["weight"]
+
+
+def test_dynamic_alias_counts_once_for_cold_l2_replicas(monkeypatch):
+    """Cold-L2 sizing counts a synthesized positional/kwarg alias once."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 2)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    original = torch.ones(1)
+    profiled = torch.ones(2)
+
+    effective_config, schedule = tuner._prepare_input_tensors_with_batches(
+        [profiled],
+        TuningConfig(use_cold_l2_cache=True),
+        alias_templates=[original],
+        kwargs={"repeated": original},
+    )
+
+    # One 8-byte allocation per invocation requires two replicas to exceed 2x a 4-byte L2.
+    assert effective_config.use_cold_l2_cache is True
+    assert len(schedule) == 2
+    for batch_inputs, batch_kwargs in schedule:
+        assert batch_inputs[0] is batch_kwargs["repeated"]
+        assert batch_inputs[0].shape == (2,)
+
+
+def test_profile_clone_oom_fallback_preserves_dynamic_alias():
+    """The non-cold OOM fallback reconstructs one canonical invocation."""
+    tuner = reset_autotuner()
+
+    class CloneOomTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, value):
+            return torch.Tensor._make_subclass(cls, value, value.requires_grad)
+
+        def clone(self, *args, **kwargs):
+            raise torch.cuda.OutOfMemoryError
+
+    original = torch.ones(1)
+    profiled = CloneOomTensor(torch.ones(2))
+
+    effective_config, schedule = tuner._prepare_input_tensors_with_batches(
+        [profiled],
+        TuningConfig(use_cold_l2_cache=True),
+        alias_templates=[original],
+        kwargs={"repeated": original},
+    )
+
+    assert effective_config.use_cold_l2_cache is False
+    assert len(schedule) == 1
+    batch_inputs, batch_kwargs = schedule[0]
+    assert batch_inputs[0] is batch_kwargs["repeated"]
+    assert batch_inputs[0] is profiled
+    assert batch_inputs[0].shape == (2,)
+
+
+def test_prepare_profile_schedule_retains_selected_tensor_kwarg_clone():
+    """A selected immutable tensor kwarg has one owned profiling address."""
+    tuner = reset_autotuner()
+    source = torch.empty(4)
+    source.fill_(3.0)
+    retained_clones = {}
+
+    config = TuningConfig(
+        use_cold_l2_cache=False,
+        profile_retained_tensor_kwargs=("scale",),
+    )
+    _, first_schedule = tuner._prepare_input_tensors_with_batches(
+        [torch.ones(1)],
+        config,
+        kwargs={"scale": source},
+        retained_kwarg_clones=retained_clones,
+    )
+    _, second_schedule = tuner._prepare_input_tensors_with_batches(
+        [torch.ones(1)],
+        config,
+        kwargs={"scale": source},
+        retained_kwarg_clones=retained_clones,
+    )
+
+    cloned = first_schedule[0][1]["scale"]
+    assert cloned is not source
+    assert second_schedule[0][1]["scale"] is cloned
+    torch.testing.assert_close(cloned, source)
+
+
+def test_choose_one_profiles_complete_invocations(monkeypatch):
+    """Ordinary tuning and explicit DA profiling must share the same invocation ABI."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    shared = torch.ones(1)
+    weight = torch.full((1,), 2.0)
+    observed = []
+
+    def fake_profile(
+        self,
+        runner_obj,
+        prof_inputs,
+        tactic,
+        tuning_config,
+        input_tensor_batches,
+    ):
+        batch_inputs, batch_kwargs = input_tensor_batches[0]
+        observed.append((batch_inputs, batch_kwargs))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one(
+            "complete_invocation",
+            [runner],
+            TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        input_idx=(0,),
+                        dim_idx=(0,),
+                        gen_tuning_buckets=(2,),
+                        map_to_tuning_buckets=lambda _value: 2,
+                    ),
+                ),
+                tensor_initializers=((0, autotuner_initializer_ones),),
+            ),
+            [shared],
+            weight=weight,
+            repeated=shared,
+            label="ordinary",
+        )
+
+    assert tactic == 0
+    assert len(observed) == 1
+    batch_inputs, batch_kwargs = observed[0]
+    assert batch_inputs[0] is batch_kwargs["repeated"]
+    assert batch_inputs[0] is not shared
+    assert batch_inputs[0].shape == (2,)
+    assert batch_kwargs["weight"] is not weight
+    assert batch_kwargs["label"] == "ordinary"
 
 
 def test_choose_one_with_none_input_no_crash():
@@ -2185,7 +2510,9 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
 
 
 def test_moe_empty_routing_placeholders_preserve_file_cache_key():
-    """Logits-routed placeholders remain bucketed in persisted tactic keys."""
+    """Logits-routed placeholders retain one key before and after synthesis."""
+    from flashinfer.prims_ts.moe.runner import PrimsTsBf16MoERunner
+
     num_tokens, hidden_size, num_experts = 17, 64, 8
     moe_inputs = MoeRunnerInputs(
         output=torch.empty((num_tokens, hidden_size)),
@@ -2206,11 +2533,22 @@ def test_moe_empty_routing_placeholders_preserve_file_cache_key():
     )
     input_shapes = AutoTuner.get()._get_input_sizes(moe_inputs.to_list())
 
-    cache_key = AutoTuner._get_cache_key(
+    runner = PrimsTsBf16MoERunner(
+        object(),
+        top_k=2,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=32,
+        num_experts=num_experts,
+    )
+    runner.set_cache_key_static_extras(routing_input_mode=RoutingInputMode.FromLogits)
+    tuner = AutoTuner.get()
+    cache_key = tuner._get_cache_key(
         "test::routed_moe",
-        DummyRunner(),
+        runner,
         input_shapes,
         tuning_config,
+        runner.get_cache_key_extras(moe_inputs.to_list()),
     )
     legacy_profile = (
         (32, hidden_size),
@@ -2225,9 +2563,96 @@ def test_moe_empty_routing_placeholders_preserve_file_cache_key():
 
     assert tuning_config.dynamic_tensor_specs[0].input_idx == (0, 1, 2, 3, 4)
     assert cache_key.nearest_profile == legacy_profile
-    assert cache_key.file_key == str(
-        ("test::routed_moe", "DummyRunner", legacy_profile, ())
+    profile = next(
+        candidate
+        for candidate in tuner._generate_optimization_profiles(
+            tuning_config, moe_inputs.to_list()
+        )
+        if candidate.get_opt_shapes() == legacy_profile
     )
+    synthesized = tuner._prepare_input_tensors(profile, moe_inputs.to_list())
+    assert synthesized[MoeRunnerInputs.idx("topk_ids")].numel() == 0
+    assert synthesized[MoeRunnerInputs.idx("expert_weights")].numel() == 0
+    synthesized_key = tuner._get_cache_key(
+        "test::routed_moe",
+        runner,
+        profile.get_opt_shapes(),
+        tuning_config,
+        runner.get_cache_key_extras(synthesized),
+    )
+    assert synthesized_key == cache_key
+
+
+def test_moe_populated_topk_ids_without_initializer_use_empty_placeholder():
+    """A missing custom top-k initializer falls back to an empty placeholder."""
+    num_tokens, hidden_size, num_experts, top_k = 4, 16, 8, 2
+    moe_inputs = MoeRunnerInputs(
+        output=torch.empty((num_tokens, hidden_size)),
+        routing_logits=None,
+        topk_ids=torch.empty((num_tokens, top_k), dtype=torch.int32),
+        expert_weights=torch.empty((num_tokens, top_k), dtype=torch.bfloat16),
+        hidden_states=torch.empty((num_tokens, hidden_size)),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+
+    tuning_config = make_moe_tuning_config(
+        moe_inputs,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        init_packed_topk_ids=None,
+    )
+
+    topk_initializer = dict(tuning_config.tensor_initializers)[
+        MoeRunnerInputs.idx("topk_ids")
+    ]
+    initialized = topk_initializer(
+        (num_tokens, top_k), torch.int32, torch.device("cpu")
+    )
+    assert initialized.shape == (0,)
+
+
+def test_moe_populated_topk_ids_accepts_falsy_callable_initializer():
+    """Initializer selection does not depend on a callable's truthiness."""
+
+    class FalsyInitializer:
+        def __bool__(self):
+            return False
+
+        def __call__(self, shape, dtype, device):
+            return torch.ones(shape, dtype=dtype, device=device)
+
+    num_tokens, hidden_size, num_experts, top_k = 4, 16, 8, 2
+    moe_inputs = MoeRunnerInputs(
+        output=torch.empty((num_tokens, hidden_size)),
+        routing_logits=None,
+        topk_ids=torch.empty((num_tokens, top_k), dtype=torch.int32),
+        expert_weights=torch.empty((num_tokens, top_k), dtype=torch.bfloat16),
+        hidden_states=torch.empty((num_tokens, hidden_size)),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    initializer = FalsyInitializer()
+
+    tuning_config = make_moe_tuning_config(
+        moe_inputs,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        init_packed_topk_ids=initializer,
+    )
+
+    topk_initializer = dict(tuning_config.tensor_initializers)[
+        MoeRunnerInputs.idx("topk_ids")
+    ]
+    assert topk_initializer is initializer
+    initialized = topk_initializer(
+        (num_tokens, top_k), torch.int32, torch.device("cpu")
+    )
+    assert initialized.shape == (num_tokens, top_k)
 
 
 def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):

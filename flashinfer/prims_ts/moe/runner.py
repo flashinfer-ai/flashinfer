@@ -581,7 +581,14 @@ class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Return cache dimensions that are invariant under input synthesis."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
+        static_extras = getattr(self, "_cache_key_static_extras", ())
+        routing_input_mode = RoutingInputMode(
+            dict(static_extras).get(
+                "routing_input_mode", int(RoutingInputMode.FromLogits)
+            )
+        )
         return (
             ("prims_ts_moe_config_version", 4),
             ("dtype_act", int(self.dtype_act)),
@@ -593,13 +600,13 @@ class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
             ("gemm1_lora_delta", moe_inputs.gemm1_lora_delta is not None),
             (
                 "routing_logits",
-                moe_inputs.routing_logits is not None,
+                routing_input_mode == RoutingInputMode.FromLogits,
             ),
             (
                 "expert_weights",
-                moe_inputs.expert_weights is not None,
+                routing_input_mode == RoutingInputMode.UnpackedPrecomputed,
             ),
-            *getattr(self, "_cache_key_static_extras", ()),
+            *static_extras,
         )
 
     def _factorized_tactic_space(

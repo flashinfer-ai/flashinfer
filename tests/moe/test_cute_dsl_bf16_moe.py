@@ -53,13 +53,13 @@ def test_sm90_moe_autotune_profile_contract():
     ).tuning_config
 
     assert config.value_aware_input_indices == (1, 2)
-    assert config.profile_arena_input_indices == (0, 1, 2, 5)
+    assert config.profile_replica_input_indices == (0, 1, 2, 5)
     assert config.use_cuda_graph
 
 
 @cute_dsl_available
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_sm90_moe_autotune_uses_dynamic_profile_arena(monkeypatch):
+def test_sm90_moe_autotune_uses_dynamic_profile_replicas(monkeypatch):
     """Large shared weights must not collapse cold-L2 profiling to one batch."""
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
