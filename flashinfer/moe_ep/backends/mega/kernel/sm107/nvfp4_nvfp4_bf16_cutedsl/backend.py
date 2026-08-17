@@ -1,8 +1,8 @@
-"""SM107 (Rubin) mxfp8 block-scaled mega-MoE kernel backend.
+"""SM107 (Rubin) nvfp4 block-scaled mega-MoE kernel backend.
 
 Wraps the vendored ``kernel_src/next_cutedsl_megamoe`` drop's fused
 dispatch + FC1 + SwiGLU + FC2 + combine inference kernel
-(``BlockScaledSwapAbMegaMoeKernel`` at quant kind mxfp8) behind the
+(``BlockScaledSwapAbMegaMoeKernel`` at quant kind nvfp4) behind the
 ``MegaKernelBackend`` contract.  The backend talks only to the drop's package
 ``__init__`` (never ``src/`` directly), keeping ``import flashinfer.moe_ep``
 CPU-safe.
@@ -23,8 +23,8 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
+from .config import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+from .staging import stage_mega_moe_inputs, validate_sm107_nvfp4_forward_inputs
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
@@ -35,25 +35,17 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(
-    config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-) -> float | None:
-    if config.gate_up_clamp is not None:
-        return config.gate_up_clamp
-    return config.activation_clamp
+@register_mega_kernel("sm107_nvfp4_nvfp4_bf16_cutedsl")
+class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
+    """Fused Rubin nvfp4 block-scaled inference MoE over the NVLink symmetric heap."""
 
-
-@register_mega_kernel("sm107_mxfp8_mxfp8_bf16_cutedsl")
-class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
-    """Fused Rubin mxfp8 block-scaled inference MoE over the NVLink symmetric heap."""
-
-    def __init__(self, config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
+    def __init__(self, config: Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm107_mxfp8_mxfp8_bf16_cutedsl"
+        return "sm107_nvfp4_nvfp4_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig):
         return sm107_block_scaled_runtime_requirements(bootstrap)
@@ -77,7 +69,6 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            kind=self._kernel_config.kind,
         )
 
     def validate_transformed_weights(
@@ -90,7 +81,6 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            kind=self._kernel_config.kind,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
@@ -119,13 +109,13 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
-            quant_kind=k.kind,
+            quant_kind="nvfp4",
             schedule_policy=k.schedule_policy,
             work_id_mode=k.work_id_mode,
             fc2_use_bulk=k.fc2_use_bulk,
             epi_flag_batches=k.epi_flag_batches,
             token_in_flag_batch=k.token_in_flag_batch,
-            gate_up_clamp=_resolve_gate_up_clamp(k),
+            gate_up_clamp=k.gate_up_clamp,
             reduce_topk_in_kernel=k.in_kernel_fc2_reduce,
             token_back_mode=k.token_back_mode,
             apply_topk_at_fc1=k.apply_topk_in_fc1,
@@ -140,14 +130,13 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        validate_sm107_forward_inputs(
+        validate_sm107_nvfp4_forward_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
             fleet_params,
             top_k=self._kernel_config.top_k,
             quantize_input=quantize_input,
-            kind=self._kernel_config.kind,
             scales=t.scales,
         )
 
@@ -163,7 +152,6 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.x_sf,
                 workspace.topk_idx,
                 workspace.topk_weights,
-                kind=self._kernel_config.kind,
             )
             workspace.note_staged_tokens(staged)
             return
@@ -219,7 +207,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         fp = fleet_params
         return (
-            "sm107_mxfp8_mxfp8_bf16_cutedsl",
+            "sm107_nvfp4_nvfp4_bf16_cutedsl",
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -229,8 +217,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.top_k,
             fp.token_hidden_size,
             k.intermediate_size,
-            k.kind,
-            _resolve_gate_up_clamp(k),
+            k.gate_up_clamp,
             k.in_kernel_fc2_reduce,
             k.token_back_mode,
             k.apply_topk_in_fc1,

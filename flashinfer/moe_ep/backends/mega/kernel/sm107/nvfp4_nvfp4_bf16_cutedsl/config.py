@@ -1,29 +1,28 @@
-"""User-facing config for the SM107 (Rubin) mxfp8 block-scaled mega kernel."""
+"""User-facing config for the SM107 (Rubin) nvfp4 block-scaled mega kernel."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
-Sm107Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
-
 
 @dataclass
-class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
+class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """Kernel params for ``kernel_src.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
 
     The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
     FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
-    kind mxfp8: mxfp8 activations x mxfp8 weights -> bf16 output, sf_vec_size
-    32, gate/up interleave 16.
+    kind nvfp4: nvfp4 activations x nvfp4 weights -> bf16 output, sf_vec_size
+    16 (FP8-E4M3 block scales), gate/up interleave 16.  The per-expert
+    fc1_alpha / fc2_alpha / fc1_norm_const dequant scalars are identically 1
+    (weights and activations quantize with norm_const=1.0), so they are
+    omitted from the kernel ABI.
     """
 
     intermediate_size: int  # post-SwiGLU width; FC1 GEMM N is 2*intermediate_size
     top_k: int
-    kernel_name: str = "sm107_mxfp8_mxfp8_bf16_cutedsl"
-    kind: Sm107Mxfp8Kind = "mxfp8_e4m3"
+    kernel_name: str = "sm107_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: Optional[float] = None
-    activation_clamp: Optional[float] = None  # deprecated alias of gate_up_clamp
     fast_math: bool = True  # accepted for mega API parity; no kernel toggle
     in_kernel_fc2_reduce: bool = False
     token_back_mode: Literal[
@@ -36,6 +35,6 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fc2_tma_stages: Optional[int] = None
     epi_flag_batches: Tuple[int, int] = (4, 2)
     token_in_flag_batch: int = 1
-    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 128)
+    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None  # None -> (2, 1)
     max_sm_count: Optional[int] = None

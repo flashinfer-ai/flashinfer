@@ -265,8 +265,10 @@ def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
-def sm107_mxfp8_glu_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
-    """Runtime needs for the SM107 (Rubin) mxfp8 GLU fprop mega kernel.
+def sm107_block_scaled_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the SM107 (Rubin) block-scaled inference mega kernel.
 
     Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
     """
@@ -282,7 +284,7 @@ __all__ = [
     "finalize_moe_ep_runtime",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
-    "sm107_mxfp8_glu_runtime_requirements",
+    "sm107_block_scaled_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
