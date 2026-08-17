@@ -107,7 +107,7 @@ def bench_tie_break_variants(
     for suffix, tie_break in TIE_BREAK_VARIANTS:
         try:
             tie_ms = bench_median_ms(
-                lambda: run_flashinfer_with_tie_break(tie_break),
+                lambda tb=tie_break: run_flashinfer_with_tie_break(tb),
                 use_cuda_graph,
             )
             metrics[f"flashinfer_tie_{suffix}_us"] = tie_ms * 1e3
@@ -190,15 +190,21 @@ def cub_topk_metrics(
     if deterministic or not cub_backend_supported(scores):
         return metrics
     set_topk_algo("cub")
-    cub_ms = bench_median_ms(lambda: run(TopKTieBreak.NONE), use_cuda_graph)
-    metrics["cub_us"] = cub_ms * 1e3
-    metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
-    if compare_tie_break:
-        for suffix, tie_break in TIE_BREAK_VARIANTS:
-            if cub_backend_supported(scores, tie_break):
-                tie_ms = bench_median_ms(lambda: run(tie_break), use_cuda_graph)
-                metrics[f"cub_tie_{suffix}_us"] = tie_ms * 1e3
-    set_topk_algo("auto")
+    try:
+        cub_ms = bench_median_ms(lambda: run(TopKTieBreak.NONE), use_cuda_graph)
+        metrics["cub_us"] = cub_ms * 1e3
+        metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
+        if compare_tie_break:
+            for suffix, tie_break in TIE_BREAK_VARIANTS:
+                if cub_backend_supported(scores, tie_break):
+                    tie_ms = bench_median_ms(
+                        lambda tb=tie_break: run(tb), use_cuda_graph
+                    )
+                    metrics[f"cub_tie_{suffix}_us"] = tie_ms * 1e3
+    finally:
+        # The per-case RuntimeError handlers continue to the next case, so the
+        # forced-cub setting must not leak past an OOM/UNSUPPORTED measurement.
+        set_topk_algo("auto")
     return metrics
 
 
