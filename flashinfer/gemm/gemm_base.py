@@ -8608,30 +8608,43 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     if m in {8192, 16384} and batch * m > 16384:
         raise ValueError(f"Cake batch DeepGEMM FP8 does not support B*M={batch * m}")
     if scale_granularity_mnk != (1, 128, 128):
-        raise ValueError("Cake batch DeepGEMM FP8 requires scale granularity (1,128,128)")
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires scale granularity (1,128,128)"
+        )
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         raise ValueError("Cake batch DeepGEMM FP8 requires float8_e4m3fn a and b")
     if a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32:
         raise ValueError("Cake batch DeepGEMM FP8 requires float32 scales")
     if masked_m.dtype != torch.int32 or masked_m.shape != (batch,):
-        raise ValueError("Cake batch DeepGEMM FP8 requires int32 masked_m with shape [B]")
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires int32 masked_m with shape [B]"
+        )
     if a_scale.shape != (batch, m, k // 128):
         raise ValueError("Cake batch DeepGEMM FP8 requires a_scale shape [B,M,K/128]")
     if b_scale.shape != (batch, n // 128, k // 128):
-        raise ValueError("Cake batch DeepGEMM FP8 requires b_scale shape [B,N/128,K/128]")
-    if not all(tensor.is_cuda and tensor.is_contiguous() for tensor in (a, b, a_scale, b_scale, masked_m)):
-        raise ValueError("Cake batch DeepGEMM FP8 inputs must be contiguous CUDA tensors")
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires b_scale shape [B,N/128,K/128]"
+        )
+    if not all(
+        tensor.is_cuda and tensor.is_contiguous()
+        for tensor in (a, b, a_scale, b_scale, masked_m)
+    ):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 inputs must be contiguous CUDA tensors"
+        )
     if not isinstance(expected_m, int) or not 0 <= expected_m <= m:
-        raise ValueError("Cake batch DeepGEMM FP8 expected_m must be an integer in [0,M]")
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 expected_m must be an integer in [0,M]"
+        )
     result_dtype = out.dtype if out is not None else (out_dtype or torch.bfloat16)
     if result_dtype != torch.bfloat16:
         raise ValueError("Cake batch DeepGEMM FP8 requires bfloat16 output")
     if out is not None and (
-        out.shape != (batch, m, n)
-        or out.device != a.device
-        or not out.is_contiguous()
+        out.shape != (batch, m, n) or out.device != a.device or not out.is_contiguous()
     ):
-        raise ValueError("Cake batch DeepGEMM FP8 out must be contiguous [B,M,N] on a.device")
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 out must be contiguous [B,M,N] on a.device"
+        )
     if any(tensor.device != a.device for tensor in (b, a_scale, b_scale, masked_m)):
         raise ValueError("Cake batch DeepGEMM FP8 inputs must share one CUDA device")
     return True
@@ -8772,9 +8785,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     if backend == "cake":
         from ..jit.gemm.cake_batch_deepgemm import run_cake_batch_deepgemm_fp8
 
-        run_cake_batch_deepgemm_fp8(
-            a, b, a_scale, b_scale, masked_m, out, expected_m
-        )
+        run_cake_batch_deepgemm_fp8(a, b, a_scale, b_scale, masked_m, out, expected_m)
     else:
         from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
 

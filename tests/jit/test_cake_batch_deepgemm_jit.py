@@ -150,8 +150,7 @@ def test_cake_batch_deepgemm_jit_spec(
     )
     assert f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL {metadata.symbol}" in binding
     assert (
-        f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT {metadata.variant}"
-        in binding
+        f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT {metadata.variant}" in binding
     )
     assert f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_N {metadata.n}" in binding
     assert f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_K {metadata.k}" in binding
@@ -160,8 +159,7 @@ def test_cake_batch_deepgemm_jit_spec(
         in binding
     )
     assert (
-        f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND {target_kind}"
-        in binding
+        f"#define FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND {target_kind}" in binding
     )
     assert '#include "cake_batch_deepgemm_fp8_binding.cuh"' in binding
     cake_batch_deepgemm.gen_cake_batch_deepgemm_module.cache_clear()

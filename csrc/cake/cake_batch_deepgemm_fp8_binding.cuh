@@ -113,8 +113,7 @@ inline bool IsSupportedM(int64_t batch, int64_t m) {
   return (m == 8192 || m == 16384) && batch * m <= 16384;
 }
 
-inline void CheckDescriptor(const TensorView& desc, const TensorView& reference,
-                            const char* name) {
+inline void CheckDescriptor(const TensorView& desc, const TensorView& reference, const char* name) {
   CHECK_CUDA(desc);
   CHECK_DEVICE(reference, desc);
   CHECK_INPUT_TYPE(desc, dl_uint8);
@@ -164,16 +163,15 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   TVM_FFI_ICHECK(a.size(2) == k) << "a must have shape [B,M," << k << "]";
   TVM_FFI_ICHECK(b.size(0) == batch && b.size(1) == n && b.size(2) == k)
       << "b must have shape [B," << n << "," << k << "]";
-  TVM_FFI_ICHECK(a_scale.ndim() == 3 && a_scale.size(0) == batch &&
-                 a_scale.size(1) == m && a_scale.size(2) == k / 128)
+  TVM_FFI_ICHECK(a_scale.ndim() == 3 && a_scale.size(0) == batch && a_scale.size(1) == m &&
+                 a_scale.size(2) == k / 128)
       << "a_scale must have shape [B,M,K/128]";
-  TVM_FFI_ICHECK(b_scale.ndim() == 3 && b_scale.size(0) == batch &&
-                 b_scale.size(1) == n / 128 && b_scale.size(2) == k / 128)
+  TVM_FFI_ICHECK(b_scale.ndim() == 3 && b_scale.size(0) == batch && b_scale.size(1) == n / 128 &&
+                 b_scale.size(2) == k / 128)
       << "b_scale must have shape [B,N/128,K/128]";
   TVM_FFI_ICHECK(masked_m.ndim() == 1 && masked_m.numel() == batch)
       << "masked_m must have shape [B]";
-  TVM_FFI_ICHECK(out.ndim() == 3 && out.size(0) == batch && out.size(1) == m &&
-                 out.size(2) == n)
+  TVM_FFI_ICHECK(out.ndim() == 3 && out.size(0) == batch && out.size(1) == m && out.size(2) == n)
       << "out must have shape [B,M,N]";
   TVM_FFI_ICHECK(expected_m >= 0 && expected_m <= m)
       << "expected_m must be in [0,M], got " << expected_m;
@@ -221,18 +219,18 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   config.attrs = attrs;
   config.numAttrs = 2;
-  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
-                               a_sf, b_sf, mask, output, static_cast<int32_t>(batch),
-                               static_cast<int32_t>(m)),
-            "Cake N128/K512 launch");
+  CheckCuda(
+      cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, a_sf, b_sf,
+                         mask, output, static_cast<int32_t>(batch), static_cast<int32_t>(m)),
+      "Cake N128/K512 launch");
 #elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 1
   const uint32_t m_tile_bound = static_cast<uint32_t>((expected_m + 127) / 128 + 1);
   config.gridDim = dim3(static_cast<uint32_t>(batch) * m_tile_bound * 4, 1, 1);
   auto* c_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(c_desc.data_ptr());
-  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
-                               c_tma, a_sf, b_sf, mask, static_cast<uint32_t>(batch),
-                               static_cast<uint32_t>(m), 4u),
-            "Cake N512/K128 launch");
+  CheckCuda(
+      cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, c_tma, a_sf,
+                         b_sf, mask, static_cast<uint32_t>(batch), static_cast<uint32_t>(m), 4u),
+      "Cake N512/K128 launch");
 #elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 2
   config.gridDim = dim3(static_cast<uint32_t>(num_sms), 1, 1);
   CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
@@ -245,8 +243,7 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   constexpr uint32_t k_tiles = 8;
   constexpr uint32_t sf_cols = 16;
   const uint32_t scheduled_pair_blocks = static_cast<uint32_t>((expected_m + 255) / 256 + 1);
-  const uint64_t scheduled_tiles =
-      static_cast<uint64_t>(batch) * scheduled_pair_blocks * grid_n;
+  const uint64_t scheduled_tiles = static_cast<uint64_t>(batch) * scheduled_pair_blocks * grid_n;
   const uint32_t clusters = std::max<uint32_t>(
       1, std::min<uint32_t>(num_sms / 2, static_cast<uint32_t>(scheduled_tiles)));
   config.gridDim = dim3(clusters * 2, 1, 1);
@@ -258,12 +255,11 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   config.attrs = attrs;
   config.numAttrs = 2;
-  CheckCuda(cudaLaunchKernelEx(
-                &config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
-                reinterpret_cast<int*>(a_scale.data_ptr()),
-                reinterpret_cast<int*>(b_scale.data_ptr()), mask, output,
-                static_cast<uint32_t>(batch), static_cast<uint32_t>(m), grid_n, k_tiles,
-                sf_cols, scheduled_pair_blocks),
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
+                               reinterpret_cast<int*>(a_scale.data_ptr()),
+                               reinterpret_cast<int*>(b_scale.data_ptr()), mask, output,
+                               static_cast<uint32_t>(batch), static_cast<uint32_t>(m), grid_n,
+                               k_tiles, sf_cols, scheduled_pair_blocks),
             "Cake N7168/K2048 launch");
 #endif
 }

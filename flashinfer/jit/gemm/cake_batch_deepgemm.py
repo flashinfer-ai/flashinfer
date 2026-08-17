@@ -292,7 +292,9 @@ def run_cake_batch_deepgemm_fp8(
     capability = torch.cuda.get_device_capability(a.device)
     target = {(10, 0): "sm100a", (10, 3): "sm103a"}.get(capability)
     if target is None:
-        raise ValueError(f"Cake batch DeepGEMM requires SM100 or SM103, got {capability}")
+        raise ValueError(
+            f"Cake batch DeepGEMM requires SM100 or SM103, got {capability}"
+        )
     a_desc, b_desc, c_desc = _tensor_maps(a, b, out)
     get_cake_batch_deepgemm_module(shape, target).run(
         a,
