@@ -46,7 +46,7 @@ void cub_topk_page_table_transform(
 
 int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorView lengths,
                                                      int64_t top_k, int64_t tie_break,
-                                                     bool with_raw_indices);
+                                                     bool with_raw_indices, bool with_row_starts);
 
 void cub_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
                                TensorView lengths, Optional<TensorView> maybe_workspace_buffer,
@@ -54,7 +54,8 @@ void cub_topk_ragged_transform(TensorView input, TensorView output_indices, Tens
                                Optional<TensorView> maybe_row_starts);
 
 int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView lengths,
-                                                 int64_t top_k, int64_t tie_break);
+                                                 int64_t top_k, int64_t tie_break,
+                                                 bool with_row_starts);
 
 void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
               Optional<TensorView> maybe_workspace_buffer, int64_t top_k, int64_t tie_break);

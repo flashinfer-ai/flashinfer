@@ -3330,7 +3330,7 @@ def test_cub_transform_workspace_paths(transform_mode):
 
         needed = int(
             module.cub_topk_page_table_transform_workspace_size(
-                scores, lengths, k, 0, False
+                scores, lengths, k, 0, False, False
             )
         )
     elif transform_mode == "ragged":
@@ -3345,7 +3345,9 @@ def test_cub_transform_workspace_paths(transform_mode):
             return (ref_idx.int() + offsets[i]).tolist()
 
         needed = int(
-            module.cub_topk_ragged_transform_workspace_size(scores, lengths, k, 0)
+            module.cub_topk_ragged_transform_workspace_size(
+                scores, lengths, k, 0, False
+            )
         )
     else:
         out = torch.full((num_rows, k), -1, dtype=torch.int64, device="cuda")

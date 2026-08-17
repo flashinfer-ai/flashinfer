@@ -156,10 +156,7 @@ struct CUBMakeRaggedRowOut {
 
 // DeviceBatchedTopK writes only min(max(length, 0), top_k) items for a variable-length
 // segment. Fill the untouched suffix after selection so short and empty rows preserve the
-// transform APIs' -1 padding contract. Keeping this launch in the same C++ entry point as
-// DeviceBatchedTopK avoids the device-idle Python/custom-op gap created by a separate
-// torch.fill_ call. A single launch handles both page-table outputs when raw indices are
-// requested, and rows with length >= top_k perform no global stores.
+// transform APIs' -1 padding contract.
 //
 // Note: this kernel writes only [valid, top_k) and reads only `lengths`, while selection
 // writes [0, valid) — the two are disjoint, so the after-selection ordering is convention,
@@ -474,10 +471,11 @@ void CheckCUBTopKArgs(const TensorView& input, const TensorView& lengths, int64_
 
 }  // namespace
 
-// CUB-backed fused top-k + page-table transform, scoped to the identity row mapping (no
-// row_to_batch / row_starts / page_table_row_starts — the Python dispatcher routes those to
-// the native backend). For each row i, the top-k is selected over input[i, 0:lengths[i]] and
-// each winning window-local index idx is written as
+// CUB-backed fused top-k + page-table transform. Supports the packed-layout arguments —
+// row_to_batch (score row i gathers through table row row_to_batch[i]), row_starts (shifts
+// the per-row read window), and page_table_row_starts (base offset into the table row, with
+// row_starts as its fallback). For each row i, the top-k is selected over
+// input[i, start:start+lengths[i]] and each winning window-local index idx is written as
 //   src_page_table[i, idx / page_size] * page_size + idx % page_size
 // with idx itself optionally duplicated into output_raw_indices. The translation happens
 // inside CUB's own kernel via the output iterators — no epilogue launch. Rows with
@@ -567,10 +565,11 @@ void cub_topk_page_table_transform(
 
 // Workspace query for the transform variant. Must instantiate the same dispatch (same
 // iterator types) as the run so the byte count matches the kernel that will execute — the
-// output mode changes the iterator type, so the caller states it via with_raw_indices.
+// output mode changes the output iterator type (with_raw_indices) and a row_starts window
+// changes the input iterator type (with_row_starts), so the caller states both.
 int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorView lengths,
                                                      int64_t top_k, int64_t tie_break,
-                                                     bool with_raw_indices) {
+                                                     bool with_raw_indices, bool with_row_starts) {
   CheckCUBTopKArgs(input, lengths, top_k, tie_break);
   const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
 
@@ -587,14 +586,17 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
   Optional<TensorView> no_workspace;
   size_t workspace_bytes = 0;
   cudaError_t status = cudaErrorInvalidValue;
+  // A non-null row_starts selects the CUBMakeRowIn input iterator, matching the run's
+  // instantiation; lengths_ptr is a stand-in base that is never dereferenced.
+  const int32_t* row_starts_stub = with_row_starts ? lengths_ptr : nullptr;
   auto query = [&](auto row_out_maker) {
     auto d_values_out =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-      status = CUBBatchedTopKVarLenTransform(
-          static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-          /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace, num_rows, max_len, top_k,
-          tie_break, &workspace_bytes, stream);
+      status = CUBBatchedTopKVarLenTransform(static_cast<const c_type*>(input.data_ptr()),
+                                             input.stride(0), row_starts_stub, d_values_out,
+                                             lengths_ptr, no_workspace, num_rows, max_len, top_k,
+                                             tie_break, &workspace_bytes, stream);
       return true;
     });
   };
@@ -690,9 +692,11 @@ void cub_topk_ragged_transform(TensorView input, TensorView output_indices, Tens
 
 // Workspace query for the ragged variant. Must instantiate the same dispatch (same iterator
 // types) as the run so the byte count matches the kernel that will execute; the ragged API
-// has a single output mode, so no mode flag is needed.
+// has a single output mode, but a row_starts window changes the input iterator type, so the
+// caller states it via with_row_starts.
 int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView lengths,
-                                                 int64_t top_k, int64_t tie_break) {
+                                                 int64_t top_k, int64_t tie_break,
+                                                 bool with_row_starts) {
   CheckCUBTopKArgs(input, lengths, top_k, tie_break);
   const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
 
@@ -709,13 +713,16 @@ int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView le
   Optional<TensorView> no_workspace;
   size_t workspace_bytes = 0;
   cudaError_t status = cudaErrorInvalidValue;
+  // A non-null row_starts selects the CUBMakeRowIn input iterator, matching the run's
+  // instantiation; lengths_ptr is a stand-in base that is never dereferenced.
+  const int32_t* row_starts_stub = with_row_starts ? lengths_ptr : nullptr;
   auto d_values_out = cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
                                                     CUBMakeRaggedRowOut{nullptr, nullptr, top_k});
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-    status = CUBBatchedTopKVarLenTransform(
-        static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-        /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace, num_rows, max_len, top_k,
-        tie_break, &workspace_bytes, stream);
+    status = CUBBatchedTopKVarLenTransform(static_cast<const c_type*>(input.data_ptr()),
+                                           input.stride(0), row_starts_stub, d_values_out,
+                                           lengths_ptr, no_workspace, num_rows, max_len, top_k,
+                                           tie_break, &workspace_bytes, stream);
     return true;
   });
 

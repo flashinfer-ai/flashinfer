@@ -1211,7 +1211,12 @@ def top_k_page_table_transform(
         # so repeated calls (including under CUDA graph capture) reuse a stable
         # allocation.
         workspace_bytes = topk_module.cub_topk_page_table_transform_workspace_size(
-            input, lengths, k, int(tie_break), out_raw_indices is not None
+            input,
+            lengths,
+            k,
+            int(tie_break),
+            out_raw_indices is not None,
+            row_starts is not None,
         )
         workspace_buffer: torch.Tensor = _get_cache_buf(
             f"cub_topk_workspace_{device}", workspace_bytes, device
@@ -1385,7 +1390,7 @@ def top_k_ragged_transform(
         # so repeated calls (including under CUDA graph capture) reuse a stable
         # allocation.
         workspace_bytes = topk_module.cub_topk_ragged_transform_workspace_size(
-            input, lengths, k, int(tie_break)
+            input, lengths, k, int(tie_break), row_starts is not None
         )
         workspace_buffer: torch.Tensor = _get_cache_buf(
             f"cub_topk_workspace_{device}", workspace_bytes, device
