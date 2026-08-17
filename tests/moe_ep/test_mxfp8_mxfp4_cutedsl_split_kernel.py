@@ -345,7 +345,7 @@ def test_expert_major_matches_torch_oracle():
 
     from flashinfer.moe_ep import EpLayout, SplitKernelContext
 
-    kernel, tw, fleet_params, w13, w2 = _make_backend_and_weights(
+    kernel, _tw, fleet_params, w13, w2 = _make_backend_and_weights(
         layout=EpLayout.EXPERT_MAJOR
     )
     g = torch.Generator(device="cuda").manual_seed(17)

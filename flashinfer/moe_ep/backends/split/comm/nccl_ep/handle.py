@@ -411,7 +411,7 @@ class NcclEpHandle(Handle):
         cached = self._hot.get("ht_recv_bufs")
         if (
             cached is None
-            or cached[0].shape[0] != num_recv
+            or cached[0].shape != (num_recv, hidden)
             or cached[1].shape[1] != self._top_k
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device

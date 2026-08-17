@@ -163,6 +163,7 @@ __all__ = [
     "Nvfp4CutedslMegaMoeConfig",
     "Sm90PullFp8MegaMoeConfig",
     "Sm90PushFp8MegaMoeConfig",
+    "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",

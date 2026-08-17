@@ -264,6 +264,11 @@ class Mxfp8Mxfp4CutedslSplitKernelBackend(SplitKernelBackend):
         else:
             # EXPERT_MAJOR: row -> its own (single) expert, weight 1.0; the
             # real topk_weights are applied by EP combine.
+            if dim0 != tw.num_local_experts:
+                raise ValueError(
+                    f"EXPERT_MAJOR dispatch tensor has {dim0} expert slots; "
+                    f"expected num_local_experts={tw.num_local_experts}."
+                )
             row_expert = torch.arange(dim0, device=device, dtype=torch.int32)
             selected_experts = (
                 row_expert.repeat_interleave(dim1).reshape(m, 1) + offset

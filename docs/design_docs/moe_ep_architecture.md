@@ -181,7 +181,7 @@ Measured results, methodology, and the full knob reference live in
 
 ## Layout
 
-```
+```text
 moe_ep/
   config.py, tensors.py, weights.py, layer.py, algo_knobs.py, errors.py
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
