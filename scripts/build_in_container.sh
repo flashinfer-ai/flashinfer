@@ -116,7 +116,7 @@ uv pip install --python "${VENV}/bin/python" \
 # plugin loads libnixl.so from it at first use. (NCCL-EP's base libnccl.so.2 +
 # libnccl_ep.so come from the nccl4py wheel installed below.)
 uv pip install --python "${VENV}/bin/python" --no-deps \
-    "nixl-cu13>=1.0.1"
+    "nixl-cu13>=1.3.1"
 
 # FlashInfer runtime deps (incl. the moe_ep deps, now part of the base
 # dependencies), installed explicitly here (WITH their own deps) so the

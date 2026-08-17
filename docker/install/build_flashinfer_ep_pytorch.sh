@@ -79,9 +79,6 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
 echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
 # The EP backends are ON by default now: NCCL-EP needs no build step (nccl4py
 # is a base dependency of flashinfer-python), so only NIXL-EP is opted out.
-# PIP_CONSTRAINT= so the build hook's --no-deps NCCL floor upgrade
-# (_ensure_nccl_floor, nvidia-nccl-cu13>=2.30.7) isn't blocked by the base
-# image's constraint file — a no-op here since 2.30.7 is already pinned above.
 cd "${FI_SRC}"
 # --no-build-isolation makes pyproject's [build-system] requires OUR job:
 # setuptools>=77 (PEP 639 SPDX `license = "Apache-2.0"`), packaging>=24, and
@@ -96,8 +93,7 @@ PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
 
 # The full-dep editable install above lets pip's resolver downgrade
 # nvidia-nccl-<cuXX> to torch's exact pin (2.28.9 on the 26.05 image), undoing
-# the 2.30.7 pin from the top of this script — and _ensure_nccl_floor runs at
-# build time, before that final resolution. Re-assert the pin last.
+# the 2.30.7 pin from the top of this script. Re-assert the pin last.
 PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
     "nvidia-nccl-${CU}==${NCCL_VERSION}"
 

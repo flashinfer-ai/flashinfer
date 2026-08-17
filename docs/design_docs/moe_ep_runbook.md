@@ -135,8 +135,7 @@ sm_90+.
 
 **1. Build with NIXL-EP enabled.** Build deps: `meson`, `ninja`, `pkg-config`,
 `nvcc`, UCX (`pkg-config --exists ucx`), `libibverbs-dev`. The build hook
-pre-installs the `nixl-cu13` wheel it links against (`_ensure_nixl_wheel`), so
-no manual NIXL install is needed.
+requires the `nixl-cu13` wheel it links against to be installed beforehand.
 
 **UCX caveat:** the UCX found via pkg-config must ship the *device API*
 (`ucp/api/device/ucp_device_impl.h`) — NGC images' HPC-X UCX and Ubuntu's apt

@@ -115,11 +115,8 @@ def is_cuda_tile_available() -> bool:
     + ``FileNotFoundError: 'tileiras' compiler not found`` cascade when the
     compiler is absent, which Python-module-only probes would miss.
 
-    This is needed because in CI's ``pip install -e . -v`` path (PEP 517
-    isolation), our build-backend's ``_install_cuda_tile_compile_deps()`` hook
-    cannot install ``nvidia-cuda-tileiras`` into the target env (the build venv
-    has no ``pip`` module to call). On cu12x CI images that don't pre-install
-    tileiras, this skip-guard prevents cuTile tests from crashing mid-JIT.
+    On cu12x CI images that don't provide ``nvidia-cuda-tileiras``, this
+    skip-guard prevents cuTile tests from crashing mid-JIT.
     """
     if importlib.util.find_spec("cuda.tile.tune") is None:
         return False
