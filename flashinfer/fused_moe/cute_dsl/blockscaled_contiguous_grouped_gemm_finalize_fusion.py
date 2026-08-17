@@ -54,6 +54,7 @@ from flashinfer.cute_dsl.utils import (
     cutlass_to_torch_dtype,
     get_num_sm,
     get_max_active_clusters,
+    is_rubin_cute_dsl_available,
     make_ptr,
 )
 
@@ -63,10 +64,6 @@ from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 )
 
 
-# Rubin FC2 kernel shares the wrapper method from Blackwell FC2 kernel.
-# Both kernels have identical __call__ signatures (positional args), so
-# the Blackwell wrapper (which builds cute.Tensors from pointers and calls
-# self()) works for Rubin as well.
 @functools.cache
 def _sm107_finalize_kernel_cls():
     """Import the SM107 kernel lazily.
@@ -74,6 +71,12 @@ def _sm107_finalize_kernel_cls():
     It requires CuTe DSL >= 4.8 (``cutlass.utils.rubin_helpers``); importing at
     module scope would break FlashInfer on older DSL releases.
     """
+    if not is_rubin_cute_dsl_available():
+        raise NotImplementedError(
+            "The SM107 (Rubin) CuTe DSL finalize-fusion grouped GEMM requires "
+            "CuTe DSL >= 4.8, which provides cutlass.utils.rubin_helpers; the "
+            "installed CuTe DSL does not have it."
+        )
     from .rubin.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
         Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
     )

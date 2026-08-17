@@ -24,7 +24,10 @@ import cutlass.utils as utils
 import torch
 
 from flashinfer.utils import get_compute_capability
-from flashinfer.cute_dsl.utils import torch_dtype_to_cutlass
+from flashinfer.cute_dsl.utils import (
+    is_rubin_cute_dsl_available,
+    torch_dtype_to_cutlass,
+)
 
 from .bmm_fp8_blackwell import bmm
 
@@ -82,6 +85,12 @@ def _sm107_gemm_kernel_cls():
     It requires CuTe DSL >= 4.8 (``cutlass.utils.rubin_helpers``); importing at
     module scope would break FlashInfer on older DSL releases.
     """
+    if not is_rubin_cute_dsl_available():
+        raise NotImplementedError(
+            "The SM107 (Rubin) CuTe DSL batched FP8 GEMM requires CuTe DSL "
+            ">= 4.8, which provides cutlass.utils.rubin_helpers; the installed "
+            "CuTe DSL does not have it."
+        )
     from .bmm_fp8_rubin import SM107PersistentDenseGemmKernel
 
     return SM107PersistentDenseGemmKernel

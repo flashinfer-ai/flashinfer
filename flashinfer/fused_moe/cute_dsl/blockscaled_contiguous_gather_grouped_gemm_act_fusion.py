@@ -64,6 +64,7 @@ from flashinfer.cute_dsl.utils import (
     cutlass_to_torch_dtype,
     get_num_sm,
     get_max_active_clusters,
+    is_rubin_cute_dsl_available,
     make_ptr,
 )
 from .moe_utils import (
@@ -84,6 +85,13 @@ def _sm107_swiglu_kernel_cls():
     It requires CuTe DSL >= 4.8 (``cutlass.utils.rubin_helpers``); importing at
     module scope would break FlashInfer on older DSL releases.
     """
+    if not is_rubin_cute_dsl_available():
+        raise NotImplementedError(
+            "The SM107 (Rubin) CuTe DSL gather/activation-fusion grouped GEMM "
+            "requires CuTe DSL >= 4.8, which provides "
+            "cutlass.utils.rubin_helpers; the installed CuTe DSL does not "
+            "have it."
+        )
     from .rubin.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
         Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
     )
