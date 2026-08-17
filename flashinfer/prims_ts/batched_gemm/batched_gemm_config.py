@@ -60,6 +60,7 @@ class ActKind(IntEnum):
     GEGLU = 2
     RELU2 = 3
     SILU = 4
+    SITU = 5
 
 
 class BiasType(IntEnum):
@@ -545,7 +546,7 @@ class BatchedGemmConfig:
     act_kind: int = int(ActKind.NONE)
     """Epilogue activation, as an :class:`ActKind` integer value.
 
-    Allowed: ``NONE``, ``SWIGLU``, ``GEGLU``, ``RELU2``, ``SILU``. Gated kinds
+    Allowed: ``NONE``, ``SWIGLU``, ``GEGLU``, ``RELU2``, ``SILU``, ``SITU``. Gated kinds
     (:attr:`has_gated_epilogue`) consume ``(gate, up)`` pairs and halve the
     paired output dimension. In ``BATCH_N`` / swap-A/B mode the paired dimension
     is output M (hidden rows); in ``BATCH_M`` / non-swap mode it is output N
@@ -962,9 +963,19 @@ class BatchedGemmConfig:
     @property
     def has_swiglu_oai_params(self) -> bool:
         """True when any runtime per-expert SwiGLU-OAI parameter is active."""
+        return self.act_kind == int(ActKind.SWIGLU) and self.has_gemm1_activation_params
+
+    @property
+    def has_gemm1_activation_params(self) -> bool:
+        """True when any runtime per-expert gated-activation parameter is active."""
         return bool(
             self.has_gemm1_alpha or self.has_gemm1_beta or self.has_gemm1_clamp_limit
         )
+
+    @property
+    def has_situ_params(self) -> bool:
+        """True when SiTU uses runtime per-expert activation parameters."""
+        return self.act_kind == int(ActKind.SITU) and self.has_gemm1_activation_params
 
     @property
     def has_deepseek_fp8(self) -> bool:
@@ -1386,8 +1397,17 @@ class BatchedGemmConfig:
 
     @property
     def num_bytes_sfb_per_stage(self) -> int:
-        """SMEM bytes for one B scale-factor stage (MX pads N up to 16)."""
-        mn = max(16, self.tile_n) if self.is_mx_mma else self.tile_n
+        """SMEM bytes for one B scale-factor stage.
+
+        The physical ``R128c4`` layout stores complete 128-row groups.  Its
+        TMA descriptor transfers those padded groups, so both the allocation
+        and the pipeline transaction byte count must use the same rounded
+        extent for non-power-of-two token tiles such as 96 and 192.
+        """
+        if self.smem_sfb_layout == int(SfLayout.R128c4):
+            mn = ((self.tile_n + 127) // 128) * 128
+        else:
+            mn = max(16, self.tile_n) if self.is_mx_mma else self.tile_n
         return mn * (self.tile_k // self.input_sf_block_size_b)
 
     @property
@@ -1600,6 +1620,17 @@ class BatchedGemmConfig:
         """:class:`SfSmemToTmemCopy` strategy for B SF, from
         :attr:`smem_sfb_layout`.
         """
+        if (
+            self.uses_unfused_tmem_sf_copy
+            and self.has_routed_sfs
+            and self.is_swap_ab
+            and self.uses_ldgsts_routed_sfs
+            and self.tile_n % 128 != 0
+        ):
+            # R128c4 staging pads N=192 to two 128-row blocks. UTCCP copies
+            # that padded representation verbatim, but the N=192 MMA consumes
+            # six contiguous scale columns. Use LDS+STTM to compact 8 -> 6.
+            return int(SfSmemToTmemCopy.LDS_STTM)
         return self._sf_smem_to_tmem_copy(self.smem_sfb_layout)
 
     @property
@@ -1614,10 +1645,7 @@ class BatchedGemmConfig:
             and self.is_swap_ab
             and self.is_persistent
             and self.has_cluster
-            and not (
-                self.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                and self.smem_sfb_layout == int(SfLayout.R8c4)
-            )
+            and self.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
             and self.tile_n >= 128
         ):
             return False
@@ -1753,13 +1781,14 @@ class BatchedGemmConfig:
 
     @property
     def has_gated_epilogue(self) -> bool:
-        """True for gated activations (``SWIGLU``/``GEGLU``/``SILU``);
+        """True for gated activations (``SWIGLU``/``GEGLU``/``SILU``/``SITU``);
         the paired output dimension is halved.
         """
         return self.act_kind in (
             int(ActKind.SWIGLU),
             int(ActKind.GEGLU),
             int(ActKind.SILU),
+            int(ActKind.SITU),
         )
 
     @property
@@ -1877,13 +1906,15 @@ class BatchedGemmConfig:
     def uses_sfb_8x4_load(self) -> bool:
         """True when the non-gather B scale-factor tensor uses the compact ``R8c4`` layout.
 
-        Requires ``sf_layout_b == R8c4``, ``tile_n <= 64``, no routed
+        Requires ``sf_layout_b == R8c4``, an 8-row aligned low-N tile or
+        ``tile_n == 192``, no routed
         :attr:`is_swap_ab` SFB, and no tile256 overlap. Forces
         :attr:`smem_sfb_layout` to ``R8c4``.
         """
         return (
             self.sf_layout_b == int(SfLayout.R8c4)
-            and self.tile_n <= 64
+            and (self.tile_n <= 64 or self.tile_n == 192)
+            and self.tile_n % 8 == 0
             and not (self.has_routed_sfs and self.is_swap_ab)
             and not self.use_tile256_tmem_overlap
         )
@@ -2415,7 +2446,12 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
 
 def _ldgsts_sfb_base_producer_commit_prefetch_depth(cfg: BatchedGemmConfig) -> int:
     """Return maximum delayed SFB commit depth for this config."""
-    if cfg.has_cluster and cfg.is_swap_ab and cfg.tile_n >= 128:
+    if (
+        cfg.has_cluster
+        and cfg.is_swap_ab
+        and cfg.tile_n >= 128
+        and cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
+    ):
         return min(
             MAX_PRODUCER_COMMIT_PREFETCH_DEPTH,
             cfg.num_stages_smem_sfb - 1,
@@ -2677,8 +2713,8 @@ def validate_config(
     if cfg.mma_m not in (64, 128, 256):
         raise ValueError(f"mma_m must be 64/128/256, got {cfg.mma_m}")
 
-    if cfg.mma_n not in (8, 16, 32, 64, 128, 256):
-        raise ValueError(f"mma_n must be 8/16/32/64/128/256, got {cfg.mma_n}")
+    if cfg.mma_n not in (8, 16, 32, 64, 128, 192, 256):
+        raise ValueError(f"mma_n must be 8/16/32/64/128/192/256, got {cfg.mma_n}")
 
     if cfg.tile_n % cfg.mma_n != 0:
         raise ValueError(
@@ -2701,8 +2737,8 @@ def validate_config(
     if cfg.is_nvfp4_mma and cfg.mma_m == 64:
         raise ValueError("NVFP4 MMA does not support mma_m=64")
 
-    if cfg.tile_n not in (8, 16, 32, 64, 128, 256):
-        raise ValueError(f"tile_n must be 8/16/32/64/128/256, got {cfg.tile_n}")
+    if cfg.tile_n not in (8, 16, 32, 64, 128, 192, 256):
+        raise ValueError(f"tile_n must be 8/16/32/64/128/192/256, got {cfg.tile_n}")
 
     if cfg.epi_tile_n <= 0:
         raise ValueError(f"epi_tile_n must be positive, got {cfg.epi_tile_n}")
@@ -2853,8 +2889,11 @@ def validate_config(
     ):
         _validate_binary_config_option(name, value)
 
-    if cfg.has_swiglu_oai_params and cfg.act_kind != int(ActKind.SWIGLU):
-        raise ValueError("SwiGLU-OAI params require act_kind=SWIGLU")
+    if cfg.has_gemm1_activation_params and cfg.act_kind not in (
+        int(ActKind.SWIGLU),
+        int(ActKind.SITU),
+    ):
+        raise ValueError("GEMM1 activation params require act_kind=SWIGLU or SITU")
 
     if cfg.per_token_sf_dtype not in (
         int(DType.FP32),
@@ -2953,7 +2992,8 @@ def validate_config(
     if cfg.has_scale_factors and cfg.sf_layout_a == int(SfLayout.R8c4):
         raise ValueError(
             "sf_layout_a=8x4 is not supported for input SF loads; "
-            "8x4 load support is only for the non-gather B tensor with tile_n <= 64"
+            "8x4 load support is only for the non-gather B tensor with an "
+            "8-row aligned tile_n <= 64 or tile_n == 192"
         )
 
     if (
@@ -2964,7 +3004,18 @@ def validate_config(
     ):
         raise ValueError(
             "sf_layout_b=8x4 requires non-gather B scale-factor loading with "
-            "tile_n <= 64, or routed low-N SFB"
+            "an 8-row aligned tile_n <= 64, tile_n == 192, or routed SFB"
+        )
+
+    if (
+        cfg.has_scale_factors
+        and cfg.sf_layout_b == int(SfLayout.R128c4)
+        and cfg.tile_n % 128 != 0
+        and not (cfg.has_routed_sfs and cfg.is_swap_ab)
+    ):
+        raise ValueError(
+            "sf_layout_b=128x4 requires tile_n to be a multiple of 128 for "
+            "non-routed B scale-factor loading"
         )
 
     if cfg.has_scale_factors and not cfg.uses_unfused_tmem_sf_copy:
@@ -3105,6 +3156,7 @@ def validate_config(
         int(ActKind.GEGLU),
         int(ActKind.RELU2),
         int(ActKind.SILU),
+        int(ActKind.SITU),
     ):
         raise ValueError(f"Unsupported act_kind={cfg.act_kind}")
 

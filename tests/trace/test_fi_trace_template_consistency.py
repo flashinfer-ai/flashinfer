@@ -809,8 +809,17 @@ def test_fi_trace_complete_moe_routing(
         (3, 1, {}, "moe_fp4_block_scale_llama4_routing"),
         (4, 4, {}, "moe_fp4_block_scale_renormalize_naive_routing"),
         (5, 4, {}, "moe_fp4_block_scale_topk_routing"),
+        (1, 4, {"activation_type": 10}, "moe_fp4_block_scale_renormalize_routing"),
     ],
-    ids=["default", "renormalize", "ds", "llama4", "renormalize_naive", "topk"],
+    ids=[
+        "default",
+        "renormalize",
+        "ds",
+        "llama4",
+        "renormalize_naive",
+        "topk",
+        "situ",
+    ],
 )
 def test_fi_trace_complete_moe_fp4_routing(
     routing_method_type, top_k, extra_kwargs, expected_name_prefix
@@ -850,6 +859,10 @@ def test_fi_trace_complete_moe_fp4_routing(
     assert defn["axes"]["num_local_experts"]["value"] == EL
     assert defn["axes"]["hidden_size"]["value"] == H
     assert defn["axes"]["top_k"]["value"] == top_k
+    if "activation_type" in extra_kwargs:
+        assert (
+            defn["axes"]["activation_type"]["value"] == extra_kwargs["activation_type"]
+        )
     assert defn["name"].startswith(expected_name_prefix)
     non_optional_unknown = [
         k

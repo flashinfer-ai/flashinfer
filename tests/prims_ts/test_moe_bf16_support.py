@@ -19,8 +19,10 @@ import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
     SUPPORTED_MXFP4_BF16_TILE_N,
+    SUPPORTED_MXFP4_MXFP8_TILE_N,
     _expanded_prims_ts_json_configs,
     _expanded_trtllm_gen_json_configs,
+    _selected_tile_ns,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_mxfp4_mxfp8_moe_tactic,
@@ -29,7 +31,16 @@ from flashinfer.prims_ts.moe.config_mapper import (
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
 )
 from flashinfer.prims_ts.moe import support
-from flashinfer.prims_ts.moe.runner import _filter_valid_moe_tactics
+from flashinfer.prims_ts.moe.runner import (
+    _filter_valid_moe_tactics,
+    _routed_token_capacity,
+)
+from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+    SfLayout,
+    SfSmemToTmemCopy,
+    make_config,
+    validate_config,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -219,6 +230,78 @@ def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     assert pair.tile_n == 8
     assert pair.fc1.cfg.kwargs["act_kind"] == 2
     assert pair.fc2.cfg.kwargs["act_kind"] == 0
+
+@pytest.mark.parametrize("num_tokens", [1024, 8192])
+def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
+    assert _selected_tile_ns(
+        num_tokens=num_tokens,
+        top_k=16,
+        num_local_experts=56,
+        supported_tiles=SUPPORTED_MXFP4_MXFP8_TILE_N,
+    ) == (128, 192, 256)
+
+
+def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [192, 0],
+        activation_type=int(ActivationType.Situ),
+        num_tokens=8192,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+    )
+
+    fc1 = pair.fc1.cfg.build()
+    fc2 = pair.fc2.cfg.build()
+    assert (fc1.mma_n, fc1.tile_n, fc1.tile_k, fc1.cluster_m) == (192, 192, 256, 2)
+    assert fc1.sf_layout_c == int(SfLayout.R8c4)
+    assert fc1.smem_sfb_layout == int(SfLayout.R128c4)
+    assert fc1.num_bytes_sfb_per_stage == 2048
+    assert fc1.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+
+    assert (fc2.mma_n, fc2.tile_n, fc2.tile_k, fc2.cluster_m) == (192, 192, 256, 2)
+    assert fc2.sf_layout_b == int(SfLayout.R8c4)
+    assert fc2.smem_sfb_layout == int(SfLayout.R8c4)
+    assert fc2.num_bytes_sfb_per_stage == 1536
+    assert fc2.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+
+    invalid_fc2 = {
+        **pair.fc2.cfg.kwargs,
+        "sf_layout_b": int(SfLayout.R128c4),
+    }
+    with pytest.raises(ValueError, match="multiple of 128"):
+        validate_config(make_config(**invalid_fc2))
+
+
+def test_config_mapper_reuses_gated_tactics_for_kimi_k3_situ():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [-1, -1],
+        activation_type=int(ActivationType.Situ),
+        num_tokens=1024,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+    )
+
+    fc1 = pair.fc1.cfg.build()
+    assert fc1.act_kind == 5
+    assert fc1.has_gated_epilogue
+    assert fc1.has_gemm1_alpha == 1
+    assert fc1.has_gemm1_beta == 1
+
+
+def test_kimi_k3_ep_capacity_uses_local_experts():
+    capacity = _routed_token_capacity(
+        _runner(num_local_experts=56, top_k=16),
+        _inputs(hidden_states=torch.empty((1024, 128), dtype=torch.bfloat16)),
+        [128, 0],
+        torch.tensor(0, dtype=torch.int32),
+        {"num_experts": 896},
+    )
+
+    assert capacity == 183 * 128
 
 
 def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
@@ -466,6 +549,25 @@ def test_support_accepts_swiglu_oa_params(monkeypatch):
 
     assert ok
     assert reason == ""
+
+
+def test_support_accepts_kimi_k3_situ_params(monkeypatch):
+    monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
+    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+
+    ok, reason = support.is_prims_ts_bf16_supported(
+        _runner(activation_type=ActivationType.Situ),
+        _inputs(),
+        [-1, -1],
+        weight_layout=WeightLayout.MajorK,
+        use_shuffled_weight=True,
+        activation_type=ActivationType.Situ,
+        gemm1_alpha=torch.full((1,), 4.0, dtype=torch.float32),
+        gemm1_beta=torch.full((1,), 25.0, dtype=torch.float32),
+    )
+    assert ok
+    assert reason == ""
+
 
 def test_support_rejects_oa_params_for_non_swiglu(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)

@@ -39,6 +39,7 @@ _SUPPORTED_ACTIVATIONS = (
     ActivationType.Geglu,
     ActivationType.Silu,
     ActivationType.Relu2,
+    ActivationType.Situ,
 )
 
 
@@ -207,7 +208,7 @@ def _split_per_channel_weight_scale_from_kwargs(
 def _is_gated_activation(activation_type: Any) -> bool:
     return any(
         _enum_eq(activation_type, act)
-        for act in (ActivationType.Swiglu, ActivationType.Geglu)
+        for act in (ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Situ)
     )
 
 
@@ -219,8 +220,11 @@ def _validate_gemm1_oa_params(
 ) -> tuple[bool, str]:
     if not _has_gemm1_oa_params(kwargs):
         return True, ""
-    if not _enum_eq(activation_type, ActivationType.Swiglu):
-        return False, "gemm1_alpha/beta/clamp_limit require Swiglu activation"
+    if not any(
+        _enum_eq(activation_type, act)
+        for act in (ActivationType.Swiglu, ActivationType.Situ)
+    ):
+        return False, "gemm1_alpha/beta/clamp_limit require Swiglu or Situ activation"
     device = moe_inputs.hidden_states.device
     num_experts = int(
         kwargs.get("local_num_experts", getattr(runner, "num_local_experts", 0))
@@ -265,7 +269,7 @@ def is_prims_ts_bf16_supported(
         return False, "only BF16 activations and BF16 weights are supported"
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     routing_method_type = kwargs.get(
         "routing_method_type", getattr(runner, "routing_method_type", None)
     )
@@ -341,7 +345,7 @@ def is_prims_ts_nvfp4_supported(
         return False, "only NVFP4 activations and NVFP4 weights are supported"
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     if not _is_supported_weight_layout(
         kwargs.get("weight_layout", runner.weight_layout)
     ):
@@ -432,7 +436,7 @@ def is_prims_ts_mxfp4_mxfp8_supported(
         return False, "hidden_states_scale is required for MXFP8 activations"
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     if not _is_supported_weight_layout(
         kwargs.get("weight_layout", runner.weight_layout)
     ):
@@ -515,7 +519,7 @@ def is_prims_ts_mxfp4_bf16_supported(
         return False, "hidden_states_scale must be None for BF16 activations"
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     if not _is_supported_weight_layout(
         kwargs.get("weight_layout", runner.weight_layout)
     ):
@@ -595,7 +599,7 @@ def is_prims_ts_fp8_per_tensor_supported(
         return False, "only FP8 activations and FP8 weights are supported"
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     routing_method_type = kwargs.get(
         "routing_method_type", getattr(runner, "routing_method_type", None)
     )
@@ -742,7 +746,7 @@ def is_prims_ts_fp8_block_scale_supported(
 
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
-        return False, "activation must be Identity, Swiglu, Geglu, Silu, or Relu2"
+        return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
     if is_deepseek and not _enum_eq(activation_type, ActivationType.Swiglu):
         return False, "DeepSeek FP8 Prims-TS integration currently exposes Swiglu only"
     if not _is_supported_weight_layout(

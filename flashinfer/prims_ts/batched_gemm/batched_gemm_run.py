@@ -119,6 +119,7 @@ def _is_gated_act_kind(act_kind: int) -> bool:
         int(ActKind.SWIGLU),
         int(ActKind.GEGLU),
         int(ActKind.SILU),
+        int(ActKind.SITU),
     )
 
 
@@ -1434,6 +1435,7 @@ def _parse_overrides(args):
                 "geglu": ActKind.GEGLU,
                 "relu2": ActKind.RELU2,
                 "silu": ActKind.SILU,
+                "situ": ActKind.SITU,
             }[args.act_kind]
         ),
         "sf_layout_a": int(
@@ -2079,7 +2081,7 @@ def reference_check(
     )
     gemm1_beta_torch = _make_per_expert_f32_tensor(
         gemm1_beta_value,
-        default=0.0,
+        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
         num_experts=L,
         device=device,
     )
@@ -2610,6 +2612,7 @@ def reference_check(
         return value
 
     is_geglu = cfg.act_kind == int(ActKind.GEGLU)
+    is_situ = cfg.act_kind == int(ActKind.SITU)
     is_gated = _is_gated_act_kind(cfg.act_kind)
     is_relu2 = cfg.act_kind == int(ActKind.RELU2)
 
@@ -2628,7 +2631,38 @@ def reference_check(
             up = ref_gemm[:, half:].float()
 
         scale_gate = _expert_scale_like(gate.shape, scale_gate_torch)
-        if cfg.has_swiglu_oai_params:
+        if is_situ:
+            if cfg.has_gemm1_clamp_limit:
+                clamp_limit = _expert_param_like(
+                    gate.shape,
+                    gemm1_clamp_limit_torch,
+                    active=True,
+                    default=0.0,
+                )
+                gate = torch.minimum(torch.maximum(gate, -clamp_limit), clamp_limit)
+                up = torch.minimum(up, clamp_limit)
+            x0 = gate * scale_gate
+            x1 = up * scale_gate
+            alpha = _expert_param_like(
+                gate.shape,
+                gemm1_alpha_torch,
+                active=bool(cfg.has_gemm1_alpha),
+                default=1.0,
+            )
+            beta = _expert_param_like(
+                gate.shape,
+                gemm1_beta_torch,
+                active=bool(cfg.has_gemm1_beta),
+                default=1.0,
+            )
+            activated = (
+                beta
+                * torch.tanh(x0 / beta)
+                * alpha
+                * torch.tanh(x1 / alpha)
+                * torch.sigmoid(x1)
+            )
+        elif cfg.has_swiglu_oai_params:
             if cfg.has_gemm1_clamp_limit:
                 clamp_limit = _expert_param_like(
                     gate.shape,
@@ -3153,7 +3187,7 @@ def _build_launch_io(
     )
     gemm1_beta_torch = _make_per_expert_f32_tensor(
         gemm1_beta_value,
-        default=0.0,
+        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
         num_experts=L,
         device=device,
     )
@@ -3784,7 +3818,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--act-kind",
-        choices=["none", "swiglu", "geglu", "relu2", "silu"],
+        choices=["none", "swiglu", "geglu", "relu2", "silu", "situ"],
         default="none",
     )
     parser.add_argument(

@@ -31,7 +31,7 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_NVFP4_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
-SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
+SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_MXFP4_BF16_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_DSFP8_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_MXFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
@@ -42,6 +42,7 @@ _ACTIVATION_TO_ACT_KIND = {
     int(ActivationType.Geglu): 2,
     int(ActivationType.Relu2): 3,
     int(ActivationType.Silu): 4,
+    int(ActivationType.Situ): 5,
 }
 
 
@@ -67,6 +68,7 @@ class _ActKind(IntEnum):
     GEGLU = 2
     RELU2 = 3
     SILU = 4
+    SITU = 5
 
 
 class _DType(IntEnum):
@@ -243,7 +245,14 @@ def _selected_tile_ns(
         if center_idx + 2 < len(supported_tiles):
             selected_tiles.add(supported_tiles[center_idx + 2])
     if center_idx > 0:
-        selected_tiles.add(supported_tiles[center_idx - 1])
+        lower_tile = supported_tiles[center_idx - 1]
+        selected_tiles.add(lower_tile)
+        # Keep the original power-of-two lower neighbor when an intermediate
+        # expert-token tile (for example 192) is added below the center. This
+        # lets the autotuner consider N=192 for large routes without dropping
+        # the N=128 tactics that are important for smaller EP workloads.
+        if center_idx > 1 and lower_tile & (lower_tile - 1):
+            selected_tiles.add(supported_tiles[center_idx - 2])
     return tuple(sorted(selected_tiles))
 
 
@@ -457,11 +466,15 @@ def _activation_json_fused_act(activation_type: int) -> bool:
         int(ActivationType.Swiglu),
         int(ActivationType.Geglu),
         int(ActivationType.Silu),
+        int(ActivationType.Situ),
     )
 
 
 def _activation_json_act(activation_type: int) -> str:
-    if int(activation_type) == int(ActivationType.Swiglu):
+    if int(activation_type) in (
+        int(ActivationType.Swiglu),
+        int(ActivationType.Situ),
+    ):
         return "swiglu"
     if int(activation_type) == int(ActivationType.Geglu):
         return "geglu"
@@ -645,7 +658,13 @@ def _json_config_matches_moe(
         if act_kind != int(_ActKind.NONE):
             return False
     elif fc == "fc1":
-        if act_kind != _activation_act_kind(activation_type):
+        expected_act_kind = _activation_act_kind(activation_type)
+        # SiTU uses the same gated GEMM geometry as SwiGLU. Existing JSON
+        # tactic rows describe geometry rather than the activation formula,
+        # so reuse SwiGLU rows and replace the generated ActKind below.
+        if expected_act_kind == int(_ActKind.SITU):
+            expected_act_kind = int(_ActKind.SWIGLU)
+        if act_kind != expected_act_kind:
             return False
     elif act_kind != int(_ActKind.NONE):
         return False
@@ -822,6 +841,7 @@ def _json_config_kwargs(
     cfg: _JsonBatchedGemmConfig,
     *,
     fc: str,
+    activation_type: int,
     has_bias: bool,
     default_dtype_a: int,
     default_dtype_b: int,
@@ -880,7 +900,11 @@ def _json_config_kwargs(
         "route_act": _json_route_value(options.get("route_act", False)),
         "route_sfs_act": _json_route_value(options.get("route_sfs_act", False)),
         "tile_scheduler": _json_scheduler_value(options["tile_scheduler"]),
-        "act_kind": _json_act_kind(options),
+        "act_kind": (
+            _activation_act_kind(activation_type)
+            if fc == "fc1" and not _bool_value(options.get("use_deepseek_fp8", False))
+            else _json_act_kind(options)
+        ),
         **_bias_kwargs(has_bias),
         "sf_layout_a": _json_sf_layout_value(options.get("sf_layout_a")),
         "sf_layout_b": _json_sf_layout_value(options.get("sf_layout_b")),
@@ -1075,6 +1099,7 @@ def _make_json_moe_config_pair(
                     **_json_config_kwargs(
                         fc1_json,
                         fc="fc1",
+                        activation_type=activation_type,
                         has_bias=fc1_has_bias,
                         default_dtype_a=dtype_a,
                         default_dtype_b=dtype_b,
@@ -1095,6 +1120,7 @@ def _make_json_moe_config_pair(
                     **_json_config_kwargs(
                         fc2_json,
                         fc="fc2",
+                        activation_type=activation_type,
                         has_bias=fc2_has_bias,
                         default_dtype_a=dtype_a,
                         default_dtype_b=dtype_b,

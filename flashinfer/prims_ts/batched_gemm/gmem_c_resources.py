@@ -285,7 +285,9 @@ class GmemCResource(MemoryResource):
         self.tile_scale_c = Float32(1.0)
         self.tile_scale_gate = Float32(1.0)
         self.tile_gemm1_alpha = Float32(1.0)
-        self.tile_gemm1_beta = Float32(0.0)
+        self.tile_gemm1_beta = Float32(
+            1.0 if self.cfg.act_kind == int(ActKind.SITU) else 0.0
+        )
         self.tile_gemm1_clamp_limit = Float32(0.0)
         self.tile_expert_idx = Int32(0)
         self.tile_token_limit = Int32(0)
@@ -328,6 +330,21 @@ class GmemCResource(MemoryResource):
         Uses exp2 (native EX2 instruction) + rcp (native RCP) for fast
         sigmoid: sigmoid(x) = rcp(1 + exp2(-x * log2(e))).
         """
+        if cutlass.const_expr(self.cfg.act_kind == int(ActKind.SITU)):
+            linear = self._clamp_swiglu_oai_linear(linear)
+            gate = self._clamp_swiglu_oai_gate(gate)
+            linear_scaled = linear * scale_gate
+            gate_scaled = gate * scale_gate
+            left = self.tile_gemm1_beta * cute.math.tanh(
+                linear_scaled / self.tile_gemm1_beta, approx=True
+            )
+            right = self.tile_gemm1_alpha * cute.math.tanh(
+                gate_scaled / self.tile_gemm1_alpha, approx=True
+            )
+            neg_gate_log2e = Float32(-1.4426950408889634) * gate_scaled
+            sigmoid_gate = cute.math.rcp(Float32(1.0) + cute.math.exp2(neg_gate_log2e))
+            return left * right * sigmoid_gate
+
         if cutlass.const_expr(self.cfg.has_swiglu_oai_params):
             linear = self._clamp_swiglu_oai_linear(linear)
             gate = self._clamp_swiglu_oai_gate(gate)
@@ -386,6 +403,80 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def _apply_gated_activation_pair(self, linear0, linear1, gate0, gate1, scale_gate):
         """Packed f32x2 SwiGLU for the two-row FP4 epilogue path."""
+        if cutlass.const_expr(self.cfg.act_kind == int(ActKind.SITU)):
+            linear0 = self._clamp_swiglu_oai_linear(linear0)
+            linear1 = self._clamp_swiglu_oai_linear(linear1)
+            gate0 = self._clamp_swiglu_oai_gate(gate0)
+            gate1 = self._clamp_swiglu_oai_gate(gate1)
+
+            linear_scaled0, linear_scaled1 = self._fmul2(
+                linear0,
+                linear1,
+                scale_gate,
+                scale_gate,
+            )
+            gate_scaled0, gate_scaled1 = self._fmul2(
+                gate0,
+                gate1,
+                scale_gate,
+                scale_gate,
+            )
+
+            inverse_beta = cute.math.rcp(self.tile_gemm1_beta, approx=True, ftz=True)
+            left_arg0, left_arg1 = self._fmul2(
+                linear_scaled0,
+                linear_scaled1,
+                inverse_beta,
+                inverse_beta,
+            )
+            left0 = cute.math.tanh(left_arg0, approx=True)
+            left1 = cute.math.tanh(left_arg1, approx=True)
+            left0, left1 = self._fmul2(
+                left0,
+                left1,
+                self.tile_gemm1_beta,
+                self.tile_gemm1_beta,
+            )
+
+            inverse_alpha = cute.math.rcp(self.tile_gemm1_alpha, approx=True, ftz=True)
+            right_arg0, right_arg1 = self._fmul2(
+                gate_scaled0,
+                gate_scaled1,
+                inverse_alpha,
+                inverse_alpha,
+            )
+            right0 = cute.math.tanh(right_arg0, approx=True)
+            right1 = cute.math.tanh(right_arg1, approx=True)
+            right0, right1 = self._fmul2(
+                right0,
+                right1,
+                self.tile_gemm1_alpha,
+                self.tile_gemm1_alpha,
+            )
+
+            neg0, neg1 = self._fmul2(
+                gate_scaled0,
+                gate_scaled1,
+                Float32(-1.4426950408889634),
+                Float32(-1.4426950408889634),
+            )
+            exp0 = cute.math.exp2(neg0, fastmath=True)
+            exp1 = cute.math.exp2(neg1, fastmath=True)
+            denom0, denom1 = self._fadd2(
+                exp0,
+                exp1,
+                Float32(1.0),
+                Float32(1.0),
+            )
+            sig0 = cute.math.rcp(denom0, approx=True, ftz=True)
+            sig1 = cute.math.rcp(denom1, approx=True, ftz=True)
+            left_right0, left_right1 = self._fmul2(
+                left0,
+                left1,
+                right0,
+                right1,
+            )
+            return self._fmul2(left_right0, left_right1, sig0, sig1)
         if cutlass.const_expr(self.cfg.act_kind == int(ActKind.GEGLU)):
             return (
                 self._apply_gated_activation(linear0, gate0, scale_gate),
@@ -535,6 +626,8 @@ class GmemCResource(MemoryResource):
     def _load_gemm1_beta_global(self, expert_idx):
         if cutlass.const_expr(self.cfg.has_gemm1_beta):
             return self.gGemm1Beta.load(idx=expert_idx, vector_size=1)[0]
+        if cutlass.const_expr(self.cfg.act_kind == int(ActKind.SITU)):
+            return Float32(1.0)
         return Float32(0.0)
 
     @cute.jit
@@ -667,7 +760,7 @@ class GmemCResource(MemoryResource):
         self.tile_token_limit = token_limit
         self.tile_scale_c = self._load_scale_c_global(expert_idx)
         self.tile_scale_gate = self._load_scale_gate_global(expert_idx)
-        if cutlass.const_expr(self.cfg.has_swiglu_oai_params):
+        if cutlass.const_expr(self.cfg.has_gemm1_activation_params):
             self.tile_gemm1_alpha = self._load_gemm1_alpha_global(expert_idx)
             self.tile_gemm1_beta = self._load_gemm1_beta_global(expert_idx)
             self.tile_gemm1_clamp_limit = self._load_gemm1_clamp_limit_global(
@@ -839,6 +932,7 @@ class GmemCResource(MemoryResource):
             (self.cfg.act_kind == int(ActKind.SWIGLU))
             or (self.cfg.act_kind == int(ActKind.GEGLU))
             or (self.cfg.act_kind == int(ActKind.SILU))
+            or (self.cfg.act_kind == int(ActKind.SITU))
         )
         is_eltwise_relu = cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2))
         if cutlass.const_expr(is_gated_act):
@@ -2405,6 +2499,7 @@ class GmemCResource(MemoryResource):
             (self.cfg.act_kind == int(ActKind.SWIGLU))
             or (self.cfg.act_kind == int(ActKind.GEGLU))
             or (self.cfg.act_kind == int(ActKind.SILU))
+            or (self.cfg.act_kind == int(ActKind.SITU))
         )
         is_eltwise_relu = cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2))
         output_m = self.problem_m

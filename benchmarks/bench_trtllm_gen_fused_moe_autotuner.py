@@ -96,6 +96,25 @@ def _apply_model_preset(args: argparse.Namespace) -> None:
     if args.model == "custom":
         return
 
+    if args.model == "kimi-k3":
+        args.quant_mode = "MxFP4xMxFP8"
+        if args.num_tokens is None:
+            args.num_tokens = [1024]
+        args.num_experts = 896
+        args.local_num_experts = 56
+        args.local_expert_offset = 0
+        args.hidden_size = 3584
+        args.intermediate_size = 3072
+        args.top_k = 16
+        args.activation_type = ActivationType.Situ
+        args.gemm1_alpha = 4.0
+        args.gemm1_beta = 25.0
+        args.use_bias = False
+        args.routed = True
+        args.routed_scaling_factor = None
+        args.swiglu_limit = None
+        return
+
     preset = MODEL_PRESETS[args.model]
     args.quant_mode = preset.quant_mode
     if args.num_tokens is None:
@@ -880,6 +899,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     warmups: int,
     iterations: int,
     activation_type: int,
+    gemm1_alpha: Optional[float],
+    gemm1_beta: Optional[float],
+    gemm1_clamp_limit: Optional[float],
     backends: list[str],
     tuning_buckets: Optional[list[int]] = None,
     use_bias: bool = True,
@@ -1011,8 +1033,20 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
 
     fp4_kwargs = dict(
         routing_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
+        gemm1_alpha=(
+            None
+            if gemm1_alpha is None
+            else torch.full(
+                (local_num_experts,), gemm1_alpha, dtype=torch.float32, device=device
+            )
+        ),
+        gemm1_beta=(
+            None
+            if gemm1_beta is None
+            else torch.full(
+                (local_num_experts,), gemm1_beta, dtype=torch.float32, device=device
+            )
+        ),
         gemm1_clamp_limit=gemm1_clamp_limit,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
@@ -1107,7 +1141,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         f"  local_experts={local_num_experts}  local_offset={local_expert_offset}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
         f"  bias={use_bias}  routed_scale={routed_scaling_factor}"
-        f"  swiglu_limit={swiglu_limit}",
+        f"  swiglu_limit={swiglu_limit}"
+        f"  activation={ActivationType(activation_type).name}"
+        f"  gemm1_alpha={gemm1_alpha}  gemm1_beta={gemm1_beta}",
         tuning_buckets=tuning_buckets,
         cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
@@ -1203,11 +1239,12 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="custom",
-        choices=["custom", *MODEL_PRESETS],
+        choices=["custom", *MODEL_PRESETS, "kimi-k3"],
         help=(
-            "MoE model preset. DeepSeek-V4 presets select the checkpoint's "
+            "MoE model preset. DeepSeek-V4 and Kimi-K3 presets select the "
+            "checkpoint's "
             "MXFP4-weight/MXFP8-activation routed-expert shape, Top-K, routing "
-            "scale, no-bias path, and SwiGLU clamp. --num-tokens and TP remain "
+            "scale/activation, and no-bias path. --num-tokens and TP remain "
             "configurable."
         ),
     )
@@ -1314,6 +1351,24 @@ if __name__ == "__main__":
         required=False,
         default=ActivationType.Swiglu,
         help=f"Type of activation function: {[e.name for e in ActivationType]}",
+    )
+    parser.add_argument(
+        "--gemm1-alpha",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation alpha (Kimi K3 SiTU gate beta: 4.0).",
+    )
+    parser.add_argument(
+        "--gemm1-beta",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation beta (Kimi K3 SiTU linear beta: 25.0).",
+    )
+    parser.add_argument(
+        "--gemm1-clamp-limit",
+        type=float,
+        default=None,
+        help="Optional per-local-expert gated activation clamp limit.",
     )
     parser.add_argument(
         "--routed",
@@ -1435,6 +1490,9 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            args.gemm1_alpha,
+            args.gemm1_beta,
+            args.gemm1_clamp_limit,
             backends,
             tuning_buckets=args.tuning_buckets,
             use_bias=args.use_bias,

@@ -1030,8 +1030,9 @@ class SmemSfLdgstsResource(MemoryResource):
             self.cfg.input_sf_block_size_b if is_b else self.cfg.input_sf_block_size_a
         )
         sf_k = self.cfg.tile_k // sf_block_size
-        # Use a compact 8-row blocked layout for low-N routed SFB
-        # kernels (tileN < 128).  The tile128+ path uses R128c4 and tcgen05_cp.
+        # Low-N routed SFB uses compact R8c4 staging. Tile N >= 128 remains
+        # physically R128c4; the N=192 LDS+STTM path compacts its padded
+        # 8-column representation to the six columns consumed by MMA.
         use_r128c4 = cutlass.const_expr((not is_b) or self.cfg.tile_n >= 128)
 
         stage_idx = stage_info.stage_idx

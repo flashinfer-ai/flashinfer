@@ -33,7 +33,6 @@ from cutlass.experimental.task_scheduling.resources import MemoryResource, WorkQ
 
 from .batched_gemm_config import (
     BatchedGemmConfig,
-    SfLayout,
     SfSmemToTmemCopy,
 )
 from .smem_misc_resources import BatchedGemmWorkQueue
@@ -998,10 +997,7 @@ def create_copy_sfb_task(
         run_only_on_cta_id=0
         if (
             cfg.has_cluster
-            and not (
-                cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                and cfg.smem_sfb_layout == int(SfLayout.R8c4)
-            )
+            and cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
             and not (cfg.has_routed_sfs and cfg.uses_tma_routed_sfs and cfg.is_swap_ab)
         )
         else None,

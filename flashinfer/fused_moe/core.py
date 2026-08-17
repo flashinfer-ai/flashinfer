@@ -5419,7 +5419,6 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts]`` swiglu alpha, ``float32``.
         For SiTU this is ``[local_num_experts]``, finite and positive;
         ``None`` materializes per-expert ``alpha=1``.
-
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, ``float32``.
         For SiTU this is ``[local_num_experts]``, finite and positive;
@@ -5486,8 +5485,8 @@ def trtllm_fp4_block_scale_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``9`` Identity.
-        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
+        ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity.  ``10`` SiTU computes
+        ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
     output : Optional[torch.Tensor]
@@ -5651,7 +5650,6 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_experts]`` swiglu alpha, float32.
         For SiTU this is ``[local_num_experts]``, finite and positive;
         ``None`` materializes per-expert ``alpha=1``.
-
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, float32.
         For SiTU this is ``[local_num_experts]``, finite and positive;
@@ -5718,7 +5716,8 @@ def trtllm_fp4_block_scale_routed_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).
-        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
+        ``10`` SiTU computes
+        ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, float32.
     output : Optional[torch.Tensor]

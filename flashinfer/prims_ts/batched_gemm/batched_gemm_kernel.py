@@ -490,10 +490,12 @@ def _make_pipeline_configs(cfg):
                 consumer_signaling_threads=ldgsts_consumer_signaling,
                 producer_op=pipeline.PipelineOp.AsyncLoad,
             )
-            if cfg.is_swap_ab and cfg.tile_n < 128:
-                # Low-N routed SFB uses the compact LDS+STTM path where all
+            if cfg.is_swap_ab and cfg.sfb_smem_to_tmem_copy == int(
+                SfSmemToTmemCopy.LDS_STTM
+            ):
+                # Compact routed SFB uses the LDS+STTM path where all
                 # CopySfB warps participate; keep generic async semantics.
-                # Generated clustered tile64 kernels still use a per-CTA
+                # Generated clustered tile64/N192 kernels use a per-CTA
                 # CutlassCpAsyncPipeline here: one LoadSfB producer warp feeds
                 # the four local CopySfB warps, so the producer group is not
                 # scaled by cluster_m.
@@ -551,20 +553,8 @@ def _make_pipeline_configs(cfg):
         else:
             tmem_sfb_producer_threads = cfg.num_copy_sfb_warps * 32
             tmem_sfb_producer_signaling = SignalingThreads.CtaLeader
-            if (
-                cfg.has_cluster
-                and cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                and (
-                    cfg.smem_sfb_layout == int(SfLayout.R8c4)
-                    # Linear routed-TMA SFB also runs CopySfB on every CTA (see
-                    # CopySfBTask.run_only_on_cta_id), so its TMEM producer is
-                    # cluster-scoped too.
-                    or (
-                        cfg.has_routed_sfs
-                        and cfg.uses_tma_routed_sfs
-                        and cfg.is_swap_ab
-                    )
-                )
+            if cfg.has_cluster and cfg.sfb_smem_to_tmem_copy == int(
+                SfSmemToTmemCopy.LDS_STTM
             ):
                 # Generated compact SFB STTM runs the CopySfB warpgroup in every
                 # CTA and uses cluster-scoped AsyncUmma-style signaling.
@@ -680,10 +670,7 @@ def _make_pipeline_configs(cfg):
                     # runs on every CTA for the per-CTA LDS+STTM paths (compact
                     # R8c4 and Linear routed-TMA SFB), and leader-only otherwise.
                     leader_only=cfg.has_cluster
-                    and not (
-                        cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                        and cfg.smem_sfb_layout == int(SfLayout.R8c4)
-                    )
+                    and cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
                     and not (
                         cfg.has_routed_sfs
                         and cfg.uses_tma_routed_sfs
@@ -2914,7 +2901,10 @@ def gemm(
                     swizzle=cuda.TensorMapSwizzle.none,
                     tma_format=cuda.TensorMapDataFormat.BYTE,
                 )
-            elif cutlass.const_expr(cfg.is_mx_mma or cfg.has_cast_a):
+            elif cutlass.const_expr(
+                (cfg.is_mx_mma or cfg.has_cast_a)
+                and cfg.smem_sfb_layout == int(SfLayout.R128c4)
+            ):
                 sfb_outer_tiles = (sfb_outer_rows + 127) // 128
                 sfb_tile_outer = (cfg.tile_n + 127) // 128
                 sfb_layout = cute.make_layout(
