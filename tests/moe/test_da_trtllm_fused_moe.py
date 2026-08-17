@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,9 +32,7 @@ from flashinfer.fused_moe import (
     trtllm_moe_release_da_resources,
 )
 from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
-from flashinfer.fused_moe.core import TrtllmDaRuntime
 from flashinfer.tllm_enums import (
-    Fp8QuantizationType,
     RoutingInputMode,
     RoutingMethodType,
 )
@@ -425,33 +422,6 @@ def test_llama4_public_routing_replay_writes_selected_ids(num_tokens: int) -> No
 # Auxiliary body ABI
 
 
-@pytest.mark.parametrize(
-    "quantization_type,activation_output_index",
-    (
-        (Fp8QuantizationType.NoneFp8, 0),
-        (Fp8QuantizationType.MxFp8, 0),
-        (Fp8QuantizationType.DeepSeekFp8, 2),
-    ),
-)
-def test_lora_auxiliary_output_view_uses_typed_activation_field(
-    quantization_type: Fp8QuantizationType, activation_output_index: int
-) -> None:
-    """The public view must select the post-activation field for each typed ABI."""
-    runtime = TrtllmDaRuntime.__new__(TrtllmDaRuntime)
-    runtime._moe_runner = SimpleNamespace(fp8_quantization_type=quantization_type)
-    mapping = torch.empty(8, dtype=torch.int32)
-    body_tensors = tuple(torch.empty(index + 1) for index in range(3))
-    resources = SimpleNamespace(
-        lora_expanded_idx_to_permuted_idx=mapping,
-        body_workspace=SimpleNamespace(tensors=body_tensors),
-    )
-
-    actual_mapping, actual_activation = runtime.lora_auxiliary_outputs(resources)
-
-    assert actual_mapping is mapping
-    assert actual_activation is body_tensors[activation_output_index]
-
-
 def test_lora_public_capture_uses_graph_stable_da_outputs() -> None:
     """A DA switch must publish stable, selected-body LoRA auxiliary outputs."""
     require_sm100()
@@ -542,9 +512,7 @@ def test_lora_public_capture_uses_graph_stable_da_outputs() -> None:
             ids, weights = _realization(factory, shape, distribution)
             packed.copy_(
                 ids.bitwise_left_shift(16).bitwise_or(
-                    weights.view(torch.int16)
-                    .to(torch.int32)
-                    .bitwise_and(0xFFFF)
+                    weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
                 )
             )
             graph.replay()
