@@ -559,9 +559,7 @@ def run_dcp_spec_decode(
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    _validate_nonempty_split_assignment(
-        num_split=num_split, local_blocks=local_blocks
-    )
+    _validate_nonempty_split_assignment(num_split=num_split, local_blocks=local_blocks)
     from .jit.cake_dcp import load_dcp_spec_module
 
     if num_split == 1:
