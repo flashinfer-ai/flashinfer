@@ -61,7 +61,13 @@ if [ "${SM_MAJOR}" = "10" ]; then
   echo "========================================"
   echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
   echo "========================================"
-  pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext"
+  DSL_VERSION_BEFORE=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext==0.1.5"
+  DSL_VERSION_AFTER=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  if [ "${DSL_VERSION_BEFORE}" != "${DSL_VERSION_AFTER}" ]; then
+    echo "ERROR: quack-kernels install moved nvidia-cutlass-dsl from ${DSL_VERSION_BEFORE} to ${DSL_VERSION_AFTER}" >&2
+    return 1 2>/dev/null || exit 1
+  fi
   # Fail here rather than as a confusing test error if --no-deps left a gap.
   python -c "import quack"
   echo "quack-kernels install complete."
