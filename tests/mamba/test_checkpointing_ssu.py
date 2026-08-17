@@ -16,6 +16,8 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.mamba.checkpointing_ssu import (
     CheckpointingSSURunner,
     _checkpointing_ssu_tuning_config,
+    _get_checkpointing_ssu_runner,
+    _make_tactics,
     allocate_checkpointing_ssu_scratch,
     checkpointing_ssu,
 )
@@ -620,7 +622,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         warm = _run(2, algorithm="auto")
 
     selected_tactic = next(iter(tuner.profiling_cache.values()))[0]
-    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 3
+    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
     for tuned_tensor, warm_tensor in zip(tuned, warm, strict=True):
         torch.testing.assert_close(tuned_tensor, warm_tensor, rtol=0, atol=0)
 
@@ -646,7 +648,7 @@ def _make_autotune_key_inputs():
     return inputs, dynamic_inputs
 
 
-def _make_autotune_runner():
+def _make_autotune_runner(inputs):
     return CheckpointingSSURunner(
         (torch.float32,),
         dt_softplus=True,
@@ -655,10 +657,13 @@ def _make_autotune_runner():
         requested_d_split=0,
         precompute_heads_per_cta=0,
         heads_per_group=16,
+        optional_tensor_presence=tuple(
+            inputs[index] is not None for index in (12, 13, 14, 15, 16, 17, 18)
+        ),
     )
 
 
-def test_autotune_runner_key_ignores_leading_stride_padding():
+def test_autotune_runner_key_is_synthesis_invariant():
     inputs, dynamic_inputs = _make_autotune_key_inputs()
     padded_inputs = list(inputs)
     for index in dynamic_inputs:
@@ -670,11 +675,20 @@ def test_autotune_runner_key_ignores_leading_stride_padding():
             dtype=tensor.dtype,
         )
 
-    runner = _make_autotune_runner()
-    assert hash(runner) == hash(_make_autotune_runner())
-    assert runner.get_cache_key_extras(inputs) == runner.get_cache_key_extras(
+    runner = _make_autotune_runner(inputs)
+    padded_runner = _make_autotune_runner(padded_inputs)
+    assert hash(runner) == hash(padded_runner)
+    assert runner.get_cache_key_extras(inputs) == padded_runner.get_cache_key_extras(
         padded_inputs
     )
+
+    strided_inputs = list(inputs)
+    strided_inputs[2] = torch.empty_strided((4, 3, 2), (30, 5, 1))
+    strided_runner = _make_autotune_runner(strided_inputs)
+    assert strided_runner.get_cache_key_extras(strided_inputs) == (
+        strided_runner.get_cache_key_extras(inputs)
+    )
+    assert hash(strided_runner) == hash(runner)
 
 
 def test_autotune_max_batch_populates_dynamic_buckets():
@@ -686,6 +700,46 @@ def test_autotune_max_batch_populates_dynamic_buckets():
 
     assert {1, 2, 4}.issubset(batches)
     assert all(shapes[0][0] == shapes[1][0] + 1 for shapes in profile_shapes)
+    runner = _make_autotune_runner(inputs)
+    assert runner.get_tuning_config(inputs) is runner.get_tuning_config(inputs)
+    runner_args = ((torch.float16,), True, 0, 0, 0, 0, 16, (False,) * 7)
+    assert _get_checkpointing_ssu_runner(*runner_args) is _get_checkpointing_ssu_runner(
+        *runner_args
+    )
+
+
+def test_autotune_tactics_deduplicate_identical_small_batch_grids():
+    tactics = _make_tactics(16, 2, 16, 148, 1, 1)
+    assert tactics[0] == (0, 0, 0, 1)
+    assert len(tactics) == 11
+    assert {tactic[1] for tactic in tactics[1:]} == {1}
+
+
+def test_autotune_tactic_carries_profile_d_split(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    monkeypatch.setattr(module, "_sm_count", lambda _device: 148)
+    inputs = [None] * 22
+    inputs[0] = torch.empty(1, 16, 64, 1, dtype=torch.float32)
+    inputs[1] = torch.empty(128, 1, 16, 64, dtype=torch.bfloat16)
+    inputs[19] = torch.empty(1, dtype=torch.bfloat16)
+    inputs[20] = torch.empty(1)
+    inputs[21] = torch.empty(1, dtype=torch.bfloat16)
+    runner = _make_autotune_runner(inputs)
+
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics[0] == (0, 0, 0, 1)
+    assert all(tactic[-1] == 1 for tactic in tactics)
+
+
+def test_default_d_split_rejects_unsupported_head_dim():
+    inputs = [None] * 22
+    inputs[0] = torch.empty(1, 2, 16, 4)
+    inputs[1] = torch.empty(1, 1, 2, 16)
+    runner = _make_autotune_runner(inputs)
+    with pytest.raises(AssertionError, match="D_PER_CTA=16 < 32"):
+        runner._resolve_d_split(inputs, 1)
 
 
 def test_two_kernel_d_split2():
