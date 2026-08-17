@@ -49,7 +49,14 @@ def _has_payload(tensor: Optional[torch.Tensor]) -> bool:
     return tensor is not None and tensor.numel() > 0
 
 
-@functools.cache
+def _empty_routing_placeholder(
+    shapes: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Keep an ABI-absent routing slot empty while its cache profile is bucketed."""
+    del shapes
+    return torch.empty((0,), dtype=dtype, device=device)
+
+
 def moe_topk_ids_init(
     num_experts: int, *, packed: bool = False
 ) -> MoeTensorInitializer:
@@ -59,6 +66,13 @@ def moe_topk_ids_init(
     while ``UnpackedPrecomputed`` profiling needs plain expert IDs. Cache the
     closure for object identity preservation in rebuilt tuning configs.
     """
+
+    return _cached_moe_topk_ids_init(num_experts, packed)
+
+
+@functools.cache
+def _cached_moe_topk_ids_init(num_experts: int, packed: bool) -> MoeTensorInitializer:
+    """Cache the initializer after normalizing the public default argument."""
 
     def _init(
         shapes: tuple[int, ...],
@@ -75,7 +89,7 @@ def moe_topk_ids_init(
             generator=generator,
         ).view(shapes)
         if not packed:
-            return expert_ids
+            return expert_ids.to(dtype)
         expert_weights = torch.ones(shapes, dtype=torch.bfloat16, device=device).view(
             torch.int16
         )
@@ -142,14 +156,20 @@ def make_moe_tuning_config(
         "output": autotuner_initializer_empty,
         "hidden_states": autotuner_initializer_randn,
     }
+    # Empty routed placeholders remain dynamic inputs so their historical
+    # bucketed cache-key shape is preserved. They carry no route payload.
     if moe_inputs.routing_logits is not None:
-        spec["routing_logits"] = autotuner_initializer_rand
+        spec["routing_logits"] = _empty_routing_placeholder
+        if _has_payload(moe_inputs.routing_logits):
+            spec["routing_logits"] = autotuner_initializer_rand
     if moe_inputs.topk_ids is not None:
-        # Empty routed placeholders remain dynamic inputs so their historical
-        # bucketed cache-key shape is preserved. They carry no route payload.
-        spec["topk_ids"] = init_packed_topk_ids or autotuner_initializer_empty
+        spec["topk_ids"] = _empty_routing_placeholder
+        if _has_payload(moe_inputs.topk_ids) and init_packed_topk_ids is not None:
+            spec["topk_ids"] = init_packed_topk_ids
     if moe_inputs.expert_weights is not None:
-        spec["expert_weights"] = autotuner_initializer_ones
+        spec["expert_weights"] = _empty_routing_placeholder
+        if _has_payload(moe_inputs.expert_weights):
+            spec["expert_weights"] = autotuner_initializer_ones
     if moe_inputs.hidden_states_scale is not None:
         spec["hidden_states_scale"] = autotuner_initializer_ones
     if moe_inputs.gemm1_lora_delta is not None:
@@ -183,6 +203,14 @@ def make_moe_tuning_config(
 
     dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
     tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
+
+    if fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
+        # TRTLLM-Gen retains the FC2 scale address while it enumerates profiles.
+        # Give it one owned clone for the complete tuning call.
+        kwargs.setdefault(
+            "profile_retained_tensor_kwargs",
+            ("gemm2_per_channel_weight_scale",),
+        )
 
     return TuningConfig(
         dynamic_tensor_specs=(

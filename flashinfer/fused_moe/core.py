@@ -1740,7 +1740,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 da_routing_metadata=routing_metadata.tensors(),
                 **kwargs,
             )
-            return tuple(prepared)
+            return tuple(_torch_view_of_ffi_tensor(tensor) for tensor in prepared)
 
         def prepare_max_body_workspace(
             self,
@@ -4318,6 +4318,21 @@ class TrtllmDaRuntime:
         runtime = get_trtllm_moe_sm100_module()
         return int(runtime.max_da_multi_tile_tokens(num_experts))
 
+    def prepare_profile_schedule(
+        self,
+        tuner: AutoTuner,
+        inputs: list[Any],
+        runner_kwargs: Mapping[str, Any],
+        tuning_config: TuningConfig,
+    ) -> tuple[TuningConfig, list[tuple[list[Any], dict[str, Any]]]]:
+        """Provision one complete maximum-profile replica ring and bucket views."""
+        effective_config, batches = tuner.prepare_profile_schedule(
+            inputs,
+            tuning_config,
+            **runner_kwargs,
+        )
+        return effective_config, batches
+
     def prepare_from_logits_profile(
         self,
         inputs: List[torch.Tensor],
@@ -4411,6 +4426,18 @@ class TrtllmDaRuntime:
             norm_topk_prob=runner_kwargs.get("norm_topk_prob", True),
             enable_pdl=runner_kwargs["enable_pdl"],
         )
+
+    def stage_canonical_profile_routing(
+        self,
+        profile_inputs: List[torch.Tensor],
+        canonical: TRTLLMCanonicalRouting,
+    ) -> None:
+        """Copy one canonical ID/weight pair into an AutoTuner-owned profile view."""
+        moe_inputs = MoeRunnerInputs.from_list(profile_inputs)
+        assert moe_inputs.topk_ids is not None
+        assert moe_inputs.expert_weights is not None
+        moe_inputs.topk_ids.copy_(canonical.routing_replay_ids)
+        moe_inputs.expert_weights.copy_(canonical.expert_weights)
 
     def prepare(
         self,

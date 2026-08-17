@@ -985,6 +985,7 @@ class TestThreadSafety:
 
 _FAKE_META = {
     "flashinfer_version": "0.6.13",
+    "profiling_schema_version": "1",
     "cuda_version": "13.0",
     "cublas_version": "13.0.2",
     "cudnn_version": "92101",
@@ -1048,6 +1049,12 @@ class TestClassifyMetadataMismatches:
         del saved["cudnn_frontend_version"]
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and set(soft) == {"cudnn_frontend_version"}
+
+    def test_missing_profiling_schema_is_soft(self):
+        saved = dict(_FAKE_META)
+        del saved["profiling_schema_version"]
+        hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
+        assert hard == {} and set(soft) == {"profiling_schema_version"}
 
     def test_unknown_matches_unknown(self):
         saved = dict(_FAKE_META, cudnn_version="unknown")
@@ -1164,6 +1171,22 @@ class TestMetadataCompatibility:
             assert data[_METADATA_KEY] == _FAKE_META
             assert _OLD_KEY not in data
 
+    def test_missing_profiling_schema_is_healed_on_save(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "configs.json")
+            old_meta = dict(_FAKE_META)
+            del old_meta["profiling_schema_version"]
+            _write_cache_file(path, old_meta)
+
+            assert self.tuner.load_configs(path) is False
+
+            self._populate_new_entry()
+            self.tuner.save_configs(path)
+
+            data = _read_cache_file(path)
+            assert data[_METADATA_KEY] == _FAKE_META
+            assert _OLD_KEY not in data
+
     def test_matching_metadata_merges_and_preserves_record(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "configs.json")
@@ -1256,3 +1279,4 @@ class TestCudnnVersionDetection:
         monkeypatch.setitem(sys.modules, "cudnn", None)
         meta = autotuner_module._collect_metadata()
         assert meta["cudnn_version"] == "unknown"
+        assert meta["profiling_schema_version"] == "1"
