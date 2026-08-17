@@ -302,6 +302,10 @@ class TrtllmDaResources:
     body_workspace: TrtllmDaBodyWorkspace
     # Device scalar written by the selector with the replay-selected body index.
     selected_body: torch.Tensor
+    # Fixed-address copy of the selected tile's expanded-to-permuted map. This
+    # is populated inside each conditional body when LoRA exposes the FC1
+    # activation through the public multi-output ABI.
+    lora_expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None
     # Stable FromLogits router outputs, or None for caller-precomputed routing.
     canonical_routing: Optional[TRTLLMCanonicalRouting] = None
 
@@ -2695,9 +2699,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_mode = RoutingInputMode(routing_input_mode)
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
-        # output format. A LoRA call returns body-specific intermediate buffers whose pointers
-        # cannot vary behind one public graph output, so it retains the ordinary multi-output ABI.
-        # TODO(da-moe): Prepare graph-stable LoRA auxiliary outputs before admitting this ABI.
+        # output format. Finalized LoRA calls use the DA lane's fixed-address
+        # permutation map and shared maximum FC1 workspace for their auxiliary ABI.
         da_eligible = (
             routing_mode
             in (
@@ -2706,7 +2709,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             )
             and topk_ids is not None
             and do_finalize
-            and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
         )
         if not da_eligible:
@@ -2717,12 +2719,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         da_config = _enabled_trtllm_da_config()
         if da_config is None:
             return run_selected_tactic(tactic)
+        runtime = TrtllmDaRuntime(moe_runner)
         return run_dist_aware_tactic(
             custom_op="flashinfer::trtllm_bf16_moe",
             tuner=tuner,
             config=da_config,
             runner=moe_runner,
-            runtime=TrtllmDaRuntime(moe_runner),
+            runtime=runtime,
             tuning_config=tuning_config,
             inputs=moe_inputs.to_list(),
             runner_kwargs=runner_kwargs,
@@ -2737,8 +2740,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, gemm1_lora_delta, expert_weights
+            finish_switch=lambda resources: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(resources)]
+                if gemm1_lora_delta is not None
+                else [],
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                expert_weights,
             ),
         )
 
@@ -2977,7 +2986,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: [output],
+            finish_switch=lambda _resources: [output],
         )
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
@@ -3225,7 +3234,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: _unpack_trtllm_moe_output(
+            finish_switch=lambda _resources: _unpack_trtllm_moe_output(
                 [], output, do_finalize, None, expert_weights
             ),
         )
@@ -3502,9 +3511,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_mode = RoutingInputMode(routing_input_mode)
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
-        # output format. Generic block-scale DA also needs precomputed routing, excludes fused
-        # shared experts, and retains LoRA on the ordinary body-specific multi-output ABI.
-        # TODO(da-moe): Prepare graph-stable LoRA auxiliary outputs before admitting this ABI.
+        # output format. Generic block-scale DA also needs precomputed routing and excludes fused
+        # shared experts. Finalized LoRA calls use graph-stable DA auxiliary outputs.
         da_eligible = (
             routing_mode
             in (
@@ -3513,7 +3521,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             )
             and topk_ids is not None
             and do_finalize
-            and gemm1_lora_delta is None
             and _nfse == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
         )
@@ -3525,12 +3532,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         da_config = _enabled_trtllm_da_config()
         if da_config is None:
             return run_selected_tactic(tactic)
+        runtime = TrtllmDaRuntime(moe_runner)
         return run_dist_aware_tactic(
             custom_op="flashinfer::trtllm_fp8_block_scale_moe",
             tuner=tuner,
             config=da_config,
             runner=moe_runner,
-            runtime=TrtllmDaRuntime(moe_runner),
+            runtime=runtime,
             tuning_config=tuning_config,
             inputs=moe_inputs.to_list(),
             runner_kwargs=runner_kwargs,
@@ -3545,8 +3553,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, gemm1_lora_delta, expert_weights
+            finish_switch=lambda resources: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(resources)]
+                if gemm1_lora_delta is not None
+                else [],
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                expert_weights,
             ),
         )
 
@@ -3841,9 +3855,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
-        # output format. FP4 DA also needs precomputed IDs/weights, excludes fused shared experts,
-        # and retains LoRA on the ordinary body-specific multi-output ABI.
-        # TODO(da-moe): Prepare graph-stable LoRA auxiliary outputs before admitting this ABI.
+        # output format. FP4 DA also needs precomputed IDs/weights and excludes fused shared
+        # experts. Finalized LoRA calls use graph-stable DA auxiliary outputs.
         da_eligible = (
             RoutingInputMode(routing_input_mode)
             in (
@@ -3853,7 +3866,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and topk_ids is not None
             and topk_weights is not None
             and do_finalize
-            and gemm1_lora_delta is None
             and num_fused_shared_experts == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
         )
@@ -3890,8 +3902,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, gemm1_lora_delta, topk_weights
+            finish_switch=lambda resources: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(resources)]
+                if gemm1_lora_delta is not None
+                else [],
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                topk_weights,
             ),
         )
 
@@ -4127,14 +4145,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
-        # output format. MXINT4 DA currently consumes its packed precomputed routing ABI and
-        # retains LoRA on the ordinary body-specific multi-output ABI.
-        # TODO(da-moe): Prepare graph-stable LoRA auxiliary outputs before admitting this ABI.
+        # output format. MXINT4 DA currently consumes its packed precomputed routing ABI and uses
+        # graph-stable DA auxiliary outputs for finalized LoRA calls.
         da_eligible = (
             routing_input_mode is RoutingInputMode.PackedPrecomputed
             and topk_ids is not None
             and do_finalize
-            and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
         )
         if not da_eligible:
@@ -4145,12 +4161,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         da_config = _enabled_trtllm_da_config()
         if da_config is None:
             return run_selected_tactic(tactic)
+        runtime = TrtllmDaRuntime(moe_runner)
         return run_dist_aware_tactic(
             custom_op="flashinfer::trtllm_mxint4_block_scale_moe",
             tuner=tuner,
             config=da_config,
             runner=moe_runner,
-            runtime=TrtllmDaRuntime(moe_runner),
+            runtime=runtime,
             tuning_config=tuning_config,
             inputs=moe_inputs.to_list(),
             runner_kwargs=runner_kwargs,
@@ -4165,8 +4182,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, gemm1_lora_delta, expert_weights
+            finish_switch=lambda resources: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(resources)]
+                if gemm1_lora_delta is not None
+                else [],
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                expert_weights,
             ),
         )
 
@@ -4607,6 +4630,9 @@ class TrtllmDaRuntime:
             ),
             capture_stream=capture_stream,
         )
+        has_lora_auxiliary_outputs = (
+            MoeRunnerInputs.from_list(inputs).gemm1_lora_delta is not None
+        )
         return TrtllmDaResources(
             generation=plan.generation,
             routing_metadata=routing_metadata,
@@ -4614,7 +4640,34 @@ class TrtllmDaRuntime:
             selected_body=torch.full(
                 (1,), -1, dtype=torch.int32, device=topk_ids.device
             ),
+            lora_expanded_idx_to_permuted_idx=(
+                torch.empty_like(routing_metadata.slots[0].expanded_idx_to_permuted_idx)
+                if has_lora_auxiliary_outputs
+                else None
+            ),
             canonical_routing=canonical_routing,
+        )
+
+    def lora_auxiliary_outputs(
+        self, resources: TrtllmDaResources
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the fixed-address public LoRA outputs for one DA lane."""
+        expanded_idx_to_permuted_idx = resources.lora_expanded_idx_to_permuted_idx
+        if expanded_idx_to_permuted_idx is None:
+            raise RuntimeError("DA LoRA auxiliary outputs were not prepared")
+
+        # Every typed body ABI keeps its public post-activation FC1 output in
+        # field zero except DeepSeek FP8, whose explicit BF16 activation buffer
+        # is field two. All bodies in the plan share the field-wise maximum
+        # workspace, so the selected activation address is graph-stable.
+        activation_output_index = (
+            2
+            if self._moe_runner.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            else 0
+        )
+        return (
+            expanded_idx_to_permuted_idx,
+            resources.body_workspace.tensors[activation_output_index],
         )
 
     def capture_switch(
@@ -4718,6 +4771,14 @@ class TrtllmDaRuntime:
                         workspace.tensors,
                         **body_kwargs,
                     )
+                    if resources.lora_expanded_idx_to_permuted_idx is not None:
+                        # Tile-N changes permutation values even though the
+                        # public map shape is fixed. Copy the selected tile's
+                        # map inside its child graph so every replay publishes
+                        # the same output address with matching contents.
+                        resources.lora_expanded_idx_to_permuted_idx.copy_(
+                            slots[body.tile_n].expanded_idx_to_permuted_idx
+                        )
                 runtime.end_da_body_capture(
                     device_index, stream_handle, body_graph_handle
                 )
