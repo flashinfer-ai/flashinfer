@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,7 +33,12 @@ from flashinfer.fused_moe import (
     trtllm_moe_release_da_resources,
 )
 from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
-from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
+from flashinfer.fused_moe.core import TrtllmDaRuntime
+from flashinfer.tllm_enums import (
+    Fp8QuantizationType,
+    RoutingInputMode,
+    RoutingMethodType,
+)
 
 from tests.moe.da_acceptance_utils import (
     PRODUCTION_PRECISIONS,
@@ -416,11 +422,38 @@ def test_llama4_public_routing_replay_writes_selected_ids(num_tokens: int) -> No
     assert torch.isfinite(output).all()
 
 
-# Auxiliary body ABI fallback
+# Auxiliary body ABI
 
 
-def test_lora_public_capture_uses_ordinary_moe_contract_when_da_is_enabled() -> None:
-    """LoRA's auxiliary public outputs must bypass a DA switch and remain capturable."""
+@pytest.mark.parametrize(
+    "quantization_type,activation_output_index",
+    (
+        (Fp8QuantizationType.NoneFp8, 0),
+        (Fp8QuantizationType.MxFp8, 0),
+        (Fp8QuantizationType.DeepSeekFp8, 2),
+    ),
+)
+def test_lora_auxiliary_output_view_uses_typed_activation_field(
+    quantization_type: Fp8QuantizationType, activation_output_index: int
+) -> None:
+    """The public view must select the post-activation field for each typed ABI."""
+    runtime = TrtllmDaRuntime.__new__(TrtllmDaRuntime)
+    runtime._moe_runner = SimpleNamespace(fp8_quantization_type=quantization_type)
+    mapping = torch.empty(8, dtype=torch.int32)
+    body_tensors = tuple(torch.empty(index + 1) for index in range(3))
+    resources = SimpleNamespace(
+        lora_expanded_idx_to_permuted_idx=mapping,
+        body_workspace=SimpleNamespace(tensors=body_tensors),
+    )
+
+    actual_mapping, actual_activation = runtime.lora_auxiliary_outputs(resources)
+
+    assert actual_mapping is mapping
+    assert actual_activation is body_tensors[activation_output_index]
+
+
+def test_lora_public_capture_uses_graph_stable_da_outputs() -> None:
+    """A DA switch must publish stable, selected-body LoRA auxiliary outputs."""
     require_sm100()
     shape = compact_shape(num_tokens=48)
     hidden, gemm1_weights, gemm2_weights = _bf16_weights(shape)
@@ -429,13 +462,13 @@ def test_lora_public_capture_uses_ordinary_moe_contract_when_da_is_enabled() -> 
     packed = expert_ids.bitwise_left_shift(16).bitwise_or(
         routing_weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
     )
-    lora_delta = torch.zeros(
+    lora_delta = torch.randn(
         shape.num_tokens,
         shape.top_k,
         2 * shape.intermediate_size,
         device=hidden.device,
         dtype=torch.bfloat16,
-    )
+    ).mul_(0.05)
     output = torch.empty_like(hidden)
 
     def invoke() -> list[torch.Tensor]:
@@ -461,24 +494,80 @@ def test_lora_public_capture_uses_ordinary_moe_contract_when_da_is_enabled() -> 
         assert isinstance(result, list)
         return result
 
+    distributions = ("uniform", "ddist:1.1", "ddist:2", "ddist:4")
+    graph = torch.cuda.CUDAGraph()
+    leases = []
     with _temporary_environment(
         FLASHINFER_DIST_AWARE_AUTOTUNE="1",
-        FLASHINFER_DA_DISTRIBUTIONS="uniform,ddist:4",
+        FLASHINFER_DA_DISTRIBUTIONS=",".join(distributions),
         FLASHINFER_DA_BASELINE_GUARD="0",
     ):
-        # Ordinary autotuning remains enabled, but DA must not claim this multi-output ABI.
+        # Tune and prepare the exact LoRA input ABI before entering graph capture.
         with autotune(True, tuning_buckets=(shape.num_tokens,)):
             result = invoke()
         assert len(result) == 3
-        graph = _capture(lambda: invoke()[0])
+        diagnostic = _matching_diagnostic("bf16", shape, distributions)
+        if diagnostic["policy"] != "da_switch":
+            pytest.skip("natural autotuning did not compile a DA switch plan")
+
+        with torch.cuda.graph(graph):
+            captured = invoke()
+        leases = trtllm_moe_acquire_da_graph_leases(graph)
 
     try:
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.isfinite(output).all()
+        if not leases:
+            pytest.skip("DA resource admission used ordinary capture fallback")
+        assert len(captured) == 3
+        stable_ptrs = tuple(tensor.data_ptr() for tensor in captured)
+
+        def canonical_activation(outputs: list[torch.Tensor]) -> torch.Tensor:
+            """Gather one tactic-specific padded FC1 buffer into token-slot order."""
+            mapping = outputs[1].reshape(-1).to(torch.int64)
+            activation = outputs[2]
+            valid = mapping >= 0
+            assert torch.all(mapping[valid] < activation.shape[0])
+            canonical = torch.zeros(
+                mapping.numel(),
+                activation.shape[-1],
+                dtype=activation.dtype,
+                device=activation.device,
+            )
+            canonical[valid] = activation[mapping[valid]]
+            return canonical
+
+        # Replay two routing spectra that may choose different bodies. The
+        # public pointers stay fixed and both output plus exposed FC1 values
+        # match the ordinary multi-output contract.
+        for distribution in ("uniform", "ddist:4"):
+            ids, weights = _realization(factory, shape, distribution)
+            packed.copy_(
+                ids.bitwise_left_shift(16).bitwise_or(
+                    weights.view(torch.int16)
+                    .to(torch.int32)
+                    .bitwise_and(0xFFFF)
+                )
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            da_output = captured[0].clone()
+            da_activation = canonical_activation(captured)
+            assert tuple(tensor.data_ptr() for tensor in captured) == stable_ptrs
+
+            with _temporary_environment(FLASHINFER_DIST_AWARE_AUTOTUNE="0"):
+                ordinary = invoke()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(da_output, ordinary[0], rtol=3e-2, atol=3e-2)
+            torch.testing.assert_close(
+                da_activation,
+                canonical_activation(ordinary),
+                rtol=3e-2,
+                atol=3e-2,
+            )
     finally:
         torch.cuda.synchronize()
         graph.reset()
+        for lease in leases:
+            lease.release()
 
 
 # Supported precision families and live replay inputs
