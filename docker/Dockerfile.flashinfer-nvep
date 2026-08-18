@@ -179,7 +179,7 @@ RUN BUILD_NVEP=${BUILD_NVEP} \
     BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
     uv pip install --python ${VENV}/bin/python \
-        --no-build-isolation -e .
+        --no-build-isolation -e ".[cu13]"
 
 # Smoke probe. Assertions fail the build if the EP backends weren't
 # actually produced — without these, a silent skip in the default

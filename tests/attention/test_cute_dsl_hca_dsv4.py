@@ -223,6 +223,15 @@ def test_dsv4_backend_neutral_alias_is_backward_compatible():
     )
 
 
+def test_hca_gather4_cutedsl_ir_support_is_available():
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.dsa.gather4_utils import (
+        _ensure_gather4_ir_support,
+    )
+
+    _ensure_gather4_ir_support()
+
+
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_dsv4_hca_public_api_forwards_gather_indices(monkeypatch, kv_layout):
     pytest.importorskip("cutlass")

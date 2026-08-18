@@ -13,7 +13,7 @@ csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv 
 csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
 
 # ── GEMM ──
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
@@ -62,6 +62,22 @@ flashinfer/jit/mamba/           @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 flashinfer/mamba/               @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+
+# ── KDA ──
+benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho
+csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho
+docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho
+docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho
+docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho
+flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho
+tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho
+tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho
 
 # ── Autotuner ──
 flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx

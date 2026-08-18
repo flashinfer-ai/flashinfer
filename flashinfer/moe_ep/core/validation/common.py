@@ -243,7 +243,7 @@ def validate_mega_arch_sm90() -> None:
     cc = _device_capability()
     if cc != (9, 0):
         raise MoEEpArchError(
-            f"sm90_pull_fp8 mega kernel requires sm_90 (Hopper); host has "
+            f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
         )
 

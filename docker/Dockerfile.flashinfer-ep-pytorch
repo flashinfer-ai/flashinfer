@@ -97,7 +97,7 @@ WORKDIR ${FLASHINFER_SRC}
 # Submodule trees are copied as-is (see .dockerignore); no `git submodule update`.
 RUN BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
-    pip install --no-cache-dir --no-build-isolation -e .
+    pip install --no-cache-dir --no-build-isolation -e ".[cu13]"
 
 # The full-dep editable install above lets pip's resolver downgrade
 # nvidia-nccl-cu13 to torch's exact pin, undoing the 2.30.7 pin — re-assert it.

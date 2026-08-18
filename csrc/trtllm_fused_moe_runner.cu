@@ -256,8 +256,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                     RoutingMethodType::RenormalizeNaive      /* Softmax -> TopK -> Renormalize */
              || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */
              || routingMethodType ==
-                    RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */
-             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */) {
+                    RoutingMethodType::SigmoidRenorm            /* Sigmoid -> TopK -> Renormalize */
+             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */
+             || routingMethodType == RoutingMethodType::TopKSigmoid /* TopK -> Sigmoid */) {
     FLASHINFER_CHECK(numFusedSharedExpert == 0,
                      "routingCustom method does not support fusing shared expert");
     using namespace moe::dev::routing;
@@ -290,6 +291,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
       routingData.mPreprocessType = RoutingPreprocessType::Sigmoid;
       routingData.mPostprocessType = RoutingPostprocessType::SumNormalize;
       routingData.mNormTopkProb = false;
+    } else if (routingMethodType == RoutingMethodType::TopKSigmoid) {
+      // TopK -> Sigmoid (select on the raw logits, then squash the survivors)
+      routingData.mPreprocessType = RoutingPreprocessType::None;
+      routingData.mPostprocessType = RoutingPostprocessType::Sigmoid;
     } else if (routingMethodType == RoutingMethodType::Renormalize ||
                routingMethodType == RoutingMethodType::RenormalizeNaive) {
       // TopK -> Softmax (also used for RenormalizeNaive, see comment above)
@@ -790,6 +795,13 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
   }
 
   return validIndices;
+}
+
+MoEConfig Runner::getConfigComponents(int64_t configIndex) const {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex, ", valid range is [0, ",
+                   static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
+  return mPassingConfigs[configIndex];
 }
 
 bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,

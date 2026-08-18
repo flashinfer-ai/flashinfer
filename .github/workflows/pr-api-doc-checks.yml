@@ -1,0 +1,107 @@
+name: PR Documentation Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  documentation:
+    name: Public API and documentation
+    if: github.event.pull_request.draft == false
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      # This pull_request job is intentionally the untrusted, read-only producer.
+      # The write-capable workflow_run reporter stays on the default branch and
+      # treats these reports as escaped data; it never executes this checkout.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check public API signature and export changes
+        id: public_api
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if python scripts/check_pr_api_diff.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-actions \
+              --report-json reports/public-api.json | tee api-doc-check.txt; then
+            status=0
+          else
+            status=$?
+          fi
+          # GitHub consumes ::warning lines as annotations. Do not also render
+          # those workflow commands as literal text in the human summary.
+          sed '/^::warning /d' api-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Check all new static documentation drift
+        id: static_documentation
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if python scripts/check_pr_document.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-actions \
+              --report-json reports/static-documentation.json | tee static-doc-check.txt; then
+            status=0
+          else
+            status=$?
+          fi
+          sed '/^::warning /d' static-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Record non-blocking checker status
+        if: always()
+        env:
+          PUBLIC_API_OUTCOME: ${{ steps.public_api.outcome }}
+          STATIC_DOCUMENTATION_OUTCOME: ${{ steps.static_documentation.outcome }}
+        run: |
+          mkdir -p reports
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          outcomes = {
+              "public_api": os.environ["PUBLIC_API_OUTCOME"],
+              "static_documentation": os.environ["STATIC_DOCUMENTATION_OUTCOME"],
+          }
+          Path("reports/execution-status.json").write_text(
+              json.dumps(outcomes, indent=2) + "\n"
+          )
+          failed = [name for name, outcome in outcomes.items() if outcome != "success"]
+          if failed:
+              print(
+                  "::warning::Non-blocking PR checker execution failed: "
+                  + ", ".join(failed)
+              )
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                  summary.write(
+                      "\n> [!WARNING]\n> The following advisory checker(s) "
+                      "could not complete: " + ", ".join(failed) + ".\n"
+                  )
+          PY
+
+      - name: Upload documentation report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-documentation-report
+          path: reports/*.json
+          retention-days: 1

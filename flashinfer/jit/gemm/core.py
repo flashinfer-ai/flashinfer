@@ -163,7 +163,7 @@ def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
             write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "nvfp4_svdquant_gemm_cutlass",

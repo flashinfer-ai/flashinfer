@@ -19,6 +19,7 @@ from flashinfer.fused_moe import (
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
@@ -49,9 +50,7 @@ def _config(**overrides) -> MoEConfig:
         experts=ExpertConfig(intermediate_size=256),
         activation=ActivationConfig.swiglu,
         backend=BackendOptions((CutlassBf16Config(),)),
-        execution=ExecutionConfig(
-            do_finalize=True, enable_pdl=False, tune_max_num_tokens=64
-        ),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
     values.update(overrides)
     return MoEConfig(**values)
@@ -315,7 +314,7 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
             "Swiglu",
         ),
         (
-            _config(execution=ExecutionConfig(do_finalize=False)),
+            _config(finalize=MoEFinalizeConfig(do_finalize=False)),
             "do_finalize=True",
         ),
         (
@@ -398,7 +397,7 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     (
         _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
         _config(activation=ActivationConfig(ActivationType.Relu2)),
-        _config(execution=ExecutionConfig(do_finalize=False)),
+        _config(finalize=MoEFinalizeConfig(do_finalize=False)),
         _config(
             experts=ExpertConfig(
                 intermediate_size=256,
@@ -536,7 +535,7 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
     runner._inner = Inner()
     runner._built = True
     runner._device_arch = 100
-    runner._stage_tactic_top_k = 2
+    runner._num_top_tactics_per_stage = 2
     inputs = [torch.empty(1) for _ in range(6)]
 
     tactics = runner.get_valid_tactics(inputs, None)
@@ -549,7 +548,7 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
     assert runner._inner.gemm_idx_for_tuning is None
 
 
-def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
+def test_cutlass_one_top_tactic_preserves_single_compound_pair(monkeypatch):
     class RecordingTuner:
         def rank_tactics(
             self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
@@ -561,7 +560,7 @@ def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
     runner._inner = type("Inner", (), {"gemm_idx_for_tuning": None})()
     runner._built = True
     runner._device_arch = 100
-    runner._stage_tactic_top_k = 1
+    runner._num_top_tactics_per_stage = 1
     inputs = [torch.empty(1) for _ in range(6)]
 
     assert runner.get_valid_tactics(inputs, None) == [(3, 9)]
@@ -569,6 +568,7 @@ def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
 
 def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config()
     runner._device_arch = 90
     runner._enable_pdl = False
     without_pdl = runner.get_cache_key_extras([])
@@ -576,8 +576,9 @@ def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner._enable_pdl = True
     with_pdl = runner.get_cache_key_extras([])
 
-    assert without_pdl == (90, False)
-    assert with_pdl == (90, True)
+    assert without_pdl[-2:] == (90, False)
+    assert with_pdl[-2:] == (90, True)
+    assert without_pdl[:-2] == with_pdl[:-2]
 
 
 def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
@@ -769,7 +770,6 @@ def _make_case(num_tokens: int = 16):
     config = _config(
         experts=ExpertConfig(intermediate_size=intermediate_size),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),
@@ -825,7 +825,6 @@ def _make_w4a16_case(num_tokens: int = 16):
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),

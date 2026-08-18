@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -135,7 +135,7 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "ce0795149bb2a183db22de04a3fec3aca65fff04/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "5988e15c0e6d006c6a64c0f6c6748b4d3150c1af/batched_gemm-3d40263-3e19f0a/"
     )
@@ -170,7 +170,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "c2d9399b2537be785882354a4f9902ed6c03136c0ea341e201eac40c3923e1dc"
+        "a8d5d3e86f5ee7dfecd36a8d6cf9a933ca0cb8225a2f954f0212c5db2d250f40"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
