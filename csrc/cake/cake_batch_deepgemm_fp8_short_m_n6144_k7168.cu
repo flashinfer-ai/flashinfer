@@ -42,21 +42,21 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define TMEM_ACCUM_OFFSET 0
 #define TMEM_TMEM_SFA_OFFSET 256
 #define TMEM_TMEM_SFB_OFFSET 264
-#define NUM_TMA_PIPE_STAGES 4
+#define NUM_TMA_PIPE_STAGES 3
 #define NUM_MAINLOOP_PIPE_STAGES 2
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 51200
+#define SMEM_SMEM_A_STRIDE 67584
 #define SMEM_SMEM_B_OFF 33792
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 51200
-#define SMEM_SMEM_SFA_OFF 50176
+#define SMEM_SMEM_B_STAGE_BYTES 32768
+#define SMEM_SMEM_B_STRIDE 67584
+#define SMEM_SMEM_SFA_OFF 66560
 #define SMEM_SMEM_SFA_STAGE_BYTES 1024
-#define SMEM_SMEM_SFA_STRIDE 51200
-#define SMEM_SMEM_SFB_OFF 51200
+#define SMEM_SMEM_SFA_STRIDE 67584
+#define SMEM_SMEM_SFB_OFF 67584
 #define SMEM_SMEM_SFB_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB_STRIDE 51200
-#define SMEM_TOTAL 205824
+#define SMEM_SMEM_SFB_STRIDE 67584
+#define SMEM_TOTAL 203776
 
 #include <math_constants.h>
 
@@ -151,14 +151,14 @@ __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int p
 }
 
 
-__device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2(
+__device__ __forceinline__ void tcgen05_mma_mxf8_bs(
     int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
     int sfa_taddr, int sfb_taddr, int enable_input_d) {
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale"
+        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale"
         " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
         "}\n"
         :: "r"(taddr), "l"(a_desc), "l"(b_desc),
@@ -172,38 +172,35 @@ __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
 }
 
 
-__device__ __forceinline__ void mma_ss_step_cg2(
+__device__ __forceinline__ void mma_ss_step(
     int a_lo, int b_lo, int taddr, uint32_t i_desc, int enable_d,
     uint32_t a_dhi, uint32_t b_dhi) {
     asm volatile(
         "{\n\t"
         ".reg .pred leader, p;\n\t"
-        ".reg .b32 adhi, bdhi, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+        ".reg .b32 adhi, bdhi;\n\t"
         ".reg .b64 da, db;\n\t"
         "elect.sync _|leader, 0xFFFFFFFF;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\t"
-        "mov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
         "mov.b32 adhi, %5;\n\t"
         "mov.b32 bdhi, %6;\n\t"
         "mov.b64 da, {%0, adhi};\n\t"
         "mov.b64 db, {%1, bdhi};\n\t"
-        "@leader tcgen05.mma.cta_group::2.kind::mxf8f6f4 [%2], da, db, %3, "
-        "{m0, m1, m2, m3, m4, m5, m6, m7}, p;\n\t"
+        "@leader tcgen05.mma.cta_group::1.kind::mxf8f6f4 [%2], da, db, %3, p;\n\t"
         "}\n"
         :: "r"(a_lo), "r"(b_lo), "r"(taddr), "r"(i_desc), "r"(enable_d), "r"(a_dhi), "r"(b_dhi));
 }
 
 
-__device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
+__device__ __forceinline__ void elect_commit(int mbar_addr) {
     asm volatile(
         "{\n\t"
         ".reg .pred leader;\n\t"
         "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
+        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+        ".shared::cluster.b64 [%0];\n\t"
         "}\n"
-        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+        :: "r"(mbar_addr));
 }
 
 
@@ -221,25 +218,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
-
-
 __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
@@ -253,10 +231,10 @@ __device__ __forceinline__ uint64_t make_sf_cp_desc_sbo256(int addr) {
 }
 
 
-__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2(
+__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
     int taddr, uint64_t s_desc) {
     asm volatile(
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
+        "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
         :: "r"(taddr), "l"(s_desc));
 }
 
@@ -270,26 +248,22 @@ __device__ __forceinline__ uint64_t make_smem_desc(int addr) {
 }
 
 
-__device__ __forceinline__ void tma_4d_gmem2smem_cta2(
+__device__ __forceinline__ void tma_4d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
     asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.cta_group::2"
+        "cp.async.bulk.tensor.4d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3, %4, %5}], [%6];"
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
            "r"(mbar_addr) : "memory");
 }
 
 
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
+__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
     asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+        ".shared::cluster.b64 [%0];"
+        :: "r"(mbar_addr) : "memory");
 }
 
 
@@ -310,8 +284,8 @@ __device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(192, 1) __cluster_dims__(2,1,1) void
-kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap const* A, CakeTensorMap const* B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, __nv_bfloat16* __restrict__ C, unsigned int num_groups, unsigned int shape_m, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols, unsigned int scheduled_pair_blocks)
+__global__ __launch_bounds__(192, 1) void
+kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_large_nk_cta1(CakeTensorMap const* A, CakeTensorMap const* B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, __nv_bfloat16* __restrict__ C, unsigned int num_groups, unsigned int shape_m, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols, unsigned int scheduled_m_blocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -323,12 +297,6 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 2;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -341,37 +309,35 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 33792);
     const int smem_b_addr = smem + 33792;
-    uint8_t* smem_sfa = reinterpret_cast<uint8_t*>(smem_raw + 50176);
-    const int smem_sfa_addr = smem + 50176;
-    uint8_t* smem_sfb = reinterpret_cast<uint8_t*>(smem_raw + 51200);
-    const int smem_sfb_addr = smem + 51200;
+    uint8_t* smem_sfa = reinterpret_cast<uint8_t*>(smem_raw + 66560);
+    const int smem_sfa_addr = smem + 66560;
+    uint8_t* smem_sfb = reinterpret_cast<uint8_t*>(smem_raw + 67584);
+    const int smem_sfb_addr = smem + 67584;
     if (warp == 5) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(A)) : "memory"); }
     if (warp == 5) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(B)) : "memory"); }
 
-    // Mbarrier init (4 groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (4 groups, 10 barriers)
+    // Mbarriers at smem_raw[0..80)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 4 barriers, init_count=2
-            mbarrier_init(smem + 0, 2);
-            mbarrier_init(smem + 8, 2);
-            mbarrier_init(smem + 16, 2);
-            mbarrier_init(smem + 24, 2);
-            // tma_free: 4 barriers, init_count=1
+            // tma_full: 3 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            mbarrier_init(smem + 8, 1);
+            mbarrier_init(smem + 16, 1);
+            // tma_free: 3 barriers, init_count=1
+            mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
-            mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 56, 1);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 2 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            // epilogue_done: 2 barriers, init_count=8
-            mbarrier_init(smem + 80, 8);
-            mbarrier_init(smem + 88, 8);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            // epilogue_done: 2 barriers, init_count=4
+            mbarrier_init(smem + 64, 4);
+            mbarrier_init(smem + 72, 4);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
@@ -379,22 +345,21 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
     __syncwarp();
 
     // TMEM alloc (512 columns, 272 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 80);
     if (warp == 0) {
-        int _tmem_hold = smem + 96;
-        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+        int _tmem_hold = smem + 80;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
-    #define tma_free_addr (mbar_base + 32)
-    #define mainloop_done_addr (mbar_base + 64)
-    #define epilogue_done_addr (mbar_base + 80)
+    #define tma_free_addr (mbar_base + 24)
+    #define mainloop_done_addr (mbar_base + 48)
+    #define epilogue_done_addr (mbar_base + 64)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -408,10 +373,18 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
             unsigned int epi_stage = 0;
             const int epi_warp = warp;
             const int epi_tid = epi_warp * 32 + lane;
-            unsigned int cta_rank_0 = (unsigned int)cta_rank;
-            unsigned int num_workers = (unsigned int)num_clusters;
-            unsigned int worker_idx = (unsigned int)cluster_id;
-            unsigned int scheduled_total_tiles = num_groups * scheduled_pair_blocks * grid_n;
+            unsigned int num_workers = (unsigned int)num_bids;
+            unsigned int worker_idx = (unsigned int)bid;
+            unsigned int exact_pair_blocks = 0;
+            #pragma unroll 1
+            for (int count_g = 0; count_g < num_groups; count_g++) {
+                unsigned int count_m = (unsigned int)masked_m[count_g];
+                unsigned int count_m_blocks = (count_m + 128 - 1) / 128;
+                exact_pair_blocks = exact_pair_blocks + (count_m_blocks + 1 - 1);
+            }
+            unsigned int scheduled_total_tiles = exact_pair_blocks * grid_n;
+            unsigned int current_group_idx = 0;
+            unsigned int current_pair_cumsum = 0;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int tile_idx = worker_idx; tile_idx < scheduled_total_tiles; tile_idx += num_workers) {
@@ -420,25 +393,25 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 unsigned int selected_pair_start = 0;
                 unsigned int selected_m_blocks = 0;
                 unsigned int selected_pair_blocks = 1;
-                unsigned int scan_pair_cumsum = 0;
                 #pragma unroll 1
-                for (int scan_g = 0; scan_g < num_groups; scan_g++) {
+                for (int scan_g = current_group_idx; scan_g < num_groups; scan_g++) {
                     unsigned int group_m = (unsigned int)masked_m[scan_g];
                     unsigned int m_blocks_scan = (group_m + 128 - 1) / 128;
-                    unsigned int pair_blocks_scan = (m_blocks_scan + 2 - 1) / 2;
-                    unsigned int next_pair_cumsum = scan_pair_cumsum + pair_blocks_scan;
+                    unsigned int pair_blocks_scan = m_blocks_scan + 1 - 1;
+                    unsigned int next_pair_cumsum = current_pair_cumsum + pair_blocks_scan;
                     if (has_tile == 0) {
-                        if (tile_idx >= scan_pair_cumsum * grid_n) {
-                            if (tile_idx < next_pair_cumsum * grid_n) {
-                                selected_group = scan_g;
-                                selected_pair_start = scan_pair_cumsum;
-                                selected_m_blocks = m_blocks_scan;
-                                selected_pair_blocks = pair_blocks_scan;
-                                has_tile = 1;
-                            }
+                        if (tile_idx < next_pair_cumsum * grid_n) {
+                            current_group_idx = scan_g;
+                            selected_group = scan_g;
+                            selected_pair_start = current_pair_cumsum;
+                            selected_m_blocks = m_blocks_scan;
+                            selected_pair_blocks = pair_blocks_scan;
+                            has_tile = 1;
+                            break;
+                        } else {
+                            current_pair_cumsum = next_pair_cumsum;
                         }
                     }
-                    scan_pair_cumsum = next_pair_cumsum;
                 }
                 unsigned int zero_u32 = (unsigned int)0;
                 unsigned int safe_tile_idx = ((has_tile != 0) ? tile_idx : zero_u32);
@@ -452,7 +425,7 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 unsigned int n_in_l2 = ((remaining_n > n_l2_limit) ? n_l2_limit : remaining_n);
                 unsigned int pair_block = in_l2 / n_in_l2;
                 unsigned int n_block = first_n + in_l2 % n_in_l2;
-                unsigned int raw_m_block = pair_block * 2 + cta_rank_0;
+                unsigned int raw_m_block = pair_block;
                 int store_tile = ((raw_m_block < selected_m_blocks) ? 1 : 0);
                 mbarrier_wait(mainloop_done_addr + (epi_stage) * 8, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -461,7 +434,7 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 unsigned long long flat_row = (unsigned long long)selected_group * (unsigned long long)shape_m + (unsigned long long)off_m + (unsigned long long)epi_tid;
                 #pragma unroll
                 for (int n_chunk = 0; n_chunk < 16; n_chunk++) {
-                    int row = (int)cta_rank_0 * 128 + epi_warp * 32;
+                    int row = epi_warp * 32;
                     int col = (int)epi_stage * 128 + n_chunk * 8;
                     int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
                     float _tmem_load_0[8];
@@ -475,13 +448,11 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                     }
                     if (store_tile != 0) {
                         unsigned long long out_col = (unsigned long long)off_n + (unsigned long long)(n_chunk * 8);
-                        reinterpret_cast<int4*>(C + (flat_row * (unsigned long long)7168 + out_col))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
+                        reinterpret_cast<int4*>(C + (flat_row * ((unsigned long long)grid_n * (unsigned long long)128) + out_col))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
                     }
                 }
                 if (elect_sync()) {
-                    asm volatile(
-                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                        :: "r"((epilogue_done_addr + (epi_stage) * 8) & 0xFEFFFFFF) : "memory");
+                    mbarrier_arrive(epilogue_done_addr + (epi_stage) * 8);
                 }
                 epi_stage += 1;
                 if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
@@ -493,64 +464,69 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
         { // mma_main
             unsigned int tma_stage = 0;
             unsigned int epi_stage_1 = 0;
-            unsigned int num_workers_1 = (unsigned int)num_clusters;
-            unsigned int worker_idx_1 = (unsigned int)cluster_id;
-            unsigned int scheduled_total_tiles_1 = num_groups * scheduled_pair_blocks * grid_n;
+            unsigned int num_workers_1 = (unsigned int)num_bids;
+            unsigned int worker_idx_1 = (unsigned int)bid;
+            unsigned int exact_pair_blocks_1 = 0;
+            #pragma unroll 1
+            for (int count_g_1 = 0; count_g_1 < num_groups; count_g_1++) {
+                unsigned int count_m_1 = (unsigned int)masked_m[count_g_1];
+                unsigned int count_m_blocks_1 = (count_m_1 + 128 - 1) / 128;
+                exact_pair_blocks_1 = exact_pair_blocks_1 + (count_m_blocks_1 + 1 - 1);
+            }
+            unsigned int scheduled_total_tiles_1 = exact_pair_blocks_1 * grid_n;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
-            if (cta_rank == 0) {
+            #pragma unroll 1
+            for (unsigned int _tile_idx = worker_idx_1; _tile_idx < scheduled_total_tiles_1; _tile_idx += num_workers_1) {
+                mbarrier_wait(epilogue_done_addr + (epi_stage_1) * 8, _phase_epilogue_done);
                 #pragma unroll 1
-                for (unsigned int _tile_idx = worker_idx_1; _tile_idx < scheduled_total_tiles_1; _tile_idx += num_workers_1) {
-                    mbarrier_wait(epilogue_done_addr + (epi_stage_1) * 8, _phase_epilogue_done);
-                    #pragma unroll 1
-                    for (int iter_k = 0; iter_k < k_tiles; iter_k++) {
-                        mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int init_flag = ((iter_k == 0) ? 1 : 0);
-                        if (elect_sync()) {
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_sbo256(smem_sfa_addr + tma_stage * 51200));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfa + 4), make_sf_cp_desc_sbo256((smem_sfa_addr + tma_stage * 51200 + 128)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_sbo256(smem_sfb_addr + tma_stage * 51200));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_sbo256((smem_sfb_addr + tma_stage * 51200 + 128)));
-                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (tma_stage) * 3200;
-                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (tma_stage) * 3200;
-                            {
-                                uint64_t a_desc = ((uint64_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
+                for (int iter_k = 0; iter_k < k_tiles; iter_k++) {
+                    mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int init_flag = ((iter_k == 0) ? 1 : 0);
+                    if (elect_sync()) {
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfa, make_sf_cp_desc_sbo256(smem_sfa_addr + tma_stage * 67584));
+                        tcgen05_cp_32x128b_warpx4((tmem_tmem_sfa + 4), make_sf_cp_desc_sbo256((smem_sfa_addr + tma_stage * 67584 + 128)));
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb, make_sf_cp_desc_sbo256(smem_sfb_addr + tma_stage * 67584));
+                        tcgen05_cp_32x128b_warpx4((tmem_tmem_sfb + 4), make_sf_cp_desc_sbo256((smem_sfb_addr + tma_stage * 67584 + 128)));
+                        int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (tma_stage) * 4224;
+                        int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (tma_stage) * 4224;
+                        {
+                            uint64_t a_desc = ((uint64_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 0, b_desc + 0,
-                                    0x10a00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag) ? 0 : 1));
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 2, b_desc + 2,
-                                    0x30a00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 4, b_desc + 4,
-                                    0x50a00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 6, b_desc + 6,
-                                    0x70a00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
-                            }
-                            int _mma_a_lo_1 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (tma_stage) * 3200;
-                            int _mma_b_lo_1 = (((smem_b_addr + 8192) >> 4) & 0x3FFF) + (tma_stage) * 3200;
-                            {
-                                uint64_t a_desc = ((uint64_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
-
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 0, b_desc + 0,
-                                    0x10a00000U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 2, b_desc + 2,
-                                    0x30a00010U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 4, b_desc + 4,
-                                    0x50a00020U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 128)), a_desc + 6, b_desc + 6,
-                                    0x70a00030U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
-                            }
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 0, b_desc + 0,
+                                0x8a00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag) ? 0 : 1));
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 2, b_desc + 2,
+                                0x28a00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 4, b_desc + 4,
+                                0x48a00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 6, b_desc + 6,
+                                0x68a00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
                         }
-                        elect_commit_cg2_multicast(tma_free_addr + (tma_stage) * 8, (uint16_t)(3));
-                        tma_stage += 1;
-                        if (tma_stage == 4) { tma_stage = 0; _phase_tma_full ^= 1; }
+                        int _mma_a_lo_1 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (tma_stage) * 4224;
+                        int _mma_b_lo_1 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (tma_stage) * 4224;
+                        {
+                            uint64_t a_desc = ((uint64_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
+
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 0, b_desc + 0,
+                                0x8a00000U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 2, b_desc + 2,
+                                0x28a00010U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 4, b_desc + 4,
+                                0x48a00020U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
+                            tcgen05_mma_mxf8_bs((tmem_accum + (epi_stage_1 * 128)), a_desc + 6, b_desc + 6,
+                                0x68a00030U, tmem_tmem_sfa + 4, tmem_tmem_sfb + 4, 1);
+                        }
                     }
-                    elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage_1) * 8, (uint16_t)(3));
-                    epi_stage_1 += 1;
-                    if (epi_stage_1 == 2) { epi_stage_1 = 0; _phase_epilogue_done ^= 1; }
+                    elect_commit(tma_free_addr + (tma_stage) * 8);
+                    tma_stage += 1;
+                    if (tma_stage == 3) { tma_stage = 0; _phase_tma_full ^= 1; }
                 }
+                elect_commit(mainloop_done_addr + (epi_stage_1) * 8);
+                epi_stage_1 += 1;
+                if (epi_stage_1 == 2) { epi_stage_1 = 0; _phase_epilogue_done ^= 1; }
             }
         }
     }
@@ -558,11 +534,19 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
     if (warp == 5) {
         { // load_main
             unsigned int load_stage = 0;
-            unsigned int cta_rank_0_1 = (unsigned int)cta_rank;
-            unsigned int num_workers_2 = (unsigned int)num_clusters;
-            unsigned int worker_idx_2 = (unsigned int)cluster_id;
+            unsigned int num_workers_2 = (unsigned int)num_bids;
+            unsigned int worker_idx_2 = (unsigned int)bid;
             unsigned int max_m_blocks = (shape_m + 128 - 1) / 128;
-            unsigned int scheduled_total_tiles_2 = num_groups * scheduled_pair_blocks * grid_n;
+            unsigned int exact_pair_blocks_2 = 0;
+            #pragma unroll 1
+            for (int count_g_2 = 0; count_g_2 < num_groups; count_g_2++) {
+                unsigned int count_m_2 = (unsigned int)masked_m[count_g_2];
+                unsigned int count_m_blocks_2 = (count_m_2 + 128 - 1) / 128;
+                exact_pair_blocks_2 = exact_pair_blocks_2 + (count_m_blocks_2 + 1 - 1);
+            }
+            unsigned int scheduled_total_tiles_2 = exact_pair_blocks_2 * grid_n;
+            unsigned int current_group_idx_1 = 0;
+            unsigned int current_pair_cumsum_1 = 0;
             unsigned int _phase_tma_free = 1;
             #pragma unroll 1
             for (unsigned int tile_idx_1 = worker_idx_2; tile_idx_1 < scheduled_total_tiles_2; tile_idx_1 += num_workers_2) {
@@ -571,25 +555,25 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 unsigned int selected_pair_start_1 = 0;
                 unsigned int selected_m_blocks_1 = 0;
                 unsigned int selected_pair_blocks_1 = 1;
-                unsigned int scan_pair_cumsum_1 = 0;
                 #pragma unroll 1
-                for (int scan_g_1 = 0; scan_g_1 < num_groups; scan_g_1++) {
+                for (int scan_g_1 = current_group_idx_1; scan_g_1 < num_groups; scan_g_1++) {
                     unsigned int group_m_1 = (unsigned int)masked_m[scan_g_1];
                     unsigned int m_blocks_scan_1 = (group_m_1 + 128 - 1) / 128;
-                    unsigned int pair_blocks_scan_1 = (m_blocks_scan_1 + 2 - 1) / 2;
-                    unsigned int next_pair_cumsum_1 = scan_pair_cumsum_1 + pair_blocks_scan_1;
+                    unsigned int pair_blocks_scan_1 = m_blocks_scan_1 + 1 - 1;
+                    unsigned int next_pair_cumsum_1 = current_pair_cumsum_1 + pair_blocks_scan_1;
                     if (has_tile_1 == 0) {
-                        if (tile_idx_1 >= scan_pair_cumsum_1 * grid_n) {
-                            if (tile_idx_1 < next_pair_cumsum_1 * grid_n) {
-                                selected_group_1 = scan_g_1;
-                                selected_pair_start_1 = scan_pair_cumsum_1;
-                                selected_m_blocks_1 = m_blocks_scan_1;
-                                selected_pair_blocks_1 = pair_blocks_scan_1;
-                                has_tile_1 = 1;
-                            }
+                        if (tile_idx_1 < next_pair_cumsum_1 * grid_n) {
+                            current_group_idx_1 = scan_g_1;
+                            selected_group_1 = scan_g_1;
+                            selected_pair_start_1 = current_pair_cumsum_1;
+                            selected_m_blocks_1 = m_blocks_scan_1;
+                            selected_pair_blocks_1 = pair_blocks_scan_1;
+                            has_tile_1 = 1;
+                            break;
+                        } else {
+                            current_pair_cumsum_1 = next_pair_cumsum_1;
                         }
                     }
-                    scan_pair_cumsum_1 = next_pair_cumsum_1;
                 }
                 unsigned int zero_u32_1 = (unsigned int)0;
                 unsigned int safe_tile_idx_1 = ((has_tile_1 != 0) ? tile_idx_1 : zero_u32_1);
@@ -603,8 +587,8 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 unsigned int n_in_l2_1 = ((remaining_n_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_n_1);
                 unsigned int pair_block_1 = in_l2_1 / n_in_l2_1;
                 unsigned int n_block_1 = first_n_1 + in_l2_1 % n_in_l2_1;
-                unsigned int raw_m_block_1 = pair_block_1 * 2 + cta_rank_0_1;
-                unsigned int m_block = ((raw_m_block_1 < max_m_blocks) ? raw_m_block_1 : pair_block_1 * 2);
+                unsigned int raw_m_block_1 = pair_block_1;
+                unsigned int m_block = ((raw_m_block_1 < max_m_blocks) ? raw_m_block_1 : pair_block_1);
                 unsigned int off_m_1 = m_block * 128;
                 unsigned int off_n_1 = n_block_1 * 128;
                 unsigned int flat_group_m = selected_group_1 * shape_m + off_m_1;
@@ -612,8 +596,8 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                 #pragma unroll 1
                 for (int iter_k_1 = 0; iter_k_1 < k_tiles; iter_k_1++) {
                     mbarrier_wait(tma_free_addr + (load_stage) * 8, _phase_tma_free);
-                    int sfa_base = smem_sfa_addr + load_stage * 51200;
-                    int sfb_base = smem_sfb_addr + load_stage * 51200;
+                    int sfa_base = smem_sfa_addr + load_stage * 67584;
+                    int sfb_base = smem_sfb_addr + load_stage * 67584;
                     unsigned int sfb_idx0 = group_sfb_base + (unsigned int)iter_k_1 * 2;
                     unsigned int sfb0 = (unsigned int)(SFB_bits[sfb_idx0] >> 23);
                     unsigned int sfb1 = (unsigned int)(SFB_bits[sfb_idx0 + 1] >> 23);
@@ -678,25 +662,22 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048(CakeTensorMap co
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
-                        tma_4d_gmem2smem_cta2(smem_a_addr + load_stage * 51200, A, 0, off_m_1, (unsigned int)iter_k_1 * 2, selected_group_1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 51200, B, 0, off_n_1 + cta_rank_0_1 * 64, (unsigned int)iter_k_1 * 2, selected_group_1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        asm volatile(
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                            :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
+                        tma_4d_gmem2smem(smem_a_addr + load_stage * 67584, A, 0, off_m_1, (unsigned int)iter_k_1 * 2, selected_group_1, tma_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(smem_b_addr + load_stage * 67584, B, 0, off_n_1, (unsigned int)iter_k_1 * 2, selected_group_1, tma_full_addr + (load_stage) * 8);
+                        mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 65536);
                     }
                     load_stage += 1;
-                    if (load_stage == 4) { load_stage = 0; _phase_tma_free ^= 1; }
+                    if (load_stage == 3) { load_stage = 0; _phase_tma_free ^= 1; }
                 }
             }
         }
     }
 
     // Cleanup
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
     }
 }
 

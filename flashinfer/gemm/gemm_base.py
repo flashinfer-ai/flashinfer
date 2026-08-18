@@ -8599,11 +8599,20 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     if b.shape[0] != batch or b.shape[2] != k:
         raise ValueError("Cake batch DeepGEMM FP8 requires matching B and K")
     n = b.shape[1]
-    if (n, k) not in {(128, 512), (512, 128), (4096, 7168), (7168, 2048)}:
+    if (n, k) not in {
+        (128, 512),
+        (512, 128),
+        (4096, 7168),
+        (7168, 2048),
+        (6144, 7168),
+        (7168, 3072),
+        (4096, 4096),
+        (4096, 2048),
+    }:
         raise ValueError(f"Cake batch DeepGEMM FP8 does not support N={n}, K={k}")
-    if batch not in {1, 4, 8, 64, 128, 256}:
+    if batch not in {1, 4, 6, 8, 32, 64, 128, 256}:
         raise ValueError(f"Cake batch DeepGEMM FP8 does not support B={batch}")
-    if m not in {128, 256, 512, 1024, 8192, 16384}:
+    if m not in {128, 256, 512, 1024, 4096, 8192, 16384}:
         raise ValueError(f"Cake batch DeepGEMM FP8 does not support M={m}")
     if m in {8192, 16384} and batch * m > 16384:
         raise ValueError(f"Cake batch DeepGEMM FP8 does not support B*M={batch * m}")

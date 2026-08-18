@@ -33,7 +33,8 @@ CakeBatchDeepGemmShape = Literal[
     "n128_k512",
     "n512_k128",
     "n4096_k7168",
-    "n7168_k2048",
+    "large_nk",
+    "short_m_n6144_k7168",
 ]
 CakeBatchDeepGemmTarget = Literal["sm100a", "sm103a"]
 
@@ -78,16 +79,35 @@ CAKE_BATCH_DEEPGEMM_METADATA: dict[
         smem_bytes=203776,
         use_fast_math=False,
     ),
-    "n7168_k2048": CakeBatchDeepGemmMetadata(
+    "large_nk": CakeBatchDeepGemmMetadata(
         n=7168,
         k=2048,
         variant=3,
         symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_n7168_k2048",
-        source="cake_batch_deepgemm_fp8_n7168_k2048.cu",
+        source="cake_batch_deepgemm_fp8_large_nk.cu",
         smem_bytes=205824,
         use_fast_math=False,
     ),
+    "short_m_n6144_k7168": CakeBatchDeepGemmMetadata(
+        n=6144,
+        k=7168,
+        variant=4,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_large_nk_cta1",
+        source="cake_batch_deepgemm_fp8_short_m_n6144_k7168.cu",
+        smem_bytes=203776,
+        use_fast_math=False,
+    ),
 }
+
+_GENERIC_NK = frozenset(
+    {
+        (7168, 2048),
+        (6144, 7168),
+        (7168, 3072),
+        (4096, 4096),
+        (4096, 2048),
+    }
+)
 
 _NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
@@ -277,6 +297,20 @@ def _tensor_maps(
     return a_desc, b_desc, c_desc
 
 
+def _select_route(n: int, k: int, expected_m: int) -> CakeBatchDeepGemmShape:
+    if (n, k) == (128, 512):
+        return "n128_k512"
+    if (n, k) == (512, 128):
+        return "n512_k128"
+    if (n, k) == (4096, 7168):
+        return "n4096_k7168"
+    if (n, k) == (6144, 7168) and expected_m == 24:
+        return "short_m_n6144_k7168"
+    if (n, k) in _GENERIC_NK:
+        return "large_nk"
+    raise ValueError(f"unsupported Cake batch DeepGEMM shape: N={n}, K={k}")
+
+
 def run_cake_batch_deepgemm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -286,9 +320,7 @@ def run_cake_batch_deepgemm_fp8(
     out: torch.Tensor,
     expected_m: int,
 ) -> None:
-    shape = f"n{b.shape[1]}_k{a.shape[2]}"
-    if shape not in CAKE_BATCH_DEEPGEMM_METADATA:
-        raise ValueError(f"unsupported Cake batch DeepGEMM shape: {shape}")
+    shape = _select_route(b.shape[1], a.shape[2], expected_m)
     capability = torch.cuda.get_device_capability(a.device)
     target = {(10, 0): "sm100a", (10, 3): "sm103a"}.get(capability)
     if target is None:
