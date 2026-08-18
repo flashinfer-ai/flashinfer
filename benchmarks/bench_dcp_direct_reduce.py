@@ -63,45 +63,6 @@ def _merge(
     return out, lse
 
 
-class NcclBaseline:
-    """NCCL all_to_all + local merge."""
-
-    def __init__(
-        self,
-        group: dist.ProcessGroup,
-        tokens: int,
-        h_local: int,
-        head_dim: int,
-        dtype,
-    ):
-        self.group = group
-        self.world = group.size()
-        self.tokens = tokens
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self.send_o = torch.empty(
-            self.world, tokens, h_local, head_dim, dtype=dtype, device=device
-        )
-        self.recv_o = torch.empty_like(self.send_o)
-        self.send_s = torch.empty(
-            self.world, tokens, h_local, dtype=torch.float32, device=device
-        )
-        self.recv_s = torch.empty_like(self.send_s)
-        self.out = torch.empty(tokens, h_local, head_dim, dtype=dtype, device=device)
-        self.lse = torch.empty(tokens, h_local, dtype=torch.float32, device=device)
-        self.h_local = h_local
-
-    def run(self, partial_o: torch.Tensor, partial_s: torch.Tensor) -> None:
-        for dst in range(self.world):
-            sl = slice(dst * self.h_local, (dst + 1) * self.h_local)
-            self.send_o[dst].copy_(partial_o[:, sl])
-            self.send_s[dst].copy_(partial_s[:, sl])
-        dist.all_to_all_single(self.recv_o, self.send_o, group=self.group)
-        dist.all_to_all_single(self.recv_s, self.send_s, group=self.group)
-        out, lse = _merge(self.recv_o, self.recv_s)
-        self.out.copy_(out.to(self.out.dtype))
-        self.lse.copy_(lse)
-
-
 def _time_graph(fn, po: torch.Tensor, ps: torch.Tensor) -> float:
     pool_o = torch.randn(8, *po.shape, dtype=po.dtype, device=po.device)
     pool_s = torch.randn(8, *ps.shape, dtype=ps.dtype, device=ps.device)
@@ -130,15 +91,6 @@ def _time_graph(fn, po: torch.Tensor, ps: torch.Tensor) -> float:
         ender.synchronize()
         samples.append(starter.elapsed_time(ender) / ITERS)
     return statistics.median(samples)
-
-
-def _try_time_graph(fn, po: torch.Tensor, ps: torch.Tensor, rank: int, label: str):
-    try:
-        return _time_graph(fn, po, ps)
-    except RuntimeError as exc:
-        if rank == 0:
-            print(f"{label} skipped: {type(exc).__name__}: {exc}")
-        return None
 
 
 def _force_posix_mnnvl_if_fabric_blocked() -> str:
@@ -296,13 +248,11 @@ def main() -> None:
     caller_s = torch.empty(max_tokens, h_local, dtype=torch.float32, device=device)
 
     if rank == 0:
-        print(
-            f"{'T':>5} {'fi_a2a':>10} {'nccl':>10} "
-            f"{'direct':>10} {'d/a2a':>8} {'d/nccl':>8}"
-        )
+        print(f"{'T':>5} {'fi_a2a':>10} {'direct':>10} {'d/a2a':>8}")
         print(
             "us; fi_a2a=decode_cp_a2a_alltoall+merge; "
-            "nccl=NCCL A2A+merge; direct=DCPDirectReduceWorkspace"
+            "direct=DCPDirectReduceWorkspace. "
+            "NCCL vs existing A2A is in benchmarks/bench_dcp_alltoall.py"
         )
 
     fi_a2a = _try_make(
@@ -317,8 +267,6 @@ def main() -> None:
         ps = torch.randn(t, TOTAL_HEADS, dtype=torch.float32, device=device)
         workspace.run(po, ps, slot=0)
         workspace.run(po, ps, slot=0, out=caller_o[:t], lse_out=caller_s[:t])
-        nccl = NcclBaseline(group, t, h_local, HEAD_DIM, DTYPE)
-        nccl.run(po, ps)
         if fi_a2a is not None:
             fi_a2a.run(po, ps)
         dist.barrier()
@@ -328,18 +276,12 @@ def main() -> None:
             if fi_a2a is not None
             else None
         )
-        nccl_ms = _try_time_graph(lambda: nccl.run(po, ps), po, ps, rank, "nccl")
         direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
 
         if rank == 0:
             a2a_str = "SKIPPED" if fi_a2a_ms is None else f"{fi_a2a_ms * 1e3:10.2f}"
-            nccl_str = "SKIPPED" if nccl_ms is None else f"{nccl_ms * 1e3:10.2f}"
             d_a2a = "n/a" if fi_a2a_ms is None else f"{direct_ms / fi_a2a_ms:8.3f}"
-            d_nccl = "n/a" if nccl_ms is None else f"{direct_ms / nccl_ms:8.3f}"
-            print(
-                f"{t:5d} {a2a_str:>10} {nccl_str:>10} "
-                f"{direct_ms * 1e3:10.2f} {d_a2a:>8} {d_nccl:>8}"
-            )
+            print(f"{t:5d} {a2a_str:>10} {direct_ms * 1e3:10.2f} {d_a2a:>8}")
 
     dist.destroy_process_group()
 
