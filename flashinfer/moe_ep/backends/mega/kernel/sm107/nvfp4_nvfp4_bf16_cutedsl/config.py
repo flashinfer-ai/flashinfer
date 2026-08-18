@@ -37,4 +37,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_in_flag_batch: int = 1
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None  # None -> (2, 1)
+    # Mixed-CGA launch: fill leftover SMs with smaller fallback clusters
+    # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
+    fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     max_sm_count: Optional[int] = None

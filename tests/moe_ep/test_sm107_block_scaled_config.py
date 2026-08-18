@@ -78,6 +78,7 @@ class TestSm107BlockScaledConfig:
         assert cfg.token_in_flag_batch == 1
         assert cfg.mma_tiler_mnk is None
         assert cfg.cluster_shape_mn is None
+        assert cfg.fallback_cluster_shape_mn is None
         assert cfg.max_sm_count is None
         # No knobs field until the next tree grows a tuner (mirrors the SM90
         # PORT NOTE contract).

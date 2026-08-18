@@ -109,6 +109,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             kwargs["mma_tiler_mnk"] = k.mma_tiler_mnk
         if k.cluster_shape_mn is not None:
             kwargs["cluster_shape_mn"] = k.cluster_shape_mn
+        if k.fallback_cluster_shape_mn is not None:
+            kwargs["fallback_cluster_shape_mn"] = k.fallback_cluster_shape_mn
         if k.fc2_tma_stages is not None:
             kwargs["fc2_tma_stages"] = k.fc2_tma_stages
         return get_symm_buffer_for_sm107_block_scaled_mega_moe(
@@ -242,6 +244,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.token_in_flag_batch,
             k.mma_tiler_mnk,
             k.cluster_shape_mn,
+            k.fallback_cluster_shape_mn,
             k.max_sm_count,
         )
 

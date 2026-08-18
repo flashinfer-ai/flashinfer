@@ -134,6 +134,9 @@ class Sm107BlockScaledMoeConfig:
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 4*ik)
     cluster_shape_mn: Tuple[int, int] = (2, 1)
+    # Mixed-CGA launch: alongside the preferred clusters, fill leftover SMs with
+    # smaller fallback clusters (upstream commit a5b4d33). None = uniform launch.
+    fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # ("grouped" | "phase_interleave", optional hint); typed loosely so backend
     # configs can carry it as a plain (str, int|None) tuple.
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
@@ -197,6 +200,43 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError("cluster_shape_mn must be a 2-tuple.")
         if tiler[0] == 256 and self.cluster_shape_mn[0] % 2 != 0:
             raise ValueError("instruction M 256 requires an even cluster M.")
+        if self.fallback_cluster_shape_mn is not None:
+            fallback = tuple(self.fallback_cluster_shape_mn)
+            if fallback == tuple(self.cluster_shape_mn):
+                # Kernel-side NonClcMixedCgaConfig collapses this to a uniform
+                # launch; normalize here so downstream logic sees one spelling.
+                object.__setattr__(self, "fallback_cluster_shape_mn", None)
+            else:
+                if len(fallback) != 2:
+                    raise ValueError("fallback_cluster_shape_mn must be a 2-tuple.")
+                if any(dim <= 0 for dim in fallback):
+                    raise ValueError(
+                        "fallback_cluster_shape_mn dimensions must be positive."
+                    )
+                if fallback[1] != 1:
+                    raise ValueError(
+                        "the swap-AB FC12 fallback path requires cluster N=1."
+                    )
+                if any(
+                    preferred % fb != 0
+                    for preferred, fb in zip(
+                        self.cluster_shape_mn, fallback, strict=True
+                    )
+                ):
+                    raise ValueError(
+                        "every preferred cluster dimension must be divisible by "
+                        "its fallback dimension."
+                    )
+                if tiler[0] == 256 and fallback[0] % 2 != 0:
+                    raise ValueError(
+                        "instruction M 256 requires an even fallback cluster M."
+                    )
+                if self.max_sm_count is not None:
+                    raise ValueError(
+                        "max_sm_count is not supported together with "
+                        "fallback_cluster_shape_mn (mixed-CGA occupancy is "
+                        "resolved from the hardware probe)."
+                    )
         if self.token_padding_block % 64 != 0:
             raise ValueError("token_padding_block must be a multiple of 64.")
         if tiler[1] % self.token_padding_block != 0:
@@ -346,12 +386,43 @@ class Sm107BlockScaledSymmBuffer:
 
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
-        launch_clusters = _max_active_clusters(cluster_size)
-        if cfg.max_sm_count is not None:
-            requested = cfg.max_sm_count // cluster_size
-            if requested <= 0:
-                raise ValueError("max_sm_count must cover at least one full cluster.")
-            launch_clusters = min(launch_clusters, requested)
+        preferred_count: Optional[int] = None
+        fallback_count: Optional[int] = None
+        if cfg.fallback_cluster_shape_mn is None:
+            launch_clusters = _max_active_clusters(cluster_size)
+            if cfg.max_sm_count is not None:
+                requested = cfg.max_sm_count // cluster_size
+                if requested <= 0:
+                    raise ValueError(
+                        "max_sm_count must cover at least one full cluster."
+                    )
+                launch_clusters = min(launch_clusters, requested)
+        else:
+            # Mirror the drop's launch_cluster_configuration()/max_active_clusters()
+            # mixed recipe (tester/host_utils.py): pack preferred clusters at their
+            # occupancy limit, then convert the leftover fallback CTA capacity into
+            # whole preferred-sized groups of fallback clusters.
+            fallback_size = (
+                cfg.fallback_cluster_shape_mn[0] * cfg.fallback_cluster_shape_mn[1]
+            )
+            if cluster_size % fallback_size != 0:
+                raise ValueError(
+                    "preferred cluster size must be a multiple of the fallback "
+                    "cluster size."
+                )
+            preferred_count = _max_active_clusters(cluster_size)
+            fallback_occupancy = _max_active_clusters(fallback_size)
+            fallback_capacity = fallback_occupancy * fallback_size
+            preferred_capacity = preferred_count * cluster_size
+            if fallback_capacity < preferred_capacity:
+                raise ValueError(
+                    "fallback cluster CTA capacity must not be smaller than "
+                    "preferred cluster CTA capacity."
+                )
+            split_factor = cluster_size // fallback_size
+            remaining = (fallback_capacity - preferred_capacity) // fallback_size
+            fallback_count = remaining // split_factor * split_factor
+            launch_clusters = preferred_count + fallback_count // split_factor
 
         problem_desc = ProblemDesc(
             {
@@ -389,6 +460,12 @@ class Sm107BlockScaledSymmBuffer:
         }
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
+        if cfg.fallback_cluster_shape_mn is not None:
+            impl_fields["fallback_cluster_shape_mn"] = tuple(
+                cfg.fallback_cluster_shape_mn
+            )
+            impl_fields["preferred_cluster_count"] = preferred_count
+            impl_fields["fallback_cluster_count"] = fallback_count
         return BlockScaledSwapAbMegaMoeKernel(problem_desc, ImplDesc(impl_fields))
 
     def note_staged_tokens(self, num_tokens: int) -> None:
@@ -487,6 +564,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     quant_kind: Sm107QuantKind = "mxfp8_e4m3",
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mn: Tuple[int, int] = (2, 1),
+    fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None),
     work_id_mode: Sm107WorkIdMode = "grid_stride",
     fc2_use_bulk: bool = False,
@@ -518,6 +596,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         quant_kind=quant_kind,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
+        fallback_cluster_shape_mn=fallback_cluster_shape_mn,
         schedule_policy=schedule_policy,
         work_id_mode=work_id_mode,
         fc2_use_bulk=fc2_use_bulk,

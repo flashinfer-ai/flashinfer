@@ -164,6 +164,56 @@ def test_shim_config_validation():
     with pytest.raises(ValueError, match="epi_flag_batches"):
         cfg_cls(**{**kwargs, "epi_flag_batches": (8, 2)})
 
+    # Mixed-CGA (fallback cluster) rules, added with upstream a5b4d33.
+    mixed = cfg_cls(
+        **{
+            **kwargs,
+            "cluster_shape_mn": (4, 1),
+            "fallback_cluster_shape_mn": (2, 1),
+        }
+    )
+    assert mixed.fallback_cluster_shape_mn == (2, 1)
+    # fallback == preferred collapses to a uniform launch (kernel does the same).
+    assert (
+        cfg_cls(
+            **{**kwargs, "fallback_cluster_shape_mn": (2, 1)}
+        ).fallback_cluster_shape_mn
+        is None
+    )
+    with pytest.raises(ValueError, match="divisible"):
+        cfg_cls(
+            **{
+                **kwargs,
+                "cluster_shape_mn": (4, 1),
+                "fallback_cluster_shape_mn": (3, 1),
+            }
+        )
+    with pytest.raises(ValueError, match="even fallback cluster M"):
+        cfg_cls(
+            **{
+                **kwargs,
+                "cluster_shape_mn": (4, 1),
+                "fallback_cluster_shape_mn": (1, 1),
+            }
+        )
+    with pytest.raises(ValueError, match="cluster N=1"):
+        cfg_cls(
+            **{
+                **kwargs,
+                "cluster_shape_mn": (4, 2),
+                "fallback_cluster_shape_mn": (2, 2),
+            }
+        )
+    with pytest.raises(ValueError, match="max_sm_count"):
+        cfg_cls(
+            **{
+                **kwargs,
+                "cluster_shape_mn": (4, 1),
+                "fallback_cluster_shape_mn": (2, 1),
+                "max_sm_count": 64,
+            }
+        )
+
 
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("quant_kind", QUANT_KINDS)
@@ -262,6 +312,94 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
         )
         rel_l2_2 = (y.to(torch.float32) - yr).norm() / yr.norm().clamp_min(1e-6)
         assert rel_l2_2.item() < band, f"second forward rel_l2 {rel_l2_2.item()}"
+    finally:
+        symm_buffer.destroy()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("quant_kind", QUANT_KINDS)
+def test_sm107_block_scaled_kernel_perf_winner_config(monkeypatch, quant_kind):
+    """Oracle check for the upstream perf-report winner knobs (a5b4d33):
+    mixed CGA (preferred 4x1, fallback 2x1), phase-interleave scheduling,
+    atomic work IDs, FC2 bulk TMA with 2 stages, epi-warp token back."""
+    pkg = _sm107_tree()
+    _require_cuda()
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+
+    staging_mod, weights_mod = _backend_modules(quant_kind)
+    from flashinfer.moe_ep.weights import MoEWeightPack
+
+    p = _single_rank_problem()
+
+    transform_kwargs = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
+    transformed = weights_mod.preprocess_mega_weights(
+        MoEWeightPack(w13=p["w13"], w2=p["w2"]),
+        intermediate_size=p["intermediate"],
+        hidden_size=p["hidden"],
+        **transform_kwargs,
+    )
+
+    symm_buffer = pkg.get_symm_buffer_for_sm107_block_scaled_mega_moe(
+        p["num_experts"],
+        p["max_tokens"],
+        p["top_k"],
+        p["hidden"],
+        p["intermediate"],
+        0,
+        1,
+        quant_kind=quant_kind,
+        cluster_shape_mn=(4, 1),
+        fallback_cluster_shape_mn=(2, 1),
+        schedule_policy=("phase_interleave", None),  # None -> minimum safe hint
+        work_id_mode="atomic_counter",
+        fc2_use_bulk=True,
+        fc2_tma_stages=2,
+        epi_flag_batches=(1, 4),
+    )
+    try:
+        stage_kwargs = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
+        staged = staging_mod.stage_mega_moe_inputs(
+            p["x"],
+            p["topk_weights"],
+            p["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            **stage_kwargs,
+        )
+        symm_buffer.note_staged_tokens(staged)
+
+        y = torch.empty(
+            p["num_tokens"], p["hidden"], device="cuda", dtype=torch.bfloat16
+        )
+        pkg.sm107_block_scaled_mega_moe(
+            y, transformed[0], transformed[1], symm_buffer, num_tokens=p["num_tokens"]
+        )
+
+        w13_q, w13_sf, w2_q, w2_sf = _quantize_reference_weights(pkg, p, quant_kind)
+        y_ref = pkg.compute_megamoe_reference_sm107_block_scaled(
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            w13_q,
+            w13_sf,
+            w2_q,
+            w2_sf,
+            quant_kind=quant_kind,
+            local_expert_offset=0,
+            gate_up_clamp=None,
+            apply_topk_at_fc1=True,
+            num_tokens=p["num_tokens"],
+        )[: p["num_tokens"]]
+
+        band = _REL_L2_BAND[quant_kind]
+        rel_l2 = (y.to(torch.float32) - y_ref.to(torch.float32)).norm() / y_ref.to(
+            torch.float32
+        ).norm().clamp_min(1e-6)
+        print(f"[sm107 oracle mixed-cga] kind={quant_kind} rel_l2={rel_l2.item():.5f}")
+        assert rel_l2.item() < band, f"rel_l2 {rel_l2.item()} out of band {band}"
     finally:
         symm_buffer.destroy()
 
