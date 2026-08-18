@@ -49,6 +49,14 @@ def _resource_at(package_root, relative_path: str):
     return resource
 
 
+def _python_resources(resource_root):
+    for resource in resource_root.iterdir():
+        if resource.is_dir():
+            yield from _python_resources(resource)
+        elif resource.name.endswith(".py") and resource.is_file():
+            yield resource
+
+
 def _backend_sources():
     source_tree = (
         _PROJECT_ROOT
@@ -64,14 +72,7 @@ def _backend_sources():
         return sorted(source_tree.rglob("*.py"))
 
     package_root = resources.files(_BACKEND_PACKAGE_NAME)
-    return sorted(
-        (
-            resource
-            for resource in package_root.iterdir()
-            if resource.name.endswith(".py") and resource.is_file()
-        ),
-        key=lambda resource: resource.name,
-    )
+    return sorted(_python_resources(package_root), key=str)
 
 
 def test_sm90_push_package_data_contains_cuda_sources():
