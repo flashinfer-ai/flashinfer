@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 Unified AllReduce Fusion API
 
 This module provides a unified interface for AllReduce + RMSNorm fusion operations
-across different backends (TensorRT-LLM, MNNVL, MNNVL CuTe DSL).
+across different backends (TensorRT-LLM, MNNVL, and NCCL with local fusion).
 
 Example usage:
     >>> # Auto-select best backend based on topology
@@ -56,9 +56,11 @@ from typing import Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.norm import fused_add_rmsnorm
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
 from flashinfer.utils import is_confidential_compute
 
@@ -96,7 +98,7 @@ from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
 # Workspace classes wrap the underlying backend workspace implementations:
 # - TRTLLMAllReduceFusionWorkspace: Wraps trtllm_create_ipc_workspace_for_all_reduce_fusion
 # - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (see trtllm_mnnvl_ar.py)
-# - MNNVLCuteDSLAllReduceFusionWorkspace: Shared LL/BT/HT backend workspace
+# - NCCLLocalAllReduceFusionWorkspace: NCCL collective with local fusion kernels
 #
 # Each workspace:
 # 1. Calls the backend-specific workspace creation function in __init__
@@ -274,6 +276,60 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self._destroyed = True
 
 
+class NCCLLocalAllReduceFusionWorkspace(AllReduceFusionWorkspace):
+    """NCCL collective followed by allocation-free local fusion kernels.
+
+    This explicit fallback backend reuses a caller-provided NCCL process group.
+    It does not allocate symmetric communication buffers and is not selected by
+    the ``"auto"`` backend heuristic.
+    """
+
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        group: Optional[ProcessGroup] = None,
+    ):
+        super().__init__(world_size, rank)
+        if not dist.is_initialized():
+            raise RuntimeError("nccl_local requires an initialized process group")
+        if dist.get_backend(group) != "nccl":
+            raise ValueError("nccl_local requires a ProcessGroupNCCL group")
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("nccl_local supports torch.float16 and torch.bfloat16")
+
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        self.group = group
+
+    @property
+    def backend(self) -> str:
+        return "nccl_local"
+
+    def is_buffer_size_sufficient(
+        self,
+        tp_size: int,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[Any] = None,
+    ) -> bool:
+        del use_oneshot
+        return (
+            tp_size == self.world_size
+            and num_tokens <= self.max_token_num
+            and hidden_dim == self.hidden_dim
+            and dtype == self.dtype
+        )
+
+    def destroy(self) -> None:
+        self._destroyed = True
+
+
 # ============================================================================
 # BACKEND CHECKS - Hard requirements for backend selection
 # ============================================================================
@@ -356,7 +412,7 @@ def _workspace_creation_heuristic(
 
 @flashinfer_api
 def create_allreduce_fusion_workspace(
-    backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
+    backend: Literal["trtllm", "mnnvl", "nccl_local", "auto"] = "auto",
     world_size: int = None,
     rank: int = None,
     max_token_num: int = None,
@@ -381,9 +437,11 @@ def create_allreduce_fusion_workspace(
 
     Parameters
     ----------
-    backend : Literal["trtllm", "mnnvl", "auto"]
+    backend : Literal["trtllm", "mnnvl", "nccl_local", "auto"]
         Backend to use. ``"auto"`` uses a topology-based heuristic to pick
-        between ``"trtllm"`` and ``"mnnvl"``.
+        between ``"trtllm"`` and ``"mnnvl"``. ``"nccl_local"`` is an
+        explicit fallback that runs a NCCL collective followed by local fusion
+        kernels; it is never selected by ``"auto"``.
     world_size : int
         Number of ranks in the process group.
     rank : int
@@ -408,14 +466,16 @@ def create_allreduce_fusion_workspace(
         backend needs to be initialized with the correct strategy; the
         TRT-LLM backend works for both.
     group : Optional[ProcessGroup]
-        Process group used for symmetric-memory rendezvous (TRT-LLM backend
-        only). Defaults to ``torch.distributed.group.WORLD``.
+        Process group used for communication. The ``"nccl_local"`` backend
+        requires a NCCL process group. Defaults to
+        ``torch.distributed.group.WORLD``.
 
     Returns
     -------
     AllReduceFusionWorkspace
-        Either a ``TRTLLMAllReduceFusionWorkspace`` or
-        ``MNNVLAllReduceFusionWorkspace``. The workspace type determines
+        A ``TRTLLMAllReduceFusionWorkspace``,
+        ``MNNVLAllReduceFusionWorkspace``, or
+        ``NCCLLocalAllReduceFusionWorkspace``. The workspace type determines
         which backend :func:`allreduce_fusion` will dispatch to.
 
     Raises
@@ -535,6 +595,15 @@ def create_allreduce_fusion_workspace(
             comm_backend=comm_backend,
             buffer_size_in_bytes=buffer_size_in_bytes,
         )
+    elif actual_backend == "nccl_local":
+        return NCCLLocalAllReduceFusionWorkspace(
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            group=group,
+        )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
 
@@ -629,6 +698,9 @@ def allreduce_fusion(
         MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
         dynamic FP8 patterns (10-11). Packed group quant patterns remain
         TRT-LLM only.
+
+        NCCL with local fusion supports only ``kAllReduce`` and
+        ``kARResidualRMSNorm``.
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM and
         the explicit MNNVL CuTe DSL backend.
@@ -742,6 +814,49 @@ def allreduce_fusion(
     ... )
     """
     # Dispatch based on workspace type
+    if isinstance(workspace, NCCLLocalAllReduceFusionWorkspace):
+        if pattern not in (
+            AllReduceFusionPattern.kAllReduce,
+            AllReduceFusionPattern.kARResidualRMSNorm,
+        ):
+            raise ValueError(
+                "nccl_local initially supports only kAllReduce and kARResidualRMSNorm"
+            )
+        if input.ndim != 2 or not input.is_contiguous():
+            raise ValueError("nccl_local input must be a contiguous 2D tensor")
+        if not workspace.is_buffer_size_sufficient(
+            workspace.world_size, input.shape[0], input.shape[1], input.dtype
+        ):
+            raise ValueError("nccl_local workspace is insufficient for the input")
+        if weight_bias != 0.0:
+            raise ValueError("nccl_local does not yet support RMSNorm weight_bias")
+
+        if output is None:
+            output = torch.empty_like(input)
+        output.copy_(input)
+        dist.all_reduce(output, group=workspace.group)
+        if pattern == AllReduceFusionPattern.kAllReduce:
+            return output
+
+        if residual_in is None or rms_gamma is None:
+            raise ValueError(
+                "residual_in and rms_gamma are required for kARResidualRMSNorm"
+            )
+        if residual_out is None:
+            residual_out = torch.empty_like(input)
+        if norm_out is None:
+            norm_out = torch.empty_like(input)
+        residual_out.copy_(residual_in)
+        norm_out.copy_(output)
+        fused_add_rmsnorm(
+            norm_out,
+            residual_out,
+            rms_gamma,
+            eps=rms_eps,
+            enable_pdl=launch_with_pdl,
+        )
+        return norm_out
+
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
         if any(
