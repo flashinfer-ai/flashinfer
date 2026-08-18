@@ -19,6 +19,8 @@ from ..compilation_context import CompilationContext
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_NINJA_MEMORY_GIB_PER_JOB = 10
+
 
 def parse_env_flags(env_var_name) -> List[str]:
     env_flags = os.environ.get(env_var_name)
@@ -343,10 +345,162 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _get_linux_mem_available_gib() -> Optional[float]:
+    """Return Linux MemAvailable in GiB, including reclaimable cache."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024**2)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    return None
+
+
+def _get_total_memory_gib() -> Optional[float]:
+    """Return total physical memory in GiB when available."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    if pages <= 0 or page_size <= 0:
+        return None
+
+    return pages * page_size / (1024**3)
+
+
+def _get_cgroup_memory_paths() -> List[tuple[str, str]]:
+    """Return limit and usage files from the current cgroup to its root."""
+    cgroup_files = []
+
+    def add_hierarchy(
+        root: Path, cgroup_path: str, limit_name: str, usage_name: str
+    ) -> None:
+        relative_parts = [part for part in cgroup_path.split("/") if part]
+        if ".." in relative_parts:
+            return
+
+        current = root.joinpath(*relative_parts)
+        while True:
+            cgroup_files.append((str(current / limit_name), str(current / usage_name)))
+            if current == root:
+                break
+            current = current.parent
+
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                _hierarchy, controllers, cgroup_path = line.strip().split(":", 2)
+                if not controllers:
+                    add_hierarchy(
+                        Path("/sys/fs/cgroup"),
+                        cgroup_path,
+                        "memory.max",
+                        "memory.current",
+                    )
+                elif "memory" in controllers.split(","):
+                    add_hierarchy(
+                        Path("/sys/fs/cgroup/memory"),
+                        cgroup_path,
+                        "memory.limit_in_bytes",
+                        "memory.usage_in_bytes",
+                    )
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    cgroup_files.extend(
+        (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            ),
+        )
+    )
+
+    return list(dict.fromkeys(cgroup_files))
+
+
+def _get_cgroup_memory_available_gib() -> Optional[float]:
+    """Return the tightest available-memory estimate in the cgroup hierarchy."""
+    available_estimates = []
+    for limit_path, usage_path in _get_cgroup_memory_paths():
+        try:
+            with open(limit_path) as f:
+                limit = f.read().strip()
+            if limit == "max":
+                continue
+            with open(usage_path) as f:
+                usage = f.read().strip()
+            available_bytes = max(0, int(limit) - int(usage))
+            available_estimates.append(available_bytes / (1024**3))
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+
+    return min(available_estimates) if available_estimates else None
+
+
+def _get_available_memory_gib() -> Optional[float]:
+    """Return the best memory estimate for choosing ninja parallelism."""
+    system_available_gib = _get_linux_mem_available_gib()
+    if system_available_gib is None:
+        system_available_gib = _get_total_memory_gib()
+
+    cgroup_available_gib = _get_cgroup_memory_available_gib()
+    estimates = [
+        value
+        for value in (system_available_gib, cgroup_available_gib)
+        if value is not None
+    ]
+    return min(estimates) if estimates else None
+
+
+def _get_available_cpu_count() -> Optional[int]:
+    """Return the process CPU allowance, accounting for affinity when available."""
+    try:
+        affinity_count = len(os.sched_getaffinity(0))
+        if affinity_count > 0:
+            return affinity_count
+    except (AttributeError, OSError):
+        pass
+
+    return os.cpu_count()
+
+
 def _get_num_workers() -> Optional[int]:
+    """Return a ninja worker cap, or None to use ninja's default."""
     max_jobs = os.environ.get("MAX_JOBS")
-    if max_jobs is not None and max_jobs.isdigit():
-        return int(max_jobs)
+    if max_jobs is not None:
+        try:
+            max_jobs_value = int(max_jobs)
+        except ValueError:
+            max_jobs_value = 0
+        if max_jobs_value >= 1:
+            return max_jobs_value
+        logger.warning(
+            "Ignoring invalid MAX_JOBS=%r; value must be a positive integer. "
+            "Applying automatic parallelism limits.",
+            max_jobs,
+        )
+
+    cpu_count = _get_available_cpu_count()
+    available_gib = _get_available_memory_gib()
+    if cpu_count is None or available_gib is None:
+        return None
+
+    memory_safe_jobs = max(1, int(available_gib // _DEFAULT_NINJA_MEMORY_GIB_PER_JOB))
+    if memory_safe_jobs < cpu_count:
+        logger.info(
+            "Limiting ninja parallelism to %s jobs based on %.1f GiB available "
+            "memory. Set MAX_JOBS to override.",
+            memory_safe_jobs,
+            available_gib,
+        )
+        return memory_safe_jobs
+
     return None
 
 

@@ -509,6 +509,12 @@ export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory
 ```
 
+When `MAX_JOBS` is unset, nvcc JIT builds cap ninja at one worker per 10 GiB of
+available memory if that is lower than the CPU-count default. On Linux, the
+estimate also honors inherited cgroup memory limits and CPU affinity. Set
+`MAX_JOBS` to a positive integer to override the cap. Zero and invalid values
+use the automatic limits and never request ninja's unlimited `-j 0` mode.
+
 #### Full Environment Variable Reference
 
 Already covered above (Quick Reference / Debugging): `FLASHINFER_LOGLEVEL`,
