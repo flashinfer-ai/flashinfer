@@ -3595,9 +3595,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        cache_padded[:, :T], cache_exact, atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(cache_padded[:, :T], cache_exact, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         cache_padded[:, T:],
         torch.full_like(cache_padded[:, T:], sentinel),
