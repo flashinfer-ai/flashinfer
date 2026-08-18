@@ -1,16 +1,12 @@
 """Destination-owned DCP Output/LSE reduce over PyTorch symmetric memory.
 
-Hot path is two kernels: fused publish+signal, then wait+merge.
-A CUDA implementation is preferred; Triton is the fallback.
+Three Triton kernels: tiled publish, system-release signal, wait+merge.
 Returned workspace views alias ``combined_*[slot]`` and remain valid
 until the next ``run(..., slot=N)`` for that same slot.
 """
 
 from __future__ import annotations
 
-import functools
-import os
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -27,111 +23,6 @@ _MAX_FENCE_SPINS = 100_000_000
 _SUPPORTED_WORLD_SIZES = (2, 4)
 _SUPPORTED_HEAD_DIMS = (128, 256, 512)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
-
-
-@triton.jit
-def _st_release_sys_u32(ptr, val):
-    tl.inline_asm_elementwise(
-        "st.global.release.sys.u32 [$1], $2;",
-        "=r, l, r",
-        [ptr, val],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _wait_signal_epoch(sig_ptr, epoch, max_spins):
-    spins = 0
-    observed = tl.atomic_add(sig_ptr, 0, sem="acquire", scope="sys")
-    while observed != epoch:
-        spins += 1
-        if spins >= max_spins:
-            tl.inline_asm_elementwise(
-                "trap;",
-                "=r",
-                [],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
-        observed = tl.atomic_add(sig_ptr, 0, sem="acquire", scope="sys")
-
-
-@triton.jit
-def _direct_publish_signal_kernel(
-    partial_output_ptr,
-    partial_lse_ptr,
-    peer_output_ptrs,
-    peer_lse_ptrs,
-    peer_signal_ptrs,
-    local_epoch_ptr,
-    my_rank,
-    num_tokens,
-    max_tokens,
-    h_local,
-    d_model,
-    stride_po_tok,
-    stride_po_head,
-    stride_pl_tok,
-    BLOCK_ITEMS: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    PACKED_HEADS: tl.constexpr,
-    OUT_DTYPE: tl.constexpr,
-):
-    dest_rank = tl.program_id(0)
-    epoch = tl.load(local_epoch_ptr)
-    next_epoch = epoch + 1
-    parity = next_epoch & 1
-    n_items = h_local * d_model
-    src_head0 = dest_rank * h_local
-    dest_out = tl.load(peer_output_ptrs + dest_rank).to(tl.pointer_type(OUT_DTYPE))
-    dest_lse = tl.load(peer_lse_ptrs + dest_rank).to(tl.pointer_type(tl.float32))
-    offs = tl.arange(0, BLOCK_ITEMS)
-    h_offs = tl.arange(0, BLOCK_H)
-    h_mask = h_offs < h_local
-
-    for token_idx in range(num_tokens):
-        dst_base = (
-            dest_out
-            + ((parity * WORLD_SIZE + my_rank) * max_tokens + token_idx) * n_items
-        )
-        if PACKED_HEADS:
-            src_base = (
-                partial_output_ptr
-                + token_idx * stride_po_tok
-                + src_head0 * stride_po_head
-            )
-            for start in range(0, n_items, BLOCK_ITEMS):
-                cur = start + offs
-                mask = cur < n_items
-                tl.store(dst_base + cur, tl.load(src_base + cur, mask=mask), mask=mask)
-        else:
-            for local_head in range(h_local):
-                src = (
-                    partial_output_ptr
-                    + token_idx * stride_po_tok
-                    + (src_head0 + local_head) * stride_po_head
-                )
-                dst = dst_base + local_head * d_model
-                for start in range(0, d_model, BLOCK_ITEMS):
-                    cur = start + offs
-                    mask = cur < d_model
-                    tl.store(dst + cur, tl.load(src + cur, mask=mask), mask=mask)
-        lse_src = partial_lse_ptr + token_idx * stride_pl_tok + src_head0
-        lse_dst = (
-            dest_lse
-            + ((parity * WORLD_SIZE + my_rank) * max_tokens + token_idx) * h_local
-        )
-        tl.store(lse_dst + h_offs, tl.load(lse_src + h_offs, mask=h_mask), mask=h_mask)
-
-    tl.debug_barrier()
-    dest_sig = tl.load(peer_signal_ptrs + dest_rank).to(tl.pointer_type(tl.int32))
-    _st_release_sys_u32(dest_sig + parity * WORLD_SIZE + my_rank, next_epoch)
-    if dest_rank == 0:
-        tl.store(local_epoch_ptr, next_epoch)
 
 
 @triton.jit
@@ -193,16 +84,11 @@ def _triton_publish_kernel(
     peer_lse_source_stride,
     peer_lse_token_stride,
     peer_lse_head_stride,
-    dest_done,
-    peer_signal_ptrs,
-    peer_signal_parity_stride,
-    num_cta_per_dest,
     my_rank: tl.constexpr,
     local_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_items: tl.constexpr,
     head_block_size: tl.constexpr,
-    FUSE_SIGNAL: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     destination_rank = tl.program_id(1).to(tl.int64)
@@ -267,19 +153,6 @@ def _triton_publish_kernel(
         is_pure=False,
         pack=1,
     )
-    if FUSE_SIGNAL:
-        finished = tl.atomic_add(dest_done + destination_rank, 1)
-        if finished == num_cta_per_dest - 1:
-            signal_ptr_table = peer_signal_ptrs.to(tl.pointer_type(tl.uint64))
-            peer_signal = tl.load(signal_ptr_table + destination_rank).to(
-                tl.pointer_type(tl.int32)
-            )
-            _store_release_system(
-                peer_signal + parity * peer_signal_parity_stride + my_rank,
-                epoch.to(tl.uint32),
-                tl.full((), 1, tl.int32),
-            )
-            tl.store(dest_done + destination_rank, 0)
 
 
 @triton.jit
@@ -413,120 +286,6 @@ def _triton_consumer_merge_kernel(
     )
 
 
-@triton.jit
-def _direct_consumer_merge_kernel(
-    recv_out_ptr,
-    recv_lse_ptr,
-    recv_sig_ptr,
-    local_epoch_ptr,
-    out_ptr,
-    lse_out_ptr,
-    max_tokens,
-    h_local,
-    d_model,
-    stride_out_tok,
-    stride_out_head,
-    stride_lse_tok,
-    BLOCK_D: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BASE_E: tl.constexpr,
-    OUT_DTYPE: tl.constexpr,
-    MAX_SPINS: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    local_head = tl.program_id(1)
-
-    epoch = tl.load(local_epoch_ptr)
-    parity = epoch & 1
-
-    # One warp waits. Extra warps would stampede the same four sys atomics.
-    for src in tl.static_range(WORLD_SIZE):
-        _wait_signal_epoch(recv_sig_ptr + parity * WORLD_SIZE + src, epoch, MAX_SPINS)
-
-    n_items = h_local * d_model
-    m = tl.full((), -float("inf"), tl.float32)
-    lses = tl.zeros((WORLD_SIZE,), dtype=tl.float32)
-    src_ids = tl.arange(0, WORLD_SIZE)
-    for src in tl.static_range(WORLD_SIZE):
-        lse_off = (
-            (parity * WORLD_SIZE + src) * max_tokens + token_idx
-        ) * h_local + local_head
-        lse_i = tl.load(recv_lse_ptr + lse_off)
-        invalid = (lse_i != lse_i) | (lse_i == float("inf"))
-        lse_i = tl.where(invalid, -float("inf"), lse_i)
-        lses = tl.where(src_ids == src, lse_i, lses)
-        m = tl.maximum(m, lse_i)
-
-    m_math = tl.where(m == -float("inf"), 0.0, m)
-    if BASE_E:
-        weights = tl.exp(lses - m_math)
-    else:
-        weights = tl.exp2(lses - m_math)
-    sum_w = tl.sum(weights)
-    norm_w = tl.where(
-        sum_w > 0, weights / sum_w, tl.zeros((WORLD_SIZE,), dtype=tl.float32)
-    )
-    if BASE_E:
-        final_lse = tl.where(sum_w > 0, tl.log(sum_w) + m_math, -float("inf"))
-    else:
-        final_lse = tl.where(sum_w > 0, tl.log2(sum_w) + m_math, -float("inf"))
-
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < d_model
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    for src in tl.static_range(WORLD_SIZE):
-        nw = tl.sum(tl.where(src_ids == src, norm_w, 0.0))
-        out_off = (
-            ((parity * WORLD_SIZE + src) * max_tokens + token_idx) * n_items
-            + local_head * d_model
-            + offs
-        )
-        partial = tl.load(recv_out_ptr + out_off, mask=mask, other=0.0).to(tl.float32)
-        partial = tl.where(nw == 0, 0.0, partial)
-        acc += partial * nw
-
-    store_ptr = (
-        out_ptr + token_idx * stride_out_tok + local_head * stride_out_head + offs
-    )
-    tl.store(store_ptr, acc.to(OUT_DTYPE), mask=mask)
-    tl.store(lse_out_ptr + token_idx * stride_lse_tok + local_head, final_lse)
-
-
-def _tl_dtype(dtype: torch.dtype):
-    if dtype == torch.float16:
-        return tl.float16
-    if dtype == torch.bfloat16:
-        return tl.bfloat16
-    raise ValueError(f"unsupported dtype {dtype}")
-
-
-@functools.cache
-def _load_cuda_module():
-    try:
-        from torch.utils.cpp_extension import load
-    except Exception:
-        return None
-    src = Path(__file__).with_name("dcp_direct_reduce_cuda.cu")
-    if not src.is_file():
-        return None
-    build = (
-        Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home() / ".cache"))
-        / "flashinfer"
-        / "dcp_direct_reduce_cuda"
-    )
-    build.mkdir(parents=True, exist_ok=True)
-    try:
-        return load(
-            name="dcp_direct_reduce_cuda",
-            sources=[str(src)],
-            extra_cuda_cflags=["-O3"],
-            build_directory=str(build),
-            verbose=False,
-        )
-    except Exception:
-        return None
-
-
 class DCPDirectReduceWorkspace:
     """Destination-owned direct Output/LSE reduce workspace.
 
@@ -545,14 +304,6 @@ class DCPDirectReduceWorkspace:
         later workspace invocations.
 
     ``out`` and ``lse_out`` must both be provided or both be None.
-
-    Backend
-    -------
-    ``FLASHINFER_DCP_DIRECT_BACKEND`` or the ``backend`` argument selects
-    ``triton``, ``cuda``, or ``auto`` (default). ``auto`` uses the CUDA
-    two-kernel path when it loaded on every rank and the stream is not
-    capturing, otherwise Triton. All ranks must enter CUDA-graph capture
-    together in ``auto`` mode so they stay on the same kernel path.
     """
 
     supports_output_view: bool = True
@@ -565,7 +316,6 @@ class DCPDirectReduceWorkspace:
         head_dim: int,
         dtype: torch.dtype,
         num_slots: int = 1,
-        backend: str | None = None,
     ) -> None:
         if group is None:
             raise ValueError("group is required")
@@ -593,33 +343,10 @@ class DCPDirectReduceWorkspace:
         self.dtype = dtype
         self.num_slots = int(num_slots)
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self._out_tl_dtype = _tl_dtype(dtype)
         self._block_items = min(
             2048, triton.next_power_of_2(self.local_heads * self.head_dim)
         )
         self._block_h = triton.next_power_of_2(self.local_heads)
-        backend = (
-            backend or os.environ.get("FLASHINFER_DCP_DIRECT_BACKEND", "auto")
-        ).lower()
-        if backend not in ("triton", "cuda", "auto"):
-            raise ValueError(
-                "FLASHINFER_DCP_DIRECT_BACKEND must be triton, cuda, or auto"
-            )
-        self._backend = backend
-        self._cuda = _load_cuda_module() if backend in ("cuda", "auto") else None
-        if backend == "cuda" and self._cuda is None:
-            raise RuntimeError(
-                "FLASHINFER_DCP_DIRECT_BACKEND=cuda but CUDA module failed to load"
-            )
-        if backend == "auto":
-            available = torch.tensor(
-                [1 if self._cuda is not None else 0],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            dist.all_reduce(available, op=dist.ReduceOp.MIN, group=group)
-            if int(available.item()) == 0:
-                self._cuda = None
         self._allocations: list[tuple[torch.Tensor, object, list[torch.Tensor]]] = []
 
         _enable_symm_mem_for_group(group.group_name)
@@ -655,9 +382,6 @@ class DCPDirectReduceWorkspace:
         self._peer_signal_views = peer_sig_views
 
         self.epoch = torch.zeros(self.num_slots, dtype=torch.int32, device=self.device)
-        self._dest_done = torch.zeros(
-            self.world_size, dtype=torch.int32, device=self.device
-        )
         self.combined_output = torch.empty(
             (self.num_slots, self.max_tokens, self.local_heads, self.head_dim),
             dtype=dtype,
@@ -829,37 +553,6 @@ class DCPDirectReduceWorkspace:
             selected_lse = lse_out
 
         epoch_slot = self.epoch[slot : slot + 1]
-        try:
-            capturing = bool(torch.cuda.is_current_stream_capturing())
-        except RuntimeError:
-            capturing = False
-        if self._backend == "cuda":
-            use_cuda = self._cuda is not None
-        elif self._backend == "triton":
-            use_cuda = False
-        else:
-            use_cuda = self._cuda is not None and not capturing
-        if use_cuda:
-            self._cuda.launch(
-                partial_output,
-                partial_lse,
-                self.peer_output_ptrs[slot],
-                self.peer_lse_ptrs[slot],
-                self.peer_signal_ptrs[slot],
-                self.received_output[slot],
-                self.received_lse[slot],
-                self.received_signal[slot],
-                epoch_slot,
-                self._dest_done,
-                selected_output,
-                selected_lse,
-                self.world_size,
-                self.rank,
-                self.max_tokens,
-                int(is_lse_base_on_e),
-            )
-            return selected_output, selected_lse
-
         self._run_triton(
             partial_output,
             partial_lse,
@@ -909,16 +602,11 @@ class DCPDirectReduceWorkspace:
             lse_slot.stride(1),
             lse_slot.stride(2),
             lse_slot.stride(3),
-            self._dest_done,
-            self.peer_signal_ptrs[slot],
-            signal_slot.stride(0),
-            t * publish_blocks,
             my_rank=self.rank,
             local_heads=self.local_heads,
             head_dim=self.head_dim,
             block_items=self._block_items,
             head_block_size=self._block_h,
-            FUSE_SIGNAL=0,
             num_warps=8,
         )
         _triton_signal_kernel[(1,)](

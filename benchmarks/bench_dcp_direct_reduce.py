@@ -21,7 +21,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -64,27 +63,8 @@ def _merge(
     return out, lse
 
 
-def _alloc_pair(shape, dtype, device, group, *, symmetric: bool):
-    handles = []
-    if not symmetric:
-        return torch.empty(*shape, dtype=dtype, device=device), handles
-    buf = symm_mem.empty(*shape, dtype=dtype, device=device)
-    buf.zero_()
-    torch.cuda.synchronize()
-    handle = symm_mem.rendezvous(buf, group.group_name)
-    assert handle is not None
-    handle.barrier()
-    handles.append(handle)
-    return buf, handles
-
-
 class NcclBaseline:
-    """NCCL all_to_all + local merge.
-
-    symmetric=False: ordinary torch.empty send/recv (portable NCCL).
-    symmetric=True: same NCCL all_to_all, but send/recv live in
-    PyTorch symmetric-memory allocations (NCCL user buffers).
-    """
+    """NCCL all_to_all + local merge."""
 
     def __init__(
         self,
@@ -93,50 +73,22 @@ class NcclBaseline:
         h_local: int,
         head_dim: int,
         dtype,
-        *,
-        symmetric: bool,
     ):
         self.group = group
         self.world = group.size()
         self.tokens = tokens
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self._handles = []
-        self.send_o, h = _alloc_pair(
-            (self.world, tokens, h_local, head_dim),
-            dtype,
-            device,
-            group,
-            symmetric=symmetric,
+        self.send_o = torch.empty(
+            self.world, tokens, h_local, head_dim, dtype=dtype, device=device
         )
-        self._handles.extend(h)
-        self.recv_o, h = _alloc_pair(
-            (self.world, tokens, h_local, head_dim),
-            dtype,
-            device,
-            group,
-            symmetric=symmetric,
+        self.recv_o = torch.empty_like(self.send_o)
+        self.send_s = torch.empty(
+            self.world, tokens, h_local, dtype=torch.float32, device=device
         )
-        self._handles.extend(h)
-        self.send_s, h = _alloc_pair(
-            (self.world, tokens, h_local),
-            torch.float32,
-            device,
-            group,
-            symmetric=symmetric,
-        )
-        self._handles.extend(h)
-        self.recv_s, h = _alloc_pair(
-            (self.world, tokens, h_local),
-            torch.float32,
-            device,
-            group,
-            symmetric=symmetric,
-        )
-        self._handles.extend(h)
+        self.recv_s = torch.empty_like(self.send_s)
         self.out = torch.empty(tokens, h_local, head_dim, dtype=dtype, device=device)
         self.lse = torch.empty(tokens, h_local, dtype=torch.float32, device=device)
         self.h_local = h_local
-        self.symmetric = symmetric
 
     def run(self, partial_o: torch.Tensor, partial_s: torch.Tensor) -> None:
         for dst in range(self.world):
@@ -345,7 +297,7 @@ def main() -> None:
 
     if rank == 0:
         print(
-            f"{'T':>5} {'fi_a2a':>10} {'nccl':>10} {'nccl_symm':>10} "
+            f"{'T':>5} {'fi_a2a':>10} {'nccl':>10} "
             f"{'direct':>10} {'d/a2a':>8} {'d/nccl':>8}"
         )
         print(
@@ -365,10 +317,8 @@ def main() -> None:
         ps = torch.randn(t, TOTAL_HEADS, dtype=torch.float32, device=device)
         workspace.run(po, ps, slot=0)
         workspace.run(po, ps, slot=0, out=caller_o[:t], lse_out=caller_s[:t])
-        nccl = NcclBaseline(group, t, h_local, HEAD_DIM, DTYPE, symmetric=False)
-        nccl_symm = NcclBaseline(group, t, h_local, HEAD_DIM, DTYPE, symmetric=True)
+        nccl = NcclBaseline(group, t, h_local, HEAD_DIM, DTYPE)
         nccl.run(po, ps)
-        nccl_symm.run(po, ps)
         if fi_a2a is not None:
             fi_a2a.run(po, ps)
         dist.barrier()
@@ -379,21 +329,15 @@ def main() -> None:
             else None
         )
         nccl_ms = _try_time_graph(lambda: nccl.run(po, ps), po, ps, rank, "nccl")
-        nccl_symm_ms = _try_time_graph(
-            lambda: nccl_symm.run(po, ps), po, ps, rank, "nccl_symm"
-        )
         direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
 
         if rank == 0:
             a2a_str = "SKIPPED" if fi_a2a_ms is None else f"{fi_a2a_ms * 1e3:10.2f}"
             nccl_str = "SKIPPED" if nccl_ms is None else f"{nccl_ms * 1e3:10.2f}"
-            nccl_symm_str = (
-                "SKIPPED" if nccl_symm_ms is None else f"{nccl_symm_ms * 1e3:10.2f}"
-            )
             d_a2a = "n/a" if fi_a2a_ms is None else f"{direct_ms / fi_a2a_ms:8.3f}"
             d_nccl = "n/a" if nccl_ms is None else f"{direct_ms / nccl_ms:8.3f}"
             print(
-                f"{t:5d} {a2a_str:>10} {nccl_str:>10} {nccl_symm_str:>10} "
+                f"{t:5d} {a2a_str:>10} {nccl_str:>10} "
                 f"{direct_ms * 1e3:10.2f} {d_a2a:>8} {d_nccl:>8}"
             )
 
