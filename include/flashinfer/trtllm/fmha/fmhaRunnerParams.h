@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,11 +59,9 @@ ATTENTION_MASK_TYPE_FUNCTION(Custom)
 enum class FmhaKernelType {
   // The context-phase kernels.
   Context = 0,
-  // Choose the best generation kernel based on the heuristic:
-  // use SwapsMmaAbForGeneration kernels when numHeadsQPerKv <= 16, otherwise
-  // KeepsMmaAbForGeneration.
+  // Choose the best generation kernel based on the heuristic.
   Generation = 1,
-  // Swap tensor A and tensor B of Mma, which only supports numHeadsQPerKv <= 16.
+  // Swap tensor A and tensor B of Mma. MLA cubins provide Q8, Q16, and Q32 head tiles.
   SwapsMmaAbForGeneration,
   // Keep tensor A and tensor B of Mma.
   KeepsMmaAbForGeneration,
@@ -151,6 +149,12 @@ enum class TrtllmGenSparseMlaType {
   None = 0,
   StaticTokenSparse = 1,
   DynamicTokenSparse = 2,
+};
+
+enum class Bf16QFp8KvTransformMode {
+  Full = 0,
+  KOnly,
+  SeparateKv,
 };
 
 inline bool isSparseMla(TrtllmGenSparseMlaType sparseMlaType) {
@@ -340,6 +344,8 @@ struct TllmGenFmhaRunnerParams {
   int mSparseMlaTopK;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx;
@@ -420,6 +426,10 @@ struct TllmGenSelectKernelParams {
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
+  // Whether the selected generation kernel groups tokensQ and headsQ into one CTA.
+  bool mGroupsTokensHeadsQ;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -439,5 +449,7 @@ struct TllmGenSelectKernelParams {
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
-        mUses2CtaMma(false) {};
+        mUses2CtaMma(false),
+        mGroupsTokensHeadsQ(false),
+        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
 };

@@ -1,11 +1,14 @@
+import inspect
+import random
+
 import pytest
 import torch
 import torch.nn.functional as F
-import random
 
 import flashinfer
 from flashinfer.mla import (
     MLALayerDimensions,
+    deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
     smaller_mla_dimensions,
 )
@@ -21,6 +24,14 @@ workspace_size = 128 * 1024 * 1024
 
 # Guard region we zero past the softmax slab so we can detect OOB writes.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+
+
+def test_grouped_mla_selection_is_not_a_public_option():
+    parameters = inspect.signature(
+        flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+    ).parameters
+
+    assert "selects_grouped_mla" not in parameters
 
 
 def trtllm_gen_workspace_softmax_end_bytes_decode(
@@ -295,6 +306,7 @@ def trtllm_batch_decode_mla(
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool = True,
     use_cum_seq_lens_q: bool = False,
+    max_q_len_exceeds_total_q: bool = False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "xqa":
@@ -312,6 +324,10 @@ def trtllm_batch_decode_mla(
     if backend == "cute-dsl":
         if compute_capability[0] not in (10, 11):
             pytest.skip("cute-dsl MLA requires SM100-SM110 (tcgen05)")
+        from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+        if not is_cute_dsl_arch_supported(*compute_capability):
+            pytest.skip("installed CuTe DSL cannot target this device architecture")
         if dynamic_scale:
             pytest.skip("cute-dsl does not support dynamic_scale")
         if enable_pdl is not None:
@@ -325,8 +341,8 @@ def trtllm_batch_decode_mla(
 
     if skips_softmax and backend != "trtllm-gen":
         pytest.skip("skips_softmax is only supported for trtllm-gen backend")
-    if use_cum_seq_lens_q and backend != "trtllm-gen":
-        pytest.skip("cum_seq_lens_q is only supported for trtllm-gen backend")
+    if use_cum_seq_lens_q and backend == "xqa":
+        pytest.skip("XQA does not support cum_seq_lens_q")
 
     torch.manual_seed(42)
     device = "cuda:0"
@@ -347,6 +363,8 @@ def trtllm_batch_decode_mla(
             torch.arange(batch_size, device=device, dtype=torch.int32)
             % q_len_per_request
         ) + 1
+        if max_q_len_exceeds_total_q:
+            q_lens[0] = 0
         q_lens[-1] = q_len_per_request
         cum_seq_lens_q = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
         cum_seq_lens_q[0] = 0
@@ -355,9 +373,13 @@ def trtllm_batch_decode_mla(
             [query[i, : int(q_lens[i].item())] for i in range(batch_size)],
             dim=0,
         )
-        # Overestimate to verify CUDA-graph-friendly max_q_len contracts.
-        # Exact max is q_lens.max().
-        max_q_len = min(q_len_per_request + 1, query_input.size(0))
+        # Overestimate the longest segment for CUDA-graph-friendly capacity.
+        # Focused tests can also make this exceed the current compact length.
+        max_q_len = (
+            q_len_per_request + 1
+            if max_q_len_exceeds_total_q
+            else min(q_len_per_request + 1, query_input.size(0))
+        )
     else:
         query_input = query
         cum_seq_lens_q = None
@@ -584,7 +606,7 @@ def trtllm_batch_decode_mla(
     if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:
         output = output.to(torch.bfloat16)
 
-    if backend in ("trtllm-gen", "cute-dsl"):
+    if backend in ("trtllm-gen", "cute-dsl", "auto"):
         # check is nan
         assert not torch.isnan(o_ref).any(), "o_ref is nan"
         assert not torch.isnan(output).any(), "output is nan"
@@ -944,6 +966,174 @@ def trtllm_batch_decode_mla_sparse(
     )
 
 
+def _run_trtllm_batch_decode_mla_head_case(
+    num_heads: int,
+    batch_size: int,
+    dtype: torch.dtype,
+    max_seq_len: int,
+) -> None:
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(
+            head_dimensions=deepseek_mla_dimensions,
+            num_heads=num_heads,
+        ),
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=dtype,
+        page_size=64,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=max_seq_len,
+        skips_softmax=False,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [6, 12, 24, 48])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("max_seq_len", [128, 1024])
+def test_trtllm_batch_decode_mla_non_power_of_two_heads(
+    num_heads: int,
+    dtype: torch.dtype,
+    max_seq_len: int,
+) -> None:
+    _run_trtllm_batch_decode_mla_head_case(
+        num_heads,
+        1,
+        dtype,
+        max_seq_len,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_heads,dtype,max_seq_len",
+    [
+        (3, torch.bfloat16, 128),
+        (9, torch.float8_e4m3fn, 1024),
+        (17, torch.bfloat16, 1024),
+        (33, torch.float8_e4m3fn, 128),
+        (63, torch.bfloat16, 1024),
+        (192, torch.bfloat16, 128),
+    ],
+)
+def test_trtllm_batch_decode_mla_generic_non_power_of_two_heads(
+    num_heads: int,
+    dtype: torch.dtype,
+    max_seq_len: int,
+) -> None:
+    _run_trtllm_batch_decode_mla_head_case(
+        num_heads,
+        1,
+        dtype,
+        max_seq_len,
+    )
+
+
+def test_trtllm_batch_decode_mla_non_power_of_two_heads_cum_seq_lens_q() -> None:
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(
+            head_dimensions=deepseek_mla_dimensions,
+            num_heads=24,
+        ),
+        batch_size=2,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=64,
+        q_len_per_request=2,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        use_cum_seq_lens_q=True,
+    )
+
+
+def _run_trtllm_batch_decode_sparse_mla_head_case(
+    num_heads: int,
+    batch_size: int,
+    dtype: torch.dtype,
+    topk: int,
+) -> None:
+    trtllm_batch_decode_mla_sparse(
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=dtype,
+        q_len_per_request=1,
+        topk=topk,
+        is_varlen=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        qk_nope_head_dim=128,
+        num_attn_heads=num_heads,
+        use_cum_seq_lens_q=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_heads,dtype",
+    [
+        (6, torch.bfloat16),
+        (12, torch.bfloat16),
+        (24, torch.bfloat16),
+        (48, torch.bfloat16),
+        (24, torch.float8_e4m3fn),
+    ],
+)
+@pytest.mark.parametrize("topk", [128, 2048])
+def test_trtllm_batch_decode_sparse_mla_non_power_of_two_heads(
+    num_heads: int,
+    dtype: torch.dtype,
+    topk: int,
+) -> None:
+    _run_trtllm_batch_decode_sparse_mla_head_case(
+        num_heads,
+        1,
+        dtype,
+        topk,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_heads,dtype,topk",
+    [
+        (3, torch.bfloat16, 128),
+        (9, torch.float8_e4m3fn, 128),
+        (17, torch.bfloat16, 2048),
+        (33, torch.float8_e4m3fn, 128),
+        (63, torch.bfloat16, 2048),
+    ],
+)
+def test_trtllm_batch_decode_sparse_mla_generic_non_power_of_two_heads(
+    num_heads: int,
+    dtype: torch.dtype,
+    topk: int,
+) -> None:
+    _run_trtllm_batch_decode_sparse_mla_head_case(
+        num_heads,
+        1,
+        dtype,
+        topk,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,dtype",
+    [(1, torch.bfloat16), (2, torch.float8_e4m3fn)],
+)
+def test_trtllm_batch_decode_sparse_mla_power_of_two_heads(
+    batch_size: int,
+    dtype: torch.dtype,
+) -> None:
+    _run_trtllm_batch_decode_sparse_mla_head_case(
+        16,
+        batch_size,
+        dtype,
+        2048,
+    )
+
+
 @pytest.mark.parametrize(
     "layer_dimensions",
     supported_mla_layer_dimensions,
@@ -1008,6 +1198,95 @@ def test_trtllm_batch_decode_mla(
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("q_len_per_request", [2, 3, 4, 5, 6, 7, 8, 9, 16, 32])
+def test_trtllm_batch_decode_grouped_mla(
+    dtype: torch.dtype,
+    num_heads: int,
+    q_len_per_request: int,
+):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, num_heads),
+        batch_size=1,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=q_len_per_request,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_trtllm_batch_decode_grouped_mla_batch_16(dtype: torch.dtype):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 32),
+        batch_size=16,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_q1_mla():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_fixed_q_batch_stride():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 8),
+        batch_size=2,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=2,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_variable_q_lengths():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=3,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        use_cum_seq_lens_q=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_mla_cum_seq_lens_q(
@@ -1029,6 +1308,29 @@ def test_trtllm_batch_decode_mla_cum_seq_lens_q(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         use_cum_seq_lens_q=True,
+    )
+
+
+@pytest.mark.parametrize("backend", ["trtllm-gen", "auto"])
+def test_trtllm_batch_decode_mla_variable_q_capacity_overestimate(backend: str):
+    """TRT accepts graph capacity above the current compact token count."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA requires SM100 or SM103")
+    trtllm_batch_decode_mla(
+        supported_mla_layer_dimensions[0],
+        batch_size=2,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=64,
+        q_len_per_request=2,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend=backend,
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=False,
+        use_cum_seq_lens_q=True,
+        max_q_len_exceeds_total_q=True,
     )
 
 

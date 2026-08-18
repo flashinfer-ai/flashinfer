@@ -17,7 +17,6 @@
 #include <flashinfer/trtllm/common.h>
 #include <flashinfer/trtllm/fmha/decoder_impl_common.h>
 #include <flashinfer/trtllm/fmha/fmhaRunnerParams.h>
-#include <nvrtc.h>
 #include <tvm/ffi/container/variant.h>
 
 #include <algorithm>
@@ -122,7 +121,7 @@ void trtllm_paged_attention_launcher(
     bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, cudaStream_t stream) {
+    int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -134,6 +133,17 @@ void trtllm_paged_attention_launcher(
   auto fmha_runner =
       TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params{};
+  TVM_FFI_ICHECK(bf16q_fp8kv_transform_mode >= 0 && bf16q_fp8kv_transform_mode <= 2)
+      << "bf16q_fp8kv_transform_mode must be 0, 1, or 2";
+  auto const transform_mode = static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
+  if (transform_mode != Bf16QFp8KvTransformMode::Full) {
+    TVM_FFI_ICHECK(
+        mode == TllmPagedAttentionMode::ForGen && q_data_type == Data_type::DATA_TYPE_BF16 &&
+        kv_data_type == Data_type::DATA_TYPE_E4M3 && o_data_type == Data_type::DATA_TYPE_BF16)
+        << "bf16q_fp8kv_transform_mode is only supported for BF16 query, FP8 E4M3 KV, "
+           "BF16 output decode";
+  }
+  runner_params.mBf16QFp8KvTransformMode = transform_mode;
 
   // Common params
   runner_params.qPtr = query;
@@ -341,7 +351,8 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, bool enable_block_sparse_attention) {
+    int64_t lse_stride_heads, bool enable_block_sparse_attention,
+    Optional<TensorView> sparse_mla_top_k_lens, int64_t bf16q_fp8kv_transform_mode) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -430,6 +441,21 @@ void trtllm_paged_attention_decode(
     TVM_FFI_ICHECK_EQ(lse.value().ndim(), 2) << "lse must be a 2D tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
+  int* sparse_mla_top_k_lens_ptr = nullptr;
+  if (sparse_mla_top_k_lens.has_value()) {
+    auto const& top_k_lens = sparse_mla_top_k_lens.value();
+    TVM_FFI_ICHECK_EQ(top_k_lens.dtype(), dl_int32) << "sparse_mla_top_k_lens must be int32";
+    TVM_FFI_ICHECK_EQ(top_k_lens.ndim(), 1)
+        << "sparse_mla_top_k_lens must have flattened shape [sumQ]";
+    TVM_FFI_ICHECK_EQ(top_k_lens.size(0), sum_seq_q)
+        << "sparse_mla_top_k_lens must contain one value per query token";
+    TVM_FFI_ICHECK_EQ(top_k_lens.device().device_type, query.device().device_type)
+        << "sparse_mla_top_k_lens must be on the same device as query";
+    TVM_FFI_ICHECK_EQ(top_k_lens.device().device_id, query.device().device_id)
+        << "sparse_mla_top_k_lens must be on the same device as query";
+    TVM_FFI_ICHECK(top_k_lens.IsContiguous()) << "sparse_mla_top_k_lens must be contiguous";
+    sparse_mla_top_k_lens_ptr = static_cast<int*>(top_k_lens.data_ptr());
+  }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
   auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
   auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
@@ -454,6 +480,9 @@ void trtllm_paged_attention_decode(
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
+  bool const is_single_pool_dynamic_sparse_mla = sparse_mla_top_k_lens_ptr != nullptr &&
+                                                 sparse_mla_top_k > 0 && head_dim_q == 512 &&
+                                                 head_dim_o == 512 && is_shared_kv;
 
   if (enable_block_sparse_attention) {
     // Block-sparse attention uses per-KV-head page tables and sequence lengths. The kernel
@@ -487,12 +516,14 @@ void trtllm_paged_attention_decode(
       q_stride_tokens, q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, /*sliding_window_kv_pool=*/nullptr,
-      /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
+      sparse_mla_top_k,
+      /*sliding_window_kv_pool=*/
+      is_single_pool_dynamic_sparse_mla ? key_cache.data_ptr() : nullptr, sparse_mla_top_k_lens_ptr,
+      /*has_sliding_window_kv_pool=*/is_single_pool_dynamic_sparse_mla,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
-      lse_stride_tokens, lse_stride_heads, stream);
+      lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -632,7 +663,7 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
-      lse_stride_tokens, lse_stride_heads, stream);
+      lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -704,6 +735,7 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
+  runner_params.mMultiCtasKvMode = false;
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
 
@@ -791,10 +823,13 @@ void trtllm_ragged_attention(
   int head_dim_v = value.size(2);
   int k_stride_keys_values = key.stride(0);
   int k_stride_heads = key.stride(1);
-  int k_stride_batch = key.numel();
+  // Ragged SeparateQkv K/V is packed along one token axis. The generated TMA
+  // shape uses a singleton batch dimension, so the launcher must pass zero
+  // batch stride instead of a synthetic numel-derived stride.
+  int k_stride_batch = 0;
   int v_stride_keys_values = value.stride(0);
   int v_stride_heads = value.stride(1);
-  int v_stride_batch = value.numel();
+  int v_stride_batch = 0;
 
   // SageAttention scaling factor pointers.
   const float* sage_attn_sfs_q_ptr =
@@ -980,7 +1015,7 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
-      /*lse_stride_heads=*/0, stream);
+      /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, stream);
 }
 
 namespace trtllm_cubin_loader {

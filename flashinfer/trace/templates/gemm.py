@@ -15,6 +15,7 @@
 """TraceTemplates for GEMM operations."""
 
 import math
+from typing import Any, cast
 
 import torch
 
@@ -56,13 +57,11 @@ def _mxfp8_gemm_check(
     rtol=None,
     atol=None,
     max_mismatch_pct=100.0,
-    min_cos_sim=0.84,
+    min_cos_sim=0.98,
 ):
     from flashinfer.trace import default_check
 
-    # Matches the linear-scale path in tests/gemm/test_mm_mxfp8.py, which is
-    # the scale layout modeled by this trace schema. Callers can pass
-    # min_cos_sim=0.98 for swizzled-scale traces.
+    # Matches tests/gemm/test_mm_mxfp8.py (swizzled scales, quantization-limited accuracy).
     return default_check(
         reference_outputs,
         actual_outputs,
@@ -102,7 +101,7 @@ def _bmm_mxfp8_check(
     rtol=None,
     atol=None,
     max_mismatch_pct=100.0,
-    min_cos_sim=0.9,
+    min_cos_sim=0.99,
 ):
     from flashinfer.trace import default_check
 
@@ -134,22 +133,58 @@ def _mm_fp8_reference(A, B):
     return torch.matmul(A_fp32, B_fp32).to(torch.bfloat16)
 
 
+def _e8m0_to_float(sf: torch.Tensor) -> torch.Tensor:
+    """Decode uint8 E8M0 scale bytes to float32 (value = 2**(byte - 127))."""
+    return torch.pow(2.0, sf.to(torch.float32) - 127.0)
+
+
+def _unswizzle_batched_sf_128x4(
+    sf: torch.Tensor, batch: int, rows: int, cols: int
+) -> torch.Tensor:
+    """Recover batched linear scale grids from concatenated 128x4 buffers."""
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 3) // 4 * 4
+    v = sf.reshape(
+        batch,
+        padded_rows // 128,
+        padded_cols // 4,
+        32,
+        4,
+        4,
+    )
+    return v.permute(0, 1, 4, 3, 2, 5).reshape(batch, padded_rows, padded_cols)[
+        :, :rows, :cols
+    ]
+
+
+def _unswizzle_sf_128x4(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Recover the linear [rows, cols] grid from a 1D 128x4-swizzled buffer."""
+    return _unswizzle_batched_sf_128x4(sf, 1, rows, cols)[0]
+
+
 def _mm_mxfp8_reference(A, B, a_descale, b_descale):
     """Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.
 
-    a_descale: [M, K//32] uint8 interpreted as float scale per block.
-    b_descale: [K//32, N] uint8 interpreted as float scale per block.
+    a_descale / b_descale are the 1D 128x4-swizzled E8M0 buffers produced by
+    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` for A [M, K] and for
+    the [N, K] weight whose transpose is B [K, N].
     """
-    _, K = A.shape
+    M, K = A.shape
+    N = B.shape[1]
     block_size = 32
-    A_fp32 = A.to(torch.float32)
-    B_fp32 = B.to(torch.float32)
+    a_scale = _e8m0_to_float(_unswizzle_sf_128x4(a_descale, M, K // block_size))
+    b_scale = _e8m0_to_float(_unswizzle_sf_128x4(b_descale, N, K // block_size))
     # Apply per-block scales along the K dimension.
-    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]
-    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)  # [K, N]
-    A_scaled = A_fp32 * a_scale
-    B_scaled = B_fp32 * b_scale
+    A_scaled = A.to(torch.float32) * a_scale.repeat_interleave(block_size, dim=1)
+    B_scaled = B.to(torch.float32) * b_scale.repeat_interleave(block_size, dim=1).T
     return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
+
+
+cast(Any, _mm_mxfp8_reference)._trace_reference_dependencies = (
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
 
 
 def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
@@ -294,7 +329,7 @@ def _mm_mxfp8_init(
     M: int,
     N: int = 4096,
     K: int = 4096,
-    K_div_32: int = 0,  # derived
+    A_scale_size: int = 0,  # derived
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -306,7 +341,7 @@ def _mm_mxfp8_init(
     swizzled layout). The trace declares ``b`` as ``[K, N]`` and the
     descales as uint8 block scales.
     """
-    del K_div_32
+    del A_scale_size
     from flashinfer import mxfp8_quantize  # noqa: PLC0415
 
     torch.manual_seed(seed)
@@ -314,11 +349,8 @@ def _mm_mxfp8_init(
     b_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     a, a_descale = mxfp8_quantize(a_bf16)
     b_fp8, b_descale = mxfp8_quantize(b_bf16)
-    # The kernel takes b as the transposed view ([K, N]) of the [N, K] result.
-    b = b_fp8.T.contiguous()
-    # Trace declares b_descale as [K//32, N]; mxfp8_quantize returns it
-    # along the same axis as b.
-    b_descale = b_descale.T.contiguous()
+    # b must stay the transposed [K, N] view: CUTLASS needs the [N, K] storage contiguous.
+    b = b_fp8.T
     return {"a": a, "b": b, "a_descale": a_descale, "b_descale": b_descale}
 
 
@@ -332,6 +364,11 @@ mm_mxfp8_trace = TraceTemplate(
         "M": Var(),
         "N": Const(),
         "K": Const(),
+        "A_scale_size": Var(description="Padded 128x4 scale-buffer length for A."),
+        "B_scale_size": Const(
+            abbrev="",
+            description="Padded 128x4 scale-buffer length for B.",
+        ),
     },
     inputs={
         "A": Tensor(
@@ -345,12 +382,12 @@ mm_mxfp8_trace = TraceTemplate(
             description="Input B tensor, float8_e4m3fn, column-major.",
         ),
         "a_descale": Tensor(
-            ["M", "K_div_32"],
-            description="Block scale for A, shape [M, K//32], uint8.",
+            ["A_scale_size"],
+            description="Physical 1D 128x4-swizzled E8M0 scale buffer for A.",
         ),
         "b_descale": Tensor(
-            ["K_div_32", "N"],
-            description="Block scale for B, shape [K//32, N], uint8.",
+            ["B_scale_size"],
+            description=("Physical 1D 128x4-swizzled E8M0 scale buffer for B."),
         ),
     },
     outputs={
@@ -783,13 +820,25 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
 
 
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
-    """Reference MXFP8 BMM (block size 32)."""
+    """Reference MXFP8 BMM (block size 32, 1D 128x4-swizzled E8M0 scales)."""
     block = 32
-    A_f = A.to(torch.float32)
-    B_f = B.to(torch.float32)
-    a_scale = A_scale.to(torch.float32).repeat_interleave(block, dim=-1)
-    b_scale = B_scale.to(torch.float32).repeat_interleave(block, dim=-2)
-    return torch.matmul(A_f * a_scale, B_f * b_scale).to(dtype)
+    batch, m, k = A.shape
+    n = B.shape[-1]
+    a_scale = _e8m0_to_float(
+        _unswizzle_batched_sf_128x4(A_scale, batch, m, k // block)
+    ).repeat_interleave(block, dim=-1)
+    b_scale = _e8m0_to_float(
+        _unswizzle_batched_sf_128x4(B_scale, batch, n, k // block)
+    ).repeat_interleave(block, dim=-1)
+    A_deq = A.to(torch.float32) * a_scale
+    B_deq = B.to(torch.float32).transpose(-2, -1) * b_scale  # [batch, n, k]
+    return torch.matmul(A_deq, B_deq.transpose(-2, -1)).to(dtype)
+
+
+cast(Any, _bmm_mxfp8_reference)._trace_reference_dependencies = (
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+)
 
 
 def _bmm_bf16_init(
@@ -903,7 +952,8 @@ def _bmm_mxfp8_init(
     M: int = 64,
     N: int = 64,
     K: int = 128,
-    K_div_32: int = 0,  # derived
+    A_scale_size: int = 0,  # derived
+    B_scale_size: int = 0,  # derived
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -914,20 +964,30 @@ def _bmm_mxfp8_init(
     ``flashinfer.mxfp8_quantize`` to produce float8_e4m3fn data and
     uint8 block scales.
     """
-    del K_div_32
+    del A_scale_size, B_scale_size
     from flashinfer import mxfp8_quantize  # noqa: PLC0415
 
     torch.manual_seed(seed)
     a_bf16 = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
-    b_bf16 = torch.randn(batch_size, K, N, dtype=torch.bfloat16, device=device)
-    A, A_scale = mxfp8_quantize(a_bf16, is_sf_swizzled_layout=True)
-    B, B_scale = mxfp8_quantize(b_bf16, is_sf_swizzled_layout=True)
+    b_bf16 = torch.randn(batch_size, N, K, dtype=torch.bfloat16, device=device)
+    a_quantized = tuple(
+        mxfp8_quantize(batch_tensor, is_sf_swizzled_layout=True)
+        for batch_tensor in a_bf16.unbind()
+    )
+    b_quantized = tuple(
+        mxfp8_quantize(batch_tensor, is_sf_swizzled_layout=True)
+        for batch_tensor in b_bf16.unbind()
+    )
+    A = torch.stack(tuple(value for value, _ in a_quantized))
+    A_scale = torch.cat(tuple(scale for _, scale in a_quantized))
+    B = torch.stack(tuple(value for value, _ in b_quantized))
+    B_scale = torch.cat(tuple(scale for _, scale in b_quantized))
     return {
         "A": A,
-        "B": B,
+        "B": B.transpose(-2, -1),
         "A_scale": A_scale,
         "B_scale": B_scale,
-        "dtype": 1,
+        "dtype": torch.bfloat16,
     }
 
 
@@ -942,16 +1002,23 @@ bmm_mxfp8_trace = TraceTemplate(
         "M": Var(),
         "N": Const(),
         "K": Const(),
-        "K_div_32": Var(description="K // 32 (MX block count)."),
+        "A_scale_size": Var(
+            description="Batched padded 128x4 scale-buffer length for A."
+        ),
+        "B_scale_size": Var(
+            description="Batched padded 128x4 scale-buffer length for B."
+        ),
     },
     inputs={
         "A": Tensor(["batch_size", "M", "K"]),
         "B": Tensor(["batch_size", "K", "N"]),
         "A_scale": Tensor(
-            ["batch_size", "M", "K_div_32"], description="MX block scales for A."
+            ["A_scale_size"],
+            description="Batched 1D 128x4-swizzled E8M0 scale buffers for A.",
         ),
         "B_scale": Tensor(
-            ["batch_size", "K_div_32", "N"], description="MX block scales for B."
+            ["B_scale_size"],
+            description=("Batched 1D 128x4-swizzled E8M0 scale buffers for B."),
         ),
         "dtype": Scalar("int32", description="Output dtype enum."),
     },
@@ -1072,16 +1139,53 @@ def _fmha_v2_prefill_deepseek_reference(
     return out
 
 
+@torch.no_grad()
+def _fmha_v2_prefill_sm120_reference(
+    query,
+    key,
+    value,
+    out,
+    num_heads,
+    head_dim,
+    seq_len,
+    scale_softmax,
+    scale_bmm1=None,
+    scale_bmm2=None,
+    causal: bool = True,
+    return_lse: bool = False,
+    lse=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for FP8 SM120 FMHA v2 standard self-attention."""
+    B, S, H, D = query.shape
+    s = float(scale_bmm1 or scale_softmax)
+    b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
+    q = query.to(torch.float32)
+    k = key.to(torch.float32)
+    v = value.to(torch.float32)
+    for batch in range(B):
+        for h in range(H):
+            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            if causal:
+                mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
+                logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+    return out
+
+
 def _fmha_v2_prefill_deepseek_init(
     *,
     batch_size: int,
     seq_len: int = 128,
+    scale_size: int = 1,
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
+    del scale_size
     torch.manual_seed(seed)
     q = torch.randn(
         batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -1101,6 +1205,54 @@ def _fmha_v2_prefill_deepseek_init(
     }
 
 
+def _fmha_v2_prefill_sm120_init(
+    *,
+    batch_size: int,
+    seq_len: int = 128,
+    scale_size: int = 1,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build independently scaled E4M3 inputs for ``fmha_v2_prefill_sm120``."""
+    torch.manual_seed(seed)
+
+    def quantize(x):
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        scale = (x.abs().amax().float() / finfo.max).clamp(min=1.0e-12)
+        quantized = (x / scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)
+        return quantized, scale.item()
+
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q, q_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    k, k_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    v, v_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    out = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "out": out,
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "seq_len": int(seq_len),
+        "scale_softmax": 1.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": torch.tensor(
+            [q_scale * k_scale / math.sqrt(head_dim)] * scale_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        "scale_bmm2_d": torch.tensor(
+            [v_scale] * scale_size, dtype=torch.float32, device=device
+        ),
+        "causal": True,
+    }
+
+
 fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
@@ -1113,6 +1265,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
@@ -1128,6 +1281,16 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "scale_softmax": Scalar("float32"),
         "scale_bmm1": Scalar("float32", optional=True),
         "scale_bmm2": Scalar("float32", optional=True),
+        "scale_bmm1_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA QK-scale model weight.",
+        ),
+        "scale_bmm2_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA V dequantization model weight.",
+        ),
     },
     outputs={
         "out": Tensor(
@@ -1137,6 +1300,59 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_fmha_v2_prefill_deepseek_reference,
     init=_fmha_v2_prefill_deepseek_init,
+)
+
+fmha_v2_prefill_sm120_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="fmha_v2_prefill_sm120",
+    description=(
+        "SM120 FMHA v2 prefill with separate Q/K/V tensors, fixed seq_len, "
+        "and causal or dense SDPA per batch. Mutates ``out`` in-place."
+    ),
+    axes={
+        "batch_size": Var(),
+        "seq_len": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+        "scale_size": Var(),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            description="In-place output buffer.",
+        ),
+        "num_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "seq_len": Scalar("int32"),
+        "scale_softmax": Scalar("float32"),
+        "scale_bmm1": Scalar("float32", optional=True),
+        "scale_bmm2": Scalar("float32", optional=True),
+        "scale_bmm1_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description=(
+                "Persistent FP32 CUDA model weight containing the full fused "
+                "q_scale * k_scale / sqrt(head_dim) value."
+            ),
+        ),
+        "scale_bmm2_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA V dequantization model weight.",
+        ),
+        "causal": Scalar("bool"),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="out"
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_fmha_v2_prefill_sm120_reference,
+    init=_fmha_v2_prefill_sm120_init,
 )
 
 

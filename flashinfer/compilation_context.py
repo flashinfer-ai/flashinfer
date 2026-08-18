@@ -17,11 +17,38 @@ limitations under the License.
 Global compilation context management for FlashInfer.
 """
 
+import functools
 import os
 import torch
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def cutlass_supports_sm107() -> bool:
+    """Return True if the bundled CUTLASS submodule natively supports SM107.
+
+    CUTLASS declares each supported architecture as a ``struct SmXXX`` in
+    ``cutlass/arch/arch.h``; the presence of ``struct Sm107`` is the canonical
+    signal that its arch tag, TMA macros, and tile schedulers recognise
+    compute_107a. Until CUTLASS adds it, SM107 CUTLASS kernels must be built
+    for the sm100f family target instead (see ``map_sm107_to_100f``).
+
+    Falls back to False (treat as unsupported, keep the sm100f mapping) when the
+    header cannot be located or read, preserving the safe default.
+    """
+    from flashinfer.jit import env as jit_env
+
+    for include_dir in jit_env.CUTLASS_INCLUDE_DIRS:
+        arch_header = include_dir / "cutlass" / "arch" / "arch.h"
+        try:
+            text = arch_header.read_text()
+        except OSError:
+            continue
+        # Header found and readable: its Sm107 declaration is authoritative.
+        return "struct Sm107" in text
+    return False
 
 
 class CompilationContext:
@@ -81,7 +108,9 @@ class CompilationContext:
                 logger.warning(f"Failed to get device capability: {e}.")
 
     def get_nvcc_flags_list(
-        self, supported_major_versions: list[int] = None
+        self,
+        supported_major_versions: list[int] = None,
+        map_sm107_to_100f: bool = False,
     ) -> list[str]:
         if supported_major_versions:
             supported_cuda_archs = [
@@ -95,7 +124,20 @@ class CompilationContext:
             raise RuntimeError(
                 f"No supported CUDA architectures found for major versions {supported_major_versions}."
             )
-        return [
-            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
-            for major, minor in sorted(supported_cuda_archs)
-        ] + self.COMMON_NVCC_FLAGS
+
+        # SM107 (Rubin) falls back to the sm100f family target only while the
+        # bundled CUTLASS lacks native compute_107a support; once CUTLASS adds
+        # it, callers that opt in with map_sm107_to_100f get native sm107a
+        # automatically, with no code change.
+        apply_sm107_mapping = map_sm107_to_100f and not cutlass_supports_sm107()
+
+        flags = []
+        for major, minor in sorted(supported_cuda_archs):
+            if apply_sm107_mapping and major == 10 and minor == "7a":
+                flags.append("-gencode=arch=compute_100f,code=sm_100f")
+            else:
+                flags.append(
+                    f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+                )
+
+        return flags + self.COMMON_NVCC_FLAGS

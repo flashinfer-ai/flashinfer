@@ -392,11 +392,22 @@ class Const:
         * ``""`` — omit this axis from the file name entirely.
         * Any other string — use that as the prefix, e.g. ``"h"`` produces
           ``h32`` for ``num_qo_heads=32``.
+    value:
+        Optional fixed integer value. When provided, tracing resolves this
+        axis without requiring a tensor or scalar argument to carry it.
     """
 
-    def __init__(self, description: str = "", abbrev: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        description: str = "",
+        abbrev: Optional[str] = None,
+        value: Optional[int] = None,
+    ) -> None:
+        if value is not None and type(value) is not int:
+            raise TypeError("Const value must be an integer or None")
         self.description = description
         self.abbrev = abbrev
+        self.value = value
 
 
 # ---------------------------------------------------------------------------
@@ -577,61 +588,102 @@ class TraceTemplate:
     def _build_axis_extractors(
         self,
     ) -> Dict[str, Callable[[Dict[str, Any]], Optional[int]]]:
-        """Build per-axis extraction callables from tensor dim_names.
+        """Build per-axis extraction callables from tensor dim_names or scalars.
 
-        For each axis in ``self.axes``, scan all ``Tensor`` inputs to find
-        which tensor contains that axis and at which dimension index.  The
-        resulting callable reads ``kwargs[param][tuple_idx].shape[dim_idx]``
-        at call time.
+        For each axis, pick a source that is *always present* in a generated
+        trace sample, in priority order:
+
+          0. an explicit ``Const(value=...)``;
+          1. a required (non-optional) ``Tensor`` whose ``dim_names`` include
+             the axis — read ``shape[dim_idx]``;
+          2. a ``Scalar`` input named after the axis — read the kwarg value;
+          3. an *optional* ``Tensor`` as a last resort;
+          4. a scalar kwarg matching the axis name.
+
+        Optional tensors are deprioritized because trace samples omit optional
+        inputs: reading their shape would return ``None`` and leave a ``Const``
+        axis without a value (e.g. ``top_k``, whose only tensor source is the
+        optional ``pre_idx`` but which is always passed as a scalar).
         """
         extractors: Dict[str, Callable[[Dict[str, Any]], Optional[int]]] = {}
-        for axis_name in self.axes:
-            # Strategy 1: find the first Tensor input whose dim_names mention
-            # this axis and read the corresponding shape dimension.
+
+        def _make_tensor_extractor(
+            p: str, ti: Optional[int], di: int
+        ) -> Callable[[Dict[str, Any]], Optional[int]]:
+            def extractor(kw: Dict[str, Any]) -> Optional[int]:
+                t = _get_tensor(kw, p, ti)
+                if t is None or di >= t.ndim:
+                    return None
+                return int(t.shape[di])
+
+            return extractor
+
+        def _make_scalar_extractor(
+            name: str,
+        ) -> Callable[[Dict[str, Any]], Optional[int]]:
+            def extractor(kw: Dict[str, Any]) -> Optional[int]:
+                val = kw.get(name)
+                if val is None:
+                    return None
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    return None
+
+            return extractor
+
+        def _make_fixed_extractor(
+            value: int,
+        ) -> Callable[[Dict[str, Any]], Optional[int]]:
+            def extractor(_kw: Dict[str, Any]) -> Optional[int]:
+                return value
+
+            return extractor
+
+        def _tensor_source(
+            axis_name: str, allow_optional: bool
+        ) -> Optional[Callable[[Dict[str, Any]], Optional[int]]]:
             for json_key, descriptor in self.inputs.items():
                 if not isinstance(descriptor, Tensor):
+                    continue
+                if descriptor.optional and not allow_optional:
                     continue
                 if axis_name not in descriptor.dim_names:
                     continue
                 param = descriptor.param if descriptor.param is not None else json_key
-                tidx = descriptor.tuple_idx
-                dim_idx = descriptor.dim_names.index(axis_name)
+                return _make_tensor_extractor(
+                    param, descriptor.tuple_idx, descriptor.dim_names.index(axis_name)
+                )
+            return None
 
-                def _make_extractor(
-                    p: str, ti: Optional[int], di: int
-                ) -> Callable[[Dict[str, Any]], Optional[int]]:
-                    def extractor(kw: Dict[str, Any]) -> Optional[int]:
-                        t = _get_tensor(kw, p, ti)
-                        if t is None or di >= t.ndim:
-                            return None
-                        return int(t.shape[di])
-
-                    return extractor
-
-                extractors[axis_name] = _make_extractor(param, tidx, dim_idx)
-                break  # Use first match only.
-
-            if axis_name in extractors:
-                continue
-
-            # Strategy 2: fall back to reading the axis value directly from a
-            # scalar kwarg whose name matches the axis name.  This handles
-            # integer arguments like ``top_k``, ``n_group``, ``topk_group``.
-            def _make_scalar_extractor(
-                name: str,
-            ) -> Callable[[Dict[str, Any]], Optional[int]]:
-                def extractor(kw: Dict[str, Any]) -> Optional[int]:
-                    val = kw.get(name)
-                    if val is None:
-                        return None
-                    try:
-                        return int(val)
-                    except (TypeError, ValueError):
-                        return None
-
-                return extractor
-
-            extractors[axis_name] = _make_scalar_extractor(axis_name)
+        for axis_name in self.axes:
+            marker = self.axes[axis_name]
+            extractor: Optional[Callable[[Dict[str, Any]], Optional[int]]]
+            # 0. Explicitly fixed Const, independent of runtime arguments.
+            if isinstance(marker, Const) and marker.value is not None:
+                extractor = _make_fixed_extractor(marker.value)
+            else:
+                extractor = None
+            # 1. Required tensor whose shape carries the axis.
+            if extractor is None:
+                extractor = _tensor_source(axis_name, allow_optional=False)
+            # 2. Scalar input named after the axis (always present).
+            if extractor is None:
+                scalar_desc = self.inputs.get(axis_name)
+                if isinstance(scalar_desc, Scalar):
+                    param = (
+                        scalar_desc.param
+                        if scalar_desc.param is not None
+                        else axis_name
+                    )
+                    extractor = _make_scalar_extractor(param)
+            # 3. Optional tensor, best-effort (None when the sample omits it).
+            if extractor is None:
+                extractor = _tensor_source(axis_name, allow_optional=True)
+            # 4. Fallback: scalar kwarg by axis name (undeclared integer args).
+            if extractor is None:
+                extractor = _make_scalar_extractor(axis_name)
+            extractors[axis_name] = extractor
 
         return extractors
 
@@ -734,9 +786,17 @@ class TraceTemplate:
                     if descriptor.dtype_from is not None:
                         ref_param = descriptor.dtype_from
                         ref_t = _get_tensor(kwargs, ref_param)
-                        dtype = (
-                            _dtype_str(ref_t.dtype) if ref_t is not None else "unknown"
-                        )
+                        if ref_t is not None:
+                            dtype = _dtype_str(ref_t.dtype)
+                        else:
+                            # dtype_from may reference an output param that is
+                            # absent when tracing symbolically; fall back to the
+                            # explicit dtype if one is declared.
+                            dtype = (
+                                descriptor.dtype
+                                if descriptor.dtype is not None
+                                else "unknown"
+                            )
                     elif descriptor.dtype is not None:
                         dtype = descriptor.dtype
                     else:

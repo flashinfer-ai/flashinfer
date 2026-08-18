@@ -8,6 +8,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from packaging.version import Version
+
+cute_dsl_version = Version(cutlass.__version__)
 
 try:
     from cutlass.cute import iket  # type: ignore
@@ -769,6 +772,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
     ) -> None:
         """Launch the fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel."""
 
+        # Keep the real runtime extent for singleton-expert TMA descriptors.
+        # A static extent of one is canonicalized out of the TMA basis before
+        # the descriptor is derefined to the kernel ABI.
+        fc1_weight_experts_runtime = fc1_weight.shape[0]
+        fc2_weight_experts_runtime = fc2_weight.shape[0]
+
         # Bind data-tensor shapes to codegen-time expert dims when requested.
         # Strides, token rows, and SF tensors stay runtime-dynamic because they
         # encode host padding/swizzle choices.
@@ -833,13 +842,21 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
         experts, hidden_b, intermediate_gateup = fc1_weight.shape
+        # Static shape refinement above rewrites the expert mode to a Python
+        # int. Re-inject its runtime extent for E=1 so TMA keeps the L basis.
+        fc1_weight_tma_experts = experts
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc1_weight_tma_experts = fc1_weight_experts_runtime
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
                 (
                     cutlass.Int32(intermediate_gateup),
                     cutlass.Int32(hidden_b),
-                    cutlass.Int32(experts),
+                    cutlass.Int32(fc1_weight_tma_experts),
                 ),
                 stride=(
                     fc1_weight.stride[2],
@@ -918,13 +935,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # A_gemm (fc2 weights): (experts, intermediate_downproj, hidden)
         # -> (M=hidden, K=intermediate_downproj, L=experts).
         experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
+        fc2_weight_tma_experts = experts2
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc2_weight_tma_experts = fc2_weight_experts_runtime
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
             cute.make_layout(
                 (
                     cutlass.Int32(hidden_b2),
                     cutlass.Int32(intermediate_downproj_b2),
-                    cutlass.Int32(experts2),
+                    cutlass.Int32(fc2_weight_tma_experts),
                 ),
                 stride=(
                     fc2_weight.stride[2],
@@ -2210,11 +2233,28 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    # CuTe-DSL 4.5.2 mainloop WAR (cutedsl_megamoe MR!27; see
+                    # TUNING.md "Follow-up 2026-07-22"): 4.5.2's codegen
+                    # mishandles the data-dependent peek guard inside the
+                    # K-loop (`if k_tile + 1 < cnt: try_wait()`), costing
+                    # 34-54% kernel time vs 4.6.1. Peeling the last k-tile out
+                    # of the loop makes the in-loop try_wait unconditional
+                    # (the peeled tail consumes the final peek), which
+                    # restores full 4.6.1 parity. const_expr-gated on exactly
+                    # 4.5.2 so newer runtimes keep the original loop shape;
+                    # delete both peel branches when 4.5.2 support is dropped.
+                    cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
+                    k_tile_loop_cnt = k_tile_cnt
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        k_tile_loop_cnt = k_tile_loop_cnt - 1
+
+                    for k_tile in cutlass.range(0, k_tile_loop_cnt, 1, unroll=1):
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
-                        peek_ab_full_status = cutlass.Boolean(1)
-                        if k_tile + 1 < k_tile_cnt:
+                        if cutlass.const_expr(cutedsl_452_ver_war):
                             peek_ab_full_status = ab_consumer.try_wait()
+                        else:
+                            if k_tile + 1 < k_tile_loop_cnt:
+                                peek_ab_full_status = ab_consumer.try_wait()
 
                         s2t_stage_coord = (None, None, None, None, handle.index)
                         cute.copy(
@@ -2237,6 +2277,36 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             sfa_tensor=tCtSFA,
                             sfb_tensor=tCtSFB_mma,
                             k_tile_idx=k_tile,
+                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                            mma_tiler_mnk=self.mma_tiler_mnk,
+                        )
+                        handle.release()
+
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        # 4.5.2 WAR peeled last k-tile (rationale above): same
+                        # body as the loop, consuming the final try_wait peek.
+                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+
+                        s2t_stage_coord = (None, None, None, None, handle.index)
+                        cute.copy(
+                            tiled_copy_s2t_sfa,
+                            tCsSFA_compact_s2t[s2t_stage_coord],
+                            tCtSFA_compact_s2t,
+                        )
+                        cute.copy(
+                            tiled_copy_s2t_sfb,
+                            tCsSFB_compact_s2t[s2t_stage_coord],
+                            tCtSFB_compact_s2t,
+                        )
+
+                        tile_crd = (None, None, None, handle.index)
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                            acc_tensor=tCtAcc,
+                            a_frag_tile=tCrA[tile_crd],
+                            b_frag_tile=tCrB[tile_crd],
+                            sfa_tensor=tCtSFA,
+                            sfb_tensor=tCtSFB_mma,
+                            k_tile_idx=k_tile_cnt - 1,
                             valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )

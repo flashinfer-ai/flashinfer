@@ -20,6 +20,7 @@ from flashinfer.gemm import (
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     get_num_sm,
+    is_cute_dsl_arch_supported,
     is_cute_dsl_available,
 )
 from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
@@ -27,6 +28,13 @@ from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
 
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
 )
 @pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
@@ -82,7 +90,7 @@ def test_blockscaled_gemm_python_interface(
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     device_ver = torch.cuda.get_device_capability(device)
-    supported_device_vers = [(10, 0), (10, 3)]
+    supported_device_vers = [(10, 0), (10, 3), (10, 7)]
     if device_ver not in supported_device_vers:
         pytest.skip(
             f"Cute-dsl backend is only supported on {supported_device_vers}, skipping {device_ver}."
@@ -263,6 +271,13 @@ def test_blockscaled_gemm_python_interface(
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
 )
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
 def test_grouped_gemm_nt_masked_scheduler_empty_experts():
     """Regression test for draining MaskedScheduler past empty experts."""
     if not torch.cuda.is_available():
@@ -313,6 +328,13 @@ def test_grouped_gemm_nt_masked_scheduler_empty_experts():
 
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
 )
 def test_grouped_gemm_nt_masked_output_layout_contract():
     """Regression test for issue #3103.

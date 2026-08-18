@@ -63,19 +63,23 @@ reused for a different shape is caught (the #2933-adjacent class).
 deviating backend is caught by #2 directly, and #2 also names which backend -- so a cross-backend
 comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
-Routing coverage (both modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
+Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
+  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4 receives separate
+    int32 ids + BF16 or FP32 weights without packed-id construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
     bias-method weight leakage (#2485/#2907). The SAME ``_route`` oracle (ported verbatim from the
     kernel-validated references in ``tests/moe/test_trtllm_gen_fused_moe.py``) is the authority for
-    both modes, so a kernel that routes wrong is caught by check #2. In-kernel routing is single-GPU
-    (non-EP) here; EP + in-kernel routing semantics are a separate validation.
+    every mode, so a kernel that routes wrong is caught by check #2. In-kernel routing is
+    single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
-Coverage today: NVFP4 (CuteDSL pre-routed + TRTLLM-FP4 pre-routed/in-kernel) on SM100 -- the only
-wired MVP runners (CuteDSL is pre-routed-only; FromLogits restricts to the trtllm backend).
+Coverage today: NVFP4, BF16, block/per-tensor FP8, MXFP4/W4A16, and MxInt4.
+CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
+dispatch to capable TRTLLM runners. MxInt4 covers packed and BF16-FromLogits
+routing.
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
 SKIPPED unless that env var is set -- waived in CI pending root-cause of a
@@ -191,6 +195,8 @@ from flashinfer.fused_moe.api import (
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
@@ -231,6 +237,7 @@ _DETERMINISTIC = {
     "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
     "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
     "trtllm_fp8_block": True,
+    "trtllm_fp8_per_tensor": True,
 }
 
 # Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
@@ -283,7 +290,9 @@ class DTypeHandler:
         tuple  # all plausible backend config classes; unwired ones auto-skip
     )
     snap: Callable  # bf16 tensor -> exactly-representable fixed point for this dtype
-    make_act_pack: Callable  # (x, selected_experts, final_scales) -> MoEActivationPack (pre-routed)
+    make_act_pack: (
+        Callable | None
+    )  # (x, selected_experts, final_scales) -> pre-routed pack
     make_act_pack_logits: (
         Callable | None  # (x, routing_logits, routing_bias) -> pack (in-kernel routing)
     )
@@ -380,6 +389,26 @@ def _bf16_act_pack(x, selected_experts, final_scales):
     )
 
 
+def _bf16_act_pack_logits(x, routing_logits, routing_bias):
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _mxint4_act_pack_logits(x, routing_logits, routing_bias):
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
 def _bf16_reference(
     x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
 ):
@@ -421,6 +450,96 @@ def _mxfp8_quant_matrix(x):
     """Quantize a logical matrix without applying the MoE weight shuffle."""
     q, scale = mxfp8_quantize(x, is_sf_swizzled_layout=False)
     return q, scale.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 32)
+
+
+def _mxfp4_quant_dequant_matrix(x):
+    """Quantize/dequantize one logical MXFP4 matrix with linear UE8M0 scales."""
+    one = torch.tensor([1.0], device=x.device)
+    q, sf = fp4_quantize(
+        x.to(torch.bfloat16),
+        global_scale=one,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=False,
+    )
+    deq = e2m1_and_ufp8sf_scale_to_float(
+        q.cpu(),
+        sf.cpu().view(torch.uint8).reshape(-1),
+        (1.0 / one).cpu(),
+        32,
+        0,
+        False,
+    )
+    return deq.reshape(x.shape).to(x.device)
+
+
+def _mxfp4_snap(t: torch.Tensor, *, bf16_activation: bool) -> torch.Tensor:
+    if t.dim() == 2:
+        if bf16_activation:
+            return t.to(torch.bfloat16)
+        q, sf = _mxfp8_quant_matrix(t.to(torch.bfloat16))
+        return _block_fp8_dequant(q, sf, QuantVariant.MxFp8).to(torch.bfloat16)
+    return torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in t]).to(
+        torch.bfloat16
+    )
+
+
+def _mxfp4_act_pack(x, selected_experts, final_scales, *, variant: QuantVariant):
+    q, sf = TrtllmFp4Config.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _mxfp4_act_pack_logits(x, routing_logits, routing_bias, *, variant):
+    q, sf = TrtllmFp4Config.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _mxfp4_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    variant,
+):
+    if variant is QuantVariant.MXFP4:
+        x_q, x_sf = _mxfp8_quant_matrix(x)
+        x32 = _block_fp8_dequant(x_q, x_sf, QuantVariant.MxFp8)
+    else:
+        x32 = x.float()
+    w1_32 = torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in w1])
+    w2_32 = torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in w2])
+    final_scales = final_scales.to(torch.bfloat16).float()
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        up = x32[token] @ w1_32[local_e, :intermediate_size].t()
+        gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
+        inter = F.silu(gate) * up
+        if variant is QuantVariant.MXFP4:
+            inter_q, inter_sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
+            inter = _block_fp8_dequant(inter_q, inter_sf, QuantVariant.MxFp8)
+        else:
+            inter = inter.to(torch.bfloat16).float()
+        out[token] += final_scales[token, slot, None] * (inter @ w2_32[local_e].t())
+    return out
 
 
 def _block_fp8_act_pack(x, selected_experts, final_scales, *, variant):
@@ -517,6 +636,119 @@ def _block_fp8_reference(
     return out
 
 
+def _fp8_per_tensor_global_scale(x):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+
+
+def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
+    input_scale = _fp8_per_tensor_global_scale(x)
+    q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=input_scale
+    )
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _fp8_per_tensor_act_pack(x, selected_experts, final_scales):
+    input_scale = _fp8_per_tensor_global_scale(x)
+    q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=input_scale
+    )
+    assert sf is None
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _fp8_per_tensor_dequant_experts(weights):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = weights.float().abs().amax(dim=(-1, -2))
+    scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+    q = (weights.float() * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    return q.to(torch.float8_e4m3fn).float() / scales[:, None, None]
+
+
+def _fp8_per_tensor_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    final_scales = final_scales.to(torch.bfloat16).float()
+    input_scale = _fp8_per_tensor_global_scale(x)
+    intermediate_scale = torch.tensor(64.0, device=x.device)
+    x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
+    x32 = x_q.to(torch.float8_e4m3fn).float() / input_scale
+    w1_32 = _fp8_per_tensor_dequant_experts(w1)
+    w2_32 = _fp8_per_tensor_dequant_experts(w2)
+
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        up = x32[token] @ w1_32[local_e, :intermediate_size].t()
+        gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
+        inter = F.silu(gate) * up
+        inter_q = (inter * intermediate_scale).clamp(-fp8_max, fp8_max)
+        inter = inter_q.to(torch.float8_e4m3fn).float() / intermediate_scale
+        expert_out = (inter @ w2_32[local_e].t()).to(torch.bfloat16).float()
+        out[token] += final_scales[token, slot, None] * expert_out
+    return out
+
+
+def _mxint4_quant_dequant(weights):
+    blocks = weights.float().reshape(-1, 32)
+    block_max = blocks.amax(dim=-1, keepdim=True) * (8.0 / 7.0)
+    block_min = blocks.amin(dim=-1, keepdim=True)
+    scales = torch.maximum(block_max, -block_min) / 8.0
+    scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    quantized = (blocks / scales).round().clamp(-8, 7)
+    stored_scales = scales.to(torch.bfloat16).float()
+    return (quantized * stored_scales).reshape_as(weights)
+
+
+def _mxint4_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+):
+    x32 = x.float()
+    w1_32 = _mxint4_quant_dequant(w1)
+    w2_32 = _mxint4_quant_dequant(w2)
+    final_scales = final_scales.to(torch.bfloat16).float()
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        fc1 = x32[token] @ w1_32[local_e].t()
+        inter = F.silu(fc1[:, intermediate_size:]) * fc1[:, :intermediate_size]
+        inter = inter.to(torch.bfloat16).float()
+        expert_out = (inter @ w2_32[local_e].t()).to(torch.bfloat16).float()
+        out[token] += final_scales[token, slot, None] * expert_out
+    return out
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -535,7 +767,7 @@ _DTYPE = {
         candidate_configs=(TrtllmBf16Config,),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
-        make_act_pack_logits=None,
+        make_act_pack_logits=_bf16_act_pack_logits,
         reference=_bf16_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
@@ -576,16 +808,76 @@ _DTYPE = {
         atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
         rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
     ),
-    # MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
+    QuantVariant.FP8PerTensor: DTypeHandler(
+        variant=QuantVariant.FP8PerTensor,
+        candidate_configs=(TrtllmFp8PerTensorConfig,),
+        snap=_block_fp8_snap,
+        make_act_pack=_fp8_per_tensor_act_pack,
+        make_act_pack_logits=_fp8_per_tensor_act_pack_logits,
+        reference=_fp8_per_tensor_reference,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,
+        rtol=0.3,
+    ),
+    QuantVariant.MXFP4: DTypeHandler(
+        variant=QuantVariant.MXFP4,
+        candidate_configs=(TrtllmFp4Config,),
+        snap=lambda t: _mxfp4_snap(t, bf16_activation=False),
+        make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
+            x, ids, weights, variant=QuantVariant.MXFP4
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _mxfp4_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.MXFP4
+        ),
+        reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.MXFP4),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
+    ),
+    QuantVariant.W4A16: DTypeHandler(
+        variant=QuantVariant.W4A16,
+        candidate_configs=(TrtllmFp4Config,),
+        snap=lambda t: _mxfp4_snap(t, bf16_activation=True),
+        make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
+            x, ids, weights, variant=QuantVariant.W4A16
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _mxfp4_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.W4A16
+        ),
+        reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.W4A16),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
+    ),
+    QuantVariant.MxInt4: DTypeHandler(
+        variant=QuantVariant.MxInt4,
+        candidate_configs=(TrtllmMxInt4Config,),
+        snap=_bf16_snap,
+        make_act_pack=_bf16_act_pack,
+        make_act_pack_logits=_mxint4_act_pack_logits,
+        reference=_mxint4_reference,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        # Curated FromLogits observes max|diff| / ||ref||inf ~= 0.0335.
+        atol_frac=0.04,
+        rtol=0.3,
+    ),
 }
 
 # Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
-_VARIANT_IDS = tuple(v.name.lower() for v in _DTYPE)
 _HANDLER_BY_ID = {variant.name.lower(): handler for variant, handler in _DTYPE.items()}
 _FROMLOGITS_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
     if handler.make_act_pack_logits is not None
+)
+_PREROUTED_VARIANT_IDS = tuple(
+    variant.name.lower()
+    for variant, handler in _DTYPE.items()
+    if handler.make_act_pack is not None
 )
 
 
@@ -626,7 +918,7 @@ _TOPK = [1, 2, 4, 6, 8]  # 6 non-pow2
 _TOKENS = [1, 2, 3, 7, 17, 64, 127, 129, 256, 1024, 2048, 4095, 4096, 4097]
 # Routing-logits *distribution* skew (orthogonal to the routing METHOD below). "all_negative"
 # (#2822 all-negative-logit mis-selection) and "all_to_one" only bite the in-kernel router; the
-# pre-routed host topk handles them trivially, but exercising both modes is free coverage.
+# pre-routed host topk handles them trivially, but exercising all modes is free coverage.
 _ROUTE = ["uniform", "uniform", "hot1", "imbalanced", "all_negative", "all_to_one"]
 
 # Routing METHOD axis (RoutingMethodType). Pre-routed mode computes the host weights per method
@@ -656,6 +948,16 @@ _FROMLOGITS_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if RoutingInputMode.FromLogits in runner_cls.supported_routing_modes
 }
+_UNPACKED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if RoutingInputMode.UnpackedPrecomputed in runner_cls.supported_routing_modes
+}
+_UNPACKED_VARIANT_IDS = tuple(
+    variant.name.lower()
+    for variant, handler in _DTYPE.items()
+    if any(cfg_cls in _UNPACKED_BACKENDS for cfg_cls in handler.candidate_configs)
+)
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
 # REQUIRES a bias; MiniMax2's is optional but we always supply one to exercise the bias path.
@@ -687,13 +989,21 @@ class Cfg:
     # Routing axes (defaults keep the original pre-routed RenormalizeNaive behavior so the
     # positional _CURATED literals below are unaffected).
     routing_method: RoutingMethodType = RoutingMethodType.RenormalizeNaive
-    routing_input_mode: str = (
-        "prerouted"  # "prerouted" (PackedPrecomputed) | "fromlogits"
-    )
+    # "prerouted" (PackedPrecomputed) | "unpacked" | "fromlogits"
+    routing_input_mode: str = "prerouted"
     logits_dtype: str = "bf16"  # "bf16" | "fp32" (#2796 fp32-router-logits class)
+    unpacked_weights_dtype: str = "bf16"  # "bf16" | "fp32"; unpacked mode only
+    # Fused shared experts (S). Layer geometry, not a per-call value: the
+    # weight tensors carry n_local + S rows and the routing kernel appends
+    # ids [E, E+S) at weight 1.0 after the routed top-k.
+    num_fused_shared_experts: int = 0
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+
+    @property
+    def n_weight_rows(self):  # physical expert-major rows: routed + shared
+        return self.n_local + self.num_fused_shared_experts
 
     @property
     def n_local(self):  # experts actually held + computed on this rank
@@ -708,13 +1018,27 @@ class Cfg:
         return self.routing_input_mode == "fromlogits"
 
     @property
+    def is_unpacked(self):
+        return self.routing_input_mode == "unpacked"
+
+    @property
     def label(self):
         ep = f"L{self.n_local}o{self.expert_offset}_" if self.is_ep else ""
-        mode = "FL_" if self.is_fromlogits else ""
+        mode = "FL_" if self.is_fromlogits else "UP_" if self.is_unpacked else ""
         ld = "fp32_" if self.logits_dtype == "fp32" else ""
+        uwd = (
+            "wfp32_"
+            if self.is_unpacked and self.unpacked_weights_dtype == "fp32"
+            else ""
+        )
         grp = f"g{self.n_group}x{self.topk_group}_" if self.n_group else ""
+        sh = (
+            f"s{self.num_fused_shared_experts}_"
+            if self.num_fused_shared_experts
+            else ""
+        )
         return (
-            f"{self.variant}_{mode}{self.routing_method.name}_{ld}{self.route}_"
+            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -727,7 +1051,9 @@ def _gen(seed):
     # routing semantics (does the kernel route over global logits then filter to local?) are a
     # separate validation, and EP collectives are out of scope for this single-GPU harness.
     # DeepSeekV3 group routing scores over the full expert set, so keep it non-EP too.
-    fromlogits = rng.random() < 0.5
+    mode_roll = rng.random()
+    fromlogits = mode_roll < 0.5
+    unpacked = 0.5 <= mode_roll < 0.65
     force_non_ep = fromlogits or method == RoutingMethodType.DeepSeekV3
     # Resample shape until the weights of the FINAL config fit the budget (modest per-test
     # GPU footprint). Routing mode is chosen BEFORE this loop on purpose: non-EP-forced
@@ -766,28 +1092,71 @@ def _gen(seed):
             [t for t in _TOPK if t <= local]
         )  # route within the local shard
 
+    fromlogits_variants = _FROMLOGITS_VARIANT_IDS
+    prerouted_variants = _PREROUTED_VARIANT_IDS
+    if method == RoutingMethodType.Llama4:
+        # Per-tensor FP8 applies the Llama4 route scale on GEMM1 input rather
+        # than in finalization, so it needs a method-aware reference.
+        fromlogits_variants = tuple(
+            variant for variant in fromlogits_variants if variant != "fp8pertensor"
+        )
+        prerouted_variants = tuple(
+            variant for variant in prerouted_variants if variant != "fp8pertensor"
+        )
+
+    variant = (
+        rng.choice(fromlogits_variants)
+        if fromlogits
+        else rng.choice(_UNPACKED_VARIANT_IDS)
+        if unpacked
+        else rng.choice(prerouted_variants)
+    )
+    # The legacy TRTLLM MXFP4 and MxInt4 modes are validated only with BF16 logits.
+    logits_dtype = (
+        "bf16"
+        if variant in ("mxfp4", "w4a16", "mxint4")
+        else ("fp32" if rng.random() < 0.25 else "bf16")
+    )
+    # Fused shared experts: only the DeepSeekV3 FromLogits path emits appended
+    # slots. Block-FP8 and all TRTLLM FP4 variants forward S; EP is rejected.
+    # Roll sparsely so this axis does not crowd out routed coverage.
+    num_fused_shared_experts = 0
+    if (
+        method == RoutingMethodType.DeepSeekV3
+        and fromlogits
+        and offset == 0
+        and local == ne
+        and variant in ("deepseekfp8", "mxfp8", "nvfp4", "mxfp4", "w4a16")
+        and rng.random() < 0.25
+    ):
+        # Bounded by the kernel ceilings on the FUSED totals.
+        max_shared = min(2, 32 - top_k, 512 - ne)
+        if (
+            max_shared >= 1
+            and _weight_elems(local + max_shared, h, i) <= _WEIGHT_ELEM_BUDGET
+        ):
+            num_fused_shared_experts = rng.randint(1, max_shared)
+
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
         intermediate=i,
         num_experts=ne,
         top_k=top_k,
-        # FromLogits can use only variants with an in-kernel-routing runner.
-        variant=rng.choice(_FROMLOGITS_VARIANT_IDS)
-        if fromlogits
-        else rng.choice(_VARIANT_IDS),
+        variant=variant,
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
         expert_offset=offset,
         routing_method=method,
-        routing_input_mode="fromlogits" if fromlogits else "prerouted",
-        logits_dtype="fp32"
-        if rng.random() < 0.25
-        else "bf16",  # #2796 fp32-logits axis
+        routing_input_mode=(
+            "fromlogits" if fromlogits else "unpacked" if unpacked else "prerouted"
+        ),
+        logits_dtype=logits_dtype,
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
 
 
@@ -869,6 +1238,34 @@ _CURATED = [
         2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_010
     ),  # bf16 mid size + empty-expert load
     Cfg(
+        64,
+        512,
+        512,
+        32,
+        4,
+        "bf16",
+        "uniform",
+        900_032,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),  # BF16 FromLogits with FP32 logits; seed % 4 == 0 exercises autotuning
+    Cfg(
+        64,
+        512,
+        512,
+        32,
+        4,
+        "bf16",
+        "uniform",
+        900_033,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=4,
+        topk_group=2,
+        routed_scaling=1.0,
+    ),  # BF16 FromLogits bias/group routing
+    Cfg(
         16,
         7168,
         2048,
@@ -905,6 +1302,186 @@ _CURATED = [
         routing_method=RoutingMethodType.Default,
         routing_input_mode="fromlogits",
     ),  # seed % 4 == 0 deliberately exercises production autotuning for MXFP8
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "fp8pertensor",
+        "uniform",
+        900_020,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),  # per-tensor FP8 FromLogits; seed % 4 == 0 exercises autotuning
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "fp8pertensor",
+        "uniform",
+        900_036,
+        routing_input_mode="prerouted",
+    ),  # per-tensor FP8 packed routing; seed % 4 == 0 exercises autotuning
+    Cfg(
+        64,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "imbalanced",
+        900_024,
+        local_experts=32,
+        expert_offset=32,
+        routing_input_mode="unpacked",
+    ),  # Unpacked BF16 weights + nonzero EP offset; seed % 4 == 0 autotunes
+    Cfg(
+        64,
+        512,
+        512,
+        128,
+        4,
+        "nvfp4",
+        "imbalanced",
+        900_028,
+        local_experts=32,
+        expert_offset=32,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),  # Unpacked FP32 weights + nonzero EP offset; seed % 4 == 0 autotunes
+    Cfg(128, 1024, 512, 16, 4, "mxfp4", "uniform", 900_017),
+    Cfg(128, 1024, 512, 16, 4, "w4a16", "imbalanced", 900_018),
+    Cfg(
+        128,
+        1024,
+        512,
+        16,
+        4,
+        "mxfp4",
+        "uniform",
+        900_019,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+    ),
+    Cfg(
+        128,
+        1024,
+        512,
+        16,
+        4,
+        "w4a16",
+        "imbalanced",
+        900_021,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+    ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "mxfp4",
+        "uniform",
+        900_032,
+        routing_input_mode="unpacked",
+    ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "w4a16",
+        "imbalanced",
+        900_036,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),
+    Cfg(
+        64,
+        512,
+        512,
+        16,
+        4,
+        "mxint4",
+        "imbalanced",
+        900_040,
+    ),  # packed MxInt4; seed % 4 == 0 exercises production autotuning
+    Cfg(
+        64,
+        512,
+        512,
+        16,
+        4,
+        "mxint4",
+        "uniform",
+        900_041,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="bf16",
+    ),
+    # Fused shared experts. Curated rather than left to the sparse random roll.
+    Cfg(
+        256,
+        1024,
+        512,
+        128,
+        8,
+        "deepseekfp8",
+        "uniform",
+        900_037,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=8,
+        topk_group=4,
+        routed_scaling=2.5,
+        num_fused_shared_experts=1,
+    ),
+    Cfg(
+        128,
+        1024,
+        512,
+        128,
+        8,
+        "mxfp8",
+        "imbalanced",
+        900_038,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=8,
+        topk_group=4,
+        routed_scaling=2.5,
+        num_fused_shared_experts=2,
+    ),
+    *[
+        Cfg(
+            32,
+            1024,
+            512,
+            32,
+            8,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.DeepSeekV3,
+            routing_input_mode="fromlogits",
+            logits_dtype="bf16",
+            n_group=8,
+            topk_group=4,
+            routed_scaling=2.5,
+            num_fused_shared_experts=num_shared,
+        )
+        for variant, num_shared, seed in (
+            ("nvfp4", 1, 900_042),
+            ("mxfp4", 2, 900_043),
+            ("w4a16", 1, 900_044),
+        )
+    ],
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1003,7 +1580,10 @@ def _master(cfg, handler):
         keep = torch.rand(shape, device="cuda", generator=g) >= 0.75  # ~75% zeros
         return handler.snap(dense * keep)
 
-    x, w1, w2 = sparse(T, H), sparse(E_local, 2 * I, H), sparse(E_local, H, I)
+    # Expert-major tensors carry the SHARED rows too (routed first, shared
+    # appended); E_local stays routed-only, matching the API contract.
+    rows = cfg.n_weight_rows
+    x, w1, w2 = sparse(T, H), sparse(rows, 2 * I, H), sparse(rows, H, I)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -1033,6 +1613,25 @@ def _master(cfg, handler):
     selected_experts = (local_sel + cfg.expert_offset).to(
         torch.int32
     )  # local -> global ids
+
+    # Mirror the routing kernel's shared-expert append: ids [E, E+S) at weight
+    # exactly 1.0, after the routed top-k. The reference sums over these the
+    # same way it does the routed slots, so no reference change is needed --
+    # it already resolves a global id to a weight row via expert_offset and
+    # sizes itself from w1.shape[0].
+    S = cfg.num_fused_shared_experts
+    if S:
+        shared_ids = torch.arange(
+            cfg.num_experts, cfg.num_experts + S, device="cuda", dtype=torch.int32
+        ).expand(T, S)
+        selected_experts = torch.cat((selected_experts, shared_ids), dim=1)
+        final_scales = torch.cat(
+            (
+                final_scales,
+                torch.ones((T, S), device="cuda", dtype=final_scales.dtype),
+            ),
+            dim=1,
+        )
     return x, w1, w2, selected_experts, final_scales, logits, routing_bias
 
 
@@ -1153,6 +1752,12 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
+    if handler.variant is QuantVariant.W4A16 and sm == 103:
+        pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
+    if handler.variant is QuantVariant.MxInt4 and (
+        cfg.hidden % 256 != 0 or cfg.intermediate % 256 != 0
+    ):
+        pytest.skip("TRTLLM MxInt4 requires hidden/intermediate divisible by 256")
     # Backend *config classes* whose runner is registered in the live MoELayer registry AND valid
     # on this arch. A newly-wired backend lands here automatically.
     wired_backends = [
@@ -1164,15 +1769,40 @@ def test_unified_moe_fuzz(cfg):
         # In-kernel routing restricts to FromLogits-capable backends (CuteDSL is pre-routed-only,
         # so it cannot serve a logits-only pack and would compare apples to oranges).
         wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
+    elif cfg.is_unpacked:
+        # Exact TRTLLM Mode 3 is currently wired only through the FP4 runner.
+        # Backends that accept separate tensors through their own ABI are not
+        # implementations of RoutingInputMode.UnpackedPrecomputed.
+        wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not wired_backends:
-        mode = "in-kernel-routing " if cfg.is_fromlogits else ""
+        mode = (
+            "in-kernel-routing "
+            if cfg.is_fromlogits
+            else "unpacked-precomputed "
+            if cfg.is_unpacked
+            else ""
+        )
         pytest.skip(f"no wired {mode}backend for {cfg.variant} on SM{sm}")
 
     x, w1, w2, selected_experts, final_scales, logits, routing_bias = _master(
         cfg, handler
     )
+    unpacked_weights_dtype = (
+        torch.float32 if cfg.unpacked_weights_dtype == "fp32" else torch.bfloat16
+    )
+    reference_scales = (
+        final_scales.to(unpacked_weights_dtype).float()
+        if cfg.is_unpacked
+        else final_scales
+    )
     ref = handler.reference(
-        x, w1, w2, selected_experts, final_scales, cfg.intermediate, cfg.expert_offset
+        x,
+        w1,
+        w2,
+        selected_experts,
+        reference_scales,
+        cfg.intermediate,
+        cfg.expert_offset,
     )
     atol = handler.atol_frac * ref.abs().max().item() + 1e-3
     rtol = handler.rtol
@@ -1184,19 +1814,33 @@ def test_unified_moe_fuzz(cfg):
         assert handler.make_act_pack_logits is not None
         act_pack = handler.make_act_pack_logits(x, logits, routing_bias)
     else:
+        assert handler.make_act_pack is not None
         act_pack = handler.make_act_pack(x, selected_experts, final_scales)
+        if cfg.is_unpacked:
+            act_pack = MoEActivationPack(
+                hidden_states_q=act_pack.hidden_states_q,
+                hidden_states_scale=act_pack.hidden_states_scale,
+                topk_ids=selected_experts,
+                topk_weights=final_scales.to(unpacked_weights_dtype),
+                routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            )
     weight_pack = MoEWeightPack()
     for BackendCfg in wired_backends:
         prepare_kwargs = dict(
-            num_local_experts=cfg.n_local,
+            num_local_experts=cfg.n_weight_rows,
             hidden_size=cfg.hidden,
             intermediate_size=cfg.intermediate,
             device=dev,
         )
-        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
-        # handler's variant explicitly to select the native scale/layout format.
-        if BackendCfg is TrtllmFp8BlockConfig:
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
+        if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = handler.variant
+        elif BackendCfg is TrtllmFp8PerTensorConfig:
+            prepare_kwargs.update(
+                hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
+                intermediate_scale_global=torch.tensor(64.0, device=dev),
+            )
         weight_pack.prepare_for(
             _BACKEND_RUNNERS[BackendCfg].backend_key,
             BackendCfg.prepare_weights(
@@ -1220,6 +1864,7 @@ def test_unified_moe_fuzz(cfg):
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
             local_expert_offset=cfg.expert_offset,
+            num_fused_shared_experts=cfg.num_fused_shared_experts,
         ),
         activation=ActivationConfig(),
         backend=BackendOptions(
@@ -1458,9 +2103,9 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
-        # handler's variant explicitly to select the native scale/layout format.
-        if B is TrtllmFp8BlockConfig:
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
+        if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = variant
         weight_pack.prepare_for(
             _BACKEND_RUNNERS[B].backend_key,

@@ -46,6 +46,34 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo ""
 fi
 
+# Install quack-kernels for the VSA blk128 backend tests.
+# quack-kernels is NOT a runtime requirement of flashinfer — only users of the
+# blk128 VSA backend need it, so it is intentionally kept out of requirements.txt
+# and installed here for CI only. The blk128 backend supports SM100/SM103, so we
+# install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The correct PyPI distribution name is quack-kernels (top-level package: quack).
+# --no-deps: quack-kernels 0.6.4 hard-pins nvidia-cutlass-dsl==4.6.2, which would
+# downgrade the DSL this job just pinned and leave libs-cu13 skewed (#4555). Its
+# remaining deps are either already installed (torch, apache-tvm-ffi, einops) or
+# listed alongside it here.
+SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
+if [ "${SM_MAJOR}" = "10" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "========================================"
+  DSL_VERSION_BEFORE=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext==0.1.5"
+  DSL_VERSION_AFTER=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  if [ "${DSL_VERSION_BEFORE}" != "${DSL_VERSION_AFTER}" ]; then
+    echo "ERROR: quack-kernels install moved nvidia-cutlass-dsl from ${DSL_VERSION_BEFORE} to ${DSL_VERSION_AFTER}" >&2
+    return 1 2>/dev/null || exit 1
+  fi
+  # Fail here rather than as a confusing test error if --no-deps left a gap.
+  python -c "import quack"
+  echo "quack-kernels install complete."
+  echo ""
+fi
+
 # Override nvidia-cutlass-dsl if specified
 if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   # Detect CUDA major version: only CUDA 13+ needs [cu13] extra

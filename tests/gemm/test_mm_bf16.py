@@ -5,17 +5,18 @@ import torch.nn.functional as F
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
-@pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("m", [1, 8, 16, 25, 32, 64])
 @pytest.mark.parametrize("n", [1024, 2048, 4096])
 @pytest.mark.parametrize("k", [1024, 2048, 3072])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
 @pytest.mark.parametrize(
-    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
+    "backend",
+    ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"],
 )
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
@@ -49,6 +50,19 @@ def test_mm_bf16(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+
+    if backend == "cute-dsl":
+        if not is_sm100a_supported(torch.device("cuda")):
+            pytest.skip("CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+.")
+
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            pytest.skip("nvidia-cutlass-dsl is not available.")
+        if m > 32:
+            pytest.skip("CuTeDSL low-M backend requires M <= 32.")
+        if res_dtype != torch.bfloat16:
+            pytest.skip("CuTeDSL low-M backend requires BF16 output.")
 
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
@@ -187,6 +201,49 @@ def test_cublaslt_bf16_runner_zero_algos():
             runner.forward(inputs)
     finally:
         runner._get_algos = original_get_algos
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
+    """The no-autotune fallback uses direct in its measured crossover band."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    m, n, k = 1, 256, 8192
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, b.T, pdl=pdl, backend="cute-dsl")
+    reference = a @ b.T
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("enable_bias", [False, True])
+def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
+    """K=128 exercises the shallow one-stage tensor-core pipeline."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    m, n, k = 1, 1024, 128
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    bias = (
+        torch.randn((n,), device="cuda", dtype=torch.bfloat16) if enable_bias else None
+    )
+    out = mm_bf16(a, b.T, bias=bias, pdl=True, backend="cute-dsl")
+    reference = F.linear(a, b, bias)
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 if __name__ == "__main__":

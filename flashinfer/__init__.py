@@ -18,7 +18,8 @@ import contextlib
 import importlib.util
 
 from .version import __version__ as __version__
-from .version import __git_version__ as __git_version__
+from .version import __git_commit__ as __git_commit__
+from .version import __git_version__ as __git_version__  # backward compat
 
 
 from . import jit as jit
@@ -94,6 +95,7 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
@@ -101,6 +103,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
@@ -123,13 +127,19 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
-from .kda_decode import recurrent_kda as recurrent_kda
+from .kda_prefill import (
+    RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
+)
+from .kda import recurrent_kda as recurrent_kda
+from .kda_decode import fused_kda_decode as fused_kda_decode
+from .kda_decode import packed_kda_decode as packed_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
+from .norm import layernorm_quant as layernorm_quant
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
@@ -225,6 +235,7 @@ from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
 from .topk import TopKTieBreak as TopKTieBreak
+from .topk_varlen.topk_varlen import top_k_varlen as top_k_varlen
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
@@ -260,3 +271,47 @@ if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "Fal
             "(continuing without Trace Apply).",
             _trace_apply_err,
         )
+
+
+# ---------------------------------------------------------------------------
+# Import-time version log: emit one line when FLASHINFER_LOGLEVEL >= 1 so
+# that crash logs contain the exact commit without any manual archaeology.
+# Respects FLASHINFER_LOGDEST (stdout / stderr / filepath) the same way
+# api_logging.py does; defaults to stdout.
+# ---------------------------------------------------------------------------
+def _log_import_version() -> None:
+    # Wrapped in a private function so no temp variables leak into the
+    # flashinfer module namespace.  Two-level protection:
+    #   inner try  – safely resolve the commit hash; falls back to "unknown"
+    #                if __git_commit__ is missing or malformed so the log
+    #                line is still emitted rather than silently suppressed.
+    #   outer try  – absorbs every other failure (non-integer LOGLEVEL env
+    #                var, closed/None stdout or stderr, unwritable log file)
+    #                so a logging misconfiguration can never block the import.
+    try:
+        if int(_os.environ.get("FLASHINFER_LOGLEVEL", "0")) < 1:
+            return
+        try:
+            _short = __git_commit__[:8] if __git_commit__ != "unknown" else "unknown"
+        except Exception:
+            _short = "unknown"
+        _line = f"FlashInfer {__version__} (commit {_short})\n"
+        _dest = _os.environ.get("FLASHINFER_LOGDEST", "stdout").replace(
+            "%i", str(_os.getpid())
+        )
+        if _dest == "stderr":
+            import sys as _sys
+
+            _sys.stderr.write(_line)
+            _sys.stderr.flush()
+        elif _dest not in ("stdout", ""):
+            with open(_dest, "a") as _f:
+                _f.write(_line)
+        else:
+            print(_line, end="", flush=True)
+    except Exception:
+        pass  # never let import-time logging crash the import
+
+
+_log_import_version()
+del _log_import_version

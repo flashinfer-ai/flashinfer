@@ -18,10 +18,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <cuda_runtime.h>
 #include "cute_sm120_mxfp8_groupwise/cute_sm120_mxfp8_runner.h"
 #include "cutlass/gemm_coord.h"
 #include "tvm_ffi_utils.h"
+#include "cute_sm120_mxfp8_groupwise/sm120_common/moe_tile_selection.h"
+#include "cute_sm120_mxfp8_groupwise/sm120_fused_moe/launch.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/builder.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/kernel_impl.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/launch.cuh"
@@ -42,6 +45,57 @@
   }
 
 namespace flashinfer::gemm::mxfp8_cute_sm120 {
+
+static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
+                                         int num_sms) {
+  int max_m_per_expert = sm120_moe_select::balanced_max_rows(total_rows, num_experts);
+  auto tile_count = [&](int tile_m, int tile_n) {
+    return sm120_moe_select::balanced_tile_count(total_rows, shape_n, num_experts, tile_m, tile_n);
+  };
+
+  int64_t swapab_tiles = tile_count(8, 128);
+  int64_t m32_tiles = tile_count(32, 128);
+  int64_t m64_tiles = tile_count(64, 128);
+  int64_t m128_tiles = tile_count(128, 64);
+  bool short_k = shape_k <= 2048;
+
+  if (max_m_per_expert <= 8 || (short_k && m32_tiles < num_sms / 2 && swapab_tiles <= num_sms)) {
+    return 8;
+  }
+
+  int64_t m32_waves = sm120_moe_select::wave_count(m32_tiles, num_sms);
+  int64_t m64_waves = sm120_moe_select::wave_count(m64_tiles, num_sms);
+  int64_t m128_waves = sm120_moe_select::wave_count(m128_tiles, num_sms);
+
+  if (m64_waves >= m32_waves) {
+    return 32;
+  }
+  if (m128_waves < m64_waves) {
+    return 128;
+  }
+  if (m128_waves > m64_waves) {
+    return 64;
+  }
+  if (short_k && m64_tiles < m128_tiles) {
+    return 64;
+  }
+  return 128;
+}
+
+static int select_mxfp8_plain_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
+                                         int num_sms) {
+  int max_m_per_expert = sm120_moe_select::balanced_max_rows(total_rows, num_experts);
+  if (max_m_per_expert <= 12) {
+    return 8;
+  }
+  if (max_m_per_expert <= 32) {
+    return 32;
+  }
+  if (shape_k <= 2048) {
+    return (max_m_per_expert < 192) ? 64 : 128;
+  }
+  return sm120_moe_select::select_plain_m64_or_m128(total_rows, shape_n, num_experts, num_sms);
+}
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
@@ -69,6 +123,115 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
   DISPATCH_GRAN_K(granK, GRAN_K, {
     gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
   })
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void CuteSm120Mxfp8GemmRunner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::fused_moe_mxfp8_nt_groupwise_impl(void* D, void const* A, void const* B,
+                                                              int32_t const* token_offset,
+                                                              int num_experts, int total_rows,
+                                                              int shape_n, int shape_k,
+                                                              cudaStream_t stream,
+                                                              int32_t const* SFA,
+                                                              int32_t const* SFB) {
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  using KT_SWAPAB = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 8, 64, 4, GranK, true>;
+  using KT_M32 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<32, 128, 64, 4, GranK>;
+  using KT_M64 =
+      sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<64, 128, 64, 4, GranK, false, true>;
+  using KT_M128 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 64, 64, 4, GranK>;
+
+  auto ptr_A = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+  auto ptr_B = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
+  auto ptr_SFB =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
+  auto ptr_D = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+  int tile_m = select_mxfp8_fused_moe_tile_m(total_rows, shape_n, shape_k, num_experts, num_sms);
+  if (tile_m == 8) {
+    sm120_blockscaled::launch_fused_moe<KT_SWAPAB>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                   total_rows, shape_n, shape_k, num_experts,
+                                                   token_offset, num_sms, stream);
+    return;
+  }
+  if (tile_m == KT_M32::kTileM) {
+    sm120_blockscaled::launch_fused_moe<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                shape_n, shape_k, num_experts, token_offset,
+                                                num_sms, stream);
+    return;
+  }
+  if (tile_m == KT_M64::kTileM) {
+    sm120_blockscaled::launch_fused_moe<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                shape_n, shape_k, num_experts, token_offset,
+                                                num_sms, stream);
+    return;
+  }
+  sm120_blockscaled::launch_fused_moe<KT_M128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                               shape_n, shape_k, num_experts, token_offset, num_sms,
+                                               stream);
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    fused_moe_mxfp8_nt_groupwise_tuned_impl(void* D, void const* A, void const* B,
+                                            int32_t const* token_offset, int num_experts,
+                                            int total_rows, int shape_n, int shape_k,
+                                            cudaStream_t stream, int32_t const* SFA,
+                                            int32_t const* SFB, int tactic_tile_m,
+                                            int tactic_tile_n) {
+  using KT_M64_N64 =
+      sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<64, 64, 64, 4, GranK, false, true>;
+  using KT_M64_N128 =
+      sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<64, 128, 64, 4, GranK, false, true>;
+  using KT_M128_N64 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 64, 64, 4, GranK>;
+  using KT_M32_N128 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<32, 128, 64, 4, GranK>;
+  using KT_SWAPAB_N8 =
+      sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 8, 64, 4, GranK, true>;
+
+  auto ptr_A = reinterpret_cast<typename KT_M128_N64::ElementA*>(const_cast<void*>(A));
+  auto ptr_B = reinterpret_cast<typename KT_M128_N64::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA =
+      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
+  auto ptr_SFB =
+      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
+  auto ptr_D = reinterpret_cast<typename KT_M128_N64::ElementD*>(D);
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  if (tactic_tile_m == 128 && tactic_tile_n == 8) {
+    sm120_blockscaled::launch_fused_moe<KT_SWAPAB_N8>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                      total_rows, shape_n, shape_k, num_experts,
+                                                      token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 32) {
+    sm120_blockscaled::launch_fused_moe<KT_M32_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                     total_rows, shape_n, shape_k, num_experts,
+                                                     token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 64 && tactic_tile_n == 64) {
+    sm120_blockscaled::launch_fused_moe<KT_M64_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                    total_rows, shape_n, shape_k, num_experts,
+                                                    token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 64) {
+    sm120_blockscaled::launch_fused_moe<KT_M64_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                     total_rows, shape_n, shape_k, num_experts,
+                                                     token_offset, num_sms, stream);
+  } else if (tactic_tile_n == 64) {
+    sm120_blockscaled::launch_fused_moe<KT_M128_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                     total_rows, shape_n, shape_k, num_experts,
+                                                     token_offset, num_sms, stream);
+  } else if constexpr (GranK == 128) {
+    using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledFusedMoeBuilder<128, 128, 64, 4, GranK>;
+    sm120_blockscaled::launch_fused_moe<KT_M128_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                      total_rows, shape_n, shape_k, num_experts,
+                                                      token_offset, num_sms, stream);
+  }
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -147,6 +310,38 @@ void CuteSm120Mxfp8GemmRunner<
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
+void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    moe_gemm_mxfp8_nt_groupwise_tuned(void* D, void const* A, void const* B,
+                                      int32_t const* token_offset, int num_experts, int total_rows,
+                                      int shape_n, int shape_k, cudaStream_t stream,
+                                      int32_t const* SFA, int32_t const* SFB, int granK,
+                                      int tactic_tile_m, int tactic_tile_n, bool is_gated) {
+  bool valid_tactic = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                      (tactic_tile_m == 64 && tactic_tile_n == 64) ||
+                      (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+                      (tactic_tile_m == 128 && tactic_tile_n == 8) ||
+                      (tactic_tile_m == 128 && tactic_tile_n == 64) ||
+                      (tactic_tile_m == 128 && tactic_tile_n == 128);
+  TVM_FFI_ICHECK(valid_tactic) << "unsupported MXFP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m
+                               << ", " << tactic_tile_n << ")";
+  TVM_FFI_ICHECK(tactic_tile_m != 128 || tactic_tile_n != 128 || granK == 128)
+      << "unsupported MXFP8 GranK=32 MoE tactic (TileM, TileN)=(128, 128)";
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    if (is_gated) {
+      fused_moe_mxfp8_nt_groupwise_tuned_impl<GRAN_K>(D, A, B, token_offset, num_experts,
+                                                      total_rows, shape_n, shape_k, stream, SFA,
+                                                      SFB, tactic_tile_m, tactic_tile_n);
+    } else {
+      moe_gemm_mxfp8_nt_groupwise_tuned_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
+                                                     shape_n, shape_k, stream, SFA, SFB,
+                                                     tactic_tile_m, tactic_tile_n);
+    }
+  })
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
 template <int GranK>
 void CuteSm120Mxfp8GemmRunner<
     ElementType, OutElementType, AccumElementType,
@@ -205,6 +400,63 @@ void CuteSm120Mxfp8GemmRunner<
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
+template <int GranK>
+void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    moe_gemm_mxfp8_nt_groupwise_tuned_impl(void* D, void const* A, void const* B,
+                                           int32_t const* token_offset, int num_experts,
+                                           int total_rows, int shape_n, int shape_k,
+                                           cudaStream_t stream, int32_t const* SFA,
+                                           int32_t const* SFB, int tactic_tile_m,
+                                           int tactic_tile_n) {
+  constexpr auto kGT = sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
+  constexpr int kTileK_M64 = (GranK == 32) ? 64 : 128;
+  using KT_M64_N64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 64, kTileK_M64, 4, GranK, kGT>;
+  using KT_M64_N128 =
+      sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
+  using KT_M128_N64 = sm120_blockscaled::SM120BlockScaledBuilder<128, 64, 64, 4, GranK, kGT>;
+  using KT_M32_N128 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
+  using KT_SWAPAB_N8 = sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, true>;
+
+  auto ptr_A = reinterpret_cast<typename KT_M128_N64::ElementA*>(const_cast<void*>(A));
+  auto ptr_B = reinterpret_cast<typename KT_M128_N64::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA =
+      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
+  auto ptr_SFB =
+      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
+  auto ptr_D = reinterpret_cast<typename KT_M128_N64::ElementD*>(D);
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  if (tactic_tile_m == 128 && tactic_tile_n == 8) {
+    sm120_blockscaled::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                     total_rows, shape_n, shape_k, num_experts,
+                                                     token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 32) {
+    sm120_blockscaled::launch_moe_gemm<KT_M32_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                    total_rows, shape_n, shape_k, num_experts,
+                                                    token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 64 && tactic_tile_n == 64) {
+    sm120_blockscaled::launch_moe_gemm<KT_M64_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                   total_rows, shape_n, shape_k, num_experts,
+                                                   token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 64) {
+    sm120_blockscaled::launch_moe_gemm<KT_M64_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                    total_rows, shape_n, shape_k, num_experts,
+                                                    token_offset, num_sms, stream);
+  } else if (tactic_tile_n == 64) {
+    sm120_blockscaled::launch_moe_gemm<KT_M128_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                    total_rows, shape_n, shape_k, num_experts,
+                                                    token_offset, num_sms, stream);
+  } else if constexpr (GranK == 128) {
+    using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+    sm120_blockscaled::launch_moe_gemm<KT_M128_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
+                                                     total_rows, shape_n, shape_k, num_experts,
+                                                     token_offset, num_sms, stream);
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
 void CuteSm120Mxfp8GemmRunner<
     ElementType, OutElementType, AccumElementType,
     BlockScaleElementType>::group_gemm_mxfp8_nt_groupwise_masked(void* D, void const* A,
@@ -256,10 +508,16 @@ void CuteSm120Mxfp8GemmRunner<
                                                         int num_experts, int total_rows,
                                                         int shape_n, int shape_k,
                                                         cudaStream_t stream, int32_t const* SFA,
-                                                        int32_t const* SFB, int granK) {
+                                                        int32_t const* SFB, int granK,
+                                                        bool is_gated) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
-    moe_gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
-                                             shape_n, shape_k, stream, SFA, SFB);
+    if (is_gated) {
+      fused_moe_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
+                                                shape_n, shape_k, stream, SFA, SFB);
+    } else {
+      moe_gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, token_offset, num_experts, total_rows,
+                                               shape_n, shape_k, stream, SFA, SFB);
+    }
   })
 }
 
@@ -292,17 +550,16 @@ void CuteSm120Mxfp8GemmRunner<
   auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
   int num_sms = sm120_blockscaled::get_num_sms();
-  int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
-
-  if (m_per_expert <= 12) {
+  int tile_m = select_mxfp8_plain_moe_tile_m(total_rows, shape_n, shape_k, num_experts, num_sms);
+  if (tile_m == 8) {
     sm120_blockscaled::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
                                                      ptr_D_in, total_rows, shape_n, shape_k,
                                                      num_experts, token_offset, num_sms, stream);
-  } else if (m_per_expert <= 32) {
+  } else if (tile_m == 32) {
     sm120_blockscaled::launch_moe_gemm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
                                                total_rows, shape_n, shape_k, num_experts,
                                                token_offset, num_sms, stream);
-  } else if (m_per_expert < 96 || (m_per_expert < 192 && shape_k <= 2048)) {
+  } else if (tile_m == 64) {
     sm120_blockscaled::launch_moe_gemm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
                                                total_rows, shape_n, shape_k, num_experts,
                                                token_offset, num_sms, stream);
