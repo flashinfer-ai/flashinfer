@@ -1408,7 +1408,11 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+                alpha=(
+                    alpha_for_cute_dsl_mxfp4
+                    if backend in ("cute-dsl", "b12x")
+                    else alpha
+                ),
                 out_dtype=res_dtype,
                 block_size=16
                 if use_nvfp4
@@ -1446,7 +1450,9 @@ def testMmFp4(args):
             b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
             a_descale=input_inv_s,
             b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-            alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+            alpha=(
+                alpha_for_cute_dsl_mxfp4 if backend in ("cute-dsl", "b12x") else alpha
+            ),
             out_dtype=res_dtype,
             block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,

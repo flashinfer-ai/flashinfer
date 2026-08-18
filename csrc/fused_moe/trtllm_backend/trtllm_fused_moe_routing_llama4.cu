@@ -132,6 +132,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         if (params.mPtrTopKWeights != nullptr) {
           params.mPtrTopKWeights[tokenIdx] = finalScore;
         }
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+        }
       }
     }
   } else {
@@ -162,6 +165,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
     if (threadIdx.x < params.mNumTokens) {
       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
+      }
     }
   }
 
@@ -381,6 +387,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   __cluster_barrier_arrive();
   __cluster_barrier_wait();
 
+  // Publish the same top-1 expert selected by the permutation path for FromLogits replay.
+  if (laneIdx == 0 && validToken && params.mPtrRoutingReplayOut != nullptr) {
+    params.mPtrRoutingReplayOut[warpTokenIdx] = smemPackedScoreIdx[warpIdx].idx;
+  }
+
   if (params.mPtrTopKIds != nullptr || params.mPtrScores != nullptr) {
     routingPermutation<KernelParams, OutputT, NumThreads, NumWarps, MaxNumTopExperts,
                        /*LoadExpertIdxFromGlobal=*/false>(params, smemPackedScoreIdx, warpIdx,
@@ -459,6 +470,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
       TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
       params.mPtrTopKPacked[tokenIdx] = packedScore;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+      }
     }
   }
 

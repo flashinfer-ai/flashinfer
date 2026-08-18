@@ -51,6 +51,46 @@ NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
 error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
 with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
+### CUTLASS DSL version
+
+After the editable install, bring the DSL up to a supported version:
+
+```bash
+pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
+```
+
+The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
+kernels need ≥ 4.6.x. **4.6.1** is the perf-validated reference (the TUNING.md
+and benchmark tables were measured on it); **4.7.0** is correctness-validated
+(2026-08-10, jobs 2384640/2384641/2384650: drop harness, fused-quant unit
+tests, and the full deep_gemm/nvfp4/mxfp8 mega multirank + oracle suites all
+green) but its perf has not been measured — pin 4.6.1 when producing numbers
+meant to compare against the reference tables.
+
+History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
+every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
+activation-quant staging (`DataPreprocess` in
+`kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+staging path — fixed by the upstream `50117315d` sync recorded in that drop's
+VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
+their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
+the vLLM engine env, not for running the moe_ep test suite.
+
+Tolerance note (dsl-version-independent, resolved 2026-08-05): on B200 nodes
+`test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` used to fail by
+one bf16 cell (rank 3, |d|=16.0 vs atol=8.0, rel_l2≈0.0017) — the flat atol
+was really "1 bf16 ULP at |term|≈2048" calibrated on GB200's rounding, and
+where large per-topk terms nearly cancel the achievable agreement is bounded
+by the bf16 round-off of the TERMS, not of the final value. The mxfp8 oracle
+compares (multirank + single-GPU) now use a per-cell term-magnitude band
+derived from the oracle's own pre-reduce terms
+(`_assert_mega_oracle_term_band_close` in
+`tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py`), which is
+arch-independent. GB200 verified 2026-08-05; if a B200 run still trips the
+band, that is a real signal, not marginality.
+
 ### Run tests
 
 `tests/moe_ep/run_tests.sh <target>` — targets and requirements:
@@ -62,7 +102,20 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
 
-- **unit** — host-only pytest (mocks + single-GPU).
+- **unit** — host-only pytest (mocks + single-GPU). The full run accumulates
+  native heap damage somewhere in the GPU/DSL/transport stack: with every
+  test PASSING, the process aborts either (a) at the first heavy
+  import/compile burst — historically
+  `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`
+  (`Fatal Python error: Aborted` in the nvfp4 warmup's module imports) — or
+  (b) in CPython teardown after the pytest summary
+  (`malloc(): unaligned tcache chunk detected`, job 2388315). Not a kernel
+  or test bug: everything passes standalone, per-file, and in every subset
+  tried (observed since 2026-07-22; B200, dsl 4.6.1). `run_tests.sh unit`
+  therefore (1) runs that test in its own pytest process and (2) exits both
+  processes via `os._exit(pytest_rc)` to skip interpreter finalization. If
+  the isolated invocation ever FAILS (not crashes), that is a real signal.
+  Root cause still open — needs an ASAN/valgrind pass over the suite.
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
@@ -144,6 +197,34 @@ Notes:
 - NIXL-EP coverage today is smoke + multirank + mocked unit tests only; the
   correctness/mega targets are NCCL-EP-only.
 
+### SM90 mega token sweep
+
+Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
+process (the SM90/SM100 kernel trees are mutually exclusive per process):
+`bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+
+The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
+token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
+topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
+per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
+
+```bash
+torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+```
+
+Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
+each row names the matching drop reference CSV
+(`moe_hopper_fp8/benchmark_data/20260720/...`) so comparison is one grep
+away. The `compute_*_us` columns map to the drop's per-rank
+`mega_us + topk_us`; `e2e_*_us` adds FI staging/validation/output-copy.
+Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
+(default both layouts at the shim default tiles: non-swap M64 N128, swap-AB
+M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
+for the full timing/mapping notes. Measured results, comparison caveats,
+and the reproduce recipe live in
+[`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+
 ---
 
 ## Benchmarking
@@ -180,11 +261,11 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `deep_gemm_mega` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `nvfp4_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `nvfp4_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
-| `+combine_nvfp4`| `fi_combine_fp4` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
-| `+combine_mxfp8`| `fi_combine_fp8` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+| `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
 
 Inside the flashinfer-EP container (editable install per "Build & test
 environment" above), pin the DSL and run the sweep:
@@ -214,7 +295,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `deep_gemm_mega` in parens:
+knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -233,7 +314,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`deep_gemm_mega` in parens.
+`sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -308,8 +389,8 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=deep_gemm_mega` |
-| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_fp4_bf16_deepgemm` |
+| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
@@ -326,7 +407,7 @@ JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
 JOBID=$JOBID bash $W/in_container.sh \
   'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
 JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
+  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
 ```
 
 Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
@@ -378,12 +459,23 @@ prefill chunks), per-role offline knob caches.
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. The kernel sources
-themselves live under
-`flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/` and are exposed
-through the `kernel_src/cutedsl_megamoe/` public API (e.g. `mxfp8_mega_moe`,
-`get_symm_buffer_for_mxfp8_mega_moe`). Use the existing `mxfp8_cutedsl` backend
-as the reference template.
+under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
+vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
+
+- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
+  (a fork of the same kernel repo)
+- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
+  JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
+
+Each tree exposes its kernels through its own package public API (e.g. the
+sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
+trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
+own drop revision and are **process-exclusive** — the top-level kernel module
+names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
+sibling tree's modules are already imported (a process runs on one
+architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
+reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
@@ -438,12 +530,13 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-Add both functions under
-`kernel_src/cutedsl_megamoe/shim/` (alongside `nvfp4.py` / `mxfp8.py`) and
-re-export them from the package `__init__.py` (or point at your own kernel
-module). Raw kernel sources live under `kernel_src/cutedsl_megamoe/src/` — see
-`kernel_src/cutedsl_megamoe/SKILL.md` for how to update that directory when the
-kernel team ships a new drop. The kernel-specific tuning knobs
+Add both functions under the owning tree's `shim/` — e.g.
+`kernel_src/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+for Hopper — and re-export them from that package's `__init__.py` (or point at
+your own kernel module). Raw kernel sources live under the tree's `src/` — see
+the tree's `SKILL.md` for how to update that directory when the kernel team
+ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
 these two calls by the backend in step 4 — so an SM90/SM120 kernel that needs

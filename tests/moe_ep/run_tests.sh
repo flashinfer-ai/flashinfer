@@ -6,10 +6,13 @@
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
+#   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
+#   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
+#   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl vs drop reference
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
 #
@@ -81,22 +84,57 @@ run_section() {
   fi
 }
 
+# Run pytest and exit the interpreter WITHOUT finalization (os._exit).
+# The full unit suite accumulates native heap damage somewhere in the
+# GPU/DSL/transport stack: with every test PASSING, the process can still
+# abort in CPython teardown ("malloc(): unaligned tcache chunk detected"
+# after the pytest summary, observed 2026-08-12 job 2388315) or, earlier,
+# inside the first heavy import after the suite (the nvfp4 warmup case
+# below). Skipping interpreter finalization sidesteps the teardown
+# detonation; the pytest exit code (all-tests result) is preserved.
+# Root-causing the corruption needs an ASAN/valgrind pass — tracked in the
+# runbook's unit-suite notes.
+pytest_no_finalize() {
+  "${PY}" -c '
+import os, sys
+import pytest
+rc = int(pytest.main(sys.argv[1:]))
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(rc)
+' "$@"
+}
+
 run_unit() {
-  "${PY}" -m pytest tests/moe_ep/ -v \
+  pytest_no_finalize tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
     --ignore=tests/moe_ep/test_mega_cuda_graph.py \
-    -k "not multirank_roundtrip"
+    -k "not multirank_roundtrip" \
+    --deselect "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # Run the nvfp4 symm-buffer-sharing test in its own interpreter. In-suite it
+  # crashes the process (Fatal Python error: Aborted) inside the nvfp4 layer
+  # warmup's kernel-module imports — the same suite-accumulated heap damage
+  # (see pytest_no_finalize above), detonating at the first big
+  # import/compile burst instead of at teardown. Passes 100% standalone,
+  # per-file, and in every subset tried (see moe_ep runbook "unit suite"
+  # notes; observed since 2026-07-22).
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
 }
 
 run_multirank() {
@@ -198,6 +236,20 @@ run_oracle() {
   return "${rc}"
 }
 
+# Single-GPU Hopper torch-oracle correctness: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel vs the
+# kernel drop's own pure-torch reference (compute_megamoe_reference_fp8).
+# Runs in its OWN pytest process: the SM90 and SM100 kernel trees share
+# top-level module names and are mutually exclusive per process, so this file
+# is excluded from run_unit and must not share an invocation with
+# SM100-importing tests.  MEGA_NO_DIST=1 single-rank (the sm90 shim's comm
+# bootstrap supports it, like the sm100 cutedsl oracle runs above).
+run_oracle_sm90() {
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py -v \
+    -m arch_hopper
+}
+
 run_mega() {
   local rc=0
 
@@ -215,6 +267,30 @@ run_mega() {
     -m arch_blackwell || rc=1
 
   return "${rc}"
+}
+
+# 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (layer-vs-direct-shim parity on
+# real cross-rank EP traffic).  Own torchrun pytest process: the SM90 and
+# SM100 kernel trees share top-level module names and are mutually exclusive
+# per process, so this must not share an invocation with the Blackwell mega
+# tests above (and is excluded from run_unit).
+run_mega_sm90() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py -v \
+    -m "gpu_4 and arch_hopper"
+}
+
+# 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
+# Own target rather than folded into `multirank` (upstream PR #4069 runs it
+# there): on non-Hopper nodes the arch-marked files collect 0 tests and
+# torchrun turns pytest exit 5 into a failure.
+NPROC_SM90_PUSH="${NPROC_SM90_PUSH:-2}"
+run_sm90_push() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_fp8_kernel.py \
+    tests/moe_ep/test_sm90_push_fp8_backend.py -v
 }
 
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
@@ -242,7 +318,9 @@ run_ft() {
       tests/moe_ep/smoke_ft_ep.py --backend "${backend}" 2>&1)" || true
     echo "${out}"
     local ok
-    ok="$(printf '%s' "${out}" | grep -c 'SMOKE_RESULT:' || true)"
+    # Count occurrences, not lines: the survivors' prints go through
+    # torchrun's stdout multiplexing and can interleave onto a single line.
+    ok="$(printf '%s' "${out}" | grep -o 'SMOKE_RESULT:' | wc -l)"
     if [ "${ok}" -ne "${expected_ok}" ]; then
       echo "FT smoke (${backend}): expected ${expected_ok} SMOKE_RESULT lines, got ${ok}" >&2
       rc=1
@@ -307,16 +385,19 @@ run_all() {
 case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
+  oracle_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
+  mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

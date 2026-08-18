@@ -133,6 +133,27 @@ class TestB12xUnifiedValidation:
             RoutingInputMode.PackedPrecomputed,
         )
 
+    def test_b12x_constructor_defers_idempotent_wrapper_build(self, monkeypatch):
+        import flashinfer.fused_moe.cute_dsl as cute_dsl
+
+        config = self._config(B12xNvfp4Config(), QuantVariant.NVFP4)
+
+        class Wrapper:
+            pass
+
+        monkeypatch.setattr(cute_dsl, "B12xMoEWrapper", Wrapper)
+        runner = B12xNvfp4Runner(config, torch.device("cuda:0"))
+        runner._check_support = lambda: None
+
+        assert runner._wrapper_cls is None
+
+        runner.check_support()
+        runner.build()
+        runner.build()
+
+        assert runner._wrapper_cls is Wrapper
+        assert runner._built
+
     @pytest.mark.parametrize(
         "runner_type,expected",
         ((B12xNvfp4Runner, "nvfp4"), (B12xW4A16Runner, "w4a16")),
@@ -328,6 +349,7 @@ class TestB12xUnifiedValidation:
             prepared["fc2_input_scale"] = weight
 
         runner = object.__new__(runner_type)
+        runner._built = True
         runner._prepared_weights = prepared
         runner._inner = Wrapper()
         hidden = torch.empty(1, 16)

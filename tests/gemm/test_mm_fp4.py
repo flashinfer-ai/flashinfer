@@ -44,14 +44,14 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports 128x4 SF layout")
         if compute_capability[0] != 12:
             pytest.skip("b12x backend only supports SM120/SM121 GPUs.")
-        if not use_nvfp4:
-            pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
         if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
-        pytest.skip("mx_fp4 is only supported for cudnn, cute-dsl, and auto backends")
+    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
+        pytest.skip(
+            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, and auto backends"
+        )
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -176,6 +176,26 @@ def test_mm_fp4_b12x_misaligned_k_raises():
     ):
         pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
     m, n, k = 64, 512, 112  # k % 32 == 16
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha,
+            torch.bfloat16,
+            res,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="b12x",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def _nvfp4_operands(m, n, k):
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     g_in = (448 * 6) / a.float().abs().nan_to_num().max()
@@ -186,22 +206,40 @@ def test_mm_fp4_b12x_misaligned_k_raises():
     b_fp4, b_s = nvfp4_quantize(
         b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
     )
-    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of 32"):
-        mm_fp4(
+    return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
+
+
+def test_mm_fp4_b12x_short_k_multi_wave():
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles, a regime the
+    # parametrized shapes never reach. Repeats, since a bad handoff shows
+    # up as a timing-dependent mismatch.
+    device = torch.device("cuda")
+    if not (
+        is_sm12x_supported(device) and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
+    m, n, k = 1024, 4096, 128
+    for _ in range(3):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+        res = mm_fp4(
             a_fp4,
             b_fp4.T,
             a_s,
             b_s.T,
-            1.0 / (g_in * g_w),
+            alpha,
             torch.bfloat16,
-            res,
+            None,
             block_size=16,
             use_8x4_sf_layout=False,
             backend="b12x",
             use_nvfp4=True,
-            skip_check=False,
         )
+        reference = torch.mm(a, b.T)
+        cos_sim = F.cosine_similarity(
+            reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
+        ).item()
+        assert cos_sim > 0.97
 
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():

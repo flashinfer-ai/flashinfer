@@ -19,6 +19,7 @@ from typing import Literal
 
 import pytest
 import torch
+import flashinfer.autotuner as autotuner_module
 
 from flashinfer import (
     RoutingMethodType,
@@ -37,13 +38,22 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
-from flashinfer.fused_moe.core import Fp8QuantizationType, MoEInputs
+from flashinfer.fused_moe.core import (
+    Fp8QuantizationType,
+    MoEInputs,
+    get_trtllm_moe_sm100_module,
+)
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import (
     device_support_pdl,
     get_compute_capability,
     last_positive_power_of_2,
+)
+
+from . import utils as moe_utils
+from .test_trtllm_gen_per_token_moe import (
+    test_routed_fused_moe as _run_per_token_nvfp4_accuracy_case,
 )
 
 from .trtllm_gen_fused_moe_utils import (
@@ -310,6 +320,7 @@ def _enumerate_valid_tactics(
     intermediate_size: int,
     num_experts: int,
     num_tokens: int,
+    use_per_token_scaling: bool = False,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given problem shape."""
@@ -328,11 +339,64 @@ def _enumerate_valid_tactics(
             ActivationType.Swiglu.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
-            False,  # use_per_token_scaling
+            use_per_token_scaling,
             num_tokens,
             False,  # has_gemm1_lora_delta
         )
     )
+
+
+def test_nvfp4_per_token_all_tactics_are_correct(monkeypatch: pytest.MonkeyPatch):
+    """Every advertised per-token NVFP4 tactic must be numerically correct."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    torch.manual_seed(42)
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k=8,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=128,
+        num_tokens=4096,
+        use_per_token_scaling=True,
+    )
+    assert valid_tactics
+
+    moe_module = get_trtllm_moe_sm100_module()
+    real_autotune = autotuner_module.autotune
+    monkeypatch.setattr(
+        autotuner_module, "autotune", lambda _enabled: real_autotune(True)
+    )
+    tuner = AutoTuner.get()
+
+    for tactic in valid_tactics:
+        tactic = list(tactic)
+        monkeypatch.setattr(
+            moe_module.MoERunner,
+            "get_valid_tactics",
+            lambda self, inputs, profile, tactic=tactic: [tactic],
+        )
+        tuner.profiling_cache.clear()
+        tuner._file_configs.clear()
+        try:
+            with moe_utils.nvfp4_4over6_env(True):
+                _run_per_token_nvfp4_accuracy_case(
+                    num_tokens=4096,
+                    hidden_size=2048,
+                    intermediate_size=768,
+                    num_experts=128,
+                    top_k=8,
+                    use_4over6=True,
+                    weights_use_4over6=True,
+                )
+        except Exception as err:
+            raise AssertionError(
+                f"Per-token NVFP4 tactic {tactic} failed accuracy"
+            ) from err
+        torch.cuda.empty_cache()
 
 
 def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():

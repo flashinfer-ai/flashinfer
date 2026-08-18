@@ -142,7 +142,7 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG = TuningConfig(
 )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
     return True
 

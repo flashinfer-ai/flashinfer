@@ -8,7 +8,7 @@ from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
-@pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("m", [1, 8, 16, 25, 32, 64])
 @pytest.mark.parametrize("n", [1024, 2048, 4096])
 @pytest.mark.parametrize("k", [1024, 2048, 3072])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
