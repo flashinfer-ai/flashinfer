@@ -11,6 +11,7 @@ from .ptx_helpers import (
     stg_e8m0x8_from_f32,
 )
 from .smem_workspace import SmemWorkspace
+from .software_sync import NvlinkBarrier, SoftwareGridSync
 from .utils import (
     IntegerType,
     ceil_div,
@@ -26,7 +27,9 @@ __all__ = [
     "GpuAsyncReleaseFlagBatchTracker",
     "GpuReleaseFlagBatchTracker",
     "IntegerType",
+    "NvlinkBarrier",
     "SmemWorkspace",
+    "SoftwareGridSync",
     "ceil_div",
     "cosize_from_shape_stride_tuples",
     "cvt_f32_to_fp8_to_f32",

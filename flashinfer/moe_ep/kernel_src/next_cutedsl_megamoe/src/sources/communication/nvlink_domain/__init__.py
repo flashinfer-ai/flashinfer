@@ -1,8 +1,8 @@
 """NVLink-domain pointer mapping and token communication."""
 
+from ...helpers.software_sync import NvlinkBarrier, SoftwareGridSync
 from ...quant_def import QuantKind
 from .symmetric_buffer import SymmetricBufferDevice, SymmetricBufferHost
-from .software_sync import NvlinkBarrier, SoftwareGridSync
 from .token_comm import (
     TokenBackMode,
     TokenBackScheduleMode,

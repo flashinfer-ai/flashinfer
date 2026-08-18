@@ -10,10 +10,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Int32
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.cutlass_dsl import Boolean, Int32
 
-from .....api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
+from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
@@ -22,7 +21,13 @@ from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
-from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
+from ....schedulers.fc12_scheduler import (
+    BlackwellFusedFc12Scheduler,
+    PhaseInterleavedFc12Scheduler,
+    minimum_phase_interleave_hint,
+)
+from ....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
+from ...custom_mix_cga_helpers import TmaAtomOrPair, pipeline_init_arrive_mixed_cga, pipeline_init_wait_mixed_cga
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
@@ -82,6 +87,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "fc2_use_bulk": bool,
             "epi_flag_batches": tuple,
             "launch_cluster_count": int,
+            "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
+            "preferred_cluster_count": OptionalRequirement(Optional[int]),
+            "fallback_cluster_count": OptionalRequirement(Optional[int]),
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
@@ -134,6 +142,25 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
         self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
 
+        self.mixed_cga_config = NonClcMixedCgaConfig(
+            preferred_cluster_shape=self.cluster_shape_mn,
+            fallback_cluster_shape=impl_desc.get("fallback_cluster_shape_mn"),
+            launch_cluster_count=self.launch_cluster_count,
+            preferred_cluster_count=impl_desc.get("preferred_cluster_count"),
+            fallback_cluster_count=impl_desc.get("fallback_cluster_count"),
+        )
+        self.fallback_cluster_shape_mn = self.mixed_cga_config.fallback_cluster_shape
+        self.preferred_cluster_count = self.mixed_cga_config.preferred_cluster_count
+        self.fallback_cluster_count = self.mixed_cga_config.fallback_cluster_count
+        self.resolved_fallback_cluster_shape_mn = (
+            self.cluster_shape_mn if self.fallback_cluster_shape_mn is None else self.fallback_cluster_shape_mn
+        )
+        if self.launch_cluster_count != self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred:
+            raise ValueError(
+                "launch_cluster_count must equal the canonical preferred-cluster slot count resolved from "
+                "preferred_cluster_count and fallback_cluster_count."
+            )
+
         self._validate_geometry()
         self._resolve_schedule_hint()
         mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -160,11 +187,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
+                "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
+                "preferred_cluster_count": self.preferred_cluster_count,
+                "fallback_cluster_count": self.fallback_cluster_count,
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
-                "promised_launchable_sm_count": (
-                    self.launch_cluster_count * self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-                ),
+                "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
                 "token_back_schedule_mode": ("atomic_counter" if self.work_id_mode == "atomic_counter" else "static"),
                 "router_smem_limit_bytes": cutlass.memory.get_smem_capacity_in_bytes(self.architecture),
             }
@@ -176,6 +204,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         resolved_impl_desc = ImplDesc(
             {
                 **impl_desc,
+                "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
+                "preferred_cluster_count": self.preferred_cluster_count,
+                "fallback_cluster_count": self.fallback_cluster_count,
                 "hint": self.hint,
                 "tmem_plan": tmem_plan,
                 "is_swap_ab": True,
@@ -312,10 +343,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("The intermediate dimension must be divisible by four scale-factor vectors.")
         if cluster_n != 1:
             raise ValueError(f"The swap-AB FC12 path requires cluster N=1, got {cluster_n}.")
-        if cluster_m <= 0 or cluster_m > 4 or cluster_m & (cluster_m - 1):
-            raise ValueError("cluster M must be a power of two no greater than four.")
+        if cluster_m <= 0 or cluster_m > 16 or cluster_m & (cluster_m - 1):
+            raise ValueError("cluster M must be a power of two no greater than 16.")
         if self.use_2cta_instrs and cluster_m % 2 != 0:
             raise ValueError("Two-CTA MMA requires an even cluster M.")
+        if self.fallback_cluster_shape_mn is not None:
+            fallback_cluster_m, fallback_cluster_n = self.fallback_cluster_shape_mn
+            if fallback_cluster_n != 1:
+                raise ValueError(f"The swap-AB FC12 fallback path requires cluster N=1, got {fallback_cluster_n}.")
+            if fallback_cluster_m <= 0 or fallback_cluster_m > 16 or fallback_cluster_m & (fallback_cluster_m - 1):
+                raise ValueError("fallback cluster M must be a power of two no greater than 16.")
+            if self.use_2cta_instrs and fallback_cluster_m % 2 != 0:
+                raise ValueError("Two-CTA MMA requires an even fallback cluster M.")
 
     def _resolve_schedule_hint(self) -> None:
         if self.schedule_mode != "phase_interleave":
@@ -325,10 +364,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         cluster_feature_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
         blocks_fc1 = ceil_div(self.intermediate_gateup_size, cluster_feature_tile)
         blocks_fc2 = ceil_div(self.hidden_size, cluster_feature_tile)
-        # Cover the worst token-block alignment of one full persistent-cluster FC2 claim wave.
-        max_dependent_token_blocks = ceil_div(self.launch_cluster_count + blocks_fc2 - 1, blocks_fc2)
-        required_fc1_work = max_dependent_token_blocks * blocks_fc1
-        raw_minimum_hint = max(1, ceil_div(required_fc1_work, self.launch_cluster_count))
+        raw_minimum_hint = minimum_phase_interleave_hint(
+            blocks_fc1=blocks_fc1,
+            blocks_fc2=blocks_fc2,
+            launch_cluster_cnt_merge_as_preferred=self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred,
+        )
         minimum_safe_hint = round_up(raw_minimum_hint, self.epi_flag_batches[0])
         if self.hint is None:
             self.hint = minimum_safe_hint
@@ -396,6 +436,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         instruction = "x".join(str(dimension) for dimension in self.mma_instruction_mnk)
         tile = "x".join(str(dimension) for dimension in self.mma_tiler_mnk)
         cluster = "x".join(str(dimension) for dimension in self.cluster_shape_mn)
+        fallback_cluster = (
+            "none"
+            if self.fallback_cluster_shape_mn is None
+            else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
+        )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
         return (
             f"sm107_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
@@ -406,11 +451,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"inst{instruction}_{self.mma_k_mode}_tile{tile}_"
             f"cluster{cluster}_{'2cta' if self.use_2cta_instrs else '1cta'}_"
+            f"fallback{fallback_cluster}_prefclusters{self.preferred_cluster_count}_"
+            f"fallbackclusters{self.fallback_cluster_count}_"
             f"sched{self.schedule_mode}_hint{self.hint}_pad{self.token_padding_block}x{self.sf_padding_block}_"
             f"work{self.work_id_mode}_"
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
-            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
+            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
@@ -715,13 +762,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc2_tma_sfa_tensor,
             fc2_tma_sfa_atom,
             fc1_tma_b_tensor,
-            fc1_tma_b_atom,
+            fc1_tma_b_atom_or_pair,
             fc1_tma_sfb_tensor,
-            fc1_tma_sfb_atom,
+            fc1_tma_sfb_atom_or_pair,
             fc2_tma_b_tensor,
-            fc2_tma_b_atom,
+            fc2_tma_b_atom_or_pair,
             fc2_tma_sfb_tensor,
-            fc2_tma_sfb_atom,
+            fc2_tma_sfb_atom_or_pair,
         ) = self._mainloop.prepare_tma_load_params(
             fc1_a=fc1_a,
             fc1_b=fc1_b,
@@ -739,7 +786,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
-        self._kernel(
+        kernel = self._kernel(
             fc1_tma_a_tensor,
             fc1_tma_a_atom,
             fc1_tma_sfa_tensor,
@@ -749,13 +796,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc2_tma_sfa_tensor,
             fc2_tma_sfa_atom,
             fc1_tma_b_tensor,
-            fc1_tma_b_atom,
+            fc1_tma_b_atom_or_pair,
             fc1_tma_sfb_tensor,
-            fc1_tma_sfb_atom,
+            fc1_tma_sfb_atom_or_pair,
             fc2_tma_b_tensor,
-            fc2_tma_b_atom,
+            fc2_tma_b_atom_or_pair,
             fc2_tma_sfb_tensor,
-            fc2_tma_sfb_atom,
+            fc2_tma_sfb_atom_or_pair,
             fc1_output_tma_atom,
             fc1_output_tma_tensor,
             fc2_output_tma_atom,
@@ -774,14 +821,26 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
-            stream=stream,
-            min_blocks_per_mp=self.occupancy,
-            use_pdl=True,
         )
+        if cutlass.const_expr(self.mixed_cga_config.is_mixed):
+            kernel.launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=(*self.cluster_shape_mn, 1),
+                fallback_cluster=(*self.resolved_fallback_cluster_shape_mn, 1),
+                stream=stream,
+                min_blocks_per_mp=self.occupancy,
+                use_pdl=True,
+            )
+        else:
+            kernel.launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=(*self.cluster_shape_mn, 1),
+                stream=stream,
+                min_blocks_per_mp=self.occupancy,
+                use_pdl=True,
+            )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             self._topk_reduce(
@@ -800,13 +859,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_tma_sfa_tensor: cute.Tensor,
         fc2_tma_sfa_atom: cute.CopyAtom,
         fc1_tma_b_tensor: cute.Tensor,
-        fc1_tma_b_atom: cute.CopyAtom,
+        fc1_tma_b_atom_or_pair: TmaAtomOrPair,
         fc1_tma_sfb_tensor: cute.Tensor,
-        fc1_tma_sfb_atom: cute.CopyAtom,
+        fc1_tma_sfb_atom_or_pair: TmaAtomOrPair,
         fc2_tma_b_tensor: cute.Tensor,
-        fc2_tma_b_atom: cute.CopyAtom,
+        fc2_tma_b_atom_or_pair: TmaAtomOrPair,
         fc2_tma_sfb_tensor: cute.Tensor,
-        fc2_tma_sfb_atom: cute.CopyAtom,
+        fc2_tma_sfb_atom_or_pair: TmaAtomOrPair,
         fc1_output_tma_atom: cute.CopyAtom,
         fc1_output_tma_tensor: cute.Tensor,
         fc2_output_tma_atom: Optional[cute.CopyAtom],
@@ -851,17 +910,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
 
         thread_idx, _, _ = cute.arch.thread_idx()
-        warp_idx = cute.arch.make_warp_uniform(thread_idx // 32)
+        warp_idx = thread_idx // 32
         block_idx = cute.arch.block_idx()
-        grid_dim = cute.arch.grid_dim()
+        active_cluster_m = Int32(self.cluster_shape_mn[0])
+        is_fallback_cluster = Boolean(False)
+        if cutlass.const_expr(self.mixed_cga_config.is_mixed):
+            active_cluster_m, _, _ = cute.arch.block_in_cluster_dim()
+            is_fallback_cluster = active_cluster_m == Int32(self.resolved_fallback_cluster_shape_mn[0])
         cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-        cta_coord_in_cluster = (
-            cta_rank_in_cluster % self.cluster_shape_mn[0],
-            cta_rank_in_cluster // self.cluster_shape_mn[0],
-            cutlass.Int32(0),
-        )
-        cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-        linear_cta_idx = cta_rank_in_cluster + block_idx[2] * Int32(cluster_size)
+        cta_coord_in_cluster = (cta_rank_in_cluster, Int32(0), Int32(0))
+        linear_cta_idx = block_idx[0] + block_idx[2] * Int32(self.cluster_shape_mn[0])
         token_comm_args = TokenCommArgs(
             activation=activation,
             activation_sf=activation_sf,
@@ -880,6 +938,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_done_counter = self.token_comm.fc2_done_counter_tensor(self._device_workspace)
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
 
+        self._mainloop.assign_device_members(
+            self._smem_workspace, smem_base, cta_coord_in_cluster, is_fallback_cluster, hidden, intermediate_gateup
+        )
         ab_pipeline = self._mainloop.create_ab_pipeline(self._smem_workspace, smem_base)
         tma_a_pipeline_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self._mainloop.num_ab_pipeline_stages
@@ -899,10 +960,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             expert_token_prefix_sum=None,
             actual_expert_shape=actual_expert_shape,
             block_idx=block_idx,
-            grid_dim=grid_dim,
             smem_workspace=self._smem_workspace,
             smem_base=smem_base,
             device_workspace=self._device_workspace,
+            is_fallback_cluster=is_fallback_cluster,
         )
         scheduler = self.scheduler
 
@@ -917,15 +978,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
         )
 
-        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
-        self._mainloop.assign_device_members(
-            self._smem_workspace, smem_base, cta_coord_in_cluster, hidden, intermediate_gateup
+        pipeline_init_arrive_mixed_cga(
+            self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster, is_relaxed=True
         )
-        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        pipeline_init_wait_mixed_cga(
+            self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
+        )
+        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
+        finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.scheduler_register_count)
             iket.range_push("mega.scheduler")
+            if cutlass.const_expr(hasattr(scheduler, "initialize_fallback_group")):
+                iket.range_push("scheduler.register_group")
+                scheduler.initialize_fallback_group()
+                iket.range_pop()
             iket.range_push("scheduler.wait_sizes_ready")
             self.token_comm.wait_for_sizes_ready(self._device_workspace)
             iket.range_pop()
@@ -971,13 +1039,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_b(
                 fc1_tma_b_tensor=fc1_tma_b_tensor,
-                fc1_tma_b_atom=fc1_tma_b_atom,
+                fc1_tma_b_atom_or_pair=fc1_tma_b_atom_or_pair,
                 fc1_tma_sfb_tensor=fc1_tma_sfb_tensor,
-                fc1_tma_sfb_atom=fc1_tma_sfb_atom,
+                fc1_tma_sfb_atom_or_pair=fc1_tma_sfb_atom_or_pair,
                 fc2_tma_b_tensor=fc2_tma_b_tensor,
-                fc2_tma_b_atom=fc2_tma_b_atom,
+                fc2_tma_b_atom_or_pair=fc2_tma_b_atom_or_pair,
                 fc2_tma_sfb_tensor=fc2_tma_sfb_tensor,
-                fc2_tma_sfb_atom=fc2_tma_sfb_atom,
+                fc2_tma_sfb_atom_or_pair=fc2_tma_sfb_atom_or_pair,
                 ab_pipeline=ab_pipeline,
                 ab_pipeline_state=tma_b_pipeline_state,
                 sched_consumer=sched_consumer,
@@ -1031,6 +1099,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
+            finalize_barrier.arrive_unaligned()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
@@ -1044,17 +1113,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                     iket.range_pop()
+                finalize_barrier.arrive_and_wait()
+                iket.range_push("mega.tail_reset")
+                self.token_comm.reset_tail()
+                iket.range_pop()
             elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
                 iket.range_push("mega.token_back_standalone")
                 self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()
-
-        iket.range_push("mega.kernel_tail_wait")
-        cute.arch.sync_threads()
-        iket.range_pop()
-        if (warp_idx >= Int32(self.transfer_warp_idx_start)) & (warp_idx < Int32(self.token_in_end_warp_idx)):
-            iket.range_push("mega.tail_reset")
-            self.token_comm.reset_tail()
-            iket.range_pop()
+                finalize_barrier.arrive_unaligned()
         self.token_comm.remove_device_members()
         self._device_workspace.remove_device_members()

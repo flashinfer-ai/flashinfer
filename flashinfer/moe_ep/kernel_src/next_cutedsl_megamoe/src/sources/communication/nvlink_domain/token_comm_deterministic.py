@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
@@ -19,6 +20,7 @@ from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.dsl_helpers import smem_exclusive_prefix
 from ...helpers.flag_batch import GpuReleaseFlagBatchTracker
 from ...helpers.iket_compat import iket
+from ...helpers.software_sync import NvlinkBarrier
 from ...helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
@@ -34,7 +36,6 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
-from .software_sync import NvlinkBarrier
 from .symmetric_buffer import SymmetricBufferDevice
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs
 
@@ -45,6 +46,33 @@ _quant_spec = {
     "mxfp8_e4m3": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
     "mxfp8_e5m2": (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, 32),
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReceiveCapacity:
+    raw_route_count: int
+    logical_route_count: int
+    padded_route_count: int
+
+
+def _compute_receive_capacity(
+    *,
+    world_size: int,
+    max_tokens_per_rank: int,
+    topk: int,
+    experts_per_rank: int,
+    max_recv_size_per_rank: int,
+    padding_block: int,
+) -> _ReceiveCapacity:
+    raw_route_count = world_size * max_tokens_per_rank * topk
+    logical_route_count = min(max_recv_size_per_rank, raw_route_count)
+    active_expert_count = min(experts_per_rank, logical_route_count)
+    padded_block_count = active_expert_count + (logical_route_count - active_expert_count) // padding_block
+    return _ReceiveCapacity(
+        raw_route_count=raw_route_count,
+        logical_route_count=logical_route_count,
+        padded_route_count=padded_block_count * padding_block,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,6 +107,20 @@ def _mark_alignment(tensor: cute.Tensor, byte_alignment: int) -> cute.Tensor:
     pointer = tensor.iterator
     return cute.make_tensor(
         cute.make_ptr(pointer.dtype, pointer.toint(), pointer.memspace, assumed_align=byte_alignment), tensor.layout
+    )
+
+
+@cute.jit
+def _device_trap() -> None:
+    """Terminate the current kernel after its failure state is published."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="trap;",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -124,12 +166,13 @@ class _MetadataPushRouter(KernelComponent):
             "expert_count": int,
             "topk": int,
             "max_tokens_per_rank": int,
+            "max_recv_size_per_rank": int,
             "apply_topk_at_fc1": bool,
         }
 
     @classmethod
     def impl_desc_require(cls) -> dict[str, type]:
-        return {"token_padding_block": int, "promised_launchable_sm_count": int}
+        return {"token_padding_block": int, "promised_launchable_sm_count": int, "drop_on_overflow": bool}
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
@@ -138,12 +181,20 @@ class _MetadataPushRouter(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
 
         self.token_padding_block = impl_desc["token_padding_block"]
         self.promised_launchable_sm_count = impl_desc["promised_launchable_sm_count"]
+        self.drop_on_overflow = impl_desc["drop_on_overflow"]
 
         self._validate_router_configuration()
+        token_capacity = self.receive_capacity(self.token_padding_block)
+        self.raw_route_count = token_capacity.raw_route_count
+        self.logical_route_capacity = token_capacity.logical_route_count
+        self.worst_case_token_count = token_capacity.padded_route_count
         self.expert_count_padded = round_up(self.expert_count, 4)
         self.expert_count_with_trash = self.expert_count_padded + 1
         self.router_elements_per_lane, self.router_data_cta_count = self._router_launch_configuration()
@@ -164,13 +215,19 @@ class _MetadataPushRouter(KernelComponent):
         self._router_grid_thread_idx = None
         self._router_warp_idx = None
         self._router_lane_idx = None
+        self._overflow_flag = None
 
     def _validate_router_configuration(self) -> None:
+        if type(self.max_recv_size_per_rank) is not int:
+            raise TypeError(f"max_recv_size_per_rank must be an int, got {type(self.max_recv_size_per_rank).__name__}.")
+        if type(self.drop_on_overflow) is not bool:
+            raise TypeError(f"drop_on_overflow must be a bool, got {type(self.drop_on_overflow).__name__}.")
         positive_fields = (
             "world_size",
             "expert_count",
             "topk",
             "max_tokens_per_rank",
+            "max_recv_size_per_rank",
             "token_padding_block",
             "promised_launchable_sm_count",
         )
@@ -191,18 +248,15 @@ class _MetadataPushRouter(KernelComponent):
     def experts_per_rank(self) -> int:
         return self.expert_count // self.world_size
 
-    def worst_case_padded_tokens(self, block: int) -> int:
-        source_token_capacity = self.world_size * self.max_tokens_per_rank
-        routes_per_source_token = min(self.topk, self.experts_per_rank)
-        route_capacity = source_token_capacity * routes_per_source_token
-        active_expert_capacity = min(self.experts_per_rank, route_capacity)
-        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
-        return min(route_budget_blocks, expert_bound_blocks) * block
-
-    @property
-    def worst_case_token_count(self) -> int:
-        return self.worst_case_padded_tokens(self.token_padding_block)
+    def receive_capacity(self, padding_block: int) -> _ReceiveCapacity:
+        return _compute_receive_capacity(
+            world_size=self.world_size,
+            max_tokens_per_rank=self.max_tokens_per_rank,
+            topk=self.topk,
+            experts_per_rank=self.experts_per_rank,
+            max_recv_size_per_rank=self.max_recv_size_per_rank,
+            padding_block=padding_block,
+        )
 
     def _router_launch_configuration(self) -> Tuple[int, int]:
         def next_power_of_two(value: int) -> int:
@@ -232,10 +286,7 @@ class _MetadataPushRouter(KernelComponent):
             stride=(self.router_warps_per_cta + 1, 1),
         )
         data_lifetime.register_tensor(
-            self.router_data_totals_region,
-            cutlass.Int32,
-            (self.expert_count_with_trash,),
-            byte_alignment=16,
+            self.router_data_totals_region, cutlass.Int32, (self.expert_count_with_trash,), byte_alignment=16
         )
         data_lifetime.register_tensor(
             self.router_data_prefix_region, cutlass.Int32, (self.expert_count_with_trash,), byte_alignment=16
@@ -349,6 +400,7 @@ class _MetadataPushRouter(KernelComponent):
         self,
         topk_indices: cute.Tensor,
         topk_scores: Optional[cute.Tensor],
+        overflow_flag: cute.Tensor,
         local_rank: Int32,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
@@ -359,10 +411,15 @@ class _MetadataPushRouter(KernelComponent):
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
             raise ValueError("apply_topk_at_fc1 requires router topk_scores.")
+        if cutlass.const_expr(overflow_flag.iterator.dtype is not cutlass.Int32):
+            raise TypeError("overflow_flag must use Int32 elements.")
+        if cutlass.const_expr(cute.size(overflow_flag) != 1):
+            raise ValueError("overflow_flag must contain exactly one element.")
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._router_kernel(
             topk_indices,
             topk_scores,
+            overflow_flag,
             local_rank,
             local_workspace,
             shared_workspace,
@@ -380,6 +437,7 @@ class _MetadataPushRouter(KernelComponent):
         self,
         topk_indices: cute.Tensor,
         topk_scores: Optional[cute.Tensor],
+        overflow_flag: cute.Tensor,
         local_rank: Int32,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
@@ -408,6 +466,7 @@ class _MetadataPushRouter(KernelComponent):
         self._router_grid_thread_idx = grid_thread_idx
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
+        self._overflow_flag = overflow_flag
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -425,6 +484,7 @@ class _MetadataPushRouter(KernelComponent):
         self._router_grid_thread_idx = None
         self._router_warp_idx = None
         self._router_lane_idx = None
+        self._overflow_flag = None
 
     @cute.jit
     def _router_single_cta(
@@ -481,13 +541,7 @@ class _MetadataPushRouter(KernelComponent):
 
             iket.range_push("router.sort")
             self._sort_router_elements(
-                expert_registers,
-                match_masks,
-                score_registers,
-                sorted_elements,
-                prefix,
-                histogram,
-                topk_indices.dtype,
+                expert_registers, match_masks, score_registers, sorted_elements, prefix, histogram, topk_indices.dtype
             )
             cute.arch.sync_threads()
             iket.range_pop()
@@ -559,13 +613,7 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
             iket.range_push("router.sort")
             self._sort_router_elements(
-                expert_registers,
-                match_masks,
-                score_registers,
-                sorted_elements,
-                prefix,
-                histogram,
-                topk_indices.dtype,
+                expert_registers, match_masks, score_registers, sorted_elements, prefix, histogram, topk_indices.dtype
             )
             cute.arch.sync_threads()
             iket.range_pop()
@@ -584,9 +632,7 @@ class _MetadataPushRouter(KernelComponent):
             for expert_round in cutlass.range_constexpr(expert_round_count):
                 expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
                 if expert < Int32(self.expert_count_padded):
-                    dump_base[expert] = source_expert_base[expert] + cta_histograms[
-                        self._router_linear_cta_idx, expert
-                    ]
+                    dump_base[expert] = source_expert_base[expert] + cta_histograms[self._router_linear_cta_idx, expert]
             cute.arch.sync_threads()
             self._dump_router_output_by_expert(totals, prefix, dump_base, sorted_elements)
             cute.arch.sync_threads()
@@ -701,14 +747,18 @@ class _MetadataPushRouter(KernelComponent):
                 if route < route_count:
                     source_position = source_begin + route
                     destination_position = destination_begin + route
+                    physical_store = Int32(destination_position < Int32(self.worst_case_token_count))
                     metadata = cute.arch.load(source_metadata + source_position, cutlass.Int64)
                     stg_b64(
                         destination_metadata_address + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes),
                         metadata,
+                        physical_store,
                     )
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score = cute.arch.load(source_scores + source_position, cutlass.Float32)
-                        stg_f32(destination_scores_address + Int64(destination_position) * Int64(4), score)
+                        stg_f32(
+                            destination_scores_address + Int64(destination_position) * Int64(4), score, physical_store
+                        )
 
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
@@ -787,7 +837,7 @@ class _MetadataPushRouter(KernelComponent):
         sizes_ready = self._device_workspace.ptr(self.sizes_ready_region)
         iket.range_push("router.wait_sizes_ready")
         if self._router_thread_idx == Int32(0):
-            while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
+            while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.raw_sizes_ready_target):
                 nanosleep(150)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -850,11 +900,60 @@ class _MetadataPushRouter(KernelComponent):
                         source_ring_offset = source_ring_offset + size_matrix[source_rank, global_expert]
                 push_destination_base[global_expert] = destination_pool_base + source_ring_offset
         cute.arch.sync_threads()
-        if self._router_thread_idx == Int32(0):
-            cute.arch.atomic_add(
-                self._device_workspace.ptr(self.push_table_ready_region), Int32(1), sem="release", scope="gpu"
-            )
         iket.range_pop()
+
+        iket.range_push("router.apply_receive_limit")
+        if self._router_thread_idx == Int32(0):
+            warp_totals[0] = Int32(0)
+        cute.arch.sync_threads()
+        thread_local_total = Int32(0)
+        local_expert_rounds = ceil_div(self.experts_per_rank, block_thread_count)
+        for expert_round in cutlass.range_constexpr(local_expert_rounds):
+            local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
+            if local_expert < Int32(self.experts_per_rank):
+                thread_local_total = thread_local_total + sizes[owner_expert_begin + local_expert]
+        if thread_local_total > Int32(0):
+            cute.arch.atomic_add(warp_totals.iterator, thread_local_total, scope="cta")
+        cute.arch.sync_threads()
+        raw_local_total = warp_totals[0]
+        did_overflow = Int32(raw_local_total > Int32(self.max_recv_size_per_rank))
+
+        if cutlass.const_expr(self.drop_on_overflow):
+            for expert_round in cutlass.range_constexpr(local_expert_rounds):
+                local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
+                if local_expert < Int32(self.experts_per_rank):
+                    # Keep every raw row that still lands inside the statically allocated padded pool.
+                    raw_size = sizes[owner_expert_begin + local_expert]
+                    retained_size = Int32(0)
+                    remaining_capacity = Int32(self.worst_case_token_count) - pool_expert_base[local_expert]
+                    if remaining_capacity > Int32(0):
+                        retained_size = cutlass.min(raw_size, remaining_capacity)
+                    if did_overflow:
+                        sizes[owner_expert_begin + local_expert] = retained_size
+
+        if self._router_thread_idx == Int32(0):
+            cute.arch.store(self._overflow_flag.iterator, did_overflow, sem="relaxed", scope="sys")
+        cute.arch.sync_threads()
+
+        if cutlass.const_expr(self.drop_on_overflow):
+            self._publish_push_table_and_sizes_ready(sizes_ready)
+        else:
+            if did_overflow:
+                if self._router_thread_idx == Int32(0):
+                    cute.arch.fence_acq_rel_sys()
+                    _device_trap()
+            else:
+                self._publish_push_table_and_sizes_ready(sizes_ready)
+        iket.range_pop()
+
+    @cute.jit
+    def _publish_push_table_and_sizes_ready(self, sizes_ready: cute.Pointer) -> None:
+        if self._router_thread_idx == Int32(0):
+            cute.arch.fence_acq_rel_gpu()
+            cute.arch.atomic_add(
+                self._device_workspace.ptr(self.push_table_ready_region), Int32(1), sem="relaxed", scope="gpu"
+            )
+            cute.arch.atomic_add(sizes_ready, Int32(1), sem="relaxed", scope="gpu")
 
     @cute.jit
     def _load_router_inputs(
@@ -936,16 +1035,11 @@ class _MetadataPushRouter(KernelComponent):
             expert = expert_registers[register_idx]
             match_mask = Int32(cute.arch.match_sync(0xFFFFFFFF, expert, kind="any"))
             match_masks[register_idx] = match_mask
-            histogram_slot = (
-                expert * Int32(self.router_warps_per_cta + 1) + self._router_warp_idx
-            )
+            histogram_slot = expert * Int32(self.router_warps_per_cta + 1) + self._router_warp_idx
             rank_in_group = Int32(cute.arch.popc(match_mask & lane_mask_less_than))
             if rank_in_group == Int32(0):
                 cute.arch.atomic_add(
-                    histogram.iterator + histogram_slot,
-                    Int32(cute.arch.popc(match_mask)),
-                    sem="relaxed",
-                    scope="cta",
+                    histogram.iterator + histogram_slot, Int32(cute.arch.popc(match_mask)), sem="relaxed", scope="cta"
                 )
         cute.arch.sync_threads()
         return match_masks
@@ -1084,6 +1178,14 @@ class _MetadataPushRouter(KernelComponent):
     def metadata_ready_target(self) -> int:
         return self.router_push_cta_count * self.world_size
 
+    @property
+    def raw_sizes_ready_target(self) -> int:
+        return self.world_size
+
+    @property
+    def published_sizes_ready_target(self) -> int:
+        return self.world_size + 1
+
     @cute.jit
     def sizes_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         return device_workspace.tensor(self.sizes_region)
@@ -1102,7 +1204,9 @@ class _MetadataPushRouter(KernelComponent):
         lane_idx = thread_idx % Int32(32)
         if lane_idx == Int32(0):
             sizes_ready = device_workspace.ptr(self.sizes_ready_region)
-            while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
+            while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="gpu") != Int32(
+                self.published_sizes_ready_target
+            ):
                 nanosleep(sleep_cycles)
         cute.arch.sync_warp()
 
@@ -1149,6 +1253,8 @@ class TokenCommDeterministic(KernelComponent):
     fc2_done_region = "nvlink.token_comm.fc2_done"
     fc2_activation_region = "nvlink.token_comm.fc2_activation"
     fc2_activation_sf_region = "nvlink.token_comm.fc2_activation_sf"
+    pre_reduced_activation_region = "nvlink.token_comm.pre_reduced_activation"
+    pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
     token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
 
     token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
@@ -1166,6 +1272,7 @@ class TokenCommDeterministic(KernelComponent):
             "expert_count": int,
             "topk": int,
             "max_tokens_per_rank": int,
+            "max_recv_size_per_rank": int,
             "hidden_size": int,
             "quant_kind": str,
             "combine_format": CombineFormat,
@@ -1184,6 +1291,7 @@ class TokenCommDeterministic(KernelComponent):
             "token_back_mode": str,
             "token_back_schedule_mode": str,
             "reduce_topk_in_kernel": bool,
+            "drop_on_overflow": bool,
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1193,6 +1301,9 @@ class TokenCommDeterministic(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = problem_desc["quant_kind"]
         self.combine_format = problem_desc["combine_format"]
@@ -1207,6 +1318,7 @@ class TokenCommDeterministic(KernelComponent):
         self.token_back_mode: TokenBackMode = impl_desc["token_back_mode"]
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.drop_on_overflow = impl_desc["drop_on_overflow"]
 
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
@@ -1219,29 +1331,11 @@ class TokenCommDeterministic(KernelComponent):
         self._lane_idx = None
 
     def _validate_configuration(self) -> None:
-        positive_fields = (
-            "world_size",
-            "expert_count",
-            "topk",
-            "max_tokens_per_rank",
-            "hidden_size",
-            "token_padding_block",
-            "sf_padding_block",
-            "tokens_per_fc1_ready_slot",
-            "promised_launchable_sm_count",
-        )
+        positive_fields = ("hidden_size", "token_padding_block", "sf_padding_block", "tokens_per_fc1_ready_slot")
         for field_name in positive_fields:
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}.")
-        if self.expert_count % self.world_size != 0:
-            raise ValueError(
-                f"expert_count must be divisible by world_size, got {self.expert_count} and {self.world_size}."
-            )
-        if self.expert_count > 16384:
-            raise NotImplementedError("TokenComm supports at most 16384 global experts.")
-        if self.topk > self.expert_count:
-            raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
         if self.quant_kind not in _quant_spec:
             raise ValueError(f"Unsupported quant_kind {self.quant_kind!r}.")
         if self.token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
@@ -1254,6 +1348,8 @@ class TokenCommDeterministic(KernelComponent):
             raise ValueError(f"token_in_flag_batch must be in [1, 32], got {self.token_in_flag_batch}.")
         if self.tokens_per_fc1_ready_slot % self.token_padding_block != 0:
             raise ValueError("tokens_per_fc1_ready_slot must be divisible by token_padding_block.")
+        if self.sf_padding_block % self.token_padding_block != 0:
+            raise ValueError("sf_padding_block must be divisible by token_padding_block.")
         if self.token_back_enabled and self.fc2_done_signals_per_token_tile <= 0:
             raise ValueError("fc2_done_signals_per_token_tile must be positive when token-back is enabled.")
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
@@ -1316,11 +1412,14 @@ class TokenCommDeterministic(KernelComponent):
 
     @property
     def worst_case_sf_token_count(self) -> int:
-        return self._router.worst_case_padded_tokens(self.sf_padding_block)
+        return self._router.receive_capacity(self.sf_padding_block).padded_route_count
 
     @property
     def max_fc1_ready_slot_count(self) -> int:
-        return self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot) // self.tokens_per_fc1_ready_slot
+        return (
+            self._router.receive_capacity(self.tokens_per_fc1_ready_slot).padded_route_count
+            // self.tokens_per_fc1_ready_slot
+        )
 
     @property
     def router_smem_workspace(self) -> SmemWorkspace:
@@ -1372,6 +1471,7 @@ class TokenCommDeterministic(KernelComponent):
         self,
         topk_indices: cute.Tensor,
         topk_scores: Optional[cute.Tensor],
+        overflow_flag: cute.Tensor,
         local_rank: Int32,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
@@ -1382,6 +1482,7 @@ class TokenCommDeterministic(KernelComponent):
         self._router.launch_router(
             topk_indices,
             topk_scores,
+            overflow_flag,
             local_rank,
             local_workspace,
             shared_workspace,
@@ -1466,11 +1567,10 @@ class TokenCommDeterministic(KernelComponent):
             buffer_space="local",
             byte_alignment=128,
         )
-        if not self.token_back_enabled:
-            return
-        workspace.register(
-            self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
-        )
+        if self.token_back_enabled:
+            workspace.register(
+                self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
+            )
         if self.token_back_push_data:
             fc2_element_count = self.worst_case_token_count * self.hidden_size
             workspace.register(
@@ -1489,10 +1589,28 @@ class TokenCommDeterministic(KernelComponent):
                 buffer_space="local",
                 byte_alignment=128,
             )
-        if self.token_back_schedule_mode == "atomic_counter":
+        if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":
             workspace.register(
                 self.token_back_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
+        if not self.reduce_topk_in_kernel:
+            workspace.register(
+                self.pre_reduced_activation_region,
+                self.combine_format.act_dtype,
+                (self.max_tokens_per_rank, self.topk, self.hidden_size),
+                buffer_space="shared",
+                mem_order=(2, 1, 0),
+                byte_alignment=128,
+            )
+            if self.combine_format.is_quantized:
+                workspace.register(
+                    self.pre_reduced_activation_sf_region,
+                    self.combine_format.scale_dtype,
+                    (self.max_tokens_per_rank, self.topk, self.combine_sf_hidden_padded),
+                    buffer_space="shared",
+                    mem_order=(2, 1, 0),
+                    byte_alignment=128,
+                )
 
     def register_smem_regions(self, workspace: SmemWorkspace) -> None:
         workspace.register_mbarrier(self.token_in_mbarrier_region, self.transfer_warp_count)
@@ -1614,6 +1732,20 @@ class TokenCommDeterministic(KernelComponent):
         )
 
     @cute.jit
+    def pre_reduced_activation_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        """Return the source-domain combine plane when top-k reduction is separate."""
+        if cutlass.const_expr(self.reduce_topk_in_kernel):
+            return None
+        return device_workspace.tensor(self.pre_reduced_activation_region)
+
+    @cute.jit
+    def pre_reduced_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        """Return the source-domain combine scale plane when one is required."""
+        if cutlass.const_expr(self.reduce_topk_in_kernel or not self.combine_format.is_quantized):
+            return None
+        return device_workspace.tensor(self.pre_reduced_activation_sf_region)
+
+    @cute.jit
     def token_in(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
         """Wait for pushed metadata, then pull activation payloads into local pools."""
         transfer_warp_idx = self._transfer_warp_idx
@@ -1640,7 +1772,9 @@ class TokenCommDeterministic(KernelComponent):
         destination_size_vectors = cute.zipped_divide(owned_sizes, (copy_elements,))
         size_vector_count = cute.size(destination_size_vectors, mode=[1])
         size_copy_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL if copy_elements == 4 else cute.nvgpu.LoadCacheMode.ALWAYS
+            ),
             cutlass.Int32,
             num_bits_per_copy=copy_elements * 32,
         )
@@ -1813,33 +1947,20 @@ class TokenCommDeterministic(KernelComponent):
         if current_window < reference_window:
             sleep_cycles = reference_window - current_window
         elif current_window > reference_window:
-            sleep_cycles = cutlass.min(
-                current_window - reference_window,
-                Int32(self.standalone_max_backoff_cycles),
-            )
+            sleep_cycles = cutlass.min(current_window - reference_window, Int32(self.standalone_max_backoff_cycles))
         if sleep_cycles > Int32(0):
             nanosleep(sleep_cycles)
 
     @cute.jit
-    def _adaptive_pace(
-        self,
-        average_window: Int32,
-        current_window: Int32,
-        low_window: int,
-        high_window: int,
-    ) -> Int32:
+    def _adaptive_pace(self, average_window: Int32, current_window: Int32, low_window: int, high_window: int) -> Int32:
         sleep_cycles = Int32(0)
         if current_window > average_window:
-            average_window = average_window + (
-                (current_window - average_window + Int32(3)) // Int32(4)
-            )
+            average_window = average_window + ((current_window - average_window + Int32(3)) // Int32(4))
             sleep_cycles = current_window - average_window
             if sleep_cycles > Int32(high_window):
                 sleep_cycles = Int32(high_window)
         else:
-            average_window = average_window - (
-                (average_window - current_window + Int32(3)) // Int32(4)
-            )
+            average_window = average_window - ((average_window - current_window + Int32(3)) // Int32(4))
             sleep_cycles = average_window - current_window
         if sleep_cycles > Int32(self.adaptive_minimum_sleep_cycles):
             nanosleep(sleep_cycles)
@@ -1895,8 +2016,7 @@ class TokenCommDeterministic(KernelComponent):
             activation_chunk_count = ceil_div(output_token_bytes, activation_chunk_bytes)
             data_window_unit = ceil_div(activation_chunk_bytes * 2, 3)
             reuse_data_pacing_enabled = (
-                self.token_back_mode == "reuse_dispatch_warps"
-                and data_window_unit > self.minimum_pacing_window_cycles
+                self.token_back_mode == "reuse_dispatch_warps" and data_window_unit > self.minimum_pacing_window_cycles
             )
             # Preserve the empirical low:initial:high ratio of 1:2.5:5.
             data_average_window = Int32(data_window_unit)
@@ -1909,8 +2029,7 @@ class TokenCommDeterministic(KernelComponent):
             sf_chunk_count = ceil_div(output_sf_bytes, sf_chunk_bytes)
             sf_window_unit = ceil_div(sf_chunk_bytes * 2, 3)
             reuse_sf_pacing_enabled = (
-                self.token_back_mode == "reuse_dispatch_warps"
-                and sf_window_unit > self.minimum_pacing_window_cycles
+                self.token_back_mode == "reuse_dispatch_warps" and sf_window_unit > self.minimum_pacing_window_cycles
             )
             sf_average_window = Int32(sf_window_unit)
             sf_low_window = sf_window_unit * 2 // 5
@@ -2013,10 +2132,7 @@ class TokenCommDeterministic(KernelComponent):
                             if is_remote_token:
                                 current_window = Int32(read_clock64() - round_start_clock)
                                 data_average_window = self._adaptive_pace(
-                                    data_average_window,
-                                    current_window,
-                                    data_low_window,
-                                    data_high_window,
+                                    data_average_window, current_window, data_low_window, data_high_window
                                 )
                         elif cutlass.const_expr(stateless_data_pacing_enabled):
                             if is_remote_token:
@@ -2076,10 +2192,7 @@ class TokenCommDeterministic(KernelComponent):
                             if is_remote_token:
                                 current_window = Int32(read_clock64() - round_start_clock)
                                 sf_average_window = self._adaptive_pace(
-                                    sf_average_window,
-                                    current_window,
-                                    sf_low_window,
-                                    sf_high_window,
+                                    sf_average_window, current_window, sf_low_window, sf_high_window
                                 )
                         elif cutlass.const_expr(stateless_sf_pacing_enabled):
                             if is_remote_token:

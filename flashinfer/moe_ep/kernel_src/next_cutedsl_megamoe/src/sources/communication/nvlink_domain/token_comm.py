@@ -19,6 +19,7 @@ from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix
 from ...helpers.flag_batch import make_flag_batch_tracker
 from ...helpers.iket_compat import iket
+from ...helpers.software_sync import NvlinkBarrier
 from ...helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
@@ -34,7 +35,6 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
-from .software_sync import NvlinkBarrier
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -170,6 +170,7 @@ class _MetadataPushRouter(KernelComponent):
             raise ValueError(
                 "Router grid exceeds promised_launchable_sm_count; all metadata-push CTAs must be concurrently resident."
             )
+        self.worst_case_token_count = self.worst_case_padded_tokens(self.token_padding_block)
         self._router_smem_workspace = self._build_router_smem_workspace()
 
         self._device_workspace = None
@@ -216,10 +217,6 @@ class _MetadataPushRouter(KernelComponent):
         route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
         expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
         return min(route_budget_blocks, expert_bound_blocks) * block
-
-    @property
-    def worst_case_token_count(self) -> int:
-        return self.worst_case_padded_tokens(self.token_padding_block)
 
     def _router_launch_configuration(self) -> Tuple[int, int]:
         def next_power_of_two(value: int) -> int:
@@ -1628,29 +1625,32 @@ class TokenCommNonDeterministic(KernelComponent):
         )
         destination_size_vectors = cute.zipped_divide(owned_sizes, (copy_elements,))
         size_vector_count = cute.size(destination_size_vectors, mode=[1])
-        size_copy_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL if copy_elements == 4 else cute.nvgpu.LoadCacheMode.ALWAYS
-            ),
-            cutlass.Int32,
-            num_bits_per_copy=copy_elements * 32,
-        )
+        size_copy_atom = _copy_atom(cutlass.Int32, copy_elements * 32)
         size_copy_rounds = ceil_div(size_vector_count, self.transfer_thread_count)
+        size_copy_registers = cute.make_rmem_tensor((copy_elements, size_copy_rounds), cutlass.Int32)
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
             vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
             if vector_idx < Int32(size_vector_count):
                 cute.copy(
-                    size_copy_atom, source_size_vectors[None, vector_idx], destination_size_vectors[None, vector_idx]
+                    size_copy_atom,
+                    source_size_vectors[None, vector_idx],
+                    size_copy_registers[None, size_copy_round],
                 )
-        cute.arch.cp_async_commit_group()
         iket.range_pop()
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
         iket.range_pop()
 
-        cute.arch.cp_async_wait_group(0)
+        for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
+            vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
+            if vector_idx < Int32(size_vector_count):
+                cute.copy(
+                    size_copy_atom,
+                    size_copy_registers[None, size_copy_round],
+                    destination_size_vectors[None, vector_idx],
+                )
         iket.range_push("token_in.size_barrier")
         token_in_size_barrier = pipeline.NamedBarrier(
             barrier_id=self.token_in_size_barrier_id, num_threads=self.transfer_thread_count

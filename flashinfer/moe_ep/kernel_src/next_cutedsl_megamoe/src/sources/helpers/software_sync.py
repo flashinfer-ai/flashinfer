@@ -1,19 +1,19 @@
-"""Software grid and NVLink synchronization for persistent communication kernels."""
+"""Software grid and NVLink synchronization for persistent kernels."""
 
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64
 
-from ...helpers.device_workspace import DeviceWorkspace
-from ...helpers.ptx_helpers import red_add_relaxed_sys_s32
+from .device_workspace import DeviceWorkspace
+from .ptx_helpers import red_add_relaxed_sys_s32
 
 
 class SoftwareGridSync:
-    """Reusable intra-rank barrier over a phase-flipping GMEM counter."""
+    """Reusable device-local barrier over a phase-flipping GMEM counter."""
 
     finish_sum_tag = 0x80000000
-    grid_counter_region = "nvlink.token_comm.grid_sync_counter"
+    grid_counter_region = "software_grid_sync.counter"
 
     def __init__(self, *, barrier_id: int) -> None:
         self.barrier_id = barrier_id
@@ -24,9 +24,7 @@ class SoftwareGridSync:
 
     def __new_from_mlir_values__(self, values: list) -> "SoftwareGridSync":
         if values:
-            raise ValueError(
-                f"SoftwareGridSync expected no MLIR values, got {len(values)}."
-            )
+            raise ValueError(f"SoftwareGridSync expected no MLIR values, got {len(values)}.")
         return self
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
@@ -48,10 +46,7 @@ class SoftwareGridSync:
 
     @cute.jit
     def _cta_rendezvous(self, participating_threads: int) -> None:
-        cute.arch.barrier(
-            barrier_id=self.barrier_id,
-            number_of_threads=participating_threads,
-        )
+        cute.arch.barrier(barrier_id=self.barrier_id, number_of_threads=participating_threads)
 
     @cute.jit
     def sync(
@@ -62,11 +57,7 @@ class SoftwareGridSync:
         thread_idx_in_group: Int32,
     ) -> None:
         self._cta_rendezvous(participating_threads)
-
-        leader_delta = (
-            Int32(-self.finish_sum_tag)
-            - (actual_cta_count - Int32(1))
-        )
+        leader_delta = Int32(-self.finish_sum_tag) - (actual_cta_count - Int32(1))
         _inline_grid_sync(
             self._grid_counter,
             linear_cta_idx,
@@ -81,6 +72,7 @@ class NvlinkBarrier(SoftwareGridSync):
     """Sense-reversing all-rank barrier layered over software grid sync."""
 
     period = 4
+    grid_counter_region = "nvlink.token_comm.grid_sync_counter"
     phase_counter_region = "nvlink.token_comm.nvlink_phase_counter"
     signal_region = "nvlink.token_comm.nvlink_signal"
 

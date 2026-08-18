@@ -10,8 +10,13 @@ kernel-component model).
 
 - Upstream repo: `cutedsl_megamoe` (kernel team), local mirror
   `/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/cutedsl_megamoe`
-- Upstream commit: `882c83e2ce4086c3cd4211fc5a2296143c5e2aea`
-  (2026-08-08, "Merge branch 'training/next_glu_rubin' into 'main'")
+- Upstream commit: `92dd334` (2026-08-15, "Merge branch 'ag_dev/perf_details'
+  into 'main'"; brings in `a5b4d33` "Rubin MegaMoE Perf Improvment" — the
+  mixed-CGA preferred/fallback cluster launch, reworked FC12 scheduler, and
+  the token-in size-copy reorder around the metadata-ready wait). Previous
+  snapshot: `882c83e2` (2026-08-08). The `rubin/inference/mega` files at
+  `92dd334` are identical to perf-report commit `47881ad2`
+  (`ag_dev/investigate_blackwell`).
 - Copied subtree: `next/sources/` → `src/sources/`
 - DSL floor: upstream CI pins `nvidia-cutlass-dsl[cu13]==4.6.0`
   (`ci/requirements.txt`); the kernels need `cutlass.utils.rubin_helpers`.
@@ -33,20 +38,31 @@ Deliberately NOT vendored (future migrations extend this same directory):
 `rubin/training/` (the fwd_glu fprop / bwd_dglu dgrad / traditional wgrad
 training kernels — an earlier revision of this drop vendored the fwd_glu
 subtree; it was removed when the flashinfer backends moved to the inference
-kernel) and the whole `kernel_src/blackwell/` tree.
+kernel), `rubin/inference/local_mega/` (the single-GPU fused-routing
+`BlockScaledSwapAbLocalMegaMoeKernel` added upstream in `4e0498e` — no EP
+token comm, out of scope for the moe_ep backends), and the whole
+`kernel_src/blackwell/` tree.
+
+Note: upstream `92dd334` moved `software_sync.py` from
+`sources/communication/nvlink_domain/` to `sources/helpers/`; the vendored
+tree mirrors the move.
 
 ## Pending local diffs vs upstream
 
 Per `kernel_src/README.md`, `src/` is verbatim except for the following
-recorded diff (a consequence of the inference-only scope):
+recorded diffs (both a consequence of the inference-only scope — upstream
+ships each file as a `<<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>` marker shim
+importing from the un-vendored `blackwell/` tree, and upstream's
+`kernel_export` script inlines the blackwell source at export time; the same
+whole-file inline was performed at vendor time. If the blackwell tree is ever
+vendored, these can revert to the marker-shim form):
 
-1. `src/sources/kernel_src/rubin/inference/mega/topk_reduce.py` — upstream
-   ships this as a `<<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>` marker shim
-   importing from `blackwell/inference/mega/topk_reduce.py`; upstream's
-   `kernel_export` script inlines the blackwell source at export time. The
-   same inline was performed at vendor time (whole-file copy — its relative
-   imports resolve identically at this depth). If the blackwell tree is ever
-   vendored, this can revert to the marker-shim form.
+1. `src/sources/kernel_src/rubin/inference/mega/topk_reduce.py` — inlines
+   `blackwell/inference/mega/topk_reduce.py`.
+2. `src/sources/kernel_src/rubin/custom_mix_cga_helpers.py` — inlines
+   `blackwell/custom_mix_cga_helpers.py` (mixed-CGA TMA helpers + the
+   TMA-to-UMMA mixed-cluster pipeline; no relative imports, so the copy is
+   byte-identical to the blackwell source).
 
 ## Layout
 

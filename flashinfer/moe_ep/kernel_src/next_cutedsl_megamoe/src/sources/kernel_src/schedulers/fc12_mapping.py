@@ -311,7 +311,6 @@ class Fc12TaskMappingState:
         is_swap_ab: bool,
         expert_token_sizes: Optional[cute.Tensor],
         expert_token_prefix_sum: Optional[cute.Tensor],
-        cta_id_in_mapping_cluster: cute.Coord,
         cursor_state: _Fc12TaskCursorState,
         num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks,
@@ -325,7 +324,6 @@ class Fc12TaskMappingState:
         self.is_swap_ab = is_swap_ab
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
-        self.cta_id_in_mapping_cluster = cta_id_in_mapping_cluster
         self.cursor_state = cursor_state
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
@@ -340,8 +338,7 @@ class Fc12TaskMappingState:
             values.extend(extract_mlir_values(self.expert_count))
         token_counts = self.expert_token_sizes if self.expert_token_sizes is not None else self.expert_token_prefix_sum
         values.extend(extract_mlir_values(token_counts))
-        for field in (self.cta_id_in_mapping_cluster, self.cursor_state):
-            values.extend(extract_mlir_values(field))
+        values.extend(extract_mlir_values(self.cursor_state))
         if isinstance(self.num_fc1_intermediate_blocks, Int32):
             values.extend(extract_mlir_values(self.num_fc1_intermediate_blocks))
         if isinstance(self.num_fc2_hidden_blocks, Int32):
@@ -375,7 +372,6 @@ class Fc12TaskMappingState:
             is_swap_ab=self.is_swap_ab,
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
-            cta_id_in_mapping_cluster=rebuild(self.cta_id_in_mapping_cluster),
             cursor_state=rebuild(self.cursor_state),
             num_fc1_intermediate_blocks=(
                 rebuild(self.num_fc1_intermediate_blocks)
@@ -409,7 +405,6 @@ def create_fc12_task_mapping_state(
     is_swap_ab: bool,
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
-    cta_id_in_mapping_cluster: cute.Coord,
 ) -> Fc12TaskMappingState:
     """Create the register-resident state for one CTA's FC12 mapper."""
     cursor_state = _Fc12TaskCursorState(
@@ -445,7 +440,6 @@ def create_fc12_task_mapping_state(
         is_swap_ab=is_swap_ab,
         expert_token_sizes=expert_token_sizes,
         expert_token_prefix_sum=expert_token_prefix_sum,
-        cta_id_in_mapping_cluster=cta_id_in_mapping_cluster,
         cursor_state=cursor_state,
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
@@ -753,7 +747,9 @@ def _seek_expert_for_work_id(linear_work_id: Int32, mapping_state: Fc12TaskMappi
 
 
 @cute.jit
-def _decode_inside_expert(linear_work_id: Int32, mapping_state: Fc12TaskMappingState) -> SchedulerWorkTileBase:
+def _decode_inside_expert(
+    linear_work_id: Int32, cta_id_in_mapping_cluster: cute.Coord, mapping_state: Fc12TaskMappingState
+) -> SchedulerWorkTileBase:
     cursor = mapping_state.cursor_state
     cta_tile_m = mapping_state.mapping_cta_tile_shape_mnk[0]
     local_work_id = linear_work_id - cursor.current_expert_tile_start
@@ -768,11 +764,10 @@ def _decode_inside_expert(linear_work_id: Int32, mapping_state: Fc12TaskMappingS
         cluster_output_block_idx = local_work_id - cluster_token_block_idx * mapping_state.num_fc2_hidden_blocks
 
     cta_token_block_idx = (
-        cluster_token_block_idx * mapping_state.mapping_cluster_shape_mn[0] + mapping_state.cta_id_in_mapping_cluster[0]
+        cluster_token_block_idx * mapping_state.mapping_cluster_shape_mn[0] + cta_id_in_mapping_cluster[0]
     )
     cta_output_block_idx = (
-        cluster_output_block_idx * mapping_state.mapping_cluster_shape_mn[1]
-        + mapping_state.cta_id_in_mapping_cluster[1]
+        cluster_output_block_idx * mapping_state.mapping_cluster_shape_mn[1] + cta_id_in_mapping_cluster[1]
     )
     token_start = cta_token_block_idx * Int32(cta_tile_m)
     remaining_tokens = cutlass.max(cursor.current_expert_token_count - token_start, Int32(0))
@@ -809,7 +804,7 @@ def _decode_inside_expert(linear_work_id: Int32, mapping_state: Fc12TaskMappingS
 
 @cute.jit
 def map_fc12_linear_work_id(
-    linear_work_id: Int32, mapping_state: Fc12TaskMappingState
+    linear_work_id: Int32, cta_id_in_mapping_cluster: cute.Coord, mapping_state: Fc12TaskMappingState
 ) -> Tuple[SchedulerWorkTileBase, Fc12TaskMappingState]:
     """Map one monotonically increasing scalar ID to an FC12 work tile."""
     cursor = mapping_state.cursor_state
@@ -839,7 +834,7 @@ def map_fc12_linear_work_id(
         else:
             mapping_state.cursor_state = mapping_state.cursor_state
         cursor = mapping_state.cursor_state
-        work_tile = _decode_inside_expert(linear_work_id, mapping_state)
+        work_tile = _decode_inside_expert(linear_work_id, cta_id_in_mapping_cluster, mapping_state)
     else:
         mapping_state.cursor_state = mapping_state.cursor_state
     return work_tile, mapping_state
@@ -915,7 +910,6 @@ class PhaseInterleavedFc12MappingState:
         is_swap_ab: bool,
         expert_token_sizes: Optional[cute.Tensor],
         expert_token_prefix_sum: Optional[cute.Tensor],
-        cta_id_in_mapping_cluster: cute.Coord,
         fc1_cursor: _PhaseFc12CursorState,
         fc2_cursor: _PhaseFc12CursorState,
         num_fc1_intermediate_blocks: int,
@@ -929,7 +923,6 @@ class PhaseInterleavedFc12MappingState:
         self.is_swap_ab = is_swap_ab
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
-        self.cta_id_in_mapping_cluster = cta_id_in_mapping_cluster
         self.fc1_cursor = fc1_cursor
         self.fc2_cursor = fc2_cursor
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
@@ -943,7 +936,7 @@ class PhaseInterleavedFc12MappingState:
         values: List[ir.Value] = []
         token_counts = self.expert_token_sizes if self.expert_token_sizes is not None else self.expert_token_prefix_sum
         values.extend(extract_mlir_values(token_counts))
-        for field in (self.cta_id_in_mapping_cluster, self.fc1_cursor, self.fc2_cursor):
+        for field in (self.fc1_cursor, self.fc2_cursor):
             values.extend(extract_mlir_values(field))
         return values
 
@@ -972,7 +965,6 @@ class PhaseInterleavedFc12MappingState:
             is_swap_ab=self.is_swap_ab,
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
-            cta_id_in_mapping_cluster=rebuild(self.cta_id_in_mapping_cluster),
             fc1_cursor=rebuild(self.fc1_cursor),
             fc2_cursor=rebuild(self.fc2_cursor),
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
@@ -1013,7 +1005,6 @@ def create_phase_interleaved_fc12_mapping_state(
     is_swap_ab: bool,
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
-    cta_id_in_mapping_cluster: cute.Coord,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
@@ -1028,7 +1019,6 @@ def create_phase_interleaved_fc12_mapping_state(
         is_swap_ab=is_swap_ab,
         expert_token_sizes=expert_token_sizes,
         expert_token_prefix_sum=expert_token_prefix_sum,
-        cta_id_in_mapping_cluster=cta_id_in_mapping_cluster,
         fc1_cursor=_make_phase_cursor(num_fc1_intermediate_blocks),
         fc2_cursor=_make_phase_cursor(num_fc2_hidden_blocks),
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
@@ -1087,18 +1077,20 @@ def _seek_phase_cursor(
 
 @cute.jit
 def _decode_phase_work_id(
-    linear_work_id: Int32, phase: Int32, cursor: _PhaseFc12CursorState, mapping_state: PhaseInterleavedFc12MappingState
+    linear_work_id: Int32,
+    phase: Int32,
+    cta_id_in_mapping_cluster: cute.Coord,
+    cursor: _PhaseFc12CursorState,
+    mapping_state: PhaseInterleavedFc12MappingState,
 ) -> SchedulerWorkTileBase:
     local_work_id = linear_work_id - cursor.expert_tile_start
     cluster_token_block_idx = local_work_id // Int32(cursor.blocks_per_token_block)
     cluster_output_block_idx = local_work_id - cluster_token_block_idx * Int32(cursor.blocks_per_token_block)
     cta_token_block_idx = (
-        cluster_token_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[0])
-        + mapping_state.cta_id_in_mapping_cluster[0]
+        cluster_token_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[0]) + cta_id_in_mapping_cluster[0]
     )
     cta_output_block_idx = (
-        cluster_output_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[1])
-        + mapping_state.cta_id_in_mapping_cluster[1]
+        cluster_output_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[1]) + cta_id_in_mapping_cluster[1]
     )
 
     cta_tile_m = mapping_state.mapping_cta_tile_shape_mnk[0]
@@ -1136,7 +1128,10 @@ def _decode_phase_work_id(
 
 @cute.jit
 def map_phase_interleaved_fc12_work_id(
-    linear_work_id: Int32, phase: Int32, mapping_state: PhaseInterleavedFc12MappingState
+    linear_work_id: Int32,
+    phase: Int32,
+    cta_id_in_mapping_cluster: cute.Coord,
+    mapping_state: PhaseInterleavedFc12MappingState,
 ) -> Tuple[SchedulerWorkTileBase, Boolean, PhaseInterleavedFc12MappingState]:
     """Map one phase-local ID and report whether the selected stream contains it."""
     work_tile = make_fc12_done_tile(mapping_state.is_swap_ab)
@@ -1147,12 +1142,16 @@ def map_phase_interleaved_fc12_work_id(
     if phase == Int32(BlockPhase.Linear1):
         fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
         if linear_work_id < fc1_cursor.expert_tile_end:
-            work_tile = _decode_phase_work_id(linear_work_id, phase, fc1_cursor, mapping_state)
+            work_tile = _decode_phase_work_id(
+                linear_work_id, phase, cta_id_in_mapping_cluster, fc1_cursor, mapping_state
+            )
             stream_has_work = Boolean(True)
     else:
         fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
         if linear_work_id < fc2_cursor.expert_tile_end:
-            work_tile = _decode_phase_work_id(linear_work_id, phase, fc2_cursor, mapping_state)
+            work_tile = _decode_phase_work_id(
+                linear_work_id, phase, cta_id_in_mapping_cluster, fc2_cursor, mapping_state
+            )
             stream_has_work = Boolean(True)
 
     mapping_state.fc1_cursor = fc1_cursor

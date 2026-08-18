@@ -9,6 +9,7 @@ from .fc12_mapping import (
     peek_ready_bit,
 )
 from .fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
+from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
 
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "BlockPhase",
     "Fc12WorkTileState",
     "NonSwapAbFc12WorkTileInfo",
+    "NonClcMixedCgaConfig",
+    "NonClcMixedCgaSchedulerWorker",
     "PhaseInterleavedFc12Scheduler",
     "SchedulerBase",
     "SchedulerConsumer",
