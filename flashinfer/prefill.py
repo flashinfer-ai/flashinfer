@@ -3858,10 +3858,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
         out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
         if out is None:
-            # Use the o_data_type from plan()
-            out_dtype = getattr(self, "_cached_o_data_type", None) or (
-                torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
-            )
+            # Use the o_data_type from plan() when it names a real output dtype.
+            # The plan() default (o_data_type = q_data_type) leaves an 8-bit
+            # dtype here for fp8 inputs, which no ragged kernel emits — keep
+            # the historical bf16 allocation for that case.
+            out_dtype = getattr(self, "_cached_o_data_type", None)
+            if out_dtype is None or out_dtype.itemsize == 1:
+                out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
