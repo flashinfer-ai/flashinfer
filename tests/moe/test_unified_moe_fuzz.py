@@ -982,6 +982,14 @@ _UNPACKED_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if RoutingInputMode.UnpackedPrecomputed in runner_cls.supported_routing_modes
 }
+# Backend config classes whose runner can compute an EP shard (a local expert subset with
+# a nonzero offset), likewise derived from the runners' capability declaration. CUTLASS and
+# b12x kernels compute the full routed set only, so an EP config restricts to these.
+_EP_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if runner_cls.supports_expert_parallelism
+}
 _UNPACKED_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -1831,6 +1839,11 @@ def test_unified_moe_fuzz(cfg):
         # Backends that accept separate tensors through their own ABI are not
         # implementations of RoutingInputMode.UnpackedPrecomputed.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
+    if cfg.is_ep:
+        # An EP shard needs the runner to map global ids onto a local expert subset;
+        # backends without that capability (CUTLASS, b12x) would fail MoELayer's
+        # check_support, and with no other candidate the case must SKIP, not FAIL.
+        wired_backends = [B for B in wired_backends if B in _EP_BACKENDS]
     if _BACKEND_FILTER:
         wired_backends = [
             B
