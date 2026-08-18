@@ -29,6 +29,7 @@ from flashinfer.utils import get_compute_capability
 kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
+kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
 
 
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
@@ -37,6 +38,126 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
         flashinfer.RecurrentKDAPrefillWorkspace
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
     )
+
+
+def _cpu_route_tensors(token_count=2):
+    shape = (1, token_count, 1, 128)
+    return {
+        "q": torch.empty(shape, dtype=torch.bfloat16),
+        "k": torch.empty(shape, dtype=torch.bfloat16),
+        "v": torch.empty(shape, dtype=torch.bfloat16),
+        "g": torch.empty(shape, dtype=torch.bfloat16),
+        "beta": torch.empty((1, token_count, 1), dtype=torch.bfloat16),
+        "A_log": torch.empty(1, dtype=torch.float32),
+        "dt_bias": torch.empty((1, 128), dtype=torch.float32),
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "beta_is_logit": True,
+    }
+
+
+def test_public_prefill_backend_option_routes_to_cute_dsl(monkeypatch):
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+
+    assert recurrent_kda(**_cpu_route_tensors(), backend="cute-dsl") is sentinel
+
+
+def test_public_prefill_cake_backend_is_strict(monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: False,
+    )
+
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(**_cpu_route_tensors(), backend="cake")
+
+
+def test_public_decode_backend_option_forwards_to_decode_layer(monkeypatch):
+    calls = []
+    sentinel = (object(), object())
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", run)
+    assert (
+        recurrent_kda(**_cpu_route_tensors(token_count=1), backend="cake") is sentinel
+    )
+    assert calls[0]["backend"] == "cake"
+
+
+def test_public_backend_option_rejects_unknown_value():
+    with pytest.raises(ValueError, match="backend must be"):
+        recurrent_kda(**_cpu_route_tensors(), backend="unknown")
+
+
+def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch):
+    calls = []
+    compile_args = []
+
+    class Compiled:
+        def workspace_size(self, cu_seqlens, heads, **kwargs):
+            assert cu_seqlens is None
+            assert heads == 1
+            assert kwargs == {"batch": 1, "seqlen": 2}
+            return 0
+
+        def __call__(self, *args):
+            calls.append(args)
+
+    def get_compiled(**kwargs):
+        compile_args.append(kwargs)
+        return Compiled()
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api, "_get_compiled_cute_dsl_kda", get_compiled
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
+    )
+
+    inputs = _cpu_route_tensors()
+    state = torch.empty((1, 1, 128, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(inputs["q"])
+    result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        scale=None,
+        initial_state=state,
+        output_final_state=False,
+        lower_bound=-5.0,
+        cu_seqlens=None,
+        output=output,
+        prefill_workspace=None,
+    )
+
+    assert result[0] is output
+    assert result[1] is None
+    assert compile_args == [
+        {"lower_bound": -5.0, "has_state_in": True, "has_state_out": True}
+    ]
+    assert calls[0][8] is state
+    assert calls[0][10] is state
+    assert calls[0][11] is None
+    assert calls[0][12] == 7
 
 
 def _strict_prefill_kwargs(inputs):

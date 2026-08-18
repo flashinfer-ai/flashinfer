@@ -24,12 +24,13 @@ decode and speculative decode retain the backend exposed by
 ``flashinfer.kda_decode``.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
 from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
+from . import kda_prefill_cute as _kda_prefill_cute
 from .api_logging import flashinfer_api
 from .trace.templates.kda import recurrent_kda_trace
 
@@ -62,6 +63,8 @@ def recurrent_kda(
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    *,
+    backend: Literal["auto", "cute-dsl", "cake"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -73,9 +76,9 @@ def recurrent_kda(
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
     gate modes as the backend implementation. On SM100a (B200/GB200) and
     SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
-    prefill is dispatched across the frozen direct-M128, M64, and B200/GB200
-    persistent schedules. All existing decode and speculative-decode calls
-    retain the CuTe DSL backend.
+    prefill can use either the frozen Cake schedules or the source-level CuTe
+    DSL BT=16 kernel. ``backend="auto"`` preserves the existing Cake-prefill
+    and CuTe-DSL-decode routing.
 
     Args:
         q (torch.Tensor):
@@ -196,6 +199,12 @@ def recurrent_kda(
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32. SGLang normally uses 64 or a larger
             cache-page-aligned multiple.
+        backend (Literal["auto", "cute-dsl", "cake"]):
+            Implementation backend. ``"auto"`` preserves the existing
+            routing, ``"cake"`` strictly selects an exported frozen Cake
+            specialization, and ``"cute-dsl"`` selects the ported BT=16
+            CuTe DSL kernel for ordinary multi-token prefill (and the existing
+            CuTe DSL implementation for decode).
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -208,30 +217,96 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
+    if backend not in ("auto", "cute-dsl", "cake"):
+        raise ValueError(
+            f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
+        )
 
-    use_flash_kda_prefill = _kda_prefill._flash_kda_prefill_is_eligible(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state=initial_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        num_spec_tokens=num_spec_tokens,
-        num_accepted_tokens=num_accepted_tokens,
-        output=output,
-        initial_state_source=initial_state_source,
-        initial_state_indices=initial_state_indices,
-        beta_is_logit=beta_is_logit,
-        state_checkpoints=state_checkpoints,
-        checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
+        q, cu_seqlens, num_spec_tokens
+    )
+    if backend == "cute-dsl" and is_plain_prefill:
+        if (
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        ):
+            raise ValueError(
+                "state checkpoints are not yet supported by backend='cute-dsl'"
+            )
+        if seq_order is not None:
+            raise ValueError("seq_order is not supported by backend='cute-dsl'")
+        if not _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+        ):
+            raise ValueError(
+                "backend='cute-dsl' does not support this recurrent_kda "
+                "prefill contract"
+            )
+        assert A_log is not None
+        assert dt_bias is not None
+        assert lower_bound is not None
+        return _kda_prefill_cute._run_cute_dsl_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            prefill_workspace=prefill_workspace,
+        )
+
+    use_flash_kda_prefill = (
+        backend != "cute-dsl"
+        and _kda_prefill._flash_kda_prefill_is_eligible(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
     )
     if use_flash_kda_prefill:
         assert A_log is not None
@@ -258,6 +333,11 @@ def recurrent_kda(
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             backend="cake",
+        )
+
+    if backend == "cake" and is_plain_prefill:
+        raise ValueError(
+            "backend='cake' does not support this recurrent_kda prefill contract"
         )
 
     if (
@@ -305,4 +385,5 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        backend="cake" if backend == "cake" else "cute-dsl",
     )

@@ -4,8 +4,8 @@ flashinfer.kda_prefill
 ======================
 
 Optimized recurrent Kimi Delta Attention (KDA) prefill support. The
-:func:`flashinfer.kda.recurrent_kda` facade dispatches a strict ordinary
-multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
+:func:`flashinfer.kda.recurrent_kda` facade exposes frozen Cake and source-level
+CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
 .. currentmodule:: flashinfer.kda_prefill
 
@@ -13,6 +13,21 @@ multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
     :toctree: ../generated
 
     RecurrentKDAPrefillWorkspace
+
+Backend selection
+-----------------
+
+``backend="auto"`` preserves the default routing: eligible multi-token prefill
+uses the frozen Cake backend, while decode uses the existing CuTe DSL backend.
+``backend="cake"`` and ``backend="cute-dsl"`` select a backend strictly and
+raise when its contract is unsupported.
+
+For multi-token prefill, ``backend="cute-dsl"`` selects the BT=16 kernel ported
+from DKG MR 26001. It supports contiguous BF16 Q, K, V, G, and beta with one
+shared head count and head dimension 128, the in-kernel lower-bound gate, fixed
+or packed-varlen layout, and BF16 recurrent state. Packed offsets must be int64
+during CUDA graph capture. Native Cake checkpoint and ``seq_order`` extensions
+are not yet supported by this backend.
 
 Optimized Blackwell prefill subset
 -----------------------------------
