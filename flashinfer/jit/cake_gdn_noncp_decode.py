@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "474ee84e279b2c82b42e9e8146f5b05618968005a07635c8f382fe414127a4e4"
-_GENERATOR_COMMIT = "11cb68d34a2d52710c599ab1d746e261dee5ddae"
+_MANIFEST_SHA256 = "47f25ac30ebded5afcdfd98d87a5522fb43a7f06d53c1a81b1b39bcdf2954008"
+_GENERATOR_COMMIT = "9e740b3abb58f1fa23a49eb29573ca44df21045b"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -112,12 +112,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1761,
-        3522,
-        3462,
+        1762,
+        3524,
+        3464,
         60,
-        77,
-        77,
+        78,
+        78,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -510,6 +510,7 @@ def select_cake_gdn_decode_variant(
             (4, 2, 16, 32, False, True, True, 4),
             (8, 3, 16, 64, True, True, True, 3),
             (8, 4, 16, 64, True, True, True, 4),
+            (8, 4, 16, 32, True, True, True, 4),
             (8, 2, 16, 64, True, False, False, 0),
             (8, 4, 16, 64, True, False, True, 5),
         }
@@ -525,7 +526,7 @@ def select_cake_gdn_decode_variant(
         )
         if layout != "pretranspose" or num_k_heads != num_q_heads or key not in promoted:
             raise CakeGDNUnsupportedError(
-                "BF16 decode is limited to the six exact promoted indexed/verify rows"
+                "BF16 decode is limited to the seven exact promoted indexed/verify rows"
             )
         state_heads = batch_size * num_v_heads
         tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32

@@ -59,13 +59,13 @@ def _decode(**overrides):
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
     assert manifest["generator_commit"] == (
-        "11cb68d34a2d52710c599ab1d746e261dee5ddae"
+        "9e740b3abb58f1fa23a49eb29573ca44df21045b"
     )
-    assert manifest["contract_row_count"] == 1761
-    assert manifest["architecture_row_count"] == 3522
-    assert manifest["admitted_architecture_rows"] == 3462
+    assert manifest["contract_row_count"] == 1762
+    assert manifest["architecture_row_count"] == 3524
+    assert manifest["admitted_architecture_rows"] == 3464
     assert manifest["fail_closed_architecture_rows"] == 60
-    assert manifest["variant_count"] == len(manifest["variants"]) == 77
+    assert manifest["variant_count"] == len(manifest["variants"]) == 78
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -179,6 +179,18 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
         (
             dict(
                 batch_size=8,
+                seq_len=4,
+                num_v_heads=32,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                cache_steps=4,
+            ),
+            "indexed_bf16_verify_t4.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
                 seq_len=2,
                 num_v_heads=64,
                 strided_inputs=True,
@@ -210,7 +222,7 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
 def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="six exact promoted",
+        match="seven exact promoted",
     ):
         _decode(
             state_dtype="bfloat16",

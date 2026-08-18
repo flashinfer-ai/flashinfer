@@ -302,6 +302,7 @@ def _make_bf16_serving_inputs(
     num_v_heads: int,
     strided_inputs: bool,
     cache_steps: int,
+    pack_gates: bool = True,
 ) -> dict[str, object]:
     torch.manual_seed(2030 + seq_len + num_v_heads)
     device = torch.device("cuda")
@@ -328,17 +329,33 @@ def _make_bf16_serving_inputs(
         q.normal_()
         k.normal_()
         v.normal_()
-        packed_gates = torch.empty(
-            batch_size,
-            seq_len,
-            2 * num_v_heads + 7,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        a = packed_gates[..., :num_v_heads]
-        b = packed_gates[..., num_v_heads : 2 * num_v_heads]
-        a.normal_().mul_(0.1)
-        b.normal_()
+        if pack_gates:
+            packed_gates = torch.empty(
+                batch_size,
+                seq_len,
+                2 * num_v_heads + 7,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            a = packed_gates[..., :num_v_heads]
+            b = packed_gates[..., num_v_heads : 2 * num_v_heads]
+            a.normal_().mul_(0.1)
+            b.normal_()
+        else:
+            a = torch.randn(
+                batch_size,
+                seq_len,
+                num_v_heads,
+                device=device,
+                dtype=torch.bfloat16,
+            ).mul_(0.1)
+            b = torch.randn(
+                batch_size,
+                seq_len,
+                num_v_heads,
+                device=device,
+                dtype=torch.bfloat16,
+            )
     else:
         q = torch.randn(
             batch_size,
@@ -602,14 +619,16 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
         "strided_inputs",
         "disable_state_update",
         "cache_steps",
+        "pack_gates",
     ),
     [
-        (4, 1, 32, True, False, 0),
-        (4, 2, 32, False, True, 4),
-        (8, 3, 64, True, True, 3),
-        (8, 4, 64, True, True, 4),
-        (8, 2, 64, True, False, 0),
-        (8, 4, 64, True, False, 5),
+        (4, 1, 32, True, False, 0, True),
+        (4, 2, 32, False, True, 4, True),
+        (8, 3, 64, True, True, 3, True),
+        (8, 4, 64, True, True, 4, True),
+        (8, 4, 32, True, True, 4, False),
+        (8, 2, 64, True, False, 0, True),
+        (8, 4, 64, True, False, 5, True),
     ],
 )
 def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
@@ -619,6 +638,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
     strided_inputs: bool,
     disable_state_update: bool,
     cache_steps: int,
+    pack_gates: bool,
 ) -> None:
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
@@ -626,6 +646,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
         num_v_heads=num_v_heads,
         strided_inputs=strided_inputs,
         cache_steps=cache_steps,
+        pack_gates=pack_gates,
     )
     expected_out, expected_cache, expected_final = _bf16_serving_reference(tensors)
     backing = tensors["state_backing"]
@@ -680,14 +701,21 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
         assert torch.equal(backing[:, num_v_heads:], backing_before[:, num_v_heads:])
 
 
-def test_exported_bf16_verify_is_cuda_graph_safe() -> None:
-    batch_size, seq_len, num_v_heads, cache_steps = 8, 4, 64, 4
+@pytest.mark.parametrize(
+    ("num_v_heads", "pack_gates"),
+    [(64, True), (32, False)],
+)
+def test_exported_bf16_verify_is_cuda_graph_safe(
+    num_v_heads: int, pack_gates: bool
+) -> None:
+    batch_size, seq_len, cache_steps = 8, 4, 4
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
         num_v_heads=num_v_heads,
         strided_inputs=True,
         cache_steps=cache_steps,
+        pack_gates=pack_gates,
     )
     expected_out, expected_cache, _ = _bf16_serving_reference(tensors)
     backing = tensors["state_backing"]

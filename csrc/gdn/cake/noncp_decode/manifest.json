@@ -1,6 +1,6 @@
 {
-  "admitted_architecture_rows": 3462,
-  "architecture_row_count": 3522,
+  "admitted_architecture_rows": 3464,
+  "architecture_row_count": 3524,
   "architectures": [
     "sm_100a",
     "sm_103a"
@@ -10,7 +10,7 @@
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264"
   },
   "binary_artifacts": false,
-  "contract_row_count": 1761,
+  "contract_row_count": 1762,
   "contract_rows": [
     {
       "contract": "prefill_focus",
@@ -31649,6 +31649,24 @@
       "domain": "decode",
       "label": "bf16_packed_checkpoint_t4_cache5",
       "line": 6
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.wide32",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96"
+        },
+        "sm_103a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.wide32",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_verify_t4",
+      "line": 7
     }
   ],
   "cuda_headers": [
@@ -31659,7 +31677,7 @@
     }
   ],
   "fail_closed_architecture_rows": 60,
-  "generator_commit": "11cb68d34a2d52710c599ab1d746e261dee5ddae",
+  "generator_commit": "9e740b3abb58f1fa23a49eb29573ca44df21045b",
   "manifest_only": false,
   "schema": "flashinfer-gdn-noncp-decode-standalone-export-v1",
   "scope": {
@@ -31669,15 +31687,15 @@
   },
   "source_only": true,
   "source_pins": {
-    "cake.generated.gdn_decode": "509311ed44f0ce05fbcfc9bd1f19704e8d1124768246c9b5a29895faa622806b",
+    "cake.generated.gdn_decode": "be70b71e6d676803d581e85990fe9e81f5df9a3744aaef350bb6787f9f29a647",
     "cake.generated.gdn_prefill": "9d7087b8f16284e31f462616df79878e9278b7f528979d55ed9367f04a505098",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode.regression/part-000.jsonl": "010399b7ddb445712e6c7e7fbfa564056c244a18d9b1c1f62b281c134a1b6582",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode.shapes/part-000.jsonl": "52b5e7bdea334ff63165617cdfe43376502962ff7cfe4ab1f46a0a5b80060c7d",
-    "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode_bf16_serving.shapes/part-000.jsonl": "6884876981ac4cbf4f7266b3708c70e29ad5ddc53b53ca8a4c7e34c5642d3f0b",
+    "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode_bf16_serving.shapes/part-000.jsonl": "29e75d4a22328a71fb92a9b772e2798f446ac13b982ec358378fd056cc3be952",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_prefill.regression/part-000.jsonl": "874306e75bd17dada6e0da48b3a51624445bf7f3adf82650662fcf07a276b2e3",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_prefill.shapes/part-000.jsonl": "3a3563a6498967d238aaab77c2d882c669d31a46ebf2873f8fa2d512e542de29"
   },
-  "variant_count": 77,
+  "variant_count": 78,
   "variants": [
     {
       "abi": [
@@ -33051,6 +33069,225 @@
         "STRIDED_INPUTS": 0,
         "TILE_V_WIDE": 32,
         "T_STEPS": 2,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "domain": "decode",
+      "dynamic_smem_bytes": 6272,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_c42340a2dd",
+        "path": "host/cake_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96.cc",
+        "sha256": "86ba831629f2c82e6d94373ec294b15aa308bc5ed64ec56ff69d3831f73f5820",
+        "size_bytes": 9979
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_8fbebc856c96.cu",
+          "sha256": "10cae7012fadb965a2ae26e8e8eecdff8614702d232a9fce88b989bdffec5098",
+          "size_bytes": 34520
+        }
+      ],
+      "source_schedule": "cake.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "source_symbol": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 4,
         "UPDATE_STATE": 0
       },
       "threads": 128,
