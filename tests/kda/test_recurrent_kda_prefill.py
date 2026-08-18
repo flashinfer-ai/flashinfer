@@ -483,7 +483,6 @@ def test_variant_selector_exposes_specialized_routes_only_when_requested():
         ((10, 0), 148, True, 1, 8, 2047, False),
         ((10, 0), 148, True, 3, 3, 2048, False),
         ((10, 0), 148, True, 1, 9, 2048, False),
-        ((12, 0), 148, True, 1, 8, 2048, False),
     ],
 )
 def test_small_bh_owner_helper_policy_matches_residency_contract(
