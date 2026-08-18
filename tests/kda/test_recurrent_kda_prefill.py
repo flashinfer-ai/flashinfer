@@ -93,6 +93,32 @@ def test_public_prefill_auto_prefers_cute_dsl(monkeypatch):
     assert recurrent_kda(**_cpu_route_tensors()) is sentinel
 
 
+def test_public_prefill_forwards_sequence_order_to_cute_dsl(monkeypatch):
+    calls = []
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: calls.append(kwargs) or sentinel,
+    )
+
+    seq_order = torch.tensor([1, 0], dtype=torch.int32)
+    assert (
+        recurrent_kda(
+            **_cpu_route_tensors(token_count=3),
+            cu_seqlens=torch.tensor([0, 1, 3], dtype=torch.int64),
+            seq_order=seq_order,
+        )
+        is sentinel
+    )
+    assert calls[0]["seq_order"] is seq_order
+
+
 def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
     sentinel = (object(), object())
     monkeypatch.setattr(
@@ -187,8 +213,8 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
             assert kwargs == {"batch": 1, "seqlen": 2}
             return 0
 
-        def __call__(self, *args):
-            calls.append(args)
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
 
     def get_compiled(**kwargs):
         compile_args.append(kwargs)
@@ -218,6 +244,7 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
         output_final_state=False,
         lower_bound=-5.0,
         cu_seqlens=None,
+        seq_order=None,
         output=output,
         prefill_workspace=None,
     )
@@ -227,13 +254,15 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
     assert compile_args == [
         {"lower_bound": -5.0, "has_state_in": True, "has_state_out": True}
     ]
-    assert calls[0][8] is state
-    assert calls[0][10] is state
-    assert calls[0][11] is None
-    assert calls[0][12] == 7
+    args, kwargs = calls[0]
+    assert args[8] is state
+    assert args[10] is state
+    assert args[11] is None
+    assert args[12] == 7
+    assert kwargs == {"seq_order": None}
 
 
-def test_cute_dsl_prefill_adapter_accepts_valid_packed_offsets(monkeypatch):
+def test_cute_dsl_prefill_adapter_forwards_explicit_sequence_order(monkeypatch):
     calls = []
 
     class Compiled:
@@ -243,8 +272,8 @@ def test_cute_dsl_prefill_adapter_accepts_valid_packed_offsets(monkeypatch):
             assert kwargs == {}
             return 0
 
-        def __call__(self, *args):
-            calls.append(args)
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
 
     monkeypatch.setattr(
         kda_prefill_cute_api,
@@ -259,6 +288,7 @@ def test_cute_dsl_prefill_adapter_accepts_valid_packed_offsets(monkeypatch):
     inputs = _cpu_route_tensors()
     output = torch.empty_like(inputs["q"])
     cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
+    seq_order = torch.tensor([1, 0], dtype=torch.int32)
     result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
         q=inputs["q"],
         k=inputs["k"],
@@ -272,27 +302,30 @@ def test_cute_dsl_prefill_adapter_accepts_valid_packed_offsets(monkeypatch):
         output_final_state=False,
         lower_bound=-5.0,
         cu_seqlens=cu_seqlens,
+        seq_order=seq_order,
         output=output,
         prefill_workspace=None,
     )
 
     assert result[0] is output
     assert result[1] is None
-    assert calls[0][7] is cu_seqlens
+    args, kwargs = calls[0]
+    assert args[7] is cu_seqlens
+    assert tuple(kwargs) == ("seq_order",)
+    assert kwargs["seq_order"] is seq_order
 
 
-def test_cute_dsl_sequence_order_is_longest_first_and_stable():
-    from flashinfer.kda_kernels.kda_chunked_bt16 import _longest_first_indices
-
-    assert _longest_first_indices((0, 1300, 1847, 3895, 4858, 5129, 8192)) == (
-        5,
-        2,
-        0,
-        3,
-        1,
-        4,
+def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatch):
+    kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
+    monkeypatch.setattr(kernel_module, "_device_sm_count", lambda device: 148)
+    monkeypatch.setattr(
+        kernel_module,
+        "_cu_seqlens_contents",
+        lambda tensor: pytest.fail("engine workspace query must not read offsets"),
     )
-    assert _longest_first_indices(tuple(range(9))) == tuple(range(8))
+
+    cu_seqlens = torch.tensor([0, 3, 7, 12, 18, 25], dtype=torch.int64)
+    assert kernel_module.workspace_size(cu_seqlens, heads=64) == 0
 
 
 def _strict_prefill_kwargs(inputs):

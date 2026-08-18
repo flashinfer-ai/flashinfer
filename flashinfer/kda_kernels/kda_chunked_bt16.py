@@ -4578,6 +4578,41 @@ def tcgen05_store_final_state_tmem(
                 )
 
 
+SEQUENCE_ORDER_THREADS: int = 256
+
+
+@cute.kernel
+def sequence_order_kernel(
+    cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor,
+) -> None:
+    """Stable device-side descending-length order via odd-even transposition."""
+
+    tidx, _, _ = cute.arch.thread_idx()
+    n_seq = cutlass.Int32(seq_order.shape[0])
+    for index in cutlass.range(tidx, n_seq, SEQUENCE_ORDER_THREADS):
+        seq_order[index] = cutlass.Int32(index)
+    cute.arch.sync_threads()
+
+    for phase in cutlass.range(n_seq):
+        parity = phase & cutlass.Int32(1)
+        pair_count = (n_seq - parity) // cutlass.Int32(2)
+        for pair in cutlass.range(tidx, pair_count, SEQUENCE_ORDER_THREADS):
+            left = parity + pair * cutlass.Int32(2)
+            right = left + cutlass.Int32(1)
+            left_seq = cutlass.Int32(seq_order[left])
+            right_seq = cutlass.Int32(seq_order[right])
+            left_len = cu_seqlens[left_seq + 1] - cu_seqlens[left_seq]
+            right_len = cu_seqlens[right_seq + 1] - cu_seqlens[right_seq]
+            swap = (right_len > left_len) | (
+                (right_len == left_len) & (right_seq < left_seq)
+            )
+            if swap:
+                seq_order[left] = right_seq
+                seq_order[right] = left_seq
+        cute.arch.sync_threads()
+
+
 @cute.kernel
 def kernel(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
@@ -6872,7 +6907,7 @@ def _partition_workspace(workspace, heads: int, total_chunks: int) -> dict:
     return out
 
 
-def _route_for_workspace(cu_list: tuple, heads: int, device, mode: str) -> str:
+def _route_for_workspace(num_sequences: int, heads: int, device, mode: str) -> str:
     if mode == "engine":
         return "engine"
     if mode == "decomp":
@@ -6880,27 +6915,30 @@ def _route_for_workspace(cu_list: tuple, heads: int, device, mode: str) -> str:
     if mode != "auto":
         raise ValueError(f"Unknown mode: {mode}")
     sm_count = _device_sm_count(device)
-    return _occupancy_pick_route(cu_list, heads, sm_count)[0]
+    return "decomp" if num_sequences * heads * 2 <= sm_count else "engine"
 
 
 def workspace_size(cu_seqlens, heads: int, mode: str = "auto") -> int:
     """Bytes for the opaque decomp workspace of this problem shape.
 
     Returns 0 for the engine route (engine needs no workspace), else the total
-    partitioned + 256B-region-aligned byte count.  Uses the SAME occupancy rule
-    (`_occupancy_pick_route`) as `host`, so the query and the launch agree.
+    partitioned + 256B-region-aligned byte count.  Uses the same CTA-count
+    occupancy rule as `host`, so the query and the launch agree.
     ``cu_seqlens`` is the int64 cumulative-length tensor (or a host sequence).
     """
 
     heads = int(heads)
     if isinstance(cu_seqlens, torch.Tensor):
-        cu_list = _cu_seqlens_contents(cu_seqlens)
         device = cu_seqlens.device
+        num_sequences = cu_seqlens.numel() - 1
     else:
         cu_list = tuple(int(x) for x in cu_seqlens)
         device = torch.cuda.current_device()
-    if _route_for_workspace(cu_list, heads, device, mode) == "engine":
+        num_sequences = len(cu_list) - 1
+    if _route_for_workspace(num_sequences, heads, device, mode) == "engine":
         return 0
+    if isinstance(cu_seqlens, torch.Tensor):
+        cu_list = _cu_seqlens_contents(cu_seqlens)
     total_chunks = sum(
         (cu_list[i + 1] - cu_list[i] + BT - 1) // BT for i in range(len(cu_list) - 1)
     )
@@ -9333,6 +9371,7 @@ def host_unified(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
+    generate_seq_order: cutlass.Int32,
     cu_chunks: cute.Tensor,
     chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
@@ -9362,6 +9401,14 @@ def host_unified(
     heads = q.shape[2]
     h32 = cutlass.Int32(heads)
     z = cutlass.Int32(0)
+    if generate_seq_order != z:
+        # This prepass is a separate launch because ordinary CUDA grids have
+        # no cross-CTA barrier that could publish a fused global ordering.
+        sequence_order_kernel(cu_seqlens, seq_order).launch(
+            grid=(1, 1, 1),
+            block=(SEQUENCE_ORDER_THREADS, 1, 1),
+            stream=stream_a,
+        )
     # Route selection.  MODE is a COMPILE-TIME constexpr:
     #   MODE is None    -> RUNTIME routing (both routes emitted, one .o handles
     #                      all shapes) — the default build.
@@ -9543,6 +9590,7 @@ def _unified_fakes(
             fbeta,
             fcu,
             forder,
+            0,  # generate_seq_order
             fcuc,
             fcts,
             fkd,
@@ -9591,34 +9639,27 @@ _CKPT_OFFSETS: dict = {}
 _UNIFORM_CU_CACHE: dict = {}
 
 
-_SEQUENCE_ORDER_CACHE: dict = {}
+_DEVICE_SEQUENCE_ORDER_CACHE: dict = {}
 
 
-def _longest_first_indices(cu_list: tuple) -> tuple:
-    """Return sequence indices stably sorted by descending token count."""
-
-    return tuple(
-        sorted(
-            range(len(cu_list) - 1),
-            key=lambda index: cu_list[index + 1] - cu_list[index],
-            reverse=True,
-        )
-    )
+def _stream_pointer(stream) -> int:
+    value = getattr(stream, "value", stream)
+    return int(value or 0)
 
 
-def _longest_first_sequence_order(cu_list: tuple, device) -> torch.Tensor:
-    """Return a cached CUDA int32 sequence permutation, longest first."""
+def _device_sequence_order_buffer(num_sequences: int, device, stream) -> torch.Tensor:
+    """Reusable per-stream output for the device sequence-order kernel."""
 
-    key = (cu_list, str(device))
-    order = _SEQUENCE_ORDER_CACHE.get(key)
+    key = (str(device), _stream_pointer(stream), int(num_sequences))
+    order = _DEVICE_SEQUENCE_ORDER_CACHE.get(key)
     if order is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "KDA sequence order must be warmed before CUDA graph capture"
+                "KDA device sequence-order buffer must be warmed before "
+                "CUDA graph capture"
             )
-        indices = _longest_first_indices(cu_list)
-        order = torch.tensor(indices, dtype=torch.int32, device=device)
-        _SEQUENCE_ORDER_CACHE[key] = order
+        order = torch.empty(num_sequences, dtype=torch.int32, device=device)
+        _DEVICE_SEQUENCE_ORDER_CACHE[key] = order
     return order
 
 
@@ -9639,7 +9680,9 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
     """Build the single user host callable over the one compiled `host_unified`.
 
     Runtime ABI: (q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens,
-    initial_state, out, final_state, workspace, stream_a, scale) —
+    initial_state, out, final_state, workspace, stream_a, scale, ..., seq_order)
+    — ``seq_order=None`` launches the device ordering prepass; an explicit
+    packed CUDA int32 permutation bypasses it. The remaining positional ABI is
     the reference host ABI (stream_a == the reference `stream`, scale in the same
     position) plus the `workspace` operand.  Decomp always runs prep-first on
     overlap.  `.workspace_size(cu_seqlens, heads)` is attached.  There is NO
@@ -9676,6 +9719,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         scale=DEFAULT_SCALE,
         state_ckpt=None,
         ckpt_interval=0,
+        seq_order=None,
     ):
         # The state specialization is DERIVED from which state tensors the call
         # actually passes (initial/final/checkpoint present or None); if it
@@ -9715,6 +9759,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 scale,
                 state_ckpt=state_ckpt,
                 ckpt_interval=ckpt_interval,
+                seq_order=seq_order,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -9742,9 +9787,31 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         heads = int(q.shape[2])
         device = q.device
         sm_count = _device_sm_count(device)
-        cu_list = _cu_seqlens_contents(cu_seqlens)
-        n_seq = len(cu_list) - 1
-        seq_order = _longest_first_sequence_order(cu_list, device)
+        n_seq = cu_seqlens.numel() - 1
+        generate_seq_order = seq_order is None
+        if generate_seq_order:
+            seq_order = _device_sequence_order_buffer(n_seq, device, stream_a)
+        elif (
+            seq_order.device != device
+            or seq_order.dtype != torch.int32
+            or seq_order.ndim != 1
+            or not seq_order.is_contiguous()
+            or seq_order.numel() != n_seq
+        ):
+            raise ValueError(
+                "seq_order must be a contiguous CUDA int32 tensor with one "
+                "entry per sequence"
+            )
+        key = (n_seq, str(device), heads, compile_mode)
+        kind = decisions.get(key)
+        if kind is None:
+            kind = _route_for_workspace(n_seq, heads, device, compile_mode or "auto")
+            decisions[key] = kind
+        cu_list = (
+            _cu_seqlens_contents(cu_seqlens)
+            if state_ckpt is not None or kind == "decomp"
+            else None
+        )
         # State checkpoints: every ckpt_interval tokens (a positive multiple of
         # BT) the live recurrent state is stored to state_ckpt[slot], slot laid
         # out flat per sequence in cu_seqlens order -- state_ckpt[k] of a
@@ -9778,23 +9845,13 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 )
         else:
             cu_ckpts_arg = None
-        max_chunks = 0
-        for i in range(n_seq):
-            c = (cu_list[i + 1] - cu_list[i] + BT - 1) // BT
-            if c > max_chunks:
-                max_chunks = c
+        max_chunks = 0  # retained in the exported ABI; no route consumes it
         seq_route = 1  # single stream; kept as an arg so host_unified re-derives
         # The route rule lives in exactly two places: `_route_for_workspace`
         # (which `workspace_size` uses, so the caller allocates the right
         # buffer) and `host_unified` (which re-derives it to pick the branch to
         # execute).  This wrapper does NOT own a third copy -- it only asks the
         # workspace helper which operands to marshal.
-        key = (cu_list, str(device), heads, compile_mode)
-        kind = decisions.get(key)
-        if kind is None:
-            kind = _route_for_workspace(cu_list, heads, device, compile_mode or "auto")
-            decisions[key] = kind
-
         if kind == "engine":
             # beta rides a TMA descriptor built over the compact [T, H] layout:
             # the base must be 16B-aligned (cuTensorMapEncodeTiled hard rule)
@@ -9829,6 +9886,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 beta,
                 cu_seqlens,
                 seq_order,
+                int(generate_seq_order),
                 cuc,
                 cts,
                 kd,
@@ -9880,6 +9938,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             beta,
             cu_seqlens,
             seq_order,
+            int(generate_seq_order),
             plan["cu_chunks"],
             plan["chunk_to_seq"],
             ws["kd"],

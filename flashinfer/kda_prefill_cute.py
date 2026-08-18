@@ -49,6 +49,7 @@ def _is_cute_dsl_kda_prefill_eligible(
     use_gate_in_kernel: bool,
     lower_bound: Optional[float],
     cu_seqlens: Optional[torch.Tensor],
+    seq_order: Optional[torch.Tensor],
     ssm_state_indices: Optional[torch.Tensor],
     num_spec_tokens: Optional[int],
     num_accepted_tokens: Optional[torch.Tensor],
@@ -144,6 +145,16 @@ def _is_cute_dsl_kda_prefill_eligible(
             return False
         num_sequences = cu_seqlens.numel() - 1
 
+    if seq_order is not None and (
+        cu_seqlens is None
+        or seq_order.device != q.device
+        or seq_order.dtype != torch.int32
+        or seq_order.ndim != 1
+        or not seq_order.is_contiguous()
+        or seq_order.numel() != num_sequences
+    ):
+        return False
+
     if initial_state is not None and (
         initial_state.device != q.device
         or initial_state.dtype != torch.bfloat16
@@ -197,6 +208,7 @@ def _run_cute_dsl_kda_prefill(
     output_final_state: bool,
     lower_bound: float,
     cu_seqlens: Optional[torch.Tensor],
+    seq_order: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -265,23 +277,6 @@ def _run_cute_dsl_kda_prefill(
         has_state_in=initial_state is not None,
         has_state_out=final_state is not None,
     )
-    if cu_seqlens is not None:
-        from .kda_kernels.kda_chunked_bt16 import _cu_seqlens_contents
-
-        offsets = _cu_seqlens_contents(cu_seqlens)
-        if (
-            not offsets
-            or offsets[0] != 0
-            or offsets[-1] != q.shape[1]
-            or any(
-                right <= left
-                for left, right in zip(offsets[:-1], offsets[1:], strict=True)
-            )
-        ):
-            raise ValueError(
-                "cu_seqlens must start at zero, be strictly increasing, and "
-                "end at the packed token count"
-            )
     if cu_seqlens is None:
         workspace_bytes = compiled.workspace_size(
             None,
@@ -320,6 +315,7 @@ def _run_cute_dsl_kda_prefill(
             workspace_arg,
             torch.cuda.current_stream(q.device).cuda_stream,
             scale_value,
+            seq_order=seq_order,
         )
 
     if lock is None:
