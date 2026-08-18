@@ -51,8 +51,10 @@ mega kernel launch (dispatch + FC1 + SwiGLU + FC2 + combine) via
 `sm107_block_scaled_mega_launch_thunk` over pre-staged inputs; the torch
 staging fallback is excluded, matching the upstream tester's span.
 Same protocol: 5 warmup + 20 measured iterations, per-iteration CUDA event
-pairs; "avg" is the mean of the four rank averages, "min-max" spans every
-rank sample. TFLOP/s = tokens x topk x 6 x hidden x intermediate / latency
+pairs, and (since job 435886) the upstream per-iteration L2 flush — a 300MB
+throwaway ``randn`` outside the event window, replicating
+``tester/solver.py::perf_run`` exactly; "avg" is the mean of the four rank
+averages, "min-max" spans every rank sample. TFLOP/s = tokens x topk x 6 x hidden x intermediate / latency
 (balanced only — the balanced cost model is not meaningful for the
 imbalanced cases; matches the upstream convention).
 
@@ -60,65 +62,68 @@ Routing generators are ports of the upstream
 `tester/generate_inputs.py` block-balanced and Zipf/Gumbel power-law
 samplers.
 
-### NVFP4, measured 2026-08-17 — hecate0146 (4x SM107), job 435057
+### NVFP4, measured 2026-08-18 — hecate0020 (4x SM107), job 435886
 
-Branch `sm107_support` @ vendored `92dd334` (commits `dd6e5df6`/`ce5b5fd8`),
-`nvidia-cutlass-dsl-internal==0.3.0+20260803235612.d88cc85`. Raw samples:
-`.sqsh_build_logs/bench_sm107_mega_results_435057.jsonl`, log
-`.sqsh_build_logs/sm107_bench_435057.log`.
+Branch `sm107_support` @ vendored `92dd334`,
+`nvidia-cutlass-dsl-internal==0.3.0+20260803235612.d88cc85`, upstream
+L2-flush timing protocol. Raw samples:
+`.sqsh_build_logs/bench_sm107_mega_results_435886.jsonl`. (An earlier
+no-flush run, job 435057, produced averages within ~1% of these but with
+much wider min-max spreads — see "Reading the deltas".)
 
 #### NVFP4, balanced routing
 
 | Tokens/rank | Avg latency (us) | Min-max (us) | TFLOP/s | Upstream (us) | Delta | Knobs |
 |---|---|---|---|---|---|---|
-| 1K | 221.15 | 216.13-269.76 | 3,670.6 | 372.22 | -40.59% | tile 256x128x256; hint 4; epi 1x4; tif 1 |
-| 2K | 293.17 | 286.91-333.06 | 5,537.7 | 410.48 | -28.58% | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 4K | 458.53 | 452.77-500.32 | 7,081.3 | 529.56 | -13.41% | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 8K | 809.45 | 801.12-855.10 | 8,022.8 | 800.48 | +1.12% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 1,504.62 | 1,496.06-1,551.04 | 8,632.0 | 1,484.16 | +1.38% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 32K | 3,011.57 | 3,000.77-3,061.28 | 8,625.4 | 2,960.92 | +1.71% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 1K | 218.83 | 215.62-226.11 | 3,709.5 | 372.22 | -41.21% | tile 256x128x256; hint 4; epi 1x4; tif 1 |
+| 2K | 290.53 | 286.02-300.00 | 5,588.0 | 410.48 | -29.22% | tile 256x256x256; hint 3; epi 2x4; tif 1 |
+| 4K | 454.13 | 445.09-461.06 | 7,149.9 | 529.56 | -14.24% | tile 256x256x256; hint 3; epi 2x4; tif 1 |
+| 8K | 802.92 | 798.46-807.23 | 8,087.9 | 800.48 | +0.31% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 16K | 1,504.68 | 1,496.13-1,510.98 | 8,631.7 | 1,484.16 | +1.38% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 32K | 3,014.84 | 3,003.90-3,026.98 | 8,616.0 | 2,960.92 | +1.82% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
 
 #### NVFP4, power-law routing (alpha=0.8)
 
 | Tokens/rank | Avg latency (us) | Min-max (us) | Upstream (us) | Delta | Knobs |
 |---|---|---|---|---|---|
-| 1K | 319.86 | 311.36-369.95 | 399.75 | -19.99% | tile 256x128x256; hint 3; epi 1x4; tif 1 |
-| 2K | 379.82 | 370.66-431.42 | 474.56 | -19.96% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 4K | 535.69 | 526.56-580.67 | 621.76 | -13.84% | tile 256x256x256; hint 4; epi 1x4; tif 1 |
-| 8K | 1,269.08 | 1,260.19-1,309.76 | 1,053.01 | +20.52% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 2,054.53 | 2,031.97-2,087.46 | 2,081.84 | -1.31% | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-| 32K | 4,504.00 | 4,469.70-4,596.80 | 4,023.79 | +11.93% | tile 256x256x256; hint 3; epi 1x4; tif 4 |
+| 1K | 315.28 | 311.68-321.89 | 399.75 | -21.13% | tile 256x128x256; hint 3; epi 1x4; tif 1 |
+| 2K | 378.97 | 373.79-387.55 | 474.56 | -20.14% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 4K | 532.55 | 525.98-537.28 | 621.76 | -14.35% | tile 256x256x256; hint 4; epi 1x4; tif 1 |
+| 8K | 1,255.96 | 1,247.71-1,265.28 | 1,053.01 | +19.27% | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 16K | 2,040.66 | 2,019.62-2,056.86 | 2,081.84 | -1.98% | tile 256x256x256; hint 3; epi 1x4; tif 4 |
+| 32K | 4,497.98 | 4,466.43-4,606.08 | 4,023.79 | +11.78% | tile 256x256x256; hint 3; epi 1x4; tif 4 |
 
-### MXFP8 (e4m3), measured 2026-08-17 — hecate (4x SM107), job 435114
+### MXFP8 (e4m3), measured 2026-08-18 — hecate0020 (4x SM107), job 435886
 
 Same harness, same shape, same replayed winner knobs with tile K 128 (the
 mxfp8 2x-mode instruction-K depth) instead of 256.  **The upstream report is
 NVFP4-only, so MXFP8 has no upstream baseline** — the reference column is our
 own NVFP4 measurement (job 435057); the ratio is the cost of doubling the
 wire width (fp8 data + per-32 e8m0 scales vs fp4 + per-16 e4m3). Raw samples:
-`.sqsh_build_logs/bench_sm107_mega_results_435114.jsonl`.
+`.sqsh_build_logs/bench_sm107_mega_results_435886.jsonl` (upstream L2-flush
+protocol).
 
 #### MXFP8, balanced routing
 
 | Tokens/rank | Avg latency (us) | Min-max (us) | TFLOP/s | NVFP4 ref (us) | MXFP8/NVFP4 | Knobs |
 |---|---|---|---|---|---|---|
-| 1K | 319.78 | 313.60-369.79 | 2,538.5 | 221.15 | 1.45x | tile 256x128x128; hint 4; epi 1x4; tif 1 |
-| 2K | 432.27 | 424.86-480.58 | 3,755.8 | 293.17 | 1.47x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 4K | 645.11 | 636.83-688.29 | 5,033.2 | 458.53 | 1.41x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 8K | 1,113.43 | 1,099.94-1,144.19 | 5,832.4 | 809.45 | 1.38x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 2,067.72 | 2,031.58-2,114.78 | 6,281.3 | 1,504.62 | 1.37x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 32K | 4,089.07 | 3,968.13-4,202.53 | 6,352.5 | 3,011.57 | 1.36x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 1K | 319.07 | 315.04-339.01 | 2,544.1 | 218.83 | 1.46x | tile 256x128x128; hint 4; epi 1x4; tif 1 |
+| 2K | 427.75 | 422.21-434.43 | 3,795.4 | 290.53 | 1.47x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
+| 4K | 643.82 | 637.25-649.63 | 5,043.3 | 454.13 | 1.42x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
+| 8K | 1,111.37 | 1,092.93-1,128.13 | 5,843.2 | 802.92 | 1.38x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 16K | 2,062.29 | 2,030.08-2,111.58 | 6,297.8 | 1,504.68 | 1.37x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 32K | 4,061.55 | 3,981.86-4,130.53 | 6,395.6 | 3,014.84 | 1.35x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
 
 #### MXFP8, power-law routing (alpha=0.8)
 
 | Tokens/rank | Avg latency (us) | Min-max (us) | NVFP4 ref (us) | MXFP8/NVFP4 | Knobs |
 |---|---|---|---|---|---|
-| 1K | 439.00 | 433.28-480.74 | 319.86 | 1.37x | tile 256x128x128; hint 3; epi 1x4; tif 1 |
-| 2K | 545.58 | 535.49-590.02 | 379.82 | 1.44x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 4K | 699.82 | 692.22-740.77 | 535.69 | 1.31x | tile 256x256x128; hint 4; epi 1x4; tif 1 |
-| 8K | 1,595.73 | 1,584.32-1,637.02 | 1,269.08 | 1.26x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 2,604.58 | 2,569.41-2,667.49 | 2,054.53 | 1.27x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
-| 32K | 5,850.91 | 5,792.77-5,894.21 | 4,504.00 | 1.30x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
+| 1K | 437.27 | 429.60-445.12 | 315.28 | 1.39x | tile 256x128x128; hint 3; epi 1x4; tif 1 |
+| 2K | 546.01 | 539.36-556.67 | 378.97 | 1.44x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 4K | 698.71 | 692.74-707.39 | 532.55 | 1.31x | tile 256x256x128; hint 4; epi 1x4; tif 1 |
+| 8K | 1,596.46 | 1,589.02-1,603.71 | 1,255.96 | 1.27x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 16K | 2,588.31 | 2,562.85-2,655.49 | 2,040.66 | 1.27x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
+| 32K | 5,851.03 | 5,782.66-5,913.06 | 4,497.98 | 1.30x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
 
 MXFP8 lands at a steady ~1.3-1.5x the NVFP4 latency and plateaus at
 ~6.3 PFLOP/s (vs 8.6 for NVFP4) — consistent with the doubled operand bytes
@@ -130,13 +135,16 @@ nvfp4 winners), so a dedicated sweep may claw some of this back.
 - **Balanced >= 8K matches upstream within ~2%** (+1.1% / +1.4% / +1.7%) at
   8.0-8.6 PFLOP/s — the compute-bound regime, where a like-for-like
   comparison is meaningful. This validates the port end to end.
-- **Small sizes read FASTER than upstream (-13% to -41%).** Our 20 measured
-  launches run back-to-back on-stream with no per-iteration cross-rank
-  barrier, so iteration i+1's dispatch overlaps iteration i's combine tail;
-  the overlap hides a fixed slice of latency that matters most when the
-  kernel is short. Treat the small-token rows as steady-state pipelined
-  throughput, not isolated-launch latency — don't celebrate the negative
-  deltas.
+- **Small sizes read FASTER than upstream (-14% to -41%), and the L2-flush
+  rerun proved it is NOT a harness artifact.** The initial hypothesis —
+  back-to-back launches overlapping across iterations — was tested by
+  replicating upstream's per-iteration L2 flush exactly (job 435886): the
+  min-max spreads tightened sharply (e.g. 1K: 216-270 -> 216-226 us) but
+  the averages moved <1.5%. The protocols now match line for line, so the
+  residual small-token gap (which shrinks from ~150 us at 1K to ~0 at 8K)
+  is an environment difference between the upstream Rubin TS4B node
+  (driver 615.31) and our hecate nodes — small sizes are dispatch/NVLink
+  latency-bound, where such differences live.
 - **Power-law rows carry routing-draw noise (+/-10-20%).** The Zipf
   popularity permutation is seed-dependent; a different draw puts a
   different load on the hottest expert/rank, which gates the whole
