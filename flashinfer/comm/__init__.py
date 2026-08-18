@@ -88,6 +88,7 @@ from .dcp_alltoall import (
 )
 from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_workspace
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size
+from .dcp_direct_reduce import DCPDirectReduceWorkspace as DCPDirectReduceWorkspace
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
