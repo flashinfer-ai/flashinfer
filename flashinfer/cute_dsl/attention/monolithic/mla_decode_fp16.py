@@ -74,6 +74,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
+# ``Arch.sm_107*`` only exists in CuTe DSL >= 4.8; requirements.txt allows 4.7,
+# where a bare attribute access raises AttributeError as soon as this branch is
+# evaluated (SM100 short-circuits before it, SM103 does not).  Fall back to the
+# sm_103 bounds so an older DSL keeps exactly its pre-Rubin behaviour.
+_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
+_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
+
 
 from .mla_helpers import (
     ceil_div,
@@ -3143,7 +3150,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_107f):
+        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= _ARCH_SM107F):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
