@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -199,6 +200,39 @@ def test_cake_batch_deepgemm_rejects_unknown_shape_and_target():
 )
 def test_cake_batch_deepgemm_source_routes(n, k, expected_m, route):
     assert cake_batch_deepgemm._select_route(n, k, expected_m) == route
+
+
+@pytest.mark.parametrize(
+    ("route", "expected_b_rows"),
+    [
+        ("large_nk", 64),
+        ("short_m_n6144_k7168", 128),
+    ],
+)
+def test_cake_batch_deepgemm_tensor_map_matches_route(
+    monkeypatch,
+    route,
+    expected_b_rows,
+):
+    calls = []
+
+    def fake_tensor_map_device(tensor, **kwargs):
+        calls.append((tensor, kwargs))
+        return len(calls)
+
+    monkeypatch.setattr(
+        cake_batch_deepgemm,
+        "_tensor_map_device",
+        fake_tensor_map_device,
+    )
+    a = SimpleNamespace(shape=(6, 4096, 7168))
+    b = SimpleNamespace(shape=(6, 6144, 7168))
+    out = SimpleNamespace(shape=(6, 4096, 6144))
+
+    cake_batch_deepgemm._tensor_maps(a, b, out, route)
+
+    assert calls[0][1]["box_dims"] == (128, 128, 2, 1)
+    assert calls[1][1]["box_dims"] == (128, expected_b_rows, 2, 1)
 
 
 def test_cake_batch_deepgemm_rejects_unknown_source_route():

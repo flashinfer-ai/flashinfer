@@ -242,6 +242,7 @@ def _tensor_maps(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor,
+    shape: CakeBatchDeepGemmShape,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, m, k = a.shape
     n = b.shape[1]
@@ -265,8 +266,8 @@ def _tensor_maps(
             swizzle=swizzle_128,
         )
     else:
-        k_box = 1 if (n, k) == (512, 128) else 2
-        b_rows = 128 if (n, k) == (512, 128) else 64
+        k_box = 1 if shape == "n512_k128" else 2
+        b_rows = 128 if shape in {"n512_k128", "short_m_n6144_k7168"} else 64
         a_desc = _tensor_map_device(
             a,
             data_type=uint8,
@@ -327,7 +328,7 @@ def run_cake_batch_deepgemm_fp8(
         raise ValueError(
             f"Cake batch DeepGEMM requires SM100 or SM103, got {capability}"
         )
-    a_desc, b_desc, c_desc = _tensor_maps(a, b, out)
+    a_desc, b_desc, c_desc = _tensor_maps(a, b, out, shape)
     get_cake_batch_deepgemm_module(shape, target).run(
         a,
         b,
