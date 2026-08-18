@@ -243,7 +243,8 @@ class TllmGenFmhaKernel {
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
-                         int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel) const {
+                         int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel,
+                         bool fp16Softmax, bool usesSpcompress) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -261,44 +262,64 @@ class TllmGenFmhaKernel {
                      "The sparse MLA type must fit in 2 bits.");
     FLASHINFER_CHECK(bf16QFp8KvTransformMode >= 0 && bf16QFp8KvTransformMode <= 2,
                      "The BF16Q FP8KV transform mode must fit in 2 bits.");
-    // Format of the hash key:
-    // Bit 0  - 3 : qkvLayout.
-    // Bit 4  - 7 : maskType.
-    // Bit 8  - 11: kernelType.
-    // Bit 12 - 15: tileScheduler.
-    // Bit 16 - 17: multiCtasKvMode.
-    // Bit 18 - 25: (headDimPerCtaV >> 3).
-    // Bit 26 - 33: (headDimQk >> 3).
-    // Bit 34 - 41: (headDimV >> 3).
-    // Bit 42 - 43: (tileSizeKv >> 6).
-    // Bit 44 - 48: (log2(numTokensPerPage)).
-    // Bit 49 - 52: (log2(tileSizeQ)).
-    // Bit 53 - 53: reuseSmemKForV.
-    // Bit 54 - 54: uses2CtaMma.
-    // Bit 55 - 56: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
-    // Bit 57 - 57: skipsSoftmax.
-    // Bit 58 - 58: dynamicNumTokensPerPage.
-    // Bit 59 - 60: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
-    // Bit 61 - 61: groupsTokensHeadsQ.
-    // Bit 62 - 62: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
+    // The enum fields are packed tightly, so an out-of-range value would alias onto its neighbour
+    // instead of producing a distinct key. Check them rather than trusting the exporter.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
-    return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
-           (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12) |
-           (static_cast<uint64_t>(multiCtasKvMode) << 16) |
-           (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18) |
-           (static_cast<uint64_t>(headDimQk >> 3) << 26) |
-           (static_cast<uint64_t>(headDimV >> 3) << 34) |
-           (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (numTokensPerPageLog2 << 44) |
-           (static_cast<uint64_t>(log2(tileSizeQ)) << 49) |
-           (static_cast<uint64_t>(reuseSmemKForV) << 53) |
-           (static_cast<uint64_t>(uses2CtaMma) << 54) |
-           (static_cast<uint64_t>(sparseMlaType) << 55) |
-           (static_cast<uint64_t>(skipsSoftmax) << 57) |
-           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
-           (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 59) |
-           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61) |
-           (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 62);
+    FLASHINFER_CHECK(qkvLayout >= 0 && qkvLayout < 4 && maskType >= 0 && maskType < 8 &&
+                         kernelType >= 0 && kernelType < 8 && scheduler >= 0 && scheduler < 4 &&
+                         multiCtasKvMode >= 0 && multiCtasKvMode < 4 &&
+                         bf16QFp8KvTransformMode >= 0 && bf16QFp8KvTransformMode < 4 &&
+                         numTokensPerPageLog2 < 16,
+                     "Kernel attribute out of range for the hash key: qkvLayout=%d, maskType=%d, "
+                     "kernelType=%d, tileScheduler=%d, multiCtasKvMode=%d, "
+                     "bf16QFp8KvTransformMode=%d, numTokensPerPage=%d",
+                     qkvLayout, maskType, kernelType, scheduler, multiCtasKvMode,
+                     bf16QFp8KvTransformMode, numTokensPerPage);
+    // Format of the hash key. The enum fields are packed to their actual width rather than a
+    // round 4 bits, which is what makes room for fp16Softmax and usesSpcompress; the key is a
+    // private lookup key (nothing persists it), so the layout can move as long as
+    // hashID(KernelMeta) and hashFromRunnerParams() move with it.
+    // Bit 0  - 1 : qkvLayout.
+    // Bit 2  - 4 : maskType.
+    // Bit 5  - 7 : kernelType.
+    // Bit 8  - 9 : tileScheduler.
+    // Bit 10 - 11: multiCtasKvMode.
+    // Bit 12 - 19: (headDimPerCtaV >> 3).
+    // Bit 20 - 27: (headDimQk >> 3).
+    // Bit 28 - 35: (headDimV >> 3).
+    // Bit 36 - 37: (tileSizeKv >> 6).
+    // Bit 38 - 41: (log2(numTokensPerPage)).
+    // Bit 42 - 44: (log2(tileSizeQ)).
+    // Bit 45 - 45: reuseSmemKForV.
+    // Bit 46 - 46: uses2CtaMma.
+    // Bit 47 - 48: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
+    // Bit 49 - 49: skipsSoftmax.
+    // Bit 50 - 50: dynamicNumTokensPerPage.
+    // Bit 51 - 52: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
+    // Bit 53 - 53: groupsTokensHeadsQ.
+    // Bit 54 - 54: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
+    // Bit 55 - 55: fp16Softmax.
+    // Bit 56 - 56: usesSpcompress.
+    // Bit 57 - 63: unused.
+    return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 2) |
+           (static_cast<uint64_t>(kernelType) << 5) | (static_cast<uint64_t>(scheduler) << 8) |
+           (static_cast<uint64_t>(multiCtasKvMode) << 10) |
+           (static_cast<uint64_t>(headDimPerCtaV >> 3) << 12) |
+           (static_cast<uint64_t>(headDimQk >> 3) << 20) |
+           (static_cast<uint64_t>(headDimV >> 3) << 28) |
+           (static_cast<uint64_t>(tileSizeKv >> 6) << 36) | (numTokensPerPageLog2 << 38) |
+           (static_cast<uint64_t>(log2(tileSizeQ)) << 42) |
+           (static_cast<uint64_t>(reuseSmemKForV) << 45) |
+           (static_cast<uint64_t>(uses2CtaMma) << 46) |
+           (static_cast<uint64_t>(sparseMlaType) << 47) |
+           (static_cast<uint64_t>(skipsSoftmax) << 49) |
+           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 50) |
+           (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 51) |
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 53) |
+           (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 54) |
+           (static_cast<uint64_t>(fp16Softmax) << 55) |
+           (static_cast<uint64_t>(usesSpcompress) << 56);
   }
 
   inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
@@ -312,16 +333,16 @@ class TllmGenFmhaKernel {
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
-    return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
-                  kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
-                  kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
-                  kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
-                  isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
-                  kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
-                  kernelMeta.mSkipsSoftmaxWhenPossible,
-                  getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
-                                             kernelMeta.mSeparateTransformedKv),
-                  is2QSlidingWindowKernel(kernelMeta));
+    return hashID(
+        kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
+        kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV,
+        kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV, kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv,
+        kernelMeta.mNumTokensPerPage, isDynamicNumTokensPerPageKernel(kernelMeta),
+        kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ,
+        kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+        getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
+                                   kernelMeta.mSeparateTransformedKv),
+        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -1183,7 +1204,9 @@ class TllmGenFmhaKernel {
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
         ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
         ", bf16QFp8KvTransformMode=" +
-        std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode));
+        std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
+        ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1201,7 +1224,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
-               /*uses2QSlidingWindowKernel=*/false),
+               /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
+               selectKernelParams.mUsesSpcompress),
         info);
   }
 
