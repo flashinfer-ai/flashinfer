@@ -1280,7 +1280,7 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        tasks, *_ = _build_decode_gen_schedule(
+        tasks, resource_dependency_graph, *_ = _build_decode_gen_schedule(
             cfg,
             total_kv_tiles=18,
             num_heads_kv=8,
@@ -1295,6 +1295,18 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
     assert dst0.isdisjoint(dst1)
     assert {"smemK0", "smemV0", "smemBlockSparseKvMetadata0"} <= dst0
     assert {"smemK1", "smemV1", "smemBlockSparseKvMetadata1"} <= dst1
+    dependency_names = {
+        resource.name: {dependency.name for dependency in dependencies}
+        for resource, dependencies in resource_dependency_graph.items()
+    }
+    metadata_names = {
+        "smemBlockSparseKvMetadata0",
+        "smemBlockSparseKvMetadata1",
+    }
+    for inst_idx in (0, 1):
+        matching_metadata = {f"smemBlockSparseKvMetadata{inst_idx}"}
+        assert dependency_names[f"smemK{inst_idx}"] & metadata_names == matching_metadata
+        assert dependency_names[f"smemV{inst_idx}"] & metadata_names == matching_metadata
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -1553,6 +1565,27 @@ def test_prepared_block_sparse_layout_geometry(
     assert layout.workspace_size_words == 4 + 3 * layout.route_metadata_stride_words
 
 
+def test_keeps_softmax_staging_rejects_more_than_four_route_origins() -> None:
+    """Keeps consumers have registers for at most four staged origins."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_block_sparse_metadata import (
+        _BlockSparseSoftmaxStagingLayout,
+    )
+
+    route_layout = SimpleNamespace(
+        kv_route_size=256,
+        atom_size=32,
+        has_token_bits=False,
+    )
+
+    with pytest.raises(AssertionError, match="at most four route origins"):
+        _BlockSparseSoftmaxStagingLayout.create(
+            use_keeps_mma_ab=True,
+            route_layout=route_layout,
+            num_stages=2,
+        )
+
+
 def test_prepared_route_logical_origin_accessors_are_layout_nfc() -> None:
     """Naming logical origins must not add or move prepared-record words."""
 
@@ -1770,6 +1803,29 @@ def test_route_storage_capacity_follows_route_width(
     )
 
     assert row_route_offsets.tolist() == expected_offsets
+
+
+def test_route_storage_rejects_int32_offset_overflow_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route ordinals must remain representable by the device Int32 ABI."""
+
+    def unexpected_arange(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("route-offset overflow must fail before device allocation")
+
+    monkeypatch.setattr(torch, "arange", unexpected_arange)
+    route_layout = SimpleNamespace(
+        num_rows=2,
+        route_metadata_capacity=1 << 31,
+        workspace_size_words=0,
+    )
+
+    with pytest.raises(OverflowError, match="route capacity.*signed int32"):
+        block_sparse_plan._allocate_route_storage(
+            device=torch.device("cpu"),
+            route_layout=route_layout,
+            uniform_row_route_capacity=1 << 30,
+        )
 
 
 def test_prepared_route_alignment_uses_route_width() -> None:

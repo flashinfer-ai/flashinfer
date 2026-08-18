@@ -2301,6 +2301,51 @@ def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
     assert credit_alloc.size_bytes == 4
 
 
+def test_attention_ts_decode_kv256_reuse_credit_requires_three_stage_ring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse-credit cursor arithmetic is specialized to three stages."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_tasks
+
+    cfg = _make_contiguous_kv256_config(persistent=True)
+    assert cfg.uses_rotating_kv256_exchange
+    monkeypatch.setattr(fmha_decode_tasks, "KV_TILE_256_SHARED_FIFO_STAGES", 4)
+
+    with pytest.raises(AssertionError, match="exactly three shared FIFO stages"):
+        fmha_decode_tasks.SmemKvReuseCreditResource(
+            cfg=cfg,
+            pipeline_config=None,
+            name="smem_kv_reuse_credit",
+        )
+
+
+def test_attention_ts_decode_rejects_reuse_credit_before_schedule_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rotating reuse credit is invalid without a persistent work queue."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_tasks
+
+    def unexpected_schedule_capture(_fn):
+        pytest.fail("invalid reuse-credit topology reached schedule capture")
+
+    monkeypatch.setattr(fmha_decode_tasks, "schedule", unexpected_schedule_capture)
+
+    with pytest.raises(ValueError, match="reuse credit requires a work queue"):
+        fmha_decode_tasks.create_correction_task(
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            None,
+            object(),
+            object(),
+            domain=0,
+        )
+
+
 @pytest.mark.parametrize(
     ("split_kv_mode", "uses_separate_reduction"),
     (

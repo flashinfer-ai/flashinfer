@@ -77,33 +77,75 @@ class _BlockSparseRunArgs:
 class _PagedKVPlanMetadataLike(Protocol):
     """Minimal paged-plan metadata consumed by shared runtime validation."""
 
-    page_size: int
-    paged_kv_indptr: torch.Tensor
-    seq_lens_kv: torch.Tensor
-    num_page_indices: int
+    @property
+    def page_size(self) -> int: ...
+
+    @property
+    def paged_kv_indptr(self) -> torch.Tensor: ...
+
+    @property
+    def seq_lens_kv(self) -> torch.Tensor: ...
+
+    @property
+    def num_page_indices(self) -> int: ...
 
 
 class _BlockSparsePlanStateLike(Protocol):
     """Structural launch state shared by contiguous and paged wrappers."""
 
-    device: torch.device
-    batch_size: int
-    seq_len_q: int
-    seq_len_kv: int
-    num_qo_heads: int
-    num_kv_heads: int
-    head_dim: int
-    q_block_size: int
-    q_dtype: torch.dtype
-    kv_dtype: torch.dtype
-    output_dtype: torch.dtype
-    use_kv_valid_bits: bool
-    dummy_kv_valid_bits: torch.Tensor | None
-    row_route_offsets: torch.Tensor
-    route_workspace: torch.Tensor
-    max_blocks_per_row: int
-    compiled: Callable[..., object]
-    paged_kv: _PagedKVPlanMetadataLike | None
+    @property
+    def device(self) -> torch.device: ...
+
+    @property
+    def batch_size(self) -> int: ...
+
+    @property
+    def seq_len_q(self) -> int: ...
+
+    @property
+    def seq_len_kv(self) -> int: ...
+
+    @property
+    def num_qo_heads(self) -> int: ...
+
+    @property
+    def num_kv_heads(self) -> int: ...
+
+    @property
+    def head_dim(self) -> int: ...
+
+    @property
+    def q_block_size(self) -> int: ...
+
+    @property
+    def q_dtype(self) -> torch.dtype: ...
+
+    @property
+    def kv_dtype(self) -> torch.dtype: ...
+
+    @property
+    def output_dtype(self) -> torch.dtype: ...
+
+    @property
+    def use_kv_valid_bits(self) -> bool: ...
+
+    @property
+    def dummy_kv_valid_bits(self) -> torch.Tensor | None: ...
+
+    @property
+    def row_route_offsets(self) -> torch.Tensor: ...
+
+    @property
+    def route_workspace(self) -> torch.Tensor: ...
+
+    @property
+    def max_blocks_per_row(self) -> int: ...
+
+    @property
+    def compiled(self) -> Callable[..., object]: ...
+
+    @property
+    def paged_kv(self) -> _PagedKVPlanMetadataLike | None: ...
 
 
 def _validate_metadata_tensor(

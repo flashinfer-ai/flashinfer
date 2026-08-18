@@ -32,7 +32,10 @@ from typing import Literal
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import prims_ts_block_sparse_trace
+from flashinfer.trace.templates.attention import (
+    prims_ts_block_sparse_trace,
+    prims_ts_paged_block_sparse_trace_dispatch,
+)
 
 from ._block_sparse.config import (
     _BlockSparseStaticProfile,
@@ -247,6 +250,35 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``None``. Routing tensors may have different identities on every run.
 
         Keep this wrapper alive until every captured CUDA Graph is destroyed.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Compact query tensor ``[B, Sq, Hq, D]`` matching the plan.
+        k : torch.Tensor
+            Compact key tensor ``[B, Skv, Hkv, D]`` matching the plan.
+        v : torch.Tensor
+            Compact value tensor with the same shape, dtype, and strides as
+            ``k``.
+        block_indptr : torch.Tensor
+            Contiguous Int32 BSR row offsets with shape
+            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+        block_indices : torch.Tensor
+            Contiguous Int32 semantic KV-block IDs referenced by
+            ``block_indptr``.
+        kv_valid_bits : torch.Tensor, optional
+            Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
+            Supply it exactly when the plan enabled token validity bits.
+        sm_scale : float, optional
+            Softmax scale. Defaults to ``1 / sqrt(D)``.
+        out : torch.Tensor, optional
+            Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
+            planned output dtype.
+
+        Returns
+        -------
+        torch.Tensor
+            The compact output tensor; identical to ``out`` when provided.
         """
 
         state = self._require_run_state()
@@ -321,6 +353,37 @@ def block_sparse_attention(
     tensors to :meth:`BlockSparseTSWrapper.run`. It therefore cannot be invoked
     inside CUDA Graph capture; plan a wrapper outside capture and capture only
     ``run()`` instead.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Compact query tensor ``[B, Sq, Hq, D]``.
+    k : torch.Tensor
+        Compact key tensor ``[B, Skv, Hkv, D]``.
+    v : torch.Tensor
+        Compact value tensor with the same shape, dtype, and strides as ``k``.
+    block_indptr : torch.Tensor
+        Contiguous Int32 BSR row offsets with shape
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+    block_indices : torch.Tensor
+        Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
+    q_block_size : int
+        Number of logical query tokens represented by one BSR row.
+    kv_block_size : int
+        Number of logical KV tokens represented by one BSR block ID.
+    kv_valid_bits : torch.Tensor, optional
+        Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
+    mask_type : {"dense", "causal"}, optional
+        Attention mask applied inside each selected sparse block.
+    sm_scale : float, optional
+        Softmax scale. Defaults to ``1 / sqrt(D)``.
+    out : torch.Tensor, optional
+        Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+
+    Returns
+    -------
+    torch.Tensor
+        The compact output tensor; identical to ``out`` when provided.
     """
 
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
@@ -540,6 +603,38 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         while a replay is outstanding. The wrapper and its captured plan state
         must also outlive the graph. One plan revision owns mutable route
         scratch; unordered concurrent runs require separate wrapper instances.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Compact query tensor ``[B, Sq, Hq, D]`` matching the plan.
+        paged_kv_cache : PagedKVCache
+            Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a
+            ``(K, V)`` tuple whose tensors are
+            ``[P, Hkv, page_size, D]``.
+        paged_kv_indices : torch.Tensor
+            Contiguous Int32 physical page IDs. Its length must equal the
+            final offset snapshotted from ``paged_kv_indptr`` during planning.
+        block_indptr : torch.Tensor
+            Contiguous Int32 BSR row offsets with shape
+            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+        block_indices : torch.Tensor
+            Contiguous Int32 logical KV-block IDs referenced by
+            ``block_indptr``.
+        kv_valid_bits : torch.Tensor, optional
+            Contiguous UInt32 logical-token validity bitmap
+            ``[B, ceil(seq_len_kv / 32)]``. Supply it exactly when the plan
+            enabled token validity bits.
+        sm_scale : float, optional
+            Softmax scale. Defaults to ``1 / sqrt(D)``.
+        out : torch.Tensor, optional
+            Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
+            planned output dtype.
+
+        Returns
+        -------
+        torch.Tensor
+            The compact output tensor; identical to ``out`` when provided.
         """
 
         state = self._require_run_state()
@@ -560,7 +655,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_api
+@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
 def block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
@@ -584,6 +679,47 @@ def block_sparse_attention_with_paged_kv_cache(
     logical request-to-page spans come from ``paged_kv_indptr`` and optional
     ``seq_lens_kv``, while live physical page IDs and sparse routes still come
     from ``paged_kv_indices`` plus BSR metadata at run time.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Compact query tensor ``[B, Sq, Hq, D]``.
+    paged_kv_cache : PagedKVCache
+        Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a ``(K, V)``
+        tuple whose tensors are ``[P, Hkv, page_size, D]``.
+    paged_kv_indptr : torch.Tensor
+        Contiguous Int32 request offsets into ``paged_kv_indices``, with shape
+        ``[B + 1]``.
+    paged_kv_indices : torch.Tensor
+        Contiguous Int32 physical page IDs referenced by ``paged_kv_indptr``.
+    block_indptr : torch.Tensor
+        Contiguous Int32 BSR row offsets with shape
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+    block_indices : torch.Tensor
+        Contiguous Int32 logical KV-block IDs referenced by ``block_indptr``.
+    q_block_size : int
+        Number of logical query tokens represented by one BSR row.
+    kv_block_size : int
+        Number of logical KV tokens represented by one BSR block ID.
+    seq_len_kv : int
+        Exact shared logical KV length, or the maximum logical length when
+        ``seq_lens_kv`` is provided.
+    seq_lens_kv : torch.Tensor, optional
+        Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
+    kv_valid_bits : torch.Tensor, optional
+        Contiguous UInt32 logical-token validity bitmap
+        ``[B, ceil(seq_len_kv / 32)]``.
+    mask_type : {"dense", "causal"}, optional
+        Attention mask applied inside each selected sparse block.
+    sm_scale : float, optional
+        Softmax scale. Defaults to ``1 / sqrt(D)``.
+    out : torch.Tensor, optional
+        Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+
+    Returns
+    -------
+    torch.Tensor
+        The compact output tensor; identical to ``out`` when provided.
     """
 
     if not isinstance(q, torch.Tensor):

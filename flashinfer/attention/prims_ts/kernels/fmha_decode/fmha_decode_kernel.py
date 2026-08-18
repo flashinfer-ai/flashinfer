@@ -1511,10 +1511,14 @@ def _build_decode_gen_schedule(
                 else {}
             ),
             smem_q: [],
-            smem_k0: smem_k_deps,
-            smem_k1: smem_k_deps,
-            smem_v0: smem_v_deps,
-            smem_v1: smem_v_deps,
+            smem_k0: smem_k_deps
+            + ([sparse_kv_metadata0] if sparse_kv_metadata0 is not None else []),
+            smem_k1: smem_k_deps
+            + ([sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []),
+            smem_v0: smem_v_deps
+            + ([sparse_kv_metadata0] if sparse_kv_metadata0 is not None else []),
+            smem_v1: smem_v_deps
+            + ([sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []),
             tmem_s0: [smem_k0, smem_q],
             tmem_s1: [smem_k1, smem_q],
             smem_p0: [tmem_s0],

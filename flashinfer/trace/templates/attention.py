@@ -18,25 +18,26 @@ Pick the template whose input schema matches your call site. Rows that share
 KV layout / indexing / stage are interchangeable from a consumer's viewpoint;
 the backend column indicates which kernel the API wraps.
 
-+---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
-| Template                  | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
-+===========================+===================+===========================+=========================+=========+=================+
-| ``single_decode``         | single request    | contiguous                | none                    | decode  | any (no plan)   |
-| ``single_prefill``        | single request    | contiguous                | none                    | prefill | any (no plan)   |
-| ``gqa_paged_decode``      | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
-| ``prims_ts_batch_decode`` | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
-| ``gqa_paged_prefill``     | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
-| ``gqa_ragged``            | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
-| ``prims_ts_block_sparse`` | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
-| ``mla_paged_decode``      | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
-| ``prims_ts_decode_mla``   | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
-| ``mla_paged_prefill``     | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
-| ``dsa_paged``             | batched           | paged MLA                 | sparse_indices (top-K)  | both    | sparse DSA      |
-| ``trtllm_batch_decode``   | batched           | paged, interleaved single | block_tables + seq_lens | decode  | TRT-LLM SM100+  |
-| ``trtllm_batch_context``  | batched           | paged, interleaved single | block_tables + cum_*    | prefill | TRT-LLM SM100+  |
-| ``cudnn_batch_decode``    | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
-| ``cudnn_batch_prefill``   | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
-+---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
++---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
+| Template                        | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
++=================================+===================+===========================+=========================+=========+=================+
+| ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
+| ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
+| ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
+| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
+| ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
+| ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
+| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
+| ``prims_ts_paged_block_sparse`` | batched, fixed    | paged HND tuple/combined  | page table + BSR + bits | both    | PrimTS SM100a   |
+| ``mla_paged_decode``            | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
+| ``prims_ts_decode_mla``         | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
+| ``mla_paged_prefill``           | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
+| ``dsa_paged``                   | batched           | paged MLA                 | sparse_indices (top-K)  | both    | sparse DSA      |
+| ``trtllm_batch_decode``         | batched           | paged, interleaved single | block_tables + seq_lens | decode  | TRT-LLM SM100+  |
+| ``trtllm_batch_context``        | batched           | paged, interleaved single | block_tables + cum_*    | prefill | TRT-LLM SM100+  |
+| ``cudnn_batch_decode``          | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
+| ``cudnn_batch_prefill``         | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
++---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
 """
 
 import math
@@ -338,6 +339,130 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
 
 
 prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
+
+
+def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
+    """Extend the one-shot block-sparse schema with paged-KV inputs."""
+
+    contiguous = _make_prims_ts_block_sparse_trace()
+    cache_form = "combined" if combined else "tuple"
+    axes = dict(contiguous.axes)
+    axes["seq_len_kv"] = Var(description="Static maximum logical K/V length.")
+    axes.update(
+        {
+            "num_pages": Var(
+                description="Total number of allocated physical KV pages."
+            ),
+            "page_size": Const(abbrev="ps"),
+            "num_page_offsets": Var(
+                description="Length of the request-to-page indptr array."
+            ),
+            "num_page_indices": Var(
+                description="Number of runtime physical page IDs."
+            ),
+        }
+    )
+    if combined:
+        axes["kv_planes"] = Const(
+            abbrev="", description="K/V plane count; required to be 2."
+        )
+
+    inputs = dict(contiguous.inputs)
+    del inputs["k"], inputs["v"]
+    if combined:
+        inputs["paged_kv_cache"] = Tensor(
+            [
+                "num_pages",
+                "kv_planes",
+                "num_kv_heads",
+                "page_size",
+                "head_dim",
+            ],
+            description="Combined K/V pages in HND layout.",
+        )
+    else:
+        inputs.update(
+            {
+                "k_cache": Tensor(
+                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                    param="paged_kv_cache",
+                    tuple_idx=0,
+                    description="K pages in the separate HND paged-cache form.",
+                ),
+                "v_cache": Tensor(
+                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                    param="paged_kv_cache",
+                    tuple_idx=1,
+                    description="V pages in the separate HND paged-cache form.",
+                ),
+            }
+        )
+    inputs.update(
+        {
+            "paged_kv_indptr": Tensor(
+                ["num_page_offsets"],
+                dtype="int32",
+                description="Request offsets into paged_kv_indices.",
+            ),
+            "paged_kv_indices": Tensor(
+                ["num_page_indices"],
+                dtype="int32",
+                description="Runtime physical page IDs.",
+            ),
+            "seq_len_kv": Scalar(
+                "int32",
+                description="Static maximum logical K/V length.",
+            ),
+            "seq_lens_kv": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                optional=True,
+                description="Optional per-request logical K/V lengths.",
+            ),
+        }
+    )
+
+    return TraceTemplate(
+        op_type=contiguous.op_type,
+        name_prefix=f"prims_ts_paged_block_sparse_{cache_form}",
+        description=(
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"BSHD Q, the {cache_form} HND paged KV cache form, request page "
+            "tables, and per-KV-head BSR metadata."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(contiguous.outputs),
+        constraints=[
+            *contiguous.constraints,
+            "num_page_offsets == batch_size + 1",
+            "num_page_indices == paged_kv_indptr[-1].item()",
+            "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+            "page_size in (16, 32, 64, 128)",
+            "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
+            "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0",
+            *(["kv_planes == 2"] if combined else []),
+        ],
+        tags=[*contiguous.tags, "kv-cache:paged"],
+    )
+
+
+_PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES = {
+    combined: _make_prims_ts_paged_block_sparse_trace(combined=combined)
+    for combined in (False, True)
+}
+
+
+def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
+    """Select the tuple or combined paged-KV block-sparse schema."""
+
+    combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
+    return _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined]
+
+
+prims_ts_paged_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
+)
 
 
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,

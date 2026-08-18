@@ -363,6 +363,10 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
         "block_sparse_attention",
     ): 1,
     (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention_with_paged_kv_cache",
+    ): 2,
+    (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
     ): 12,
@@ -415,7 +419,7 @@ def test_attention_ts_trace_registry_coverage():
         if func.__module__.startswith("flashinfer.attention.prims_ts")
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
-    assert sum(discovered.values()) == 49
+    assert sum(discovered.values()) == 51
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
@@ -423,6 +427,7 @@ def test_attention_ts_trace_constraints_match_cache_axes():
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
         prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
@@ -440,7 +445,10 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
-    block_sparse_templates = (prims_ts_block_sparse_trace,)
+    block_sparse_templates = (
+        prims_ts_block_sparse_trace,
+        *prims_ts_paged_block_sparse_trace_dispatch.templates,
+    )
     for dispatch in (*fmha_dispatches, *mla_dispatches):
         for template in dispatch.templates:
             assert_template_constraints_valid(template, label=dispatch.__name__)
@@ -466,7 +474,10 @@ def test_attention_ts_trace_constraints_match_cache_axes():
 
 
 def test_prims_ts_block_sparse_trace_describes_gqa_contract():
-    from flashinfer.trace.templates.attention import prims_ts_block_sparse_trace
+    from flashinfer.trace.templates.attention import (
+        prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
+    )
 
     constraints = set(prims_ts_block_sparse_trace.constraints)
     assert "num_qo_heads % num_kv_heads == 0" in constraints
@@ -475,6 +486,54 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
     assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
     assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
+
+    paged_templates = {
+        template.name_prefix: template
+        for template in prims_ts_paged_block_sparse_trace_dispatch.templates
+    }
+    tuple_trace = paged_templates["prims_ts_paged_block_sparse_tuple"]
+    combined_trace = paged_templates["prims_ts_paged_block_sparse_combined"]
+    common_inputs = {
+        "q",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_len_kv",
+        "seq_lens_kv",
+        "block_indptr",
+        "block_indices",
+        "q_block_size",
+        "kv_block_size",
+        "kv_valid_bits",
+        "mask_type",
+        "sm_scale",
+    }
+    for template in (tuple_trace, combined_trace):
+        assert common_inputs <= template.inputs.keys()
+        assert "paged KV" in template.description
+
+    assert tuple_trace.inputs["k_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["k_cache"].tuple_idx == 0
+    assert tuple_trace.inputs["v_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["v_cache"].tuple_idx == 1
+    assert combined_trace.inputs["paged_kv_cache"].dim_names == [
+        "num_pages",
+        "kv_planes",
+        "num_kv_heads",
+        "page_size",
+        "head_dim",
+    ]
+    assert "kv_planes == 2" in combined_trace.constraints
+
+    tuple_cache = (torch.empty(1), torch.empty(1))
+    combined_cache = torch.empty(1)
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=tuple_cache)
+        is tuple_trace
+    )
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=combined_cache)
+        is combined_trace
+    )
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():

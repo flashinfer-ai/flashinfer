@@ -1,0 +1,204 @@
+{
+  "name": "prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q, the tuple HND paged KV cache form, request page tables, and per-KV-head BSR metadata.",
+  "op_type": "block_sparse",
+  "tags": [
+    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
+    "backend:prims-ts",
+    "sparse:block",
+    "status:experimental",
+    "kv-cache:paged"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of requests."
+    },
+    "seq_len_q": {
+      "type": "var",
+      "description": "Fixed query length per request."
+    },
+    "seq_len_kv": {
+      "type": "var",
+      "description": "Static maximum logical K/V length."
+    },
+    "num_qo_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_q_block_offsets": {
+      "type": "var",
+      "description": "Number of BSR row offsets per batch and KV head."
+    },
+    "num_block_indices": {
+      "type": "var",
+      "description": "Number of selected KV blocks."
+    },
+    "num_kv_valid_words": {
+      "type": "var",
+      "description": "Number of optional token-validity words per batch."
+    },
+    "q_block_size": {
+      "type": "const",
+      "value": 64
+    },
+    "kv_block_size": {
+      "type": "const",
+      "value": 64
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Total number of allocated physical KV pages."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64
+    },
+    "num_page_offsets": {
+      "type": "var",
+      "description": "Length of the request-to-page indptr array."
+    },
+    "num_page_indices": {
+      "type": "var",
+      "description": "Number of runtime physical page IDs."
+    }
+  },
+  "constraints": [
+    "num_qo_heads % num_kv_heads == 0",
+    "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
+    "head_dim == 128",
+    "q_block_size in (8, 16, 32) or (q_block_size > 0 and q_block_size % 64 == 0)",
+    "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
+    "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    "mask_type is None or mask_type in ('dense', 'causal')",
+    "num_page_offsets == batch_size + 1",
+    "num_page_indices == paged_kv_indptr[-1].item()",
+    "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+    "page_size in (16, 32, 64, 128)",
+    "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
+    "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "block_indptr": {
+      "shape": [
+        "batch_size",
+        "num_kv_heads",
+        "num_q_block_offsets"
+      ],
+      "dtype": "int32",
+      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+    },
+    "block_indices": {
+      "shape": [
+        "num_block_indices"
+      ],
+      "dtype": "int32",
+      "description": "Selected KV block IDs, consumed by the one-shot call."
+    },
+    "kv_valid_bits": {
+      "shape": [
+        "batch_size",
+        "num_kv_valid_words"
+      ],
+      "dtype": "uint32",
+      "optional": true,
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+    },
+    "q_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "kv_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "mask_type": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "float16",
+      "description": "K pages in the separate HND paged-cache form."
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "float16",
+      "description": "V pages in the separate HND paged-cache form."
+    },
+    "paged_kv_indptr": {
+      "shape": [
+        "num_page_offsets"
+      ],
+      "dtype": "int32",
+      "description": "Request offsets into paged_kv_indices."
+    },
+    "paged_kv_indices": {
+      "shape": [
+        "num_page_indices"
+      ],
+      "dtype": "int32",
+      "description": "Runtime physical page IDs."
+    },
+    "seq_len_kv": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Static maximum logical K/V length."
+    },
+    "seq_lens_kv": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Optional per-request logical K/V lengths."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "float16",
+      "param": "out"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

@@ -24,6 +24,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from .common import _SIGNED_INT32_MAX
 from .compiler import _get_compiled_block_sparse
 from .config import (
     _BlockSparseStaticProfile,
@@ -240,6 +241,11 @@ def _allocate_route_storage(
     expected_capacity = route_layout.num_rows * uniform_row_route_capacity
     if expected_capacity != route_layout.route_metadata_capacity:
         raise RuntimeError("uniform row capacity does not match route layout")
+    if expected_capacity > _SIGNED_INT32_MAX:
+        raise OverflowError(
+            "block-sparse route capacity must fit in signed int32: "
+            f"got {expected_capacity}"
+        )
     offsets_i64 = torch.arange(
         route_layout.num_rows + 1,
         dtype=torch.int64,

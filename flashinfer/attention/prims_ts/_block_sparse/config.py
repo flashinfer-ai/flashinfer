@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass, replace
 import functools
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 
@@ -332,7 +332,7 @@ def _validate_block_sparse_static_profile(
     validated_max_blocks_per_row = None
     if max_blocks_per_row is not _CAPACITY_UNSET:
         validated_max_blocks_per_row = _validate_max_blocks_per_row(
-            max_blocks_per_row,
+            cast(int, max_blocks_per_row),
             seq_len_kv=seq_len_kv,
             kv_block_size=kv_block_size,
         )

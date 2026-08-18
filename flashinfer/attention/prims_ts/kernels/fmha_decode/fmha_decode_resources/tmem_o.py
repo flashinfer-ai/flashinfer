@@ -234,7 +234,12 @@ class TmemOResource(DecodeGenResourceBase):
         fragment_idx: Constexpr[int],
         initial_scale_d,
     ) -> None:
-        """Issue the two WS MMA steps covered by one KV256 P fragment."""
+        """Issue the two WS MMA steps covered by one KV256 P fragment.
+
+        ``p_tmem_addr`` is already the base of the fragment selected by
+        ``wait_p_fragment``. Only the two local K-step offsets are added here;
+        ``fragment_idx`` must not be applied to the TMEM address again.
+        """
         cfg = self.cfg
         assert cfg.tile_size_kv == 256 and cfg.uses_two_inst_tmem_p
         v_desc = _freeze_smem_descriptor(v_desc)

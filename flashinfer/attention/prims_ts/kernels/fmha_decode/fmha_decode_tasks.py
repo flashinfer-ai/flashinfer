@@ -170,6 +170,9 @@ class SmemKvReuseCreditResource(MemoryResource):
 
     def __post_init__(self) -> None:
         """Create the routed consumer slot for one physical K/V stage."""
+        assert KV_TILE_256_SHARED_FIFO_STAGES == 3, (
+            "KV256 reuse-credit rotation requires exactly three shared FIFO stages"
+        )
         if not self.cfg.uses_rotating_kv256_exchange:
             raise ValueError(
                 "rotating KV scratch requires persistent direct Q64/KV256 "
@@ -3292,6 +3295,9 @@ def create_correction_task(
     **kw: TaskKwarg,
 ) -> Task:
     """Create the two-instance correction and output task."""
+
+    if smem_kv_reuse_credit is not None and work_queue is None:
+        raise ValueError("KV reuse credit requires a work queue")
 
     def correction_schedule_body(
         tmem_softmax_local0: MemoryResource,

@@ -173,6 +173,9 @@ class _BlockSparseSoftmaxStagingLayout:
         has_token_bits = route_layout.has_token_bits
         if use_keeps_mma_ab:
             num_origin_words = kv_route_size // atom_size
+            assert num_origin_words <= 4, (
+                "Keeps softmax staging supports at most four route origins"
+            )
             origins_per_warp = num_origin_words
             route_flags_word_offset = num_origin_words
             aligned_payload_words = ((route_flags_word_offset + 1 + 3) // 4) * 4

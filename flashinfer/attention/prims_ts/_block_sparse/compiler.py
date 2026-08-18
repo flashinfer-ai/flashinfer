@@ -227,6 +227,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     q_fake = fake_compact(config.q_dtype, q_shape, 16)
     out_fake = fake_compact(config.out_dtype, q_shape, 16)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    tensor_adapter: Callable[..., object]
+    dynamic_args: tuple[object, ...]
     if key.page_size is None:
         kv_shape = (
             key.batch_size,

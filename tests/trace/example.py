@@ -76,6 +76,8 @@ mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
+prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
+prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -121,7 +123,10 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
-from flashinfer.attention.prims_ts.block_sparse import block_sparse_attention
+from flashinfer.attention.prims_ts.block_sparse import (
+    block_sparse_attention,
+    block_sparse_attention_with_paged_kv_cache,
+)
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
@@ -663,6 +668,48 @@ block_sparse_attention.fi_trace(
     mask_type="dense",
     out=bs_out,
 )
+
+# ── PrimTS paged block-sparse (both public cache forms) ──────────────────
+bs_page_size = 64
+bs_pages_per_request = bs_Skv // bs_page_size
+bs_num_pages = bs_B * bs_pages_per_request
+bs_paged_kv_indptr = (
+    torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
+)
+bs_paged_kv_indices = torch.arange(
+    bs_num_pages, dtype=torch.int32, device=device
+)
+bs_seq_lens_kv = torch.tensor(
+    [bs_Skv - bs_page_size // 2, bs_Skv], dtype=torch.int32, device=device
+)
+bs_k_cache = torch.randn(
+    bs_num_pages,
+    bs_H,
+    bs_page_size,
+    bs_D,
+    dtype=torch.float16,
+    device=device,
+)
+bs_v_cache = torch.randn_like(bs_k_cache)
+bs_combined_cache = torch.stack((bs_k_cache, bs_v_cache), dim=1)
+
+for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
+    block_sparse_attention_with_paged_kv_cache.fi_trace(
+        save_dir=SAVE_DIR,
+        q=bs_q,
+        paged_kv_cache=bs_paged_cache,
+        paged_kv_indptr=bs_paged_kv_indptr,
+        paged_kv_indices=bs_paged_kv_indices,
+        block_indptr=bs_block_indptr,
+        block_indices=bs_block_indices,
+        q_block_size=bs_q_block,
+        kv_block_size=bs_kv_block,
+        seq_len_kv=bs_Skv,
+        seq_lens_kv=bs_seq_lens_kv,
+        kv_valid_bits=bs_valid_bits,
+        mask_type="dense",
+        out=bs_out,
+    )
 # ── MLA paged decode (DeepSeek-V3 TP=8, h=16/ckv=512/kpe=64) ─────────────────
 mla_b, mla_h, ckv, kpe = 128, 16, 512, 64
 
