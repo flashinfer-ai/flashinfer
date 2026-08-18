@@ -193,7 +193,7 @@ if [[ "${CUDA_VERSION}" == 13* ]]; then
     FLASHINFER_EDITABLE_SPEC=".[cu13]"
 fi
 run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
-    pip install --no-build-isolation -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
+    pip install --no-build-isolation --no-deps -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
@@ -216,8 +216,11 @@ echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
 rm -rf dist build *.egg-info
+# The image satisfies this package's build requires except wheel, until the
+# images carrying it are rolled out.
+python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
 run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
-    python -m build --wheel
+    python -m build --wheel --no-isolation
 
 # Get the built wheel file
 WHEEL_FILE=$(ls -t dist/*.whl | head -n 1)

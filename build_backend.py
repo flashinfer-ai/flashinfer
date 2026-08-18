@@ -119,6 +119,15 @@ def _in_isolated_build_env() -> bool:
     return any(m in p for m in markers for p in paths)
 
 
+def _no_pip_installs() -> bool:
+    """True when the environment is preprovisioned and the hooks must not install.
+
+    Set by the CI scripts: they build with --no-build-isolation, which would
+    otherwise turn hook installs that isolation always swallowed into downloads.
+    """
+    return os.environ.get("FLASHINFER_BUILD_NO_PIP") == "1"
+
+
 def _detect_cuda_major() -> int:
     """Best-effort detection of the CUDA major version on the host."""
     try:
@@ -567,6 +576,12 @@ def _ensure_nixl_wheel() -> None:
         except Exception:
             pass
         return
+    if _no_pip_installs():
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; no NIXL wheel to "
+            "pre-install, so the pre-flight probe will skip NIXL-EP"
+        )
+        return
     cuda_major = _detect_cuda_major()
     wheel = f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}"
     print(f"[BUILD_NVEP] pre-installing NIXL wheel --no-deps: {wheel}")
@@ -602,6 +617,9 @@ def _ensure_nccl_floor() -> None:
     cuda_major = _detect_cuda_major()
     if cuda_major < 13:
         return  # EP is CUDA-13-only; nothing to upgrade on cu12 hosts.
+    if _no_pip_installs():
+        print("[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; leaving NCCL as installed")
+        return
     wheel = "nvidia-nccl-cu13>=2.30.7"
     print(f"[BUILD_NVEP] ensuring NCCL-EP floor --no-deps: {wheel}")
 
@@ -732,6 +750,25 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
         ) from e
 
 
+def _compile_deps_installed(specs) -> bool:
+    """True when every spec is already satisfied. False on any doubt, so that an
+    unreadable environment still reaches the install below."""
+    try:
+        from importlib.metadata import version
+        from packaging.requirements import Requirement
+    except ImportError:
+        return False
+
+    for spec in specs:
+        try:
+            req = Requirement(spec)
+            if not req.specifier.contains(version(req.name), prereleases=True):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def _install_cuda_tile_compile_deps() -> None:
     """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
 
@@ -775,6 +812,18 @@ def _install_cuda_tile_compile_deps() -> None:
         "nvidia-nvjitlink<14,>=13.3",
         "nvidia-cuda-crt<13.4,>=13.2",
     ]
+
+    if _compile_deps_installed(wheels):
+        print("[BUILD] cuda-tile compile deps already installed; skipping", flush=True)
+        return
+
+    if _no_pip_installs():
+        print(
+            "[BUILD] FLASHINFER_BUILD_NO_PIP=1; not installing cuda-tile compile deps",
+            flush=True,
+        )
+        return
+
     print(f"[BUILD] cuda-tile compile deps (--no-deps): {' '.join(wheels)}", flush=True)
 
     uv_bin = shutil.which("uv")
