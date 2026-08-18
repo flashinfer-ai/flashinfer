@@ -88,6 +88,7 @@ from .jit.fused_moe import (
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.monomoe import gen_monomoe_module
+from .jit.glm5_moe import gen_glm5_moe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
@@ -656,6 +657,8 @@ def gen_all_modules(
             jit_specs.append(gen_moe_utils_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
+            # Low-token GLM5 block-FP8 MoE (SM100-family, TP4/TP8).
+            jit_specs.append(gen_glm5_moe_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())

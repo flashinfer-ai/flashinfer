@@ -150,6 +150,7 @@ def assert_template_axes_covered(
         name
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
+        and marker.value is None
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names
