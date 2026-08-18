@@ -1571,13 +1571,10 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          // m == -inf means the row has no unmasked logit yet, in which case
-          // every exponent below is (-inf) - (-inf); clamp it to -inf so the
-          // tile contributes exp2(-inf) = 0 instead of NaN. Finite inputs are
-          // unaffected because m >= m_prev and m >= every s_frag entry, so the
-          // clamped differences are always <= 0.
-          float o_scale =
-              math::ptx_exp2(max(m_prev * sm_scale - m[mma_q][j] * sm_scale, -math::inf));
+          // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
+          const float m_scaled =
+              max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
+          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -1588,14 +1585,14 @@ __device__ __forceinline__ void update_mdo_states(
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            s_frag[mma_q][mma_kv][j * 2 + 0] = math::ptx_exp2(max(
-                s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m[mma_q][j] * sm_scale, -math::inf));
-            s_frag[mma_q][mma_kv][j * 2 + 1] = math::ptx_exp2(max(
-                s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m[mma_q][j] * sm_scale, -math::inf));
-            s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(max(
-                s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m[mma_q][j] * sm_scale, -math::inf));
-            s_frag[mma_q][mma_kv][j * 2 + 5] = math::ptx_exp2(max(
-                s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m[mma_q][j] * sm_scale, -math::inf));
+            s_frag[mma_q][mma_kv][j * 2 + 0] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 1] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 5] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m_scaled);
           }
         }
       }
@@ -1620,11 +1617,9 @@ __device__ __forceinline__ void update_mdo_states(
             __hmax2(*(half2*)&m[mma_q], math::shfl_xor_sync(*(half2*)&m[mma_q], 0x1));
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          // See the float path above: clamp (-inf) - (-inf) to -inf so fully
-          // masked rows contribute zero instead of NaN (__hmax2 returns the
-          // non-NaN operand).
-          float o_scale = math::ptx_exp2(
-              max(float(m_prev[j] * sm_scale.x - m[mma_q][j] * sm_scale.x), -math::inf));
+          // Per-row clamp to the lowest finite half (see the float path above).
+          const half m_scaled_h = __hmax(__hmul(m[mma_q][j], sm_scale.x), __float2half(-65504.f));
+          float o_scale = math::ptx_exp2(float(m_prev[j] * sm_scale.x) - float(m_scaled_h));
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -1633,14 +1628,13 @@ __device__ __forceinline__ void update_mdo_states(
             o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
             o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
           }
-          half2 m2 = make_half2(m[mma_q][j], m[mma_q][j]);
-          half2 neg_inf2 = __float2half2_rn(-math::inf);
+          half2 m2s = make_half2(m_scaled_h, m_scaled_h);
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2] = math::ptx_exp2(__hmax2(
-                *(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2 * sm_scale, neg_inf2));
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(__hmax2(
-                *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2 * sm_scale, neg_inf2));
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2] =
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2s);
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2s);
           }
         }
       }
@@ -1875,9 +1869,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                                 lane_idx / 4];
             float m_prev = m_new, d_prev = d_new;
             m_new = max(m_new, md.x);
-            // Rows masked in every kv warp merge two -inf maxima; clamp the
-            // exponent differences at -inf (max() drops the NaN operand) so
-            // the merged state stays (m=-inf, d finite, o=0) instead of NaN.
+            // max() drops the NaN from merging two -inf maxima (fully masked rows).
             d_new = d_prev * math::ptx_exp2(max(m_prev - m_new, -math::inf)) +
                     md.y * math::ptx_exp2(max(md.x - m_new, -math::inf));
           }
@@ -3230,8 +3222,9 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       }
       float m_prev = float(m[mma_q][j]);
       float m_new = max(m_prev, mt);
-      // Clamp at -inf for fully masked rows (see update_mdo_states).
-      o_scale[mma_q][j] = math::ptx_exp2(max(m_prev * sm_scale - m_new * sm_scale, -math::inf));
+      // Per-row clamp for fully masked rows (see update_mdo_states).
+      const float m_new_scaled = max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
+      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
       d[mma_q][j] *= o_scale[mma_q][j];
       m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
     }
@@ -3244,16 +3237,16 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      const float m_new = float(m[mma_q][j]) * sm_scale;
+      // Per-row clamp for fully masked rows (see update_mdo_states).
+      const float m_new =
+          max(float(m[mma_q][j]) * sm_scale, -cuda::std::numeric_limits<float>::max());
       float dsum = 0.f;
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
         for (uint32_t k = 0; k < 2; ++k) {  // reg positions j*2+{0,1} and j*2+{4,5}
-          float p0 =
-              math::ptx_exp2(max(s_frag[mma_q][mma_kv][j * 2 + k] * sm_scale - m_new, -math::inf));
-          float p1 = math::ptx_exp2(
-              max(s_frag[mma_q][mma_kv][j * 2 + 4 + k] * sm_scale - m_new, -math::inf));
+          float p0 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + k] * sm_scale - m_new);
+          float p1 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4 + k] * sm_scale - m_new);
           dsum += p0 + p1;
           const uint32_t row = q_row_base + mma_q * 16 + lane_idx / 4 + 8 * j;
           const uint32_t col0 = mma_kv * 16 + 2 * (lane_idx % 4) + k;

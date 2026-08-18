@@ -101,8 +101,7 @@ __device__ __forceinline__ void compute_qk(
   }
 
   if constexpr (variant.use_softmax) {
-    // A fully masked tile leaves st.m at -inf; clamp the exponent differences
-    // at -inf so the tile contributes zero instead of (-inf) - (-inf) = NaN.
+    // max() drops the NaN when the tile is fully masked (st.m == -inf).
     float o_scale = math::ptx_exp2(max(m_prev - st.m, -math::inf));
     st.d *= o_scale;
 #pragma unroll
@@ -866,8 +865,7 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     st.m = max(st.m, s[j]);
   }
 
-  // Clamp at -inf so a fully masked tile contributes zero instead of
-  // (-inf) - (-inf) = NaN (see update_mdo_states in prefill.cuh).
+  // max() drops the NaN when the tile is fully masked (st.m == -inf).
   float o_scale = math::ptx_exp2(max(m_prev - st.m, -math::inf));
   st.d *= o_scale;
 #pragma unroll

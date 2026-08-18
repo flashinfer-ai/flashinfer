@@ -54,10 +54,7 @@ struct state_t {
                                         float other_d) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
-    // Merging two states whose maxima are both -inf (no unmasked logit on
-    // either side) would compute (-inf) - (-inf) = NaN; clamp the exponent
-    // differences at -inf (max() drops the NaN operand) so an empty state
-    // contributes zero weight instead.
+    // max() drops the NaN from merging two empty states ((-inf) - (-inf)).
     float f1 = math::ptx_exp2(max(m_prev - m, -math::inf));
     float f2 = math::ptx_exp2(max(other_m - m, -math::inf));
     d = d_prev * f1 + other_d * f2;
@@ -76,9 +73,8 @@ struct state_t {
   }
 
   __device__ __forceinline__ void normalize() {
-    // only normalize by d when not normalized on the fly
-    // A fully masked state (m == -inf) accumulates d == 0; its output must
-    // stay zero rather than 0/0 = NaN.
+    // only normalize by d when not normalized on the fly; empty states
+    // (d == 0) keep zero output instead of 0/0 = NaN
     float d_rcp = (d > 0.f) ? __fdividef(1.f, d) : 0.f;
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
