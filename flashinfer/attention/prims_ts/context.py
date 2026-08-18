@@ -1568,6 +1568,7 @@ class BatchPrefillTSWrapper:
 
     @flashinfer_api
     def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._planned = False
 
     @flashinfer_api
@@ -1589,6 +1590,23 @@ class BatchPrefillTSWrapper:
 
         Packed cumulative offsets remain live device inputs. Their runtime
         values must follow the replay contract documented on this wrapper.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Fixed or packed query, key, and value tensors.
+        qo_indptr, kv_indptr : torch.Tensor, optional
+            Cumulative query and K/V offsets for packed-ragged input.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1658,7 +1676,15 @@ class BatchPrefillTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch on the current stream into output disjoint from Q, K, and V."""
+        """Launch on the current stream into output disjoint from Q, K, and V.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Runtime query, key, and value tensors matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1720,6 +1746,13 @@ class BatchPrefillPagedTSWrapper:
 
     @flashinfer_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
+        """Initialize an unplanned paged context-attention wrapper.
+
+        Parameters
+        ----------
+        kv_layout : {"HND"}
+            Layout of the separate K and V page pools.
+        """
         _validate_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._planned = False
@@ -1746,6 +1779,29 @@ class BatchPrefillPagedTSWrapper:
 
         Runtime Q lengths may vary within the planned maximum-Q capacity and
         must remain no greater than the snapshotted K length for causal plans.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Packed query tensor.
+        k_cache, v_cache : torch.Tensor
+            Separate HND key and value page pools.
+        qo_indptr : torch.Tensor
+            Cumulative packed-query offsets.
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+            FlashInfer CSR page metadata.
+        page_size : int
+            Number of K/V tokens stored in each page.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1824,7 +1880,17 @@ class BatchPrefillPagedTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch the planned page-table specialization on the current stream."""
+        """Launch the planned page-table specialization on the current stream.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Runtime packed query tensor matching the plan.
+        k_cache, v_cache : torch.Tensor
+            Runtime HND key and value page pools matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1886,6 +1952,25 @@ def batch_prefill(
     left window; a positive value selects the private head-paired GQA policy
     and retains at most ``window_left + 1`` keys at each causal row, including
     when ``S_q < S_kv``.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Fixed or packed query, key, and value tensors.
+    qo_indptr, kv_indptr : torch.Tensor, optional
+        Cumulative query and K/V offsets for packed-ragged input.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (
@@ -1934,6 +2019,33 @@ def batch_prefill_with_paged_kv_cache(
     use FlashInfer's CSR representation.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
     256; Q, K, and V must share one supported dtype.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Packed query tensor.
+    k_cache, v_cache : torch.Tensor
+        Separate HND key and value page pools.
+    qo_indptr : torch.Tensor
+        Cumulative packed-query offsets.
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+        FlashInfer CSR page metadata.
+    page_size : int
+        Number of K/V tokens stored in each page.
+    kv_layout : {"HND"}
+        Layout of the separate K and V page pools.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (

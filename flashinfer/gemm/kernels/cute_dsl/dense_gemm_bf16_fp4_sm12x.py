@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""bf16 x fp4 dense GEMM for Blackwell (SM100/103/120/121).
+"""bf16 x fp4 dense GEMM for Blackwell GeForce (SM12x).
 
 Built on top of ``dense_gemm_bf16_blackwell.py`` from cutlass examples at
 https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py
@@ -125,7 +125,7 @@ _PACK_TILE_N: cutlass.Constexpr = 64
 _PACK_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
 
 
-class BlackwellDenseGemmBf16Fp4Kernel:
+class Sm12xDenseGemmBf16Fp4Kernel:
     """Warp-MMA dense GEMM for Blackwell, FP4-weight A bf16/fp16 input.
 
     A: (M, K, L) bf16/fp16.
@@ -237,7 +237,6 @@ class BlackwellDenseGemmBf16Fp4Kernel:
         self.threads_per_cta = (
             self.num_mma_warps + self.num_dma_warps
         ) * self.num_threads_per_warp
-        # SM100/103 expose >= SM120 SMEM/CTA
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
 
         self.ab_stage = None
