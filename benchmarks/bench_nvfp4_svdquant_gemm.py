@@ -112,6 +112,9 @@ def _build_case(m, n, k, rank, device):
     # bmm_fp8 expects B as column-major [batch, k, n]. Quantizing W.T retains
     # its column-major stride, while the singleton batch dimension is a view.
     w_fp8, w_fp8_scale = _to_float8(w.T)
+    assert w_fp8.stride(0) == 1, (
+        f"bmm_fp8 requires a column-major B; got strides {w_fp8.stride()}"
+    )
 
     return {
         "x": x,
@@ -174,92 +177,133 @@ def bench_one(
 
     fused_backend = "cute-dsl" if get_compute_capability(device)[0] == 12 else "cutlass"
 
-    def run_fused():
+    def run_fused(xq, wq, x_sf, w_sf, alpha, d, l1, bias, out):
         mm_nvfp4_svdquant(
-            c["xq"],
-            c["wq"],
-            c["x_sf_flat"],
-            c["w_sf_flat"],
-            c["alpha"],
-            c["d"],
-            c["l1_scaled"],
-            bias=c["bias"],
-            out=c["out_fused"],
+            xq,
+            wq,
+            x_sf,
+            w_sf,
+            alpha,
+            d,
+            l1,
+            bias=bias,
+            out=out,
             backend=fused_backend,
         )
 
-    def run_svdquant_linear():
+    def run_svdquant_linear(
+        x, wq, w_sf, alpha, pqs, l2t_smoothed, l1_scaled, global_sf, bias
+    ):
         svdquant_linear(
-            c["x"],
-            c["wq"],
-            c["w_sf_flat"],
-            c["alpha"],
-            c["pqs"],
-            c["l2t_smoothed"],
-            c["l1_scaled"],
-            c["global_sf"],
-            bias=c["bias"],
+            x,
+            wq,
+            w_sf,
+            alpha,
+            pqs,
+            l2t_smoothed,
+            l1_scaled,
+            global_sf,
+            bias=bias,
             backend=svdquant_backend,
         )
 
-    def run_unfused():
+    def run_unfused(xq, wq, x_sf, w_sf, alpha, d, l1, bias, out):
         mm_nvfp4_svdquant(
-            c["xq"],
-            c["wq"],
-            c["x_sf_flat"],
-            c["w_sf_flat"],
-            c["alpha"],
-            c["d"],
-            c["l1_scaled"],
-            bias=c["bias"],
-            out=c["out_fused"],
+            xq,
+            wq,
+            x_sf,
+            w_sf,
+            alpha,
+            d,
+            l1,
+            bias=bias,
+            out=out,
             backend=unfused_backend,
         )
 
-    def run_mm_fp4():
+    def run_mm_fp4(xq, wq, x_sf, w_sf, alpha, out):
         mm_fp4(
-            c["xq"],
-            c["wq"].T,
-            c["x_sf"],
-            c["w_sf"].T,
-            c["alpha"],
+            xq,
+            wq.T,
+            x_sf,
+            w_sf.T,
+            alpha,
             torch.bfloat16,
-            c["out_fp4"],
+            out,
             block_size=16,
             use_8x4_sf_layout=False,
             backend=mm_fp4_backend,
             use_nvfp4=True,
         )
 
-    def run_residual_gemm():
+    def run_residual_gemm(x, w, bias, out):
         torch.addmm(
-            c["bias"],
-            c["x"],
-            c["w"].T,
-            out=c["out_bf16"],
+            bias,
+            x,
+            w.T,
+            out=out,
         )
 
-    def run_fp8_per_tensor():
+    def run_fp8_per_tensor(x, w, x_scale, w_scale, out):
         bmm_fp8(
-            c["x_fp8"],
-            c["w_fp8"],
-            c["x_fp8_scale"],
-            c["w_fp8_scale"],
+            x,
+            w,
+            x_scale,
+            w_scale,
             torch.bfloat16,
-            out=c["out_fp8"],
+            out=out,
             backend="auto",
         )
+
+    fused_args = (
+        c["xq"],
+        c["wq"],
+        c["x_sf_flat"],
+        c["w_sf_flat"],
+        c["alpha"],
+        c["d"],
+        c["l1_scaled"],
+        c["bias"],
+        c["out_fused"],
+    )
+    svdquant_linear_args = (
+        c["x"],
+        c["wq"],
+        c["w_sf_flat"],
+        c["alpha"],
+        c["pqs"],
+        c["l2t_smoothed"],
+        c["l1_scaled"],
+        c["global_sf"],
+        c["bias"],
+    )
+    mm_fp4_args = (
+        c["xq"],
+        c["wq"],
+        c["x_sf"],
+        c["w_sf"],
+        c["alpha"],
+        c["out_fp4"],
+    )
+    residual_gemm_args = (c["x"], c["w"], c["bias"], c["out_bf16"])
+    fp8_args = (
+        c["x_fp8"],
+        c["w_fp8"],
+        c["x_fp8_scale"],
+        c["w_fp8_scale"],
+        c["out_fp8"],
+    )
 
     # Tune once; subsequent calls replay the best tactic from the tuner cache.
     with autotune(True):
         for _ in range(3):
-            run_fused()
+            run_fused(*fused_args)
             if unfused_backend is not None:
-                run_unfused()
-            run_svdquant_linear()
-            run_mm_fp4()
-            run_residual_gemm()
-            run_fp8_per_tensor()
+                run_unfused(*fused_args)
+            run_svdquant_linear(*svdquant_linear_args)
+            run_mm_fp4(*mm_fp4_args)
+            run_residual_gemm(*residual_gemm_args)
+            run_fp8_per_tensor(*fp8_args)
     torch.cuda.synchronize()
 
     bench_kwargs = dict(
@@ -269,16 +313,28 @@ def bench_one(
         enable_cupti=True,
         cold_l2_cache=cold_l2_cache,
     )
-    fused_us = _median_us(bench_gpu_time(run_fused, **bench_kwargs))
+    fused_us = _median_us(
+        bench_gpu_time(run_fused, input_args=fused_args, **bench_kwargs)
+    )
     unfused_us = (
-        _median_us(bench_gpu_time(run_unfused, **bench_kwargs))
+        _median_us(bench_gpu_time(run_unfused, input_args=fused_args, **bench_kwargs))
         if unfused_backend is not None
         else float("nan")
     )
-    svdquant_linear_us = _median_us(bench_gpu_time(run_svdquant_linear, **bench_kwargs))
-    mm_fp4_us = _median_us(bench_gpu_time(run_mm_fp4, **bench_kwargs))
-    residual_gemm_us = _median_us(bench_gpu_time(run_residual_gemm, **bench_kwargs))
-    fp8_per_tensor_us = _median_us(bench_gpu_time(run_fp8_per_tensor, **bench_kwargs))
+    svdquant_linear_us = _median_us(
+        bench_gpu_time(
+            run_svdquant_linear, input_args=svdquant_linear_args, **bench_kwargs
+        )
+    )
+    mm_fp4_us = _median_us(
+        bench_gpu_time(run_mm_fp4, input_args=mm_fp4_args, **bench_kwargs)
+    )
+    residual_gemm_us = _median_us(
+        bench_gpu_time(run_residual_gemm, input_args=residual_gemm_args, **bench_kwargs)
+    )
+    fp8_per_tensor_us = _median_us(
+        bench_gpu_time(run_fp8_per_tensor, input_args=fp8_args, **bench_kwargs)
+    )
 
     return (
         fused_us,
@@ -361,10 +417,13 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{major}{minor})")
     print(f"mm_fp4 baseline backend: {mm_fp4_backend}")
     print(f"SVDQuant implementation policy: {args.svdquant_backend}")
-    print("BF16 residual_gemm baseline: torch.addmm (PyTorch-selected CUDA backend)")
+    print(
+        "BF16 residual_gemm baseline: torch.addmm (PyTorch-selected CUDA backend; "
+        "residual + bias only, no LoRA-down or LoRA-up correction)"
+    )
     print(
         "FP8 per-tensor baseline: bmm_fp8 backend=auto "
-        "(scales and quantization excluded)"
+        "(residual only; scales, quantization, LoRA-down, and LoRA-up excluded)"
     )
     print(f"unfused oracle backend: {unfused_backend or 'not available'}")
     print(f"execution mode: {'CUDA graph' if args.cuda_graph else 'eager'}")

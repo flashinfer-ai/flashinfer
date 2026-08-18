@@ -2327,6 +2327,7 @@ nvfp4_quantize_smooth_trace = TraceTemplate(
 def _svdquant_linear_init(
     *,
     M: int,
+    SF_B: int = 0,
     N: int = 3072,
     K: int = 3072,
     device: str = "cuda",
@@ -2335,6 +2336,7 @@ def _svdquant_linear_init(
     """Build inputs for ``flashinfer.svdquant_linear`` (full SVDQuant linear chain)."""
     from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
 
+    del SF_B  # derived axis
     torch.manual_seed(seed)
     rank = 32
     x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -2380,7 +2382,9 @@ svdquant_linear_trace = TraceTemplate(
         "N": Const(),
         "K": Const(),
         "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
-        "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
         "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
@@ -2424,6 +2428,9 @@ svdquant_linear_trace = TraceTemplate(
     outputs={
         "out": Tensor(["M", "N"], dtype="bfloat16"),
     },
+    constraints=[
+        "SF_B == ((N + 127) // 128) * 128 * (((K // 16) + 3) // 4) * 4",
+    ],
     tags=["quantization:fp4"],
     init=_svdquant_linear_init,
 )

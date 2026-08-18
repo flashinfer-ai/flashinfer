@@ -1889,6 +1889,19 @@ def nvfp4_quantize_cute_dsl(
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
 
+    # Return explicit empty shapes before compiling or launching. In
+    # particular, K == 0 would make _compute_optimal_threads divide by zero.
+    if m == 0 or k == 0:
+        num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
+        if sf_layout == SF_LAYOUT_LINEAR:
+            padded_sf_cols = num_sf_blocks_per_row
+        else:
+            padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        return (
+            torch.empty((m, k // 2), dtype=torch.uint8, device=input.device),
+            torch.empty((m, padded_sf_cols), dtype=torch.uint8, device=input.device),
+        )
+
     input = input.contiguous()
 
     _torch_to_dtype_key = {
@@ -2046,9 +2059,7 @@ def nvfp4_quantize_cute_dsl(
             padded_m,
             num_blocks,
             global_scale_arg,
-            input[0]
-            if m > 0
-            else torch.empty(k, dtype=input.dtype, device=input.device),
+            input[0],
         )
 
     # Reshape using padded_sf_cols: for swizzled layouts the buffer includes
@@ -2081,6 +2092,12 @@ def nvfp4_quantize_smooth_cute_dsl(
 
     input = input.contiguous()
     pre_quant_scale = pre_quant_scale.reshape(k).contiguous()
+    # Vectorized BF16 loads require physical alignment; contiguous
+    # storage-offset views can still have a misaligned data pointer.
+    if input.data_ptr() % 16 != 0:
+        input = input.clone()
+    if pre_quant_scale.data_ptr() % 16 != 0:
+        pre_quant_scale = pre_quant_scale.clone()
     global_scale_arg = global_scale.float().reshape(1).contiguous().to(input.device)
     enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
 
@@ -2088,6 +2105,13 @@ def nvfp4_quantize_smooth_cute_dsl(
     padded_m = _round_up(m, ROW_TILE_SIZE)
     padded_sf_cols = _round_up(num_sf_blocks_per_row, 4)
     scale_output_size = padded_m * padded_sf_cols
+
+    fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+    scale_output = torch.empty(
+        scale_output_size, dtype=torch.uint8, device=input.device
+    )
+    if m == 0 or k == 0:
+        return fp4_output, scale_output.reshape(m, padded_sf_cols)
 
     kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4(
         "bfloat16",
@@ -2102,10 +2126,6 @@ def nvfp4_quantize_smooth_cute_dsl(
     num_blocks = min(
         (padded_m + rows_per_block - 1) // rows_per_block,
         get_num_sm(input.device) * _BLOCKS_PER_SM,
-    )
-    fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-    scale_output = torch.empty(
-        scale_output_size, dtype=torch.uint8, device=input.device
     )
     kernel_fn(
         input,

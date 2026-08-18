@@ -44,10 +44,8 @@ def test_nvfp4_svdquant_backend_arch_support():
     assert not mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 100)
 
 
-def test_sm120_svdquant_can_implement_rejects_ragged_rank():
-    _skip_unless_sm120()
-    import cutlass
-
+def test_sm120_svdquant_kernel_iket_flag_defaults_off():
+    pytest.importorskip("cutlass")
     from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
         Sm120B12xBlockScaledDenseGemmKernel,
     )
@@ -56,6 +54,13 @@ def test_sm120_svdquant_can_implement_rejects_ragged_rank():
     assert Sm120B12xBlockScaledDenseGemmKernel(
         16, (64, 64), (1, 1), enable_iket=True
     ).enable_iket
+
+
+def test_sm120_svdquant_can_implement_rejects_ragged_rank():
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
+        Sm120B12xBlockScaledDenseGemmKernel,
+    )
 
     common_args = (
         cutlass.Float4E2M1FN,
@@ -109,6 +114,20 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     if noise == 0:
         return float("inf")
     return float(10 * torch.log10((ref.float() ** 2).mean() / noise))
+
+
+def _assert_sm120_accuracy(ref: torch.Tensor, got: torch.Tensor) -> None:
+    """Guard aggregate quality and localized spikes with measured margin.
+
+    The review sweep measured a 53.27 dB SQNR floor and a 0.347% maximum
+    error/reference-peak ceiling; historical tile coverage reached 48.99 dB.
+    """
+    ref_f32 = ref.float()
+    got_f32 = got.float()
+    assert _sqnr_db(ref_f32, got_f32) > 45.0
+    peak = ref_f32.abs().amax().clamp_min(torch.finfo(torch.float32).tiny)
+    normalized_max_error = (ref_f32 - got_f32).abs().amax() / peak
+    assert normalized_max_error < 0.01
 
 
 def _nvfp4_quantize_128x4(t: torch.Tensor, backend="cuda"):
@@ -362,6 +381,36 @@ def test_mm_nvfp4_svdquant_rejects_bad_rank():
             )
 
 
+def test_mm_nvfp4_svdquant_sm100_pooled_alpha_uses_first_element():
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    p = _make_gemm_problem(129, 3072, 3072, rank=32)
+    expected = mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=p["bias"],
+        backend="cutlass",
+    )
+    pooled_alpha = torch.cat([p["alpha"], torch.tensor([2.0, 3.0, 4.0], device="cuda")])
+    actual = mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        pooled_alpha,
+        p["d"],
+        p["l1_scaled"],
+        bias=p["bias"],
+        backend="cutlass",
+    )
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("m", [129, 6912])
 @pytest.mark.parametrize("rank", [32, 96])
 def test_mm_nvfp4_svdquant_autotuned(m, rank):
@@ -462,10 +511,10 @@ def test_svdquant_linear_matches_reference(use_bias, rank):
     assert _sqnr_db(ref, out.float()) > 40.0
 
 
-def test_nvfp4_quantize_smooth_sm120_cute_dsl():
+@pytest.mark.parametrize("m,k", [(129, 256), (129, 12288), (70, 3088)])
+def test_nvfp4_quantize_smooth_sm120_cute_dsl(m, k):
     _skip_unless_sm120()
     torch.manual_seed(0)
-    m, k = 129, 256
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     pqs = (
         (1.0 + 0.3 * torch.randn(k, dtype=torch.bfloat16, device="cuda"))
@@ -495,6 +544,50 @@ def test_nvfp4_quantize_smooth_sm120_cute_dsl():
     assert torch.equal(sf, sf_ref.view(torch.uint8).reshape(-1))
     assert torch.equal(xq_auto, xq)
     assert torch.equal(sf_auto, sf)
+
+
+def test_nvfp4_quantize_smooth_sm120_misaligned_inputs():
+    _skip_unless_sm120()
+    torch.manual_seed(0)
+    m, k = 70, 256
+    x_storage = torch.randn(m * k + 1, dtype=torch.bfloat16, device="cuda")
+    x = x_storage[1:].view(m, k)
+    pqs_storage = torch.randn(k + 1, dtype=torch.bfloat16, device="cuda").abs()
+    pqs = pqs_storage[1:]
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    assert pqs.is_contiguous() and pqs.data_ptr() % 16 != 0
+    smoothed = (x * pqs).to(torch.bfloat16)
+    global_sf = ((448.0 * 6.0) / smoothed.float().abs().max()).reshape(1)
+    expected_q, expected_sf = nvfp4_quantize(
+        smoothed,
+        global_sf,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cute-dsl",
+    )
+    actual_q, actual_sf = nvfp4_quantize_smooth(x, pqs, global_sf, backend="cute-dsl")
+    assert torch.equal(actual_q, expected_q.view(torch.uint8))
+    assert torch.equal(actual_sf, expected_sf.view(torch.uint8).reshape(-1))
+
+
+@pytest.mark.parametrize("m,k", [(0, 256), (4, 0)])
+def test_nvfp4_quantizers_sm120_empty_inputs(m, k):
+    _skip_unless_sm120()
+    from flashinfer.quantization.kernels.nvfp4_quantize import (
+        nvfp4_quantize_cute_dsl,
+    )
+
+    x = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
+    pqs = torch.ones(k, dtype=torch.bfloat16, device="cuda")
+    global_sf = torch.ones(1, dtype=torch.float32, device="cuda")
+    xq, sf = nvfp4_quantize_smooth(x, pqs, global_sf, backend="cute-dsl")
+    plain_xq, plain_sf = nvfp4_quantize_cute_dsl(x, global_sf)
+
+    assert xq.shape == (m, k // 2) and xq.dtype == torch.uint8
+    assert sf.shape == (0,) and sf.dtype == torch.uint8
+    assert plain_xq.shape == (m, k // 2) and plain_xq.dtype == torch.uint8
+    assert plain_sf.shape == (m, ((k // 16 + 3) // 4) * 4)
+    assert plain_sf.dtype == torch.uint8
 
 
 @pytest.mark.parametrize("use_bias", [False, True])
@@ -541,18 +634,25 @@ def test_mm_nvfp4_svdquant_sm120_fused(use_bias):
     # The fused path accumulates the BF16 rank correction in FP32 before its
     # single BF16 store, whereas the oracle rounds the residual and correction
     # in separate launches. Compare numerically, not bitwise.
-    assert _sqnr_db(expected.float(), out.float()) > 35.0
-    assert _sqnr_db(expected.float(), out_auto.float()) > 35.0
+    _assert_sm120_accuracy(expected, out)
+    _assert_sm120_accuracy(expected, out_auto)
     fp32_ref = p["ref_bias"] if use_bias else p["ref"]
-    assert _sqnr_db(fp32_ref, out.float()) > 35.0
+    _assert_sm120_accuracy(fp32_ref, out)
 
 
-@pytest.mark.parametrize("tile_k,rank", [(64, 32), (128, 32), (256, 64)])
-def test_mm_nvfp4_svdquant_sm120_large_m_tile(tile_k, rank):
+@pytest.mark.parametrize(
+    "tactic,rank",
+    [
+        (((64, 64), 128, False), 32),
+        (((128, 128), 128, False), 64),
+        (((256, 64), 128, False), 32),
+    ],
+)
+def test_mm_nvfp4_svdquant_sm120_large_m_tactic(tactic, rank):
     _skip_unless_sm120()
     from flashinfer.gemm.gemm_svdquant import _mm_nvfp4_svdquant_sm120_fused
 
-    torch.manual_seed(tile_k)
+    torch.manual_seed(tactic[0][0])
     p = _make_gemm_problem(
         257,
         128,
@@ -573,9 +673,9 @@ def test_mm_nvfp4_svdquant_sm120_large_m_tile(tile_k, rank):
         p["bias"],
         out,
         device_support_pdl(torch.device("cuda")),
-        tactic=((256, 64), tile_k, False, False),
+        tactic=tactic,
     )
-    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+    _assert_sm120_accuracy(p["ref_bias"], out)
 
 
 @pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
@@ -603,7 +703,7 @@ def test_mm_nvfp4_svdquant_sm120_autotuned_replay(backend):
             bias=p["bias"],
             backend=backend,
         )
-    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+    _assert_sm120_accuracy(p["ref_bias"], out)
 
     # Replay outside the tuning context must reuse the selected tactic.
     out_replay = mm_nvfp4_svdquant(
@@ -669,7 +769,7 @@ def test_mm_nvfp4_svdquant_sm120_fused_rank_chunks(rank):
         bias=p["bias"],
         backend="cute-dsl",
     )
-    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+    _assert_sm120_accuracy(p["ref_bias"], out)
 
 
 @pytest.mark.parametrize(
@@ -701,11 +801,12 @@ def test_mm_nvfp4_svdquant_sm120_fused_boundary_plans(m, n, k, rank):
         bias=p["bias"],
         backend="cute-dsl",
     )
-    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+    _assert_sm120_accuracy(p["ref_bias"], out)
 
 
-@pytest.mark.parametrize("alpha_shape", [(), (1, 1)])
-def test_mm_nvfp4_svdquant_sm120_normalizes_alpha_shape(alpha_shape):
+@pytest.mark.parametrize("alpha_shape", [(), (1, 1), (4,)])
+@pytest.mark.parametrize("backend", ["cute-dsl", "cute-dsl-unfused"])
+def test_mm_nvfp4_svdquant_sm120_normalizes_alpha_shape(alpha_shape, backend):
     _skip_unless_sm120()
     torch.manual_seed(0)
     p = _make_gemm_problem(
@@ -725,18 +826,23 @@ def test_mm_nvfp4_svdquant_sm120_normalizes_alpha_shape(alpha_shape):
         p["d"],
         p["l1_scaled"],
         bias=p["bias"],
-        backend="cute-dsl",
+        backend=backend,
+    )
+    alpha = (
+        p["alpha"].reshape(alpha_shape)
+        if alpha_shape != (4,)
+        else torch.cat([p["alpha"], torch.tensor([2.0, 3.0, 4.0], device="cuda")])
     )
     out = mm_nvfp4_svdquant(
         p["xq"],
         p["wq"],
         p["x_sf_flat"],
         p["w_sf_flat"],
-        p["alpha"].reshape(alpha_shape),
+        alpha,
         p["d"],
         p["l1_scaled"],
         bias=p["bias"],
-        backend="cute-dsl",
+        backend=backend,
     )
     assert torch.equal(out, expected)
 
@@ -852,6 +958,7 @@ def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
         l1_scaled,
         global_sf,
         bias=bias,
+        backend="cute-dsl",
     )
     assert torch_mm_calls == 1
 
@@ -876,7 +983,7 @@ def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
         ref.add_(bias.float())
 
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
-    assert _sqnr_db(ref, out.float()) > 35.0
+    _assert_sm120_accuracy(ref, out)
 
 
 @pytest.mark.parametrize("rank", [32, 128])
@@ -952,6 +1059,47 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
 
     # Same tactic and operands: the deterministic kernel must match bit-exactly.
     assert torch.equal(out_graph, out_eager)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
+def test_mm_nvfp4_svdquant_sm120_cuda_graph_replay(backend):
+    _skip_unless_sm120()
+    torch.manual_seed(0)
+    p = _make_gemm_problem(
+        129,
+        256,
+        256,
+        rank=32,
+        quant_backend="cute-dsl",
+        residual_backend="b12x",
+    )
+    out = torch.empty(129, 256, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"],
+            out=out,
+            backend=backend,
+        )
+
+    # Compile and tune before capture; capture must only replay the cached path.
+    with autotune(True):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_sm120_accuracy(p["ref_bias"], out)
 
 
 if __name__ == "__main__":

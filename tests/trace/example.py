@@ -25,7 +25,6 @@ recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
-gemm_bf16_N32_K3072.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
@@ -42,7 +41,7 @@ gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
 layernorm_quant_h768.json
-linear_nvfp4_svdquant_N3072_K3072_K_packed1536_SF_B589824_rank32.json
+linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
