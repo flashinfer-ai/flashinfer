@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import pytest
@@ -195,8 +196,10 @@ def _worker(world_size: int, rank: int, port: int, suite: str) -> None:
         else:
             raise ValueError(suite)
     finally:
-        dist.barrier(group)
-        dist.destroy_process_group()
+        with contextlib.suppress(Exception):
+            dist.barrier(group)
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _suite_peer(device: torch.device, group: dist.ProcessGroup) -> None:
@@ -455,6 +458,9 @@ def _suite_generations(device: torch.device, group: dist.ProcessGroup) -> None:
         assert epoch == i + 1
 
 
+_JOIN_TIMEOUT_S = 600
+
+
 def _spawn(world_size: int, suite: str) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"need {world_size} GPUs")
@@ -465,11 +471,25 @@ def _spawn(world_size: int, suite: str) -> None:
         proc = mp.Process(target=_worker, args=(world_size, rank, port, suite))
         proc.start()
         procs.append(proc)
+    timed_out = []
+    failed = []
     for rank, proc in enumerate(procs):
-        proc.join()
-        assert proc.exitcode == 0, (
-            f"rank {rank} failed with {proc.exitcode} suite={suite}"
-        )
+        proc.join(timeout=_JOIN_TIMEOUT_S)
+        if proc.is_alive():
+            timed_out.append(rank)
+        elif proc.exitcode != 0:
+            failed.append((rank, proc.exitcode))
+    if timed_out or failed:
+        for proc in procs:
+            if proc.is_alive():
+                proc.kill()
+        for proc in procs:
+            proc.join(timeout=5)
+        if timed_out:
+            pytest.fail(
+                f"ranks {timed_out} timed out after {_JOIN_TIMEOUT_S}s suite={suite}"
+            )
+        pytest.fail(f"ranks {failed} failed suite={suite}")
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

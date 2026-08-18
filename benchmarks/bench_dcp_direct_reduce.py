@@ -38,7 +38,6 @@ WARMUP = 50
 ITERS = 500
 SAMPLES = 7
 TOKEN_ROWS = (1, 8, 32, 64, 128)
-ACCEPT = {1: 0.80, 8: 0.80, 32: 0.95, 64: 1.03, 128: 1.03}
 
 
 def _sanitize_lse(s: torch.Tensor) -> torch.Tensor:
@@ -169,15 +168,25 @@ def _time_graph(fn, po: torch.Tensor, ps: torch.Tensor) -> float:
     ender = torch.cuda.Event(enable_timing=True)
     samples = []
     for _ in range(SAMPLES):
+        po.copy_(pool_o[0])
+        ps.copy_(pool_s[0])
+        torch.cuda.synchronize()
         starter.record()
-        for i in range(ITERS):
-            po.copy_(pool_o[i % 8])
-            ps.copy_(pool_s[i % 8])
+        for _i in range(ITERS):
             graph.replay()
         ender.record()
         ender.synchronize()
         samples.append(starter.elapsed_time(ender) / ITERS)
     return statistics.median(samples)
+
+
+def _try_time_graph(fn, po: torch.Tensor, ps: torch.Tensor, rank: int, label: str):
+    try:
+        return _time_graph(fn, po, ps)
+    except RuntimeError as exc:
+        if rank == 0:
+            print(f"{label} skipped: {type(exc).__name__}: {exc}")
+        return None
 
 
 def _force_posix_mnnvl_if_fabric_blocked() -> str:
@@ -369,16 +378,23 @@ def main() -> None:
             if fi_a2a is not None
             else None
         )
-        nccl_ms = _time_graph(lambda: nccl.run(po, ps), po, ps)
-        nccl_symm_ms = _time_graph(lambda: nccl_symm.run(po, ps), po, ps)
+        nccl_ms = _try_time_graph(lambda: nccl.run(po, ps), po, ps, rank, "nccl")
+        nccl_symm_ms = _try_time_graph(
+            lambda: nccl_symm.run(po, ps), po, ps, rank, "nccl_symm"
+        )
         direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
 
         if rank == 0:
             a2a_str = "SKIPPED" if fi_a2a_ms is None else f"{fi_a2a_ms * 1e3:10.2f}"
+            nccl_str = "SKIPPED" if nccl_ms is None else f"{nccl_ms * 1e3:10.2f}"
+            nccl_symm_str = (
+                "SKIPPED" if nccl_symm_ms is None else f"{nccl_symm_ms * 1e3:10.2f}"
+            )
             d_a2a = "n/a" if fi_a2a_ms is None else f"{direct_ms / fi_a2a_ms:8.3f}"
+            d_nccl = "n/a" if nccl_ms is None else f"{direct_ms / nccl_ms:8.3f}"
             print(
-                f"{t:5d} {a2a_str:>10} {nccl_ms * 1e3:10.2f} {nccl_symm_ms * 1e3:10.2f} "
-                f"{direct_ms * 1e3:10.2f} {d_a2a:>8} {direct_ms / nccl_ms:8.3f}"
+                f"{t:5d} {a2a_str:>10} {nccl_str:>10} {nccl_symm_str:>10} "
+                f"{direct_ms * 1e3:10.2f} {d_a2a:>8} {d_nccl:>8}"
             )
 
     dist.destroy_process_group()

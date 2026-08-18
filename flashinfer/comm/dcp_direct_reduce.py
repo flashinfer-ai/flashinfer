@@ -8,7 +8,6 @@ until the next ``run(..., slot=N)`` for that same slot.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import os
 from pathlib import Path
@@ -21,6 +20,7 @@ import triton
 import triton.language as tl
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.comm import dcp_direct_reduce_trace
 from .torch_symmetric_memory import _enable_symm_mem_for_group
 
 _MAX_FENCE_SPINS = 100_000_000
@@ -256,15 +256,18 @@ def _triton_publish_kernel(
         ),
         mask=lse_mask,
     )
+    # System fence so peer GPUs observe payload stores before the later
+    # release signal. Do not advance local_epoch here: other CTAs still
+    # sample it for parity.
+    tl.inline_asm_elementwise(
+        "membar.sys;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
     if FUSE_SIGNAL:
-        tl.inline_asm_elementwise(
-            "membar.sys;",
-            "=r",
-            [],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
         finished = tl.atomic_add(dest_done + destination_rank, 1)
         if finished == num_cta_per_dest - 1:
             signal_ptr_table = peer_signal_ptrs.to(tl.pointer_type(tl.uint64))
@@ -277,8 +280,6 @@ def _triton_publish_kernel(
                 tl.full((), 1, tl.int32),
             )
             tl.store(dest_done + destination_rank, 0)
-            if destination_rank == 0:
-                tl.store(local_epoch, epoch)
 
 
 @triton.jit
@@ -518,7 +519,7 @@ def _load_cuda_module():
         return load(
             name="dcp_direct_reduce_cuda",
             sources=[str(src)],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cuda_cflags=["-O3"],
             build_directory=str(build),
             verbose=False,
         )
@@ -544,6 +545,14 @@ class DCPDirectReduceWorkspace:
         later workspace invocations.
 
     ``out`` and ``lse_out`` must both be provided or both be None.
+
+    Backend
+    -------
+    ``FLASHINFER_DCP_DIRECT_BACKEND`` or the ``backend`` argument selects
+    ``triton``, ``cuda``, or ``auto`` (default). ``auto`` uses the CUDA
+    two-kernel path when it loaded on every rank and the stream is not
+    capturing, otherwise Triton. All ranks must enter CUDA-graph capture
+    together in ``auto`` mode so they stay on the same kernel path.
     """
 
     supports_output_view: bool = True
@@ -602,6 +611,15 @@ class DCPDirectReduceWorkspace:
             raise RuntimeError(
                 "FLASHINFER_DCP_DIRECT_BACKEND=cuda but CUDA module failed to load"
             )
+        if backend == "auto":
+            available = torch.tensor(
+                [1 if self._cuda is not None else 0],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            dist.all_reduce(available, op=dist.ReduceOp.MIN, group=group)
+            if int(available.item()) == 0:
+                self._cuda = None
         self._allocations: list[tuple[torch.Tensor, object, list[torch.Tensor]]] = []
 
         _enable_symm_mem_for_group(group.group_name)
@@ -656,15 +674,22 @@ class DCPDirectReduceWorkspace:
         )
         self.peer_lse_ptrs = torch.empty_like(self.peer_output_ptrs)
         self.peer_signal_ptrs = torch.empty_like(self.peer_output_ptrs)
-        for slot in range(self.num_slots):
-            for peer in range(self.world_size):
-                self.peer_output_ptrs[slot, peer] = peer_out_views[peer][
-                    slot
-                ].data_ptr()
-                self.peer_lse_ptrs[slot, peer] = peer_lse_views[peer][slot].data_ptr()
-                self.peer_signal_ptrs[slot, peer] = peer_sig_views[peer][
-                    slot
-                ].data_ptr()
+
+        def _ptr_table(views: list[torch.Tensor]) -> torch.Tensor:
+            return torch.tensor(
+                [
+                    [
+                        int(views[peer][slot].data_ptr())
+                        for peer in range(self.world_size)
+                    ]
+                    for slot in range(self.num_slots)
+                ],
+                dtype=torch.int64,
+            )
+
+        self.peer_output_ptrs.copy_(_ptr_table(peer_out_views))
+        self.peer_lse_ptrs.copy_(_ptr_table(peer_lse_views))
+        self.peer_signal_ptrs.copy_(_ptr_table(peer_sig_views))
 
     def _alloc_symmetric(
         self, shape: tuple[int, ...], dtype: torch.dtype
@@ -752,7 +777,7 @@ class DCPDirectReduceWorkspace:
         if not lse_out.is_contiguous():
             raise ValueError("lse_out must be contiguous")
 
-    @flashinfer_api
+    @flashinfer_api(trace=dcp_direct_reduce_trace)
     def run(
         self,
         partial_output: torch.Tensor,
@@ -763,6 +788,35 @@ class DCPDirectReduceWorkspace:
         out: Optional[torch.Tensor] = None,
         lse_out: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce per-rank partial Output/LSE into the destination-owned shard.
+
+        Every rank must call this with the same ``T``, ``slot``, and
+        ``is_lse_base_on_e``. A mismatch is not detected on the host and
+        leaves the merge kernel spinning until the spin trap fires.
+
+        Parameters
+        ----------
+        partial_output
+            ``[T, H_total, D]`` partial attention output on this rank.
+        partial_lse
+            ``[T, H_total]`` float32 partial LSE on this rank.
+        slot
+            Workspace slot in ``[0, num_slots)``.
+        is_lse_base_on_e
+            If True, LSE is natural-log. If False, LSE is log2.
+        out
+            Optional contiguous ``[T, H_local, D]`` destination. Must be
+            provided together with ``lse_out``.
+        lse_out
+            Optional contiguous ``[T, H_local]`` float32 destination.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Combined output and LSE. Workspace-backed views alias
+            ``combined_output[slot, :T]`` / ``combined_lse[slot, :T]``
+            until the next ``run`` on the same slot.
+        """
         self._validate_inputs(partial_output, partial_lse, slot)
         self._validate_outputs(partial_output, out, lse_out)
 
@@ -775,9 +829,10 @@ class DCPDirectReduceWorkspace:
             selected_lse = lse_out
 
         epoch_slot = self.epoch[slot : slot + 1]
-        capturing = False
-        with contextlib.suppress(Exception):
+        try:
             capturing = bool(torch.cuda.is_current_stream_capturing())
+        except RuntimeError:
+            capturing = False
         if self._backend == "cuda":
             use_cuda = self._cuda is not None
         elif self._backend == "triton":
