@@ -59,13 +59,13 @@ def _decode(**overrides):
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
     assert manifest["generator_commit"] == (
-        "0e0436e43f70d1c6a40291fbc98ff9459df96d34"
+        "11cb68d34a2d52710c599ab1d746e261dee5ddae"
     )
-    assert manifest["contract_row_count"] == 1755
-    assert manifest["architecture_row_count"] == 3510
-    assert manifest["admitted_architecture_rows"] == 3450
+    assert manifest["contract_row_count"] == 1761
+    assert manifest["architecture_row_count"] == 3522
+    assert manifest["admitted_architecture_rows"] == 3462
     assert manifest["fail_closed_architecture_rows"] == 60
-    assert manifest["variant_count"] == len(manifest["variants"]) == 71
+    assert manifest["variant_count"] == len(manifest["variants"]) == 77
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -135,12 +135,99 @@ def test_decode_resolver_selects_all_promoted_physical_routes() -> None:
     assert "pretranspose_splitv8" in pretranspose.variant_name
 
 
+def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
+    rows = (
+        (
+            dict(batch_size=4, seq_len=1, num_v_heads=32, strided_inputs=True),
+            "indexed_bf16_t1.wide32",
+        ),
+        (
+            dict(
+                batch_size=4,
+                seq_len=2,
+                num_v_heads=32,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                cache_steps=4,
+            ),
+            "indexed_bf16_verify_t2.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=3,
+                num_v_heads=64,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                cache_steps=3,
+            ),
+            "indexed_bf16_verify_t3.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_v_heads=64,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                cache_steps=4,
+            ),
+            "indexed_bf16_verify_t4.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=2,
+                num_v_heads=64,
+                strided_inputs=True,
+            ),
+            "indexed_bf16_update_t2.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_v_heads=64,
+                strided_inputs=True,
+                cache_intermediate_states=True,
+                cache_steps=5,
+            ),
+            "indexed_bf16_checkpoint_t4.wide64",
+        ),
+    )
+    for overrides, route_suffix in rows:
+        route = _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            **overrides,
+        )
+        assert route.route_id.endswith(route_suffix)
+        assert "bf16state_wide128" in route.variant_name
+
+
+def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError,
+        match="six exact promoted",
+    ):
+        _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            batch_size=5,
+            num_v_heads=32,
+            seq_len=1,
+            strided_inputs=True,
+        )
+
+
 def test_decode_resolver_fails_closed_outside_child_contract() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="requires BF16 I/O and FP32 state",
+        match="requires BF16 I/O and FP32 or BF16 state",
     ):
-        _decode(state_dtype="bfloat16")
+        _decode(state_dtype="float16")
 
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,

@@ -20,9 +20,9 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 template <int N>
-struct __align__(128) LoomTensorMapPack { LoomTensorMap maps[N]; };
+struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 

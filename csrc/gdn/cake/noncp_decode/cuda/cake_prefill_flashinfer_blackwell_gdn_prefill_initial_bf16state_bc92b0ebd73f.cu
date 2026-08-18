@@ -15,7 +15,7 @@
 // clang-format off
 #include "cake_common.cuh"
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_STATE_OFFSET 0
 #define TMEM_TMEM_Q_STATE_OFFSET 128
@@ -84,7 +84,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_gdn_prefill_initial_bf16state(LoomTensorMap const* Q, LoomTensorMap const* K, LoomTensorMap const* V, LoomTensorMap const* O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ output_state, __nv_bfloat16* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int num_q_heads, int num_v_heads, int total_tiles)
+kernel_flashinfer_blackwell_gdn_prefill_initial_bf16state(CakeTensorMap const* Q, CakeTensorMap const* K, CakeTensorMap const* V, CakeTensorMap const* O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ output_state, __nv_bfloat16* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int num_q_heads, int num_v_heads, int total_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -3342,7 +3342,7 @@ kernel_flashinfer_blackwell_gdn_prefill_initial_bf16state(LoomTensorMap const* Q
 #undef ENABLE_CHECKPOINTS
 #undef HEAD_GROUP_LOG2
 #undef IS_GQA
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_AINV_PIPE_STAGES
 #undef NUM_CG0_ACC_PIPE_STAGES
 #undef NUM_GATE_PIPE_STAGES

@@ -23,7 +23,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple
 
 from filelock import FileLock
 from tvm_ffi import cpp
@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "4f5f8ffe2c6a46a21d09ab715ad4759ffe78d0aaffd104d10a73e2e7fbf518bc"
-_GENERATOR_COMMIT = "0e0436e43f70d1c6a40291fbc98ff9459df96d34"
+_MANIFEST_SHA256 = "474ee84e279b2c82b42e9e8146f5b05618968005a07635c8f382fe414127a4e4"
+_GENERATOR_COMMIT = "11cb68d34a2d52710c599ab1d746e261dee5ddae"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -112,12 +112,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1755,
-        3510,
-        3450,
+        1761,
+        3522,
+        3462,
         60,
-        71,
-        71,
+        77,
+        77,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -305,8 +305,8 @@ def _variant_for(
     *, domain: str, schedule_attr: str, specializations: dict[str, int | float]
 ) -> dict[str, Any]:
     source_schedule = {
-        "decode": "loom.examples.weave.gdn_decode_pretranspose",
-        "prefill": "loom.examples.weave.flashinfer_blackwell_gdn_prefill",
+        "decode": "cake.generated.decode",
+        "prefill": "cake.generated.prefill",
     }[domain]
     expected_source = f"{source_schedule}:{schedule_attr}"
     matches = [
@@ -474,18 +474,22 @@ def select_cake_gdn_decode_variant(
     scale: float,
     seq_len: int,
     use_qk_l2norm: bool,
+    strided_inputs: bool = False,
+    disable_state_update: bool = False,
+    cache_intermediate_states: bool = False,
+    cache_steps: int = 0,
 ) -> CakeGDNRoute:
-    """Resolve the frozen FP32-state T=1 decode child contract."""
+    """Resolve one frozen FP32 T=1 or exact promoted BF16 serving row."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
-    if io_dtype != "bfloat16" or state_dtype != "float32":
+    if io_dtype != "bfloat16" or state_dtype not in {"float32", "bfloat16"}:
         raise CakeGDNUnsupportedError(
-            "T=1 child contract requires BF16 I/O and FP32 state"
+            "Cake decode requires BF16 I/O and FP32 or BF16 state"
         )
-    if head_size != 128 or seq_len != 1:
+    if head_size != 128:
         raise CakeGDNUnsupportedError(
-            "T=1 child contract requires K=V=128 and sequence length 1"
+            "Cake decode requires K=V=128"
         )
     if not use_qk_l2norm:
         raise CakeGDNUnsupportedError(
@@ -500,6 +504,74 @@ def select_cake_gdn_decode_variant(
         raise CakeGDNUnsupportedError("unsupported decode head mapping")
     if batch_size <= 0:
         raise CakeGDNUnsupportedError("decode batch size must be positive")
+    if state_dtype == "bfloat16":
+        promoted = {
+            (4, 1, 16, 32, True, False, False, 0),
+            (4, 2, 16, 32, False, True, True, 4),
+            (8, 3, 16, 64, True, True, True, 3),
+            (8, 4, 16, 64, True, True, True, 4),
+            (8, 2, 16, 64, True, False, False, 0),
+            (8, 4, 16, 64, True, False, True, 5),
+        }
+        key = (
+            batch_size,
+            seq_len,
+            num_q_heads,
+            num_v_heads,
+            strided_inputs,
+            disable_state_update,
+            cache_intermediate_states,
+            cache_steps,
+        )
+        if layout != "pretranspose" or num_k_heads != num_q_heads or key not in promoted:
+            raise CakeGDNUnsupportedError(
+                "BF16 decode is limited to the six exact promoted indexed/verify rows"
+            )
+        state_heads = batch_size * num_v_heads
+        tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
+        update_state = not cache_intermediate_states
+        record = _variant_for(
+            domain="decode",
+            schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+            specializations={
+                "CACHE_INTERMEDIATE_STATES": int(cache_intermediate_states),
+                "H": num_q_heads,
+                "HV": num_v_heads,
+                "INTERMEDIATE_BATCH_STRIDE": (
+                    cache_steps * num_v_heads * 128 * 128
+                    if cache_intermediate_states
+                    else 128 * 128
+                ),
+                "INTERMEDIATE_TOKEN_STRIDE": (
+                    num_v_heads * 128 * 128
+                    if cache_intermediate_states
+                    else 128 * 128
+                ),
+                "SCALE": scale,
+                "STRIDED_INPUTS": int(strided_inputs),
+                "TILE_V_WIDE": tile_v,
+                "T_STEPS": seq_len,
+                "UPDATE_STATE": int(update_state),
+            },
+        )
+        if seq_len == 1:
+            route = "cake.gdn_decode.indexed_bf16_t1"
+        elif disable_state_update:
+            route = f"cake.gdn_decode.indexed_bf16_verify_t{seq_len}"
+        elif cache_intermediate_states:
+            route = f"cake.gdn_decode.indexed_bf16_checkpoint_t{seq_len}"
+        else:
+            route = f"cake.gdn_decode.indexed_bf16_update_t{seq_len}"
+        return CakeGDNRoute(f"{route}.wide{tile_v}", record["name"])
+
+    if seq_len != 1:
+        raise CakeGDNUnsupportedError(
+            "FP32-state child contract requires sequence length 1"
+        )
+    if disable_state_update or cache_intermediate_states or cache_steps:
+        raise CakeGDNUnsupportedError(
+            "FP32-state T=1 child contract requires state update and no cache"
+        )
     if layout == "pretranspose":
         schedule_attr = "gdn_decode_pretranspose_splitv8"
         route = "cake.gdn_decode.indexed_fp32_t1_splitv8"

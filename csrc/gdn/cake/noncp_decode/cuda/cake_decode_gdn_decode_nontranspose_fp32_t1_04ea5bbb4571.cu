@@ -15,7 +15,7 @@
 // clang-format off
 #include "cake_common.cuh"
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SSTATE_OFF 0
 #define SMEM_SSTATE_STAGE_BYTES 36864
@@ -252,7 +252,7 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
 
 #undef H
 #undef HV
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef SCALE
 #undef SMEM_SK_OFF
