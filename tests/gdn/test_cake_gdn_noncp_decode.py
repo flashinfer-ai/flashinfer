@@ -58,12 +58,12 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("9e740b3abb58f1fa23a49eb29573ca44df21045b")
-    assert manifest["contract_row_count"] == 1762
-    assert manifest["architecture_row_count"] == 3524
-    assert manifest["admitted_architecture_rows"] == 3464
+    assert manifest["generator_commit"] == ("78e460e9d92759bb568c75aae4e6601ea4f425d4")
+    assert manifest["contract_row_count"] == 1764
+    assert manifest["architecture_row_count"] == 3528
+    assert manifest["admitted_architecture_rows"] == 3468
     assert manifest["fail_closed_architecture_rows"] == 60
-    assert manifest["variant_count"] == len(manifest["variants"]) == 78
+    assert manifest["variant_count"] == len(manifest["variants"]) == 80
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -216,11 +216,42 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
         assert route.route_id.endswith(route_suffix)
         assert "bf16state_wide128" in route.variant_name
 
+    tp4_rows = (
+        (
+            dict(batch_size=4, seq_len=1),
+            "indexed_bf16_t1.tile16_fullwarp",
+            "t1_bf16state_tile16",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                cache_steps=4,
+            ),
+            "indexed_bf16_verify_t4.tile16_fullwarp",
+            "t4_bf16state_tile16",
+        ),
+    )
+    for overrides, route_suffix, variant_fragment in tp4_rows:
+        route = _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            num_k_heads=4,
+            num_q_heads=4,
+            num_v_heads=8,
+            strided_inputs=True,
+            **overrides,
+        )
+        assert route.route_id.endswith(route_suffix)
+        assert variant_fragment in route.variant_name
+
 
 def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="seven exact promoted",
+        match="nine exact promoted",
     ):
         _decode(
             state_dtype="bfloat16",

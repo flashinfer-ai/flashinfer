@@ -297,6 +297,7 @@ def _make_bf16_serving_inputs(
     *,
     batch_size: int,
     seq_len: int,
+    num_q_heads: int,
     num_v_heads: int,
     strided_inputs: bool,
     cache_steps: int,
@@ -304,7 +305,6 @@ def _make_bf16_serving_inputs(
 ) -> dict[str, object]:
     torch.manual_seed(2030 + seq_len + num_v_heads)
     device = torch.device("cuda")
-    num_q_heads = 16
     if strided_inputs:
         packed_qkv = torch.empty(
             batch_size,
@@ -510,6 +510,7 @@ def _load_bf16_serving(
     *,
     batch_size: int,
     seq_len: int,
+    num_q_heads: int,
     num_v_heads: int,
     strided_inputs: bool,
     disable_state_update: bool,
@@ -522,8 +523,8 @@ def _load_bf16_serving(
         state_dtype="bfloat16",
         head_size=_HEAD_SIZE,
         layout="pretranspose",
-        num_k_heads=16,
-        num_q_heads=16,
+        num_k_heads=num_q_heads,
+        num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         scale=_SCALE,
         seq_len=seq_len,
@@ -541,10 +542,19 @@ def _launch_bf16_serving(
     tensors: dict[str, object],
     *,
     batch_size: int,
+    num_q_heads: int,
     num_v_heads: int,
 ) -> None:
     state_heads = batch_size * num_v_heads
-    tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
+    tile_v = (
+        16
+        if num_q_heads == 4 and num_v_heads == 8
+        else 128
+        if state_heads >= 1024
+        else 64
+        if state_heads >= 512
+        else 32
+    )
     cache = tensors["intermediate_state"]
     entry(
         tensors["q"],
@@ -616,6 +626,7 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
     (
         "batch_size",
         "seq_len",
+        "num_q_heads",
         "num_v_heads",
         "strided_inputs",
         "disable_state_update",
@@ -623,18 +634,21 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
         "pack_gates",
     ),
     [
-        (4, 1, 32, True, False, 0, True),
-        (4, 2, 32, False, True, 4, True),
-        (8, 3, 64, True, True, 3, True),
-        (8, 4, 64, True, True, 4, True),
-        (8, 4, 32, True, True, 4, False),
-        (8, 2, 64, True, False, 0, True),
-        (8, 4, 64, True, False, 5, True),
+        (4, 1, 16, 32, True, False, 0, True),
+        (4, 1, 4, 8, True, False, 0, False),
+        (4, 2, 16, 32, False, True, 4, True),
+        (8, 3, 16, 64, True, True, 3, True),
+        (8, 4, 16, 64, True, True, 4, True),
+        (8, 4, 16, 32, True, True, 4, False),
+        (8, 4, 4, 8, True, True, 4, False),
+        (8, 2, 16, 64, True, False, 0, True),
+        (8, 4, 16, 64, True, False, 5, True),
     ],
 )
 def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
     batch_size: int,
     seq_len: int,
+    num_q_heads: int,
     num_v_heads: int,
     strided_inputs: bool,
     disable_state_update: bool,
@@ -644,6 +658,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
+        num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         strided_inputs=strided_inputs,
         cache_steps=cache_steps,
@@ -660,6 +675,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
     route, entry = _load_bf16_serving(
         batch_size=batch_size,
         seq_len=seq_len,
+        num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         strided_inputs=strided_inputs,
         disable_state_update=disable_state_update,
@@ -673,6 +689,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
             entry,
             tensors,
             batch_size=batch_size,
+            num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
         )
     stream.synchronize()
@@ -703,16 +720,17 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
 
 
 @pytest.mark.parametrize(
-    ("num_v_heads", "pack_gates"),
-    [(64, True), (32, False)],
+    ("num_q_heads", "num_v_heads", "pack_gates"),
+    [(16, 64, True), (16, 32, False), (4, 8, False)],
 )
 def test_exported_bf16_verify_is_cuda_graph_safe(
-    num_v_heads: int, pack_gates: bool
+    num_q_heads: int, num_v_heads: int, pack_gates: bool
 ) -> None:
     batch_size, seq_len, cache_steps = 8, 4, 4
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
+        num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         strided_inputs=True,
         cache_steps=cache_steps,
@@ -729,6 +747,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     _, entry = _load_bf16_serving(
         batch_size=batch_size,
         seq_len=seq_len,
+        num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         strided_inputs=True,
         disable_state_update=True,
@@ -740,6 +759,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             entry,
             tensors,
             batch_size=batch_size,
+            num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
         )
     stream.synchronize()
@@ -754,6 +774,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             entry,
             tensors,
             batch_size=batch_size,
+            num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
         )
     graph.replay()

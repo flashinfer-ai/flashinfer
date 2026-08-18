@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "47f25ac30ebded5afcdfd98d87a5522fb43a7f06d53c1a81b1b39bcdf2954008"
-_GENERATOR_COMMIT = "9e740b3abb58f1fa23a49eb29573ca44df21045b"
+_MANIFEST_SHA256 = "77e1417829203006c2c19a93a5c5917281058f69fa3b325ddd29bca3ea99d62e"
+_GENERATOR_COMMIT = "78e460e9d92759bb568c75aae4e6601ea4f425d4"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -108,12 +108,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1762,
-        3524,
-        3464,
+        1764,
+        3528,
+        3468,
         60,
-        78,
-        78,
+        80,
+        80,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -497,10 +497,12 @@ def select_cake_gdn_decode_variant(
     if state_dtype == "bfloat16":
         promoted = {
             (4, 1, 16, 32, True, False, False, 0),
+            (4, 1, 4, 8, True, False, False, 0),
             (4, 2, 16, 32, False, True, True, 4),
             (8, 3, 16, 64, True, True, True, 3),
             (8, 4, 16, 64, True, True, True, 4),
             (8, 4, 16, 32, True, True, True, 4),
+            (8, 4, 4, 8, True, True, True, 4),
             (8, 2, 16, 64, True, False, False, 0),
             (8, 4, 16, 64, True, False, True, 5),
         }
@@ -520,8 +522,38 @@ def select_cake_gdn_decode_variant(
             or key not in promoted
         ):
             raise CakeGDNUnsupportedError(
-                "BF16 decode is limited to the seven exact promoted indexed/verify rows"
+                "BF16 decode is limited to the nine exact promoted indexed/verify rows"
             )
+        if num_q_heads == 4 and num_v_heads == 8:
+            if seq_len == 1:
+                schedule_attr = "gdn_decode_pretranspose_t1_bf16state_tile16"
+                specializations = {
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": int(strided_inputs),
+                }
+                route = "cake.gdn_decode.indexed_bf16_t1.tile16_fullwarp"
+            else:
+                schedule_attr = "gdn_decode_pretranspose_t4_bf16state_tile16"
+                specializations = {
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "INTERMEDIATE_BATCH_STRIDE": (
+                        cache_steps * num_v_heads * 128 * 128
+                    ),
+                    "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": int(strided_inputs),
+                }
+                route = "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+            record = _variant_for(
+                domain="decode",
+                schedule_attr=schedule_attr,
+                specializations=specializations,
+            )
+            return CakeGDNRoute(route, record["name"])
+
         state_heads = batch_size * num_v_heads
         tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         update_state = not cache_intermediate_states
