@@ -372,6 +372,56 @@ def test_fp8_groupwise_batch_deepgemm_masked(
         )
 
 
+@pytest.mark.parametrize(
+    ("nk", "expected_m"),
+    [
+        ((6144, 7168), 1228),
+        ((6144, 7168), 24),
+        ((7168, 3072), 24),
+        ((4096, 4096), 24),
+        ((4096, 2048), 24),
+    ],
+)
+def test_fp8_groupwise_batch_deepgemm_cake_deepgemm_benchmark_shapes(
+    nk,
+    expected_m,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
+
+    torch.random.manual_seed(0)
+    group_size, m = 6, 4096
+    n, k = nk
+    a_fp8 = torch.randint(
+        -2, 3, (group_size, m, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    b_fp8 = torch.randint(
+        -2, 3, (group_size, n, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    a_scale = torch.ones(
+        (group_size, m, k // 128), device="cuda", dtype=torch.float32
+    )
+    b_scale = torch.ones(
+        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    )
+    masked_m = torch.ones((group_size,), device="cuda", dtype=torch.int32)
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=torch.bfloat16,
+        backend="cake",
+    )
+    for i in range(group_size):
+        reference = torch.mv(b_fp8[i].float(), a_fp8[i, 0].float())
+        torch.testing.assert_close(out[i, 0].float(), reference, atol=0.1, rtol=0.1)
+
+
 @pytest.mark.parametrize("m", [128, 512])
 @pytest.mark.parametrize("n", [256, 4096])
 @pytest.mark.parametrize("k", [256, 2048])
