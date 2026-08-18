@@ -726,7 +726,15 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
-        partitioned_sfa = _collapse_to_vmk(partitioned_sfa)
+        if cutlass.const_expr(
+            self.sf_vec_size == 16 and cute.rank(partitioned_sfa) > 3
+        ):
+            # NVFP4's extra SFA mode belongs to the MN coordinate for wide-M
+            # tiles; retain the SVDQuant-tested grouping. MXFP4 instead carries
+            # an extra trailing K mode and uses the upstream normalization.
+            partitioned_sfa = cute.group_modes(partitioned_sfa, 1, 3)
+        else:
+            partitioned_sfa = _collapse_to_vmk(partitioned_sfa)
         return cute.make_fragment_like(partitioned_sfa)
 
     def _partition_fragment_SFB(
