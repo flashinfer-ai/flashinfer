@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from flashinfer.jit.cake_dsv4 import _CAKE_DSV4_VARIANTS
-from flashinfer.mla._cake_dsv4 import _route
+from flashinfer.mla.cake_dsv4 import _route
 
 
 @pytest.mark.parametrize(

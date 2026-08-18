@@ -1906,7 +1906,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     if backend == "cake":
-        from ._cake_dsv4 import run_cake_dsv4
+        from .cake_dsv4 import run_cake_dsv4
 
         return run_cake_dsv4(
             query=query_flat,
