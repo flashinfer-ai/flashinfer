@@ -373,18 +373,19 @@ def test_fp8_groupwise_batch_deepgemm_masked(
 
 
 @pytest.mark.parametrize(
-    ("nk", "expected_m"),
+    ("nk", "expected_m", "masked_m_values"),
     [
-        ((6144, 7168), 1228),
-        ((6144, 7168), 24),
-        ((7168, 3072), 24),
-        ((4096, 4096), 24),
-        ((4096, 2048), 24),
+        ((6144, 7168), 1228, (1057, 1325, 833, 1197, 1203, 1235)),
+        ((6144, 7168), 24, (21, 15, 20, 14, 20, 22)),
+        ((7168, 3072), 24, (20, 24, 16, 17, 24, 21)),
+        ((4096, 4096), 24, (16, 18, 17, 20, 25, 16)),
+        ((4096, 2048), 24, (21, 18, 24, 20, 20, 16)),
     ],
 )
 def test_fp8_groupwise_batch_deepgemm_cake_deepgemm_benchmark_shapes(
     nk,
     expected_m,
+    masked_m_values,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in ((10, 0), (10, 3)):
@@ -405,7 +406,7 @@ def test_fp8_groupwise_batch_deepgemm_cake_deepgemm_benchmark_shapes(
     b_scale = torch.ones(
         (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
     )
-    masked_m = torch.ones((group_size,), device="cuda", dtype=torch.int32)
+    masked_m = torch.tensor(masked_m_values, device="cuda", dtype=torch.int32)
 
     out = batch_deepgemm_fp8_nt_groupwise(
         a_fp8,
@@ -417,9 +418,12 @@ def test_fp8_groupwise_batch_deepgemm_cake_deepgemm_benchmark_shapes(
         out_dtype=torch.bfloat16,
         backend="cake",
     )
-    for i in range(group_size):
-        reference = torch.mv(b_fp8[i].float(), a_fp8[i, 0].float())
-        torch.testing.assert_close(out[i, 0].float(), reference, atol=0.1, rtol=0.1)
+    for i, valid_rows in enumerate(masked_m_values):
+        for row in {0, valid_rows - 1}:
+            reference = torch.mv(b_fp8[i].float(), a_fp8[i, row].float())
+            torch.testing.assert_close(
+                out[i, row].float(), reference, atol=0.1, rtol=0.1
+            )
 
 
 @pytest.mark.parametrize("m", [128, 512])
