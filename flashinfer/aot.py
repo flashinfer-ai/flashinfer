@@ -77,6 +77,10 @@ from .jit.cake_flash_kda_packed_t1 import (
     FLASH_KDA_PACKED_T1_VARIANTS,
     gen_flash_kda_packed_t1_module,
 )
+from .jit.cake_kda_packed_t1 import (
+    CAKE_KDA_PACKED_T1_VARIANTS,
+    gen_cake_kda_packed_t1_module,
+)
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
@@ -602,10 +606,18 @@ def gen_all_modules(
             gen_flash_kda_packed_t1_module(variant, "sm100a")
             for variant in FLASH_KDA_PACKED_T1_VARIANTS
         )
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm100a")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
+        )
     if has_flash_kda_packed_t1_sm100f:
         jit_specs.extend(
             gen_flash_kda_packed_t1_module(variant, "sm100f")
             for variant in FLASH_KDA_PACKED_T1_VARIANTS
+        )
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm100f")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
 
     if add_act:

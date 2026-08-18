@@ -353,15 +353,18 @@ def test_packed_kda_decode_all_inactive_is_bitwise_noop(packed_kda_device):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("batch", [8, 64])
-def test_packed_kda_decode_sanitizer_schedules(packed_kda_device, batch):
-    """Small named entry points for tile8/tile16 sanitizer invocations."""
+@pytest.mark.parametrize(
+    ("batch", "state_padding"),
+    [(8, 17), (8, _PRODUCTION_STATE_PADDING), (64, _PRODUCTION_STATE_PADDING)],
+)
+def test_packed_kda_decode_sanitizer_schedules(packed_kda_device, batch, state_padding):
+    """Small named entry points for legacy and optimized sanitizer runs."""
     case = _make_case(
         batch,
         packed_kda_device,
         seed=20260824 + batch,
         inactive=False,
-        state_padding=17,
+        state_padding=state_padding,
     )
     _call(case)
     torch.cuda.synchronize(packed_kda_device)
@@ -615,7 +618,7 @@ class _FakeCudaTensor:
     ("batch", "target", "variant"),
     [(31, "sm100a", "tile8"), (32, "sm100f", "tile16")],
 )
-def test_kernel_facade_selects_variant_and_caller_stream_cpu(
+def test_kernel_facade_preserves_legacy_fallback_and_caller_stream_cpu(
     monkeypatch, batch, target, variant
 ):
     packed_module = importlib.import_module(
@@ -630,6 +633,11 @@ def test_kernel_facade_selects_variant_and_caller_stream_cpu(
     )
     monkeypatch.setattr(packed_module, "torch", fake_torch)
     monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(
+        packed_module,
+        "_optimized_alignment_flags",
+        lambda *args: (False, False),
+    )
 
     module_calls = []
     launch_calls = []
@@ -647,6 +655,48 @@ def test_kernel_facade_selects_variant_and_caller_stream_cpu(
 
     assert result is output
     assert module_calls == [(variant, target)]
+    assert len(launch_calls) == 1
+    assert launch_calls[0][-2] is output.view_result
+    assert launch_calls[0][-1] == stream_handle
+
+
+def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypatch):
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
+    batch = 29
+    target = "sm100f"
+    stream_handle = 0x12345678
+    fake_torch = SimpleNamespace(
+        Tensor=_FakeCudaTensor,
+        cuda=SimpleNamespace(
+            current_stream=lambda device: SimpleNamespace(cuda_stream=stream_handle)
+        ),
+    )
+    monkeypatch.setattr(packed_module, "torch", fake_torch)
+    monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(
+        packed_module,
+        "_optimized_alignment_flags",
+        lambda *args: (True, True),
+    )
+
+    module_calls = []
+    launch_calls = []
+
+    def get_module(selected_variant, selected_target):
+        module_calls.append((selected_variant, selected_target))
+        return SimpleNamespace(run=lambda *args: launch_calls.append(args))
+
+    monkeypatch.setattr(packed_module, "get_cake_kda_packed_t1_module", get_module)
+    mixed_qkv = _FakeCudaTensor((batch, _MIXED_WIDTH))
+    inputs = [mixed_qkv, *(_FakeCudaTensor((1,)) for _ in range(6))]
+    output = _FakeCudaTensor((batch, 1, _HEADS, _HEAD_DIM))
+
+    result = packed_module.run_packed_kda_decode(*inputs, output=output)
+
+    assert result is output
+    assert module_calls == [("register_tile8_interleaved", target)]
     assert len(launch_calls) == 1
     assert launch_calls[0][-2] is output.view_result
     assert launch_calls[0][-1] == stream_handle
