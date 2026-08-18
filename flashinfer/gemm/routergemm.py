@@ -171,6 +171,62 @@ def get_dsv3_router_gemm_module():
     )
 
 
+@functools.cache
+def get_cake_router_gemm_module():
+    from flashinfer.jit.cake_router_gemm import run
+
+    @register_custom_op(
+        "flashinfer::cake_ml3_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N128(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        run(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::cake_dsv3_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N256(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        run(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::cake_glm_dsa_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K6144_N256(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        run(mat_a, mat_b, out, launch_with_pdl)
+
+    return SimpleNamespace(
+        mm_M1_16_K7168_N128=mm_M1_16_K7168_N128,
+        mm_M1_16_K7168_N256=mm_M1_16_K7168_N256,
+        mm_M1_16_K6144_N256=mm_M1_16_K6144_N256,
+    )
+
+
+def get_router_gemm_module(*, backend: str):
+    if backend != "cake":
+        raise ValueError(f"unsupported Router GEMM backend: {backend!r}")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if major == 10 and minor in (0, 3):
+        return get_cake_router_gemm_module()
+    return get_dsv3_router_gemm_module()
+
+
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N128_shape_checks)
 @flashinfer_api
 def mm_M1_16_K7168_N128(
@@ -212,7 +268,7 @@ def mm_M1_16_K7168_N128(
     dimensions, strides, or dtypes do not match the expected Mistral Large 3
     configuration.
     """
-    get_dsv3_router_gemm_module().mm_M1_16_K7168_N128(
+    get_router_gemm_module(backend="cake").mm_M1_16_K7168_N128(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -258,7 +314,7 @@ def mm_M1_16_K7168_N256(
     ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
     expected DeepSeek-V3 router configuration.
     """
-    get_dsv3_router_gemm_module().mm_M1_16_K7168_N256(
+    get_router_gemm_module(backend="cake").mm_M1_16_K7168_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -304,7 +360,7 @@ def mm_M1_16_K6144_N256(
     ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
     expected GLM-MoE-DSA configuration.
     """
-    get_dsv3_router_gemm_module().mm_M1_16_K6144_N256(
+    get_router_gemm_module(backend="cake").mm_M1_16_K6144_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
 
