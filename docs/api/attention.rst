@@ -150,6 +150,7 @@ Batch Prefill/Append Attention
     trtllm_ragged_attention_deepseek
     fmha_v2_prefill_deepseek
     trtllm_fmha_v2_prefill
+    fmha_v2_prefill_sm120
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:

@@ -417,6 +417,23 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+_TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
+    "k_only": 1,
+    "separate_kv": 2,
+}
+
+
+def _get_bf16q_fp8kv_transform_mode(
+    mode: Literal["k_only", "separate_kv"],
+) -> int:
+    try:
+        return _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES[mode]
+    except KeyError as err:
+        raise ValueError(
+            "bf16q_fp8kv_transform_mode must be one of 'k_only' or 'separate_kv'"
+        ) from err
+
+
 @flashinfer_api
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
@@ -2054,7 +2071,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
             # use q's head_dim for output instead
-            out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
+            # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
+            # asymmetric QK/VO plans; q.shape[-1] assumed QK == VO).
+            # Only the NVFP4 packed path (uint8 KV) stores VO at half width;
+            # derive the doubled output width from the KV dtype, not merely from
+            # kv_cache_sf being present, so a stray scale-factor tensor on a
+            # non-uint8 cache can't silently miscompute the output shape.
+            out_head_dim = (
+                v_cache.shape[-1] * 2
+                if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+                else v_cache.shape[-1]
+            )
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )
@@ -2164,6 +2191,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 ]
 
                 if self._backend == "trtllm-gen":
+                    bf16q_fp8kv_transform_mode = (
+                        _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES["separate_kv"]
+                        if q.dtype == torch.bfloat16
+                        and k_cache.dtype == torch.float8_e4m3fn
+                        and v_cache.dtype == torch.float8_e4m3fn
+                        and out.dtype == torch.bfloat16
+                        else 0
+                    )
                     # decode.py's trtllm-gen paged_run (get_trtllm_gen_decode_module)
                     # has a different optional-param layout than prefill.py's paged_run
                     run_args += [
@@ -2179,6 +2214,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         value_block_scales,
                         skip_softmax_threshold_scale_factor,
                         True,  # uses_shared_paged_kv_idx
+                        bf16q_fp8kv_transform_mode,
                     ]
                 else:
                     run_args += [
@@ -2809,6 +2845,7 @@ class TrtllmGenDecodeModule:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
         lse: Optional[torch.Tensor] = None,
+        bf16q_fp8kv_transform_mode: int = 0,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -2868,6 +2905,7 @@ class TrtllmGenDecodeModule:
             lse_stride_heads,
             False,  # enable_block_sparse_attention
             None,  # sparse_mla_top_k_lens
+            bf16q_fp8kv_transform_mode,
         )
         return out
 
@@ -2935,6 +2973,7 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        bf16q_fp8kv_transform_mode: int = 0,
     ) -> None:
         assert paged_kv_cache is not None
         assert num_qo_heads is not None
@@ -2966,6 +3005,7 @@ def get_trtllm_gen_decode_module(*args):
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             lse=maybe_lse,
+            bf16q_fp8kv_transform_mode=bf16q_fp8kv_transform_mode,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -3014,6 +3054,7 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        bf16q_fp8kv_transform_mode: int = 0,
     ) -> None:
         pass
 
@@ -3059,6 +3100,7 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale_log2: Optional[torch.Tensor] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     enable_block_sparse_attention: bool = False,
+    bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -3230,6 +3272,12 @@ def trtllm_batch_decode_with_kv_cache(
         Not compatible with sliding window (``window_left != -1``),
         ``skip_softmax_threshold_scale_factor``, or ``uses_shared_paged_kv_idx=False``.
 
+    bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
+        Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
+        default separate transformed-K/V cubins and is ignored by other paths.
+        ``"k_only"`` selects the optimized K-only transform cubins, and
+        ``"separate_kv"`` selects the separate transformed-K/V cubins.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -3288,7 +3336,6 @@ def trtllm_batch_decode_with_kv_cache(
 
     if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
         raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
-
     if enable_block_sparse_attention:
         if backend != "trtllm-gen":
             raise ValueError(
@@ -3305,6 +3352,10 @@ def trtllm_batch_decode_with_kv_cache(
                 "block-sparse attention does not support "
                 "skip_softmax_threshold_scale_factor"
             )
+    if backend != "trtllm-gen" and bf16q_fp8kv_transform_mode is not None:
+        raise ValueError(
+            "bf16q_fp8kv_transform_mode is only supported by backend='trtllm-gen'"
+        )
 
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
@@ -3442,6 +3493,23 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+        uses_bf16q_fp8kv = (
+            query.dtype == torch.bfloat16
+            and k_cache.dtype == torch.float8_e4m3fn
+            and v_cache.dtype == torch.float8_e4m3fn
+            and out_dtype == torch.bfloat16
+        )
+        if bf16q_fp8kv_transform_mode is None:
+            bf16q_fp8kv_transform_mode_value = (
+                _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES["separate_kv"]
+                if uses_bf16q_fp8kv
+                else 0
+            )
+        else:
+            bf16q_fp8kv_transform_mode_value = _get_bf16q_fp8kv_transform_mode(
+                bf16q_fp8kv_transform_mode
+            )
+
         bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
             bmm1_scale, bmm1_scale_log2, query.device
         )
@@ -3531,6 +3599,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_heads,
             enable_block_sparse_attention,
             None,  # sparse_mla_top_k_lens
+            bf16q_fp8kv_transform_mode_value,
         )
 
         result_out = (

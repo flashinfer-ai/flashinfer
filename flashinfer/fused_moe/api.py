@@ -215,36 +215,60 @@ class ExpertConfig:
 
 
 @dataclass(frozen=True)
-class ExecutionConfig:
-    """Runtime execution parameters.
+class MoEFinalizeConfig:
+    """How the finalize (combine) step behaves.
+
+    Split out of ``ExecutionConfig`` for the same reason ``RoutingConfig`` is
+    its own config: finalize is a distinct architectural concern (how the
+    per-expert partials are reduced back into one row per token), not a
+    runtime knob like PDL or the autotuner token budget.
 
     Parameters
     ----------
     do_finalize : bool
-        Whether to apply routing-weight scaling and accumulate into output.
-    enable_pdl : bool or None
-        Persistent device launch.  ``None`` → auto (True for sm90+).
-    tune_max_num_tokens : int
-        Token budget hint for autotuner / CUDA graph capture.
+        Whether to apply routing-weight scaling and accumulate the per-expert
+        partial results into the output.  ``False`` returns the unreduced
+        per-expert partials, leaving the combine to the caller — only the
+        backends that advertise it support this.
     use_fused_finalize : bool
-        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue
+        (atomic accumulation) instead of running a separate reduction kernel.
+        Backends that do not support it ignore the flag.
     """
 
     do_finalize: bool = True
-    enable_pdl: Optional[bool] = None
-    tune_max_num_tokens: int = 8192
     use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
         if not self.do_finalize:
             parts.append(f"do_finalize={self.do_finalize!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        return f"MoEFinalizeConfig({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Runtime execution parameters.
+
+    Parameters
+    ----------
+    enable_pdl : bool or None
+        Persistent device launch.  ``None`` → auto (True for sm90+).
+    tune_max_num_tokens : int
+        Token budget hint for autotuner / CUDA graph capture.
+    """
+
+    enable_pdl: Optional[bool] = None
+    tune_max_num_tokens: int = 8192
+
+    def __repr__(self) -> str:
+        parts = []
         if self.enable_pdl is not None:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
-        if not self.use_fused_finalize:
-            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -876,6 +900,8 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Appended last so existing positional construction keeps working.
+    finalize: MoEFinalizeConfig = field(default_factory=MoEFinalizeConfig)
 
     def __post_init__(self) -> None:
         # Not in check_support(): MoELayer swallows its exceptions to filter
@@ -999,10 +1025,10 @@ class MoEActivationPack:
       selection on the host and passes ``topk_ids`` + ``topk_weights``.
       The TRTLLM runners normally combine both fields into one packed ``int32``
       tensor before launch.
-    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
-      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
-      BF16 or FP32 weights directly, avoiding packed-id construction. The
-      launcher consumes the weights in their native dtype.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
+      by the TRTLLM runners. The caller supplies ``int32`` ids and BF16 or FP32
+      weights directly, avoiding packed-id construction. The launcher consumes
+      the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -1025,7 +1051,7 @@ class MoEActivationPack:
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
-    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    # float32 for TRTLLM UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
     # Per-token NVFP4 row scale, shape [M].
     per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)

@@ -23,6 +23,21 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .jit import (
+    gen_batch_prefill_module,
+    gen_customize_batch_prefill_module,
+    gen_fmha_cutlass_sm100a_module,
+    gen_fmha_v2_module,
+    gen_single_prefill_module,
+    gen_trtllm_fmha_v2_sm120_module,
+    gen_trtllm_gen_fmha_module,
+    get_batch_prefill_uri,
+    get_single_prefill_uri,
+    setup_cubin_loader,
+)
+from .page import get_seq_lens
+from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
     gqa_paged_prefill_trace,
     gqa_ragged_prefill_trace,
@@ -31,26 +46,12 @@ from .trace.templates.attention import (
 )
 from .trace.templates.gemm import (
     fmha_v2_prefill_deepseek_trace,
+    fmha_v2_prefill_sm120_trace,
     trtllm_ragged_attention_deepseek_trace,
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
-from .jit import (
-    gen_batch_prefill_module,
-    gen_customize_batch_prefill_module,
-    gen_fmha_cutlass_sm100a_module,
-    gen_fmha_v2_module,
-    gen_single_prefill_module,
-    get_batch_prefill_uri,
-    get_single_prefill_uri,
-    setup_cubin_loader,
-    gen_trtllm_gen_fmha_module,
-    gen_trtllm_fmha_v2_sm120_module,
-)
-from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
 from .utils import (
-    log2e,
+    SINGLE_KERNEL_TMP_SIZE,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -60,29 +61,29 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
-    check_shape_dtype_device,
-    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
-    _unpack_paged_kv_cache,
     _should_use_fmha_v2_sm120,
+    _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    ceil_div,
+    check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
+    get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
     is_float8,
+    is_sm12x_supported,
     is_sm100a_supported,
     is_sm110a_supported,
-    is_sm12x_supported,
+    log2e,
+    prepare_jit_additional_args,
     register_custom_op,
     register_fake_op,
-    ceil_div,
     round_up,
-    SINGLE_KERNEL_TMP_SIZE,
-    prepare_jit_additional_args,
 )
 
 
@@ -1371,8 +1372,16 @@ def single_prefill_with_kv_cache(
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
+    # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
+    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO. Gate on the packed
+    # (uint8) storage, not just kv_cache_sf, so a stray scale-factor tensor on a
+    # non-uint8 cache cannot silently double the output width.
+    out_head_dim = (
+        v.shape[-1] * 2
+        if kv_cache_sf is not None and v.dtype == torch.uint8
+        else v.shape[-1]
+    )
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -1488,6 +1497,31 @@ def _compute_page_mask_indptr(
         0,
     )
     return mask_indptr
+
+
+def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
+    """Whether split-KV must be disabled because the KV cache is NVFP4.
+
+    This gate is an *empirical workaround*: with split-KV (flash-decoding)
+    enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
+    a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
+    and prefix-cache extend), while dense full-prefill was unaffected.
+    Disabling split-KV removes the corruption, and decode-throughput
+    measurements showed no cost from the gate.
+
+    The root cause has not been confirmed. The FP8 scale-factor blocks
+    themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
+    *head-dim* elements of a single token, whereas split-KV partitions the
+    *token* axis, so a split boundary never slices a scale block. The current
+    hypothesis (unconfirmed) is that the small per-split KV chunks interact
+    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
+    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
+    FP8 and 16-bit KV caches are unaffected and keep split-KV.
+    """
+    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
+        return True
+    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    return native_fp4 is not None and kv_data_type == native_fp4
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -1696,9 +1730,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_additional_scalar_names = list(jit_args[9])
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_additional_scalar_names = []
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2262,9 +2298,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # The segment_packbits kernel requires the indptr on the mask's
+            # device (CHECK_DEVICE in quantization.cu), but mask_indptr
+            # inherits qo_indptr's device, which callers (e.g. vLLM) routinely
+            # keep on CPU while the mask is on GPU.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
@@ -2544,6 +2584,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
@@ -2852,7 +2899,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
+        # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
+        # (2 values per byte): the unpacked VO width is v_cache.shape[-1]*2,
+        # which equals head_dim_vo even for asymmetric (QK, VO) plans.
+        # Using q.shape[-1] here assumed head_dim_vo == head_dim_qk and made
+        # the kernel (which writes head_dim_vo-wide rows) garble a too-wide
+        # output buffer whenever VO < QK.
+        out_head_dim = (
+            v_cache.shape[-1] * 2
+            if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            else v_cache.shape[-1]
+        )
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -2942,19 +2999,58 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                run_args.extend(
-                    prepare_jit_additional_args(
-                        self._jit_additional_tensor_names,
-                        {
-                            "maybe_custom_mask": self._custom_mask_buf,
-                            "maybe_mask_indptr": self._mask_indptr_buf,
-                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                                q.shape[1], q.device
-                            ),
-                        },
-                        args,
-                    )
+                additional_args = prepare_jit_additional_args(
+                    self._jit_additional_tensor_names,
+                    {
+                        "maybe_custom_mask": self._custom_mask_buf,
+                        "maybe_mask_indptr": self._mask_indptr_buf,
+                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                            q.shape[1], q.device
+                        ),
+                        "maybe_prefix_len_ptr": self._prefix_len_ptr,
+                        "maybe_token_pos_in_items_ptr": self._token_pos_in_items_ptr,
+                        "maybe_max_item_len_ptr": self._max_item_len_ptr,
+                        "maybe_k_cache_sf": key_block_scales,
+                        "maybe_v_cache_sf": value_block_scales,
+                    },
+                    args,
                 )
+                expected_additional_arg_count = len(
+                    self._jit_additional_tensor_names
+                ) + len(self._jit_additional_scalar_names)
+                if len(additional_args) < expected_additional_arg_count:
+                    _, scale_q_scalar = _split_scale_param(q_scale)
+                    _, scale_k_scalar = _split_scale_param(k_scale)
+                    _, scale_v_scalar = _split_scale_param(v_scale)
+                    jit_scalar_values = {
+                        "logits_soft_cap": logits_soft_cap,
+                        "sm_scale": sm_scale,
+                        "rope_rcp_scale": 1.0 / rope_scale,
+                        "rope_rcp_theta": 1.0 / rope_theta,
+                        "scale_q_scalar": scale_q_scalar,
+                        "scale_k_scalar": scale_k_scalar,
+                        "scale_v_scalar": scale_v_scalar,
+                        "token_pos_in_items_len": self._token_pos_in_items_len,
+                    }
+                    # prepare_jit_additional_args returns one entry per declared
+                    # tensor name plus any scalars the caller passed
+                    # positionally, so the number of scalars already provided is
+                    # exactly the excess over the tensor-name count.
+                    num_scalars_provided = len(additional_args) - len(
+                        self._jit_additional_tensor_names
+                    )
+                    for name in self._jit_additional_scalar_names[
+                        num_scalars_provided:
+                    ]:
+                        if name not in jit_scalar_values:
+                            raise ValueError(
+                                f"JIT module declares additional scalar {name!r}, "
+                                "which was not passed positionally to run() and "
+                                "cannot be derived automatically; derivable "
+                                f"scalars are: {sorted(jit_scalar_values)}"
+                            )
+                        additional_args.append(jit_scalar_values[name])
+                run_args.extend(additional_args)
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -3486,9 +3582,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # segment_packbits requires mask_indptr on the same device as
+            # custom_mask, but mask_indptr inherits qo_indptr's device (often
+            # CPU) while custom_mask is on GPU. Mirror the paged path's
+            # .to(device) so the ragged custom-mask flow doesn't crash.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
@@ -3780,6 +3880,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # Empirical workaround: split-KV corrupted NVFP4 KV reads
+                    # when qo_len << kv_len (decode / prefix-cache extend); see
+                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
@@ -3976,8 +4083,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
 
-        # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+        # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
+        # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed
+        # (uint8) storage so a stray scale-factor tensor on a non-uint8 cache
+        # can't silently double the output width (matches the decode-side guard).
+        out_head_dim = (
+            v.shape[-1] * 2
+            if kv_cache_sf is not None and v.dtype == torch.uint8
+            else v.shape[-1]
+        )
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
@@ -4598,6 +4712,8 @@ def trtllm_ragged_attention_deepseek(
     ] = (None, None, None, None),
     num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
     backend: str = "trtllm-gen",
+    q_seq_lens_cpu: Optional[torch.Tensor] = None,
+    kv_seq_lens_cpu: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -4664,6 +4780,16 @@ def trtllm_ragged_attention_deepseek(
         contains non-``None`` tensors.
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+    q_seq_lens_cpu : Optional[torch.Tensor]
+        Optional trusted CPU mirror of the per-row query lengths. When provided
+        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
+        all-active ragged fast path asynchronous while still compacting empty-KV
+        rows. If omitted, the wrapper derives lengths from the device indptrs
+        and may synchronize to preserve correctness for direct callers.
+        Currently only consulted by the ``trtllm-gen`` backend.
+    kv_seq_lens_cpu : Optional[torch.Tensor]
+        Optional trusted CPU mirror of the per-row KV lengths. Currently only
+        consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -4779,6 +4905,276 @@ def trtllm_ragged_attention_deepseek(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        def _validate_cpu_seq_lens(
+            lengths: torch.Tensor,
+            name: str,
+            total_tokens: int,
+            max_len: int,
+        ) -> int:
+            if lengths.device.type != "cpu":
+                raise ValueError(f"{name} must be a CPU tensor")
+            if lengths.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
+            if lengths.shape != (batch_size,):
+                raise ValueError(f"{name} must have shape ({batch_size},)")
+            if bool((lengths < 0).any().item()):
+                raise ValueError(f"{name} must contain non-negative lengths")
+
+            actual_total = int(lengths.sum().item())
+            if actual_total != total_tokens:
+                raise ValueError(
+                    f"{name} sums to {actual_total}, but expected {total_tokens} "
+                    "tokens from the corresponding ragged tensor"
+                )
+            if batch_size > 0 and int(lengths.max().item()) > max_len:
+                raise ValueError(f"{name} contains a length larger than max_len")
+            return actual_total
+
+        run_out = out
+        run_lse = lse
+        run_query = query
+        run_key = key
+        run_value = value
+        run_seq_lens = seq_lens
+        run_max_q_len = max_q_len
+        run_max_kv_len = max_kv_len
+        run_batch_size = batch_size
+        run_cum_seq_lens_q = cum_seq_lens_q
+        run_cum_seq_lens_kv = cum_seq_lens_kv
+        q_active_indices = None
+        should_launch = True
+
+        q_lens = None
+        kv_lens = None
+        q_lens_cpu = None
+        kv_lens_cpu = None
+        active_rows = None
+        has_inactive_rows = False
+        has_active_rows = True
+
+        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+            if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
+                raise ValueError(
+                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
+                )
+
+            _validate_cpu_seq_lens(
+                q_seq_lens_cpu,
+                "q_seq_lens_cpu",
+                query.shape[0],
+                max_q_len,
+            )
+            kv_total = _validate_cpu_seq_lens(
+                kv_seq_lens_cpu,
+                "kv_seq_lens_cpu",
+                key.shape[0],
+                max_kv_len,
+            )
+            if kv_total != value.shape[0]:
+                raise ValueError(
+                    "kv_seq_lens_cpu must sum to both key and value token counts"
+                )
+
+            q_lens_cpu = q_seq_lens_cpu
+            kv_lens_cpu = kv_seq_lens_cpu
+            active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+            if not bool(active_rows_cpu.all().item()):
+                has_inactive_rows = True
+                has_active_rows = bool(active_rows_cpu.any().item())
+        else:
+            if (
+                query.is_cuda
+                and hasattr(torch.cuda, "is_current_stream_capturing")
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise ValueError(
+                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided during "
+                    "CUDA graph capture"
+                )
+            q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+            kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+            active_rows = (q_lens > 0) & (kv_lens > 0)
+            has_inactive_rows = bool((~active_rows).any().item())
+            if has_inactive_rows:
+                has_active_rows = bool(active_rows.any().item())
+
+        if has_inactive_rows:
+            if isinstance(bmm1_scale, torch.Tensor) or isinstance(
+                bmm2_scale, torch.Tensor
+            ):
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when bmm scale tensors are provided."
+                )
+            if attention_sinks is not None:
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when attention sinks are provided."
+                )
+            if any(scale_tensor is not None for scale_tensor in sage_attn_sfs):
+                raise ValueError(
+                    "TRTLLM-GEN ragged attention does not support compacting "
+                    "empty KV rows when SageAttention scale-factor tensors are "
+                    "provided."
+                )
+
+            if not has_active_rows:
+                out.zero_()
+                if lse is not None:
+                    lse.fill_(-float("inf"))
+                should_launch = False
+            else:
+                if q_lens_cpu is not None:
+                    assert kv_lens_cpu is not None
+
+                    active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+                    q_active_mask_cpu = torch.repeat_interleave(
+                        active_rows_cpu, q_lens_cpu
+                    )
+                    q_inactive_indices_cpu = torch.nonzero(
+                        ~q_active_mask_cpu, as_tuple=False
+                    ).flatten()
+                    if q_inactive_indices_cpu.numel() > 0:
+                        q_inactive_indices = q_inactive_indices_cpu.to(
+                            query.device, non_blocking=True
+                        )
+                        out.index_fill_(0, q_inactive_indices, 0)
+                        if lse is not None:
+                            lse.index_fill_(0, q_inactive_indices, -float("inf"))
+
+                    active_indices_cpu = torch.nonzero(
+                        active_rows_cpu, as_tuple=False
+                    ).flatten()
+                    kv_active_mask_cpu = torch.repeat_interleave(
+                        active_rows_cpu, kv_lens_cpu
+                    )
+                    q_active_indices_cpu = torch.nonzero(
+                        q_active_mask_cpu, as_tuple=False
+                    ).flatten()
+                    kv_active_indices_cpu = torch.nonzero(
+                        kv_active_mask_cpu, as_tuple=False
+                    ).flatten()
+
+                    q_active_indices = q_active_indices_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    kv_active_indices = kv_active_indices_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_query = query.index_select(0, q_active_indices).contiguous()
+                    run_key = key.index_select(0, kv_active_indices).contiguous()
+                    run_value = value.index_select(0, kv_active_indices).contiguous()
+
+                    run_q_lens_cpu = q_lens_cpu.index_select(0, active_indices_cpu).to(
+                        dtype=cum_seq_lens_q.dtype
+                    )
+                    run_seq_lens_cpu = kv_lens_cpu.index_select(
+                        0, active_indices_cpu
+                    ).to(dtype=seq_lens.dtype)
+                    run_cum_seq_lens_q_cpu = torch.cat(
+                        [
+                            torch.zeros(1, dtype=cum_seq_lens_q.dtype),
+                            torch.cumsum(
+                                run_q_lens_cpu, dim=0, dtype=cum_seq_lens_q.dtype
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    run_cum_seq_lens_kv_cpu = torch.cat(
+                        [
+                            torch.zeros(1, dtype=cum_seq_lens_kv.dtype),
+                            torch.cumsum(
+                                run_seq_lens_cpu.to(dtype=cum_seq_lens_kv.dtype),
+                                dim=0,
+                                dtype=cum_seq_lens_kv.dtype,
+                            ),
+                        ],
+                        dim=0,
+                    )
+
+                    run_seq_lens = run_seq_lens_cpu.to(query.device, non_blocking=True)
+                    run_cum_seq_lens_q = run_cum_seq_lens_q_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_cum_seq_lens_kv = run_cum_seq_lens_kv_cpu.to(
+                        query.device, non_blocking=True
+                    )
+                    run_max_q_len = int(run_q_lens_cpu.max().item())
+                    run_max_kv_len = int(run_seq_lens_cpu.max().item())
+                    run_batch_size = int(active_indices_cpu.numel())
+                else:
+                    if q_lens is None:
+                        q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+                    if kv_lens is None:
+                        kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+                    assert active_rows is not None
+
+                    q_active_mask = torch.repeat_interleave(active_rows, q_lens)
+                    q_inactive_indices = torch.nonzero(
+                        ~q_active_mask, as_tuple=False
+                    ).flatten()
+                    if q_inactive_indices.numel() > 0:
+                        out.index_fill_(0, q_inactive_indices, 0)
+                        if lse is not None:
+                            lse.index_fill_(0, q_inactive_indices, -float("inf"))
+
+                    active_indices = torch.nonzero(
+                        active_rows, as_tuple=False
+                    ).flatten()
+                    kv_active_mask = torch.repeat_interleave(active_rows, kv_lens)
+                    kv_active_indices = torch.nonzero(
+                        kv_active_mask, as_tuple=False
+                    ).flatten()
+                    q_active_indices = torch.nonzero(
+                        q_active_mask, as_tuple=False
+                    ).flatten()
+
+                    run_query = query.index_select(0, q_active_indices).contiguous()
+                    run_key = key.index_select(0, kv_active_indices).contiguous()
+                    run_value = value.index_select(0, kv_active_indices).contiguous()
+                    run_seq_lens = kv_lens.index_select(0, active_indices).contiguous()
+                    run_q_lens = q_lens.index_select(0, active_indices).contiguous()
+                    run_cum_seq_lens_q = torch.cat(
+                        [
+                            torch.zeros(
+                                1, device=query.device, dtype=cum_seq_lens_q.dtype
+                            ),
+                            torch.cumsum(run_q_lens, dim=0, dtype=cum_seq_lens_q.dtype),
+                        ],
+                        dim=0,
+                    )
+                    run_cum_seq_lens_kv = torch.cat(
+                        [
+                            torch.zeros(
+                                1, device=query.device, dtype=cum_seq_lens_kv.dtype
+                            ),
+                            torch.cumsum(
+                                run_seq_lens, dim=0, dtype=cum_seq_lens_kv.dtype
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    run_max_q_len = int(run_q_lens.max().item())
+                    run_max_kv_len = int(run_seq_lens.max().item())
+                    run_batch_size = int(active_indices.numel())
+                run_out = torch.empty(
+                    run_query.shape[0],
+                    query.shape[1],
+                    value.shape[2],
+                    device=query.device,
+                    dtype=out.dtype,
+                )
+                run_lse = (
+                    torch.empty(
+                        run_query.shape[0],
+                        query.shape[1],
+                        device=query.device,
+                        dtype=torch.float32,
+                    )
+                    if lse is not None
+                    else None
+                )
+
         workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
         sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = (
             sage_attn_sfs
@@ -4786,38 +5182,44 @@ def trtllm_ragged_attention_deepseek(
         num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
             num_elts_per_sage_attn_blk
         )
-        run_func(
-            out,
-            query,
-            key,
-            value,
-            workspace_buffer,
-            seq_lens,
-            max_q_len,
-            max_kv_len,
-            bmm1_scale,
-            bmm2_scale,
-            o_sf_scale,
-            batch_size,
-            window_left,
-            cum_seq_lens_q,
-            cum_seq_lens_kv,
-            sm_count,
-            enable_pdl,
-            is_causal,
-            workspace_size,
-            attention_sinks,
-            skip_softmax_threshold_scale_factor,
-            lse,
-            sage_attn_sfs_q,
-            sage_attn_sfs_k,
-            sage_attn_sfs_p,
-            sage_attn_sfs_v,
-            num_elts_sage_q,
-            num_elts_sage_k,
-            num_elts_sage_p,
-            num_elts_sage_v,
-        )
+        if should_launch:
+            run_func(
+                run_out,
+                run_query,
+                run_key,
+                run_value,
+                workspace_buffer,
+                run_seq_lens,
+                run_max_q_len,
+                run_max_kv_len,
+                bmm1_scale,
+                bmm2_scale,
+                o_sf_scale,
+                run_batch_size,
+                window_left,
+                run_cum_seq_lens_q,
+                run_cum_seq_lens_kv,
+                sm_count,
+                enable_pdl,
+                is_causal,
+                workspace_size,
+                attention_sinks,
+                skip_softmax_threshold_scale_factor,
+                run_lse,
+                sage_attn_sfs_q,
+                sage_attn_sfs_k,
+                sage_attn_sfs_p,
+                sage_attn_sfs_v,
+                num_elts_sage_q,
+                num_elts_sage_k,
+                num_elts_sage_p,
+                num_elts_sage_v,
+            )
+            if q_active_indices is not None:
+                out.index_copy_(0, q_active_indices, run_out)
+                if lse is not None:
+                    assert run_lse is not None
+                    lse.index_copy_(0, q_active_indices, run_lse)
 
     if return_lse:
         assert lse is not None, (
@@ -5187,6 +5589,195 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
+def _fmha_v2_prefill_sm120_run(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float],
+    scale_bmm2: Optional[float],
+    causal: bool,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+    scale_bmm1_d: Optional[torch.Tensor],
+    scale_bmm2_d: Optional[torch.Tensor],
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    module = get_trtllm_fmha_v2_sm120_module()
+    is_e4m3 = query.dtype == torch.float8_e4m3fn
+    is_bf16_output = out.dtype == torch.bfloat16
+    scale_softmax = (
+        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
+    )
+    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
+    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    for name, device_scale in (
+        ("scale_bmm1_d", scale_bmm1_d),
+        ("scale_bmm2_d", scale_bmm2_d),
+    ):
+        if not is_e4m3 and device_scale is not None:
+            raise ValueError(f"{name} is only valid for FP8 E4M3 input.")
+        if device_scale is not None and (
+            device_scale.shape != (1,)
+            or device_scale.dtype != torch.float32
+            or device_scale.device != query.device
+            or not device_scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous FP32 CUDA tensor with shape [1] "
+                "on the query device."
+            )
+    module.run(
+        query,
+        key,
+        value,
+        out,
+        lse,
+        scale_bmm1_d,
+        scale_bmm2_d,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        causal,
+        is_e4m3,
+        is_bf16_output,
+    )
+    if return_lse:
+        return out, lse
+    return out
+
+
+@flashinfer_api(trace=fmha_v2_prefill_sm120_trace)
+def fmha_v2_prefill_sm120(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    causal: bool = True,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+    scale_bmm1_d: Optional[torch.Tensor] = None,
+    scale_bmm2_d: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
+
+    Supports FP8 E4M3 standard MHA self-attention with equal Q/K/V head counts
+    and head dimensions of 64 or 128, and BF16 output. GQA and MQA are not
+    supported by this entry point. ``scale_bmm1`` combines the Q and K
+    dequantization scales with the attention scale; ``scale_bmm2`` is the V
+    dequantization scale. Set ``causal=False`` for dense / bidirectional
+    attention. Q/K/V/O use fixed-shape ``[batch, seq_len, heads, head_dim]``
+    storage, so every batch item has the same sequence length. Use
+    :func:`trtllm_fmha_v2_prefill` for ragged inputs.
+    FP8 calls may pass ``scale_bmm1_d`` and ``scale_bmm2_d`` as persistent
+    one-element FP32 CUDA model weights. ``scale_bmm1_d`` replaces
+    ``scale_bmm1`` and must contain the full fused
+    ``q_scale * k_scale / sqrt(head_dim)`` value; ``scale_bmm2_d`` replaces
+    ``scale_bmm2`` and contains the V dequantization scale. If either is
+    omitted, the kernel uses the corresponding host-encoded scale.
+
+    This entry point is validated for SM120. SM121 support is not enabled.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        Contiguous FP8 E4M3 Q, K, and V tensors in BSHD layout.
+    out : torch.Tensor
+        Caller-owned contiguous BF16 output tensor in BSHD layout.
+    num_heads, head_dim, seq_len : int
+        Fixed attention geometry shared by every batch item.
+    scale_softmax : float
+        Softmax scale passed to the FMHA kernel.
+    scale_bmm1, scale_bmm2 : float, optional
+        Host-encoded QK and V dequantization scales.
+    causal : bool
+        Apply bottom-right causal masking when true.
+    return_lse : bool
+        Return the log-sum-exp tensor together with ``out``.
+    lse : torch.Tensor, optional
+        Caller-owned contiguous FP32 ``[B, S, H, 2]`` LSE tensor.
+    scale_bmm1_d, scale_bmm2_d : torch.Tensor, optional
+        Persistent one-element FP32 CUDA scale tensors overriding host scales.
+    """
+    if not is_sm12x_supported(query.device) or torch.cuda.get_device_capability(
+        query.device
+    ) != (12, 0):
+        raise ValueError(
+            "fmha_v2_prefill_sm120 is only supported on SM120 GPUs; "
+            "SM121 has not been validated."
+        )
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
+        raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
+    if query.dtype != torch.float8_e4m3fn:
+        raise ValueError("standard SM120 self-attention requires FP8 E4M3 input.")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype.")
+    if not all(t.device == query.device for t in (key, value, out)):
+        raise ValueError("query, key, value, and out must be on the same device.")
+    expected_prefix = (query.shape[0], seq_len, num_heads)
+    if (
+        query.shape[:3] != expected_prefix
+        or key.shape[:3] != expected_prefix
+        or value.shape[:3] != expected_prefix
+        or out.shape[:3] != expected_prefix
+    ):
+        raise ValueError("tensor shapes must match batch, seq_len, and num_heads.")
+    if (
+        head_dim not in (64, 128)
+        or query.shape[3] != head_dim
+        or key.shape[3] != head_dim
+    ):
+        raise ValueError(
+            "standard SM120 self-attention requires Q/K head_dim=64 or 128."
+        )
+    if value.shape[3] != head_dim or out.shape[3] != head_dim:
+        raise ValueError(
+            "standard SM120 self-attention requires V/O head_dim to match Q/K."
+        )
+    if out.dtype != torch.bfloat16:
+        raise ValueError("standard SM120 self-attention requires BF16 output.")
+    if not all(t.is_contiguous() for t in (query, key, value, out)):
+        raise ValueError("query, key, value, and out must be contiguous.")
+    if return_lse and lse is None:
+        raise ValueError("lse must be provided when return_lse=True.")
+    if lse is not None and (
+        lse.shape != (*expected_prefix, 2)
+        or lse.dtype != torch.float32
+        or lse.device != query.device
+        or not lse.is_contiguous()
+    ):
+        raise ValueError("lse must be a contiguous FP32 [B, S, H, 2] tensor.")
+    return _fmha_v2_prefill_sm120_run(
+        query,
+        key,
+        value,
+        out,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        causal,
+        return_lse,
+        lse,
+        scale_bmm1_d,
+        scale_bmm2_d,
+    )
+
+
 @flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
@@ -5201,6 +5792,8 @@ def fmha_v2_prefill_deepseek(
     scale_bmm2: Optional[float] = None,
     return_lse: bool = False,
     lse: Optional[torch.Tensor] = None,
+    scale_bmm1_d: Optional[torch.Tensor] = None,
+    scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5229,6 +5822,13 @@ def fmha_v2_prefill_deepseek(
         scale for bmm2
     lse : Optional[torch.Tensor]
         log-sum-exp of attention output
+    scale_bmm1_d : Optional[torch.Tensor]
+        Optional persistent one-element FP32 CUDA model weight containing the
+        FP8 QK scale. The host ``scale_bmm1`` value is used when omitted.
+    scale_bmm2_d : Optional[torch.Tensor]
+        Optional persistent one-element FP32 CUDA model weight containing the
+        FP8 V dequantization scale. The host ``scale_bmm2`` value is used when
+        this is omitted.
     Returns
     -------
     out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -5238,36 +5838,30 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    if query.shape[1] != seq_len:
+        raise ValueError("query sequence length must match seq_len.")
+    if return_lse and lse is None:
+        raise ValueError("lse must be provided when return_lse=True.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
-    module = get_trtllm_fmha_v2_sm120_module()
-    is_e4m3 = query.dtype == torch.float8_e4m3fn
-    is_bf16_output = out.dtype == torch.bfloat16
-    scale_softmax = (
-        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
-    )
-    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
-    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
-    module.run(
+    return _fmha_v2_prefill_sm120_run(
         query,
         key,
         value,
         out,
-        lse,
         num_heads,
         head_dim,
         seq_len,
         scale_softmax,
         scale_bmm1,
         scale_bmm2,
-        is_e4m3,
-        is_bf16_output,
+        causal=True,
+        return_lse=return_lse,
+        lse=lse,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
     )
-    if return_lse:
-        return out, lse
-    else:
-        return out
 
 
 @functools.cache
@@ -5275,6 +5869,55 @@ def get_trtllm_fmha_v2_module(
     input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
 ):
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
+
+
+def _check_paged_kv_non_interleaved(
+    k_cache: torch.Tensor, v_cache: torch.Tensor, block_tables: Optional[torch.Tensor]
+) -> None:
+    """Validate the separate-K/V paged input form.
+
+    The kernel addresses every block relative to ``k_cache``'s base pointer
+    with strides derived from shapes (never from tensor strides), so the
+    caller must supply contiguous same-shape caches whose V storage sits at a
+    positive block-aligned offset from K (one allocation), plus pre-expanded
+    ``[B, 2, M]`` block offsets whose V rows account for that offset (e.g.
+    ``page_idx + delta_blocks``).
+    """
+    if block_tables is None or block_tables.dim() != 3 or block_tables.shape[1] != 2:
+        raise ValueError(
+            "Non-interleaved paged KV (separate k_cache/v_cache tensors) requires "
+            "pre-expanded block_tables of shape [B, 2, M] with independent K and V "
+            f"block offsets; got {None if block_tables is None else tuple(block_tables.shape)}."
+        )
+    if (
+        k_cache.dim() != 4
+        or k_cache.shape != v_cache.shape
+        or k_cache.dtype != v_cache.dtype
+    ):
+        raise ValueError(
+            "Non-interleaved paged KV expects 4D k_cache/v_cache with identical shape "
+            f"and dtype; got {tuple(k_cache.shape)}/{k_cache.dtype} vs "
+            f"{tuple(v_cache.shape)}/{v_cache.dtype}."
+        )
+    if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+        raise ValueError(
+            "Non-interleaved paged KV requires contiguous k_cache/v_cache: the kernel "
+            "derives strides from shapes, not tensor strides."
+        )
+    block_bytes = k_cache[0].numel() * k_cache.element_size()
+    delta_bytes = v_cache.data_ptr() - k_cache.data_ptr()
+    if delta_bytes <= 0 or delta_bytes % block_bytes != 0:
+        raise ValueError(
+            "Non-interleaved paged KV requires V stored at a positive block-aligned "
+            f"offset from K in one allocation (v_ptr - k_ptr = {delta_bytes} "
+            f"bytes, block = {block_bytes} bytes). Pass a stacked [pages, 2, ...]"
+            "tensor instead of independently allocated K and V."
+        )
+
+
+def _check_paged_block_tables(block_tables: Optional[torch.Tensor]) -> None:
+    if block_tables is not None and block_tables.dtype != torch.int32:
+        raise ValueError(f"block_tables must be int32, got {block_tables.dtype}.")
 
 
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
@@ -5326,6 +5969,13 @@ def trtllm_fmha_v2_prefill(
           (``paged_KV[:, 0, ...]`` is key cache, ``paged_KV[:, 1, ...]`` is value cache).
         - ``Q_PAGED_KV_NHD``: same as ``Q_PAGED_KV_HND`` but paged_KV shape is
           ``[num_pages, 2, page_size, num_kv_heads, head_dim]``.
+
+          For both paged layouts, ``paged_KV`` may instead be a tuple
+          ``(k_cache, v_cache)`` of separate 4D tensors (non-interleaved). This
+          requires pre-expanded ``block_tables`` of shape ``[B, 2, M]`` holding
+          independent K and V block offsets relative to ``k_cache``'s base
+          pointer (K and V must live in one allocation at block-aligned
+          positions).
         - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
@@ -5348,8 +5998,16 @@ def trtllm_fmha_v2_prefill(
     cum_seq_lens_kv
         The cumulative sequence lengths for KV cache, shape: ``[batch_size + 1]``.
     block_tables
-        The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
-        Required when using paged KV cache format.
+        The page table mapping each sequence to its KV cache pages. Required
+        for the paged KV layouts. Its expected shape depends on the form of
+        the paged KV data tensor passed in ``qkv``
+        - Stacked pool (single 5D ``paged_KV`` tensor): shape
+          ``[batch_size, max_num_pages_per_seq]`` of logical page indices,
+          each shared by K and V of that page.
+        - Separate ``(k_cache, v_cache)`` tensors: pre-expanded shape
+          ``[batch_size, 2, max_num_pages_per_seq]``, where ``[:, 0, :]``
+          holds K block offsets and ``[:, 1, :]`` holds V block offsets,
+          both relative to ``k_cache``'s base pointer in units of blocks.
     out
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
@@ -5406,26 +6064,40 @@ def trtllm_fmha_v2_prefill(
             )
         k_cache = kv_cache
         v_cache = kv_cache  # placeholder (not used for this layout)
-    elif input_layout == "Q_PAGED_KV_NHD":
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
-    elif input_layout == "Q_PAGED_KV_HND":
-        assert isinstance(qkv, tuple)
-        query, paged_kv = qkv[0], qkv[1]
-        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
-            raise ValueError(
-                f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
-            )
-        k_cache, v_cache = paged_kv.unbind(dim=1)
+        _check_paged_block_tables(block_tables)
         if block_tables is None:
+            # The kernel dereferences the block-offsets pointer unconditionally
+            # for paged layouts; there is no contiguous fallback.
             raise ValueError(
-                "block_tables is required for Q_PAGED_KV_HND input layout."
+                f"block_tables is required for the {input_layout} input layout."
             )
+        if block_tables.shape[0] != batch_size:
+            raise ValueError(
+                f"block_tables batch dimension ({block_tables.shape[0]}) does "
+                f"not match batch_size ({batch_size})."
+            )
+        if isinstance(paged_kv, tuple):
+            # Requires pre-expanded [B, 2, M] block_tables so the kernel can
+            # address V's blocks relative to K's base pointer.
+            k_cache, v_cache = paged_kv
+            _check_paged_kv_non_interleaved(k_cache, v_cache, block_tables)
+        else:
+            if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
+                raise ValueError(
+                    f"{input_layout} expects paged_KV shape [pages, 2, ...] "
+                    "(page_size/num_kv_heads per layout order), got "
+                    f"{tuple(paged_kv.shape)}"
+                )
+            if block_tables is not None and block_tables.dim() != 2:
+                raise ValueError(
+                    "Stacked paged_KV uses shared [B, M] block_tables; got "
+                    f"{tuple(block_tables.shape)}. Pre-expanded [B, 2, M] "
+                    "offsets are only valid with separate (k_cache, v_cache)."
+                )
+            k_cache, v_cache = paged_kv.unbind(dim=1)
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]

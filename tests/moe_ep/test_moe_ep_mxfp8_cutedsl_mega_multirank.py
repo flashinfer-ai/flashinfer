@@ -1,11 +1,11 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (mxfp8_cutedsl).
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -20,7 +20,7 @@ Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
 self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
 ownership, cross-rank combine), because both sides run the same CUDA kernel.
 ``test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle`` closes that gap with
-the sm90_pull_fp8 twin's methodology: every rank all-gathers the actual staged
+the sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: every rank all-gathers the actual staged
 MXFP8 payloads, routing, and plain weight legs, runs the multi-rank-native
 ``compute_megamoe_reference_mxfp8`` on the global problem, and checks its own
 rank's slice against the real-EP kernel output.
@@ -33,9 +33,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -161,15 +161,15 @@ def _reference_mxfp8_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -231,12 +231,12 @@ def _reference_mxfp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -314,9 +314,9 @@ def _megakernel_config(
     *,
     in_kernel_fc2_reduce: bool = False,
 ):
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
-    return Mxfp8CutedslMegaMoeConfig(
+    return Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         kind=problem["kind"],
@@ -352,7 +352,7 @@ def _run_mega_layer(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -378,7 +378,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mxfp8_mega_moe,
             )
 
@@ -481,25 +481,29 @@ def _run_mega_layer(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
-    """MoEEpMegaLayer (mxfp8_cutedsl) with on-the-fly bf16→MXFP8 staging."""
+    """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with on-the-fly bf16→MXFP8 staging."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (staged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer (mxfp8_cutedsl) with pre-staged MXFP8 activations."""
+    """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with pre-staged MXFP8 activations."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (prestaged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -523,7 +527,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
         rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
     )
     print(
-        f"rank {rank}: mxfp8_cutedsl mega layer (in_kernel_fc2_reduce) "
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
     )
 
@@ -561,7 +565,9 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
             "load_balance_mode": "atomic_counter",
         },
     )
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (large tokens) matches reference"
+    )
 
 
 def _all_gather_stack(t):
@@ -589,7 +595,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     Parity alone cannot catch a kernel that is wrong but self-consistent at
     ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
     cross-rank combine), because both sides run the same CUDA kernel; this
-    closes that gap (sm90_pull_fp8 twin methodology).
+    closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
     cross-rank NVSHMEM traffic, then all-gathers the ACTUAL staged MXFP8
@@ -614,20 +620,23 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
 
-    from .test_mxfp8_cutedsl_preprocess_vs_reference import _plain_mxfp8_from_bf16
+    from .test_mxfp8_cutedsl_preprocess_vs_reference import (
+        _assert_mega_oracle_term_band_close,
+        _plain_mxfp8_from_bf16,
+    )
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
@@ -663,98 +672,91 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             gate_up_clamp=problem["gate_up_clamp"],
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-            kind=problem["kind"],
-        )
-        # Snapshot exactly what the kernel consumes (this rank's shard).
-        x_local = symm_buffer.x[:n].clone()
-        x_sf_local = symm_buffer.x_sf[:n].clone()
-        idx_local = symm_buffer.topk_idx[:n].clone()
-        w_local = symm_buffer.topk_weights[:n].clone()
-
-        transformed_l1, transformed_l2 = preprocess_mega_weights(
-            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
-            intermediate_size=problem["intermediate"],
-            hidden_size=problem["hidden"],
-            kind=problem["kind"],
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
-
-        y_kernel = torch.empty(
-            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        mxfp8_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=n,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fast_math=problem["fast_math"],
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        symm_buffer.destroy()
-
-        # Reassemble the global problem from the operands each rank staged;
-        # the reference consumes (num_ranks, ...) stacks directly.
-        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
-        combine_ref = compute_megamoe_reference_mxfp8(
-            input_activation=_all_gather_stack(x_local),
-            input_activation_sf=_all_gather_stack(x_sf_local),
-            input_topk_idx=_all_gather_stack(idx_local),
-            input_topk_weights=_all_gather_stack(w_local),
-            fc1_weight=_all_gather_stack(fc1_plain),
-            fc1_weight_sf=_all_gather_stack(fc1_sf),
-            fc2_weight=_all_gather_stack(fc2_plain),
-            fc2_weight_sf=_all_gather_stack(fc2_sf),
-            ab_dtype=torch.float8_e4m3fn,
-            gate_up_clamp=problem["gate_up_clamp"],
-            apply_topk_in_fc1=True,
-        )
-        # The topk weight is already folded before the fc1-out round-trip, so
-        # the per-topk terms reduce with a plain sum; compare this rank's slice.
-        y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
-
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
-        print(
-            f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
-            f"rel_l2={rel_l2.item():.4g} "
-            f"max|d|={(yk - y_ref).abs().max().item():.4g} "
-            f"amax(ref)={y_ref.abs().max().item():.4g}"
-        )
-        # Single-GPU oracle tolerances: random unscaled bf16 weights yield
-        # |y|~1e2–1e3; kernel vs torch ref can differ by ~1 bf16 ULP (|d|≈8)
-        # on a handful of cells.
-        if in_kernel_fc2_reduce:
-            # The REDG reduce accumulates the K per-topk bf16 terms in
-            # nondeterministic order vs the reference's fp32 sum; widen the
-            # band by the bf16 K-term accumulation band per row (same bound
-            # as _assert_ikr_close).
-            diff = (yk - y_ref).abs()
-            row_scale = torch.maximum(yk.abs(), y_ref.abs()).amax(dim=1, keepdim=True)
-            tol = (
-                8.0 + 0.05 * y_ref.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x,
+                symm_buffer.x_sf,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+                kind=problem["kind"],
             )
-            worst = (diff - tol).max().item()
-            assert worst <= 0.0, (
-                f"ikr oracle output outside the widened band "
-                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
+            idx_local = symm_buffer.topk_idx[:n].clone()
+            w_local = symm_buffer.topk_weights[:n].clone()
+
+            transformed_l1, transformed_l2 = preprocess_mega_weights(
+                MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+                intermediate_size=problem["intermediate"],
+                hidden_size=problem["hidden"],
+                kind=problem["kind"],
+                gate_up_clamp=problem["gate_up_clamp"],
             )
-            assert rel_l2.item() < 0.03
-        else:
-            torch.testing.assert_close(yk, y_ref, atol=8.0, rtol=0.05)
-            assert rel_l2.item() < 0.02
-        return rank
+
+            y_kernel = torch.empty(
+                n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            mxfp8_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # Reassemble the global problem from the operands each rank staged;
+            # the reference consumes (num_ranks, ...) stacks directly.
+            fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
+            combine_ref = compute_megamoe_reference_mxfp8(
+                input_activation=_all_gather_stack(x_local),
+                input_activation_sf=_all_gather_stack(x_sf_local),
+                input_topk_idx=_all_gather_stack(idx_local),
+                input_topk_weights=_all_gather_stack(w_local),
+                fc1_weight=_all_gather_stack(fc1_plain),
+                fc1_weight_sf=_all_gather_stack(fc1_sf),
+                fc2_weight=_all_gather_stack(fc2_plain),
+                fc2_weight_sf=_all_gather_stack(fc2_sf),
+                ab_dtype=torch.float8_e4m3fn,
+                gate_up_clamp=problem["gate_up_clamp"],
+                apply_topk_in_fc1=True,
+            )
+            # The topk weight is already folded before the fc1-out round-trip, so
+            # the per-topk terms reduce with a plain sum; compare this rank's slice.
+            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+            print(
+                f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
+                f"rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                f"amax(ref)={y_ref.abs().max().item():.4g}"
+            )
+            # Per-cell bf16 term-magnitude band (see
+            # _assert_mega_oracle_term_band_close): the old flat atol=8.0 was
+            # "1 bf16 ULP at |term|~2048" calibrated on GB200's rounding and
+            # tripped by one cell on B200; the band derives the bound from the
+            # oracle's own per-topk terms instead. The ikr coefficient absorbs
+            # the REDG nondeterministic reduce order (same bound as
+            # _assert_ikr_close).
+            _assert_mega_oracle_term_band_close(
+                yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
+            )
+            assert rel_l2.item() < (0.03 if in_kernel_fc2_reduce else 0.02)
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 
@@ -772,7 +774,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
         rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
     )
     print(
-        f"rank {rank}: mxfp8_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}) "
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}) "
         "matches the multi-rank torch oracle"
     )
 
@@ -784,7 +786,7 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -819,10 +821,10 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Mxfp8CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
-    assert kernel.kernel_name() == "mxfp8_cutedsl"
+    assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"

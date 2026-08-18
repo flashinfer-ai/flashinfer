@@ -17,10 +17,12 @@ Results:
 bmm_mxfp8_N128_K128.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
+fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
@@ -122,6 +124,7 @@ from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
+    fmha_v2_prefill_sm120,
 )
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -711,6 +714,31 @@ flashinfer.kda_decode.recurrent_kda(
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
 )
+
+# ── serving-native packed Kimi K3 KDA decode ────────────────────────────────
+# The trace is emitted before the exact-SM kernel is loaded, so suppressing an
+# unsupported-device/JIT error still leaves a useful definition JSON.
+with contextlib.suppress(Exception):
+    pk_B, pk_H, pk_D = 4, 12, 128
+    pk_hidden = pk_H * pk_D
+    pk_mixed_qkv = torch.randn(pk_B, 3 * pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_gate = torch.randn(pk_B, pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_beta = torch.randn(pk_B, pk_H, dtype=torch.bfloat16, device=device)
+    pk_A_log = torch.randn(pk_H, dtype=torch.float32, device=device)
+    pk_dt_bias = torch.randn(pk_hidden, dtype=torch.float32, device=device)
+    pk_state = torch.zeros(pk_B, pk_H, pk_D, pk_D, dtype=torch.bfloat16, device=device)
+    pk_indices = torch.arange(pk_B, dtype=torch.int32, device=device)
+    pk_output = torch.empty(pk_B, 1, pk_H, pk_D, dtype=torch.bfloat16, device=device)
+    flashinfer.packed_kda_decode(
+        pk_mixed_qkv,
+        pk_raw_gate,
+        pk_raw_beta,
+        pk_A_log,
+        pk_dt_bias,
+        pk_state,
+        pk_indices,
+        output=pk_output,
+    )
 
 # ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
 fk_N, fk_H, fk_D = 4, 12, 128
@@ -1859,6 +1887,44 @@ with contextlib.suppress(Exception):
         is_neox=False,
         page_size=_rqfap_PS,
         kv_layout="NHD",
+    )
+
+# ── SM120 FP8 self-attention with separate Q/K/V ─────────────────────────────
+if torch.cuda.get_device_capability() == (12, 0):
+    _fmha_B, _fmha_S, _fmha_H, _fmha_D = 1, 128, 4, 128
+    _fmha_shape = (_fmha_B, _fmha_S, _fmha_H, _fmha_D)
+    _fmha_q = torch.randn(_fmha_shape, dtype=torch.bfloat16, device=device)
+    _fmha_k = torch.randn_like(_fmha_q)
+    _fmha_v = torch.randn_like(_fmha_q)
+    _fmha_q_scale = max(_fmha_q.abs().max().float().item() / 448.0, 1.0e-12)
+    _fmha_k_scale = max(_fmha_k.abs().max().float().item() / 448.0, 1.0e-12)
+    _fmha_v_scale = max(_fmha_v.abs().max().float().item() / 448.0, 1.0e-12)
+    _fmha_q = (_fmha_q / _fmha_q_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    _fmha_k = (_fmha_k / _fmha_k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    _fmha_v = (_fmha_v / _fmha_v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    _fmha_out = torch.empty(_fmha_shape, dtype=torch.bfloat16, device=device)
+    _fmha_scale_bmm2_d = torch.tensor(
+        [_fmha_v_scale], dtype=torch.float32, device=device
+    )
+    _fmha_scale_bmm1_d = torch.tensor(
+        [_fmha_q_scale * _fmha_k_scale / (_fmha_D**0.5)],
+        dtype=torch.float32,
+        device=device,
+    )
+    fmha_v2_prefill_sm120(
+        _fmha_q,
+        _fmha_k,
+        _fmha_v,
+        _fmha_out,
+        _fmha_H,
+        _fmha_D,
+        _fmha_S,
+        scale_softmax=1.0,
+        scale_bmm1=_fmha_q_scale * _fmha_k_scale / (_fmha_D**0.5),
+        scale_bmm2=_fmha_v_scale,
+        scale_bmm1_d=_fmha_scale_bmm1_d,
+        scale_bmm2_d=_fmha_scale_bmm2_d,
+        causal=True,
     )
 
 # ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────
