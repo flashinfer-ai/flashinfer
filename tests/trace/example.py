@@ -432,14 +432,24 @@ except Exception:
 try:
     batch_size, M, K, N = 2, 128, 128, 128
     scale_cols = (K // 32 + 3) // 4 * 4
-    a_scale_size = batch_size * ((M + 127) // 128 * 128) * scale_cols
-    b_scale_size = batch_size * ((N + 127) // 128 * 128) * scale_cols
+    a_scale_rows = (M + 127) // 128 * 128
+    b_scale_rows = (N + 127) // 128 * 128
     a_mxfp8 = torch.zeros(batch_size, M, K, dtype=torch.float8_e4m3fn, device=device)
     weight_mxfp8 = torch.zeros(
         batch_size, N, K, dtype=torch.float8_e4m3fn, device=device
     )
-    a_ds = torch.full((a_scale_size,), 127, dtype=torch.uint8, device=device)
-    b_ds = torch.full((b_scale_size,), 127, dtype=torch.uint8, device=device)
+    a_ds = torch.full(
+        (batch_size, a_scale_rows, scale_cols),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    b_ds = torch.full(
+        (batch_size, b_scale_rows, scale_cols),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
     flashinfer.gemm.bmm_mxfp8(
         a_mxfp8,
         weight_mxfp8.transpose(-2, -1),

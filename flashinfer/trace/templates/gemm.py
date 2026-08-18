@@ -819,16 +819,27 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
     return torch.matmul(A_f, B_f).to(dtype)
 
 
+def _decode_bmm_mxfp8_scale(
+    scale: torch.Tensor, batch: int, rows: int, cols: int
+) -> torch.Tensor:
+    """Decode a flat combined-batch or rank-preserving MXFP8 scale buffer."""
+    if scale.ndim == 1:
+        return _unswizzle_batched_sf_128x4(scale, 1, batch * rows, cols).reshape(
+            batch, rows, cols
+        )
+    return _unswizzle_batched_sf_128x4(scale, batch, rows, cols)
+
+
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
-    """Reference MXFP8 BMM (block size 32, 1D 128x4-swizzled E8M0 scales)."""
+    """Reference MXFP8 BMM for flat or rank-preserving swizzled scales."""
     block = 32
     batch, m, k = A.shape
     n = B.shape[-1]
     a_scale = _e8m0_to_float(
-        _unswizzle_batched_sf_128x4(A_scale, batch, m, k // block)
+        _decode_bmm_mxfp8_scale(A_scale, batch, m, k // block)
     ).repeat_interleave(block, dim=-1)
     b_scale = _e8m0_to_float(
-        _unswizzle_batched_sf_128x4(B_scale, batch, n, k // block)
+        _decode_bmm_mxfp8_scale(B_scale, batch, n, k // block)
     ).repeat_interleave(block, dim=-1)
     A_deq = A.to(torch.float32) * a_scale
     B_deq = B.to(torch.float32).transpose(-2, -1) * b_scale  # [batch, n, k]
@@ -838,6 +849,7 @@ def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
 cast(Any, _bmm_mxfp8_reference)._trace_reference_dependencies = (
     _e8m0_to_float,
     _unswizzle_batched_sf_128x4,
+    _decode_bmm_mxfp8_scale,
 )
 
 
@@ -946,7 +958,7 @@ bmm_fp8_trace = TraceTemplate(
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
 
 
-def _bmm_mxfp8_init(
+def _bmm_mxfp8_flat_init(
     *,
     batch_size: int,
     M: int = 64,
@@ -957,6 +969,36 @@ def _bmm_mxfp8_init(
     device: str = "cuda",
     seed: int = 0,
 ):
+    """Build combined-batch swizzled inputs for cuDNN ``bmm_mxfp8``."""
+    del A_scale_size, B_scale_size
+    from flashinfer import mxfp8_quantize  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(batch_size, N, K, dtype=torch.bfloat16, device=device)
+    A, A_scale = mxfp8_quantize(a_bf16, is_sf_swizzled_layout=True)
+    B, B_scale = mxfp8_quantize(b_bf16, is_sf_swizzled_layout=True)
+    return {
+        "A": A,
+        "B": B.transpose(-2, -1),
+        "A_scale": A_scale,
+        "B_scale": B_scale,
+        "dtype": torch.bfloat16,
+    }
+
+
+def _bmm_mxfp8_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    A_scale_rows: int = 0,  # derived
+    B_scale_rows: int = 0,  # derived
+    scale_cols: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
     """Build inputs for ``bmm_mxfp8`` (block size 32).
 
     Sourced from ``tests/gemm/test_bmm_mxfp8.py``: ``input`` and
@@ -964,7 +1006,7 @@ def _bmm_mxfp8_init(
     ``flashinfer.mxfp8_quantize`` to produce float8_e4m3fn data and
     uint8 block scales.
     """
-    del A_scale_size, B_scale_size
+    del A_scale_rows, B_scale_rows, scale_cols
     from flashinfer import mxfp8_quantize  # noqa: PLC0415
 
     torch.manual_seed(seed)
@@ -979,9 +1021,17 @@ def _bmm_mxfp8_init(
         for batch_tensor in b_bf16.unbind()
     )
     A = torch.stack(tuple(value for value, _ in a_quantized))
-    A_scale = torch.cat(tuple(scale for _, scale in a_quantized))
+    A_scale = torch.stack(tuple(scale for _, scale in a_quantized)).reshape(
+        batch_size,
+        (M + 127) // 128 * 128,
+        ((K + 31) // 32 + 3) // 4 * 4,
+    )
     B = torch.stack(tuple(value for value, _ in b_quantized))
-    B_scale = torch.cat(tuple(scale for _, scale in b_quantized))
+    B_scale = torch.stack(tuple(scale for _, scale in b_quantized)).reshape(
+        batch_size,
+        (N + 127) // 128 * 128,
+        ((K + 31) // 32 + 3) // 4 * 4,
+    )
     return {
         "A": A,
         "B": B.transpose(-2, -1),
@@ -989,6 +1039,48 @@ def _bmm_mxfp8_init(
         "B_scale": B_scale,
         "dtype": torch.bfloat16,
     }
+
+
+bmm_mxfp8_flat_trace = TraceTemplate(
+    op_type="bmm_mxfp8",
+    name_prefix="bmm_mxfp8_flat",
+    description=(
+        "MXFP8 batched matmul with combined-batch flat swizzled scales. "
+        "This layout is used by the cuDNN backend."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "A_scale_size": Var(
+            description="Combined-batch padded 128x4 scale-buffer length for A."
+        ),
+        "B_scale_size": Var(
+            description="Combined-batch padded 128x4 scale-buffer length for B."
+        ),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+        "A_scale": Tensor(
+            ["A_scale_size"],
+            description="Combined-batch 1D 128x4-swizzled E8M0 scale for A.",
+        ),
+        "B_scale": Tensor(
+            ["B_scale_size"],
+            description="Combined-batch 1D 128x4-swizzled E8M0 scale for B.",
+        ),
+        "dtype": Scalar("int32", description="Output dtype enum."),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:mxfp8", "layout:combined-batch"],
+    reference=_bmm_mxfp8_reference,
+    check=_bmm_mxfp8_check,
+    init=_bmm_mxfp8_flat_init,
+)
 
 
 bmm_mxfp8_trace = TraceTemplate(
@@ -1002,23 +1094,24 @@ bmm_mxfp8_trace = TraceTemplate(
         "M": Var(),
         "N": Const(),
         "K": Const(),
-        "A_scale_size": Var(
-            description="Batched padded 128x4 scale-buffer length for A."
+        "A_scale_rows": Var(
+            description="Per-batch padded 128x4 scale-buffer rows for A."
         ),
-        "B_scale_size": Var(
-            description="Batched padded 128x4 scale-buffer length for B."
+        "B_scale_rows": Var(
+            description="Per-batch padded 128x4 scale-buffer rows for B."
         ),
+        "scale_cols": Var(description="Padded scale columns for the 128x4 layout."),
     },
     inputs={
         "A": Tensor(["batch_size", "M", "K"]),
         "B": Tensor(["batch_size", "K", "N"]),
         "A_scale": Tensor(
-            ["A_scale_size"],
-            description="Batched 1D 128x4-swizzled E8M0 scale buffers for A.",
+            ["batch_size", "A_scale_rows", "scale_cols"],
+            description="Rank-preserving per-batch 128x4-swizzled scales for A.",
         ),
         "B_scale": Tensor(
-            ["B_scale_size"],
-            description=("Batched 1D 128x4-swizzled E8M0 scale buffers for B."),
+            ["batch_size", "B_scale_rows", "scale_cols"],
+            description="Rank-preserving per-batch 128x4-swizzled scales for B.",
         ),
         "dtype": Scalar("int32", description="Output dtype enum."),
     },
@@ -1030,6 +1123,34 @@ bmm_mxfp8_trace = TraceTemplate(
     check=_bmm_mxfp8_check,
     init=_bmm_mxfp8_init,
 )
+
+
+def bmm_mxfp8_trace_dispatch(**kwargs):
+    """Select the MXFP8 BMM trace contract from the scale tensor ranks."""
+    a_scale = kwargs.get("A_scale")
+    b_scale = kwargs.get("B_scale")
+    if a_scale is None and b_scale is None:
+        device = torch.device(kwargs.get("device", "cuda"))
+        if device.type == "cuda" and torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(device)
+            if major in (10, 11):
+                return bmm_mxfp8_flat_trace
+        return bmm_mxfp8_trace
+    if a_scale is None or b_scale is None or a_scale.ndim != b_scale.ndim:
+        raise ValueError(
+            "bmm_mxfp8 tracing requires A_scale and B_scale ranks to match"
+        )
+    if a_scale.ndim == 1:
+        return bmm_mxfp8_flat_trace
+    if a_scale.ndim == 3:
+        return bmm_mxfp8_trace
+    raise ValueError("bmm_mxfp8 tracing requires 1D or 3D scale tensors")
+
+
+bmm_mxfp8_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    bmm_mxfp8_flat_trace,
+    bmm_mxfp8_trace,
+]
 
 
 # ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
