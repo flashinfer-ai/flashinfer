@@ -30,6 +30,8 @@
 
 namespace flashinfer::cake_dsv4 {
 
+namespace {
+
 static_assert(sizeof(CUtensorMap) == 128);
 static_assert(sizeof(cake_dsv4_generated_CakeTensorMap) == sizeof(CUtensorMap));
 
@@ -92,6 +94,9 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     }
   }
 }
+
+}  // namespace
+
 
 void Run_split_reduce(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O, int64_t arg_num_q_heads, int64_t arg_num_split, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError)

@@ -30,6 +30,8 @@
 
 namespace flashinfer::cake_dsv4 {
 
+namespace {
+
 
 
 
@@ -90,6 +92,9 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     }
   }
 }
+
+}  // namespace
+
 
 void Run_bf16_h128_topk128x_reduce(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O, int64_t arg_num_heads, int64_t arg_num_splits, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError)

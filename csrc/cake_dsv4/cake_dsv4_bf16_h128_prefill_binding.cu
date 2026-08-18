@@ -30,6 +30,8 @@
 
 namespace flashinfer::cake_dsv4 {
 
+namespace {
+
 static_assert(sizeof(CUtensorMap) == 128);
 static_assert(sizeof(cake_dsv4_generated_CakeTensorMap) == sizeof(CUtensorMap));
 
@@ -269,6 +271,9 @@ inline CUtensorMap EncodeTma_tmap_compressed_v(const TensorView& t) {
       << "cuTensorMapEncodeTiled (2D, 'tmap_compressed_v') failed: CUresult=" << (int)r;
   return tm;
 }
+
+}  // namespace
+
 
 void Run_bf16_h128_prefill(TensorView arg_tmap_q, TensorView arg_tmap_swa_k, TensorView arg_tmap_compressed_k, TensorView arg_tmap_swa_v, TensorView arg_tmap_compressed_v, TensorView arg_O, TensorView arg_sparse_indices, TensorView arg_sparse_topk_lens, TensorView arg_sinks, TensorView arg_bmm1_scale, TensorView arg_bmm2_scale, int64_t arg_num_heads, int64_t arg_num_query_tokens, int64_t arg_sparse_topk, int64_t arg_has_sinks, int64_t arg_total_work_items, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError)

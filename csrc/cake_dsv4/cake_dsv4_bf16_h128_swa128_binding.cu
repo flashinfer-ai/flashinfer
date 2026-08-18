@@ -30,6 +30,8 @@
 
 namespace flashinfer::cake_dsv4 {
 
+namespace {
+
 
 
 
@@ -244,6 +246,9 @@ inline CUtensorMap EncodeTma_tmap_swa_kv(const TensorView& t) {
       << "cuTensorMapEncodeTiled (2D, 'tmap_swa_kv') failed: CUresult=" << (int)r;
   return tm;
 }
+
+}  // namespace
+
 
 void Run_bf16_h128_swa128(TensorView arg_tmap_q, TensorView arg_tmap_swa_kv, TensorView arg_O, TensorView arg_sparse_indices, TensorView arg_sparse_topk_lens, TensorView arg_sinks, TensorView arg_bmm1_scale, TensorView arg_bmm2_scale, int64_t arg_num_heads, int64_t arg_num_head_tiles, int64_t arg_has_sinks, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError)
