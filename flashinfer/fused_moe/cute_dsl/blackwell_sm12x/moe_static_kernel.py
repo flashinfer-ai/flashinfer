@@ -528,13 +528,11 @@ class MoEStaticKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        # Both the MXFP4 and NVFP4 block-scaled MMA atoms are m16n8k64
-        # instructions, so the fused FC1 pass iterates the accumulator
-        # tiling in 64-row m-tiles for either format. #4290's unified
-        # M//(16*atom) formula under-sliced the NVFP4 accumulator and,
-        # once the gate/up GEMMs share the fused tiling, the MXFP4 one
-        # too — harmless in the two-pass layout but corrupting the fused
-        # gate+up pass.
+        # Both the MXFP4 and NVFP4 block-scaled MMA atoms are m16n8k64;
+        # with the gate/up GEMMs emitted as sequential phases, either
+        # m-tile granularity is correct in the fused layout. M//64 is
+        # kept to restore NVFP4's pre-#4290 behavior and keep both
+        # formats aligned.
         m_tile_rows = 16 * 4
         self.num_m_tiles = self.tile_shape_mnk[0] // m_tile_rows
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
