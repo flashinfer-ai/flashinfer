@@ -417,7 +417,11 @@ def main() -> None:
                             if quant_kind == "nvfp4"
                             else None
                         )
-                        delta = f"{(avg - ref) / ref * 100.0:+.2f}%" if ref else "n/a"
+                        delta = (
+                            f"{(avg - ref) / ref * 100.0:+.2f}% ({avg / ref:.2f}x)"
+                            if ref
+                            else "n/a"
+                        )
                         knobs = result["knobs"]
                         tflops_col = f"{tflops:.1f}" if tflops is not None else "-"
                         ref_col = f"{ref:.2f}" if ref is not None else "-"
