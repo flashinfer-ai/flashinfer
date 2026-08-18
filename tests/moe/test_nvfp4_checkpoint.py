@@ -269,7 +269,8 @@ def test_nvfp4_checkpoint_crops_k_tail_and_padding():
     decoded = canonical_dequantize_nvfp4(checkpoint)
     assert decoded.shape == (1, 2, 17)
     assert decoded[0, 0, 16].item() == 0.5
-    assert decoded[0, 0, -1].item() != 1.0
+    assert decoded[0, 0, 15].item() == 6.0
+    assert decoded[0, 1, 16].item() == 6.0
 
 
 def test_nvfp4_checkpoint_supports_empty_expert_axis():

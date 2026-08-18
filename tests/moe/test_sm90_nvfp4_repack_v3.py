@@ -1,5 +1,6 @@
 """CPU contract tests for the versioned SM90 NVFP4 K-major layout."""
 
+import copy
 import json
 import math
 from dataclasses import replace
@@ -20,6 +21,7 @@ from flashinfer.fused_moe.sm90_nvfp4_repack import (
     NVFP4_SM90_STAGE_LAYOUT_VERSION,
     NVFP4SM90WeightViewV4,
     NVFP4V3Manifest,
+    NVFP4V4Manifest,
     build_nvfp4_rs_weight_view,
     build_w4a8_v4_views,
     convert_nvfp4_rs_v2_to_v3,
@@ -236,6 +238,43 @@ def test_v4_stage_layout_is_a_byte_exact_reorder(group_size, residual_scheme):
     assert torch.equal(restored.promotion_group_scale, v3.promotion_group_scale)
     assert torch.equal(restored.global_alpha, v3.global_alpha)
     assert restored.manifest.to_dict() == v3.manifest.to_dict()
+
+
+def test_v4_manifest_copy_and_missing_field_lookup_are_bounded():
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(physical_k=128, logical_k=113),
+        group_size=128,
+        residual_scheme="generic",
+    )
+    manifest = build_w4a8_v4_views(v3).manifest
+
+    assert copy.copy(manifest) == manifest
+    assert copy.deepcopy(manifest) == manifest
+    with pytest.raises(AttributeError):
+        _ = manifest.__setstate__
+    incomplete = object.__new__(NVFP4V4Manifest)
+    with pytest.raises(AttributeError):
+        _ = incomplete.logical_shape
+
+
+@pytest.mark.parametrize("scalar_alpha", [False, True])
+def test_v4_rejects_global_alpha_dtype_and_scope_shape(scalar_alpha):
+    v3 = repack_nvfp4_sm90_v3(
+        _checkpoint(physical_k=128, logical_k=113, scalar_alpha=scalar_alpha),
+        group_size=128,
+        residual_scheme="generic",
+    )
+    v4 = build_w4a8_v4_views(v3)
+
+    with pytest.raises(ValueError, match="v4 global_alpha must be float32"):
+        replace(v4, global_alpha=v4.global_alpha.to(torch.float64))
+    wrong_shape = (
+        torch.ones(v4.manifest.padded_shape[0], dtype=torch.float32)
+        if scalar_alpha
+        else torch.ones((), dtype=torch.float32)
+    )
+    with pytest.raises(ValueError, match="v4 global_alpha must be float32"):
+        replace(v4, global_alpha=wrong_shape)
 
 
 def test_w4a8_production_repack_defaults_to_v4_and_gates_v3_oracle():

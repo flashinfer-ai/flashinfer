@@ -663,7 +663,7 @@ def validate_nvfp4_sm90_v3_layout(view: NVFP4SM90WeightViewV3) -> None:
         NVFP4_SM90_TILE_N,
         NVFP4_SM90_TILE_K // 2,
     )
-    expected_scales = expected_payload[:-1] + (NVFP4_SM90_TILE_K // 16,)
+    expected_scales = (*expected_payload[:-1], NVFP4_SM90_TILE_K // 16)
     expected_group_scales = (
         experts,
         padded_k // view.manifest.group_size,
@@ -772,7 +772,10 @@ class NVFP4V4Manifest:
             raise TypeError("checksums must be NVFP4V3Checksums")
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.source_manifest, name)
+        if name.startswith("__") or name == "source_manifest":
+            raise AttributeError(name)
+        source_manifest = object.__getattribute__(self, "source_manifest")
+        return getattr(source_manifest, name)
 
     def metadata_dict(self) -> dict[str, Any]:
         metadata = self.source_manifest.metadata_dict()
@@ -854,12 +857,23 @@ class NVFP4SM90WeightViewV4:
         expected_shapes = {
             "payload": (
                 self.packed_e2m1,
-                (experts, padded_k // 128, padded_n, NVFP4_SM90_STAGE_PACKED_BYTES),
+                (
+                    experts,
+                    padded_k // NVFP4_SM90_K_ALIGNMENT,
+                    padded_n,
+                    NVFP4_SM90_STAGE_PACKED_BYTES,
+                ),
                 torch.uint8,
             ),
             "scale": (
                 self.scale_e4m3_per16,
-                (experts, padded_k // 32, padded_n // 64, 64, 2),
+                (
+                    experts,
+                    padded_k // NVFP4_SM90_TILE_K,
+                    padded_n // NVFP4_SM90_TILE_N,
+                    NVFP4_SM90_TILE_N,
+                    NVFP4_SM90_TILE_K // 16,
+                ),
                 torch.float8_e4m3fn,
             ),
             "group scale": (
@@ -867,8 +881,8 @@ class NVFP4SM90WeightViewV4:
                 (
                     experts,
                     padded_k // self.manifest.group_size,
-                    padded_n // 64,
-                    64,
+                    padded_n // NVFP4_SM90_TILE_N,
+                    NVFP4_SM90_TILE_N,
                 ),
                 torch.float32,
             ),
@@ -876,7 +890,7 @@ class NVFP4SM90WeightViewV4:
                 self.promotion_residual,
                 (
                     experts,
-                    padded_k // 128,
+                    padded_k // NVFP4_SM90_K_ALIGNMENT,
                     padded_n,
                     NVFP4_SM90_STAGE_RESIDUAL_ELEMENTS,
                 ),
@@ -889,6 +903,18 @@ class NVFP4SM90WeightViewV4:
                     f"v4 {name} must be contiguous {dtype} {shape}, got "
                     f"{tensor.dtype} {tuple(tensor.shape)}"
                 )
+        expected_alpha_shape = (
+            () if self.manifest.alpha_scope == "per_tensor" else (experts,)
+        )
+        if (
+            self.global_alpha.dtype != torch.float32
+            or tuple(self.global_alpha.shape) != expected_alpha_shape
+        ):
+            raise ValueError(
+                f"v4 global_alpha must be float32 {expected_alpha_shape} for "
+                f"{self.manifest.alpha_scope}, got {self.global_alpha.dtype} "
+                f"{tuple(self.global_alpha.shape)}"
+            )
         tensors = (
             self.packed_e2m1,
             self.scale_e4m3_per16,

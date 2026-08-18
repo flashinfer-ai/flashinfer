@@ -277,6 +277,11 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
             != baseline
             for value in variants
         )
+        hot_one = replace(config, weight_policy="hot_folded", hot_expert_count=1)
+        hot_two = replace(config, weight_policy="hot_folded", hot_expert_count=2)
+        assert _make_backend(hot_one, process_group=group)._workspace_pool_key(
+            fleet
+        ) != _make_backend(hot_two, process_group=group)._workspace_pool_key(fleet)
         assert _make_backend(config)._workspace_pool_key(fleet) != baseline
         assert (
             _make_backend(config, process_group=group, rank=0)._workspace_pool_key(

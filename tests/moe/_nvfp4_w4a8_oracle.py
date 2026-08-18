@@ -95,7 +95,7 @@ def simulate_w4a8_operand_bytes(
         raise ValueError("packed_e2m1 must be uint8 [E,Kt,Nt,64,16]")
     if tuple(packed_e2m1.shape[-2:]) != (64, 16):
         raise ValueError("packed_e2m1 physical tile must be [64,16]")
-    expected_residual_shape = tuple(packed_e2m1.shape[:-1]) + (2,)
+    expected_residual_shape = (*packed_e2m1.shape[:-1], 2)
     if tuple(promotion_residual.shape) != expected_residual_shape:
         raise ValueError(
             "promotion_residual shape must be "

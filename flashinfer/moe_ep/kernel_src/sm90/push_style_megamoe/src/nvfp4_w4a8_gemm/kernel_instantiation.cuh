@@ -62,7 +62,7 @@ cudaError_t launch_w4a8_kernel_variant(bool debug_fp32, int32_t blocks, cudaStre
             static_cast<float*>(params.output), params.activation_scales, params.alpha,
             params.expert_mapping, params.source_offsets, params.tile_prefix, params.task_counter,
             params.row_capacity, params.logical_n, params.padded_n, params.padded_k,
-            params.launch_n_tiles, params.n_tile_begin, params.bucket_experts,
+            params.launch_n_tiles, params.n_tile_begin, params.bucket_experts, params.total_experts,
             params.activation_scale_stride, params.alpha_per_expert, params.activation_map,
             params.payload_map, params.residual_map, params.group_scales);
   } else {
@@ -71,7 +71,7 @@ cudaError_t launch_w4a8_kernel_variant(bool debug_fp32, int32_t blocks, cudaStre
             static_cast<__nv_bfloat16*>(params.output), params.activation_scales, params.alpha,
             params.expert_mapping, params.source_offsets, params.tile_prefix, params.task_counter,
             params.row_capacity, params.logical_n, params.padded_n, params.padded_k,
-            params.launch_n_tiles, params.n_tile_begin, params.bucket_experts,
+            params.launch_n_tiles, params.n_tile_begin, params.bucket_experts, params.total_experts,
             params.activation_scale_stride, params.alpha_per_expert, params.activation_map,
             params.payload_map, params.residual_map, params.group_scales);
   }

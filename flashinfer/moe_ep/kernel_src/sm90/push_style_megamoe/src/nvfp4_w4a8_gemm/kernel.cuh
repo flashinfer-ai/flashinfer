@@ -306,7 +306,7 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
     const float* activation_scales, const float* alpha, const int32_t* expert_mapping,
     const int64_t* source_offsets, const int64_t* tile_prefix, unsigned long long* task_counter,
     int64_t row_capacity, int32_t logical_n, int32_t padded_n, int32_t padded_k,
-    int32_t launch_n_tiles, int32_t n_tile_begin, int32_t bucket_experts,
+    int32_t launch_n_tiles, int32_t n_tile_begin, int32_t bucket_experts, int32_t total_experts,
     int64_t activation_scale_stride, bool alpha_per_expert, const CUtensorMap& activation_map,
     const CUtensorMap& payload_map, const CUtensorMap& residual_map, const float* group_scales) {
   static_assert(std::is_same_v<Output, __nv_bfloat16> || std::is_same_v<Output, float>);
@@ -350,7 +350,7 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
       const uint64_t task_index = atomicAdd(task_counter, 1ULL);
       storage.task = map_grouped_task<BlockM, BlockN>(task_index, source_offsets, expert_mapping,
                                                       tile_prefix, bucket_experts, launch_n_tiles,
-                                                      n_tile_begin, row_capacity);
+                                                      n_tile_begin, total_experts, row_capacity);
     }
     __syncthreads();
     if (!storage.task.valid) {
@@ -533,7 +533,7 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
       const int32_t *expert_mapping, const int64_t *source_offsets, const int64_t *tile_prefix,    \
       unsigned long long *task_counter, int64_t row_capacity, int32_t logical_n, int32_t padded_n, \
       int32_t padded_k, int32_t launch_n_tiles, int32_t n_tile_begin, int32_t bucket_experts,      \
-      int64_t activation_scale_stride, bool alpha_per_expert,                                      \
+      int32_t total_experts, int64_t activation_scale_stride, bool alpha_per_expert,               \
       __grid_constant__ const CUtensorMap activation_map,                                          \
       __grid_constant__ const CUtensorMap payload_map,                                             \
       __grid_constant__ const CUtensorMap residual_map, const float *group_scales
@@ -550,8 +550,8 @@ __global__ __launch_bounds__(
   grouped_w4a8_kernel_body<__nv_bfloat16, BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
       storage, output, activation_scales, alpha, expert_mapping, source_offsets, tile_prefix,
       task_counter, row_capacity, logical_n, padded_n, padded_k, launch_n_tiles, n_tile_begin,
-      bucket_experts, activation_scale_stride, alpha_per_expert, activation_map, payload_map,
-      residual_map, group_scales);
+      bucket_experts, total_experts, activation_scale_stride, alpha_per_expert, activation_map,
+      payload_map, residual_map, group_scales);
 }
 
 template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme, int PipelineStages>
@@ -566,8 +566,8 @@ __global__ __launch_bounds__(
   grouped_w4a8_kernel_body<float, BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
       storage, output, activation_scales, alpha, expert_mapping, source_offsets, tile_prefix,
       task_counter, row_capacity, logical_n, padded_n, padded_k, launch_n_tiles, n_tile_begin,
-      bucket_experts, activation_scale_stride, alpha_per_expert, activation_map, payload_map,
-      residual_map, group_scales);
+      bucket_experts, total_experts, activation_scale_stride, alpha_per_expert, activation_map,
+      payload_map, residual_map, group_scales);
 }
 
 #undef FLASHINFER_SM90_W4A8_KERNEL_PARAMETERS

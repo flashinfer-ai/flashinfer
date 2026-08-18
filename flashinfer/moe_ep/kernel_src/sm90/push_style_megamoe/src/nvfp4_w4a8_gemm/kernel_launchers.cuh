@@ -29,6 +29,7 @@ struct W4A8KernelLaunchParams {
   int32_t launch_n_tiles;
   int32_t n_tile_begin;
   int32_t bucket_experts;
+  int32_t total_experts;
   int64_t activation_scale_stride;
   bool alpha_per_expert;
   const float* group_scales;

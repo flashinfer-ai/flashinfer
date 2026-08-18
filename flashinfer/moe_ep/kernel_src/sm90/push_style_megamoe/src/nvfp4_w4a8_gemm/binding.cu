@@ -895,6 +895,7 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
         n_tiles,
         n_tile_begin,
         bucket_experts_,
+        total_experts_,
         padded_scale_stride_,
         alpha.ndim() == 1,
         tma_maps.group_scales,

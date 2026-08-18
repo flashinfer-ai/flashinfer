@@ -79,6 +79,8 @@ inline CUtensorMap make_tma_map(T* address, uint64_t global_dim_0, uint64_t glob
 
 class Sm90Nvfp4RsGroupedGemmRunner final : public tvm::ffi::ModuleObj {
  public:
+  // Each runner owns one task counter and mutable TMA descriptors. Calls on
+  // the same instance must be host-serialized and stream-ordered.
   const char* type_key() const { return "flashinfer.Sm90Nvfp4RsGroupedGemmRunner"; }
 
   const char* kind() const final { return "sm90_nvfp4_rs_grouped_gemm_runner"; }

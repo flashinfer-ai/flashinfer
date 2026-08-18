@@ -63,6 +63,19 @@ TOKEN_CAPACITY = 32
 _KEEP_ALIVE: list[object] = []
 
 
+@pytest.fixture(autouse=True)
+def _destroy_retained_layers():
+    try:
+        yield
+    finally:
+        retained_layers = tuple(reversed(_KEEP_ALIVE))
+        _KEEP_ALIVE.clear()
+        for layer in retained_layers:
+            destroy = getattr(layer, "destroy", None)
+            if destroy is not None:
+                destroy()
+
+
 def test_compute_rejects_weight_mismatch_after_completing_the_round() -> None:
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,

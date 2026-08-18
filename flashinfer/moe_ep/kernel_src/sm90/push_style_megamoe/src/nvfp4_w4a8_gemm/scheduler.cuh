@@ -188,7 +188,7 @@ template <int BlockM, int BlockN>
 __device__ __forceinline__ GroupedTask
 map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32_t* expert_mapping,
                  const int64_t* tile_prefix, int32_t bucket_experts, int32_t n_tiles,
-                 int32_t n_tile_begin, int64_t row_capacity) {
+                 int32_t n_tile_begin, int32_t total_experts, int64_t row_capacity) {
   static_assert(BlockM == 64 || BlockM == 128);
   static_assert(BlockN == 64 || BlockN == 128);
   GroupedTask result{-1, -1, 0, 0, 0, 0, false};
@@ -218,7 +218,7 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
   const uint64_t local_m_tile = row_task - static_cast<uint64_t>(tile_prefix[bucket_expert]);
   const uint64_t local_n_tile = task_index % static_cast<uint64_t>(n_tiles);
   const int32_t source_expert = expert_mapping[bucket_expert];
-  if (source_expert < 0) {
+  if (source_expert < 0 || source_expert >= total_experts) {
     return result;
   }
   const int64_t source_begin = source_offsets[source_expert];

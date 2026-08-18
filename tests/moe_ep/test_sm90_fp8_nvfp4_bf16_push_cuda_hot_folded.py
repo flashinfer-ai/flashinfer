@@ -270,31 +270,37 @@ def test_hot_folded_two_layers_share_workspace_and_graph_replay() -> None:
         *_checkpoints(device, 332), hot_experts=1
     )
     config = _nvfp4_config(weight_policy="hot_folded", hot_expert_count=1)
-    layer_a = _build_prepared_layer(config, hybrid_a)
-    layer_b = _build_prepared_layer(config, hybrid_b)
-    inputs = [
-        _make_inputs(16, LOCAL_EXPERTS, 332 + index, device) for index in range(2)
-    ]
-    eager = [
-        (
-            _forward(layer_a, *values).clone(),
-            _forward(layer_b, *values).clone(),
-        )
-        for values in inputs
-    ]
-    assert layer_a._workspace is layer_b._workspace
-    static_x = torch.empty_like(inputs[0][0]).copy_(inputs[0][0])
-    static_ids = torch.empty_like(inputs[0][1]).copy_(inputs[0][1])
-    static_weights = torch.empty_like(inputs[0][2]).copy_(inputs[0][2])
-    for _ in range(2):
-        _forward(layer_a, static_x, static_ids, static_weights)
-        _forward(layer_b, static_x, static_ids, static_weights)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        static_output_a = _forward(layer_a, static_x, static_ids, static_weights)
-        static_output_b = _forward(layer_b, static_x, static_ids, static_weights)
+    layer_a = None
+    layer_b = None
     try:
+        layer_a = _build_prepared_layer(config, hybrid_a)
+        layer_b = _build_prepared_layer(config, hybrid_b)
+        inputs = [
+            _make_inputs(16, LOCAL_EXPERTS, 332 + index, device) for index in range(2)
+        ]
+        eager = [
+            (
+                _forward(layer_a, *values).clone(),
+                _forward(layer_b, *values).clone(),
+            )
+            for values in inputs
+        ]
+        assert layer_a._workspace is layer_b._workspace
+        static_x = torch.empty_like(inputs[0][0]).copy_(inputs[0][0])
+        static_ids = torch.empty_like(inputs[0][1]).copy_(inputs[0][1])
+        static_weights = torch.empty_like(inputs[0][2]).copy_(inputs[0][2])
+        current_stream = torch.cuda.current_stream()
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(current_stream)
+        with torch.cuda.stream(side_stream):
+            for _ in range(2):
+                _forward(layer_a, static_x, static_ids, static_weights)
+                _forward(layer_b, static_x, static_ids, static_weights)
+        current_stream.wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output_a = _forward(layer_a, static_x, static_ids, static_weights)
+            static_output_b = _forward(layer_b, static_x, static_ids, static_weights)
         for values, expected in zip(inputs, eager, strict=True):
             static_x.copy_(values[0])
             static_ids.copy_(values[1])
@@ -304,5 +310,7 @@ def test_hot_folded_two_layers_share_workspace_and_graph_replay() -> None:
             assert torch.equal(static_output_a, expected[0])
             assert torch.equal(static_output_b, expected[1])
     finally:
-        layer_a.destroy()
-        layer_b.destroy()
+        if layer_a is not None:
+            layer_a.destroy()
+        if layer_b is not None:
+            layer_b.destroy()

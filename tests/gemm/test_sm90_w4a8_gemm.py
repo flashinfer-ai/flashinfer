@@ -301,6 +301,8 @@ def test_sm90_w4a8_untrusted_schedule_validation_stays_on_device():
     binding = sources["binding.cu"].decode("utf-8")
     assert "sm90_w4a8_gemm: invalid offsets or expert mapping" in scheduler
     assert 'asm volatile("trap;")' in scheduler
+    assert "source_expert < 0 || source_expert >= total_experts" in scheduler
+    assert "total_experts_" in binding
     assert "cudaMemcpyDeviceToHost" not in binding
     assert "cudaStreamSynchronize" not in binding
 
