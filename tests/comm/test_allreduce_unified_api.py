@@ -189,7 +189,7 @@ def run_allreduce_test(
         fusion: Whether to test fused allreduce+rmsnorm or just allreduce
         dtype: Data type for tensors
         hidden_size: Hidden dimension size
-        backend: Backend to use ("auto", "trtllm", "mnnvl")
+        backend: Backend to use ("auto", "trtllm", "mnnvl", "nccl_local")
     """
 
     comm = MPI.COMM_WORLD
@@ -284,7 +284,7 @@ def run_allreduce_test(
         if workspace is not None:
             workspace.destroy()
         # Cleanup torch.distributed if we initialized it
-        if backend in ("trtllm", "auto"):
+        if backend in ("trtllm", "nccl_local", "auto"):
             cleanup_torch_distributed()
 
     # Final synchronization
@@ -312,6 +312,29 @@ def test_allreduce_unified(
     Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
     """
     run_allreduce_test(monkeypatch, seq_lens, fusion, dtype, hidden_size, backend)
+
+
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_allreduce_nccl_local(
+    monkeypatch,
+    fusion: bool,
+    dtype: torch.dtype,
+):
+    """Exercise the explicit NCCL fallback and local RMSNorm fusion.
+
+    Run with:
+        mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py \\
+            -k nccl_local -vv -s
+    """
+    run_allreduce_test(
+        monkeypatch,
+        seq_lens=[1, 64],
+        fusion=fusion,
+        dtype=dtype,
+        hidden_size=7168,
+        backend="nccl_local",
+    )
 
 
 @pytest.mark.parametrize("seq_len", [64, 256])
