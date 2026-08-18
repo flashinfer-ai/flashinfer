@@ -64,6 +64,57 @@ vendored, these can revert to the marker-shim form):
    TMA-to-UMMA mixed-cluster pipeline; no relative imports, so the copy is
    byte-identical to the blackwell source).
 
+## How this drop was ported / how to re-vendor a future upstream update
+
+The `92dd334` refresh followed this procedure; reuse it for the next sync.
+Ground rule: **never hand-edit anything under `src/`** — files are either
+verbatim upstream copies or recorded whole-file inlines (see the local-diffs
+section above). All adaptation lives in `shim/` and the backends.
+
+1. **Fetch + pick the upstream commit.** In the mirror repo, `git fetch`,
+   then choose the sync point (normally `origin/main`; if a perf report
+   quotes a dev-branch commit, check whether the `rubin/inference` files at
+   that commit are identical to main — `git diff <main> <dev> -- '**/rubin/inference/**'`
+   — before preferring one over the other).
+2. **Diff the vendored closure file-by-file.** For every `.py` under
+   `src/sources/`, `cmp` against `next/sources/<same path>` upstream. This
+   yields three lists: CHANGED (copy over), GONE-UPSTREAM (moved/deleted —
+   follow the move, e.g. `software_sync.py` → `helpers/`), and files only
+   changed here (the recorded inlines — leave them unless their blackwell
+   source changed; check with
+   `git diff <old> <new> -- '**/blackwell/**/<file>'`).
+3. **Copy changed files verbatim** (`cp`, no editing), `git rm` files that
+   moved away, and add any NEW files the updated kernel imports.
+4. **Handle `COPY_FROM_IMPORT` marker shims.** Files whose upstream body is
+   `<<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>` + a relative import from the
+   un-vendored `blackwell/` tree get the blackwell source inlined
+   WHOLE-FILE at the same path (mirroring upstream's own `kernel_export`).
+   Record each one in the local-diffs section above.
+5. **Run the closure scan.** AST-walk every vendored file and verify all
+   relative imports resolve inside `src/sources/` (the scan used for
+   `92dd334` found 40 files, zero unresolved). Also purge `__pycache__`
+   remnants of removed subtrees.
+6. **Sync the shim.** Diff the kernel's `ProblemDesc`/`ImplDesc` requirement
+   dicts (`block_scaled_swap_ab_mega_moe_kernel.py`) and the upstream
+   `tester/solvers/inference_solver.py` validity rules against
+   `shim/block_scaled.py`. New `OptionalRequirement` keys are
+   backward-compatible (the old shim keeps working) but should be exposed as
+   config knobs with the solver's validation mirrored — e.g. `92dd334`'s
+   `fallback_cluster_shape_mn` / `preferred_cluster_count` /
+   `fallback_cluster_count`, whose occupancy recipe the shim replicates from
+   `launch_cluster_configuration()` in the solver + `max_active_clusters()`
+   in `tester/host_utils.py`.
+7. **Thread new knobs to the backends** (`backends/mega/kernel/sm107/*/
+   config.py` + `backend.py`: dataclass field, allocator kwarg, workspace
+   pool key) and extend the tests
+   (`tests/moe_ep/test_sm107_block_scaled_*.py`: config defaults, shim
+   validation cases, an oracle case exercising the new path).
+8. **Update this file** (provenance commit, scope notes, local diffs) and
+   validate on hecate via `.sqsh_build_logs/run_sm107_tests.sbatch`
+   (config + oracle + 4-rank multirank must be green; `92dd334` ran as job
+   435039). Perf tracking lives in `TUNING.md`
+   (`.sqsh_build_logs/run_sm107_bench.sbatch`).
+
 ## Layout
 
 - `src/` — the drop (`sources` becomes a top-level module via
