@@ -72,6 +72,79 @@ def test_public_prefill_backend_option_routes_to_cute_dsl(monkeypatch):
     assert recurrent_kda(**_cpu_route_tensors(), backend="cute-dsl") is sentinel
 
 
+def test_public_prefill_auto_prefers_cute_dsl(monkeypatch):
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: pytest.fail("auto should not probe Cake after a CuTe match"),
+    )
+
+    assert recurrent_kda(**_cpu_route_tensors()) is sentinel
+
+
+def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+
+    assert recurrent_kda(**_cpu_route_tensors()) is sentinel
+
+
+def test_public_prefill_auto_keeps_checkpoint_contract_on_cake(monkeypatch):
+    sentinel = (object(), object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: pytest.fail("checkpointing must bypass CuTe DSL"),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+
+    checkpoint_state = torch.empty((1, 1, 128, 128), dtype=torch.bfloat16)
+    checkpoint_starts = torch.tensor([0, 1], dtype=torch.int64)
+    assert (
+        recurrent_kda(
+            **_cpu_route_tensors(),
+            state_checkpoints=checkpoint_state,
+            checkpoint_cu_starts=checkpoint_starts,
+            checkpoint_every_n_tokens=32,
+        )
+        is sentinel
+    )
+
+
 def test_public_prefill_cake_backend_is_strict(monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api,
@@ -158,6 +231,68 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
     assert calls[0][10] is state
     assert calls[0][11] is None
     assert calls[0][12] == 7
+
+
+def test_cute_dsl_prefill_adapter_accepts_valid_packed_offsets(monkeypatch):
+    calls = []
+
+    class Compiled:
+        def workspace_size(self, cu_seqlens, heads, **kwargs):
+            assert cu_seqlens.tolist() == [0, 1, 2]
+            assert heads == 1
+            assert kwargs == {}
+            return 0
+
+        def __call__(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_get_compiled_cute_dsl_kda",
+        lambda **kwargs: Compiled(),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
+    )
+
+    inputs = _cpu_route_tensors()
+    output = torch.empty_like(inputs["q"])
+    cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
+    result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        lower_bound=-5.0,
+        cu_seqlens=cu_seqlens,
+        output=output,
+        prefill_workspace=None,
+    )
+
+    assert result[0] is output
+    assert result[1] is None
+    assert calls[0][7] is cu_seqlens
+
+
+def test_cute_dsl_sequence_order_is_longest_first_and_stable():
+    from flashinfer.kda_kernels.kda_chunked_bt16 import _longest_first_indices
+
+    assert _longest_first_indices((0, 1300, 1847, 3895, 4858, 5129, 8192)) == (
+        5,
+        2,
+        0,
+        3,
+        1,
+        4,
+    )
+    assert _longest_first_indices(tuple(range(9))) == tuple(range(8))
 
 
 def _strict_prefill_kwargs(inputs):

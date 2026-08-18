@@ -77,8 +77,8 @@ def recurrent_kda(
     gate modes as the backend implementation. On SM100a (B200/GB200) and
     SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
     prefill can use either the frozen Cake schedules or the source-level CuTe
-    DSL BT=16 kernel. ``backend="auto"`` preserves the existing Cake-prefill
-    and CuTe-DSL-decode routing.
+    DSL BT=16 kernel. ``backend="auto"`` prefers CuTe DSL for supported plain
+    prefill contracts and keeps Cake as the feature-complete fallback.
 
     Args:
         q (torch.Tensor):
@@ -200,11 +200,11 @@ def recurrent_kda(
             must be divisible by 32. SGLang normally uses 64 or a larger
             cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake"]):
-            Implementation backend. ``"auto"`` preserves the existing
-            routing, ``"cake"`` strictly selects an exported frozen Cake
-            specialization, and ``"cute-dsl"`` selects the ported BT=16
-            CuTe DSL kernel for ordinary multi-token prefill (and the existing
-            CuTe DSL implementation for decode).
+            Implementation backend. ``"auto"`` selects the ported BT=16
+            CuTe DSL kernel for supported ordinary multi-token prefill and
+            falls back to an exported frozen Cake specialization for contracts
+            such as checkpointing or caller-provided sequence order.
+            ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -225,7 +225,16 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
-    if backend == "cute-dsl" and is_plain_prefill:
+    cute_dsl_feature_contract = (
+        checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+        and seq_order is None
+    )
+    try_cute_dsl_prefill = backend == "cute-dsl" or (
+        backend == "auto" and cute_dsl_feature_contract
+    )
+    if try_cute_dsl_prefill and is_plain_prefill:
         if (
             checkpoint_every_n_tokens != 0
             or state_checkpoints is not None
@@ -236,7 +245,7 @@ def recurrent_kda(
             )
         if seq_order is not None:
             raise ValueError("seq_order is not supported by backend='cute-dsl'")
-        if not _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
+        cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
             q=q,
             k=k,
             v=v,
@@ -256,30 +265,32 @@ def recurrent_kda(
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
             beta_is_logit=beta_is_logit,
-        ):
+        )
+        if backend == "cute-dsl" and not cute_dsl_eligible:
             raise ValueError(
                 "backend='cute-dsl' does not support this recurrent_kda "
                 "prefill contract"
             )
-        assert A_log is not None
-        assert dt_bias is not None
-        assert lower_bound is not None
-        return _kda_prefill_cute._run_cute_dsl_kda_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            output=output,
-            prefill_workspace=prefill_workspace,
-        )
+        if cute_dsl_eligible:
+            assert A_log is not None
+            assert dt_bias is not None
+            assert lower_bound is not None
+            return _kda_prefill_cute._run_cute_dsl_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                prefill_workspace=prefill_workspace,
+            )
 
     use_flash_kda_prefill = (
         backend != "cute-dsl"

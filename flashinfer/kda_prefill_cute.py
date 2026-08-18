@@ -274,7 +274,8 @@ def _run_cute_dsl_kda_prefill(
             or offsets[0] != 0
             or offsets[-1] != q.shape[1]
             or any(
-                right <= left for left, right in zip(offsets, offsets[1:], strict=True)
+                right <= left
+                for left, right in zip(offsets[:-1], offsets[1:], strict=True)
             )
         ):
             raise ValueError(

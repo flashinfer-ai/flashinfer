@@ -4594,6 +4594,7 @@ def kernel(
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -4606,19 +4607,23 @@ def kernel(
 ) -> None:
     """BT=16 KDA forward kernel.
 
-    Grid: `(num_sequences, heads, 1)`. Each CTA owns one packed sequence/head
+    Grid: `(heads, num_sequences, 1)`. Each CTA owns one packed sequence/head
     and iterates over `ceil(sequence_length / 16)` chunks in order.
     """
 
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, bidy, _ = cute.arch.block_idx()
+    # Put heads in grid-x so every sequence's head CTAs are contiguous in the
+    # linear launch order. sequence_slot follows the automatic longest-first
+    # permutation; bidx/bidy remain the original sequence/head indices below.
+    bidy, sequence_slot, _ = cute.arch.block_idx()
+    bidx = cutlass.Int32(seq_order[sequence_slot])
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % THREADS_PER_WARP
 
     sequence_start = cutlass.Int32(cu_seqlens[bidx])
-    # beta TMA transport shape: heads from grid-y; g = 8/gcd(heads, 8) via the
+    # beta TMA transport shape: heads from grid-x; g = 8/gcd(heads, 8) via the
     # lowest set bit (g==1 -> 8-head-group box, g>1 -> pair-packed rows).
-    heads32 = cutlass.Int32(cute.arch.grid_dim()[1])
+    heads32 = cutlass.Int32(cute.arch.grid_dim()[0])
     beta_lsb = heads32 & (-heads32)
     beta_g = cutlass.Int32(8) // cutlass.min(beta_lsb, cutlass.Int32(8))
     sequence_end = cutlass.Int32(cu_seqlens[bidx + 1])
@@ -5978,6 +5983,7 @@ def host(
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -6090,6 +6096,7 @@ def host(
         dt_bias,
         beta,
         cu_seqlens,
+        seq_order,
         initial_state,
         out,
         final_state,
@@ -6100,7 +6107,7 @@ def host(
         GATE_SCALE_LOG2,
         gate_dtype,
     ).launch(
-        grid=(num_sequences, heads, 1),
+        grid=(heads, num_sequences, 1),
         block=(THREADS, 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
@@ -9325,6 +9332,7 @@ def host_unified(
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor,
     cu_chunks: cute.Tensor,
     chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
@@ -9434,6 +9442,7 @@ def host_unified(
             dt_bias,
             beta,
             cu_seqlens,
+            seq_order,
             initial_state,
             out,
             final_state,
@@ -9479,6 +9488,7 @@ def _unified_fakes(
     fdt = F(cutlass.Float32, (sh, DK), stride_order=(1, 0), assumed_align=16)
     fbeta = F(cutlass.BFloat16, (1, ss, sh), stride_order=(2, 1, 0), assumed_align=16)
     fcu = F(cutlass.Int64, (scu,), stride_order=(0,), assumed_align=8)
+    forder = F(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=8)
     fcuc = F(cutlass.Int32, (scu2,), stride_order=(0,), assumed_align=8)
     fcts = F(cutlass.Int32, (sc,), stride_order=(0,), assumed_align=8)
 
@@ -9532,6 +9542,7 @@ def _unified_fakes(
             fdt,
             fbeta,
             fcu,
+            forder,
             fcuc,
             fcts,
             fkd,
@@ -9578,6 +9589,37 @@ _CKPT_OFFSETS: dict = {}
 
 
 _UNIFORM_CU_CACHE: dict = {}
+
+
+_SEQUENCE_ORDER_CACHE: dict = {}
+
+
+def _longest_first_indices(cu_list: tuple) -> tuple:
+    """Return sequence indices stably sorted by descending token count."""
+
+    return tuple(
+        sorted(
+            range(len(cu_list) - 1),
+            key=lambda index: cu_list[index + 1] - cu_list[index],
+            reverse=True,
+        )
+    )
+
+
+def _longest_first_sequence_order(cu_list: tuple, device) -> torch.Tensor:
+    """Return a cached CUDA int32 sequence permutation, longest first."""
+
+    key = (cu_list, str(device))
+    order = _SEQUENCE_ORDER_CACHE.get(key)
+    if order is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "KDA sequence order must be warmed before CUDA graph capture"
+            )
+        indices = _longest_first_indices(cu_list)
+        order = torch.tensor(indices, dtype=torch.int32, device=device)
+        _SEQUENCE_ORDER_CACHE[key] = order
+    return order
 
 
 def _uniform_cu_seqlens(batch: int, seqlen: int, device) -> torch.Tensor:
@@ -9702,6 +9744,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         sm_count = _device_sm_count(device)
         cu_list = _cu_seqlens_contents(cu_seqlens)
         n_seq = len(cu_list) - 1
+        seq_order = _longest_first_sequence_order(cu_list, device)
         # State checkpoints: every ckpt_interval tokens (a positive multiple of
         # BT) the live recurrent state is stored to state_ckpt[slot], slot laid
         # out flat per sequence in cu_seqlens order -- state_ckpt[k] of a
@@ -9785,6 +9828,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 dt_bias,
                 beta,
                 cu_seqlens,
+                seq_order,
                 cuc,
                 cts,
                 kd,
@@ -9835,6 +9879,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             dt_bias,
             beta,
             cu_seqlens,
+            seq_order,
             plan["cu_chunks"],
             plan["chunk_to_seq"],
             ws["kd"],

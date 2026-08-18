@@ -154,6 +154,30 @@ SMALL_BH_CASES = (
     Case("h1_fixed_131072", 1, (131072,), False, 11002),
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
 )
+POLICY_CASES = (
+    tuple(
+        Case(f"h{heads}_fixed8192", heads, (8192,), False, 20000 + heads)
+        for heads in (24, 32, 48)
+    )
+    + tuple(
+        case
+        for heads in (24, 32, 48)
+        for case in (
+            Case(
+                f"h{heads}_mixed",
+                heads,
+                (1300, 547, 2048, 963, 271, 3063),
+                True,
+                21000 + heads,
+            ),
+            Case(f"h{heads}_uniform", heads, (1024,) * 8, True, 22000 + heads),
+        )
+    )
+    + (
+        Case("h64_packed_single", 64, (8192,), True, 23064),
+        Case("h96_packed_single", 96, (8192,), True, 23096),
+    )
+)
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
 
@@ -266,6 +290,7 @@ def _make_case(
     *,
     state_rotations: int,
     candidate_route: str,
+    candidate_backend: str,
     flash_kda=None,
 ) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
@@ -356,6 +381,7 @@ def _make_case(
             beta_is_logit=True,
             seq_order=seq_order,
             prefill_workspace=candidate_workspace,
+            backend=candidate_backend,
         )
 
     peer_raw_run = None
@@ -463,11 +489,25 @@ def _make_case(
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
         reset_state_pools()
-    if len(resolved_routes) != 1:
+    if candidate_backend == "cute-dsl" and resolved_routes:
         raise RuntimeError(
-            f"expected one FlashKDA prefill route during warmup, got {resolved_routes}"
+            f"CuTe DSL backend unexpectedly entered a Cake route: {resolved_routes}"
         )
-    resolved_variant, resolved_target = resolved_routes[0]
+    if candidate_backend in ("auto", "cute-dsl") and not resolved_routes:
+        cute_module = import_module("flashinfer.kda_kernels.kda_chunked_bt16")
+        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        resolved_variant, _ = cute_module._occupancy_pick_route(
+            tuple(offsets), case.num_heads, sm_count
+        )
+        resolved_variant = f"bt16-{resolved_variant}"
+        resolved_target = "cute-dsl"
+    else:
+        if len(resolved_routes) != 1:
+            raise RuntimeError(
+                "expected one FlashKDA prefill route during warmup, "
+                f"got {resolved_routes}"
+            )
+        resolved_variant, resolved_target = resolved_routes[0]
 
     metadata = {
         "name": case.name,
@@ -478,6 +518,7 @@ def _make_case(
         "variant": resolved_variant,
         "target": resolved_target,
         "candidate_route": candidate_route,
+        "candidate_backend": candidate_backend,
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -566,11 +607,11 @@ def main() -> None:
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh"),
+        choices=("all", "legacy", "h12", "small_bh", "policy", "sweep"),
         default="all",
         help=(
-            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
-            "cases, or the fixed-layout small-BH cases."
+            "Run all standard cases, the original H64/H96 cases, Kimi-K3 TP8 "
+            "H12 cases, fixed-layout small-BH cases, or backend-policy cases."
         ),
     )
     parser.add_argument(
@@ -582,6 +623,12 @@ def main() -> None:
             f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
             f"{DEFAULT_H12_STATE_ROTATIONS} slots."
         ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cake", "cute-dsl"),
+        default="auto",
+        help="Public recurrent_kda backend to benchmark.",
     )
     parser.add_argument(
         "--candidate-route",
@@ -624,6 +671,8 @@ def main() -> None:
         parser.error(
             "--flash-kda-peer and --flash-kda-source-dir must be provided together"
         )
+    if args.backend == "cute-dsl" and args.candidate_route != "dispatcher":
+        parser.error("--candidate-route nonpersistent is Cake-specific")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
@@ -666,6 +715,8 @@ def main() -> None:
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
+        "policy": POLICY_CASES,
+        "sweep": CASES + POLICY_CASES,
     }[args.case_set]
     results = []
     for case in selected_cases:
@@ -680,6 +731,7 @@ def main() -> None:
             case,
             state_rotations=state_rotations,
             candidate_route=args.candidate_route,
+            candidate_backend=args.backend,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}
