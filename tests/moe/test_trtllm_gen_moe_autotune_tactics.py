@@ -78,6 +78,8 @@ def _moe_profile_shapes(
     def _bucket(t: torch.Tensor | None, dim: int = 0) -> tuple:
         if t is None:
             return (0,)
+        if t.numel() == 0:
+            return tuple(t.shape)
         s = list(t.shape)
         s[dim] = bucket_m
         return tuple(s)
