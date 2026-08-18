@@ -181,9 +181,7 @@ class _BlockSparseSoftmaxStagingLayout:
             aligned_payload_words = ((route_flags_word_offset + 1 + 3) // 4) * 4
             token_words_word_offset = aligned_payload_words if has_token_bits else None
             token_words = kv_route_size // 32 if has_token_bits else 0
-            stage_stride_words = (
-                (aligned_payload_words + token_words + 3) // 4
-            ) * 4
+            stage_stride_words = ((aligned_payload_words + token_words + 3) // 4) * 4
         else:
             softmax_atom_size = min(atom_size, 32)
             num_origin_words = kv_route_size // softmax_atom_size
@@ -262,9 +260,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     def _init_placeholder_state(self) -> None:
         """Create shape-correct K/V metadata SMEM for task-graph tracing."""
 
-        self._smem_words = _placeholder_smem_array(
-            Int32, self._retained_route_words
-        )
+        self._smem_words = _placeholder_smem_array(Int32, self._retained_route_words)
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Allocate one aligned instruction-local K/V metadata slot."""
@@ -370,9 +366,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             route_record_word_offset = (row_route_begin + route_idx) * Int32(
                 self.route_layout.route_metadata_stride_words
             )
-        route_record_word_offset = cute.arch.make_warp_uniform(
-            route_record_word_offset
-        )
+        route_record_word_offset = cute.arch.make_warp_uniform(route_record_word_offset)
 
         num_logical_origins = self.route_layout.logical_origins_per_route
         uses_two_fragment_route = num_logical_origins == 2
@@ -405,27 +399,21 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             if cutlass.const_expr(self.cfg.use_kv_valid_bits):
                 # The validity word shares the prepared record's cache line
                 # with fields consumed shortly afterward by Softmax.
-                atom_valid_mask = _warp_broadcast_i32(
-                    atom_valid_mask, valid_mask_lane
-                )
+                atom_valid_mask = _warp_broadcast_i32(atom_valid_mask, valid_mask_lane)
             else:
                 # Unmasked metadata needs no later fields. Recover validity
                 # from the invalid-origin sentinel and avoid the dead load.
                 origin_is_valid = cutlass.Boolean(
                     lane_idx < Int32(2) and logical_origin >= Int32(0)
                 )
-                atom_valid_mask = Int32(
-                    cute.arch.vote_ballot_sync(origin_is_valid)
-                )
+                atom_valid_mask = Int32(cute.arch.vote_ballot_sync(origin_is_valid))
             return origin0, origin1, atom_valid_mask, route_record_word_offset
 
         # Wider routes stay lane-distributed: each active lane carries only
         # its origin and validity through the existing three-scalar K/V ABI.
         valid = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
-            atom_valid_mask = _warp_broadcast_i32(
-                atom_valid_mask, valid_mask_lane
-            )
+            atom_valid_mask = _warp_broadcast_i32(atom_valid_mask, valid_mask_lane)
             if lane_idx < Int32(num_logical_origins):
                 valid = (atom_valid_mask & (Int32(1) << lane_idx)) != Int32(0)
         else:
@@ -680,17 +668,13 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     def _producer_stage_base(self, stage_info: StageInfo) -> Int32:
         """Return the producer stage selected by the task scheduler."""
 
-        return stage_info.stage_idx * Int32(
-            self.staging_layout.stage_stride_words
-        )
+        return stage_info.stage_idx * Int32(self.staging_layout.stage_stride_words)
 
     @cute.jit
     def _consumer_stage_base(self) -> Int32:
         """Return the consumer stage selected by the latest wait."""
 
-        return self.consumer_work_stage * Int32(
-            self.staging_layout.stage_stride_words
-        )
+        return self.consumer_work_stage * Int32(self.staging_layout.stage_stride_words)
 
     @cute.jit
     def _store_route_swaps(
@@ -730,19 +714,14 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 softmax_origin = Int32(resolved_origin0)
                 if resolved_atom_validity == Int32(0):
                     softmax_origin = Int32(-1)
-                if cutlass.const_expr(
-                    _swaps_forwards_packed_route_full(self.cfg)
-                ):
+                if cutlass.const_expr(_swaps_forwards_packed_route_full(self.cfg)):
                     # Replicate route-full in each K32 slice's first origin;
                     # B8 alignment leaves bit 0 free for the summary.
-                    if (
-                        lane_idx
-                        % Int32(self.staging_layout.origins_per_warp)
-                        == Int32(0)
+                    if lane_idx % Int32(self.staging_layout.origins_per_warp) == Int32(
+                        0
                     ):
                         softmax_origin = (
-                            softmax_origin
-                            & Int32(_SWAPS_PACKED_ROUTE_FULL_CLEAR_MASK)
+                            softmax_origin & Int32(_SWAPS_PACKED_ROUTE_FULL_CLEAR_MASK)
                         ) | packed_route_full
                 self._smem_words[stage_base + lane_idx] = softmax_origin
         else:
@@ -806,8 +785,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         if cutlass.const_expr(num_origins > 2):
             route_flags = Int32(
                 cute.arch.vote_ballot_sync(
-                    lane_idx < Int32(num_origins)
-                    and resolved_atom_validity != Int32(0)
+                    lane_idx < Int32(num_origins) and resolved_atom_validity != Int32(0)
                 )
             )
         token_word = Uint32(0)
@@ -827,8 +805,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             # Prepared bit 0 summarizes the whole route. Staged low bits are
             # already fragment validity, so remap the summary above them.
             route_token_mask_is_full = cutlass.Boolean(
-                (gmem_route_flags & Int32(_PREPARED_ROUTE_IS_FULL_FLAG))
-                != Int32(0)
+                (gmem_route_flags & Int32(_PREPARED_ROUTE_IS_FULL_FLAG)) != Int32(0)
             )
             if (
                 lane_idx < Int32(self.route_layout.token_words_per_route)
@@ -1062,8 +1039,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             else:
                 token_word0 = Uint32(
                     self._smem_words[
-                        stage_base
-                        + Int32(self.staging_layout.token_words_word_offset)
+                        stage_base + Int32(self.staging_layout.token_words_word_offset)
                     ]
                 )
                 token_word1 = Uint32(

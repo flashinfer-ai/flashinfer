@@ -172,9 +172,7 @@ class SmemPResource(DecodeGenResourceBase):
         return [self._alloc]
 
     @cute.jit
-    def _bind_fragment_ready(
-        self, context: ResourceContext | None = None
-    ) -> None:
+    def _bind_fragment_ready(self, context: ResourceContext | None = None) -> None:
         """Bind the one-way KV256 P-ready barriers from the SMEM context."""
         if cutlass.const_expr(
             self.cfg.streams_tmem_p_fragments
@@ -326,9 +324,7 @@ class SmemPResource(DecodeGenResourceBase):
         # Eight independent chains keep the denominator update off one long
         # dependency chain. Reuse s_arr for probabilities so only one K32 score
         # fragment remains live while P is packed.
-        sum_chains = cutlass.Array(
-            Float32, 8, space=cutlass.AddressSpace.rmem
-        )
+        sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(8):
             sum_chains[chain_idx] = Float32(0.0)
         for pair_idx in cutlass.range_constexpr(16):
@@ -365,10 +361,7 @@ class SmemPResource(DecodeGenResourceBase):
         local_sum = Float32(total_pair[0] + total_pair[1])
 
         packed_p = (
-            s_arr.data_ptr()
-            .load(count=32, alignment=4)
-            .to(cfg.q_dtype)
-            .bitcast(Int32)
+            s_arr.data_ptr().load(count=32, alignment=4).to(cfg.q_dtype).bitcast(Int32)
         )
 
         fragment_cols = cfg.softmax_score_fragment_regs // 2
@@ -394,9 +387,7 @@ class SmemPResource(DecodeGenResourceBase):
         # for all producer warps before consuming the fragment.
         tidx, _, _ = cute.arch.thread_idx()
         if (tidx & Int32(31)) == Int32(0):
-            prims.mbarrier_arrive(
-                self._fragment_ready.data_ptr() + Int32(fragment_idx)
-            )
+            prims.mbarrier_arrive(self._fragment_ready.data_ptr() + Int32(fragment_idx))
 
         if cutlass.const_expr(fragment_idx != 0):
             local_sum += self.tmem_s_ref.load_p_local_sum(0)

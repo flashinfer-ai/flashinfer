@@ -520,8 +520,8 @@ def launch_block_sparse(
 
 
 __all__ = [
-    "_ContiguousKVStorage",
     "_BlockSparseRunArgs",
+    "_ContiguousKVStorage",
     "_PagedKVLaunchPayload",
     "_PagedKVStorage",
     "launch_block_sparse",

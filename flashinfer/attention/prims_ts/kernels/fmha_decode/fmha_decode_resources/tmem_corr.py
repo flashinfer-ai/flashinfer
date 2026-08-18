@@ -160,8 +160,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         """Return 128 lane-local stats plus 64 logical output rows."""
         return (
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
-            + _KV_TILE_256_LOGICAL_OUTPUT_ROWS
-            * _KV_TILE_256_EXCHANGE_ROW_STRIDE
+            + _KV_TILE_256_LOGICAL_OUTPUT_ROWS * _KV_TILE_256_EXCHANGE_ROW_STRIDE
         )
 
     def _init_placeholder_state(self) -> None:
@@ -305,10 +304,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     size_bytes=8,
                     alignment=8,
                 )
-        if (
-            self.cfg.tile_size_kv == 256
-            and self._kv_tile_256_exchange_alloc is None
-        ):
+        if self.cfg.tile_size_kv == 256 and self._kv_tile_256_exchange_alloc is None:
             # Tail correction exchanges all lane-local stats, then pipelines
             # D32 fragments through 64 logical output rows. Upper lanes publish
             # one spatial half while lower lanes retain the matching fragment
@@ -951,9 +947,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             sum_val,
             max_val,
         )
-        dst_offset = dst_row_base + reduce_col_idx * Int32(
-            self.cfg.o_dtype_bytes
-        )
+        dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.o_dtype_bytes)
         final_o_dst = cutlass.inttoptr(
             self.o_ptr.toint() + cutlass.Int64(dst_offset),
             mem_space=1,
@@ -2372,9 +2366,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
         )
         output_lane = exchange_idx < Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS)
-        exchange_row_idx = exchange_idx & Int32(
-            _KV_TILE_256_LOGICAL_OUTPUT_ROWS - 1
-        )
+        exchange_row_idx = exchange_idx & Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS - 1)
         output_exchange_row_base = output_exchange_base + exchange_row_idx * Int32(
             _KV_TILE_256_EXCHANGE_ROW_STRIDE
         )
@@ -2429,9 +2421,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             if exchange_idx >= Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS):
                 (
-                    exchange.data_ptr()
-                    + output_exchange_row_base
-                    + Int32(fragment_col)
+                    exchange.data_ptr() + output_exchange_row_base + Int32(fragment_col)
                 ).store(own_vals, alignment=16)
 
             # Lower lanes keep ``own_vals`` live across the barrier. Once every
@@ -2444,9 +2434,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             if output_lane:
                 peer_vals = (
-                    exchange.data_ptr()
-                    + output_exchange_row_base
-                    + Int32(fragment_col)
+                    exchange.data_ptr() + output_exchange_row_base + Int32(fragment_col)
                 ).load(count=32, alignment=16)
                 for vector_idx in cutlass.range_constexpr(4):
                     vector_col = vector_idx * 8
@@ -2479,9 +2467,9 @@ class TmemCorrResource(DecodeGenResourceBase):
                                 scaled_values, Float32
                             )
                             if cutlass.const_expr(partial_o_uses_bf16):
-                                packed = scaled_vector.to(
-                                    cutlass.BFloat16
-                                ).bitcast(Int32)
+                                packed = scaled_vector.to(cutlass.BFloat16).bitcast(
+                                    Int32
+                                )
                             else:
                                 packed = scaled_vector.to(cutlass.Float16).bitcast(
                                     Int32
@@ -2533,8 +2521,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                         logical_output_row_idx,
                     )
                     stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint()
-                        + stats_row * Int64(2 * 4),
+                        self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
                         mem_space=1,
                         dtype=Float32,
                     )
@@ -2647,9 +2634,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_h_k_idx, logical_b_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        logical_q_group_idx = _logical_q_group_idx(
-            cfg, stage_info, self.q_group_idx
-        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         q_row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
         logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
         splits_kv = Int32(1)
@@ -2681,9 +2666,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Every correction lane joins the generic fused-GMEM completion
             # protocol after the low 64 lanes publish one full D128 row each.
             counter_q_groups = self._multi_cta_counter_q_groups(self.h_r)
-            counter_group_idx = (
-                logical_kv_idx * counter_q_groups + logical_q_group_idx
-            )
+            counter_group_idx = logical_kv_idx * counter_q_groups + logical_q_group_idx
             self._reduce_fused_gmem_partials(
                 logical_h_k_idx,
                 logical_b_idx,

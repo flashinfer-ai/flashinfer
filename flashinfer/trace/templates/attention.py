@@ -357,9 +357,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "num_page_offsets": Var(
                 description="Length of the request-to-page indptr array."
             ),
-            "num_page_indices": Var(
-                description="Number of runtime physical page IDs."
-            ),
+            "num_page_indices": Var(description="Number of runtime physical page IDs."),
         }
     )
     if combined:

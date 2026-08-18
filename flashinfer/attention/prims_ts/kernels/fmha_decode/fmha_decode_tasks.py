@@ -211,9 +211,7 @@ class SmemKvReuseCreditResource(MemoryResource):
         context: ResourceContext | None = None,
     ) -> ResourceVars:
         """Initialize the persistent ring cursor before TS tasks start."""
-        if cutlass.const_expr(
-            context is not None and context.smem_base is not None
-        ):
+        if cutlass.const_expr(context is not None and context.smem_base is not None):
             payload = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=Int32,
@@ -1618,9 +1616,7 @@ def create_load_task_split_kv(
         raise ValueError("schedule-token throttle requires a work queue")
     if smem_page_offsets_v is not None and smem_page_offsets is None:
         raise ValueError("V page offsets require K page offsets")
-    if (smem_k0 is None) != (smem_v0 is None) or (smem_k1 is None) != (
-        smem_v1 is None
-    ):
+    if (smem_k0 is None) != (smem_v0 is None) or (smem_k1 is None) != (smem_v1 is None):
         raise ValueError("each split K resource requires its matching V resource")
     if smem_k0 is None and smem_k1 is None:
         raise ValueError("at least one split K/V instance is required")
@@ -1708,14 +1704,17 @@ def create_load_task_split_kv(
             smem_q.commit()
 
         head_routes = []
-        for smem_k, _, sparse_kv_metadata, sparse_softmax_metadata, load_k, _ in (
-            active_instances
-        ):
+        for (
+            smem_k,
+            _,
+            sparse_kv_metadata,
+            sparse_softmax_metadata,
+            load_k,
+            _,
+        ) in active_instances:
             if smem_k is None:
                 continue
-            route = _resolve_and_store_sparse_route(
-                sparse_kv_metadata, FmhaStage.Head
-            )
+            route = _resolve_and_store_sparse_route(sparse_kv_metadata, FmhaStage.Head)
             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
             head_routes.append((sparse_softmax_metadata, route))
         # In the combined task, preserve both K issues ahead of Softmax

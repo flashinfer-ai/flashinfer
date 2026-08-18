@@ -676,9 +676,7 @@ bs_num_pages = bs_B * bs_pages_per_request
 bs_paged_kv_indptr = (
     torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
 )
-bs_paged_kv_indices = torch.arange(
-    bs_num_pages, dtype=torch.int32, device=device
-)
+bs_paged_kv_indices = torch.arange(bs_num_pages, dtype=torch.int32, device=device)
 bs_seq_lens_kv = torch.tensor(
     [bs_Skv - bs_page_size // 2, bs_Skv], dtype=torch.int32, device=device
 )

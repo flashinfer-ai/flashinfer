@@ -784,9 +784,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     atom_valid_mask = Int32(
                         self.sparse_kv_metadata.route_atom_valid_mask()
                     )
-                    valid0 = cutlass.Boolean(
-                        (atom_valid_mask & Int32(1)) != Int32(0)
-                    )
+                    valid0 = cutlass.Boolean((atom_valid_mask & Int32(1)) != Int32(0))
                     if not valid0:
                         origin0 = Int32(self.max_seq_len_kv)
                     stage_base = self._stage_base(stage_info)
@@ -1909,9 +1907,7 @@ class SmemKvResource(DecodeGenResourceBase):
         cfg = self.cfg
         grouped_tile_idx = Int32(0)
         if cutlass.const_expr(not cfg.use_block_sparse):
-            grouped_tile_idx = self._maybe_runtime_tile_idx(
-                stage_info, local_tile_idx
-            )
+            grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
         stage_base = self._stage_base(stage_info)
 
         if prims.elect_sync():
@@ -1946,13 +1942,11 @@ class SmemKvResource(DecodeGenResourceBase):
                 for dim_half in cutlass.range_constexpr(2):
                     if cutlass.const_expr(kv_kind == KV_KIND_K):
                         block_base = (
-                            dim_half * cfg.tile_size_kv * 64
-                            + physical_block * 64 * 64
+                            dim_half * cfg.tile_size_kv * 64 + physical_block * 64 * 64
                         )
                     else:
                         block_base = (
-                            semantic_block * cfg.headdim * 64
-                            + dim_half * 64 * 64
+                            semantic_block * cfg.headdim * 64 + dim_half * 64 * 64
                         )
 
                     if cutlass.const_expr(cfg.use_block_sparse):
@@ -1976,18 +1970,14 @@ class SmemKvResource(DecodeGenResourceBase):
                     elif cutlass.const_expr(cfg.use_paged_kv):
                         fragment_tokens = min(cfg.num_tokens_per_page, 64)
                         fragments_per_block = 64 // fragment_tokens
-                        for fragment in cutlass.range_constexpr(
-                            fragments_per_block
-                        ):
+                        for fragment in cutlass.range_constexpr(fragments_per_block):
                             token_in_tile = (
                                 semantic_block * 64 + fragment * fragment_tokens
                             )
                             logical_page = token_in_tile // cfg.num_tokens_per_page
                             token_in_page = token_in_tile % cfg.num_tokens_per_page
                             page_id = Int32(dense_page_ids[logical_page])
-                            smem_offset = (
-                                block_base + fragment * fragment_tokens * 64
-                            )
+                            smem_offset = block_base + fragment * fragment_tokens * 64
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 stage_base.subview(smem_offset),
                                 tma_desc,

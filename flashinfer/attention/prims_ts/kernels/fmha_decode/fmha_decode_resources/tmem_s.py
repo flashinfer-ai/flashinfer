@@ -174,9 +174,7 @@ def _can_skip_sparse_keeps_structural_mask(
     if cutlass.const_expr(apply_causal_mask):
         last_causal_origin = causal_end - fragment_size
         can_skip = Boolean(
-            can_skip
-            and origin0 <= last_causal_origin
-            and origin1 <= last_causal_origin
+            can_skip and origin0 <= last_causal_origin and origin1 <= last_causal_origin
         )
     return can_skip
 
@@ -765,15 +763,11 @@ class TmemSResource(DecodeGenResourceBase):
                 Int32(0),
             )
 
-        logical_q_group_idx = _logical_q_group_idx(
-            cfg, stage_info, self.q_group_idx
-        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
         element_mask_end_idx = seq_len_kv
         if cutlass.const_expr(cfg.uses_uniform_causal_mask):
-            element_mask_end_idx = (
-                seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
-            )
+            element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
 
         use_runtime_kv_domain = (
             self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
@@ -791,9 +785,7 @@ class TmemSResource(DecodeGenResourceBase):
             effective_tile_idx = (
                 Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tile_idx
             )
-            effective_total_kv_tiles = Int32(
-                task_cache[_TASK_CACHE_KV_VALID_TILE_END]
-            )
+            effective_total_kv_tiles = Int32(task_cache[_TASK_CACHE_KV_VALID_TILE_END])
             tile_idx = effective_tile_idx
             window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
         else:
@@ -906,8 +898,7 @@ class TmemSResource(DecodeGenResourceBase):
 
         new_anchor = cute.math.max(old_max, tile_max, ftz=True)
         if cutlass.const_expr(
-            self.cfg.use_block_sparse
-            and _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 > 0.0
+            self.cfg.use_block_sparse and _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 > 0.0
         ):
             # Online softmax only requires a common finite reference for P,
             # sum, and O; it does not require the exact row maximum. Defer a
@@ -1153,9 +1144,7 @@ class TmemSResource(DecodeGenResourceBase):
             cute.math.max(max_chains[2], max_chains[3], ftz=True),
             ftz=True,
         )
-        if cutlass.const_expr(
-            cfg.tile_size_q == 64 and cfg.tile_size_kv != 256
-        ):
+        if cutlass.const_expr(cfg.tile_size_q == 64 and cfg.tile_size_kv != 256):
             return cute.math.max(
                 tile_max,
                 Float32(
@@ -1192,8 +1181,7 @@ class TmemSResource(DecodeGenResourceBase):
         route_token_mask_is_full = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
             route_token_mask_is_full = cutlass.Boolean(
-                (route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG))
-                != Int32(0)
+                (route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)) != Int32(0)
             )
 
         num_local_words = 4 if self.cfg.tile_size_q == 128 else 2
@@ -1481,9 +1469,7 @@ class TmemSResource(DecodeGenResourceBase):
                 # numerator and denominator remain in the same scale frame.
                 # Large jumps still rebase to keep P comfortably in range.
                 max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
-                if max_delta_log2 >= Float32(
-                    -KV_TILE_256_RESCALE_THRESHOLD_LOG2
-                ):
+                if max_delta_log2 >= Float32(-KV_TILE_256_RESCALE_THRESHOLD_LOG2):
                     new_max = old_max
             old_max_arr[0] = old_max
             sum_arr[0] = running_sum
@@ -1888,10 +1874,7 @@ class TmemSResource(DecodeGenResourceBase):
                     # for this Softmax warp's logical K32 slice.
                     k32_is_full = cute.arch.make_warp_uniform(
                         cutlass.Boolean(
-                            (
-                                sparse_route_flags
-                                & Uint32(_PREPARED_ROUTE_IS_FULL_FLAG)
-                            )
+                            (sparse_route_flags & Uint32(_PREPARED_ROUTE_IS_FULL_FLAG))
                             != Uint32(0)
                         )
                     )
@@ -2402,13 +2385,9 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_token_word3,
         )
         keep_words = cutlass.Array(Uint32, 4, space=cutlass.AddressSpace.rmem)
-        warp_group_thread_idx = Int32(
-            task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        )
+        warp_group_thread_idx = Int32(task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX])
         tile_row_idx = _keeps_row_idx(cfg, warp_group_thread_idx)
-        logical_q_group_idx = _logical_q_group_idx(
-            cfg, stage_info, self.q_group_idx
-        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         q_token_idx, _ = _q_row_token_and_local_head(
             cfg,
             self.h_r,
@@ -2458,9 +2437,7 @@ class TmemSResource(DecodeGenResourceBase):
                 and keep_words[fragment_idx] == Uint32(0xFFFFFFFF)
             )
         # The load/store branch must be uniform for each participating warp.
-        warp_scores_are_unmasked = cute.arch.vote_all_sync(
-            warp_scores_are_unmasked
-        )
+        warp_scores_are_unmasked = cute.arch.vote_all_sync(warp_scores_are_unmasked)
 
         score_tmem_addr = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
@@ -2505,8 +2482,7 @@ class TmemSResource(DecodeGenResourceBase):
                 for score_idx in cutlass.range_constexpr(32):
                     score = Float32(loaded[score_idx])
                     score_is_kept = (
-                        (keep_words[fragment_idx] >> Int32(score_idx))
-                        & Uint32(1)
+                        (keep_words[fragment_idx] >> Int32(score_idx)) & Uint32(1)
                     ) != Uint32(0)
                     if not score_is_kept:
                         score = _neg_max_f32()

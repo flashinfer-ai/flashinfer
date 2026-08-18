@@ -518,9 +518,7 @@ def _build_decode_gen_schedule(
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
-    use_per_inst_kv_resources = (
-        cfg.use_block_sparse and cfg.tile_size_kv != 256
-    ) or (
+    use_per_inst_kv_resources = (cfg.use_block_sparse and cfg.tile_size_kv != 256) or (
         cfg.use_keeps_mma_ab
         and cfg.tile_size_kv != 256
         and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
@@ -1599,9 +1597,7 @@ def _build_decode_gen_schedule(
     if smem_kv_reuse_credit is not None:
         # A self-edge models the one-slot ownership token: Load produces it
         # for the current tile and Correction consumes it before the next Load.
-        resource_dependency_graph[smem_kv_reuse_credit] = [
-            smem_kv_reuse_credit
-        ]
+        resource_dependency_graph[smem_kv_reuse_credit] = [smem_kv_reuse_credit]
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
@@ -1738,11 +1734,7 @@ def _build_decode_gen_schedule(
         tmem_allocator.add_resource(tmem_softmax_local1)
     tmem_allocator.add_resource(tmem_o)
     tmem_allocator.compute_layout()
-    if (
-        cfg.use_keeps_mma_ab
-        and not use_one_inst_qkv
-        and not cfg.uses_tmem_p
-    ):
+    if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
         # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
         # standalone-first S/O layout after unused stats aliases are removed.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
@@ -1827,7 +1819,9 @@ def _build_decode_gen_schedule(
             tmem_s_alloc.offset + cfg.tmem_stats_cols
         )
 
-    eager_init_resources = [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
+    eager_init_resources = (
+        [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
+    )
     if smem_kv_reuse_credit is not None:
         # Initialize the persistent ring cursor under the same CTA-wide fence
         # and barrier used by other manually managed SMEM control state.
@@ -2113,9 +2107,7 @@ def _run_decode_gen_active(
         dma_consumer_release_labels=dma_consumer_release_labels,
         skip_validation=True,
         verbose=False,
-        exhaustive_deadlock_race_check=not _has_unmodeled_tmem_p_alias_protocol(
-            cfg
-        ),
+        exhaustive_deadlock_race_check=not _has_unmodeled_tmem_p_alias_protocol(cfg),
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
     )

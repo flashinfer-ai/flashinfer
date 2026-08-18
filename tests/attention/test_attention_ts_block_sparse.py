@@ -921,12 +921,13 @@ def test_one_shot_inspection_publishes_only_the_semantic_row_bound() -> None:
     assert [field.name for field in fields(_BlockSparseInspection)] == [
         "max_row_block_count"
     ]
-    assert "kv_route_size" not in inspect.signature(
-        _inspect_block_sparse_bsr
-    ).parameters
-    assert "kv_route_size" not in inspect.signature(
-        compile_block_sparse_inspection
-    ).parameters
+    assert (
+        "kv_route_size" not in inspect.signature(_inspect_block_sparse_bsr).parameters
+    )
+    assert (
+        "kv_route_size"
+        not in inspect.signature(compile_block_sparse_inspection).parameters
+    )
 
 
 def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
@@ -1305,8 +1306,12 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
     }
     for inst_idx in (0, 1):
         matching_metadata = {f"smemBlockSparseKvMetadata{inst_idx}"}
-        assert dependency_names[f"smemK{inst_idx}"] & metadata_names == matching_metadata
-        assert dependency_names[f"smemV{inst_idx}"] & metadata_names == matching_metadata
+        assert (
+            dependency_names[f"smemK{inst_idx}"] & metadata_names == matching_metadata
+        )
+        assert (
+            dependency_names[f"smemV{inst_idx}"] & metadata_names == matching_metadata
+        )
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -1627,8 +1632,6 @@ def test_prepared_route_logical_origin_accessors_are_layout_nfc() -> None:
 def test_logical_origins_feed_masks_while_contiguous_loads_are_identity() -> None:
     """Mask coordinates stay logical; contiguous K/V loads preserve them."""
 
-    from cutlass import Int32
-
     from flashinfer.attention.prims_ts.kernels.fmha_decode import (
         block_sparse_prepare,
     )
@@ -1646,7 +1649,9 @@ def test_logical_origins_feed_masks_while_contiguous_loads_are_identity() -> Non
 
     resource = smem_block_sparse_metadata.SmemBlockSparseKvMetadataResource
     assert "_prepared_route_logical_origin" in inspect.getsource(resource.resolve_route)
-    assert "logical_b_idx" in inspect.signature(resource.route_tma_coordinate).parameters
+    assert (
+        "logical_b_idx" in inspect.signature(resource.route_tma_coordinate).parameters
+    )
     kv_load_sources = inspect.getsource(
         smem_resources.SmemKvTileResource
     ) + inspect.getsource(smem_resources.SmemKvResource)
@@ -3587,6 +3592,8 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
     torch.cuda.synchronize()
     assert state.route_workspace[0].item() == -4
     assert torch.count_nonzero(overflow).item() == 0
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
@@ -3619,16 +3626,22 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
             ),
         )
     )
-    q = torch.randn(
-        (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
-        device="cuda",
-        dtype=case.dtype,
-    ) * 0.25
-    k_pages = torch.randn(
-        (3, case.effective_num_kv_heads, page_size, _HEAD_DIM),
-        device="cuda",
-        dtype=case.dtype,
-    ) * 0.25
+    q = (
+        torch.randn(
+            (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+            device="cuda",
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
+    k_pages = (
+        torch.randn(
+            (3, case.effective_num_kv_heads, page_size, _HEAD_DIM),
+            device="cuda",
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
     v_pages = torch.randn_like(k_pages)
     paged_kv_cache = torch.stack((k_pages, v_pages), dim=1)
     logical_k = torch.cat(
@@ -3910,6 +3923,8 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
         atol=1e-2,
     )
     assert wrapper._published_state() is planned_state
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
@@ -4030,19 +4045,13 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         for batch_page_ids in physical_page_ids_by_batch:
             logical_k_batches.append(
                 torch.cat(
-                    [
-                        k_pages[page_id].transpose(0, 1)
-                        for page_id in batch_page_ids
-                    ],
+                    [k_pages[page_id].transpose(0, 1) for page_id in batch_page_ids],
                     dim=0,
                 )
             )
             logical_v_batches.append(
                 torch.cat(
-                    [
-                        v_pages[page_id].transpose(0, 1)
-                        for page_id in batch_page_ids
-                    ],
+                    [v_pages[page_id].transpose(0, 1) for page_id in batch_page_ids],
                     dim=0,
                 )
             )

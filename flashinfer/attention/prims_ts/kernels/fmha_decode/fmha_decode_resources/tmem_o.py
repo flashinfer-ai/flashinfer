@@ -269,8 +269,7 @@ class TmemOResource(DecodeGenResourceBase):
                     p_tmem_addr + Int32(local_k_step * 8), Int32
                 )
                 iter_v_desc = v_desc + Int32(
-                    (k_step // 4) * cfg.headdim * 16
-                    + (k_step % 4) * 128
+                    (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
                 )
                 tcgen05_mma_ws(
                     _mma_kind_for_qkv(cfg),
@@ -278,9 +277,7 @@ class TmemOResource(DecodeGenResourceBase):
                     p_operand,
                     iter_v_desc,
                     idesc,
-                    initial_scale_d
-                    or fragment_idx != 0
-                    or local_k_step != 0,
+                    initial_scale_d or fragment_idx != 0 or local_k_step != 0,
                 )
 
     @cute.jit
