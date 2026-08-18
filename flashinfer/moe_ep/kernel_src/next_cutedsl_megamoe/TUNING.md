@@ -71,25 +71,25 @@ L2-flush timing protocol. Raw samples:
 
 #### NVFP4, balanced routing
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | TFLOP/s | Upstream (us) | Ours/upstream | Knobs |
-|---|---|---|---|---|---|---|
-| 1K | 218.83 | 215.62-226.11 | 3,709.5 | 372.22 | 0.59x | tile 256x128x256; hint 4; epi 1x4; tif 1 |
-| 2K | 290.53 | 286.02-300.00 | 5,588.0 | 410.48 | 0.71x | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 4K | 454.13 | 445.09-461.06 | 7,149.9 | 529.56 | 0.86x | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 8K | 802.92 | 798.46-807.23 | 8,087.9 | 800.48 | 1.00x | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 1,504.68 | 1,496.13-1,510.98 | 8,631.7 | 1,484.16 | 1.01x | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 32K | 3,014.84 | 3,003.90-3,026.98 | 8,616.0 | 2,960.92 | 1.02x | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| Tokens/rank | Upstream (us) | Ours (us) | Min-max (us) | TFLOP/s | Knobs |
+|---|---|---|---|---|---|
+| 1K | 372.22 | 218.83 (0.59x) | 215.62-226.11 | 3,709.5 | tile 256x128x256; hint 4; epi 1x4; tif 1 |
+| 2K | 410.48 | 290.53 (0.71x) | 286.02-300.00 | 5,588.0 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
+| 4K | 529.56 | 454.13 (0.86x) | 445.09-461.06 | 7,149.9 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
+| 8K | 800.48 | 802.92 (1.00x) | 798.46-807.23 | 8,087.9 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 16K | 1,484.16 | 1,504.68 (1.01x) | 1,496.13-1,510.98 | 8,631.7 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 32K | 2,960.92 | 3,014.84 (1.02x) | 3,003.90-3,026.98 | 8,616.0 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
 
 #### NVFP4, power-law routing (alpha=0.8)
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | Upstream (us) | Ours/upstream | Knobs |
-|---|---|---|---|---|---|
-| 1K | 315.28 | 311.68-321.89 | 399.75 | 0.79x | tile 256x128x256; hint 3; epi 1x4; tif 1 |
-| 2K | 378.97 | 373.79-387.55 | 474.56 | 0.80x | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 4K | 532.55 | 525.98-537.28 | 621.76 | 0.86x | tile 256x256x256; hint 4; epi 1x4; tif 1 |
-| 8K | 1,255.96 | 1,247.71-1,265.28 | 1,053.01 | 1.19x | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 2,040.66 | 2,019.62-2,056.86 | 2,081.84 | 0.98x | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-| 32K | 4,497.98 | 4,466.43-4,606.08 | 4,023.79 | 1.12x | tile 256x256x256; hint 3; epi 1x4; tif 4 |
+| Tokens/rank | Upstream (us) | Ours (us) | Min-max (us) | Knobs |
+|---|---|---|---|---|
+| 1K | 399.75 | 315.28 (0.79x) | 311.68-321.89 | tile 256x128x256; hint 3; epi 1x4; tif 1 |
+| 2K | 474.56 | 378.97 (0.80x) | 373.79-387.55 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 4K | 621.76 | 532.55 (0.86x) | 525.98-537.28 | tile 256x256x256; hint 4; epi 1x4; tif 1 |
+| 8K | 1,053.01 | 1,255.96 (1.19x) | 1,247.71-1,265.28 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+| 16K | 2,081.84 | 2,040.66 (0.98x) | 2,019.62-2,056.86 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
+| 32K | 4,023.79 | 4,497.98 (1.12x) | 4,466.43-4,606.08 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
 
 ### MXFP8 (e4m3), measured 2026-08-18 — hecate0020 (4x SM107), job 435886
 
@@ -103,25 +103,25 @@ protocol).
 
 #### MXFP8, balanced routing
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | TFLOP/s | NVFP4 ref (us) | MXFP8/NVFP4 | Knobs |
-|---|---|---|---|---|---|---|
-| 1K | 319.07 | 315.04-339.01 | 2,544.1 | 218.83 | 1.46x | tile 256x128x128; hint 4; epi 1x4; tif 1 |
-| 2K | 427.75 | 422.21-434.43 | 3,795.4 | 290.53 | 1.47x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 4K | 643.82 | 637.25-649.63 | 5,043.3 | 454.13 | 1.42x | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 8K | 1,111.37 | 1,092.93-1,128.13 | 5,843.2 | 802.92 | 1.38x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 2,062.29 | 2,030.08-2,111.58 | 6,297.8 | 1,504.68 | 1.37x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 32K | 4,061.55 | 3,981.86-4,130.53 | 6,395.6 | 3,014.84 | 1.35x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| Tokens/rank | NVFP4 ref (us) | MXFP8 (us) | Min-max (us) | TFLOP/s | Knobs |
+|---|---|---|---|---|---|
+| 1K | 218.83 | 319.07 (1.46x) | 315.04-339.01 | 2,544.1 | tile 256x128x128; hint 4; epi 1x4; tif 1 |
+| 2K | 290.53 | 427.75 (1.47x) | 422.21-434.43 | 3,795.4 | tile 256x256x128; hint 3; epi 2x4; tif 1 |
+| 4K | 454.13 | 643.82 (1.42x) | 637.25-649.63 | 5,043.3 | tile 256x256x128; hint 3; epi 2x4; tif 1 |
+| 8K | 802.92 | 1,111.37 (1.38x) | 1,092.93-1,128.13 | 5,843.2 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 16K | 1,504.68 | 2,062.29 (1.37x) | 2,030.08-2,111.58 | 6,297.8 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 32K | 3,014.84 | 4,061.55 (1.35x) | 3,981.86-4,130.53 | 6,395.6 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
 
 #### MXFP8, power-law routing (alpha=0.8)
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | NVFP4 ref (us) | MXFP8/NVFP4 | Knobs |
-|---|---|---|---|---|---|
-| 1K | 437.27 | 429.60-445.12 | 315.28 | 1.39x | tile 256x128x128; hint 3; epi 1x4; tif 1 |
-| 2K | 546.01 | 539.36-556.67 | 378.97 | 1.44x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 4K | 698.71 | 692.74-707.39 | 532.55 | 1.31x | tile 256x256x128; hint 4; epi 1x4; tif 1 |
-| 8K | 1,596.46 | 1,589.02-1,603.71 | 1,255.96 | 1.27x | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 2,588.31 | 2,562.85-2,655.49 | 2,040.66 | 1.27x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
-| 32K | 5,851.03 | 5,782.66-5,913.06 | 4,497.98 | 1.30x | tile 256x256x128; hint 3; epi 1x4; tif 4 |
+| Tokens/rank | NVFP4 ref (us) | MXFP8 (us) | Min-max (us) | Knobs |
+|---|---|---|---|---|
+| 1K | 315.28 | 437.27 (1.39x) | 429.60-445.12 | tile 256x128x128; hint 3; epi 1x4; tif 1 |
+| 2K | 378.97 | 546.01 (1.44x) | 539.36-556.67 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 4K | 532.55 | 698.71 (1.31x) | 692.74-707.39 | tile 256x256x128; hint 4; epi 1x4; tif 1 |
+| 8K | 1,255.96 | 1,596.46 (1.27x) | 1,589.02-1,603.71 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
+| 16K | 2,040.66 | 2,588.31 (1.27x) | 2,562.85-2,655.49 | tile 256x256x128; hint 3; epi 1x4; tif 4 |
+| 32K | 4,497.98 | 5,851.03 (1.30x) | 5,782.66-5,913.06 | tile 256x256x128; hint 3; epi 1x4; tif 4 |
 
 MXFP8 lands at a steady ~1.3-1.5x the NVFP4 latency and plateaus at
 ~6.3 PFLOP/s (vs 8.6 for NVFP4) — consistent with the doubled operand bytes

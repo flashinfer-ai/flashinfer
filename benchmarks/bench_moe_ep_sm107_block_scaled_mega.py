@@ -67,7 +67,7 @@ WINNERS = {
     ("power_law", 32768): dict(tile=(256, 256, 256), hint=3, epi=(1, 4), tif=4),
 }
 
-# Upstream reference latencies (us) for the delta column, Rubin TS4B @ 47881ad2.
+# Upstream reference latencies (us) for the reference column, Rubin TS4B @ 47881ad2.
 UPSTREAM_US = {
     ("balanced", 1024): 372.22,
     ("balanced", 2048): 410.48,
@@ -417,9 +417,6 @@ def main() -> None:
                             if quant_kind == "nvfp4"
                             else None
                         )
-                        # Plain latency ratio (ours/reference): signed percent
-                        # deltas are easy to misread, X.XXx is not.
-                        delta = f"{avg / ref:.2f}x" if ref else "n/a"
                         knobs = result["knobs"]
                         tflops_col = f"{tflops:.1f}" if tflops is not None else "-"
                         ref_col = f"{ref:.2f}" if ref is not None else "-"
@@ -429,10 +426,13 @@ def main() -> None:
                             f"epi {knobs['epi'][0]}x{knobs['epi'][1]}; "
                             f"tif {knobs['tif']}"
                         )
+                        # Reference first, then our result with the inline
+                        # latency ratio (ours/reference) — no signed-percent
+                        # delta column (easy to misread).
+                        ours = f"{avg:.2f} ({avg / ref:.2f}x)" if ref else f"{avg:.2f}"
                         print(
-                            f"| {quant_kind} | {routing} | {tokens} | {avg:.2f} | "
-                            f"{lo:.2f}-{hi:.2f} | "
-                            f"{tflops_col} | {ref_col} | {delta} | {detail} |",
+                            f"| {quant_kind} | {routing} | {tokens} | {ref_col} | "
+                            f"{ours} | {lo:.2f}-{hi:.2f} | {tflops_col} | {detail} |",
                             flush=True,
                         )
                         with open(args.output, "a") as fh:
