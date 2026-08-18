@@ -130,6 +130,7 @@ from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
+from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode

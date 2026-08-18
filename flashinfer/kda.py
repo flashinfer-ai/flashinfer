@@ -24,6 +24,7 @@ decode and speculative decode retain the backend exposed by
 ``flashinfer.kda_decode``.
 """
 
+import threading
 from typing import Literal, Optional
 
 import torch
@@ -138,9 +139,9 @@ def recurrent_kda(
             contract is not normally host-validated. Eager calls without an
             explicit workspace or ``seq_order`` read these values once per
             unchanged offsets tensor to schedule longer sequences first on
-            Cake. CuTe DSL instead generates the order on device every launch;
-            eligible 148-SM B200 and 152-SM GB200 Cake calls also cache
-            persistent worker task bins.
+            Cake. CuTe DSL uses the original sequence order unless the caller
+            supplies ``seq_order``; eligible 148-SM B200 and 152-SM GB200 Cake
+            calls also cache persistent worker task bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
@@ -172,12 +173,13 @@ def recurrent_kda(
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
-            permutation of shape ``[N]``. It overrides automatic ordering in
-            both Cake and CuTe DSL. Without it, CuTe DSL runs a device-side
-            stable descending-length sort before each non-persistent launch;
-            Cake constructs and caches eager host metadata. On Cake, supplying
-            it keeps the direct schedule so caller-owned ordering is not
-            replaced by persistent task bins.
+            permutation of shape ``[N]``. CuTe DSL uses the original sequence
+            order when this is omitted; callers that want length-prioritized
+            scheduling can prepare it outside the launch with
+            :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
+            own eager host metadata. On Cake, supplying an order keeps the
+            direct schedule so caller-owned ordering is not replaced by
+            persistent task bins.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family prefill backends.
@@ -202,9 +204,9 @@ def recurrent_kda(
             cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake"]):
             Implementation backend. ``"auto"`` selects the ported BT=16
-            CuTe DSL kernel for supported ordinary multi-token prefill and
-            falls back to an exported frozen Cake specialization for contracts
-            such as checkpointing.
+            CuTe DSL kernel for supported ordinary multi-token prefill,
+            including state checkpoints, and otherwise falls back to an
+            exported frozen Cake specialization.
             ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
 
     Returns:
@@ -226,23 +228,8 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
-    cute_dsl_feature_contract = (
-        checkpoint_every_n_tokens == 0
-        and state_checkpoints is None
-        and checkpoint_cu_starts is None
-    )
-    try_cute_dsl_prefill = backend == "cute-dsl" or (
-        backend == "auto" and cute_dsl_feature_contract
-    )
+    try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
-        if (
-            checkpoint_every_n_tokens != 0
-            or state_checkpoints is not None
-            or checkpoint_cu_starts is not None
-        ):
-            raise ValueError(
-                "state checkpoints are not yet supported by backend='cute-dsl'"
-            )
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
             q=q,
             k=k,
@@ -264,6 +251,9 @@ def recurrent_kda(
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
             beta_is_logit=beta_is_logit,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
         if backend == "cute-dsl" and not cute_dsl_eligible:
             raise ValueError(
@@ -290,6 +280,9 @@ def recurrent_kda(
                 seq_order=seq_order,
                 output=output,
                 prefill_workspace=prefill_workspace,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
 
     use_flash_kda_prefill = (
@@ -398,3 +391,215 @@ def recurrent_kda(
         beta_is_logit=beta_is_logit,
         backend="cake" if backend == "cake" else "cute-dsl",
     )
+
+
+class RecurrentKDAPrefillWrapper:
+    """Plan-and-run wrapper for packed recurrent-KDA prefill.
+
+    ``plan`` runs outside CUDA Graph capture.  It reads ``cu_seqlens`` on the
+    host, builds a stable descending-length sequence order, and copies both
+    arrays into fixed-address device buffers.  ``run`` consumes those buffers
+    through :func:`recurrent_kda` as an explicit host-planned order.
+
+    The number of sequences, total token count, and total BT=16 chunk count are
+    fixed by the first ``plan`` call so device buffer addresses, workspace
+    capacity, and captured launch geometry remain valid across CUDA Graph
+    replays.  Call ``plan`` again before replay to update individual lengths,
+    order, and chunk metadata in place when those totals remain unchanged.
+
+    This wrapper is specific to the CuTe DSL backend and intentionally uses
+    its non-persistent schedule.
+    """
+
+    def __init__(
+        self,
+        device: torch.device | str,
+    ) -> None:
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("RecurrentKDAPrefillWrapper requires a CUDA device")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self._workspace = _kda_prefill.RecurrentKDAPrefillWorkspace(self.device)
+        self._cu_seqlens_buf: Optional[torch.Tensor] = None
+        self._seq_order_buf: Optional[torch.Tensor] = None
+        self._cu_chunks_buf: Optional[torch.Tensor] = None
+        self._chunk_to_seq_buf: Optional[torch.Tensor] = None
+        self._num_sequences: Optional[int] = None
+        self._total_tokens: Optional[int] = None
+        self._total_chunks: Optional[int] = None
+        self._lock = threading.Lock()
+
+    def plan(
+        self,
+        cu_seqlens: torch.Tensor,
+        *,
+        non_blocking: bool = True,
+    ) -> None:
+        """Plan a packed prefill sequence order outside CUDA Graph capture.
+
+        ``cu_seqlens`` may reside on CPU or on this wrapper's CUDA device and
+        may use int32 or int64 storage.  Device input is copied to the host for
+        validation and sorting.  The resulting metadata is then copied into
+        stable int64/int32 CUDA buffers owned by the wrapper.
+        """
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "RecurrentKDAPrefillWrapper.plan must run outside CUDA graph capture"
+            )
+        if not isinstance(cu_seqlens, torch.Tensor):
+            raise TypeError("cu_seqlens must be a torch.Tensor")
+        if (
+            cu_seqlens.dtype not in (torch.int32, torch.int64)
+            or cu_seqlens.ndim != 1
+            or not cu_seqlens.is_contiguous()
+            or cu_seqlens.numel() < 2
+        ):
+            raise ValueError(
+                "cu_seqlens must be a contiguous int32 or int64 tensor with "
+                "at least two entries"
+            )
+        if cu_seqlens.is_cuda and cu_seqlens.device != self.device:
+            raise ValueError(
+                f"cu_seqlens must be on {self.device} or CPU, got {cu_seqlens.device}"
+            )
+
+        offsets = tuple(int(value) for value in cu_seqlens.to("cpu").tolist())
+        if offsets[0] != 0 or any(
+            right <= left for left, right in zip(offsets, offsets[1:], strict=False)
+        ):
+            raise ValueError("cu_seqlens must start at zero and be strictly increasing")
+        num_sequences = len(offsets) - 1
+        sequence_order = sorted(
+            range(num_sequences),
+            key=lambda index: offsets[index + 1] - offsets[index],
+            reverse=True,
+        )
+        chunk_counts = [
+            (offsets[index + 1] - offsets[index] + 15) // 16
+            for index in range(num_sequences)
+        ]
+        cu_chunks = [0]
+        chunk_to_seq = []
+        for index, count in enumerate(chunk_counts):
+            cu_chunks.append(cu_chunks[-1] + count)
+            chunk_to_seq.extend([index] * count)
+        total_chunks = cu_chunks[-1]
+
+        with self._lock:
+            if self._num_sequences is None:
+                self._num_sequences = num_sequences
+                self._cu_seqlens_buf = torch.empty(
+                    num_sequences + 1, dtype=torch.int64, device=self.device
+                )
+                self._seq_order_buf = torch.empty(
+                    num_sequences, dtype=torch.int32, device=self.device
+                )
+                self._cu_chunks_buf = torch.empty(
+                    num_sequences + 1, dtype=torch.int32, device=self.device
+                )
+                self._chunk_to_seq_buf = torch.empty(
+                    total_chunks, dtype=torch.int32, device=self.device
+                )
+                self._total_chunks = total_chunks
+            elif num_sequences != self._num_sequences:
+                raise ValueError(
+                    "the number of sequences is fixed after the first plan call: "
+                    f"expected {self._num_sequences}, got {num_sequences}"
+                )
+            elif offsets[-1] != self._total_tokens:
+                raise ValueError(
+                    "the total token count is fixed after the first plan call: "
+                    f"expected {self._total_tokens}, got {offsets[-1]}"
+                )
+            elif total_chunks != self._total_chunks:
+                raise ValueError(
+                    "the total BT=16 chunk count is fixed after the first plan "
+                    "call so CUDA Graph launch geometry remains stable: "
+                    f"expected {self._total_chunks}, got {total_chunks}"
+                )
+            assert self._cu_seqlens_buf is not None
+            assert self._seq_order_buf is not None
+            assert self._cu_chunks_buf is not None
+            assert self._chunk_to_seq_buf is not None
+            self._cu_seqlens_buf.copy_(cu_seqlens, non_blocking=non_blocking)
+            self._seq_order_buf.copy_(
+                torch.tensor(sequence_order, dtype=torch.int32),
+                non_blocking=non_blocking,
+            )
+            self._cu_chunks_buf.copy_(
+                torch.tensor(cu_chunks, dtype=torch.int32),
+                non_blocking=non_blocking,
+            )
+            self._chunk_to_seq_buf.copy_(
+                torch.tensor(chunk_to_seq, dtype=torch.int32),
+                non_blocking=non_blocking,
+            )
+            self._workspace.__dict__["_cute_dsl_cu_chunks"] = self._cu_chunks_buf
+            self._workspace.__dict__["_cute_dsl_chunk_to_seq"] = self._chunk_to_seq_buf
+            self._total_tokens = offsets[-1]
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        scale: Optional[float] = None,
+        initial_state: Optional[torch.Tensor] = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = True,
+        use_gate_in_kernel: bool = False,
+        lower_bound: Optional[float] = None,
+        output: Optional[torch.Tensor] = None,
+        beta_is_logit: bool = False,
+        state_checkpoints: Optional[torch.Tensor] = None,
+        checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        checkpoint_every_n_tokens: int = 0,
+    ) -> (
+        tuple[torch.Tensor, Optional[torch.Tensor]]
+        | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+    ):
+        """Run packed recurrent-KDA prefill using the most recent plan."""
+
+        with self._lock:
+            if self._total_tokens is None:
+                raise RuntimeError("call plan before run")
+            if q.ndim != 4 or q.shape[0] * q.shape[1] != self._total_tokens:
+                raise ValueError(
+                    "q token count must match the most recent plan: "
+                    f"expected {self._total_tokens}, got "
+                    f"{q.shape[0] * q.shape[1] if q.ndim == 4 else 'invalid rank'}"
+                )
+            cu_seqlens = self._cu_seqlens_buf
+            seq_order = self._seq_order_buf
+        assert cu_seqlens is not None
+        assert seq_order is not None
+        return recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            beta_is_logit=beta_is_logit,
+            seq_order=seq_order,
+            prefill_workspace=self._workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            backend="cute-dsl",
+        )

@@ -28,6 +28,7 @@ from .kda_prefill import (
     RecurrentKDAPrefillWorkspace,
     _bind_workspace,
     _check_output_does_not_overlap_inputs,
+    _identity_seq_order,
 )
 from .utils import get_compute_capability
 
@@ -57,6 +58,9 @@ def _is_cute_dsl_kda_prefill_eligible(
     initial_state_source: Optional[torch.Tensor],
     initial_state_indices: Optional[torch.Tensor],
     beta_is_logit: bool,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
 ) -> bool:
     """Return whether the call matches the ported BT=16 kernel contract."""
 
@@ -169,11 +173,40 @@ def _is_cute_dsl_kda_prefill_eligible(
         or not output.is_contiguous()
     ):
         return False
+    if (
+        checkpoint_every_n_tokens < 0
+        or checkpoint_every_n_tokens > torch.iinfo(torch.int32).max
+        or checkpoint_every_n_tokens % 32 != 0
+    ):
+        return False
+    if checkpoint_every_n_tokens:
+        if (
+            not isinstance(state_checkpoints, torch.Tensor)
+            or state_checkpoints.device != q.device
+            or state_checkpoints.dtype != torch.bfloat16
+            or state_checkpoints.ndim != 4
+            or tuple(state_checkpoints.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
+            or state_checkpoints.shape[0] > torch.iinfo(torch.int32).max
+            or not state_checkpoints.is_contiguous()
+            or not isinstance(checkpoint_cu_starts, torch.Tensor)
+            or checkpoint_cu_starts.device != q.device
+            or checkpoint_cu_starts.dtype != torch.int64
+            or checkpoint_cu_starts.ndim != 1
+            or checkpoint_cu_starts.numel() != num_sequences + 1
+            or not checkpoint_cu_starts.is_contiguous()
+        ):
+            return False
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        return False
     return True
 
 
 def _get_compiled_cute_dsl_kda(
-    *, lower_bound: float, has_state_in: bool, has_state_out: bool
+    *,
+    lower_bound: float,
+    has_state_in: bool,
+    has_state_out: bool,
+    has_state_ckpt: bool,
 ):
     # Keep the large CuTe DSL module lazy so normal Cake and decode imports do
     # not initialize its compilation stack.
@@ -189,7 +222,7 @@ def _get_compiled_cute_dsl_kda(
         gate_lower_bound=lower_bound,
         has_state_in=has_state_in,
         has_state_out=has_state_out,
-        has_state_ckpt=False,
+        has_state_ckpt=has_state_ckpt,
         mode=None,
     )
 
@@ -211,7 +244,13 @@ def _run_cute_dsl_kda_prefill(
     seq_order: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> (
+    tuple[torch.Tensor, Optional[torch.Tensor]]
+    | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+):
     """Launch the ported DKG BT=16 prefill kernel on the current stream."""
 
     capturing = torch.cuda.is_current_stream_capturing()
@@ -245,6 +284,11 @@ def _run_cute_dsl_kda_prefill(
         raise ValueError(f"scale must be finite, got {scale_value}")
 
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+    if seq_order is None:
+        seq_order = _identity_seq_order(
+            device=q.device,
+            num_sequences=num_sequences,
+        )
     if initial_state is not None:
         final_state = initial_state
     elif output_final_state:
@@ -276,8 +320,26 @@ def _run_cute_dsl_kda_prefill(
         lower_bound=float(lower_bound),
         has_state_in=initial_state is not None,
         has_state_out=final_state is not None,
+        has_state_ckpt=state_checkpoints is not None,
     )
-    if cu_seqlens is None:
+    planned_cu_chunks = (
+        getattr(prefill_workspace, "_cute_dsl_cu_chunks", None)
+        if prefill_workspace is not None
+        else None
+    )
+    planned_chunk_to_seq = (
+        getattr(prefill_workspace, "_cute_dsl_chunk_to_seq", None)
+        if prefill_workspace is not None
+        else None
+    )
+    if planned_cu_chunks is not None and planned_chunk_to_seq is not None:
+        workspace_bytes = compiled.workspace_size_from_total_chunks(
+            num_sequences,
+            q.shape[2],
+            planned_chunk_to_seq.numel(),
+            q.device,
+        )
+    elif cu_seqlens is None:
         workspace_bytes = compiled.workspace_size(
             None,
             q.shape[2],
@@ -300,6 +362,13 @@ def _run_cute_dsl_kda_prefill(
         workspace = None
 
     def launch(workspace_arg: Optional[torch.Tensor]) -> None:
+        checkpoint_kwargs = {}
+        if checkpoint_every_n_tokens:
+            checkpoint_kwargs = {
+                "state_ckpt": state_checkpoints,
+                "checkpoint_cu_starts": checkpoint_cu_starts,
+                "ckpt_interval": checkpoint_every_n_tokens,
+            }
         compiled(
             q,
             k,
@@ -316,6 +385,9 @@ def _run_cute_dsl_kda_prefill(
             torch.cuda.current_stream(q.device).cuda_stream,
             scale_value,
             seq_order=seq_order,
+            planned_cu_chunks=planned_cu_chunks,
+            planned_chunk_to_seq=planned_chunk_to_seq,
+            **checkpoint_kwargs,
         )
 
     if lock is None:
@@ -330,7 +402,7 @@ def _run_cute_dsl_kda_prefill(
                 capturing=capturing,
                 explicit=True,
             )
-            workspace = workspace_owner._cute_dsl_workspace
+            workspace = getattr(workspace_owner, "_cute_dsl_workspace", None)
             if workspace_bytes and (
                 workspace is None or workspace.numel() < workspace_bytes
             ):
@@ -342,13 +414,17 @@ def _run_cute_dsl_kda_prefill(
                 workspace = torch.empty(
                     workspace_bytes, dtype=torch.uint8, device=q.device
                 )
-                workspace_owner._cute_dsl_workspace = workspace
+                workspace_owner.__dict__["_cute_dsl_workspace"] = workspace
             if workspace is not None:
                 workspace = workspace[:workspace_bytes]
             launch(workspace)
             if capturing:
                 workspace_owner._captured = True
-    return out, final_state if output_final_state else None
+    result = (out, final_state if output_final_state else None)
+    if checkpoint_every_n_tokens:
+        assert state_checkpoints is not None
+        return (*result, state_checkpoints)
+    return result
 
 
 __all__ = [

@@ -290,7 +290,6 @@ def _make_case(
     *,
     state_rotations: int,
     candidate_route: str,
-    candidate_backend: str,
     flash_kda=None,
 ) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
@@ -381,7 +380,6 @@ def _make_case(
             beta_is_logit=True,
             seq_order=seq_order,
             prefill_workspace=candidate_workspace,
-            backend=candidate_backend,
         )
 
     peer_raw_run = None
@@ -489,25 +487,11 @@ def _make_case(
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
         reset_state_pools()
-    if candidate_backend == "cute-dsl" and resolved_routes:
+    if len(resolved_routes) != 1:
         raise RuntimeError(
-            f"CuTe DSL backend unexpectedly entered a Cake route: {resolved_routes}"
+            f"expected one FlashKDA prefill route during warmup, got {resolved_routes}"
         )
-    if candidate_backend in ("auto", "cute-dsl") and not resolved_routes:
-        cute_module = import_module("flashinfer.kda_kernels.kda_chunked_bt16")
-        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-        resolved_variant, _ = cute_module._occupancy_pick_route(
-            tuple(offsets), case.num_heads, sm_count
-        )
-        resolved_variant = f"bt16-{resolved_variant}"
-        resolved_target = "cute-dsl"
-    else:
-        if len(resolved_routes) != 1:
-            raise RuntimeError(
-                "expected one FlashKDA prefill route during warmup, "
-                f"got {resolved_routes}"
-            )
-        resolved_variant, resolved_target = resolved_routes[0]
+    resolved_variant, resolved_target = resolved_routes[0]
 
     metadata = {
         "name": case.name,
@@ -518,7 +502,6 @@ def _make_case(
         "variant": resolved_variant,
         "target": resolved_target,
         "candidate_route": candidate_route,
-        "candidate_backend": candidate_backend,
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -625,12 +608,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--backend",
-        choices=("auto", "cake", "cute-dsl"),
-        default="auto",
-        help="Public recurrent_kda backend to benchmark.",
-    )
-    parser.add_argument(
         "--candidate-route",
         choices=("dispatcher", "nonpersistent"),
         default="dispatcher",
@@ -671,8 +648,6 @@ def main() -> None:
         parser.error(
             "--flash-kda-peer and --flash-kda-source-dir must be provided together"
         )
-    if args.backend == "cute-dsl" and args.candidate_route != "dispatcher":
-        parser.error("--candidate-route nonpersistent is Cake-specific")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
@@ -731,7 +706,6 @@ def main() -> None:
             case,
             state_rotations=state_rotations,
             candidate_route=args.candidate_route,
-            candidate_backend=args.backend,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}

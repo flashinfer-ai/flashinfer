@@ -17,22 +17,23 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 Backend selection
 -----------------
 
-``backend="auto"`` preserves the default routing: eligible multi-token prefill
-uses the frozen Cake backend, while decode uses the existing CuTe DSL backend.
+``backend="auto"`` selects the source-level CuTe DSL backend for eligible
+ordinary multi-token prefill and falls back to the frozen Cake backend for
+unsupported contracts. Decode retains the existing KDA decode routing.
 ``backend="cake"`` and ``backend="cute-dsl"`` select a backend strictly and
 raise when its contract is unsupported.
 
 For multi-token prefill, ``backend="cute-dsl"`` selects the BT=16 kernel ported
 from DKG MR 26001. It supports contiguous BF16 Q, K, V, G, and beta with one
 shared head count and head dimension 128, the in-kernel lower-bound gate, fixed
-or packed-varlen layout, and BF16 recurrent state. Packed offsets must be int64
-during CUDA graph capture. Native Cake checkpoint and ``seq_order`` extensions
-are not yet supported by this backend.
+or packed-varlen layout, BF16 recurrent state, explicit ``seq_order``, and the
+same checkpoint contract as Cake. Packed offsets and checkpoint starts must be
+int64 during CUDA graph capture. The CuTe DSL schedule is non-persistent.
 
 Optimized Blackwell prefill subset
 -----------------------------------
 
-``flashinfer.kda.recurrent_kda`` uses the frozen prefill backend only when
+The strict Cake backend is available only when
 every condition below holds:
 
 * the device has compute capability 10.0 (SM100a; B200/GB200) or 10.3
@@ -51,8 +52,7 @@ every condition below holds:
   features are not enabled. Plain int32 ``ssm_state_indices`` and native
   prefill checkpoints are supported by direct M128.
 
-Calls outside that subset retain the existing CuTe-DSL path. In particular,
-T=1 decode and speculative decode are not rerouted.
+T=1 decode and speculative decode are not handled by either prefill backend.
 
 CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
 ``sm_100a`` modules. With CUDA 12.9 or newer, JIT and AOT compile one
@@ -101,6 +101,14 @@ packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64 value-split kernel;
 the fixed small-BH region described above selects its eight-CTA owner/helper
 schedule; all remaining eligible inputs select the general 32-token M128
 schedule.
+
+CuTe DSL no-plan execution also uses the original sequence order and launches
+no sorting kernel. ``flashinfer.RecurrentKDAPrefillWrapper`` provides an
+optional host-planned path: ``plan`` builds a stable decreasing-length order
+and the decomp ``cu_chunks`` / ``chunk_to_seq`` metadata, then ``run`` consumes
+fixed-address buffers. The number of sequences, total tokens, and total BT=16
+chunks are fixed by the first plan so the metadata and launch geometry remain
+valid across CUDA Graph replays.
 
 State and graph semantics
 -------------------------

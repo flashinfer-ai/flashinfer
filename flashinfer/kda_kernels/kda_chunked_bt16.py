@@ -73,10 +73,11 @@ Optimization notes (each expanded at its definition site):
   all drain the same accumulator (`tcgen05_store_final_state_tmem`).
 
 State checkpoints (opt-in): `compile(has_state_ckpt=True)` returns a callable
-taking `state_ckpt` ([total_ckpts, H, DV, DK] fp32) and `ckpt_interval` (a
-positive multiple of BT); `state_ckpt[k]` of a sequence is bitwise the
-`final_state` a run truncated after `(k + 1) * ckpt_interval` tokens would
-emit.
+taking `state_ckpt`, `checkpoint_cu_starts`, and `ckpt_interval` (a positive
+multiple of BT).  Each sequence stores its initial state first, followed by
+states at `ckpt_interval` boundaries strictly before the end of the sequence;
+the final state remains a separate output.  This matches the public KDA/Cake
+checkpoint contract.
 
 Reproducing the results::
 
@@ -113,6 +114,7 @@ class CompiledKDA(Protocol):
     """Callable returned by ``compile`` with its workspace query attached."""
 
     workspace_size: Callable[..., int]
+    workspace_size_from_total_chunks: Callable[..., int]
 
     def __call__(self, *args, **kwargs) -> None: ...
 
@@ -3224,6 +3226,8 @@ def advance_ring_stage(
 def tcgen05_store_initial_state_tmem(
     tmem_raw_addr,
     initial_state: cute.Tensor | None,
+    state_ckpt: cute.Tensor | None,
+    ckpt_slot,
     bidx,
     bidy,
     dv_half,
@@ -3276,6 +3280,19 @@ def tcgen05_store_initial_state_tmem(
                         cutlass.Float32
                     )
             state_block[col] = state_value
+            if cutlass.const_expr(state_ckpt is not None):
+                if (ckpt_slot >= cutlass.Int32(0)) & (
+                    ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+                ):
+                    if cutlass.const_expr(HALF):
+                        if valid_lane:
+                            state_ckpt[ckpt_slot, bidy, value_dim, key_dim] = (
+                                state_value.to(state_ckpt.element_type)
+                            )
+                    else:
+                        state_ckpt[ckpt_slot, bidy, value_dim, key_dim] = (
+                            state_value.to(state_ckpt.element_type)
+                        )
 
         projection_col_id = base_col_id + KDA_TMEM_STATE_COL_OFFSET + key_block_start
         block_addr = (row_id << 16) | projection_col_id
@@ -4578,41 +4595,6 @@ def tcgen05_store_final_state_tmem(
                 )
 
 
-SEQUENCE_ORDER_THREADS: int = 256
-
-
-@cute.kernel
-def sequence_order_kernel(
-    cu_seqlens: cute.Tensor,
-    seq_order: cute.Tensor,
-) -> None:
-    """Stable device-side descending-length order via odd-even transposition."""
-
-    tidx, _, _ = cute.arch.thread_idx()
-    n_seq = cutlass.Int32(seq_order.shape[0])
-    for index in cutlass.range(tidx, n_seq, SEQUENCE_ORDER_THREADS):
-        seq_order[index] = cutlass.Int32(index)
-    cute.arch.sync_threads()
-
-    for phase in cutlass.range(n_seq):
-        parity = phase & cutlass.Int32(1)
-        pair_count = (n_seq - parity) // cutlass.Int32(2)
-        for pair in cutlass.range(tidx, pair_count, SEQUENCE_ORDER_THREADS):
-            left = parity + pair * cutlass.Int32(2)
-            right = left + cutlass.Int32(1)
-            left_seq = cutlass.Int32(seq_order[left])
-            right_seq = cutlass.Int32(seq_order[right])
-            left_len = cu_seqlens[left_seq + 1] - cu_seqlens[left_seq]
-            right_len = cu_seqlens[right_seq + 1] - cu_seqlens[right_seq]
-            swap = (right_len > left_len) | (
-                (right_len == left_len) & (right_seq < left_seq)
-            )
-            if swap:
-                seq_order[left] = right_seq
-                seq_order[right] = left_seq
-        cute.arch.sync_threads()
-
-
 @cute.kernel
 def kernel(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
@@ -4636,6 +4618,7 @@ def kernel(
     SCALE: cutlass.Float32,
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Int32,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
@@ -5454,7 +5437,7 @@ def kernel(
         late_operand_stage = cg0_group_id
         cg0_ckpt_stride = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
-            cg0_ckpt_stride = cutlass.Int32(cu_ckpts[0])
+            cg0_ckpt_stride = checkpoint_stride_chunks
         # v27_peel: STRUCTURAL in-kernel tail-peel of the CG0 producer loop.
         # The interior mainloop runs the GUARD-FREE body over chunks
         # [cg0_group_id, num_chunks-1): NO per-chunk `chunk_start+BT>seqlen`
@@ -5688,9 +5671,16 @@ def kernel(
     elif is_compute_group1_warp(warp_idx):
         prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
         tmem_raw_addr = tmem_ptr_i32.load()
+        ckpt_slot = cutlass.Int32(0)
+        if cutlass.const_expr(state_ckpt is not None):
+            ckpt_stride = checkpoint_stride_chunks
+            ckpt_next = ckpt_stride
+            ckpt_slot = cutlass.Int32(cu_ckpts[bidx])
         tcgen05_store_initial_state_tmem(
             tmem_raw_addr,
             initial_state,
+            state_ckpt,
+            ckpt_slot,
             bidx,
             bidy,
             cutlass.Int32(0),
@@ -5702,14 +5692,9 @@ def kernel(
         state_input_ready_arrive(initial_state_ready_mbar)
         shared_acc_event_id = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
-            # cu_ckpts[0] carries the checkpoint stride in chunks; per-sequence
-            # base slot offsets follow at [1 + seq].  Loop-carried counters
-            # replace a per-chunk div/mod, so a checkpoint costs one compare per
-            # chunk and no extra ABI scalar (the non-checkpoint kernel keeps
-            # its exact signature and generated code).
-            ckpt_stride = cutlass.Int32(cu_ckpts[0])
-            ckpt_next = ckpt_stride
-            ckpt_slot = cutlass.Int32(cu_ckpts[bidx + cutlass.Int32(1)])
+            # cu_ckpts supplies the per-sequence base slot offsets.  A
+            # loop-carried counter replaces a per-chunk div/mod.
+            ckpt_slot += cutlass.Int32(1)
 
         if num_chunks > 0:
             shared_input_stage = cutlass.Int32(0)
@@ -5793,20 +5778,23 @@ def kernel(
             if cutlass.const_expr(state_ckpt is not None):
                 # Peeled chunk 0's checkpoint (fires only for stride 1, i.e. a
                 # checkpoint every BT tokens).
-                if ckpt_next == cutlass.Int32(1):
+                if (ckpt_next == cutlass.Int32(1)) & (cutlass.Int32(1) < num_chunks):
                     tcgen05_wait_acc_buffer_ready(k_restore_consumed_mbar.subview(0), 0)
-                    tcgen05_store_final_state_tmem(
-                        tmem_raw_addr,
-                        KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
-                        state_ckpt,
-                        ckpt_slot,
-                        bidy,
-                        cutlass.Int32(0),
-                        warp_idx,
-                        post_scale_lane,
-                        HALF=False,
-                    )
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                    if (ckpt_slot >= cutlass.Int32(0)) & (
+                        ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+                    ):
+                        tcgen05_store_final_state_tmem(
+                            tmem_raw_addr,
+                            KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+                            state_ckpt,
+                            ckpt_slot,
+                            bidy,
+                            cutlass.Int32(0),
+                            warp_idx,
+                            post_scale_lane,
+                            HALF=False,
+                        )
+                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
                     ckpt_slot += cutlass.Int32(1)
                     ckpt_next += ckpt_stride
@@ -5937,23 +5925,28 @@ def kernel(
                 # post-loop final store waits (the chunk's state-update MMA has
                 # committed), then reuse the final-state store routine with the
                 # flat checkpoint slot standing in for the sequence index.
-                if chunk + cutlass.Int32(1) == ckpt_next:
+                if (chunk + cutlass.Int32(1) == ckpt_next) & (
+                    chunk + cutlass.Int32(1) < num_chunks
+                ):
                     tcgen05_wait_acc_buffer_ready(
                         k_restore_consumed_mbar.subview(chunk % DECAY_STAGE_COUNT),
                         (chunk // DECAY_STAGE_COUNT) % 2,
                     )
-                    tcgen05_store_final_state_tmem(
-                        tmem_raw_addr,
-                        KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
-                        state_ckpt,
-                        ckpt_slot,
-                        bidy,
-                        cutlass.Int32(0),
-                        warp_idx,
-                        post_scale_lane,
-                        HALF=False,
-                    )
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                    if (ckpt_slot >= cutlass.Int32(0)) & (
+                        ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+                    ):
+                        tcgen05_store_final_state_tmem(
+                            tmem_raw_addr,
+                            KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+                            state_ckpt,
+                            ckpt_slot,
+                            bidy,
+                            cutlass.Int32(0),
+                            warp_idx,
+                            post_scale_lane,
+                            HALF=False,
+                        )
+                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
                     ckpt_slot += cutlass.Int32(1)
                     ckpt_next += ckpt_stride
@@ -6026,6 +6019,7 @@ def host(
     SCALE: cutlass.Float32,
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Int32,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
@@ -6138,6 +6132,7 @@ def host(
         SCALE,
         state_ckpt,
         cu_ckpts,
+        checkpoint_stride_chunks,
         SAFE_GATE,
         GATE_SCALE_LOG2,
         gate_dtype,
@@ -8553,6 +8548,7 @@ def kernel_chain_dv2(
     SCALE: cutlass.Float32,
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Int32,
 ) -> None:
     """kernel 2, DV-split: each CTA owns half the hidden dimension.
 
@@ -8960,18 +8956,18 @@ def kernel_chain_dv2(
     elif is_compute_group1_warp(warp_idx):
         prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
         tmem_raw_addr = tmem_ptr_i32.load()
+        ckpt_slot = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
-            # cu_ckpts[0] carries the checkpoint stride in chunks; per-sequence
-            # base slot offsets follow at [1 + seq].  Loop-carried counters
-            # replace a per-chunk div/mod, so a checkpoint costs one compare per
-            # chunk and no extra ABI scalar (the non-checkpoint kernel keeps
-            # its exact signature and generated code).
-            ckpt_stride = cutlass.Int32(cu_ckpts[0])
+            # cu_ckpts supplies the per-sequence base slot offsets.  A
+            # loop-carried counter replaces a per-chunk div/mod.
+            ckpt_stride = checkpoint_stride_chunks
             ckpt_next = ckpt_stride
-            ckpt_slot = cutlass.Int32(cu_ckpts[bidx + cutlass.Int32(1)])
+            ckpt_slot = cutlass.Int32(cu_ckpts[bidx])
         tcgen05_store_initial_state_tmem(
             tmem_raw_addr,
             initial_state,
+            state_ckpt,
+            ckpt_slot,
             bidx,
             bidy,
             dv_half,
@@ -8979,6 +8975,8 @@ def kernel_chain_dv2(
             lane,
             HALF=True,
         )
+        if cutlass.const_expr(state_ckpt is not None):
+            ckpt_slot += cutlass.Int32(1)
         if num_chunks > 0:
             diag_raw_stage = diag_raw_smem.subview(0)
             state_left = tcgen05_stage_state_input_dv2_half_tmem(
@@ -9025,22 +9023,25 @@ def kernel_chain_dv2(
             update_ready_arrive(update_ready_mbar)
             if cutlass.const_expr(state_ckpt is not None):
                 # Peeled chunk 0's checkpoint (stride 1 only).
-                if ckpt_next == cutlass.Int32(1):
+                if (ckpt_next == cutlass.Int32(1)) & (cutlass.Int32(1) < num_chunks):
                     tcgen05_wait_acc_buffer_ready(
                         k_restore_consumed_l_mbar.subview(0), 0
                     )
                     tcgen05_wait_acc_buffer_ready(k_restore_consumed_mbar.subview(0), 0)
-                    tcgen05_store_final_state_tmem(
-                        tmem_raw_addr,
-                        KDA_TMEM_STATE_COL_OFFSET,
-                        state_ckpt,
-                        ckpt_slot,
-                        bidy,
-                        dv_half,
-                        warp_idx,
-                        post_scale_lane,
-                        HALF=True,
-                    )
+                    if (ckpt_slot >= cutlass.Int32(0)) & (
+                        ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+                    ):
+                        tcgen05_store_final_state_tmem(
+                            tmem_raw_addr,
+                            KDA_TMEM_STATE_COL_OFFSET,
+                            state_ckpt,
+                            ckpt_slot,
+                            bidy,
+                            dv_half,
+                            warp_idx,
+                            post_scale_lane,
+                            HALF=True,
+                        )
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
                     ckpt_slot += cutlass.Int32(1)
                     ckpt_next += ckpt_stride
@@ -9094,7 +9095,9 @@ def kernel_chain_dv2(
                 # Same contract as the engine-side checkpoint; both M=64 TMEM
                 # halves wait their own k_restore parity slot (the same wait
                 # the post-loop final store performs) before draining.
-                if chunk + cutlass.Int32(1) == ckpt_next:
+                if (chunk + cutlass.Int32(1) == ckpt_next) & (
+                    chunk + cutlass.Int32(1) < num_chunks
+                ):
                     tcgen05_wait_acc_buffer_ready(
                         k_restore_consumed_l_mbar.subview(chunk % 2),
                         (chunk // 2) % 2,
@@ -9103,17 +9106,20 @@ def kernel_chain_dv2(
                         k_restore_consumed_mbar.subview(chunk % 2),
                         (chunk // 2) % 2,
                     )
-                    tcgen05_store_final_state_tmem(
-                        tmem_raw_addr,
-                        KDA_TMEM_STATE_COL_OFFSET,
-                        state_ckpt,
-                        ckpt_slot,
-                        bidy,
-                        dv_half,
-                        warp_idx,
-                        post_scale_lane,
-                        HALF=True,
-                    )
+                    if (ckpt_slot >= cutlass.Int32(0)) & (
+                        ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+                    ):
+                        tcgen05_store_final_state_tmem(
+                            tmem_raw_addr,
+                            KDA_TMEM_STATE_COL_OFFSET,
+                            state_ckpt,
+                            ckpt_slot,
+                            bidy,
+                            dv_half,
+                            warp_idx,
+                            post_scale_lane,
+                            HALF=True,
+                        )
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
                     ckpt_slot += cutlass.Int32(1)
                     ckpt_next += ckpt_stride
@@ -9172,7 +9178,7 @@ def kernel_chain_dv2(
             prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
             tmem_raw_addr = tmem_ptr_i32.load()
             if cutlass.const_expr(state_ckpt is not None):
-                cg0_ckpt_stride = cutlass.Int32(cu_ckpts[0])
+                cg0_ckpt_stride = checkpoint_stride_chunks
             if num_chunks > 0:
                 state_input_ready_wait(
                     state_input_ready_l_mbar,
@@ -9240,6 +9246,7 @@ def host_chain_dv2(
     SCALE: cutlass.Float32,
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Int32,
     THREADS: cutlass.Constexpr,
 ) -> None:
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
@@ -9336,6 +9343,7 @@ def host_chain_dv2(
         SCALE,
         state_ckpt,
         cu_ckpts,
+        checkpoint_stride_chunks,
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
@@ -9371,7 +9379,6 @@ def host_unified(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
-    generate_seq_order: cutlass.Int32,
     cu_chunks: cute.Tensor,
     chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
@@ -9385,7 +9392,7 @@ def host_unified(
     stream_a: cuda_driver.CUstream,
     seq_route: cutlass.Int32,
     sm_count: cutlass.Int32,
-    max_chunks: cutlass.Int32,
+    checkpoint_stride_chunks: cutlass.Int32,
     prep_num_ctas: cutlass.Int32,
     prep_cpc: cutlass.Int32,
     scale: cutlass.Float32,
@@ -9401,14 +9408,6 @@ def host_unified(
     heads = q.shape[2]
     h32 = cutlass.Int32(heads)
     z = cutlass.Int32(0)
-    if generate_seq_order != z:
-        # This prepass is a separate launch because ordinary CUDA grids have
-        # no cross-CTA barrier that could publish a fused global ordering.
-        sequence_order_kernel(cu_seqlens, seq_order).launch(
-            grid=(1, 1, 1),
-            block=(SEQUENCE_ORDER_THREADS, 1, 1),
-            stream=stream_a,
-        )
     # Route selection.  MODE is a COMPILE-TIME constexpr:
     #   MODE is None    -> RUNTIME routing (both routes emitted, one .o handles
     #                      all shapes) — the default build.
@@ -9476,6 +9475,7 @@ def host_unified(
             scale,
             state_ckpt,
             cu_ckpts,
+            checkpoint_stride_chunks,
             THREADS,
         )
     else:
@@ -9497,6 +9497,7 @@ def host_unified(
             scale,
             state_ckpt,
             cu_ckpts,
+            checkpoint_stride_chunks,
             SAFE_GATE,
             GATE_SCALE_LOG2,
             THREADS,
@@ -9575,7 +9576,7 @@ def _unified_fakes(
         fckpt = F(
             state_dtype, (sk, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16
         )
-        fcuk = F(cutlass.Int32, (scuk,), stride_order=(0,), assumed_align=8)
+        fcuk = F(cutlass.Int64, (scuk,), stride_order=(0,), assumed_align=8)
     else:
         fckpt = None
         fcuk = None
@@ -9590,7 +9591,6 @@ def _unified_fakes(
             fbeta,
             fcu,
             forder,
-            0,  # generate_seq_order
             fcuc,
             fcts,
             fkd,
@@ -9639,27 +9639,21 @@ _CKPT_OFFSETS: dict = {}
 _UNIFORM_CU_CACHE: dict = {}
 
 
-_DEVICE_SEQUENCE_ORDER_CACHE: dict = {}
+_IDENTITY_SEQUENCE_ORDER_CACHE: dict = {}
 
 
-def _stream_pointer(stream) -> int:
-    value = getattr(stream, "value", stream)
-    return int(value or 0)
+def _identity_sequence_order(num_sequences: int, device) -> torch.Tensor:
+    """Cached original sequence order for the low-level callable."""
 
-
-def _device_sequence_order_buffer(num_sequences: int, device, stream) -> torch.Tensor:
-    """Reusable per-stream output for the device sequence-order kernel."""
-
-    key = (str(device), _stream_pointer(stream), int(num_sequences))
-    order = _DEVICE_SEQUENCE_ORDER_CACHE.get(key)
+    key = (str(device), int(num_sequences))
+    order = _IDENTITY_SEQUENCE_ORDER_CACHE.get(key)
     if order is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "KDA device sequence-order buffer must be warmed before "
-                "CUDA graph capture"
+                "KDA identity sequence order must be warmed before CUDA graph capture"
             )
-        order = torch.empty(num_sequences, dtype=torch.int32, device=device)
-        _DEVICE_SEQUENCE_ORDER_CACHE[key] = order
+        order = torch.arange(num_sequences, dtype=torch.int32, device=device)
+        _IDENTITY_SEQUENCE_ORDER_CACHE[key] = order
     return order
 
 
@@ -9681,8 +9675,8 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
 
     Runtime ABI: (q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens,
     initial_state, out, final_state, workspace, stream_a, scale, ..., seq_order)
-    — ``seq_order=None`` launches the device ordering prepass; an explicit
-    packed CUDA int32 permutation bypasses it. The remaining positional ABI is
+    — ``seq_order=None`` uses the original sequence order; an explicit packed
+    CUDA int32 permutation overrides it. The remaining positional ABI is
     the reference host ABI (stream_a == the reference `stream`, scale in the same
     position) plus the `workspace` operand.  Decomp always runs prep-first on
     overlap.  `.workspace_size(cu_seqlens, heads)` is attached.  There is NO
@@ -9718,8 +9712,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         stream_a,
         scale=DEFAULT_SCALE,
         state_ckpt=None,
+        checkpoint_cu_starts=None,
         ckpt_interval=0,
         seq_order=None,
+        planned_cu_chunks=None,
+        planned_chunk_to_seq=None,
     ):
         # The state specialization is DERIVED from which state tensors the call
         # actually passes (initial/final/checkpoint present or None); if it
@@ -9758,8 +9755,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 stream_a,
                 scale,
                 state_ckpt=state_ckpt,
+                checkpoint_cu_starts=checkpoint_cu_starts,
                 ckpt_interval=ckpt_interval,
                 seq_order=seq_order,
+                planned_cu_chunks=planned_cu_chunks,
+                planned_chunk_to_seq=planned_chunk_to_seq,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -9788,9 +9788,8 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         device = q.device
         sm_count = _device_sm_count(device)
         n_seq = cu_seqlens.numel() - 1
-        generate_seq_order = seq_order is None
-        if generate_seq_order:
-            seq_order = _device_sequence_order_buffer(n_seq, device, stream_a)
+        if seq_order is None:
+            seq_order = _identity_sequence_order(n_seq, device)
         elif (
             seq_order.device != device
             or seq_order.dtype != torch.int32
@@ -9807,45 +9806,49 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         if kind is None:
             kind = _route_for_workspace(n_seq, heads, device, compile_mode or "auto")
             decisions[key] = kind
-        cu_list = (
-            _cu_seqlens_contents(cu_seqlens)
-            if state_ckpt is not None or kind == "decomp"
-            else None
+        has_planned_chunks = (
+            planned_cu_chunks is not None and planned_chunk_to_seq is not None
         )
-        # State checkpoints: every ckpt_interval tokens (a positive multiple of
-        # BT) the live recurrent state is stored to state_ckpt[slot], slot laid
-        # out flat per sequence in cu_seqlens order -- state_ckpt[k] of a
-        # sequence equals the final_state of the same run truncated after
-        # (k+1)*ckpt_interval tokens.  cu_ckpts carries the per-sequence base
-        # offsets (host-computed prefix sums, cached per shape).
+        if (planned_cu_chunks is None) != (planned_chunk_to_seq is None):
+            raise ValueError(
+                "planned_cu_chunks and planned_chunk_to_seq must be provided together"
+            )
+        cu_list = None
+        if (kind == "decomp" and not has_planned_chunks) or (
+            state_ckpt is not None and checkpoint_cu_starts is None
+        ):
+            cu_list = _cu_seqlens_contents(cu_seqlens)
+        checkpoint_stride_chunks = 0
         if state_ckpt is not None:
             if ckpt_interval <= 0 or ckpt_interval % BT:
                 raise ValueError(
                     f"ckpt_interval must be a positive multiple of {BT}, "
                     f"got {ckpt_interval}"
                 )
-            ckpt_key = (cu_list, int(ckpt_interval), str(device))
-            cu_ckpts_arg = _CKPT_OFFSETS.get(ckpt_key)
-            if cu_ckpts_arg is None:
-                offs, tot = [], 0
-                for i in range(n_seq):
-                    offs.append(tot)
-                    tot += (cu_list[i + 1] - cu_list[i]) // ckpt_interval
-                cu_ckpts_arg = torch.tensor(
-                    [ckpt_interval // BT] + offs, dtype=torch.int32, device=device
-                )
-                _CKPT_OFFSETS[ckpt_key] = cu_ckpts_arg
-            total_ckpts = sum(
-                (cu_list[i + 1] - cu_list[i]) // ckpt_interval for i in range(n_seq)
-            )
-            if state_ckpt.shape[0] < total_ckpts:
+            if checkpoint_cu_starts is not None and (
+                checkpoint_cu_starts.device != device
+                or checkpoint_cu_starts.dtype != torch.int64
+                or checkpoint_cu_starts.ndim != 1
+                or not checkpoint_cu_starts.is_contiguous()
+                or checkpoint_cu_starts.numel() != n_seq + 1
+            ):
                 raise ValueError(
-                    f"state_ckpt holds {state_ckpt.shape[0]} slots; this shape "
-                    f"needs {total_ckpts}"
+                    "checkpoint_cu_starts must be a contiguous CUDA int64 "
+                    "tensor with one entry per sequence plus one"
                 )
+            checkpoint_stride_chunks = ckpt_interval // BT
+            if checkpoint_cu_starts is None:
+                assert cu_list is not None
+                offsets, total = [0], 0
+                for i in range(n_seq):
+                    seq_len = cu_list[i + 1] - cu_list[i]
+                    total += (seq_len + ckpt_interval - 1) // ckpt_interval
+                    offsets.append(total)
+                cu_ckpts_arg = torch.tensor(offsets, dtype=torch.int64, device=device)
+            else:
+                cu_ckpts_arg = checkpoint_cu_starts
         else:
             cu_ckpts_arg = None
-        max_chunks = 0  # retained in the exported ABI; no route consumes it
         seq_route = 1  # single stream; kept as an arg so host_unified re-derives
         # The route rule lives in exactly two places: `_route_for_workspace`
         # (which `workspace_size` uses, so the caller allocates the right
@@ -9886,7 +9889,6 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 beta,
                 cu_seqlens,
                 seq_order,
-                int(generate_seq_order),
                 cuc,
                 cts,
                 kd,
@@ -9900,7 +9902,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 stream_a,
                 seq_route,
                 sm_count,
-                max_chunks,
+                checkpoint_stride_chunks,
                 1,
                 1,
                 scale,
@@ -9914,7 +9916,29 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             raise ValueError(
                 "workspace required for this shape; call workspace_size() and allocate"
             )
-        plan = _plan(cu_seqlens)
+        if has_planned_chunks:
+            if (
+                planned_cu_chunks.device != device
+                or planned_cu_chunks.dtype != torch.int32
+                or planned_cu_chunks.ndim != 1
+                or not planned_cu_chunks.is_contiguous()
+                or planned_cu_chunks.numel() != n_seq + 1
+                or planned_chunk_to_seq.device != device
+                or planned_chunk_to_seq.dtype != torch.int32
+                or planned_chunk_to_seq.ndim != 1
+                or not planned_chunk_to_seq.is_contiguous()
+            ):
+                raise ValueError(
+                    "planned chunk metadata must be contiguous CUDA int32 "
+                    "cu_chunks[N+1] and chunk_to_seq[total_chunks] tensors"
+                )
+            plan = {
+                "total_chunks": planned_chunk_to_seq.numel(),
+                "cu_chunks": planned_cu_chunks,
+                "chunk_to_seq": planned_chunk_to_seq,
+            }
+        else:
+            plan = _plan(cu_seqlens)
         total_chunks = plan["total_chunks"]
         ws = _partition_workspace(workspace, heads, total_chunks)
         # Decomp is prep-first on one stream: k1 runs its full grid, then k2
@@ -9938,7 +9962,6 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             beta,
             cu_seqlens,
             seq_order,
-            int(generate_seq_order),
             plan["cu_chunks"],
             plan["chunk_to_seq"],
             ws["kd"],
@@ -9952,7 +9975,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             stream_a,
             seq_route,
             sm_count,
-            max_chunks,
+            checkpoint_stride_chunks,
             num_ctas,
             cpc,
             scale,
@@ -9970,8 +9993,15 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             cu_seqlens = tuple(int(seqlen) * i for i in range(int(batch) + 1))
         return workspace_size(cu_seqlens, heads, mode or (compile_mode or "auto"))
 
+    def _ws_size_from_total_chunks(num_sequences, heads, total_chunks, device):
+        route_mode = compile_mode or "auto"
+        if _route_for_workspace(num_sequences, heads, device, route_mode) == "engine":
+            return 0
+        return _decomp_ws_bytes(int(heads), int(total_chunks))
+
     compiled_call = cast(CompiledKDA, call)
     compiled_call.workspace_size = _ws_size
+    compiled_call.workspace_size_from_total_chunks = _ws_size_from_total_chunks
     return compiled_call
 
 
@@ -10024,7 +10054,7 @@ def compile(  # noqa: A001
         make_fake_stream(),
         0,  # seq_route
         0,  # sm_count
-        0,  # max_chunks
+        0,  # checkpoint_stride_chunks
         0,  # prep_num_ctas
         0,  # prep_cpc
         DEFAULT_SCALE,
@@ -10123,7 +10153,14 @@ def _eager_module_load(
             s,
             DEFAULT_SCALE,
             state_ckpt=(
-                torch.zeros(64, heads, DV, DK, dtype=torch.float32, device="cuda")
+                torch.zeros(
+                    64,
+                    heads,
+                    DV,
+                    DK,
+                    dtype=DTYPE_MAP[state_dtype],
+                    device="cuda",
+                )
                 if has_state_ckpt
                 else None
             ),
