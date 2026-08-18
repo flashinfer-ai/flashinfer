@@ -50,9 +50,7 @@ def _config(**overrides) -> MoEConfig:
         experts=ExpertConfig(intermediate_size=256),
         activation=ActivationConfig.swiglu,
         backend=BackendOptions((CutlassBf16Config(),)),
-        execution=ExecutionConfig(
-            do_finalize=True, enable_pdl=False, tune_max_num_tokens=64
-        ),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
     values.update(overrides)
     return MoEConfig(**values)
@@ -772,7 +770,6 @@ def _make_case(num_tokens: int = 16):
     config = _config(
         experts=ExpertConfig(intermediate_size=intermediate_size),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),
@@ -828,7 +825,6 @@ def _make_w4a16_case(num_tokens: int = 16):
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),
