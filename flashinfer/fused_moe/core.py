@@ -1679,6 +1679,7 @@ def _unpack_trtllm_moe_output(
     do_finalize: bool,
     gemm1_lora_delta: Optional[torch.Tensor],
     expert_weights: Optional[torch.Tensor] = None,
+    return_gemm1_output_scale: bool = False,
 ) -> List[torch.Tensor]:
     """Translate the ``Array<Tensor>`` returned by ``FusedMoeLauncher::run`` to
     the Python-facing ``List[torch.Tensor]``.
@@ -1692,11 +1693,16 @@ def _unpack_trtllm_moe_output(
     if do_finalize and gemm1_lora_delta is None:
         return [output]
     elif do_finalize and gemm1_lora_delta is not None:
-        return [
+        result = [
             output,
             torch.from_dlpack(intermediate_output[1]),  # expanded_idx_to_permuted_idx
             torch.from_dlpack(intermediate_output[2]),  # gemm1_output
         ]
+        if return_gemm1_output_scale and len(intermediate_output) > 3:
+            # Quantized activation scale. Tensor rank preserves physical layout:
+            # rank 4 is SWIZZLED_8x4 and rank 5 is SWIZZLED_128x4.
+            result.append(torch.from_dlpack(intermediate_output[3]))
+        return result
 
     # do_finalize=False: index 1 is expert_weights.  Only convert it when the
     # launcher owned (allocated) the buffer -- converting a borrowed slot would
@@ -1713,6 +1719,10 @@ def _unpack_trtllm_moe_output(
     ]
     if gemm1_lora_delta is not None:
         result.append(torch.from_dlpack(intermediate_output[3]))  # gemm1_output
+        if return_gemm1_output_scale and len(intermediate_output) > 4:
+            result.append(
+                torch.from_dlpack(intermediate_output[4])
+            )  # gemm1_output_scale
     return result
 
 
@@ -3640,6 +3650,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
         num_fused_shared_experts: int = 0,
+        return_gemm1_output_scale: bool = False,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3837,6 +3848,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 do_finalize,
                 gemm1_lora_delta,
                 topk_weights,
+                return_gemm1_output_scale,
             )
 
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
@@ -3891,7 +3903,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
             finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, gemm1_lora_delta, topk_weights
+                [],
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                topk_weights,
+                return_gemm1_output_scale,
             ),
         )
 
@@ -3935,10 +3952,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
         num_fused_shared_experts: int = 0,
+        return_gemm1_output_scale: bool = False,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out
         _ = num_fused_shared_experts
+        _ = return_gemm1_output_scale
         # Respect a caller-provided output width when tracing the finalized public result.
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
@@ -6260,6 +6279,7 @@ def trtllm_fp4_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
+    return_gemm1_output_scale: bool = False,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -6378,8 +6398,15 @@ def trtllm_fp4_block_scale_routed_moe(
     gemm1_lora_delta : Optional[torch.Tensor]
         Optional MoE LoRA delta of shape
         ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
-        set it is added to FC1 before the fused gated activation and the
-        post-activation FC1 output is appended to the return list.
+        set it is added to FC1 before the fused gated activation. The
+        post-activation FC1 output is appended to the return list, followed by
+        its scale tensor when quantized. Scale tensor rank is graph-safe layout
+        metadata: rank 4 is ``SWIZZLED_8x4`` and rank 5 is
+        ``SWIZZLED_128x4``.
+    return_gemm1_output_scale : bool
+        When ``True`` and ``gemm1_lora_delta`` is set for MXFP4×MXFP8,
+        append the post-activation FC1 scale tensor after the FC1 output.
+        Defaults to ``False`` to preserve the established return-list length.
 
     Returns
     -------
@@ -6411,7 +6438,7 @@ def trtllm_fp4_block_scale_routed_moe(
             gemm1_lora_delta.to(torch.float32) * inv_dequant_ab[..., None]
         ).to(gemm1_lora_delta.dtype)
 
-    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_mode,
         None,
         topk_ids_tensor,
@@ -6451,6 +6478,13 @@ def trtllm_fp4_block_scale_routed_moe(
         None,  # routing_replay_out: not used for pre-computed routing
         0,  # num_fused_shared_experts: not used for pre-computed routing
     )
+    if (
+        gemm1_lora_delta is not None
+        and not return_gemm1_output_scale
+        and len(result) > 3
+    ):
+        return result[:3]
+    return result
 
 
 @flashinfer_api(trace=trtllm_mxint4_block_scale_moe_trace)

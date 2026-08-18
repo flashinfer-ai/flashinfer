@@ -494,6 +494,10 @@ struct MoeRunResultBuffers {
   // Optional activation output.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   Optional<Tensor> activation_output;
+  // Optional block scales for a quantized activation output. Physical layout is
+  // preserved in tensor rank: rank 4 is SWIZZLED_8x4, rank 5 is SWIZZLED_128x4.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  Optional<Tensor> activation_output_scale;
   // Whether FFI[0] is finalized output rather than an unfinalized FC2 buffer.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   bool is_finalized{true};
@@ -515,6 +519,9 @@ struct MoeRunResultBuffers {
     }
     if (activation_output.has_value()) {
       tensors.push_back(activation_output.value());
+    }
+    if (activation_output_scale.has_value()) {
+      tensors.push_back(activation_output_scale.value());
     }
     return tensors;
   }
@@ -1472,9 +1479,10 @@ class FusedMoeLauncher {
   // | do_finalize | return_activation_output | Returned tensors                                  |
   // |-------------|--------------------------|---------------------------------------------------|
   // | true  | false | [output]                                                                   |
-  // | true  | true  | [output, expanded_idx_to_permuted_idx, gemm1_output]                       |
+  // | true  | true  | [output, expanded_idx_to_permuted_idx, gemm1_output, (gemm1_output_scale)] |
   // | false | false | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]               |
-  // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output] |
+  // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output, |
+  // |               |  (gemm1_output_scale)]                                                     |
   //
   // The `gemm1_output` slot carries the post-activation FC1 output with shape
   // [num_padded_tokens, intermediate_size].
@@ -3150,10 +3158,32 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     auto const gemm1_output_hidden =
         mDtypeAct == btg::Dtype::E2m1 ? args->intermediate_size / 2 : args->intermediate_size;
-    if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
+    if (mDtypeAct == btg::Dtype::E2m1) {
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
           max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
+    } else if (mDtypeAct == btg::Dtype::MxE4m3) {
+      int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
+          max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
+      // Preserve tactic-selected physical layout in tensor shape. This keeps
+      // the public result graph-safe: consumers can dispatch from host metadata
+      // without copying a device scalar or synchronizing the launch stream.
+      int64_t const sf_cols = args->intermediate_size / sf_vec_size;
+      int64_t const padded_sf_cols = ((sf_cols + 3) / 4) * 4;
+      TVM_FFI_ICHECK_EQ(sf_size % padded_sf_cols, 0)
+          << "MXFP8 FC1 scale allocation is not row-aligned";
+      int64_t const padded_sf_rows = sf_size / padded_sf_cols;
+      if (tile_tokens_dim <= 64) {
+        TVM_FFI_ICHECK_EQ(padded_sf_rows % 8, 0)
+            << "SWIZZLED_8x4 FC1 scales require rows padded to 8";
+        gemm1_output_scale = alloc_tensor({padded_sf_rows / 8, padded_sf_cols / 4, 8, 4}, dl_uint8,
+                                          hidden_states.device());
+      } else {
+        TVM_FFI_ICHECK_EQ(padded_sf_rows % 128, 0)
+            << "SWIZZLED_128x4 FC1 scales require rows padded to 128";
+        gemm1_output_scale = alloc_tensor({padded_sf_rows / 128, padded_sf_cols / 4, 32, 4, 4},
+                                          dl_uint8, hidden_states.device());
+      }
     }
     if (!per_token_scales.has_value()) {
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
@@ -3320,6 +3350,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     }
     if (return_activation_output) {
       result.activation_output = gemm1_output;
+      if (mDtypeAct == btg::Dtype::MxE4m3 && gemm1_output_scale.has_value()) {
+        result.activation_output_scale = gemm1_output_scale.value();
+      }
     }
     return result;
   }

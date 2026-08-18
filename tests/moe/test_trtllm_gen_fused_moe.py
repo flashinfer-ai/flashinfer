@@ -2567,7 +2567,7 @@ def _build_w_ptr_table(weights, num_experts):
     return w_ptr, stride
 
 
-@pytest.mark.parametrize("num_tokens", [8, 128])
+@pytest.mark.parametrize("num_tokens", [8, 128, 1152])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
 @pytest.mark.parametrize(
@@ -2676,6 +2676,16 @@ def test_moe_lora_delta(
       * "fake": zero vs constant delta, so the test fails if LoRA is silently dropped;
       * "real": regular 2-slice delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test;
       * "performant": shared-A + horizontally-fused-B delta via 1D [E] w_ptr tables."""
+    if num_tokens == 1152 and not (
+        isinstance(moe_impl, FP4Moe)
+        and moe_impl.quant_mode == QuantMode.FP4_MXFP4_MXFP8
+        and weight_processing["layout"] == WeightLayout.MajorK
+        and delta_mode == "real"
+    ):
+        pytest.skip(
+            "large-M scale-layout transition is covered on MxFp4xMxFp8 real delta"
+        )
+
     if delta_mode == "performant" and not (
         num_tokens == 128
         and weight_processing["layout"] == WeightLayout.BlockMajorK
