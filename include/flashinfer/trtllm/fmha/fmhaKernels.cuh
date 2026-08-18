@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -197,7 +197,6 @@ class TllmGenFmhaKernel {
         if (mKernelMetaMap.find(hash) != mKernelMetaMap.end()) {
           // The kernelMeta of the existing kernel.
           auto const& existingKernelMeta = mKernelMeta[mKernelMetaMap.at(hash)];
-          // Allow conflicts only if they are family/specific versions of the same architecture.
           FLASHINFER_CHECK(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
                            "Hash conflicts exist between %s and %s.", existingKernelMeta.mFuncName,
                            kernelMeta.mFuncName);
@@ -685,8 +684,9 @@ class TllmGenFmhaKernel {
     int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
     // Then split the headDimV into multiple CTAs if there are still unused SMs.
-    if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV &&
-        !selectKernelParams.mSelectNewKernel && !selectKernelParams.mUses2CtaMma) {
+    if (isMlaGenKernel(params) && !selectKernelParams.mGroupsTokensHeadsQ &&
+        !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel &&
+        !selectKernelParams.mUses2CtaMma) {
       // Split the headDimV into multiple CTAs if the utilization is not full.
       // It doesn't work with reuseSmemKForV currently.
       // TODO: find better heuristic of splitting headDimV across multiple CTAs.
@@ -827,9 +827,60 @@ class TllmGenFmhaKernel {
     }
   }
 
+  inline bool usesGroupedMlaGenerationKernel(RunnerParams const& params) const {
+    bool const usesSupportedDtypes = (mDtypeQ == DATA_TYPE_BF16 && mDtypeK == DATA_TYPE_BF16 &&
+                                      mDtypeV == DATA_TYPE_BF16 && mDtypeOut == DATA_TYPE_BF16) ||
+                                     (mDtypeQ == DATA_TYPE_E4M3 && mDtypeK == DATA_TYPE_E4M3 &&
+                                      mDtypeV == DATA_TYPE_E4M3 && mDtypeOut == DATA_TYPE_BF16);
+    bool const usesSupportedHeadRatio =
+        params.mNumHeadsQPerKv == 8 || params.mNumHeadsQPerKv == 16 || params.mNumHeadsQPerKv == 32;
+
+    return !isSparseMla(params.mSparseMlaType) && params.mMaxSeqLenQ > 1 &&
+           usesSupportedHeadRatio && params.mBatchSize >= 1 && params.mBatchSize <= 16 &&
+           params.mNumTokensPerPage == 32 && params.mHeadDimQk == 576 && params.mHeadDimV == 512 &&
+           usesSupportedDtypes;
+  }
+
+  // Grouped MLA generation packs query tokens and local Q heads into Q64 CTAs.
+  void selectGroupedMlaGenerationKernel(RunnerParams const& params,
+                                        SelectKernelParams& selectKernelParams) const {
+    selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+    selectKernelParams.mTileSizeQ = 64;
+    selectKernelParams.mTileSizeKv = 128;
+    // Preserve Disabled/Persistent selected by an earlier low-KV pass.
+    if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
+      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+      selectKernelParams.mTileScheduler = TileScheduler::Static;
+    }
+    selectKernelParams.mForceGmemReduction = true;
+    selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+    selectKernelParams.mReuseSmemKForV = false;
+    selectKernelParams.mGroupsTokensHeadsQ = true;
+    selectKernelParams.mUses2CtaMma = false;
+
+    int const groupedRows = params.mMaxSeqLenQ * params.mNumHeadsQPerKv;
+    int const baseNumCtas =
+        params.mBatchSize * params.mNumHeadsKv * flashinfer::ceil_div(groupedRows, 64);
+    if (baseNumCtas <= 1) {
+      selectKernelParams.mHeadDimPerCtaV = 128;
+    } else if (baseNumCtas <= 4) {
+      selectKernelParams.mHeadDimPerCtaV = 256;
+    } else {
+      selectKernelParams.mHeadDimPerCtaV = 512;
+    }
+    selectKernelParams.mHeadDimPerCtaV =
+        std::min(selectKernelParams.mHeadDimPerCtaV, params.mHeadDimV);
+  }
+
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel(RunnerParams const& params,
                                  SelectKernelParams& selectKernelParams) const {
+    if (usesGroupedMlaGenerationKernel(params)) {
+      selectGroupedMlaGenerationKernel(params, selectKernelParams);
+      return;
+    }
+    selectKernelParams.mGroupsTokensHeadsQ = false;
+
     // The kernel type.
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
@@ -866,6 +917,9 @@ class TllmGenFmhaKernel {
 
   void syncGqaGenerationTraitsForKernelHash(RunnerParams const& params,
                                             SelectKernelParams& selectKernelParams) const {
+    // Same-dtype GQA generation cubins export this trait for every tile size, including runtime
+    // shapes where the resulting CTA covers only one query token.
+    selectKernelParams.mGroupsTokensHeadsQ = true;
     bool const multiCtasKvEnabled = isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode);
     if (selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
         params.mHeadDimV > 256) {
@@ -1016,6 +1070,7 @@ class TllmGenFmhaKernel {
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
+    selectKernelParams.mGroupsTokensHeadsQ = false;
 
     // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
     // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
