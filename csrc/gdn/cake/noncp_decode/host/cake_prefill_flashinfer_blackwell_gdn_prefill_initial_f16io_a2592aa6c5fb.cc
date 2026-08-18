@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_prefill_initial_f16io_1335d41809);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_prefill_initial_f16io_06de7a068b);
 
 namespace loom_host_shim {
 
@@ -175,36 +175,36 @@ static inline void* TmaDeviceSlot(
 // 3D TMA descriptor for buffer 'Q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_Q(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'Q' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'Q' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'Q' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "Q");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'Q' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'Q' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d3), (uint64_t)(d2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'Q' resolved a non-positive global dim";
   TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (64, 64, 1) exceeds resolved global dims for 'Q'";
   uint64_t global_strides[2] = {
+      (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
   };
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
@@ -214,36 +214,36 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
 // 3D TMA descriptor for buffer 'K' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_K(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'K' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'K' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'K' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'K' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "K");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'K' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'K' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'K' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d3), (uint64_t)(d2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'K' resolved a non-positive global dim";
   TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (64, 64, 1) exceeds resolved global dims for 'K'";
   uint64_t global_strides[2] = {
+      (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
   };
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'K') failed: CUresult=" << (int)r;
@@ -253,36 +253,36 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
 // 3D TMA descriptor for buffer 'V' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_V(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'V' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'V' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'V' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'V' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "V");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'V' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'V' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'V' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d3), (uint64_t)(d2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'V' resolved a non-positive global dim";
   TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (64, 64, 1) exceeds resolved global dims for 'V'";
   uint64_t global_strides[2] = {
+      (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
   };
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'V') failed: CUresult=" << (int)r;
@@ -292,36 +292,36 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
 // 3D TMA descriptor for buffer 'O' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_O(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'O' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'O' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'O' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'O' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "O");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'O' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'O' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'O' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d3), (uint64_t)(d2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'O' resolved a non-positive global dim";
   TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (64, 64, 1) exceeds resolved global dims for 'O'";
   uint64_t global_strides[2] = {
+      (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
   };
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'O') failed: CUresult=" << (int)r;
@@ -430,7 +430,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   int32_t v_total_tiles = (int32_t)arg_total_tiles;
   void* kargs[] = {&p_Q, &p_K, &p_V, &p_O, &p_gate, &p_beta, &p_cu_seqlens, &p_state_indices, &p_initial_state, &p_output_state, &p_checkpoint_state, &p_cu_checkpoints, &p_tensormap_workspace, &v_initial_state_stride_slot, &v_output_state_stride_slot, &v_checkpoint_every_n_tokens, &v_scale, &v_num_seqs, &v_num_q_heads, &v_num_v_heads, &v_total_tiles};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_prefill_initial_f16io_1335d41809::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_prefill_initial_f16io", 226048);
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_prefill_initial_f16io_06de7a068b::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_prefill_initial_f16io", 226048);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
 

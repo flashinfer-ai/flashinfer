@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "6a2f050c1165b303c2f119c1c0f6c3b03a323a7e093590533ab65575fff9e2d3"
-_GENERATOR_COMMIT = "bfef0844fb4069b084c11d3137dea07d9fe28f05"
+_MANIFEST_SHA256 = "4f5f8ffe2c6a46a21d09ab715ad4759ffe78d0aaffd104d10a73e2e7fbf518bc"
+_GENERATOR_COMMIT = "0e0436e43f70d1c6a40291fbc98ff9459df96d34"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
