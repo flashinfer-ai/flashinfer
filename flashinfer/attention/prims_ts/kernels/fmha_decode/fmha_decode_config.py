@@ -134,15 +134,8 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
     "load_num_warps": 1,
     "page_offsets_warp_idx": 14,
     "page_offsets_num_warps": 1,
-    "padding_warp_idx": 14,
-    "padding_num_warps": 2,
     "scheduler_warp_idx": 13,
     "scheduler_num_warps": 1,
-    "clc_load_warp_idx": 15,
-    "clc_padding_warp_idx": 14,
-    "clc_padding_num_warps": 1,
-    "clc_tail_padding_warp_idx": 12,
-    "clc_tail_padding_num_warps": 0,
 }
 
 _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
@@ -2319,7 +2312,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
             )
         )
 
-    if cfg.use_paged_kv:
+    if cfg.use_paged_kv and not cfg.use_block_sparse:
         roles.append(
             _WarpRole(
                 "page_offsets",
@@ -3964,6 +3957,7 @@ def make_decode_config(
             ),
         )
 
+    _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
 
     _validate_profile_support(

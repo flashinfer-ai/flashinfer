@@ -174,31 +174,28 @@ def _resolve_block_sparse_per_inst_load_topology(
 
     if cfg.load_num_warps != 1:
         return None
+    padding_warps = tuple(
+        range(
+            cfg.wg3_padding_warp_idx,
+            cfg.wg3_padding_warp_idx + cfg.wg3_padding_num_warps,
+        )
+    )
     if use_clc_dynamic:
-        # Load1 consumes the only otherwise-idle warp in WG3. A profile with
-        # an additional CLC tail-padding warp therefore cannot use this
-        # topology without assigning two tasks to the same warp.
-        if (
-            cfg.scheduler_num_warps != 1
-            or cfg.clc_padding_num_warps != 1
-            or cfg.clc_tail_padding_num_warps != 0
-        ):
+        # Load1 consumes the only otherwise-idle warp in WG3.
+        if cfg.scheduler_num_warps != 1 or len(padding_warps) != 1:
             return None
         role_warps = (
             cfg.mma_warp_idx,
             cfg.scheduler_warp_idx,
             cfg.clc_load_warp_idx,
-            cfg.clc_padding_warp_idx,
+            padding_warps[0],
         )
         if len(set(role_warps)) != len(role_warps):
             return None
         if len({warp_idx // 4 for warp_idx in role_warps}) != 1:
             return None
-        return (cfg.clc_load_warp_idx, cfg.clc_padding_warp_idx), None
+        return (cfg.clc_load_warp_idx, padding_warps[0]), None
 
-    padding_warps = tuple(
-        range(cfg.padding_warp_idx, cfg.padding_warp_idx + cfg.padding_num_warps)
-    )
     if len(padding_warps) != 2:
         return None
     role_warps = (cfg.mma_warp_idx, cfg.load_warp_idx, *padding_warps)
@@ -1294,9 +1291,7 @@ def _build_decode_gen_schedule(
         )
     page_offsets_task = None
     if use_dense_page_offsets:
-        page_offsets_warp_idx = (
-            cfg.clc_padding_warp_idx if use_clc_dynamic else cfg.page_offsets_warp_idx
-        )
+        page_offsets_warp_idx = cfg.page_offsets_warp_idx
         if use_separate_kv_page_offset_resources:
             page_offsets_task = create_page_offsets_task_split_kv(
                 smem_page_offsets,
