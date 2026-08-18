@@ -2245,6 +2245,29 @@ struct SwigluStepAdaptor {
   }
 };
 
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 4.0f;
+  float beta = 0.0f;
+  float limit = 25.0f;
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    T out;
+    float const a = alpha;
+    float const b = limit;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < static_cast<int>(T::kElements); ++i) {
+      float const g = static_cast<float>(gate[i]);
+      float const u = static_cast<float>(linear[i]);
+      float const gate_out = a * tanhf(g / a) * (1.0f / (1.0f + expf(-g)));
+      float const up_out = b * tanhf(u / b);
+      out[i] = static_cast<typename T::Element>(gate_out * up_out);
+    }
+    return out;
+  }
+};
+
 // ============================== Gated Activation =================================
 constexpr static int MAX_ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2328,6 +2351,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2670,8 +2695,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
-      };
+                              decltype(nvfp4_4over6_config_tag)>,
+          &doActivationKernel<
+              T, GemmOutputType, ScaleBiasType, SituAdaptor, decltype(block_scaling_type)::value,
+              decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>};
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
 #ifdef ENABLE_FP4
