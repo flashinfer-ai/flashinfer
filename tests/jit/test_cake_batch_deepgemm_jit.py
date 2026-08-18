@@ -224,6 +224,7 @@ def test_cake_batch_deepgemm_binding_public_abi_and_boundary():
     assert "(n == 7168 && k == 3072)" in binding
     assert "(n == 4096 && k == 4096)" in binding
     assert "the short-M N6144/K7168 route requires expected_m=24" in binding
+    assert "kMaxGenericPersistentCtas = 156" in binding
     assert "a_scale must have shape [B,M,K/128]" in binding
     assert "b_scale must have shape [B,N/128,K/128]" in binding
     assert "masked_m must have shape [B]" in binding

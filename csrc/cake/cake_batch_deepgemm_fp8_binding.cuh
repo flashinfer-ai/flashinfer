@@ -79,6 +79,7 @@ constexpr int32_t kVariantLargeNK = 3;
 constexpr int32_t kVariantShortMN6144K7168 = 4;
 constexpr int32_t kTargetSM100a = 1000;
 constexpr int32_t kTargetSM103a = 1003;
+constexpr uint32_t kMaxGenericPersistentCtas = 156;
 
 static_assert(FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND == kTargetSM100a ||
                   FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND == kTargetSM103a,
@@ -266,7 +267,9 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   const uint32_t scheduled_pair_blocks = static_cast<uint32_t>((expected_m + 255) / 256 + 1);
   const uint64_t scheduled_tiles = static_cast<uint64_t>(batch) * scheduled_pair_blocks * grid_n;
   const uint32_t clusters = std::max<uint32_t>(
-      1, std::min<uint32_t>(num_sms / 2, static_cast<uint32_t>(scheduled_tiles)));
+      1, std::min<uint32_t>({static_cast<uint32_t>(num_sms / 2),
+                             kMaxGenericPersistentCtas / 2,
+                             static_cast<uint32_t>(scheduled_tiles)}));
   config.gridDim = dim3(clusters * 2, 1, 1);
   attrs[0].id = cudaLaunchAttributeClusterDimension;
   attrs[0].val.clusterDim.x = 2;
