@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Recurrent KDA (Kimi Delta Attention) decode kernels using CuTe DSL for SM100.
+Recurrent KDA (Kimi Delta Attention) decode kernels using CuTe DSL for SM100+
+and SM12x.
 
 Supports single-token decode and fused speculative-token updates with
 per-key-dimension gating.
@@ -1779,7 +1780,7 @@ def run_recurrent_kda(
               state pool used by the shim.
 
     Note:
-        - Requires SM100 (Blackwell) architecture
+        - Requires SM100+ or SM12x (Blackwell)
         - State is bfloat16 ``[N, HV, V, K]`` and updated in-place
         - HEAD_DIM (K=V) must be 64 or 128
         - When using ``cu_seqlens``, batch size ``B`` must be 1
