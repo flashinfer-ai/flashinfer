@@ -68,11 +68,7 @@ def _source_dir() -> Path:
     if installed.exists():
         return installed
     checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "gdn"
-        / "cake"
-        / "noncp_decode"
+        Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "cake" / "noncp_decode"
     )
     if checkout.exists():
         return checkout
@@ -383,9 +379,7 @@ def select_cake_gdn_prefill_variant(
         )
     enable_checkpoints = checkpoint_every_n_tokens > 0
     if use_state_indices and (not use_initial_state or not store_final_state):
-        raise CakeGDNUnsupportedError(
-            "indexed state requires initial and final state"
-        )
+        raise CakeGDNUnsupportedError("indexed state requires initial and final state")
     low_precision_state = state_dtype in {
         "float16",
         "float8_e4m3fn",
@@ -413,9 +407,7 @@ def select_cake_gdn_prefill_variant(
             "checkpoint route requires FP16 I/O, FP32 state, no initial state, "
             "final state, and packed state"
         )
-    dvsplit = (
-        4 * num_seqs * num_o_heads <= _ARCH_ACTIVE_CLUSTERS[arch]
-    )
+    dvsplit = 4 * num_seqs * num_o_heads <= _ARCH_ACTIVE_CLUSTERS[arch]
     if low_precision_state and not dvsplit:
         raise CakeGDNUnsupportedError(
             "low-precision state requires the DV-split physical schedule"
@@ -433,7 +425,7 @@ def select_cake_gdn_prefill_variant(
         state_dtype=state_dtype,
         single_chunk=single_chunk,
     )
-    specializations = {
+    specializations: dict[str, int | float] = {
         "ENABLE_CHECKPOINTS": int(enable_checkpoints),
         "HEAD_GROUP_LOG2": _power_of_two_log2(num_o_heads // min_heads),
         "IS_GQA": int(num_q_heads >= num_v_heads),
@@ -488,9 +480,7 @@ def select_cake_gdn_decode_variant(
             "Cake decode requires BF16 I/O and FP32 or BF16 state"
         )
     if head_size != 128:
-        raise CakeGDNUnsupportedError(
-            "Cake decode requires K=V=128"
-        )
+        raise CakeGDNUnsupportedError("Cake decode requires K=V=128")
     if not use_qk_l2norm:
         raise CakeGDNUnsupportedError(
             "Cake T=1 child contract requires in-kernel Q/K L2 normalization"
@@ -524,7 +514,11 @@ def select_cake_gdn_decode_variant(
             cache_intermediate_states,
             cache_steps,
         )
-        if layout != "pretranspose" or num_k_heads != num_q_heads or key not in promoted:
+        if (
+            layout != "pretranspose"
+            or num_k_heads != num_q_heads
+            or key not in promoted
+        ):
             raise CakeGDNUnsupportedError(
                 "BF16 decode is limited to the seven exact promoted indexed/verify rows"
             )
@@ -544,9 +538,7 @@ def select_cake_gdn_decode_variant(
                     else 128 * 128
                 ),
                 "INTERMEDIATE_TOKEN_STRIDE": (
-                    num_v_heads * 128 * 128
-                    if cache_intermediate_states
-                    else 128 * 128
+                    num_v_heads * 128 * 128 if cache_intermediate_states else 128 * 128
                 ),
                 "SCALE": scale,
                 "STRIDED_INPUTS": int(strided_inputs),
@@ -584,9 +576,7 @@ def select_cake_gdn_decode_variant(
             schedule_attr = "gdn_decode_nontranspose_fp32_t1"
             route = "cake.gdn_decode.direct_fp32_t1_nontranspose_large"
     else:
-        raise CakeGDNUnsupportedError(
-            f"unsupported decode state layout {layout}"
-        )
+        raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
         domain="decode",
         schedule_attr=schedule_attr,

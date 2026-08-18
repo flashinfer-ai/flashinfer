@@ -79,9 +79,7 @@ def _make_inputs(batch_size: int) -> dict[str, torch.Tensor]:
             torch.randn(num_v_heads, device=device, dtype=torch.float32) * 0.1
         ).contiguous(),
         "a": (
-            torch.randn(
-                batch_size, 1, num_v_heads, device=device, dtype=torch.float32
-            )
+            torch.randn(batch_size, 1, num_v_heads, device=device, dtype=torch.float32)
             * 0.1
         )
         .to(torch.bfloat16)
@@ -496,8 +494,7 @@ def _bf16_serving_reference(
         beta = torch.sigmoid(b[:, token].float())
         state = state * alpha[:, :, None, None]
         v_delta = (
-            v_all[:, token].float()
-            - torch.einsum("bhk,bhvk->bhv", k, state)
+            v_all[:, token].float() - torch.einsum("bhk,bhvk->bhv", k, state)
         ) * beta[:, :, None]
         state = state + v_delta.unsqueeze(-1) * k.unsqueeze(-2)
         outputs.append(torch.einsum("bhk,bhvk->bhv", q, state))
@@ -583,7 +580,9 @@ def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None
         _launch(entry, tensors, batch_size)
     stream.synchronize()
 
-    torch.testing.assert_close(tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
     torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
 
 
@@ -607,7 +606,9 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
     graph.replay()
     stream.synchronize()
 
-    torch.testing.assert_close(tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
     torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
 
 
@@ -759,7 +760,9 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     stream.synchronize()
 
     torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(cache.float(), expected_cache.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        cache.float(), expected_cache.float(), atol=1e-2, rtol=1e-2
+    )
     assert torch.equal(out, eager_out)
     assert torch.equal(cache, eager_cache)
     assert torch.equal(backing, backing_before)
@@ -775,7 +778,9 @@ def test_exported_prefill_matches_torch_and_is_cuda_graph_safe() -> None:
     with torch.cuda.stream(stream):
         _launch_prefill(entry, tensors)
     stream.synchronize()
-    torch.testing.assert_close(tensors["out"].float(), expected.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected.float(), atol=1e-2, rtol=1e-2
+    )
     eager = tensors["out"].clone()
     tensors["out"].zero_()
 
@@ -785,5 +790,7 @@ def test_exported_prefill_matches_torch_and_is_cuda_graph_safe() -> None:
     graph.replay()
     stream.synchronize()
 
-    torch.testing.assert_close(tensors["out"].float(), expected.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected.float(), atol=1e-2, rtol=1e-2
+    )
     assert torch.equal(tensors["out"], eager)

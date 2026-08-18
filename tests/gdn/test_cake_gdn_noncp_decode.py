@@ -58,9 +58,7 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == (
-        "9e740b3abb58f1fa23a49eb29573ca44df21045b"
-    )
+    assert manifest["generator_commit"] == ("9e740b3abb58f1fa23a49eb29573ca44df21045b")
     assert manifest["contract_row_count"] == 1762
     assert manifest["architecture_row_count"] == 3524
     assert manifest["admitted_architecture_rows"] == 3464
