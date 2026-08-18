@@ -264,7 +264,12 @@ def plan_cake_vsa(
         device=device,
     )
     row_counts = dense.sum(dim=-1, dtype=torch.int32)
-    if int(row_counts.min().item()) <= 0:
+    min_selected_blocks = int(row_counts.min().item())
+    max_selected_blocks = int(row_counts.max().item())
+    uniform_selected_blocks = bool(
+        torch.all(row_counts == max_selected_blocks).item()
+    )
+    if min_selected_blocks <= 0:
         raise ValueError("every Cake VSA block row must select at least one block")
     shared_indptr = shared_indices = None
     if R == 64 or torch.equal(dense, dense[:1].expand_as(dense)):
@@ -283,6 +288,8 @@ def plan_cake_vsa(
         "sm_scale": sm_scale,
         "block_mask": dense,
         "row_counts": row_counts,
+        "max_selected_blocks": max_selected_blocks,
+        "uniform_selected_blocks": uniform_selected_blocks,
         "indptr": shared_indptr,
         "indices": shared_indices,
         "workspace": {},
@@ -599,9 +606,8 @@ def run_cake_vsa(
     ):
         if return_lse:
             raise ValueError("Cake ultrasparse routes do not support return_lse")
-        counts = plan["row_counts"]
-        selected = int(counts.max().item())
-        if selected > _MAX_DIRECT_TOPK or not torch.all(counts == selected):
+        selected = plan["max_selected_blocks"]
+        if selected > _MAX_DIRECT_TOPK or not plan["uniform_selected_blocks"]:
             raise ValueError("Cake ultrasparse route requires fixed top-k <= 32")
         _run_standard(
             "ultrasparse_bsr",
@@ -617,9 +623,8 @@ def run_cake_vsa(
     elif plan["N"] >= 16384 and plan["num_qo_heads"] == 8:
         if return_lse:
             raise ValueError("Cake long-sequence routes do not support return_lse")
-        counts = plan["row_counts"]
-        selected = int(counts.max().item())
-        if selected > _MAX_LONGSEQ_BLOCKS or not torch.all(counts == selected):
+        selected = plan["max_selected_blocks"]
+        if selected > _MAX_LONGSEQ_BLOCKS or not plan["uniform_selected_blocks"]:
             raise ValueError("Cake long-sequence route requires fixed top-k <= 192")
         _run_standard(
             "longseq",
@@ -633,7 +638,7 @@ def run_cake_vsa(
             selected_blocks=selected,
         )
     else:
-        if int(plan["row_counts"].max().item()) > _MAX_COMPACT_BLOCKS:
+        if plan["max_selected_blocks"] > _MAX_COMPACT_BLOCKS:
             raise ValueError("Cake compact route supports at most 64 selected blocks")
         _run_standard(
             "blk128_compact",
