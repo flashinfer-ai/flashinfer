@@ -3,7 +3,8 @@
 Reproduces the upstream cutedsl_megamoe Rubin TS4B perf-report protocol
 (tested upstream at 47881ad2 / vendored 92dd334) on the flashinfer moe_ep
 backends: DSv4-Pro EP4 shape (hidden 7168, MoE intermediate 3072, 384 total
-experts, top-k 6, NVFP4, BF16 combine), balanced + power-law(0.8) routing,
+experts, top-k 6, BF16 combine), NVFP4 and/or MXFP8 (--quant-kind; the
+upstream baseline is NVFP4-only), balanced + power-law(0.8) routing,
 5 warmup + 20 measured iterations, per-rank averages.
 
 Timing covers ONLY the fused mega kernel launch (dispatch + FC1 + SwiGLU +
@@ -129,12 +130,22 @@ def _make_routing(world, tokens, routing, alpha):
     return topk_idx.to(torch.int32), topk_weights
 
 
-def _local_transformed_weights(rank: int, world: int):
+def _local_transformed_weights(rank: int, world: int, quant_kind: str):
     """Random local expert slice, quantized chunk-wise to bound peak memory."""
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
-        weights as weights_mod,
-    )
+
+    if quant_kind == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
+            weights as weights_mod,
+        )
+
+        extra = {}
+    else:
+        from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
+            weights as weights_mod,
+        )
+
+        extra = {"kind": quant_kind}
 
     experts_per_rank = NUM_EXPERTS // world
     generator = torch.Generator(device="cuda").manual_seed(SEED + 7 * rank)
@@ -167,6 +178,7 @@ def _local_transformed_weights(rank: int, world: int):
             MoEWeightPack(w13=w13, w2=w2),
             intermediate_size=INTERMEDIATE,
             hidden_size=HIDDEN,
+            **extra,
         )
         fc1_parts.append(fc1_w)
         fc1_sf_parts.append(fc1_sf.reshape(count, -1))
@@ -189,6 +201,7 @@ def _bench_one(
     transformed,
     warmup: int,
     iters: int,
+    quant_kind: str = "nvfp4",
     knobs_override: Optional[dict] = None,
 ) -> Tuple[dict, list]:
     import flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe as pkg
@@ -198,14 +211,22 @@ def _bench_one(
         MegaConfig,
         MoEEpLayer,
         MoEEpTensors,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     knobs = dict(WINNERS[(routing, tokens)])
     if knobs_override:
         knobs.update(knobs_override)
+    # WINNERS tiles are the nvfp4 selections (2x-mode instruction K 128, tile
+    # K 256). mxfp8's 2x-mode instruction K is 64, so the analogous tile K is
+    # 128; M/N and the scheduler knobs carry over unchanged.
+    tile = tuple(knobs["tile"])
+    if quant_kind != "nvfp4":
+        tile = (tile[0], tile[1], 128)
+        knobs["tile"] = tile
 
-    cfg = Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    common = dict(
         intermediate_size=INTERMEDIATE,
         top_k=TOP_K,
         in_kernel_fc2_reduce=False,  # separate top-k reduction (upstream winners)
@@ -215,10 +236,14 @@ def _bench_one(
         fc2_tma_stages=2,
         epi_flag_batches=tuple(knobs["epi"]),
         token_in_flag_batch=knobs["tif"],
-        mma_tiler_mnk=tuple(knobs["tile"]),
+        mma_tiler_mnk=tile,
         cluster_shape_mn=(4, 1),
         fallback_cluster_shape_mn=(2, 1),
     )
+    if quant_kind == "nvfp4":
+        cfg = Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+    else:
+        cfg = Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=world, rank=rank, auto_bootstrap=False),
         fleet_params=FleetParams(
@@ -289,6 +314,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", default="1024,2048,4096,8192,16384,32768")
     parser.add_argument(
+        "--quant-kind", default="nvfp4", choices=["nvfp4", "mxfp8_e4m3", "both"]
+    )
+    parser.add_argument(
         "--routing", default="balanced", choices=["balanced", "power_law", "both"]
     )
     parser.add_argument("--alpha", type=float, default=0.8)
@@ -318,74 +346,88 @@ def main() -> None:
 
     token_list = [int(t) for t in args.tokens.split(",")]
     routings = ["balanced", "power_law"] if args.routing == "both" else [args.routing]
+    kinds = ["nvfp4", "mxfp8_e4m3"] if args.quant_kind == "both" else [args.quant_kind]
     try:
-        transformed = _local_transformed_weights(rank, world)
-        if rank == 0:
-            print(
-                f"# sm107 nvfp4 mega EP{world}: hidden={HIDDEN} inter={INTERMEDIATE} "
-                f"experts={NUM_EXPERTS} topk={TOP_K} "
-                f"warmup={args.warmup} iters={args.iters}",
-                flush=True,
-            )
-        for routing in routings:
-            for tokens in token_list:
-                result, samples = _bench_one(
-                    rank,
-                    world,
-                    tokens,
-                    routing,
-                    args.alpha,
-                    transformed,
-                    args.warmup,
-                    args.iters,
+        for quant_kind in kinds:
+            transformed = _local_transformed_weights(rank, world, quant_kind)
+            if rank == 0:
+                print(
+                    f"# sm107 {quant_kind} mega EP{world}: hidden={HIDDEN} "
+                    f"inter={INTERMEDIATE} experts={NUM_EXPERTS} topk={TOP_K} "
+                    f"warmup={args.warmup} iters={args.iters}",
+                    flush=True,
                 )
-                # Aggregate: mean of rank averages; min/max over every sample.
-                stats = torch.tensor(
-                    [result["avg_us"], result["min_us"], result["max_us"]],
-                    device="cuda",
-                )
-                gathered = [torch.zeros_like(stats) for _ in range(world)]
-                dist.all_gather(gathered, stats)
-                if rank == 0:
-                    avg = sum(g[0].item() for g in gathered) / world
-                    lo = min(g[1].item() for g in gathered)
-                    hi = max(g[2].item() for g in gathered)
-                    flops = tokens * TOP_K * 6 * HIDDEN * INTERMEDIATE
-                    tflops = (
-                        flops / (avg * 1e-6) / 1e12 if routing == "balanced" else None
+            for routing in routings:
+                for tokens in token_list:
+                    result, samples = _bench_one(
+                        rank,
+                        world,
+                        tokens,
+                        routing,
+                        args.alpha,
+                        transformed,
+                        args.warmup,
+                        args.iters,
+                        quant_kind=quant_kind,
                     )
-                    ref = UPSTREAM_US.get((routing, tokens))
-                    delta = f"{(avg - ref) / ref * 100.0:+.2f}%" if ref else "n/a"
-                    knobs = result["knobs"]
-                    tflops_col = f"{tflops:.1f}" if tflops is not None else "-"
-                    ref_col = f"{ref:.2f}" if ref is not None else "-"
-                    detail = (
-                        f"tile {'x'.join(map(str, knobs['tile']))}; "
-                        f"hint {knobs['hint']}; "
-                        f"epi {knobs['epi'][0]}x{knobs['epi'][1]}; "
-                        f"tif {knobs['tif']}"
+                    # Aggregate: mean of rank averages; min/max over every sample.
+                    stats = torch.tensor(
+                        [result["avg_us"], result["min_us"], result["max_us"]],
+                        device="cuda",
                     )
-                    print(
-                        f"| {routing} | {tokens} | {avg:.2f} | {lo:.2f}-{hi:.2f} | "
-                        f"{tflops_col} | {ref_col} | {delta} | {detail} |",
-                        flush=True,
-                    )
-                    with open(args.output, "a") as fh:
-                        fh.write(
-                            json.dumps(
-                                dict(
-                                    result,
-                                    rank_avgs=[g[0].item() for g in gathered],
-                                    mean_us=avg,
-                                    min_us=lo,
-                                    max_us=hi,
-                                    tflops=tflops,
-                                    upstream_us=ref,
-                                )
-                            )
-                            + "\n"
+                    gathered = [torch.zeros_like(stats) for _ in range(world)]
+                    dist.all_gather(gathered, stats)
+                    if rank == 0:
+                        avg = sum(g[0].item() for g in gathered) / world
+                        lo = min(g[1].item() for g in gathered)
+                        hi = max(g[2].item() for g in gathered)
+                        flops = tokens * TOP_K * 6 * HIDDEN * INTERMEDIATE
+                        tflops = (
+                            flops / (avg * 1e-6) / 1e12
+                            if routing == "balanced"
+                            else None
                         )
-                dist.barrier()
+                        # The upstream report is NVFP4-only; mxfp8 has no baseline.
+                        ref = (
+                            UPSTREAM_US.get((routing, tokens))
+                            if quant_kind == "nvfp4"
+                            else None
+                        )
+                        delta = f"{(avg - ref) / ref * 100.0:+.2f}%" if ref else "n/a"
+                        knobs = result["knobs"]
+                        tflops_col = f"{tflops:.1f}" if tflops is not None else "-"
+                        ref_col = f"{ref:.2f}" if ref is not None else "-"
+                        detail = (
+                            f"tile {'x'.join(map(str, knobs['tile']))}; "
+                            f"hint {knobs['hint']}; "
+                            f"epi {knobs['epi'][0]}x{knobs['epi'][1]}; "
+                            f"tif {knobs['tif']}"
+                        )
+                        print(
+                            f"| {quant_kind} | {routing} | {tokens} | {avg:.2f} | "
+                            f"{lo:.2f}-{hi:.2f} | "
+                            f"{tflops_col} | {ref_col} | {delta} | {detail} |",
+                            flush=True,
+                        )
+                        with open(args.output, "a") as fh:
+                            fh.write(
+                                json.dumps(
+                                    dict(
+                                        result,
+                                        quant_kind=quant_kind,
+                                        rank_avgs=[g[0].item() for g in gathered],
+                                        mean_us=avg,
+                                        min_us=lo,
+                                        max_us=hi,
+                                        tflops=tflops,
+                                        upstream_us=ref,
+                                    )
+                                )
+                                + "\n"
+                            )
+                    dist.barrier()
+            del transformed
+            torch.cuda.empty_cache()
     finally:
         finalize_moe_ep_runtime(runtime)
 

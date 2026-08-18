@@ -19,6 +19,7 @@ from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import sm107_block_scaled_runtime_requirements
 from ......core.validation.common import (
+    MoEEpConfigError,
     validate_mega_arch_sm107,
     validate_mega_fleet_params,
 )
@@ -104,15 +105,31 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
-        kwargs: dict = {}
-        if k.mma_tiler_mnk is not None:
-            kwargs["mma_tiler_mnk"] = k.mma_tiler_mnk
-        if k.cluster_shape_mn is not None:
-            kwargs["cluster_shape_mn"] = k.cluster_shape_mn
-        if k.fallback_cluster_shape_mn is not None:
-            kwargs["fallback_cluster_shape_mn"] = k.fallback_cluster_shape_mn
-        if k.fc2_tma_stages is not None:
-            kwargs["fc2_tma_stages"] = k.fc2_tma_stages
+        # The tuning knobs the offline tuner sweeps; the config's `knobs`
+        # field (dict / "cache") overrides the explicit fields.
+        tuning: dict = {
+            "mma_tiler_mnk": k.mma_tiler_mnk,
+            "cluster_shape_mn": k.cluster_shape_mn,
+            "fallback_cluster_shape_mn": k.fallback_cluster_shape_mn,
+            "schedule_policy": k.schedule_policy,
+            "work_id_mode": k.work_id_mode,
+            "fc2_use_bulk": k.fc2_use_bulk,
+            "fc2_tma_stages": k.fc2_tma_stages,
+            "epi_flag_batches": k.epi_flag_batches,
+            "token_in_flag_batch": k.token_in_flag_batch,
+            "token_back_mode": k.token_back_mode,
+            "reduce_topk_in_kernel": k.in_kernel_fc2_reduce,
+        }
+        tuning.update(self._knob_overrides(fp))
+        # Unset optional keys fall back to the allocator defaults.
+        for key in (
+            "mma_tiler_mnk",
+            "cluster_shape_mn",
+            "fallback_cluster_shape_mn",
+            "fc2_tma_stages",
+        ):
+            if tuning[key] is None:
+                del tuning[key]
         return get_symm_buffer_for_sm107_block_scaled_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
@@ -122,17 +139,55 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             quant_kind=k.kind,
-            schedule_policy=k.schedule_policy,
-            work_id_mode=k.work_id_mode,
-            fc2_use_bulk=k.fc2_use_bulk,
-            epi_flag_batches=k.epi_flag_batches,
-            token_in_flag_batch=k.token_in_flag_batch,
             gate_up_clamp=_resolve_gate_up_clamp(k),
-            reduce_topk_in_kernel=k.in_kernel_fc2_reduce,
-            token_back_mode=k.token_back_mode,
             apply_topk_at_fc1=k.apply_topk_in_fc1,
             max_sm_count=k.max_sm_count,
-            **kwargs,
+            **tuning,
+        )
+
+    def _knob_overrides(self, fleet_params: FleetParams) -> dict:
+        """Resolve the config's ``knobs`` field into shim-kwarg overrides.
+
+        ``None`` -> {} (the explicit config fields stand); a dict ->
+        validated explicit overrides; ``"cache"`` -> knob-cache lookup with
+        the built-in heuristic fallback.  The online ``"auto"`` sweep is not
+        supported on the engine path — the SM107 session bakes knobs at
+        construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
+        """
+        from ......kernel_src.next_cutedsl_megamoe import KNOB_KEYS, resolve_knobs
+
+        k = self._kernel_config
+        if k.knobs is None:
+            return {}
+        if isinstance(k.knobs, dict):
+            unknown = set(k.knobs) - set(KNOB_KEYS)
+            if unknown:
+                raise MoEEpConfigError(
+                    f"unknown SM107 knob keys: {sorted(unknown)} "
+                    f"(valid: {sorted(KNOB_KEYS)})"
+                )
+            return dict(k.knobs)
+        if k.knobs == "cache":
+            knobs, source = resolve_knobs(
+                dtype=k.kind,
+                world_size=self.ep_world_size,
+                hidden=fleet_params.token_hidden_size,
+                intermediate=k.intermediate_size,
+                num_experts=fleet_params.num_experts,
+                topk=k.top_k,
+                max_tokens=fleet_params.max_tokens_per_rank,
+            )
+            if self.ep_rank == 0:
+                print(
+                    f"[{self.kernel_name()}] knobs='cache' resolved via "
+                    f"{source}: {knobs}",
+                    flush=True,
+                )
+            return knobs
+        raise MoEEpConfigError(
+            "knobs='auto' (online sweep) is not supported by the SM107 "
+            "backends; run the offline tuner (python -m flashinfer.moe_ep.tune)"
+            " and use knobs=None, knobs='cache', or an explicit knob dict."
         )
 
     def validate_forward(
@@ -218,6 +273,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams):
+        from ......core.kernel.workspace_pool import knobs_pool_key
+
         k = self._kernel_config
         fp = fleet_params
         return (
@@ -246,6 +303,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
+            knobs_pool_key(k.knobs),
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:

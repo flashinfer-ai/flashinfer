@@ -80,9 +80,9 @@ class TestSm107BlockScaledConfig:
         assert cfg.cluster_shape_mn is None
         assert cfg.fallback_cluster_shape_mn is None
         assert cfg.max_sm_count is None
-        # No knobs field until the next tree grows a tuner (mirrors the SM90
-        # PORT NOTE contract).
-        assert "knobs" not in {f.name for f in dataclasses.fields(cfg)}
+        # Tuner contract: the knobs field defaults to None (explicit fields
+        # stand); "cache" / dict resolution happens at workspace allocation.
+        assert cfg.knobs is None
 
     @pytest.mark.parametrize("config_cls, backend_cls, name", _BACKENDS)
     def test_is_mega_kernel_config(self, config_cls, backend_cls, name) -> None:

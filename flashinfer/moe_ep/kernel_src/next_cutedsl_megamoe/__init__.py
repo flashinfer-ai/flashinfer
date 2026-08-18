@@ -14,16 +14,26 @@ cutlass / cuda imports lazy, so importing this package stays CPU-safe.
 """
 
 from .shim import (
+    KNOB_KEYS,
     Sm107BlockScaledMoeConfig,
     Sm107BlockScaledSymmBuffer,
     Sm107QuantKind,
     TransformedBlockScaledWeights,
+    autotune_sm107_block_scaled_mega_moe,
     bootstrap_paths,
+    default_knobs,
     ensure_not_capturing,
     free_sym_tensor,
     get_symm_buffer_for_sm107_block_scaled_mega_moe,
+    is_valid_sm107,
+    knob_cache_path,
+    lookup_knobs,
+    record_knobs,
+    resolve_knobs,
     sm107_block_scaled_mega_launch_thunk,
     sm107_block_scaled_mega_moe,
+    sm107_candidates,
+    sm107_schedule_candidates,
     sym_zeros,
 )
 
@@ -58,15 +68,25 @@ def __getattr__(name):  # PEP 562
 
 __all__ = [
     *_LAZY_HELPERS,
+    "KNOB_KEYS",
     "Sm107BlockScaledMoeConfig",
     "Sm107BlockScaledSymmBuffer",
     "Sm107QuantKind",
     "TransformedBlockScaledWeights",
+    "autotune_sm107_block_scaled_mega_moe",
     "bootstrap_paths",
+    "default_knobs",
     "ensure_not_capturing",
     "free_sym_tensor",
     "get_symm_buffer_for_sm107_block_scaled_mega_moe",
+    "is_valid_sm107",
+    "knob_cache_path",
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
     "sm107_block_scaled_mega_launch_thunk",
     "sm107_block_scaled_mega_moe",
+    "sm107_candidates",
+    "sm107_schedule_candidates",
     "sym_zeros",
 ]

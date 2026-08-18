@@ -317,6 +317,77 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
 
 
 @pytest.mark.arch_rubin
+def test_sm107_knob_cache_and_candidates(monkeypatch, tmp_path):
+    """Host-only tuner plumbing: knob-cache roundtrip, heuristic profiles,
+    and candidate-grid validity against the shim config rules."""
+    pkg = _sm107_tree()
+
+    # --- knob cache roundtrip (isolated file; no CUDA needed via device=) ---
+    cache = tmp_path / "knob_cache.json"
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(cache))
+    key = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=512,
+        intermediate=256,
+        num_experts=8,
+        topk=4,
+        device="test-gpu",
+    )
+    knobs = pkg.default_knobs(4096, quant_kind="nvfp4")
+    assert pkg.record_knobs(knobs, max_tokens=4096, p50_us=123.0, **key) == str(cache)
+    assert pkg.lookup_knobs(max_tokens=4096, **key) == knobs
+    # bucket resolution: smallest recorded bucket >= request
+    assert pkg.lookup_knobs(max_tokens=1024, **key) == knobs
+    # a different geometry misses (no neighbour borrowing)
+    assert pkg.lookup_knobs(max_tokens=4096, **{**key, "hidden": 1024}) is None
+    # disabled cache
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    assert pkg.knob_cache_path() is None
+    assert pkg.lookup_knobs(max_tokens=4096, **key) is None
+
+    # --- heuristic profiles ---
+    small = pkg.default_knobs(1024, quant_kind="nvfp4")
+    large = pkg.default_knobs(4096, quant_kind="nvfp4")
+    assert small["mma_tiler_mnk"] == (256, 128, 256)
+    assert large["mma_tiler_mnk"] == (256, 256, 256)
+    assert pkg.default_knobs(4096, quant_kind="mxfp8_e4m3")["mma_tiler_mnk"] == (
+        256,
+        256,
+        128,
+    )
+    for profile in (small, large):
+        assert profile["fallback_cluster_shape_mn"] == (2, 1)
+        assert profile["schedule_policy"] == ("phase_interleave", None)
+        assert set(profile) <= set(pkg.KNOB_KEYS)
+
+    # --- candidate grids are constructible on a real geometry ---
+    for quant_kind in QUANT_KINDS:
+        base = pkg.Sm107BlockScaledMoeConfig(
+            num_total_experts=8,
+            max_tokens_per_rank=128,
+            num_topk=4,
+            hidden=512,
+            intermediate=256,
+            rank=0,
+            world_size=1,
+            quant_kind=quant_kind,
+        )
+        candidates = pkg.sm107_candidates(quant_kind)
+        assert len(candidates) == 16
+        assert all(pkg.is_valid_sm107(knobs, base) for knobs in candidates)
+        with_ikr = pkg.sm107_candidates(quant_kind, allow_in_kernel_fc2_reduce=True)
+        assert len(with_ikr) == 32
+        assert all(pkg.is_valid_sm107(knobs, base) for knobs in with_ikr)
+        schedule = pkg.sm107_schedule_candidates(candidates[0])
+        assert len(schedule) == 8
+        assert all(pkg.is_valid_sm107(knobs, base) for knobs in schedule)
+        with pytest.raises(ValueError, match="unknown SM107 knob"):
+            pkg.is_valid_sm107({"bogus_knob": 1}, base)
+        assert not pkg.is_valid_sm107({"epi_flag_batches": (8, 8)}, base)
+
+
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("quant_kind", QUANT_KINDS)
 def test_sm107_block_scaled_kernel_perf_winner_config(monkeypatch, quant_kind):
     """Oracle check for the upstream perf-report winner knobs (a5b4d33):
