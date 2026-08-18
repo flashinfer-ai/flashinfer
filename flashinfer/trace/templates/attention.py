@@ -27,7 +27,7 @@ the backend column indicates which kernel the API wraps.
 | ``prims_ts_batch_decode`` | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``     | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``            | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
-| ``prims_ts_block_sparse`` | batched, fixed    | contiguous BSHD           | per-head BSR + bits     | both    | PrimTS SM100a   |
+| ``prims_ts_block_sparse`` | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
 | ``mla_paged_decode``      | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
 | ``prims_ts_decode_mla``   | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
 | ``mla_paged_prefill``     | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
@@ -301,8 +301,8 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
         op_type="block_sparse",
         name_prefix="prims_ts_block_sparse",
         description=(
-            "One-shot PrimTS block-sparse MHA attention over compact "
-            "BSHD Q/K/V and per-batch/per-head BSR metadata."
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            "BSHD Q/K/V and per-KV-head BSR metadata."
         ),
         axes=axes,
         inputs=inputs,
@@ -314,7 +314,8 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
             )
         },
         constraints=[
-            "num_qo_heads == num_kv_heads",
+            "num_qo_heads % num_kv_heads == 0",
+            "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
             "head_dim == 128",
             (
                 "q_block_size in (8, 16, 32) or "
@@ -324,7 +325,6 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
                 "kv_block_size in (8, 16, 32) or "
                 "(kv_block_size > 0 and kv_block_size % 64 == 0)"
             ),
-            "kv_block_size >= 64 or q_block_size in (8, 16, 32)",
             "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
             "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
             "mask_type is None or mask_type in ('dense', 'causal')",

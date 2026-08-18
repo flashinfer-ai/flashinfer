@@ -18,6 +18,8 @@ _FINE_BLOCK_SIZES = (8, 16, 32)
 _PREPARED_KV_ROUTE_SIZE = 128
 _MAX_KV_ATOM_SIZE = 64
 _SIGNED_INT32_MAX = (1 << 31) - 1
+_BLOCK_SPARSE_Q_TILE_SIZES = (8, 16, 32, 64, 128)
+_BLOCK_SPARSE_MAX_HEADS_Q_PER_KV = 32
 
 
 def _validate_sparse_block_size(value: object, name: str) -> int:
@@ -41,13 +43,42 @@ def _validate_sparse_block_size(value: object, name: str) -> int:
     return value
 
 
-def _canonical_block_sparse_q_tile_size(q_block_size: int) -> int:
-    """Select the canonical PrimTS Q tile for a semantic Q block."""
+def _select_block_sparse_q_tile_size(
+    *,
+    q_block_size: int,
+    heads_q_per_kv: int,
+    kv_block_size: int,
+) -> int:
+    """Select the largest row-pure tile from grouped Q tokens and heads.
+
+    One CTA belongs to one KV head and may group complete Q-head groups across
+    several tokens. The selected tile therefore divides evenly into head
+    groups, and its token span stays within one semantic sparse Q block.
+    """
 
     q_block_size = _validate_sparse_block_size(q_block_size, "q_block_size")
-    if q_block_size in _FINE_BLOCK_SIZES:
-        return q_block_size
-    return 128 if q_block_size % 128 == 0 else 64
+    kv_block_size = _validate_sparse_block_size(kv_block_size, "kv_block_size")
+    if isinstance(heads_q_per_kv, bool) or not isinstance(heads_q_per_kv, int):
+        raise TypeError("heads_q_per_kv must be a positive integer")
+    if heads_q_per_kv <= 0:
+        raise ValueError("heads_q_per_kv must be positive")
+    if heads_q_per_kv > _BLOCK_SPARSE_MAX_HEADS_Q_PER_KV:
+        raise ValueError("block-sparse supports at most 32 Q heads per KV head")
+    if heads_q_per_kv & (heads_q_per_kv - 1):
+        raise ValueError("Q heads per KV head must be a power of two")
+
+    max_q_tile_size = min(
+        q_block_size * heads_q_per_kv,
+        32 if kv_block_size < 64 else 128,
+    )
+    for q_tile_size in reversed(_BLOCK_SPARSE_Q_TILE_SIZES):
+        if (
+            q_tile_size <= max_q_tile_size
+            and q_tile_size % heads_q_per_kv == 0
+            and q_block_size % (q_tile_size // heads_q_per_kv) == 0
+        ):
+            return q_tile_size
+    raise ValueError("block-sparse Q geometry has no row-pure Q tile")
 
 
 def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
@@ -73,7 +104,5 @@ def _prepared_kv_routes_are_block_aligned(
     """Return whether each prepared route stays within one semantic BSR block."""
 
     return (
-        _validate_sparse_block_size(kv_block_size, "kv_block_size")
-        % kv_route_size
-        == 0
+        _validate_sparse_block_size(kv_block_size, "kv_block_size") % kv_route_size == 0
     )

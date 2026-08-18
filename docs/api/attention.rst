@@ -61,8 +61,14 @@ Block-Sparse FMHA
     :toctree: ../generated
 
     block_sparse_attention
+    block_sparse_attention_with_paged_kv_cache
 
 .. autoclass:: BlockSparseTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BlockSparsePagedTSWrapper
     :members:
 
     .. automethod:: __init__

@@ -22,6 +22,15 @@ from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
+from flashinfer.utils import ceil_div
+
+from .compiler import _get_compiled_block_sparse
+from .config import (
+    _BlockSparseStaticProfile,
+    _resolve_block_sparse_launch_spec,
+)
+from .prepared import _BlockSparseRouteLayout
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -49,26 +58,116 @@ def _serialize_plan(
 
 
 @dataclass(frozen=True)
+class _PagedKVPlanMetadata:
+    """Plan-owned metadata required only by paged K/V storage."""
+
+    page_size: int
+    paged_kv_indptr: torch.Tensor
+    seq_lens_kv: torch.Tensor
+    num_page_indices: int
+    use_variable_seqlens_kv: bool
+
+
+def _snapshot_paged_kv_plan_metadata(
+    paged_kv_indptr: torch.Tensor,
+    seq_lens_kv: torch.Tensor | None,
+    *,
+    static: _BlockSparseStaticProfile,
+    device: torch.device,
+    plan_stream: torch.cuda.Stream,
+) -> _PagedKVPlanMetadata:
+    """Validate and copy stable paged inputs into one final plan object."""
+
+    assert static.page_size is not None
+    if seq_lens_kv is not None:
+        if not isinstance(seq_lens_kv, torch.Tensor):
+            raise TypeError("seq_lens_kv must be a torch.Tensor")
+        if seq_lens_kv.dtype != torch.int32:
+            raise TypeError("seq_lens_kv must have dtype torch.int32")
+        if seq_lens_kv.ndim != 1:
+            raise ValueError("seq_lens_kv must be one-dimensional")
+        if seq_lens_kv.device != device:
+            raise ValueError(
+                f"seq_lens_kv must be on planned device {device}, "
+                f"got {seq_lens_kv.device}"
+            )
+        if tuple(seq_lens_kv.shape) != (static.batch_size,):
+            raise ValueError(f"seq_lens_kv must have shape ({static.batch_size},)")
+        if not seq_lens_kv.is_contiguous():
+            raise ValueError("seq_lens_kv must be contiguous")
+        if seq_lens_kv.data_ptr() % 4 != 0:
+            raise ValueError("seq_lens_kv data pointer must be 4-byte aligned")
+
+    with torch.cuda.device(device), torch.cuda.stream(plan_stream):
+        indptr_values = tuple(int(value) for value in paged_kv_indptr.tolist())
+        if indptr_values[0] != 0:
+            raise ValueError("paged_kv_indptr must start at zero")
+        for begin, end in zip(indptr_values[:-1], indptr_values[1:], strict=True):
+            if end < begin:
+                raise ValueError("paged_kv_indptr must be monotonic non-decreasing")
+
+        if seq_lens_kv is None:
+            seq_lens_kv_values = (static.seq_len_kv,) * static.batch_size
+        else:
+            seq_lens_kv_values = tuple(int(value) for value in seq_lens_kv.tolist())
+
+        lower_bound = static.seq_len_q if static.mask_type == "causal" else 1
+        for request_idx, (live_kv, begin, end) in enumerate(
+            zip(
+                seq_lens_kv_values,
+                indptr_values[:-1],
+                indptr_values[1:],
+                strict=True,
+            )
+        ):
+            if not lower_bound <= live_kv <= static.seq_len_kv:
+                raise ValueError(
+                    "seq_lens_kv values must be in "
+                    f"[{lower_bound}, {static.seq_len_kv}]"
+                )
+            required_pages = ceil_div(live_kv, static.page_size)
+            available_pages = end - begin
+            if available_pages < required_pages:
+                qualifier = " for live seq_lens_kv" if seq_lens_kv is not None else ""
+                raise ValueError(
+                    "each paged_kv_indptr request must contain at least "
+                    f"{required_pages} pages{qualifier}; request {request_idx} "
+                    f"contains {available_pages}"
+                )
+
+        use_variable_seqlens_kv = any(
+            live_kv != static.seq_len_kv for live_kv in seq_lens_kv_values
+        )
+        return _PagedKVPlanMetadata(
+            page_size=static.page_size,
+            paged_kv_indptr=torch.tensor(
+                indptr_values,
+                dtype=torch.int32,
+                device=device,
+            ),
+            seq_lens_kv=torch.tensor(
+                seq_lens_kv_values,
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_page_indices=indptr_values[-1],
+            use_variable_seqlens_kv=use_variable_seqlens_kv,
+        )
+
+
+@dataclass(frozen=True)
 class _BlockSparsePlanState:
     """One complete launch state published by a block-sparse wrapper.
 
     Every state executes one ``prepare -> prepared-route attention`` adapter,
-    including a pattern whose rows select every KV block. The state retains
-    caller BSR tensors because the prepare launch consumes their live values
-    on every run.
+    including a pattern whose rows select every KV block. Caller BSR and token
+    mask tensors belong to individual runs and are never retained here.
 
-    Runtime geometry, dtypes, metadata tensors, the compiled launch, and the
-    readiness event are published together. ``run()`` therefore sees either
-    the complete old state or the complete new one, never a mix.
-
-    BSR tensors and any effective caller mask are borrowed. They must remain
-    immutable until their queued work completes unless the public plan opted
-    into dynamic metadata. That mode permits in-place updates to indptr,
-    block-index, and token-mask values between ordered launches while every
-    BSR row remains within its planned capacity, strictly increasing, unique,
-    and in range. Plan-owned row offsets describe capacity slices rather than
-    live BSR boundaries. Mutable route scratch, the dummy mask, and the event
-    are also state-owned.
+    Runtime geometry, dtypes, the compiled launch, and the readiness event are
+    published together. ``run()`` therefore sees either the complete old state
+    or the complete new one, never a mix. Plan-owned row offsets describe
+    uniform capacity slices. Mutable route scratch, the optional unmasked-ABI
+    dummy mask, and the event are also state-owned.
     Policy is immutable after publication; the cached compiled adapter is
     shared read-only.
 
@@ -78,34 +177,33 @@ class _BlockSparsePlanState:
     launches would race. Different wrappers and published revisions own
     independent workspaces.
 
-    ``record_stream()`` extends allocator lifetime only—it cannot prevent the
-    caller from modifying borrowed metadata in place.
+    Caller routing storage must outlive its queued run or captured graph.
+    ``record_stream()`` extends allocator lifetime for eager runs only; it
+    cannot prevent in-place modification or replace graph ownership.
     """
 
     device: torch.device
     batch_size: int
     seq_len_q: int
     seq_len_kv: int
-    num_heads: int
+    num_qo_heads: int
+    num_kv_heads: int
     head_dim: int
+    q_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     output_dtype: torch.dtype
+    use_kv_valid_bits: bool
 
-    # Caller-owned canonical BSR read directly by every run.
-    block_indptr: torch.Tensor
-    block_indices: torch.Tensor
-
-    # ``kv_valid_bits`` is either the caller mask or a plan-owned
-    # shape-correct dummy required by the compiled ABI.
-    kv_valid_bits: torch.Tensor
+    # Only an unmasked specialization needs a shape-correct ABI placeholder.
+    dummy_kv_valid_bits: torch.Tensor | None
 
     # Immutable row capacities and mutable per-run route payload.
     row_route_offsets: torch.Tensor
     route_workspace: torch.Tensor
-    # Optional semantic row bound; unlike route capacity, this distinguishes
+    # Semantic row bound; unlike route capacity, this distinguishes
     # multiple semantic blocks packed into one prepared route.
-    max_blocks_per_row: int | None
+    max_blocks_per_row: int
 
     policy: tuple[tuple[str, object], ...]
     compiled: Callable[..., object]
@@ -113,6 +211,7 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
+    paged_kv: _PagedKVPlanMetadata | None
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -130,6 +229,31 @@ def _allocate_dummy_kv_valid_bits(
     )
 
 
+def _allocate_route_storage(
+    *,
+    device: torch.device,
+    route_layout: _BlockSparseRouteLayout,
+    uniform_row_route_capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate uniform plan-owned route slices and mutable route scratch."""
+
+    expected_capacity = route_layout.num_rows * uniform_row_route_capacity
+    if expected_capacity != route_layout.route_metadata_capacity:
+        raise RuntimeError("uniform row capacity does not match route layout")
+    offsets_i64 = torch.arange(
+        route_layout.num_rows + 1,
+        dtype=torch.int64,
+        device=device,
+    ) * int(uniform_row_route_capacity)
+    row_route_offsets = offsets_i64.to(torch.int32)
+    route_workspace = torch.empty(
+        route_layout.workspace_size_words,
+        dtype=torch.int32,
+        device=device,
+    )
+    return row_route_offsets, route_workspace
+
+
 def _record_block_sparse_plan_ready_event(
     stream: torch.cuda.Stream,
 ) -> torch.cuda.Event:
@@ -141,31 +265,132 @@ def _record_block_sparse_plan_ready_event(
     return event
 
 
+def _build_block_sparse_plan_state(
+    static: _BlockSparseStaticProfile,
+    *,
+    device: torch.device,
+    device_index: int,
+    plan_stream: torch.cuda.Stream,
+    paged_kv: _PagedKVPlanMetadata | None,
+) -> _BlockSparsePlanState:
+    """Build and close one complete state after storage validation."""
+
+    assert static.max_blocks_per_row is not None
+    assert (static.page_size is None) == (paged_kv is None)
+    if paged_kv is not None:
+        assert static.page_size == paged_kv.page_size
+    max_row_route_capacity = ceil_div(
+        static.max_blocks_per_row * static.kv_block_size,
+        static.kv_route_size,
+    )
+    num_rows = (
+        static.batch_size
+        * static.num_kv_heads
+        * ceil_div(static.seq_len_q, static.q_block_size)
+    )
+    route_layout = _BlockSparseRouteLayout.create(
+        kv_route_size=static.kv_route_size,
+        kv_block_size=static.kv_block_size,
+        page_size=static.page_size,
+        has_token_bits=static.use_kv_valid_bits,
+        route_metadata_capacity=num_rows * max_row_route_capacity,
+        num_rows=num_rows,
+    )
+    with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
+        spec = _resolve_block_sparse_launch_spec(
+            device_index=device_index,
+            batch_size=static.batch_size,
+            seq_len_q=static.seq_len_q,
+            seq_len_kv=static.seq_len_kv,
+            num_qo_heads=static.num_qo_heads,
+            num_kv_heads=static.num_kv_heads,
+            head_dim=static.head_dim,
+            q_block_size=static.q_block_size,
+            kv_block_size=static.kv_block_size,
+            kv_route_size=static.kv_route_size,
+            page_size=static.page_size,
+            dtype_key=static.dtype_key,
+            mask_type=static.mask_type,
+            use_kv_valid_bits=static.use_kv_valid_bits,
+            max_row_route_capacity=max_row_route_capacity,
+            use_variable_seqlens_kv=(
+                False if paged_kv is None else paged_kv.use_variable_seqlens_kv
+            ),
+        )
+        policy = (
+            *spec.policy,
+            ("max_blocks_per_row", static.max_blocks_per_row),
+        )
+        compiled = _get_compiled_block_sparse(spec.compile_key)
+        dummy_kv_valid_bits = (
+            None
+            if static.use_kv_valid_bits
+            else _allocate_dummy_kv_valid_bits(
+                batch_size=static.batch_size,
+                seq_len_kv=static.seq_len_kv,
+                device=device,
+            )
+        )
+        row_route_offsets, route_workspace = _allocate_route_storage(
+            device=device,
+            route_layout=route_layout,
+            uniform_row_route_capacity=max_row_route_capacity,
+        )
+        ready_event = _record_block_sparse_plan_ready_event(plan_stream)
+
+    return _BlockSparsePlanState(
+        device=device,
+        batch_size=static.batch_size,
+        seq_len_q=static.seq_len_q,
+        seq_len_kv=static.seq_len_kv,
+        num_qo_heads=static.num_qo_heads,
+        num_kv_heads=static.num_kv_heads,
+        head_dim=static.head_dim,
+        q_block_size=static.q_block_size,
+        q_dtype=static.q_dtype,
+        kv_dtype=static.kv_dtype,
+        output_dtype=static.output_dtype,
+        use_kv_valid_bits=static.use_kv_valid_bits,
+        dummy_kv_valid_bits=dummy_kv_valid_bits,
+        row_route_offsets=row_route_offsets,
+        route_workspace=route_workspace,
+        max_blocks_per_row=static.max_blocks_per_row,
+        policy=policy,
+        compiled=compiled,
+        ready_event=ready_event,
+        ready_stream_handle=plan_stream.cuda_stream,
+        paged_kv=paged_kv,
+    )
+
+
 def _wait_and_record_block_sparse_plan(
     state: _BlockSparsePlanState,
     stream: torch.cuda.Stream,
 ) -> None:
-    """Acquire one state on ``stream`` and retain all launch storage."""
+    """Acquire one state on ``stream`` and retain all plan-owned launch storage."""
 
     if stream.device != state.device:
         raise ValueError("run stream must share the planned CUDA device")
     if stream.cuda_stream != state.ready_stream_handle:
         stream.wait_event(state.ready_event)
 
-    # Raw BSR and route storage are true run-time launch tensors. Extending
-    # all of them is required for eager cross-stream use and captured
-    # revisions.
-    state.block_indptr.record_stream(stream)
-    state.block_indices.record_stream(stream)
-    state.kv_valid_bits.record_stream(stream)
+    if state.dummy_kv_valid_bits is not None:
+        state.dummy_kv_valid_bits.record_stream(stream)
     state.row_route_offsets.record_stream(stream)
     state.route_workspace.record_stream(stream)
+    if state.paged_kv is not None:
+        state.paged_kv.paged_kv_indptr.record_stream(stream)
+        state.paged_kv.seq_lens_kv.record_stream(stream)
 
 
 __all__ = [
     "_BlockSparsePlanState",
+    "_PagedKVPlanMetadata",
     "_allocate_dummy_kv_valid_bits",
+    "_allocate_route_storage",
+    "_build_block_sparse_plan_state",
     "_record_block_sparse_plan_ready_event",
     "_serialize_plan",
+    "_snapshot_paged_kv_plan_metadata",
     "_wait_and_record_block_sparse_plan",
 ]

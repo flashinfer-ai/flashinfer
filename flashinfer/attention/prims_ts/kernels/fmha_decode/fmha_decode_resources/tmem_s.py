@@ -123,7 +123,7 @@ def _swaps_uses_origin0_k32_full_guard(cfg: FmhaDecodeConfig) -> bool:
 
 
 def _swaps_token_word_covers_kv_tail(cfg: FmhaDecodeConfig) -> bool:
-    """Whether SWAP's prepared token word covers the physical KV tail."""
+    """Whether SWAP's prepared token word covers the logical KV tail."""
 
     return (
         cfg.use_kv_valid_bits
@@ -1242,14 +1242,20 @@ class TmemSResource(DecodeGenResourceBase):
         routed_token_word2: Uint32,
         routed_token_word3: Uint32,
     ) -> tuple[object, object, object, object]:
-        """Load Keeps scores and mask them in original physical KV coordinates."""
+        """Load Keeps scores and mask them in logical KV coordinates."""
         cfg = self.cfg
         num_s_regs = cfg.num_s_regs_per_thread
         old_max = new_max_arr[0]
         running_sum = sum_arr[0]
         s_vals = cutlass.Array(Float32, num_s_regs, space=cutlass.AddressSpace.rmem)
         task_cache = _decode_gen_task_cache(stage_info)
-        seq_len_kv = Int32(self.max_seq_len_kv)
+        seq_len_kv = _load_runtime_seq_len_kv(
+            self.seqlens_kv,
+            self.max_seq_len_kv,
+            stage_info,
+            Int32(0),
+            Int32(0),
+        )
         warp_grp_thread_idx = Int32(task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX])
         lane_idx = Int32(task_cache[_TASK_CACHE_LANE_IDX])
         tile_row_idx = _keeps_row_idx(cfg, warp_grp_thread_idx)
@@ -1344,24 +1350,24 @@ class TmemSResource(DecodeGenResourceBase):
         if not can_skip_structural_mask:
             for reg_idx in cutlass.range_constexpr(num_s_regs):
                 fragment_offset = Int32(reg_idx)
-                physical_k = origin0 + fragment_offset
+                logical_k = origin0 + fragment_offset
                 fragment_valid = valid0
                 if cutlass.const_expr(cfg.tile_size_q == 128 and reg_idx >= 64):
                     fragment_offset = Int32(reg_idx - 64)
-                    physical_k = origin1 + fragment_offset
+                    logical_k = origin1 + fragment_offset
                     fragment_valid = valid1
                 elif cutlass.const_expr(cfg.tile_size_q == 64):
                     if col_base >= Int32(64):
-                        physical_k = origin1 + fragment_offset
+                        logical_k = origin1 + fragment_offset
                         fragment_valid = valid1
 
                 score_is_valid = (
                     q_row_is_valid
                     and fragment_valid != Int32(0)
-                    and physical_k < seq_len_kv
+                    and logical_k < seq_len_kv
                 )
                 if cutlass.const_expr(cfg.mask_type == CAUSAL):
-                    score_is_valid = score_is_valid and physical_k < causal_end
+                    score_is_valid = score_is_valid and logical_k < causal_end
                 if not score_is_valid:
                     s_vals[reg_idx] = _neg_max_f32()
 
@@ -1650,7 +1656,7 @@ class TmemSResource(DecodeGenResourceBase):
         return s_arr
 
     @cute.jit
-    def _sparse_swaps_physical_k(
+    def _sparse_swaps_logical_k(
         self,
         lane_k_offset: Int32,
         sparse_origin0: Int32,
@@ -1660,7 +1666,7 @@ class TmemSResource(DecodeGenResourceBase):
         *,
         token_group_idx: Constexpr[int],
     ) -> tuple[Int32, Int32]:
-        """Map one SWAP register group to its routed physical K position."""
+        """Map one SWAP register group to its routed logical K position."""
 
         atom_size = min(self.cfg.kv_block_size, 32)
         groups_per_atom = atom_size // 8
@@ -1905,7 +1911,7 @@ class TmemSResource(DecodeGenResourceBase):
                 lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
                 token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
                 for token_group_idx in cutlass.range_constexpr(4):
-                    atom_origin, physical_k = self._sparse_swaps_physical_k(
+                    atom_origin, logical_k = self._sparse_swaps_logical_k(
                         lane_k_offset,
                         sparse_origin0,
                         sparse_origin1,
@@ -1913,7 +1919,7 @@ class TmemSResource(DecodeGenResourceBase):
                         sparse_origin3,
                         token_group_idx=token_group_idx,
                     )
-                    # Prepared words zero absent atoms and the physical KV
+                    # Prepared words zero absent atoms and the logical KV
                     # tail. Qualified profiles can therefore omit the local
                     # atom-origin guard, independently of the K/V issuer warp.
                     score_is_valid = cutlass.Boolean(True)
@@ -1923,11 +1929,11 @@ class TmemSResource(DecodeGenResourceBase):
                         score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
                     if cutlass.const_expr(not token_word_covers_kv_tail):
                         score_is_valid = cutlass.Boolean(
-                            score_is_valid and physical_k < seq_len_kv
+                            score_is_valid and logical_k < seq_len_kv
                         )
                     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
                         score_is_valid = cutlass.Boolean(
-                            score_is_valid and physical_k < element_mask_end_idx
+                            score_is_valid and logical_k < element_mask_end_idx
                         )
                     if cutlass.const_expr(cfg.use_kv_valid_bits):
                         token_bit_idx = Int32(token_group_idx * 8) + lane_k_offset
@@ -2041,7 +2047,7 @@ class TmemSResource(DecodeGenResourceBase):
                 )
             if apply_per_row_causal_mask:
                 # Grouped causal decode has a distinct causal/window bound for
-                # every Q token. Sparse routes always use their physical K;
+                # every Q token. Sparse routes always use their logical K;
                 # dense routes retain the boundary-tile fast path above.
                 warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
                 lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -2072,7 +2078,7 @@ class TmemSResource(DecodeGenResourceBase):
                             tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
                         )
                         if cutlass.const_expr(use_sparse):
-                            _, token_idx = self._sparse_swaps_physical_k(
+                            _, token_idx = self._sparse_swaps_logical_k(
                                 lane_idx >> Int32(2),
                                 sparse_origin0,
                                 sparse_origin1,
@@ -2416,7 +2422,13 @@ class TmemSResource(DecodeGenResourceBase):
             tile_row_idx,
             self.seq_len_q,
         )
-        seq_len_kv = Int32(self.max_seq_len_kv)
+        seq_len_kv = _load_runtime_seq_len_kv(
+            self.seqlens_kv,
+            self.max_seq_len_kv,
+            stage_info,
+            Int32(0),
+            Int32(0),
+        )
         causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
         origin0 = Int32(sparse_origin0)
         origin1 = Int32(sparse_origin1)
@@ -2608,7 +2620,7 @@ class TmemSResource(DecodeGenResourceBase):
                 routed_token_word3=sparse_token_word3,
             )
         # SWAP reuses the Keeps seven-slot task ABI: all four origins remain
-        # physical KV atom bases, but origin2 occupies the flags slot and
+        # logical KV atom bases, but origin2 occupies the flags slot and
         # origin3 is bit-preserved in word0. Word1 carries the logical K32 token
         # mask and word2 optionally carries the prepared route-full summary.
         return self._compute_softmax_loop_swaps(

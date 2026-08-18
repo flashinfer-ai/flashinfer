@@ -465,6 +465,18 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             )
 
 
+def test_prims_ts_block_sparse_trace_describes_gqa_contract():
+    from flashinfer.trace.templates.attention import prims_ts_block_sparse_trace
+
+    constraints = set(prims_ts_block_sparse_trace.constraints)
+    assert "num_qo_heads % num_kv_heads == 0" in constraints
+    assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
+    assert "num_qo_heads == num_kv_heads" not in constraints
+    assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
+    assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
+    assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
+
+
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     """Resolve a realistic causal SQ4 trace through all six public surfaces."""
     from flashinfer.attention.prims_ts.decode import (

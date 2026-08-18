@@ -49,8 +49,6 @@ from ...placeholder_helpers import _placeholder_smem_array
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
-    _TASK_CACHE_KV_PAGE_IDX_UB,
-    _TASK_CACHE_KV_REQUEST_BEGIN,
     _TASK_CACHE_SEQ_LEN_KV,
     _TASK_CACHE_WARP_IDX,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
@@ -59,6 +57,8 @@ from .helpers_common import (
     ResourceVars,
     _decode_gen_task_cache,
     _keeps_col_base,
+    _sparse_task_cache_route_begin,
+    _sparse_task_cache_route_count,
     _warp_broadcast_i32,
 )
 
@@ -72,6 +72,29 @@ _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
 # in Softmax's private staging payload. Reusing it avoids adding a word to every
 # pipeline stage merely to forward prepare's route-full summary.
 _SWAPS_PACKED_ROUTE_FULL_CLEAR_MASK = ~_PREPARED_ROUTE_IS_FULL_FLAG
+
+
+@cute.jit
+def _paged_sparse_kv_load_coordinate(
+    logical_origin: Int32,
+    physical_page_id: Int32,
+    atom_is_valid: cutlass.Boolean,
+    page_size: Constexpr[int],
+) -> tuple[Int32, Int32]:
+    """Return the in-page token and physical-page TMA coordinates.
+
+    Invalid atoms still issue their normal TMA transaction so the pipeline
+    barrier observes a fixed transaction count.  Mapping them to the first
+    token just beyond page zero makes the token coordinate OOB while keeping
+    the page coordinate itself valid.
+    """
+
+    token_in_page = Int32(page_size)
+    page_id = Int32(0)
+    if atom_is_valid:
+        token_in_page = logical_origin % Int32(page_size)
+        page_id = physical_page_id
+    return token_in_page, page_id
 
 
 def _swaps_forwards_packed_route_full(cfg: FmhaDecodeConfig) -> bool:
@@ -91,17 +114,20 @@ def _swaps_forwards_packed_route_full(cfg: FmhaDecodeConfig) -> bool:
     )
 
 
-def _kv_retained_route_words(route_layout: _BlockSparseRouteLayout) -> int:
+def _kv_retained_route_words(
+    route_layout: _BlockSparseRouteLayout,
+) -> int:
     """Return the aligned SMEM words retained from K issue through V.
 
-    Every route retains its origin prefix. A two-origin route additionally
-    keeps the atom-valid mask used to choose one KV128 or two KV64 TensorMaps;
-    wider lane-distributed routes retain one word per atom and normalize
-    invalid entries to the K/V TensorMap's OOB coordinate when stored.
+    Contiguous routes retain their existing load-origin payload. Paged routes
+    retain parallel logical-origin and physical-page-ID arrays so every atom
+    has an independent storage locator; invalid entries use ``(-1, -1)``.
     """
 
-    payload_words = route_layout.origins_per_route
-    if route_layout.origins_per_route == 2:
+    payload_words = route_layout.logical_origins_per_route
+    if route_layout.is_paged:
+        payload_words *= 2
+    elif route_layout.logical_origins_per_route == 2:
         payload_words += 1
     return ((payload_words + 3) // 4) * 4
 
@@ -118,7 +144,7 @@ class _BlockSparseSoftmaxStagingLayout:
     otherwise-zero low bit of each warp's first aligned origin.
     """
 
-    # Physical-origin scalars staged for one complete logical KV route.
+    # Logical-origin scalars staged for one complete KV route.
     num_origin_words: int
     # SWAP origins consumed by one Softmax warp; Keeps retains all origins.
     origins_per_warp: int
@@ -178,16 +204,16 @@ class _BlockSparseSoftmaxStagingLayout:
 class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     """Pipeline-free route metadata retained from one K issue through V.
 
-    ``route_metadata`` points at the first prepared GMEM record. The record
-    geometry comes from ``route_layout``; this resource retains only the
-    origin prefix and, for a two-fragment route, its atom-valid mask in SMEM.
-    Invalid fine-route origins are normalized to ``tma_oob_origin`` because
-    this private copy is consumed only by K/V TensorMap loads.
+    ``route_metadata`` points at the first prepared GMEM record. Resolution
+    returns logical origins to masking consumers. The private SMEM copy keeps
+    contiguous load origins or paged ``(logical origin, physical page ID)``
+    pairs through the matching V issue. Invalid atoms are retained as safe
+    storage-specific OOB coordinates.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
-        ("resolved_origin0_slot", Int32, Int32(0), "Primary routed origin."),
-        ("resolved_origin1_slot", Int32, Int32(0), "Coarse second KV64 origin."),
+        ("resolved_origin0_slot", Int32, Int32(0), "First logical origin."),
+        ("resolved_origin1_slot", Int32, Int32(0), "Second logical origin."),
         (
             "resolved_atom_validity_slot",
             Int32,
@@ -226,6 +252,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         """Derive the retained K/V payload from the prepared route layout."""
 
         assert self.route_layout is not None
+        assert self.route_layout.is_paged == self.cfg.use_paged_kv
         self._retained_route_words = _kv_retained_route_words(self.route_layout)
         super().__post_init__()
 
@@ -274,6 +301,38 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
 
         self._create_initial_task_locals(stage_info.context)
 
+    @cute.jit
+    def _prepared_route_logical_origin(
+        self,
+        route_record_word_offset: Int32,
+        atom_idx: Int32,
+    ) -> Int32:
+        """Load one logical KV-token origin from a prepared GMEM record."""
+
+        assert self.route_metadata is not None
+        return Int32(self.route_metadata[route_record_word_offset + atom_idx])
+
+    @cute.jit
+    def _prepared_route_physical_page_id_if_valid(
+        self,
+        route_record_word_offset: Int32,
+        atom_idx: Int32,
+    ) -> Int32:
+        """Load a page ID only when the prepared-record offset is valid."""
+
+        assert self.route_metadata is not None
+        assert self.route_layout.is_paged
+        physical_page_id = Int32(-1)
+        if route_record_word_offset >= Int32(0):
+            physical_page_id = Int32(
+                self.route_metadata[
+                    route_record_word_offset
+                    + Int32(self.route_layout.physical_page_ids_word_offset)
+                    + atom_idx
+                ]
+            )
+        return physical_page_id
+
     @consumer_work(
         returns=(
             resolved_origin0_slot,
@@ -290,8 +349,8 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
 
         assert self.route_metadata is not None
         task_cache = _decode_gen_task_cache(stage_info)
-        row_route_begin = Int32(task_cache[_TASK_CACHE_KV_REQUEST_BEGIN])
-        route_count = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
+        row_route_begin = _sparse_task_cache_route_begin(task_cache)
+        route_count = _sparse_task_cache_route_count(task_cache)
         # HEAD publishes one route per instruction. LOOP starts after those
         # two publications, hence the one-based loop offset below. Keeping the
         # constexpr branch local lets the task scheduler specialize each work
@@ -312,20 +371,21 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             route_record_word_offset
         )
 
-        num_origins = self.route_layout.origins_per_route
-        uses_two_fragment_route = num_origins == 2
+        num_logical_origins = self.route_layout.logical_origins_per_route
+        uses_two_fragment_route = num_logical_origins == 2
         # Keep the validity load adjacent to the lane-distributed origins.
         # For the maximal 32-origin layout, lane 31 can retain its origin and
         # load the independent validity scalar before the warp broadcasts it.
-        valid_mask_lane = min(num_origins, 31)
-        origin = Int32(-1)
+        valid_mask_lane = min(num_logical_origins, 31)
+        logical_origin = Int32(-1)
         atom_valid_mask = Int32(0)
         route_record_is_valid = route_record_word_offset >= Int32(0)
 
         if route_record_is_valid:
-            if lane_idx < Int32(num_origins):
-                origin = Int32(
-                    self.route_metadata[route_record_word_offset + lane_idx]
+            if lane_idx < Int32(num_logical_origins):
+                logical_origin = self._prepared_route_logical_origin(
+                    route_record_word_offset,
+                    lane_idx,
                 )
             if cutlass.const_expr(self.cfg.use_kv_valid_bits):
                 if lane_idx == Int32(valid_mask_lane):
@@ -337,8 +397,8 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                     )
 
         if cutlass.const_expr(uses_two_fragment_route):
-            origin0 = _warp_broadcast_i32(origin, 0)
-            origin1 = _warp_broadcast_i32(origin, 1)
+            origin0 = _warp_broadcast_i32(logical_origin, 0)
+            origin1 = _warp_broadcast_i32(logical_origin, 1)
             if cutlass.const_expr(self.cfg.use_kv_valid_bits):
                 # The validity word shares the prepared record's cache line
                 # with fields consumed shortly afterward by Softmax.
@@ -349,7 +409,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                 # Unmasked metadata needs no later fields. Recover validity
                 # from the invalid-origin sentinel and avoid the dead load.
                 origin_is_valid = cutlass.Boolean(
-                    lane_idx < Int32(2) and origin >= Int32(0)
+                    lane_idx < Int32(2) and logical_origin >= Int32(0)
                 )
                 atom_valid_mask = Int32(
                     cute.arch.vote_ballot_sync(origin_is_valid)
@@ -363,12 +423,12 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             atom_valid_mask = _warp_broadcast_i32(
                 atom_valid_mask, valid_mask_lane
             )
-            if lane_idx < Int32(num_origins):
+            if lane_idx < Int32(num_logical_origins):
                 valid = (atom_valid_mask & (Int32(1) << lane_idx)) != Int32(0)
         else:
-            if lane_idx < Int32(num_origins):
-                valid = origin >= Int32(0)
-        return origin, Int32(0), Int32(valid), route_record_word_offset
+            if lane_idx < Int32(num_logical_origins):
+                valid = logical_origin >= Int32(0)
+        return logical_origin, Int32(0), Int32(valid), route_record_word_offset
 
     @producer_work
     @cute.jit
@@ -379,12 +439,38 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         resolved_origin0: Int32,
         resolved_origin1: Int32,
         resolved_atom_validity: Int32,
+        route_record_word_offset: Int32,
     ) -> None:
-        """Store resolved scalars in the slot retained from K through V."""
+        """Retain storage coordinates for the matching K/V load pair."""
 
         del stage_info
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        if cutlass.const_expr(self.route_layout.origins_per_route == 2):
+        num_origins = self.route_layout.logical_origins_per_route
+        if cutlass.const_expr(self.route_layout.is_paged):
+            if lane_idx < Int32(num_origins):
+                logical_origin = Int32(resolved_origin0)
+                atom_is_valid = resolved_atom_validity != Int32(0)
+                if cutlass.const_expr(num_origins == 2):
+                    if lane_idx == Int32(0):
+                        logical_origin = resolved_origin0
+                    else:
+                        logical_origin = resolved_origin1
+                    atom_is_valid = (
+                        resolved_atom_validity & (Int32(1) << lane_idx)
+                    ) != Int32(0)
+                physical_page_id = Int32(-1)
+                if atom_is_valid:
+                    physical_page_id = self._prepared_route_physical_page_id_if_valid(
+                        route_record_word_offset,
+                        lane_idx,
+                    )
+                else:
+                    logical_origin = Int32(-1)
+                self._smem_words[lane_idx] = logical_origin
+                self._smem_words[
+                    Int32(self.route_layout.physical_page_ids_word_offset) + lane_idx
+                ] = physical_page_id
+        elif cutlass.const_expr(num_origins == 2):
             if lane_idx == Int32(0):
                 self._smem_words[Int32(0)] = resolved_origin0
                 self._smem_words[Int32(1)] = resolved_origin1
@@ -392,31 +478,56 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                     Int32(self.route_layout.atom_valid_mask_word_offset)
                 ] = resolved_atom_validity
         else:
-            if lane_idx < Int32(self.route_layout.origins_per_route):
-                origin = Int32(resolved_origin0)
+            if lane_idx < Int32(self.route_layout.logical_origins_per_route):
+                load_origin = Int32(resolved_origin0)
                 if resolved_atom_validity == Int32(0):
                     # Fine-route K and V both consume this retained value.
                     # Materialize their TensorMap OOB coordinate once here
                     # instead of rechecking the invalid-origin sentinel for
                     # every atom copy in both producer passes.
-                    origin = Int32(self.tma_oob_origin)
-                self._smem_words[lane_idx] = origin
+                    load_origin = Int32(self.tma_oob_origin)
+                self._smem_words[lane_idx] = load_origin
         # K consumes this slot immediately, while V consumes it at the start
         # of the next cadence.  Both execute in this warp, so a warp fence is
         # sufficient; no cross-warp mbarrier belongs here.
         cute.arch.sync_warp()
 
     @cute.jit
-    def route_origin(self, atom_idx: Int32) -> Int32:
-        """Load one execution-atom origin retained for K and V."""
+    def route_tma_coordinate(
+        self,
+        atom_idx: Int32,
+        logical_b_idx: Int32,
+    ) -> tuple[Int32, Int32]:
+        """Load one retained sparse atom and return its TensorMap coordinates."""
 
-        return Int32(self._smem_words[atom_idx])
+        logical_origin = Int32(self._smem_words[atom_idx])
+        if cutlass.const_expr(not self.route_layout.is_paged):
+            # Invalid contiguous atoms were normalized to the TensorMap OOB
+            # token coordinate when the route was retained, so their storage
+            # coordinate remains the live batch index.
+            return logical_origin, logical_b_idx
+
+        physical_page_id = Int32(
+            self._smem_words[
+                Int32(self.route_layout.physical_page_ids_word_offset) + atom_idx
+            ]
+        )
+        atom_is_valid = cutlass.Boolean(
+            logical_origin >= Int32(0) and physical_page_id >= Int32(0)
+        )
+        return _paged_sparse_kv_load_coordinate(
+            logical_origin,
+            physical_page_id,
+            atom_is_valid,
+            self.route_layout.paged_page_size,
+        )
 
     @cute.jit
     def route_atom_valid_mask(self) -> Int32:
         """Load the retained route's two-fragment validity mask."""
 
-        assert self.route_layout.origins_per_route == 2
+        assert not self.route_layout.is_paged
+        assert self.route_layout.logical_origins_per_route == 2
         return Int32(
             self._smem_words[Int32(self.route_layout.atom_valid_mask_word_offset)]
         )
@@ -436,13 +547,13 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
-        ("softmax_origin0_slot", Int32, Int32(0), "Loaded first physical origin."),
-        ("softmax_origin1_slot", Int32, Int32(0), "Loaded second physical origin."),
+        ("softmax_origin0_slot", Int32, Int32(0), "Loaded first logical origin."),
+        ("softmax_origin1_slot", Int32, Int32(0), "Loaded second logical origin."),
         (
             "softmax_route_flags_slot",
             Int32,
             Int32(0),
-            "Keeps route flags or SWAP's third physical origin.",
+            "Keeps route flags or SWAP's third logical origin.",
         ),
         (
             "softmax_token_word0_slot",
@@ -502,6 +613,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         """Derive the staged metadata layout."""
 
         assert self.route_layout is not None
+        assert self.route_layout.is_paged == self.cfg.use_paged_kv
         self.staging_layout = _BlockSparseSoftmaxStagingLayout.create(
             use_keeps_mma_ab=self.cfg.use_keeps_mma_ab,
             route_layout=self.route_layout,
@@ -632,7 +744,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 self._smem_words[stage_base + lane_idx] = softmax_origin
         else:
             # SWAP with a coarse KV atom expands the two resolved KV64
-            # fragments into the four physical K32 origins consumed by its
+            # fragments into the four logical K32 origins consumed by its
             # four softmax warps.
             if lane_idx < Int32(4):
                 fragment_idx = lane_idx >> Int32(1)
@@ -686,7 +798,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         assert self.staging_layout.route_flags_word_offset is not None
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         route_record_is_valid = route_record_word_offset >= Int32(0)
-        num_origins = self.route_layout.origins_per_route
+        num_origins = self.route_layout.logical_origins_per_route
         route_flags = Int32(resolved_atom_validity)
         if cutlass.const_expr(num_origins > 2):
             route_flags = Int32(
@@ -788,9 +900,9 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     def _load_route_swaps_values(
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Uint32, Uint32, Uint32]:
-        """Load one SWAP warp's physical KV origins and optional token mask.
+        """Load one SWAP warp's logical KV origins and optional token mask.
 
-        ``origin0..3`` are absolute physical KV-token atom bases assigned to
+        ``origin0..3`` are logical KV-token atom bases assigned to
         this Softmax warp's logical K32 slice; unused or invalid origins are
         negative. To preserve the shared seven-slot task ABI, origin 2/3
         subsequently travel through the shared route-flags/token-word-0 slots.

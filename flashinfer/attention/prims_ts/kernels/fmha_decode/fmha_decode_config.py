@@ -27,7 +27,8 @@ import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 
 from ..._block_sparse.common import (
-    _canonical_block_sparse_q_tile_size,
+    _block_sparse_kv_atom_size,
+    _select_block_sparse_q_tile_size,
     _validate_sparse_block_size,
 )
 from ...split_kv_mode_policy import select_split_kv_modes
@@ -1203,6 +1204,52 @@ class FmhaDecodeConfig:
             if config_field.type in (bool, "bool") and not isinstance(value, bool):
                 raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
 
+    def validate_paged_kv_staging_config(self) -> None:
+        """Validate the selected dense or sparse paged-KV staging geometry."""
+
+        if not self.use_paged_kv:
+            raise ValueError("paged-KV staging requires use_paged_kv=True")
+        validate_page_size(self.num_tokens_per_page)
+
+        if self.use_block_sparse:
+            if self.tile_size_kv not in (128, 256):
+                raise ValueError(
+                    "paged block-sparse supports only KV128 or KV256 routes"
+                )
+            atom_size = _block_sparse_kv_atom_size(self.kv_block_size)
+            if atom_size > self.num_tokens_per_page:
+                raise ValueError(
+                    "paged block-sparse atom size must not exceed page size"
+                )
+            if self.num_tokens_per_page % atom_size != 0:
+                raise ValueError(
+                    "paged block-sparse page size must be divisible by atom size"
+                )
+            if self.tile_size_kv == 256 and self.num_tokens_per_page not in (
+                64,
+                128,
+            ):
+                raise ValueError(
+                    "paged block-sparse KV256 routes require page size 64 or 128"
+                )
+            return
+
+        if self.tile_size_kv <= 0:
+            raise ValueError("paged-KV tile_size_kv must be positive")
+        if self.tile_size_kv % self.num_tokens_per_page != 0:
+            raise ValueError(
+                "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
+            )
+        pages_per_tile = self.tile_size_kv // self.num_tokens_per_page
+        if pages_per_tile not in (1, 2, 4, 8, 16):
+            raise ValueError(
+                "paged-KV staging supports 1, 2, 4, 8, or 16 pages per KV tile"
+            )
+        if self.page_offsets_num_warps != 1:
+            raise ValueError(
+                "paged-KV page-offset staging requires exactly one producer warp"
+            )
+
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""
         if not self.use_block_sparse:
@@ -1219,12 +1266,14 @@ class FmhaDecodeConfig:
                 "block-sparse supports only matching Float16 or BFloat16 IO"
             )
 
-        canonical_q_tile = _canonical_block_sparse_q_tile_size(self.q_block_size)
         kv_block_size = _validate_sparse_block_size(self.kv_block_size, "kv_block_size")
+        selected_q_tile = _select_block_sparse_q_tile_size(
+            q_block_size=self.q_block_size,
+            heads_q_per_kv=heads_q_per_kv,
+            kv_block_size=kv_block_size,
+        )
         if self.use_paged_kv:
-            raise ValueError("block-sparse does not support use_paged_kv")
-        if heads_q_per_kv != 1:
-            raise ValueError("block-sparse requires heads_q_per_kv == 1")
+            self.validate_paged_kv_staging_config()
         if not self.groups_tokens_heads_q:
             raise ValueError("block-sparse requires groups_tokens_heads_q=True")
         if self.headdim != 128:
@@ -1240,9 +1289,11 @@ class FmhaDecodeConfig:
                 "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
                 "profile with coarse KV blocks and one load task"
             )
-        if self.tile_size_q != canonical_q_tile:
-            raise ValueError("raw q_block_size requires its canonical tile_size_q")
-        uses_fine_q_tile = canonical_q_tile < 64
+        if self.tile_size_q != selected_q_tile:
+            raise ValueError(
+                "block-sparse tile_size_q must match its grouped-Q geometry"
+            )
+        uses_fine_q_tile = selected_q_tile < 64
         uses_fine_kv_blocks = kv_block_size < 64
         if uses_fine_q_tile:
             if self.use_keeps_mma_ab:
@@ -3366,12 +3417,8 @@ def _validate_profile_support(
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
-    if cfg.use_paged_kv:
-        validate_paged_kv_staging_config(
-            tile_size_kv=cfg.tile_size_kv,
-            num_tokens_per_page=cfg.num_tokens_per_page,
-            page_offsets_num_warps=cfg.page_offsets_num_warps,
-        )
+    if cfg.use_paged_kv and not cfg.use_block_sparse:
+        cfg.validate_paged_kv_staging_config()
     if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")
     heads_q_per_kv = num_heads_q // num_heads_kv
@@ -3667,31 +3714,6 @@ def validate_page_size(num_tokens_per_page: int) -> None:
         raise ValueError("num_tokens_per_page must be one of 16, 32, 64, or 128")
     if 128 % num_tokens_per_page != 0:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
-
-
-def validate_paged_kv_staging_config(
-    *,
-    tile_size_kv: int,
-    num_tokens_per_page: int,
-    page_offsets_num_warps: int,
-) -> None:
-    """Validate page-ID staging geometry and its single producer-warp contract."""
-    validate_page_size(num_tokens_per_page)
-    if tile_size_kv <= 0:
-        raise ValueError("paged-KV tile_size_kv must be positive")
-    if tile_size_kv % num_tokens_per_page != 0:
-        raise ValueError(
-            "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
-        )
-    pages_per_tile = tile_size_kv // num_tokens_per_page
-    if pages_per_tile not in (1, 2, 4, 8, 16):
-        raise ValueError(
-            "paged-KV staging supports 1, 2, 4, 8, or 16 pages per KV tile"
-        )
-    if page_offsets_num_warps != 1:
-        raise ValueError(
-            "paged-KV page-offset staging requires exactly one producer warp"
-        )
 
 
 def make_decode_config(

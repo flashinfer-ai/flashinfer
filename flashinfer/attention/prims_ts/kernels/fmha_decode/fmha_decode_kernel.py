@@ -65,7 +65,7 @@ from ..tensor_map import (
     create_tensor_map_tiled,
     create_tensor_map_tiled_from_view,
 )
-from .fmha_decode_config import FmhaDecodeConfig, validate_paged_kv_staging_config
+from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
@@ -380,11 +380,7 @@ def _build_decode_gen_schedule(
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
     if cfg.use_paged_kv:
-        validate_paged_kv_staging_config(
-            tile_size_kv=cfg.tile_size_kv,
-            num_tokens_per_page=cfg.num_tokens_per_page,
-            page_offsets_num_warps=cfg.page_offsets_num_warps,
-        )
+        cfg.validate_paged_kv_staging_config()
     if cfg.use_block_sparse:
         if tma_desc_q is not None:
             if sparse_row_route_offsets is None:
@@ -463,6 +459,7 @@ def _build_decode_gen_schedule(
     # into the unified block. Separate barrier arrays create an alignment gap
     # before the 1024-byte-aligned data block and overflow near-capacity Q128.
     use_paged_kv = cfg.use_paged_kv
+    use_dense_page_offsets = use_paged_kv and not cfg.use_block_sparse
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     one_inst_kv_stages = cfg.num_head_dim_stages_kv if use_one_inst_qkv else 1
@@ -542,7 +539,7 @@ def _build_decode_gen_schedule(
         and cfg.num_insts_kv == 2
     )
     use_separate_kv_page_offset_resources = (
-        use_paged_kv and use_per_inst_kv_resources and not use_one_inst_qkv
+        use_dense_page_offsets and use_per_inst_kv_resources and not use_one_inst_qkv
     )
     # Paired resources publish independent K0/K1 and V0/V1 stages. Shared
     # split-KV retains the aligned 32-ID representation for its optional
@@ -616,7 +613,7 @@ def _build_decode_gen_schedule(
 
     smem_page_offsets_cfg = None
     smem_page_offsets_v_cfg = None
-    if use_paged_kv:
+    if use_dense_page_offsets:
         page_offsets_stages = (
             3 if use_separate_kv_page_offset_resources else cfg.page_offsets_stages
         )
@@ -829,7 +826,7 @@ def _build_decode_gen_schedule(
     kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
-    if use_paged_kv:
+    if use_dense_page_offsets:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
@@ -878,6 +875,7 @@ def _build_decode_gen_schedule(
             has_token_bits=cfg.use_kv_valid_bits,
             route_metadata_capacity=0,
             num_rows=1,
+            page_size=cfg.num_tokens_per_page if cfg.use_paged_kv else None,
         )
         sparse_kv_metadata0 = SmemBlockSparseKvMetadataResource(
             pipeline_config=None,
@@ -1295,7 +1293,7 @@ def _build_decode_gen_schedule(
             ),
         )
     page_offsets_task = None
-    if use_paged_kv:
+    if use_dense_page_offsets:
         page_offsets_warp_idx = (
             cfg.clc_padding_warp_idx if use_clc_dynamic else cfg.page_offsets_warp_idx
         )
@@ -2795,14 +2793,17 @@ def fmha_block_sparse_launch(
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int],
+    g_seqlens_kv: cute.Pointer | None = None,
+    use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
+    num_physical_kv_pages: Int64 = 0,
+    k_page_stride: Int64 = 0,
+    v_page_stride: Int64 = 0,
 ) -> None:
-    """Launch contiguous-BSHD attention over prepared KV route metadata.
+    """Launch attention over contiguous or paged prepared KV routes.
 
     A preceding prepare kernel has already resolved each BSR row into compact
-    physical atom origins, validity flags, and optional logical token words.
-    The attention schedule consumes only that metadata. Fine blocks use their
-    single-atom TensorMap directly; coarse routes use the descriptor matching
-    their selected physical load atom.
+    logical atom origins, storage locators, validity flags, and optional token
+    words. Both layouts execute the same ``decode_gen_kernel`` schedule.
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires cfg.use_block_sparse=True")
@@ -2824,7 +2825,7 @@ def fmha_block_sparse_launch(
     tma_box0 = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
     tma_swizzle = cuda.TensorMapSwizzle.s128b
     # Public tensors are contiguous BSHD. Q is factored into (Hr, Hkv) so the
-    # unchanged grouped-Q resource can address one sparse MHA head/tile.
+    # unchanged grouped-Q resource can address one KV head's grouped-Q tile.
     q_desc = create_tensor_map_tiled(
         global_address=q_iter.toint(),
         dtype=cfg.q_dtype,
@@ -2840,58 +2841,100 @@ def fmha_block_sparse_launch(
         swizzle=tma_swizzle,
     )
 
-    # Keep sparse K/V TensorMap coordinates in the tensor's logical
-    # (D, S, H, B) mode order, matching the dense decode descriptor ABI.
-    # The BSHD storage strides and TMA box geometry remain unchanged.
     kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
-    primary_kv_box_size = 2 * kv_atom_size if kv_atom_size == 64 else kv_atom_size
-    kv_dims = (d, s_k, h_k, b)
-    k_desc_primary = create_tensor_map_tiled(
-        global_address=k_iter.toint(),
-        dtype=cfg.kv_dtype,
-        global_dims=kv_dims,
-        global_strides=kv_strides,
-        box_dims=(tma_box0, primary_kv_box_size, 1, 1),
-        swizzle=tma_swizzle,
-    )
-    v_desc_primary = create_tensor_map_tiled(
-        global_address=v_iter.toint(),
-        dtype=cfg.kv_dtype,
-        global_dims=kv_dims,
-        global_strides=kv_strides,
-        box_dims=(tma_box0, primary_kv_box_size, 1, 1),
-        swizzle=tma_swizzle,
-    )
-    k_desc_atom = k_desc_primary
-    v_desc_atom = v_desc_primary
-    if cutlass.const_expr(
-        kv_atom_size == 64
-        and (
-            cfg.tile_size_kv == 256
-            or not _prepared_kv_routes_are_block_aligned(
-                cfg.kv_block_size,
-                cfg.tile_size_kv,
-            )
+    if cutlass.const_expr(cfg.use_paged_kv):
+        # Paged HND storage is addressed as (D, token-in-page, Hkv, page).
+        # Prepared routes already contain each atom's physical page ID, so no
+        # dense page table is passed to or staged by the attention kernel.
+        kv_shape = (
+            d,
+            Int32(cfg.num_tokens_per_page),
+            h_k,
+            num_physical_kv_pages,
         )
-    ):
-        # KV256 always stages four semantic KV64 atoms. KV128 needs this atom
-        # map only when a route may join unrelated BSR entries.
-        k_desc_atom = create_tensor_map_tiled(
+        k_layout = cute.make_layout(
+            kv_shape,
+            stride=(
+                1,
+                d,
+                d * Int32(cfg.num_tokens_per_page),
+                k_page_stride,
+            ),
+        )
+        v_layout = cute.make_layout(
+            kv_shape,
+            stride=(
+                1,
+                d,
+                d * Int32(cfg.num_tokens_per_page),
+                v_page_stride,
+            ),
+        )
+        k_desc_atom = create_tensor_map_tiled_from_view(
+            cute.make_tensor(k_iter, k_layout),
+            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=tma_swizzle,
+        )
+        v_desc_atom = create_tensor_map_tiled_from_view(
+            cute.make_tensor(v_iter, v_layout),
+            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=tma_swizzle,
+        )
+        k_desc_primary = k_desc_atom
+        v_desc_primary = v_desc_atom
+    else:
+        # Contiguous sparse coordinates retain the logical (D, S, H, B)
+        # order and the established primary/atom descriptor split.
+        primary_kv_box_size = 2 * kv_atom_size if kv_atom_size == 64 else kv_atom_size
+        kv_dims = (d, s_k, h_k, b)
+        k_desc_primary = create_tensor_map_tiled(
             global_address=k_iter.toint(),
             dtype=cfg.kv_dtype,
             global_dims=kv_dims,
             global_strides=kv_strides,
-            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            box_dims=(tma_box0, primary_kv_box_size, 1, 1),
             swizzle=tma_swizzle,
         )
-        v_desc_atom = create_tensor_map_tiled(
+        v_desc_primary = create_tensor_map_tiled(
             global_address=v_iter.toint(),
             dtype=cfg.kv_dtype,
             global_dims=kv_dims,
             global_strides=kv_strides,
-            box_dims=(tma_box0, kv_atom_size, 1, 1),
+            box_dims=(tma_box0, primary_kv_box_size, 1, 1),
             swizzle=tma_swizzle,
         )
+        k_desc_atom = k_desc_primary
+        v_desc_atom = v_desc_primary
+        if cutlass.const_expr(
+            kv_atom_size == 64
+            and (
+                cfg.tile_size_kv == 256
+                or not _prepared_kv_routes_are_block_aligned(
+                    cfg.kv_block_size,
+                    cfg.tile_size_kv,
+                )
+            )
+        ):
+            # KV256 always stages four semantic KV64 atoms. KV128 needs this
+            # map only when a route may join unrelated BSR entries.
+            k_desc_atom = create_tensor_map_tiled(
+                global_address=k_iter.toint(),
+                dtype=cfg.kv_dtype,
+                global_dims=kv_dims,
+                global_strides=kv_strides,
+                box_dims=(tma_box0, kv_atom_size, 1, 1),
+                swizzle=tma_swizzle,
+            )
+            v_desc_atom = create_tensor_map_tiled(
+                global_address=v_iter.toint(),
+                dtype=cfg.kv_dtype,
+                global_dims=kv_dims,
+                global_strides=kv_strides,
+                box_dims=(tma_box0, kv_atom_size, 1, 1),
+                swizzle=tma_swizzle,
+            )
 
     q_groups = Int32(
         (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
@@ -2916,6 +2959,9 @@ def fmha_block_sparse_launch(
         0,
         mem_space=cutlass.AddressSpace.gmem,
     )
+    seqlens_kv_iter = (
+        g_seqlens_kv if cutlass.const_expr(use_variable_seqlens_kv) else null_i32_ptr
+    )
     decode_gen_kernel(
         q_desc,
         k_desc_primary,
@@ -2927,7 +2973,7 @@ def fmha_block_sparse_launch(
         h_k,
         Float32(scale_s * log2_e),
         Float32(1.0),
-        null_i32_ptr,
+        seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,
         o_iter,
@@ -2938,7 +2984,7 @@ def fmha_block_sparse_launch(
         tile_sched_params,
         cfg,
         seq_len_kv,
-        False,  # use_variable_seqlens_kv
+        use_variable_seqlens_kv,
         False,  # use_native_paged_kv
         False,  # use_static_native_seqlens_kv
         null_i32_ptr,  # g_paged_kv_indptr

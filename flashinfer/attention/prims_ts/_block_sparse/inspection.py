@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host side of the plan-time raw-BSR validation and capacity reduction.
+"""Host side of one-shot raw-BSR validation and capacity reduction.
 
-The public wrapper validates the tensor ABI before this module checks Int32
-addressing limits, launches the GPU inspector, and decodes its fixed Int64
-summary into Python planning facts. Inspection deliberately performs one
-packed device-to-host copy and does not inspect token-mask contents or build
-run-time route metadata.
+The one-shot public entry point validates the tensor ABI before this module
+checks Int32 addressing limits, launches the GPU inspector, and decodes its
+fixed Int64 summary into Python planning facts. Reusable plans instead receive
+an explicit row-capacity bound. Inspection deliberately performs one packed
+device-to-host copy and does not inspect token-mask contents or build run-time
+route metadata.
 """
 
 from dataclasses import dataclass
@@ -29,27 +30,18 @@ from .common import _SIGNED_INT32_MAX
 
 
 # Device summary ABI; keep this order synchronized with block_sparse_inspect.py:
-# error, maximum row route capacity, total route capacity, maximum row blocks.
-_SUMMARY_FIELDS = 4
+# validation error, maximum semantic BSR blocks in one row.
+_SUMMARY_FIELDS = 2
 
 
 @dataclass(frozen=True)
 class _BlockSparseInspection:
     """Planning facts derived from caller-owned canonical BSR metadata.
 
-    ``max_row_route_capacity`` is the maximum of
-    ``ceil(row_nnz * kv_block_size / kv_route_size)`` across rows;
-    ``total_route_capacity`` sums the same quantity. Both are conservative
-    bounds derived only from the inspected indptr row lengths; live indices,
-    token bits, and the physical KV tail cannot specialize them. Static plans
-    use both values directly. Dynamic plans use the maximum as their default
-    uniform row envelope and may replace it with an explicit larger bound.
-    ``max_row_block_count`` retains the corresponding semantic BSR-block bound
-    so an explicit public capacity is validated before route packing.
+    ``max_row_block_count`` is the semantic BSR-block bound used by the
+    one-shot entry point to create a temporary capacity-only plan.
     """
 
-    max_row_route_capacity: int
-    total_route_capacity: int
     max_row_block_count: int
 
 
@@ -84,7 +76,6 @@ def _inspect_block_sparse_bsr(
     seq_len_kv: int,
     q_block_size: int,
     kv_block_size: int,
-    kv_route_size: int,
     stream: torch.cuda.Stream,
 ) -> _BlockSparseInspection:
     """Inspect raw BSR on its CUDA device and return host planning facts.
@@ -94,7 +85,7 @@ def _inspect_block_sparse_bsr(
     contiguous Int32 ``block_indices[nnz]``.
 
     The GPU validates each referenced range before reading it, reduces all rows
-    into one zero-initialized Int64[4], and this function performs the sole D2H
+    into one zero-initialized Int64[2], and this function performs the sole D2H
     synchronization before returning an immutable ``_BlockSparseInspection``.
     The run-time prepare kernel resolves current BSR indices and token bits into
     fixed-stride route metadata.
@@ -142,7 +133,6 @@ def _inspect_block_sparse_bsr(
             seq_len_kv=seq_len_kv,
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
-            kv_route_size=kv_route_size,
         )
         inspect_bsr(
             block_indptr,
@@ -154,9 +144,7 @@ def _inspect_block_sparse_bsr(
     _raise_for_noncanonical_bsr(summary_values)
     # This positional decode is the host mirror of the device summary ABI.
     return _BlockSparseInspection(
-        max_row_route_capacity=summary_values[1],
-        total_route_capacity=summary_values[2],
-        max_row_block_count=summary_values[3],
+        max_row_block_count=summary_values[1],
     )
 
 

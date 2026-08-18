@@ -939,10 +939,13 @@ class DecodeGenTask(Task):
                 self._lane_idx,
             )
 
-            # Sparse resources reuse the paged-KV cache fields as compact row
-            # metadata. Clear dense/paged-only coordinates on every logical
-            # tile because persistent tasks reuse the same task object.
-            self._seq_len_kv = self.max_seq_len_kv
+            # Sparse route-span accessors share two underlying cache words
+            # with paged KV. Clear dense/paged-only coordinates on every
+            # logical tile because persistent tasks reuse the same task object.
+            if self.seqlens_kv is None:
+                self._seq_len_kv = self.max_seq_len_kv
+            else:
+                self._seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
             self._kv_request_begin = row_route_begin
             self._kv_page_idx_ub = route_count
             self._kv_raw_tile_base = cutlass.Int32(0)
@@ -1065,8 +1068,8 @@ class DecodeGenTask(Task):
 #   HEAD:    Q + K0 + K1
 #   LOOP[i]: K(i+2) + V(i)
 #   TAIL:    V(last-1) + V(last)
-# When paged-KV is enabled, each K/V load consumes a page-offsets entry
-# produced ahead of time by PageTableTask.
+# Dense paged-KV consumes page offsets produced by PageTableTask. Sparse
+# paged-KV instead consumes physical page IDs retained with its prepared route.
 # ======================================================================
 def _resolve_and_store_sparse_route(
     sparse_kv_metadata: MemoryResource | None,
@@ -1086,6 +1089,7 @@ def _resolve_and_store_sparse_route(
         resolved_origin0=resolved_origin0,
         resolved_origin1=resolved_origin1,
         resolved_atom_validity=resolved_atom_validity,
+        route_record_word_offset=route_record_word_offset,
     )
     return (
         resolved_origin0,

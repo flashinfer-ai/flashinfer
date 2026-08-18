@@ -71,6 +71,25 @@ _TASK_CACHE_KV_PAGE_IDX_UB = 6
 _TASK_CACHE_KV_RAW_TILE_BASE = 7
 _TASK_CACHE_KV_VALID_TILE_END = 8
 _TASK_CACHE_KV_WINDOW_START = 9
+# Block-sparse rows share the two generic KV-span words with paged decode.
+# Semantic aliases keep sparse consumers independent of page-table naming
+# without extending the stable ten-word task-cache ABI.
+_TASK_CACHE_SPARSE_ROUTE_BEGIN = _TASK_CACHE_KV_REQUEST_BEGIN
+_TASK_CACHE_SPARSE_ROUTE_COUNT = _TASK_CACHE_KV_PAGE_IDX_UB
+
+
+@cute.jit
+def _sparse_task_cache_route_begin(task_cache: TaskCache) -> Int32:
+    """Load the first prepared-route ordinal for one sparse row."""
+
+    return Int32(task_cache[_TASK_CACHE_SPARSE_ROUTE_BEGIN])
+
+
+@cute.jit
+def _sparse_task_cache_route_count(task_cache: TaskCache) -> Int32:
+    """Load the live prepared-route count for one sparse row."""
+
+    return Int32(task_cache[_TASK_CACHE_SPARSE_ROUTE_COUNT])
 
 
 @cute.jit

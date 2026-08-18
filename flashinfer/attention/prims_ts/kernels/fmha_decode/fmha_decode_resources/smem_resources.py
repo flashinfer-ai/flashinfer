@@ -86,6 +86,34 @@ if TYPE_CHECKING:
     from .smem_block_sparse_metadata import SmemBlockSparseKvMetadataResource
 
 
+def _paged_sparse_kv_tma_transaction_geometry(
+    *,
+    tile_size_kv: int,
+    kv_atom_size: int,
+    head_dim_stage: int,
+    kv_dtype_bytes: int,
+) -> tuple[int, int, int]:
+    """Return fixed copy count, bytes per copy, and bytes per paged K/V load.
+
+    Every logical atom participates, including atoms mapped to an OOB
+    coordinate. This keeps the TMA pipeline's expected transaction bytes
+    independent of route validity.
+    """
+
+    chunk_head_dim = min(head_dim_stage, 64)
+    assert tile_size_kv % kv_atom_size == 0
+    assert head_dim_stage % chunk_head_dim == 0
+    transactions_per_load = (tile_size_kv // kv_atom_size) * (
+        head_dim_stage // chunk_head_dim
+    )
+    transaction_bytes = kv_atom_size * chunk_head_dim * kv_dtype_bytes
+    return (
+        transactions_per_load,
+        transaction_bytes,
+        transactions_per_load * transaction_bytes,
+    )
+
+
 @cute.jit
 def _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
     dst_mem: cutlass.Array,
@@ -691,14 +719,68 @@ class SmemKvTileResource(DecodeGenResourceBase):
             chunk_hd = min(head_dim_stage, 64)
             num_chunks = head_dim_stage // chunk_hd
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
-            if cutlass.const_expr(kv_atom_size == 64):
+            if cutlass.const_expr(cfg.use_paged_kv):
+                # Paged sparse routes retain an independent physical page ID
+                # for every logical atom.  Never infer adjacency: issue the
+                # same atom-sized TMA sequence for valid and invalid atoms,
+                # with invalid coordinates mapped just beyond page zero so
+                # the fixed mbarrier transaction count is preserved.
+                atoms_per_route = cfg.tile_size_kv // kv_atom_size
+                (
+                    transactions_per_load,
+                    transaction_bytes,
+                    total_transaction_bytes,
+                ) = _paged_sparse_kv_tma_transaction_geometry(
+                    tile_size_kv=cfg.tile_size_kv,
+                    kv_atom_size=kv_atom_size,
+                    head_dim_stage=head_dim_stage,
+                    kv_dtype_bytes=cfg.kv_dtype_bytes,
+                )
+                assert total_transaction_bytes == cfg.smem_kv_tile_bytes
+                num_chunks = transactions_per_load // atoms_per_route
+                chunk_hd = transaction_bytes // (kv_atom_size * cfg.kv_dtype_bytes)
+                atom_chunk_elems = transaction_bytes // cfg.kv_dtype_bytes
+                tile_chunk_elems = chunk_hd * cfg.tile_size_kv
+                if prims.elect_sync():
+                    stage_base = self._stage_base(stage_info)
+                    for atom_idx in cutlass.range_constexpr(atoms_per_route):
+                        token_coord, storage_coord = (
+                            self.sparse_kv_metadata.route_tma_coordinate(
+                                Int32(atom_idx),
+                                logical_b_idx,
+                            )
+                        )
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                stage_base.subview(
+                                    local_tile_offset + atom_idx * atom_chunk_elems
+                                ),
+                                tma_desc_atom,
+                                (
+                                    Int32(global_head_dim_offset),
+                                    token_coord,
+                                    logical_h_k_idx,
+                                    storage_coord,
+                                ),
+                                stage_info.barrier,
+                            )
+            elif cutlass.const_expr(kv_atom_size == 64):
                 # A B128-aligned semantic block keeps every route inside one
                 # BSR entry, so one KV128 TMA is always legal; TMA OOB fill
                 # handles a partial physical tail. Other coarse blocks may
                 # join unrelated entries and must prove physical adjacency.
                 fragment_chunk_elems = chunk_hd * 64
                 if prims.elect_sync():
-                    origin0 = Int32(self.sparse_kv_metadata.route_origin(Int32(0)))
+                    origin0, _ = self.sparse_kv_metadata.route_tma_coordinate(
+                        Int32(0),
+                        logical_b_idx,
+                    )
+                    origin0 = Int32(origin0)
                     atom_valid_mask = Int32(
                         self.sparse_kv_metadata.route_atom_valid_mask()
                     )
@@ -731,7 +813,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 stage_info.barrier,
                             )
                     else:
-                        origin1 = Int32(self.sparse_kv_metadata.route_origin(Int32(1)))
+                        origin1, _ = self.sparse_kv_metadata.route_tma_coordinate(
+                            Int32(1),
+                            logical_b_idx,
+                        )
+                        origin1 = Int32(origin1)
                         valid1 = cutlass.Boolean(
                             (atom_valid_mask & Int32(2)) != Int32(0)
                         )
@@ -797,23 +883,29 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     # chunks. The copies still target disjoint SMEM regions
                     # and share one completion barrier, so only issue order
                     # changes.
-                    origin = Int32(
-                        self.sparse_kv_metadata.route_origin(Int32(0))
+                    origin, _ = self.sparse_kv_metadata.route_tma_coordinate(
+                        Int32(0),
+                        logical_b_idx,
                     )
-                    next_origin = Int32(
-                        self.sparse_kv_metadata.route_origin(Int32(1))
+                    next_origin, _ = self.sparse_kv_metadata.route_tma_coordinate(
+                        Int32(1),
+                        logical_b_idx,
                     )
+                    origin = Int32(origin)
+                    next_origin = Int32(next_origin)
                     for atom_idx in cutlass.range_constexpr(atoms_per_route):
                         # Keep two origins ahead of TMA issue so the scalar
                         # LDS -> uniform-register handoff can overlap a full
                         # atom's asynchronous copies.
                         future_origin = next_origin
                         if cutlass.const_expr(atom_idx + 2 < atoms_per_route):
-                            future_origin = Int32(
-                                self.sparse_kv_metadata.route_origin(
-                                    Int32(atom_idx + 2)
+                            future_origin, _ = (
+                                self.sparse_kv_metadata.route_tma_coordinate(
+                                    Int32(atom_idx + 2),
+                                    logical_b_idx,
                                 )
                             )
+                            future_origin = Int32(future_origin)
                         for chunk_idx in cutlass.range_constexpr(num_chunks):
                             local_head_dim_offset = chunk_idx * chunk_hd
                             global_head_dim_offset = (
@@ -1826,18 +1918,25 @@ class SmemKvResource(DecodeGenResourceBase):
             # Only the elected TMA issuer needs page IDs. In particular,
             # page16/KV256 otherwise makes all 32 load-warp lanes repeat four
             # vector loads for the same 16-entry page fragment.
-            page_ids = cached_page_ids
-            if cutlass.const_expr(cfg.use_paged_kv and cached_page_ids is None):
-                page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+            dense_page_ids = cached_page_ids
+            if cutlass.const_expr(
+                cfg.use_paged_kv
+                and not cfg.use_block_sparse
+                and cached_page_ids is None
+            ):
+                assert self.page_offsets_kv is not None
+                dense_page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
             for semantic_block in cutlass.range_constexpr(4):
-                atom_origin = Int32(0)
+                token_coord = Int32(0)
+                storage_coord = logical_b_idx
                 if cutlass.const_expr(cfg.use_block_sparse):
                     assert sparse_kv_metadata is not None
-                    # Invalid origins were normalized to the TensorMap OOB
-                    # coordinate when the route was retained, so K and V use
-                    # the same straight-line four-atom issue sequence.
-                    atom_origin = Int32(
-                        sparse_kv_metadata.route_origin(Int32(semantic_block))
+                    (
+                        token_coord,
+                        storage_coord,
+                    ) = sparse_kv_metadata.route_tma_coordinate(
+                        Int32(semantic_block),
+                        logical_b_idx,
                     )
                 physical_block = semantic_block
                 if cutlass.const_expr(kv_kind == KV_KIND_K):
@@ -1868,9 +1967,9 @@ class SmemKvResource(DecodeGenResourceBase):
                             sparse_tma_desc,
                             (
                                 Int32(dim_half * 64),
-                                atom_origin,
+                                token_coord,
                                 logical_h_k_idx,
-                                logical_b_idx,
+                                storage_coord,
                             ),
                             stage_info.barrier,
                         )
@@ -1885,7 +1984,7 @@ class SmemKvResource(DecodeGenResourceBase):
                             )
                             logical_page = token_in_tile // cfg.num_tokens_per_page
                             token_in_page = token_in_tile % cfg.num_tokens_per_page
-                            page_id = Int32(page_ids[logical_page])
+                            page_id = Int32(dense_page_ids[logical_page])
                             smem_offset = (
                                 block_base + fragment * fragment_tokens * 64
                             )

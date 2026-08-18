@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_block_sparse_h8_kv8_d128_qb64_kb64",
-  "description": "One-shot PrimTS block-sparse MHA attention over compact BSHD Q/K/V and per-batch/per-head BSR metadata.",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and per-KV-head BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
@@ -55,11 +55,11 @@
     }
   },
   "constraints": [
-    "num_qo_heads == num_kv_heads",
+    "num_qo_heads % num_kv_heads == 0",
+    "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
     "head_dim == 128",
     "q_block_size in (8, 16, 32) or (q_block_size > 0 and q_block_size % 64 == 0)",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "kv_block_size >= 64 or q_block_size in (8, 16, 32)",
     "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
     "mask_type is None or mask_type in ('dense', 'causal')"

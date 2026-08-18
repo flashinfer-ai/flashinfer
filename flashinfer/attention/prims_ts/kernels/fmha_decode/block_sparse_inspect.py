@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validate canonical BSR and reduce plan-time route capacity in one pass.
+"""Validate canonical BSR and reduce its maximum semantic row width.
 
 A BSR Q-block row is one ``block_indptr`` row keyed by
-``(batch, kv_head, q_block)``. The capacity summary is the conservative route
-count implied by the inspected indptr row lengths. Static plans use compact
-per-row slices; dynamic plans use the maximum as a uniform default envelope.
-Token-mask contents belong to the run-time prepare kernel and are not read
-here.
+``(batch, kv_head, q_block)``. The maximum row width gives the one-shot API the
+same semantic ``max_blocks_per_row`` bound that reusable plans receive from
+their caller. Token-mask contents belong to the run-time prepare kernel and
+are not read here.
 
 Four warps validate four BSR Q-block rows per CTA and publish one validation
-status plus three planning facts in one Int64 summary. No per-route payload is
-constructed.
+status plus the maximum row width in one Int64 summary. No per-route payload
+is constructed.
 """
 
 import functools
@@ -39,12 +38,10 @@ _WARP_SIZE = 32
 _THREADS_PER_CTA = _WARPS_PER_CTA * _WARP_SIZE
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 
-# ``summary`` is a zero-initialized Int64[4] shared with the host wrapper.
+# ``summary`` is a zero-initialized Int64[2] shared with the host wrapper.
 _SUMMARY_ERROR_CODE = 0
-_SUMMARY_MAX_KV_ROUTE_CAPACITY = 1
-_SUMMARY_TOTAL_KV_ROUTE_CAPACITY = 2
-_SUMMARY_MAX_BSR_BLOCK_COUNT = 3
-_SUMMARY_FIELDS = 4
+_SUMMARY_MAX_BSR_BLOCK_COUNT = 1
+_SUMMARY_FIELDS = 2
 
 _BSR_ERROR_NONE = 0
 _BSR_ERROR_NOT_STRICTLY_INCREASING = 1
@@ -90,16 +87,14 @@ class _InspectBlockSparseBsr:
 
     * ``block_indptr``: Int32 ``[B, Hkv, num_q_block_rows + 1]`` offsets;
     * ``block_indices``: Int32 ``[nnz]`` semantic KV-block IDs;
-    * ``summary``: zero-initialized Int64 ``[4]`` output.
+    * ``summary``: zero-initialized Int64 ``[2]`` output.
 
     One 128-thread CTA contains four independent warps, and each warp handles
     one flattened ``(batch, kv_head, q_block_row)``. Lanes validate the row's
-    index stripe, then lane zero contributes its planning bounds:
+    index stripe, then lane zero contributes its planning bound:
 
     * ``[0]`` highest validation error code (zero means canonical BSR);
-    * ``[1]`` maximum conservative route capacity of any row;
-    * ``[2]`` sum of conservative route capacities across all rows;
-    * ``[3]`` maximum semantic BSR-block count of any row.
+    * ``[1]`` maximum semantic BSR-block count of any row.
 
     No per-route metadata is produced here; the run-time prepare kernel
     consumes the caller's BSR and current token mask before attention.
@@ -114,11 +109,8 @@ class _InspectBlockSparseBsr:
         seq_len_kv: int,
         q_block_size: int,
         kv_block_size: int,
-        kv_route_size: int,
     ) -> None:
         self.num_kv_heads = num_kv_heads
-        self.kv_block_size = kv_block_size
-        self.kv_route_size = kv_route_size
         self.num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         self.num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
         self.total_bsr_row_count = batch_size * num_kv_heads * self.num_q_block_rows
@@ -215,23 +207,6 @@ class _InspectBlockSparseBsr:
                 )
             else:
                 selected_kv_block_count = bsr_row_end - bsr_row_begin
-                route_capacity = (
-                    cutlass.Int64(selected_kv_block_count)
-                    * cutlass.Int64(self.kv_block_size)
-                    + cutlass.Int64(self.kv_route_size - 1)
-                ) // cutlass.Int64(self.kv_route_size)
-                cute.arch.atomic_max(
-                    summary.iterator + _SUMMARY_MAX_KV_ROUTE_CAPACITY,
-                    route_capacity,
-                    sem="relaxed",
-                    scope="gpu",
-                )
-                cute.arch.atomic_add(
-                    summary.iterator + _SUMMARY_TOTAL_KV_ROUTE_CAPACITY,
-                    route_capacity,
-                    sem="relaxed",
-                    scope="gpu",
-                )
                 cute.arch.atomic_max(
                     summary.iterator + _SUMMARY_MAX_BSR_BLOCK_COUNT,
                     cutlass.Int64(selected_kv_block_count),
@@ -264,7 +239,6 @@ def compile_block_sparse_inspection(
     seq_len_kv: int,
     q_block_size: int,
     kv_block_size: int,
-    kv_route_size: int,
 ) -> Callable[..., None]:
     """Compile one geometry specialization while keeping ``indices[nnz]`` dynamic.
 
@@ -283,7 +257,6 @@ def compile_block_sparse_inspection(
         seq_len_kv=seq_len_kv,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        kv_route_size=kv_route_size,
     )
     with torch.cuda.device(device_index):
         return cute.compile(
