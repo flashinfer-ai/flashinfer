@@ -1071,8 +1071,8 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     )
     supports_fused_shared_experts = True
 
-    def check_support(self) -> None:
-        super().check_support()
+    def _check_support(self) -> None:
+        super()._check_support()
         if self.config.activation.type not in (ActivationType.Swiglu, ActivationType.Relu2):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
