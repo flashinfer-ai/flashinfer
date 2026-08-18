@@ -152,6 +152,10 @@ _NVCC_FLAGS = {
     "sm103a": sm103a_nvcc_flags,
 }
 _TARGET_KIND = {"sm100a": 1000, "sm103a": 1003}
+_CAPABILITY_TARGETS: dict[tuple[int, int], CakeBatchDeepGemmTarget] = {
+    (10, 0): "sm100a",
+    (10, 3): "sm103a",
+}
 
 
 def _get_csrc_dir() -> Path:
@@ -450,7 +454,7 @@ def run_cake_batch_deepgemm_fp8(
     n = b.shape[1]
     route = _select_route(batch, m, n, k, expected_m)
     capability = torch.cuda.get_device_capability(a.device)
-    target = {(10, 0): "sm100a", (10, 3): "sm103a"}.get(capability)
+    target = _CAPABILITY_TARGETS.get(capability)
     if target is None:
         raise ValueError(
             f"Cake batch DeepGEMM requires SM100 or SM103, got {capability}"
@@ -503,6 +507,7 @@ def run_cake_batch_deepgemm_fp8(
             )
         return
 
+    assert route != "m224_tail128"
     _run_module(
         route,
         target,
