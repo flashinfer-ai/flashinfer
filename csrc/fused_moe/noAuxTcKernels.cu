@@ -9,6 +9,11 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tvm_ffi_utils.h"
 
+#ifdef FLASHINFER_CAKE_BACKEND
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels.cu"
+#include "cake_deepseek_fused_routing_launch.cuh"
+#endif
+
 using tvm::ffi::Optional;
 
 namespace cg = cooperative_groups;
@@ -233,6 +238,27 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out) {
+#ifdef FLASHINFER_CAKE_BACKEND
+  bool const cake_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  int64_t const cake_experts_per_group = num_experts / n_group;
+  bool const cake_multi_group =
+      (n_group != 1) && (num_experts <= NumDeepseekExperts) &&
+      (cake_experts_per_group <= WARP_SIZE) &&
+      (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
+  TLLM_CHECK_WITH_INFO(
+      cake_single_group || cake_multi_group,
+      "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, "
+      "topk_group=%ld). Please use original pytorch implementation.",
+      n_group, num_experts, topk_group);
+  auto const status = flashinfer::cake_deepseek_fused_routing::launch<InputT, BiasT>(
+      scores, bias, topk_values, topk_indices, routing_replay_out, num_tokens, num_experts,
+      n_group, topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+  TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Cake fused routing launch failed: %s",
+                       cudaGetErrorString(status));
+  sync_check_cuda_error(stream);
+  return;
+#endif
+
   // Check if we can use the optimized deepseek_v3_topk_kernel
   bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
 

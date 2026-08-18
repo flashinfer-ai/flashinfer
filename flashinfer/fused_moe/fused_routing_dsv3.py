@@ -101,8 +101,8 @@ def _check_dsv3_fused_routing_supported(
 
 
 @functools.cache
-def get_dsv3_fused_routing_module():
-    module = gen_dsv3_fused_routing_module().build_and_load()
+def get_dsv3_fused_routing_module(backend: str = "default"):
+    module = gen_dsv3_fused_routing_module(backend=backend).build_and_load()
 
     @register_custom_op(
         "flashinfer::NoAuxTc",
@@ -232,7 +232,13 @@ def fused_topk_deepseek(
     load-balancing losses and the ``Tc`` suffix indicates Tensor-Core
     utilization.
     """
-    get_dsv3_fused_routing_module().NoAuxTc(
+    capability = torch.cuda.get_device_capability(scores.device)
+    module = (
+        get_dsv3_fused_routing_module(backend="cake")
+        if capability in ((10, 0), (10, 3))
+        else get_dsv3_fused_routing_module(backend="default")
+    )
+    module.NoAuxTc(
         scores,
         bias,
         n_group,
