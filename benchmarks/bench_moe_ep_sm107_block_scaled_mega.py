@@ -12,6 +12,14 @@ FC2 + combine) via the shim's steady-state launch thunk over pre-staged
 inputs — the same span the upstream tester times. Input staging (torch
 quantization fallback) is deliberately outside the timed region.
 
+Timed-loop protocol replicates upstream ``tester/solver.py::perf_run``:
+back-to-back launches with a per-iteration L2 flush (a throwaway 300MB
+``randn`` on the stream, outside the event window — upstream
+``host_utils.l2_flush``). The flush both cold-caches each iteration and
+separates consecutive launches; ``--no-l2-flush`` restores the raw
+back-to-back mode (small-token latencies then read low because iteration
+i+1's dispatch overlaps iteration i's combine tail).
+
 Run (whole node, 4 Rubin GPUs)::
 
     torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
@@ -192,6 +200,13 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
     )
 
 
+def _l2_flush() -> None:
+    """Upstream tester/host_utils.l2_flush: a fresh 300MB fp32 randn on the
+    current stream evicts the caches; enqueued before the start event so it
+    falls outside the timing window."""
+    _ = torch.randn(300 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+
+
 def _bench_one(
     rank: int,
     world: int,
@@ -202,6 +217,7 @@ def _bench_one(
     warmup: int,
     iters: int,
     quant_kind: str = "nvfp4",
+    l2_flush: bool = True,
     knobs_override: Optional[dict] = None,
 ) -> Tuple[dict, list]:
     import flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe as pkg
@@ -287,6 +303,8 @@ def _bench_one(
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
         stops = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
         for i in range(iters):
+            if l2_flush:
+                _l2_flush()
             starts[i].record()
             thunk()
             stops[i].record()
@@ -305,6 +323,7 @@ def _bench_one(
             min_us=min(samples_us),
             max_us=max(samples_us),
             knobs=knobs,
+            l2_flush=l2_flush,
         ),
         samples_us,
     )
@@ -315,6 +334,11 @@ def main() -> None:
     parser.add_argument("--tokens", default="1024,2048,4096,8192,16384,32768")
     parser.add_argument(
         "--quant-kind", default="nvfp4", choices=["nvfp4", "mxfp8_e4m3", "both"]
+    )
+    parser.add_argument(
+        "--no-l2-flush",
+        action="store_true",
+        help="drop the upstream per-iteration L2 flush (raw back-to-back mode)",
     )
     parser.add_argument(
         "--routing", default="balanced", choices=["balanced", "power_law", "both"]
