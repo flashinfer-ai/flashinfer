@@ -220,8 +220,11 @@ rm -rf dist build *.egg-info
 # The image satisfies this package's build requires except wheel, until the
 # images carrying it are rolled out.
 python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
+# --no-isolation keeps build from re-downloading torch, but it then verifies the
+# build requires transitively, and the image's torch declares an nvidia-cudnn
+# wheel the image does not install. Testing what the image ships is the point.
 run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
-    python -m build --wheel --no-isolation
+    python -m build --wheel --no-isolation --skip-dependency-check
 
 # Get the built wheel file
 WHEEL_FILE=$(ls -t dist/*.whl | head -n 1)
