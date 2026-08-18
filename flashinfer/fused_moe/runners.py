@@ -2188,6 +2188,14 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             )
         variant = self.config.quant.variant
         if variant in self.supported_quant_variants:
+            if (
+                self.config.quant.per_token_scale
+                and variant is not QuantVariant.NVFP4
+            ):
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support per-token scale for {variant.name}."
+                )
+
             from ..utils import get_compute_capability
 
             # Direct-runner guard: #4280 relanded the SM107 cubins removed by
