@@ -988,8 +988,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
-        self._workspace_cache: Dict[Tuple, Any] = {}
-
         # Match production EP routing density while retaining seeded load
         # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
@@ -1191,7 +1189,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
             tactic=None if tactic is None or tactic == -1 else tactic,
-            workspace_cache=self._workspace_cache,
         )
 
 
