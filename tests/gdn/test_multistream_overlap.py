@@ -29,6 +29,7 @@ import random
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.utils import is_sm100a_supported
 
@@ -218,11 +219,24 @@ def _make_prefill_inputs(seq_lens, HQ, HV, DK, seed, device):
     def rnd(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, generator=gen, dtype=dtype, device=device)
 
+    def unit_rows(*shape):
+        # Un-normalized rows (norm ~= sqrt(DK)) make the delta-rule triangular
+        # inverse (I + tril(diag(beta) K K^T))^-1 overflow over a 512-token sequence.
+        return (
+            F.normalize(rnd(*shape, dtype=torch.float32), dim=-1)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+
     return dict(
-        q=rnd(total, HQ, DK),
-        k=rnd(total, HQ, DK),
+        q=unit_rows(total, HQ, DK),
+        k=unit_rows(total, HQ, DK),
         v=rnd(total, HV, DK),
-        gate=rnd(total, HV, dtype=torch.float32) * 0.1,
+        # FlashInfer consumes linear-space alpha = exp(log_g) in (0, 1]; the
+        # kernel takes log2 itself, so any non-positive entry becomes NaN.
+        gate=torch.exp(
+            -F.softplus(rnd(total, HV, dtype=torch.float32) * 0.5 - 2.0)
+        ).contiguous(),
         beta=torch.sigmoid(rnd(total, HV, dtype=torch.float32)),
         cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=device),
         initial_state=rnd(len(seq_lens), HV, DK, DK, dtype=torch.float32) * 0.01,
