@@ -133,11 +133,6 @@ main() {
 
         install_and_verify
 
-        # Apply dependency overrides after installation since pip may overwrite
-        # the versions established by the CI image.
-        # shellcheck disable=SC1091
-        source "${SCRIPT_DIR}/setup_test_env.sh"
-
         # tests/moe_ep needs its additional runtime stack only on CUDA 13 images.
         local cuda_major
         cuda_major=$(python -c \
@@ -145,6 +140,10 @@ main() {
             2>/dev/null || echo 0)
         if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
             FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
+            # The EP setup performs another dependency-resolving editable
+            # install, so restore the source-CI DSL baseline afterward.
+            # shellcheck disable=SC1091
+            source "${SCRIPT_DIR}/setup_ci_test_env.sh"
         fi
     fi
 

@@ -5,6 +5,10 @@ kernel used by FlashInfer's experimental Blackwell APIs. One implementation
 serves fixed contiguous, packed-ragged contiguous, and packed-query paged-KV
 attention with MHA or GQA.
 
+This kernel requires `nvidia-cutlass-dsl>=4.7.0`; see the shared
+[CUTLASS DSL version policy](../../README.md#cutlass-dsl-version-policy) for
+the package-default and CI behavior.
+
 The public API exposes attention semantics, not scheduling controls. Contiguous
 and paged plans select a nonpersistent, static-persistent, or CLC-persistent
 launch from logical work, task topology, live-metadata requirements, causal

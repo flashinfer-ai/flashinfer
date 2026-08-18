@@ -4,7 +4,8 @@ set -eo pipefail
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Source test environment setup (handles package overrides like TVM-FFI)
+
+# Source the pre-install guards and optional dependency overrides.
 source "${SCRIPT_DIR}/setup_test_env.sh"
 
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)

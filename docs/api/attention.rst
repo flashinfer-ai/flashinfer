@@ -17,6 +17,15 @@ for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
 but not yet signoff-qualified.
 
+.. note::
+
+    Release and nightly packages retain ``nvidia-cutlass-dsl==4.6.2`` for the
+    general FlashInfer runtime. PrimTS requires ``nvidia-cutlass-dsl>=4.7.0``
+    and is validated after a CI-only 4.7.0 override. Importing PrimTS on the
+    default version raises a feature-local error; other FlashInfer APIs remain
+    available. See the PrimTS guide index above for CUDA 12 and CUDA 13 install
+    commands and the package-metadata caveat.
+
 .. currentmodule:: flashinfer.attention.prims_ts
 
 FMHA Context/Prefill

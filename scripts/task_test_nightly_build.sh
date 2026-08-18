@@ -3,6 +3,8 @@
 set -eo pipefail
 set -x
 
+NIGHTLY_CUTLASS_DSL_VERSION="4.6.2"
+
 # Source test environment setup (handles package overrides like TVM-FFI)
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
@@ -45,6 +47,47 @@ export FLASHINFER_DISABLE_JIT=1
 
 echo "Installing flashinfer-python from ${DIST_PYTHON_DIR}..."
 pip install ${DIST_PYTHON_DIR}/*.tar.gz
+
+# Nightly artifacts must be tested with their published 4.6 dependency even
+# though the reusable CI image starts on 4.7. Reinstall the complete stack so
+# this job represents a normal package consumer rather than the PrimTS CI
+# source-test override.
+CUDA_MAJOR=$(python -c "import torch; print(torch.version.cuda.split('.')[0])")
+pip uninstall -y \
+  nvidia-cutlass-dsl \
+  nvidia-cutlass-dsl-libs-core \
+  nvidia-cutlass-dsl-libs-base \
+  nvidia-cutlass-dsl-libs-cu12 \
+  nvidia-cutlass-dsl-libs-cu13 2>/dev/null || true
+if [ "$CUDA_MAJOR" = "13" ]; then
+  CUTLASS_DSL_PACKAGE="nvidia-cutlass-dsl[cu13]==${NIGHTLY_CUTLASS_DSL_VERSION}"
+  CUTLASS_DSL_PACKAGES="nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13"
+else
+  CUTLASS_DSL_PACKAGE="nvidia-cutlass-dsl==${NIGHTLY_CUTLASS_DSL_VERSION}"
+  CUTLASS_DSL_PACKAGES="nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12"
+fi
+pip install --upgrade "$CUTLASS_DSL_PACKAGE"
+python -c "
+import importlib.metadata as m, sys
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
+expected = '${NIGHTLY_CUTLASS_DSL_VERSION}'
+for name in '${CUTLASS_DSL_PACKAGES}'.split():
+    version = m.version(name)
+    if version != expected:
+        sys.exit(f'ERROR: {name} is {version}, expected {expected}')
+requirements = [Requirement(raw) for raw in (m.distribution('flashinfer-python').requires or [])]
+dsl_requirements = [
+    requirement
+    for requirement in requirements
+    if canonicalize_name(requirement.name) == 'nvidia-cutlass-dsl'
+]
+if not dsl_requirements or any(str(requirement.specifier) != f'=={expected}' for requirement in dsl_requirements):
+    sys.exit(f'ERROR: flashinfer-python CUTLASS DSL requirements are {dsl_requirements}, expected =={expected}')
+print(f'Nightly CUTLASS DSL package check passed: {expected}')
+"
+pip check
 
 # Verify installation
 echo "Verifying installation..."

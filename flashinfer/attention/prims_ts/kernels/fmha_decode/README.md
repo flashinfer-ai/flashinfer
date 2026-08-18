@@ -5,6 +5,10 @@ FlashInfer's experimental paged decode APIs on NVIDIA Blackwell GPUs. It
 supports token-at-a-time decode, small fixed speculative-query batches, and
 packed variable-length queries over a paged K/V cache.
 
+This kernel requires `nvidia-cutlass-dsl>=4.7.0`; see the shared
+[CUTLASS DSL version policy](../../README.md#cutlass-dsl-version-policy) for
+the package-default and CI behavior.
+
 The public API describes attention semantics and cache metadata. Tile shapes
 and launch policy are selected internally for the problem and GPU. Fixed-Q
 plans may use direct, persistent, or split-KV execution. Packed-Q and

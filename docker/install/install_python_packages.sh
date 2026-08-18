@@ -19,6 +19,8 @@
 set -e
 set -u
 
+CUTLASS_DSL_CI_VERSION="4.7.0"
+
 pip3 install --upgrade "setuptools>=77" "pip>=24"
 
 # Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
@@ -56,19 +58,40 @@ pip3 install -r /install/requirements.txt
 pip3 install responses pytest scipy build "$NVSHMEM4PY"
 pip3 install --upgrade "$CUDA_PYTHON"
 
-# Install cudnn package based on CUDA version
+# CI deliberately validates CUTLASS DSL 4.7 while published FlashInfer
+# packages retain their 4.6 dependency. Reinstall the complete package stack
+# after requirements.txt so neither the default pin nor a stale CUDA-family
+# libs wheel can leak into the test image.
+pip3 uninstall -y \
+  nvidia-cutlass-dsl \
+  nvidia-cutlass-dsl-libs-core \
+  nvidia-cutlass-dsl-libs-base \
+  nvidia-cutlass-dsl-libs-cu12 \
+  nvidia-cutlass-dsl-libs-cu13 2>/dev/null || true
+
+# Install cudnn and CUTLASS DSL packages based on CUDA version.
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
+  CUTLASS_DSL_PACKAGE="nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_CI_VERSION}"
+  CUTLASS_DSL_PACKAGES="nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13"
 else
   pip3 install --upgrade nvidia-cudnn-cu12
+  CUTLASS_DSL_PACKAGE="nvidia-cutlass-dsl==${CUTLASS_DSL_CI_VERSION}"
+  CUTLASS_DSL_PACKAGES="nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12"
 fi
+pip3 install --upgrade "$CUTLASS_DSL_PACKAGE"
 
-# Fail the build if torch or cuda-python drifted off this image's CUDA major.
+# Fail the build if torch, cuda-python, or CUTLASS DSL drifted from the CI
+# image contract.
 python3 -c "
 import importlib.metadata as m, sys, torch
 for name, ver in (('torch', torch.version.cuda or ''), ('cuda-python', m.version('cuda-python'))):
     if ver.split('.')[0] != '${CUDA_MAJOR}':
         sys.exit(f'ERROR: {name} targets CUDA {ver}, but this image is CUDA ${CUDA_MAJOR}')
+for name in '${CUTLASS_DSL_PACKAGES}'.split():
+    ver = m.version(name)
+    if ver != '${CUTLASS_DSL_CI_VERSION}':
+        sys.exit(f'ERROR: {name} is {ver}, expected ${CUTLASS_DSL_CI_VERSION}')
 print('CUDA ${CUDA_MAJOR} check passed:', torch.__version__)
+print('CUTLASS DSL CI check passed: ${CUTLASS_DSL_CI_VERSION}')
 "

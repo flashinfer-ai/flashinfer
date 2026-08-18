@@ -6,11 +6,13 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SKIP_INSTALL:=0}
 
-# Source test environment setup (handles package overrides like TVM-FFI)
+# Source the pre-install guards and optional dependency overrides.
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
+  # shellcheck disable=SC1091
+  source "$(dirname "${BASH_SOURCE[0]}")/setup_ci_test_env.sh"
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # avoid memory fragmentation

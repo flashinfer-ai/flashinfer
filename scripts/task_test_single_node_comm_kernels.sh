@@ -5,7 +5,7 @@ set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
 
-# Source test environment setup (handles package overrides like TVM-FFI)
+# Source the pre-install guards and optional dependency overrides.
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
@@ -16,6 +16,8 @@ echo "Cache cleaned."
 echo ""
 
 pip install -e . -v
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/setup_ci_test_env.sh"
 
 # nvshmem4py-cu12 pins cuda-python<=12.9; letting pip resolve its deps on a
 # cu13 container downgrades cuda-python/cuda-bindings and makes the next
