@@ -1112,10 +1112,9 @@ def _run_flash_kda_prefill(
     stream_workspace = (
         _get_stream_workspace(q.device) if prefill_workspace is None else None
     )
-    needs_direct_m128 = (
+    has_direct_m128_only_features = (
         state_indices is not None
         or checkpoint_every_n_tokens != 0
-        or not beta.is_contiguous()
         or seq_order is not None
         or (
             initial_state is not None
@@ -1123,13 +1122,17 @@ def _run_flash_kda_prefill(
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         )
     )
-    small_bh_candidate = not needs_direct_m128 and _should_use_small_bh_owner_helper(
-        compute_capability=compute_capability,
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        sequence_length=seq_len,
+    needs_direct_m128 = has_direct_m128_only_features or not beta.is_contiguous()
+    small_bh_candidate = (
+        not has_direct_m128_only_features
+        and _should_use_small_bh_owner_helper(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            sequence_length=seq_len,
+        )
     )
     persistent_candidate = (
         _uses_measured_sm100_persistent_policy(
