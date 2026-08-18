@@ -280,6 +280,7 @@ def recurrent_kda(
                 seq_order=seq_order,
                 output=output,
                 prefill_workspace=prefill_workspace,
+                state_indices=ssm_state_indices,
                 state_checkpoints=state_checkpoints,
                 checkpoint_cu_starts=checkpoint_cu_starts,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
@@ -560,6 +561,7 @@ class RecurrentKDAPrefillWrapper:
         state_checkpoints: Optional[torch.Tensor] = None,
         checkpoint_cu_starts: Optional[torch.Tensor] = None,
         checkpoint_every_n_tokens: int = 0,
+        ssm_state_indices: Optional[torch.Tensor] = None,
     ) -> (
         tuple[torch.Tensor, Optional[torch.Tensor]]
         | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -596,6 +598,7 @@ class RecurrentKDAPrefillWrapper:
             cu_seqlens=cu_seqlens,
             output=output,
             beta_is_logit=beta_is_logit,
+            ssm_state_indices=ssm_state_indices,
             seq_order=seq_order,
             prefill_workspace=self._workspace,
             state_checkpoints=state_checkpoints,

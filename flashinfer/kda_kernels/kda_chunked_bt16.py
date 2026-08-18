@@ -3228,7 +3228,7 @@ def tcgen05_store_initial_state_tmem(
     initial_state: cute.Tensor | None,
     state_ckpt: cute.Tensor | None,
     ckpt_slot,
-    bidx,
+    state_slot,
     bidy,
     dv_half,
     warp_idx,
@@ -3272,13 +3272,13 @@ def tcgen05_store_initial_state_tmem(
             if cutlass.const_expr(initial_state is not None):
                 if cutlass.const_expr(HALF):
                     if valid_lane:
-                        state_value = initial_state[bidx, bidy, value_dim, key_dim].to(
-                            cutlass.Float32
-                        )
+                        state_value = initial_state[
+                            state_slot, bidy, value_dim, key_dim
+                        ].to(cutlass.Float32)
                 else:
-                    state_value = initial_state[bidx, bidy, value_dim, key_dim].to(
-                        cutlass.Float32
-                    )
+                    state_value = initial_state[
+                        state_slot, bidy, value_dim, key_dim
+                    ].to(cutlass.Float32)
             state_block[col] = state_value
             if cutlass.const_expr(state_ckpt is not None):
                 if (ckpt_slot >= cutlass.Int32(0)) & (
@@ -4612,6 +4612,7 @@ def kernel(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
+    state_indices: cute.Tensor | None,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -5671,6 +5672,11 @@ def kernel(
     elif is_compute_group1_warp(warp_idx):
         prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
         tmem_raw_addr = tmem_ptr_i32.load()
+        # Only CG1 touches recurrent state. Keep the pool lookup outside the
+        # chunk loop and out of producer/MMAs warps.
+        state_slot = bidx
+        if cutlass.const_expr(state_indices is not None):
+            state_slot = cutlass.Int32(state_indices[bidx])
         ckpt_slot = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
             ckpt_stride = checkpoint_stride_chunks
@@ -5681,7 +5687,7 @@ def kernel(
             initial_state,
             state_ckpt,
             ckpt_slot,
-            bidx,
+            state_slot,
             bidy,
             cutlass.Int32(0),
             warp_idx,
@@ -5991,7 +5997,7 @@ def kernel(
                 tmem_raw_addr,
                 KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
                 final_state,
-                bidx,
+                state_slot,
                 bidy,
                 cutlass.Int32(0),
                 warp_idx,
@@ -6012,6 +6018,7 @@ def host(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
+    state_indices: cute.Tensor | None,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -6126,6 +6133,7 @@ def host(
         beta,
         cu_seqlens,
         seq_order,
+        state_indices,
         initial_state,
         out,
         final_state,
@@ -8541,6 +8549,7 @@ def kernel_chain_dv2(
     v: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
+    state_indices: cute.Tensor | None,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -8956,6 +8965,11 @@ def kernel_chain_dv2(
     elif is_compute_group1_warp(warp_idx):
         prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
         tmem_raw_addr = tmem_ptr_i32.load()
+        # Only CG1 touches recurrent state. Keep the pool lookup outside the
+        # chunk loop and out of producer/MMAs warps.
+        state_slot = bidx
+        if cutlass.const_expr(state_indices is not None):
+            state_slot = cutlass.Int32(state_indices[bidx])
         ckpt_slot = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
             # cu_ckpts supplies the per-sequence base slot offsets.  A
@@ -8968,7 +8982,7 @@ def kernel_chain_dv2(
             initial_state,
             state_ckpt,
             ckpt_slot,
-            bidx,
+            state_slot,
             bidy,
             dv_half,
             warp_idx,
@@ -9138,7 +9152,7 @@ def kernel_chain_dv2(
                 tmem_raw_addr,
                 KDA_TMEM_STATE_COL_OFFSET,
                 final_state,
-                bidx,
+                state_slot,
                 bidy,
                 dv_half,
                 warp_idx,
@@ -9237,6 +9251,7 @@ def host_chain_dv2(
     ws_w: cute.Tensor,
     ws_qk: cute.Tensor,
     ws_diag: cute.Tensor,
+    state_indices: cute.Tensor | None,
     initial_state: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
@@ -9336,6 +9351,7 @@ def host_chain_dv2(
         v,
         cu_seqlens,
         cu_chunks,
+        state_indices,
         initial_state,
         out,
         final_state,
@@ -9379,6 +9395,7 @@ def host_unified(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
+    state_indices: cute.Tensor | None,
     cu_chunks: cute.Tensor,
     chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
@@ -9466,6 +9483,7 @@ def host_unified(
             ws_w,
             ws_qk,
             ws_diag,
+            state_indices,
             initial_state,
             out,
             final_state,
@@ -9490,6 +9508,7 @@ def host_unified(
             beta,
             cu_seqlens,
             seq_order,
+            state_indices,
             initial_state,
             out,
             final_state,
@@ -9511,6 +9530,7 @@ def _unified_fakes(
     has_state_in: bool,
     has_state_out: bool,
     has_state_ckpt: bool,
+    has_state_indices: bool,
     gate_dtype: type = cutlass.BFloat16,
 ) -> tuple:
     """Union fake-tensor set for the single `host_unified` compile.
@@ -9524,6 +9544,7 @@ def _unified_fakes(
     scu = cute.sym_int64(divisibility=1)
     scu2 = cute.sym_int64(divisibility=1)
     sn = cute.sym_int64(divisibility=1)
+    sp = cute.sym_int64(divisibility=1)
     sh = cute.sym_int64(divisibility=1)
     ss = cute.sym_int64(divisibility=1)
     sc = cute.sym_int64(divisibility=1)
@@ -9537,6 +9558,11 @@ def _unified_fakes(
     fbeta = F(cutlass.BFloat16, (1, ss, sh), stride_order=(2, 1, 0), assumed_align=16)
     fcu = F(cutlass.Int64, (scu,), stride_order=(0,), assumed_align=8)
     forder = F(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=8)
+    fstate_indices = (
+        F(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=4)
+        if has_state_indices
+        else None
+    )
     fcuc = F(cutlass.Int32, (scu2,), stride_order=(0,), assumed_align=8)
     fcts = F(cutlass.Int32, (sc,), stride_order=(0,), assumed_align=8)
 
@@ -9554,13 +9580,13 @@ def _unified_fakes(
         assumed_align=16,
     )
     fstate = (
-        F(state_dtype, (sn, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
+        F(state_dtype, (sp, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
         if has_state_in
         else None
     )
     fout = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
     ffinal = (
-        F(state_dtype, (sn, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
+        F(state_dtype, (sp, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
         if has_state_out
         else None
     )
@@ -9591,6 +9617,7 @@ def _unified_fakes(
             fbeta,
             fcu,
             forder,
+            fstate_indices,
             fcuc,
             fcts,
             fkd,
@@ -9694,6 +9721,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         spec["has_state_in"],
         spec["has_state_out"],
         spec["has_state_ckpt"],
+        spec["has_state_indices"],
     )
 
     def call(
@@ -9717,6 +9745,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         seq_order=None,
         planned_cu_chunks=None,
         planned_chunk_to_seq=None,
+        state_indices=None,
     ):
         # The state specialization is DERIVED from which state tensors the call
         # actually passes (initial/final/checkpoint present or None); if it
@@ -9726,6 +9755,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             initial_state is not None,
             final_state is not None,
             state_ckpt is not None,
+            state_indices is not None,
         )
         if want != built_states:
             sibling = compile(
@@ -9737,6 +9767,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 has_state_in=want[0],
                 has_state_out=want[1],
                 has_state_ckpt=want[2],
+                has_state_indices=want[3],
                 mode=spec["mode"],
             )
             return sibling(
@@ -9754,6 +9785,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 workspace,
                 stream_a,
                 scale,
+                state_indices=state_indices,
                 state_ckpt=state_ckpt,
                 checkpoint_cu_starts=checkpoint_cu_starts,
                 ckpt_interval=ckpt_interval,
@@ -9800,6 +9832,18 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             raise ValueError(
                 "seq_order must be a contiguous CUDA int32 tensor with one "
                 "entry per sequence"
+            )
+        if state_indices is not None and (
+            initial_state is None
+            or state_indices.device != device
+            or state_indices.dtype != torch.int32
+            or state_indices.ndim != 1
+            or not state_indices.is_contiguous()
+            or state_indices.numel() != n_seq
+        ):
+            raise ValueError(
+                "state_indices requires initial_state and must be a contiguous "
+                "CUDA int32 tensor with one entry per sequence"
             )
         key = (n_seq, str(device), heads, compile_mode)
         kind = decisions.get(key)
@@ -9889,6 +9933,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 beta,
                 cu_seqlens,
                 seq_order,
+                state_indices,
                 cuc,
                 cts,
                 kd,
@@ -9962,6 +10007,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             beta,
             cu_seqlens,
             seq_order,
+            state_indices,
             plan["cu_chunks"],
             plan["chunk_to_seq"],
             ws["kd"],
@@ -10015,6 +10061,7 @@ def compile(  # noqa: A001
     has_state_in: bool = True,
     has_state_out: bool = True,
     has_state_ckpt: bool = False,
+    has_state_indices: bool = False,
     mode=None,
 ) -> CompiledKDA:
     """Compile KDA; the returned callable is the single host entry.
@@ -10046,7 +10093,13 @@ def compile(  # noqa: A001
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
     fakes, fckpt, fcuk = _unified_fakes(
-        dtype, state_dtype, has_state_in, has_state_out, has_state_ckpt, gate_dtype
+        dtype,
+        state_dtype,
+        has_state_in,
+        has_state_out,
+        has_state_ckpt,
+        has_state_indices,
+        gate_dtype,
     )
     unified = cute.compile(
         host_unified,
@@ -10078,6 +10131,7 @@ def compile(  # noqa: A001
             has_state_in=has_state_in,
             has_state_out=has_state_out,
             has_state_ckpt=has_state_ckpt,
+            has_state_indices=has_state_indices,
             mode=mode,
         ),
     )
@@ -10092,6 +10146,7 @@ def compile(  # noqa: A001
             has_state_in,
             has_state_out,
             has_state_ckpt,
+            has_state_indices,
             gate_dtype,
         )
     return fn
@@ -10104,6 +10159,7 @@ def _eager_module_load(
     has_state_in: bool,
     has_state_out: bool,
     has_state_ckpt: bool = False,
+    has_state_indices: bool = False,
     gate_dtype: type = cutlass.BFloat16,
 ) -> None:
     """One launch to make the device module resident so no real call lazy-loads.
@@ -10152,6 +10208,11 @@ def _eager_module_load(
             workspace,
             s,
             DEFAULT_SCALE,
+            state_indices=(
+                torch.zeros(1, dtype=torch.int32, device="cuda")
+                if has_state_indices
+                else None
+            ),
             state_ckpt=(
                 torch.zeros(
                     64,

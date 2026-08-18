@@ -71,7 +71,6 @@ def _is_cute_dsl_kda_prefill_eligible(
     if any(
         value is not None
         for value in (
-            ssm_state_indices,
             num_accepted_tokens,
             initial_state_source,
             initial_state_indices,
@@ -159,13 +158,28 @@ def _is_cute_dsl_kda_prefill_eligible(
     ):
         return False
 
-    if initial_state is not None and (
-        initial_state.device != q.device
-        or initial_state.dtype != torch.bfloat16
-        or initial_state.shape != (num_sequences, num_heads, _HEAD_DIM, _HEAD_DIM)
-        or not initial_state.is_contiguous()
-    ):
-        return False
+    if ssm_state_indices is not None:
+        if (
+            initial_state is None
+            or ssm_state_indices.device != q.device
+            or ssm_state_indices.dtype != torch.int32
+            or ssm_state_indices.ndim != 1
+            or ssm_state_indices.numel() != num_sequences
+            or not ssm_state_indices.is_contiguous()
+        ):
+            return False
+    if initial_state is not None:
+        if (
+            initial_state.device != q.device
+            or initial_state.dtype != torch.bfloat16
+            or initial_state.ndim != 4
+            or initial_state.shape[0] <= 0
+            or tuple(initial_state.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
+            or not initial_state.is_contiguous()
+        ):
+            return False
+        if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
+            return False
     if output is not None and (
         output.device != q.device
         or output.dtype != torch.bfloat16
@@ -207,6 +221,7 @@ def _get_compiled_cute_dsl_kda(
     has_state_in: bool,
     has_state_out: bool,
     has_state_ckpt: bool,
+    has_state_indices: bool,
 ):
     # Keep the large CuTe DSL module lazy so normal Cake and decode imports do
     # not initialize its compilation stack.
@@ -223,6 +238,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_in=has_state_in,
         has_state_out=has_state_out,
         has_state_ckpt=has_state_ckpt,
+        has_state_indices=has_state_indices,
         mode=None,
     )
 
@@ -247,6 +263,7 @@ def _run_cute_dsl_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -321,6 +338,7 @@ def _run_cute_dsl_kda_prefill(
         has_state_in=initial_state is not None,
         has_state_out=final_state is not None,
         has_state_ckpt=state_checkpoints is not None,
+        has_state_indices=state_indices is not None,
     )
     planned_cu_chunks = (
         getattr(prefill_workspace, "_cute_dsl_cu_chunks", None)
@@ -384,6 +402,7 @@ def _run_cute_dsl_kda_prefill(
             workspace_arg,
             torch.cuda.current_stream(q.device).cuda_stream,
             scale_value,
+            state_indices=state_indices,
             seq_order=seq_order,
             planned_cu_chunks=planned_cu_chunks,
             planned_chunk_to_seq=planned_chunk_to_seq,

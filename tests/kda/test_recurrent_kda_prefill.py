@@ -284,7 +284,9 @@ def test_public_backend_option_rejects_unknown_value():
         recurrent_kda(**_cpu_route_tensors(), backend="unknown")
 
 
-def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch):
+def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
+    monkeypatch,
+):
     calls = []
     compile_args = []
     identity_order = torch.tensor([0], dtype=torch.int32)
@@ -317,7 +319,8 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
     )
 
     inputs = _cpu_route_tensors()
-    state = torch.empty((1, 1, 128, 128), dtype=torch.bfloat16)
+    state = torch.empty((3, 1, 128, 128), dtype=torch.bfloat16)
+    state_indices = torch.tensor([2], dtype=torch.int32)
     output = torch.empty_like(inputs["q"])
     result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
         q=inputs["q"],
@@ -338,6 +341,7 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
         state_checkpoints=None,
         checkpoint_cu_starts=None,
         checkpoint_every_n_tokens=0,
+        state_indices=state_indices,
     )
 
     assert result[0] is output
@@ -348,6 +352,7 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
             "has_state_in": True,
             "has_state_out": True,
             "has_state_ckpt": False,
+            "has_state_indices": True,
         }
     ]
     args, kwargs = calls[0]
@@ -357,6 +362,7 @@ def test_cute_dsl_prefill_adapter_preserves_in_place_state_semantics(monkeypatch
     assert args[12] == 7
     assert kwargs == {
         "seq_order": identity_order,
+        "state_indices": state_indices,
         "planned_cu_chunks": None,
         "planned_chunk_to_seq": None,
     }
@@ -415,11 +421,13 @@ def test_cute_dsl_prefill_adapter_forwards_explicit_sequence_order(monkeypatch):
     args, kwargs = calls[0]
     assert args[7] is cu_seqlens
     assert tuple(kwargs) == (
+        "state_indices",
         "seq_order",
         "planned_cu_chunks",
         "planned_chunk_to_seq",
     )
     assert kwargs["seq_order"] is seq_order
+    assert kwargs["state_indices"] is None
     assert kwargs["planned_cu_chunks"] is None
     assert kwargs["planned_chunk_to_seq"] is None
 
@@ -2236,6 +2244,56 @@ def test_cute_dsl_checkpoints_match_cake(
             "state_checkpoints": checkpoints,
             "checkpoint_cu_starts": checkpoint_cu_starts,
             "checkpoint_every_n_tokens": interval,
+        }
+        if backend == "cute-dsl" and packed:
+            wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
+            wrapper.plan(run_kwargs.pop("cu_seqlens"))
+            results[backend] = wrapper.run(**run_kwargs)
+        else:
+            results[backend] = recurrent_kda(**run_kwargs, backend=backend)
+
+    for cute_value, cake_value in zip(
+        results["cute-dsl"], results["cake"], strict=True
+    ):
+        torch.testing.assert_close(
+            cute_value.float(), cake_value.float(), atol=1e-2, rtol=1e-2
+        )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "num_heads", "packed"),
+    [((17,), 96, False), ((17, 33), 12, True)],
+)
+def test_cute_dsl_indexed_state_matches_cake(
+    flash_kda_device, seq_lens, num_heads, packed
+):
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        seed=2117 + num_heads,
+    )
+    # Exercise Cake's minimum int32 alignment contract, including a +4-byte
+    # contiguous view that is not 8-byte aligned.
+    state_indices = torch.tensor(
+        [0, 3, 1][: len(seq_lens) + 1],
+        dtype=torch.int32,
+        device=flash_kda_device,
+    )[1:]
+    state_pool = torch.zeros(
+        4, num_heads, 128, 128, dtype=torch.bfloat16, device=flash_kda_device
+    )
+    state_pool[state_indices.to(torch.int64)] = inputs["initial_state"]
+
+    results = {}
+    for backend in ("cake", "cute-dsl"):
+        backend_inputs = {**inputs, "initial_state": state_pool.clone()}
+        run_kwargs = {
+            **_strict_prefill_kwargs(backend_inputs),
+            "output": torch.empty_like(inputs["q"]),
+            "output_final_state": True,
+            "ssm_state_indices": state_indices,
         }
         if backend == "cute-dsl" and packed:
             wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
