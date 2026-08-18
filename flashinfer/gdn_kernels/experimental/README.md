@@ -274,10 +274,23 @@ dispatch, kernel or consumer code has to move.
    previous one — call `kernel/_stream_order.py`'s
    `order_after_previous_stream(<your per-device stream dict>, device)`, as
    both shipped impls do.  It records an event on the previous stream and
-   costs a stream compare in the steady state.  Two *replays* of captured
-   graphs running concurrently on different streams remain a caller-side
-   serialization requirement, exactly as the in-place conv/ssm pools already
-   are.
+   costs a stream compare in the steady state.  What it covers is *one host
+   thread* switching streams, which is the reachable case.  It does **not**
+   make the shared state safe against genuinely concurrent callers, and two
+   cases stay a caller-side serialization requirement, exactly as the
+   in-place conv/ssm pools already are:
+
+   - two host threads calling the op for the same device at the same time —
+     the "record an event on the previous stream" step and the launch it
+     protects are not one atomic action, so a second thread can slip between
+     them;
+   - two *replays* of captured graphs running concurrently on different
+     streams.
+
+   Keying the state by stream instead would not fix either, and would cost
+   the CUDA-graph contract: `torch.cuda.graph` captures on a fresh side
+   stream, so a stream-keyed cache is always cold at capture time and
+   `ready_for_graph_capture` would decline.
 3. Match the composable path's numerics, which is what the correctness tests
    assert: round the fp32 `b`/`a` GEMV sums through bf16 before the gates
    (the reference materializes `ba` as a bf16 tensor, so skipping this makes
@@ -286,16 +299,26 @@ dispatch, kernel or consumer code has to move.
    ~88.7 in fp32 and silently zeroes the decay gate.
 
    A CuTe-DSL impl must also stay inside the DSL surface its *deployed*
-   version offers, not the newest one installed while developing: the
-   `cute.math` module was hand-written up to nvidia-cutlass-dsl 4.5 and
-   became a re-export of the much larger `cutlass._mlir_helpers.math` in
-   4.6, so e.g. `cute.math.max` resolves on 4.6+ and raises `AttributeError`
-   inside `cute.compile` on 4.5.  That error is caught by the dispatch
-   layer, which latches the impl off and serves the next one — a silent
-   substitution, not a crash.  `PORTABLE_CUTE_MATH_PRIMITIVES` in
-   `tests/gdn/test_fused_decode.py` pins the supported surface and is
-   checked without a GPU or cutlass; raise it deliberately if the floor
-   moves.
+   version offers, not the newest one installed while developing.  **The
+   runtime floor for this package is nvidia-cutlass-dsl 4.5**, which is
+   deliberately lower than the `==4.7.0` FlashInfer itself pins in
+   `requirements.txt` and the `cu12`/`cu13` extras.  The two answer different
+   questions: the pin says which DSL a FlashInfer install brings along, the
+   floor says which DSL the shipped kernel must still compile under — and
+   they differ because this op is consumed from serving stacks that resolve
+   the DSL themselves (the vLLM nightly image these kernels were validated
+   in downgrades to 4.5.2, vLLM's own pin, *after* FlashInfer is installed;
+   the pt2605 container ships 4.5.0).  Concretely: the `cute.math` module was
+   hand-written up to 4.5 and became a re-export of the much larger
+   `cutlass._mlir_helpers.math` in 4.6, so e.g. `cute.math.max` resolves on
+   4.6+ and raises `AttributeError` inside `cute.compile` on 4.5.  That error
+   is caught by the dispatch layer, which latches the impl off and serves the
+   next one — a silent substitution, not a crash, which is why the floor is
+   enforced by a test rather than left to review.  The authoritative
+   statement is `CUTE_DSL_RUNTIME_FLOOR` plus
+   `PORTABLE_CUTE_MATH_PRIMITIVES` in `tests/gdn/test_fused_decode.py`,
+   checked without a GPU or cutlass (a third test asserts the floor stays at
+   or below the repo pin).  Raise it deliberately, in both places and here.
 4. Map the impl to an internal preference family in `BACKEND_IMPLS` (an
    existing family to extend its impl set, or a new one, placed in
    `_AUTO_BACKEND_ORDER`) and add the workload rows to

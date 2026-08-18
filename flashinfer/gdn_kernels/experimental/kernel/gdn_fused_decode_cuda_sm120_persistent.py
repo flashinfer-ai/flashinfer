@@ -10,8 +10,9 @@ synchronized by a device-wide grid barrier.
 
 Implements the impl-module interface documented in ../README.md.
 Compilation is lazy: the first eager :func:`execute` builds and loads the
-module (and allocates the per-device barrier); once warm, calls are
-capture-safe (regular launches only).  Consumed by
+module and allocates the per-device barrier and the per-(batch, device)
+launch scratch; once warm, calls are capture-safe (regular launches only,
+no allocation).  Consumed by
 :mod:`flashinfer.gdn_kernels.experimental.gdn_fused_decode_specialized`;
 import errors are tolerated there.
 """
@@ -43,7 +44,17 @@ _GEMV_NSPLIT = 160
 # the next one arrives at the same barrier buffer.
 _barrier_cache: dict = {}
 
-# Stream that last launched with the shared per-device barrier.
+# Per-(batch, device) launch scratch: the conv output and the fp32 GEMV
+# partials. Both are pure scratch -- written before they are read within the
+# one launch that uses them -- so they are cached rather than reallocated per
+# call, like the CuTe-DSL impl's workspace: it keeps the allocator off the
+# per-layer decode path and, more importantly, keeps allocation out of CUDA
+# graph capture, which is what ready_for_graph_capture() is allowed to promise.
+# Shared per device, so they fall under the same cross-stream ordering as the
+# barrier (order_after_previous_stream below covers all three).
+_scratch_cache: dict = {}
+
+# Stream that last launched with the shared per-device barrier and scratch.
 _barrier_stream: dict = {}
 
 _launch_count = 0
@@ -81,15 +92,56 @@ def _get_barrier(device: torch.device) -> torch.Tensor:
     return barrier
 
 
+def _scratch_key(hidden_states: torch.Tensor, conv_state: torch.Tensor) -> tuple:
+    """Cache key of the launch scratch, from the two tensors both the
+    readiness check and :func:`execute` are given.
+
+    ``conv_state`` is the logical ``[P, qkv_dim, state_len]`` view, so it
+    carries ``qkv_dim``; together with the batch size and the device that
+    fixes ``conv_out``'s shape.  ``n_ba`` is not derivable here, but it is
+    pinned per geometry by the dispatch guard, so it cannot vary
+    independently of ``qkv_dim`` for a registered call -- :func:`_get_scratch`
+    re-allocates if it ever does.
+    """
+    return (
+        int(hidden_states.shape[0]),
+        int(conv_state.shape[1]),
+        str(hidden_states.device),
+    )
+
+
+def _get_scratch(
+    hidden_states: torch.Tensor, conv_state: torch.Tensor, n_ba: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The (conv_out, ba_part) scratch pair for this call, allocated once."""
+    key = _scratch_key(hidden_states, conv_state)
+    B, qkv_dim = key[0], key[1]
+    ba_elems = _GEMV_NSPLIT * B * n_ba
+    scratch = _scratch_cache.get(key)
+    if scratch is None or scratch[1].numel() != ba_elems:
+        device = hidden_states.device
+        scratch = (
+            torch.empty((B, qkv_dim), dtype=torch.bfloat16, device=device),
+            torch.empty((ba_elems,), dtype=torch.float32, device=device),
+        )
+        _scratch_cache[key] = scratch
+    return scratch
+
+
 def ready_for_graph_capture(
     hidden_states: torch.Tensor, conv_state: torch.Tensor, scale: float
 ) -> bool:
     """True when a call is capture-safe: the compiled module is resident and
-    the persistent barrier for this device already exists (so no compilation
-    or persistent allocation can happen during capture).  The kernel is
-    B-dynamic and takes scale and the conv-state strides as runtime
-    parameters, so readiness does not depend on them."""
-    return _module_is_resident() and str(hidden_states.device) in _barrier_cache
+    the persistent barrier and the launch scratch for this call already exist,
+    so neither compilation nor allocation can happen during capture.  The
+    kernel is B-dynamic and takes scale and the conv-state strides as runtime
+    parameters, so readiness does not depend on those -- but it does depend on
+    the batch size and ``qkv_dim``, which size the scratch."""
+    return (
+        _module_is_resident()
+        and str(hidden_states.device) in _barrier_cache
+        and _scratch_key(hidden_states, conv_state) in _scratch_cache
+    )
 
 
 def execute(
@@ -114,7 +166,6 @@ def execute(
     global _launch_count
     module = _get_module()
     B = hidden_states.shape[0]
-    qkv_dim = mixed_qkv.shape[1]
     n_ba = w_ba.shape[1]
     hv = A_log.shape[0]
     d = ssm_state.shape[-1]
@@ -124,10 +175,7 @@ def execute(
         if out is not None
         else torch.empty((B, 1, hv, d), dtype=torch.bfloat16, device=device)
     )
-    conv_out_scratch = torch.empty((B, qkv_dim), dtype=torch.bfloat16, device=device)
-    ba_scratch = torch.empty(
-        (_GEMV_NSPLIT * B * n_ba,), dtype=torch.float32, device=device
-    )
+    conv_out_scratch, ba_scratch = _get_scratch(hidden_states, conv_state, n_ba)
     barrier = _get_barrier(device)
     order_after_previous_stream(_barrier_stream, device)
     module.gdn_fused_decode(

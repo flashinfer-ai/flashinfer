@@ -241,19 +241,51 @@ def conv_state_layout(conv_state: torch.Tensor) -> Optional[str]:
 
 
 @functools.lru_cache(maxsize=32)
-def _device_cc(device) -> Optional[int]:
-    """Compute capability of ``device`` as ``major * 10 + minor``.
+def _device_cc_for_index(index: int) -> Optional[int]:
+    """Compute capability of CUDA device ``index`` as ``major * 10 + minor``.
 
-    Cached: a device's capability cannot change, and this is on the
-    per-layer-per-step routing-probe path.  Keyed on the argument as passed
-    (``None``, an index, a string or a :class:`torch.device`), so distinct
-    spellings of one device merely occupy distinct entries.
+    Cached on a resolved ordinal: a device's capability cannot change, so
+    this is the only part of the lookup that is safe to memoize.
     """
     try:
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = torch.cuda.get_device_capability(index)
     except (RuntimeError, ValueError, AssertionError, TypeError):
         return None
     return major * 10 + minor
+
+
+def _device_cc(device) -> Optional[int]:
+    """Compute capability of ``device`` as ``major * 10 + minor``, or None.
+
+    ``device`` may be ``None``, an ordinal, a string or a
+    :class:`torch.device`; ``None`` and an index-less ``"cuda"`` both mean
+    "whatever device is current *now*".  That is why the ordinal is resolved
+    BEFORE the cache is consulted: memoizing under the literal argument
+    would pin the first answer to the key ``None``, and a later
+    ``torch.cuda.set_device()`` onto a device of a different capability
+    would keep reading the old one -- routing a call into a kernel built for
+    another architecture, or declining one it could serve.  On the
+    per-layer-per-step probe path this costs one ``current_device()`` call
+    (tens of nanoseconds) on top of the memo lookup, only when the caller
+    did not name a device.
+    """
+    try:
+        if device is None:
+            index: int = torch.cuda.current_device()
+        elif isinstance(device, int):
+            index = device
+        else:
+            resolved = torch.device(device)
+            if resolved.type != "cuda":
+                return None
+            index = (
+                resolved.index
+                if resolved.index is not None
+                else torch.cuda.current_device()
+            )
+    except (RuntimeError, ValueError, AssertionError, TypeError):
+        return None
+    return _device_cc_for_index(index)
 
 
 def match_gdn_fused_decode_signature(signature: dict, device) -> List[dict]:
@@ -289,10 +321,17 @@ def signature_from_geometry(
     head_dim: int,
     conv_width: int,
     conv_state_len: int,
-    conv_state_layout: str,
+    conv_layout: str,
 ) -> Optional[dict]:
-    """Signature dict for the probe's scalar geometry, or None if malformed."""
-    if conv_state_layout not in _CONV_LAYOUTS:
+    """Signature dict for the probe's scalar geometry, or None if malformed.
+
+    The layout parameter is named ``conv_layout`` -- the registry field name
+    -- rather than ``conv_state_layout``, which is the module-level
+    classifier :func:`conv_state_layout`: a parameter of that name shadows
+    the function inside this body, so a later edit reaching for the
+    classifier here would silently call a string.
+    """
+    if conv_layout not in _CONV_LAYOUTS:
         return None
     return {
         "b": int(batch_size),
@@ -304,7 +343,7 @@ def signature_from_geometry(
         "d": int(head_dim),
         "conv_width": int(conv_width),
         "conv_state_len": int(conv_state_len),
-        "conv_layout": str(conv_state_layout),
+        "conv_layout": str(conv_layout),
     }
 
 
@@ -478,7 +517,7 @@ def gdn_fused_decode_supported_geometry(
     head_dim: int,
     conv_width: int,
     conv_state_len: int,
-    conv_state_layout: str,
+    conv_layout: str,
     device=None,
 ) -> bool:
     """Memoized routing probe over a scalar geometry (the serving path).
@@ -507,7 +546,7 @@ def gdn_fused_decode_supported_geometry(
         head_dim,
         conv_width,
         conv_state_len,
-        conv_state_layout,
+        conv_layout,
     )
     # _registry_index() is what invalidates the memo when the registry is
     # substituted, so it must run before the memo is consulted.  Both are
@@ -525,7 +564,7 @@ def gdn_fused_decode_supported_geometry(
             head_dim,
             conv_width,
             conv_state_len,
-            conv_state_layout,
+            conv_layout,
         )
         answer = signature is not None and gdn_fused_decode_probe(signature, device)
         _probe_memo[key] = answer

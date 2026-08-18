@@ -48,6 +48,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda_driver
 from cutlass.cute.runtime import from_dlpack
 
+from ....cuda_utils import checkCudaErrors
 from ._stream_order import order_after_previous_stream
 
 HIDDEN = 5120
@@ -453,7 +454,15 @@ def execute(
     # but an impl that reads torch.cuda.current_stream() with no argument would
     # silently follow the ambient device if that ever stopped being true.
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    cuda_driver.cuMemsetD32Async(int(part.data_ptr()), 0, B * N_BA, stream)
+    # Checked, not fire-and-forget: `part` is the accumulator the K-split GEMV
+    # atomically adds into, so a memset that did not run leaves the previous
+    # step's partials in place and both gates are silently wrong -- exactly the
+    # class of failure the impl attestation exists to make visible. Raising
+    # instead hands the call to the dispatch layer, which latches this impl off
+    # and serves the composable path.
+    checkCudaErrors(
+        cuda_driver.cuMemsetD32Async(int(part.data_ptr()), 0, B * N_BA, stream)
+    )
 
     # conv_state is a logical [P, QKV_DIM, CONV_STATE_LEN] view over either a
     # transposed SD pool (stride-1 channels, vLLM default) or a DS-dense pool
@@ -462,25 +471,29 @@ def execute(
     # static stride-1 mode differs).
     cs_ld = conv_state_leading_dim(conv_state)
 
-    m_hidden = from_dlpack(hidden_states, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_wba = from_dlpack(w_ba, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_qkv = from_dlpack(mixed_qkv, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_cw = from_dlpack(conv_weight, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_cb = from_dlpack(conv_bias, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_cs = from_dlpack(conv_state, enable_tvm_ffi=True).mark_layout_dynamic(
-        leading_dim=cs_ld
-    )
-    m_alog = from_dlpack(A_log, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_dtb = from_dlpack(dt_bias, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_ssm = from_dlpack(ssm_state, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_si = from_dlpack(state_indices, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_out = from_dlpack(output, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_qa = from_dlpack(qkv_act, enable_tvm_ffi=True).mark_layout_dynamic()
-    m_part = from_dlpack(part, enable_tvm_ffi=True).mark_layout_dynamic()
-
     key = (B, scale_f, cs_ld)
     fn = _compiled.get(key)
     if fn is None:
+        # The DLPack markers exist only to describe the argument layouts to
+        # cute.compile; the compiled kernel is invoked with the torch tensors
+        # themselves. Building them on a warm call would be thirteen
+        # from_dlpack round-trips of pure host overhead per decode step per
+        # layer, so they are built only on the compiling call.
+        m_hidden = from_dlpack(hidden_states, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_wba = from_dlpack(w_ba, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_qkv = from_dlpack(mixed_qkv, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_cw = from_dlpack(conv_weight, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_cb = from_dlpack(conv_bias, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_cs = from_dlpack(conv_state, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=cs_ld
+        )
+        m_alog = from_dlpack(A_log, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_dtb = from_dlpack(dt_bias, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_ssm = from_dlpack(ssm_state, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_si = from_dlpack(state_indices, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_out = from_dlpack(output, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_qa = from_dlpack(qkv_act, enable_tvm_ffi=True).mark_layout_dynamic()
+        m_part = from_dlpack(part, enable_tvm_ffi=True).mark_layout_dynamic()
         fn = cute.compile(
             fused_launch,
             m_hidden,

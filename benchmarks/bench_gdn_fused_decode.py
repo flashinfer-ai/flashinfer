@@ -127,6 +127,11 @@ def _make_inputs(row, seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     B = int(row["b"])
+    # state_indices walks the pool downwards from POOL-1, so a batch larger
+    # than the pool runs off the bottom, where torch's negative-index wrap
+    # silently aliases two batch rows onto one state slot instead of failing.
+    # A registry row wide enough to do that must fail loudly here.
+    assert B <= POOL, f"registry row b={B} exceeds the benchmark state pool ({POOL})"
     hidden, n_ba = int(row["hidden"]), int(row["n_ba"])
     qkv_dim, hv, d = int(row["qkv_dim"]), int(row["hv"]), int(row["d"])
     conv_width = int(row["conv_width"])
@@ -341,19 +346,33 @@ def run_default_phase(args, signatures, specialized_gdn):
         record["dispatched_graph_ms"] = graph_ms
         results["rows"].append(record)
 
-    # Attest the internal preference order: a signature served by both
-    # impls must run the CuTe-DSL one.
-    first = next(iter(signatures.values()))["row"]
+    # Attest the internal preference order: a signature served by BOTH impls
+    # must run the CuTe-DSL one.  The signature has to be one both impls
+    # register -- picking an arbitrary one (e.g. the first) attests nothing
+    # when only the CuTe-DSL impl serves it, and reports a false negative when
+    # only the CUDA impl does, since then the CuTe-DSL launch counter
+    # correctly does not move.
+    contested = next(
+        (
+            entry["row"]
+            for entry in signatures.values()
+            if set(SHIPPED_IMPLS).issubset(entry["impls"])
+        ),
+        None,
+    )
     cutedsl = specialized_gdn._load_impl("cutedsl_sm120_pdl")
-    if cutedsl is not None:
-        inputs = _make_inputs(first)
+    if cutedsl is None:
+        results["prefers_cutedsl_attested"] = None  # DSL unavailable
+    elif contested is None:
+        # Nothing to attest: no shipped signature is served by both impls.
+        results["prefers_cutedsl_attested"] = None
+    else:
+        inputs = _make_inputs(contested)
         launches_before = cutedsl.launch_count()
         gdn_fused_decode_step(**inputs)
         results["prefers_cutedsl_attested"] = (
             cutedsl.launch_count() == launches_before + 1
         )
-    else:
-        results["prefers_cutedsl_attested"] = None  # DSL unavailable
     results["stats"] = specialized_gdn.gdn_fused_decode_stats()
     return results
 

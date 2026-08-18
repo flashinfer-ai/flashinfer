@@ -52,7 +52,8 @@ flashinfer/gdn_kernels/experimental/README.md):
   off), the attestation that makes it visible to a measurement, and the
   probe memo it has to invalidate;
 - the CuTe-DSL impl staying inside the DSL surface its DEPLOYED version
-  offers, not the one a dev box happens to have;
+  offers, not the one a dev box happens to have, and that documented floor
+  staying consistent with the nvidia-cutlass-dsl version the repo pins;
 - multi-device dispatch: a call whose tensors live on a device other than
   the ambient one must still reach the kernel (TP > 1 serving does exactly
   that) and must leave the caller's ambient device alone, and no impl may
@@ -64,10 +65,13 @@ flashinfer/gdn_kernels/experimental/README.md):
 from __future__ import annotations
 
 import ast
+import functools
+import importlib
 import inspect
 import math
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -85,11 +89,28 @@ _CUDA_IMPL = "cuda_sm120_persistent"
 _CUTEDSL_IMPL = "cutedsl_sm120_pdl"
 SHIPPED_IMPLS = (_CUTEDSL_IMPL, _CUDA_IMPL)  # in dispatch preference order
 
-# The ``cute.math`` surface of nvidia-cutlass-dsl 4.5.x -- the oldest release
-# the CuTe-DSL impl has to run on.  4.5 ships a hand-written ``cute/math.py``
-# exporting exactly these nineteen names; 4.6 replaced it with a re-export of
-# ``cutlass._mlir_helpers.math``, which exports 54 (``max``, ``min``,
-# ``clamp``, ``log1p``, ``fma`` ... ).
+# The oldest nvidia-cutlass-dsl release the CuTe-DSL impl has to RUN on.
+#
+# This is deliberately BELOW the version FlashInfer itself pins
+# (``requirements.txt`` / the ``cu12``/``cu13`` extras in ``pyproject.toml``),
+# and the two are not in conflict: the pin says which DSL a
+# ``pip install flashinfer-python`` brings along, while the floor says which
+# DSL the shipped kernel must still compile under.  Those differ because this
+# op is consumed from serving stacks that resolve the DSL themselves -- the
+# vLLM nightly image the end-to-end arms of this work ran in downgrades to
+# 4.5.2 (vLLM's own pin) after FlashInfer is installed, and the DGX/pt2605
+# containers ship 4.5.0.  So "the pin is 4.7.0" is not a licence to use a 4.6+
+# primitive here.
+#
+# Authoritative statement of the floor for this package: this constant plus
+# PORTABLE_CUTE_MATH_PRIMITIVES below.  Raising it is a deliberate act -- edit
+# both, and say so in ``flashinfer/gdn_kernels/experimental/README.md``.
+CUTE_DSL_RUNTIME_FLOOR = (4, 5)
+
+# The ``cute.math`` surface of nvidia-cutlass-dsl 4.5.x.  4.5 ships a
+# hand-written ``cute/math.py`` exporting exactly these nineteen names; 4.6
+# replaced it with a re-export of ``cutlass._mlir_helpers.math``, which
+# exports 54 (``max``, ``min``, ``clamp``, ``log1p``, ``fma`` ... ).
 #
 # That difference is a deployment trap, not a style question: a primitive
 # added in 4.6 resolves fine on a dev box or in the kernel-benchmark image
@@ -321,6 +342,33 @@ def _matched_rows(inputs: dict):
     return specialized_gdn.match_gdn_fused_decode_signature(
         signature, inputs["hidden_states"].device
     )
+
+
+def _make_impls_look_cold(monkeypatch) -> tuple:
+    """Present both impls as freshly imported, undoably.
+
+    Returns ``(cuda_module, cutedsl_module_or_None)``.
+
+    The CUDA impl memoizes its loaded JIT module in a module-level
+    ``functools.cache``.  Calling ``_get_module.cache_clear()`` would empty
+    that PROCESS-GLOBAL memo, and monkeypatch cannot put the entry back at
+    teardown -- so every later test (and every later call in the session)
+    pays a module reload, and a test that happens to assert on residency
+    inherits whichever order pytest chose.  Swapping in a fresh cache over
+    the same underlying function is equivalent for the test and is undone
+    automatically, because monkeypatch restores the attribute itself.
+    """
+    cuda = _impl(_CUDA_IMPL)
+    monkeypatch.setattr(
+        cuda, "_get_module", functools.cache(cuda._get_module.__wrapped__)
+    )
+    monkeypatch.setattr(cuda, "_barrier_cache", {})
+    monkeypatch.setattr(cuda, "_scratch_cache", {})
+    cutedsl = specialized_gdn._load_impl(_CUTEDSL_IMPL)
+    if cutedsl is not None:
+        monkeypatch.setattr(cutedsl, "_compiled", {})
+        monkeypatch.setattr(cutedsl, "_workspace_cache", {})
+    return cuda, cutedsl
 
 
 @pytest.fixture(autouse=True)
@@ -896,13 +944,7 @@ def test_graph_capture_with_cold_caches_bakes_composable(monkeypatch):
     seed = 20260713
 
     # Make both impls look cold without touching the real caches.
-    cuda = _impl(_CUDA_IMPL)
-    cuda._get_module.cache_clear()
-    monkeypatch.setattr(cuda, "_barrier_cache", {})
-    cutedsl = specialized_gdn._load_impl(_CUTEDSL_IMPL)
-    if cutedsl is not None:
-        monkeypatch.setattr(cutedsl, "_compiled", {})
-        monkeypatch.setattr(cutedsl, "_workspace_cache", {})
+    cuda, cutedsl = _make_impls_look_cold(monkeypatch)
 
     calls = {"fallback": 0}
     real_fallback = gfd._gdn_fused_decode_step_fallback
@@ -961,9 +1003,7 @@ def test_capture_never_compiles_a_cold_impl(monkeypatch):
     context is not disturbed by an aborted real capture.
     """
     _skip_if_no_specialized()
-    cuda = _impl(_CUDA_IMPL)
-    cuda._get_module.cache_clear()
-    monkeypatch.setattr(cuda, "_barrier_cache", {})
+    cuda, _ = _make_impls_look_cold(monkeypatch)
     _restrict_registry_to(monkeypatch, _CUDA_IMPL)
     inputs = _make_inputs(1, padded_pool=False, seed=29)
     assert _matched_rows(inputs), "the geometry must be registered for this test"
@@ -1042,13 +1082,52 @@ def test_portable_cute_math_primitives_exist_in_the_installed_dsl():
     Guards the other direction -- a future DSL that drops one of these would
     otherwise leave the allow-list quietly lying.
     """
-    cute = pytest.importorskip(
-        "cutlass.cute", reason="nvidia-cutlass-dsl not installed"
+    # Import the SUBMODULE, not the package: ``cutlass.cute.math`` is only an
+    # attribute of ``cutlass.cute`` because that package happens to import it
+    # eagerly today.  Asking for the submodule by name is what actually pins
+    # its contents; the attribute spelling the kernel uses is then checked to
+    # resolve to the same module, so both halves of the assumption are tested.
+    cute_math = pytest.importorskip(
+        "cutlass.cute.math", reason="nvidia-cutlass-dsl not installed"
+    )
+    cute = importlib.import_module("cutlass.cute")
+    assert getattr(cute, "math", None) is cute_math, (
+        "the kernel reaches these primitives as cute.math.<name>, so "
+        "cutlass.cute must expose the math submodule as an attribute"
     )
     missing = sorted(
-        name for name in PORTABLE_CUTE_MATH_PRIMITIVES if not hasattr(cute.math, name)
+        name for name in PORTABLE_CUTE_MATH_PRIMITIVES if not hasattr(cute_math, name)
     )
     assert not missing, f"installed cute.math is missing {missing}"
+
+
+def test_the_documented_dsl_floor_is_below_the_repo_pin():
+    """The DSL floor this package targets and the version the repo installs
+    must tell one story.
+
+    ``requirements.txt`` pins the nvidia-cutlass-dsl a FlashInfer install
+    brings along; ``CUTE_DSL_RUNTIME_FLOOR`` is the oldest release the shipped
+    CuTe-DSL kernel must still compile under, because serving stacks resolve
+    the DSL themselves and routinely pin older (vLLM's image downgrades to
+    4.5.2).  The floor therefore has to stay at or below the pin -- a floor
+    ABOVE it would mean the repo's own CI never exercises the version the
+    kernel claims to support, and a floor equal to it would mean the
+    portability allow-list can be widened.  Cheap, needs nothing installed.
+    """
+    path = pathlib.Path(__file__).resolve().parents[2] / "requirements.txt"
+    if not path.is_file():
+        pytest.skip("requirements.txt is only present in a source checkout")
+    requirements = path.read_text(encoding="utf-8")
+    match = re.search(
+        r"^nvidia-cutlass-dsl\s*==\s*(\d+)\.(\d+)", requirements, re.MULTILINE
+    )
+    assert match, "requirements.txt no longer pins nvidia-cutlass-dsl with =="
+    pinned = (int(match.group(1)), int(match.group(2)))
+    assert pinned >= CUTE_DSL_RUNTIME_FLOOR, (
+        f"the CuTe-DSL impl documents a floor of {CUTE_DSL_RUNTIME_FLOOR} but "
+        f"the repo pins {pinned}; lower the floor or raise the pin, and update "
+        "PORTABLE_CUTE_MATH_PRIMITIVES to match whichever moved"
+    )
 
 
 def _bare_current_stream_calls(path: pathlib.Path) -> list:

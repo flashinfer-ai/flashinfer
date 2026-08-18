@@ -12,9 +12,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-"""
 
-"""
 Fused GDN Decode Step - API Layer
 =================================
 
@@ -140,7 +138,10 @@ def _gdn_fused_decode_step_fallback(
     use_qk_l2norm: bool,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Composable torch implementation (any CUDA arch); pools update in place."""
+    """Composable torch implementation (any CUDA arch); pools update in place.
+
+    ``scale`` follows the public op: ``None`` or ``0.0`` means ``1/sqrt(D)``.
+    """
     B = hidden_states.shape[0]
     hv = A_log.shape[0]
     qkv_dim = mixed_qkv.shape[1]
@@ -250,7 +251,11 @@ def gdn_fused_decode_step(
     dt_bias : torch.Tensor
         Decay bias of shape ``[HV]``, bfloat16.
     scale : float, optional
-        Query scale; defaults to ``1/sqrt(D)`` when ``None``.
+        Query scale. ``None`` **and** ``0.0`` both select the default
+        ``1/sqrt(D)``: a zero scale would make the whole attention output
+        zero, so it is treated as "unset" rather than honoured (frameworks
+        that keep the scale in a config default it to 0). Pass an explicit
+        non-zero value to override.
     ssm_state : torch.Tensor
         Paged fp32 recurrent-state pool of shape ``[P, HV, V, K]`` (V-major /
         K-last), row stride may be padded (``stride(0) >= HV*V*K``). Updated

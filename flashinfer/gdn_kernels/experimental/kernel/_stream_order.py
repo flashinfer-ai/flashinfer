@@ -35,9 +35,24 @@ def order_after_previous_stream(
 
     Skipped during capture: ``torch.cuda.graph`` already forks the capture
     stream from the caller's stream, and touching another stream mid-capture
-    is illegal.  NOT covered, and a caller-side requirement: two *replays* of
-    captured graphs running concurrently on different streams share this
-    state (as they share the caller's state pools).
+    is illegal.
+
+    What this covers is ONE host thread switching streams, which is the
+    reachable case.  Two things are deliberately NOT covered and remain
+    caller-side serialization requirements, exactly as the in-place conv/ssm
+    state pools already are:
+
+    * two host threads issuing calls for the same device concurrently -- the
+      event record here and the launch it protects are not one atomic action,
+      so a second thread can interleave between them and both calls then
+      write the same shared buffers;
+    * two *replays* of captured graphs running concurrently on different
+      streams.
+
+    Keying the shared state by stream instead of ordering it would fix
+    neither, and would cost the CUDA-graph contract: ``torch.cuda.graph``
+    captures on a fresh side stream, so a stream-keyed cache is always cold
+    at capture time and ``ready_for_graph_capture`` would decline.
     """
     if torch.cuda.is_current_stream_capturing():
         return

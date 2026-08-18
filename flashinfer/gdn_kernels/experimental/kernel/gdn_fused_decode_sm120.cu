@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+#include <atomic>
+
 #include "tvm_ffi_utils.h"
 
 namespace {
@@ -64,6 +66,22 @@ __device__ __forceinline__ float warp_reduce(float v) {
 // co-resident (grid capped to occupancy), and at most one kernel using the
 // buffer in flight (single-stream use; the in-place state pools already
 // require this).
+//
+// Memory ordering: the barrier is release/acquire, not just a flag.
+//  - Release: the block that completes the count fences before bumping the
+//    generation, so every pre-barrier write of every block that arrived
+//    before it is visible at the point the generation changes.
+//  - Acquire: a block leaving the barrier fences AGAIN before its
+//    post-barrier reads. Observing the new generation through a volatile
+//    (L2-serviced) load only orders that one location; without the leaving
+//    fence, a subsequent ordinary load of ba_part / conv_out -- written by a
+//    *different* block, i.e. potentially a different SM -- may be serviced
+//    from a stale non-coherent L1 line or be hoisted by the compiler above
+//    the spin. This mirrors cooperative_groups' own grid barrier, which
+//    calls its `bar_flush()` (a __threadfence) on the way out for exactly
+//    this reason. The fence is executed by the same thread that spun and is
+//    followed by __syncthreads(), which propagates the ordering to the rest
+//    of the block.
 __device__ __forceinline__ void grid_barrier(volatile unsigned* barrier, int nblocks) {
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -78,6 +96,7 @@ __device__ __forceinline__ void grid_barrier(volatile unsigned* barrier, int nbl
       while (barrier[1] == gen) { /* spin */
       }
     }
+    __threadfence();  // acquire: peers' pre-barrier writes before our reads
   }
   __syncthreads();
 }
@@ -346,26 +365,45 @@ void gdn_fused_decode_launch(const void* hidden, const void* w_ba, const void* m
                              long conv_stride_p, long conv_stride_c, long conv_stride_t, int B,
                              cudaStream_t stream) {
   constexpr int kBlock = 256;
+  constexpr int kWarpsPerBlock = kBlock / 32;
   constexpr int kMaxDevices = 64;
+  // Per-device launch-geometry cache. num_sm[dev] doubles as the entry's
+  // COMPLETION flag and is therefore published LAST, with release ordering:
+  // a second launcher thread that sees it non-zero must also see the two
+  // occupancy values. Writing it first (and the occupancies after) would let
+  // such a thread read blocks_per_sm_*[dev] == 0, collapse `cap` to 0 and run
+  // the persistent kernel on a single block -- still correct (both the
+  // barrier and the delta loop are grid-size agnostic) but orders of
+  // magnitude slower, and only on the unlucky interleaving. Two threads
+  // filling the entry concurrently is harmless: the queries are pure and
+  // return identical values.
   static int blocks_per_sm_b1[kMaxDevices] = {0};
   static int blocks_per_sm_gen[kMaxDevices] = {0};
-  static int num_sm[kMaxDevices] = {0};
+  static std::atomic<int> num_sm[kMaxDevices] = {};
   int dev = 0;
   cudaGetDevice(&dev);
   if (dev < 0 || dev >= kMaxDevices) dev = 0;
-  if (num_sm[dev] == 0) {
-    cudaDeviceGetAttribute(&num_sm[dev], cudaDevAttrMultiProcessorCount, dev);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_b1[dev],
-                                                  gdn_fused_decode_kernel<true>, kBlock, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_gen[dev],
-                                                  gdn_fused_decode_kernel<false>, kBlock, 0);
+  int sm_count = num_sm[dev].load(std::memory_order_acquire);
+  if (sm_count == 0) {
+    int occ_b1 = 0;
+    int occ_gen = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_b1, gdn_fused_decode_kernel<true>, kBlock,
+                                                  0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_gen, gdn_fused_decode_kernel<false>, kBlock,
+                                                  0);
+    blocks_per_sm_b1[dev] = occ_b1;
+    blocks_per_sm_gen[dev] = occ_gen;
+    num_sm[dev].store(sm_count, std::memory_order_release);
   }
   // Grid must be <= resident capacity (persistent barrier needs co-residency),
-  // but no larger than needed. Delta single-pass needs ceil(rows/ROWS_PER_WARP/8) blocks.
+  // but no larger than needed. Delta single-pass needs
+  // ceil(rows / ROWS_PER_WARP / warps-per-block) blocks -- derived from kBlock
+  // so the two cannot drift apart.
   long rows = (long)B * HV * D;
   long warps_needed = (rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-  int delta_blocks = (int)((warps_needed + 7) / 8);
-  int cap = (B == 1 ? blocks_per_sm_b1[dev] : blocks_per_sm_gen[dev]) * num_sm[dev];
+  int delta_blocks = (int)((warps_needed + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  int cap = (B == 1 ? blocks_per_sm_b1[dev] : blocks_per_sm_gen[dev]) * sm_count;
   int grid = delta_blocks < cap ? delta_blocks : cap;
   if (grid < 1) grid = 1;
   // No per-call barrier reset: the barrier is zero-initialized at allocation
@@ -488,8 +526,23 @@ void gdn_fused_decode(TensorView hidden_states, TensorView w_ba, TensorView mixe
   TVM_FFI_ICHECK_EQ(ssm_state.stride(2), D);
   TVM_FFI_ICHECK_EQ(ssm_state.stride(1), (long)D * D);
   TVM_FFI_ICHECK_GE(ssm_state.stride(0), (long)HV * D * D);
+  // The delta phase loads and stores whole state rows as float4, so every row
+  // base -- idx*stride(0) + h*D*D + v*D -- must be 16B aligned. D*D and v*D
+  // already are; a padded page stride is the only term that can break it, and
+  // an odd pad would fault rather than degrade.
+  TVM_FFI_ICHECK_EQ(ssm_state.stride(0) % 4, 0)
+      << "ssm_state page stride must be a multiple of 4 floats (float4 row access)";
   TVM_FFI_ICHECK_EQ(output.stride(3), 1);
   TVM_FFI_ICHECK_EQ(output.stride(2), D);
+  // The kernel addresses output as one dense [B, 1, HV, D] block
+  // (output[((b*HV) + h)*D + v]), so the batch stride is not free either: a
+  // destination that is dense per row but strided across the batch (a slice of
+  // a wider buffer) would be written at the wrong offsets rather than
+  // rejected. stride(1) is deliberately NOT checked -- that axis has extent 1,
+  // so the kernel never uses its stride and torch leaves it unconstrained on
+  // otherwise contiguous tensors; checking it could reject a valid buffer, and
+  // a rejection here latches the whole impl off.
+  TVM_FFI_ICHECK_EQ(output.stride(0), (long)HV * D);
 
   const long state_stride_0 = static_cast<long>(ssm_state.stride(0));
   const long qkv_stride = static_cast<long>(mixed_qkv.stride(0));
