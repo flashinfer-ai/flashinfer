@@ -180,6 +180,37 @@ def _time_graph(fn, po: torch.Tensor, ps: torch.Tensor) -> float:
     return statistics.median(samples)
 
 
+def _force_posix_mnnvl_if_fabric_blocked() -> str:
+    """Use POSIX-fd VMM when FABRIC cuMemCreate is denied.
+
+    GB200 can report fabric support (NVML cluster UUID + HANDLE_TYPE_FABRIC)
+    while ``cuMemCreate(..., CU_MEM_HANDLE_TYPE_FABRIC)`` still returns
+    ``CUDA_ERROR_NOT_PERMITTED`` — typically IMEX is not running in this
+    container. Intra-node POSIX-fd export is the existing MnnvlMemory
+    fallback and keeps the same ``decode_cp_a2a_alltoall`` kernel.
+    """
+    from cuda.bindings import driver as cuda
+    from flashinfer.comm.mnnvl import MnnvlMemory
+
+    if MnnvlMemory._fabric_supported is False:
+        return "posix"
+
+    loc = cuda.CUmemLocation()
+    loc.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    loc.id = int(torch.cuda.current_device())
+    prop = cuda.CUmemAllocationProp()
+    prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location = loc
+    prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    status, handle = cuda.cuMemCreate(2 << 20, prop, 0)
+    if int(status) == 0:
+        cuda.cuMemRelease(handle)
+        return "fabric"
+
+    MnnvlMemory._fabric_supported = False
+    return f"posix (fabric cuMemCreate={status})"
+
+
 class DcpA2aBaseline:
     """Current FlashInfer decode_cp_a2a_alltoall + local merge."""
 
@@ -193,12 +224,13 @@ class DcpA2aBaseline:
         )
         from flashinfer.comm.comm_backend import TorchDistBackend
         from flashinfer.comm.mapping import Mapping
-        from flashinfer.comm.mnnvl import MnnvlConfig, MnnvlMemory
+        from flashinfer.comm.mnnvl import MnnvlMemory
         import pynvml
 
         pynvml.nvmlInit()
         if not MnnvlMemory.supports_mnnvl():
             raise RuntimeError("MNNVL not supported")
+        self.mnnvl_handle_path = _force_posix_mnnvl_if_fabric_blocked()
         self.decode_cp_a2a_alltoall = decode_cp_a2a_alltoall
         self.group = group
         self.world = group.size()
@@ -214,10 +246,11 @@ class DcpA2aBaseline:
             tp_size=1,
             pp_size=1,
         )
+        # World comm, not set_comm_from_config: that Split uses
+        # color=pp_rank*cp_size+cp_rank and would isolate each CP rank.
         MnnvlMemory.initialize()
-        self.workspace = decode_cp_a2a_allocate_mnnvl_workspace(
-            mapping, mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(group))
-        )
+        MnnvlMemory.comm = TorchDistBackend(group)
+        self.workspace = decode_cp_a2a_allocate_mnnvl_workspace(mapping)
         decode_cp_a2a_init_workspace(self.workspace, self.rank, self.world)
         torch.cuda.synchronize()
         dist.barrier(group)
@@ -315,6 +348,8 @@ def main() -> None:
         lambda: DcpA2aBaseline(group, max_tokens, h_local, HEAD_DIM, DTYPE),
         rank,
     )
+    if rank == 0 and fi_a2a is not None:
+        print(f"fi_a2a handle path: {fi_a2a.mnnvl_handle_path}")
 
     for t in TOKEN_ROWS:
         po = torch.randn(t, TOTAL_HEADS, HEAD_DIM, dtype=DTYPE, device=device)
