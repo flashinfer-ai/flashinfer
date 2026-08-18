@@ -60,7 +60,7 @@ pytestmark = [
     pytest.mark.skipif(
         not _HAS_QUACK,
         reason="VSA SM100 backend requires the quack package "
-        "(pip install quack-kernels==0.6.4)",
+        "(pip install --no-deps quack-kernels==0.6.4)",
     ),
     pytest.mark.skipif(
         torch.cuda.is_available()

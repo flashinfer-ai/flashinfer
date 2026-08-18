@@ -964,9 +964,6 @@ def _build_decode_gen_schedule(
         )
     page_offsets_task = None
     if use_paged_kv:
-        page_offsets_warp_idx = (
-            cfg.clc_padding_warp_idx if use_clc_dynamic else cfg.page_offsets_warp_idx
-        )
         if split_head_dim_page_offsets_kv:
             page_offsets_task = create_page_offsets_task_split_kv(
                 smem_page_offsets,
@@ -975,7 +972,7 @@ def _build_decode_gen_schedule(
                 cfg,
                 domain=load_domain,
                 domain_bias=0,
-                warp_idx=page_offsets_warp_idx,
+                warp_idx=cfg.page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
                 paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
                 **task_runtime_kwargs,
@@ -992,7 +989,7 @@ def _build_decode_gen_schedule(
                 cfg,
                 domain=load_domain,
                 domain_bias=0,
-                warp_idx=page_offsets_warp_idx,
+                warp_idx=cfg.page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
                 paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
                 **task_runtime_kwargs,
@@ -1100,53 +1097,40 @@ def _build_decode_gen_schedule(
             domain_bias=0,
             **task_runtime_kwargs,
         )
-    padding_task = None
-    if not (use_paged_kv and use_clc_dynamic):
-        padding_task = create_padding_task(
+    padding_warp_ranges = (
+        (cfg.wg0_padding_warp_idx, cfg.wg0_padding_num_warps),
+        (cfg.wg1_padding_warp_idx, cfg.wg1_padding_num_warps),
+        (cfg.wg2_padding_warp_idx, cfg.wg2_padding_num_warps),
+        (cfg.wg3_padding_warp_idx, cfg.wg3_padding_num_warps),
+    )
+    padding_tasks = [
+        create_padding_task(
             cfg,
             work_queue,
-            warp_idx=(
-                cfg.page_offsets_warp_idx + cfg.page_offsets_num_warps
-                if use_paged_kv
-                else (cfg.clc_padding_warp_idx if use_clc_dynamic else None)
-            ),
-            num_warps=(
-                1
-                if use_paged_kv
-                else (cfg.clc_padding_num_warps if use_clc_dynamic else None)
-            ),
+            warp_idx=warp_idx,
+            num_warps=num_warps,
         )
+        for warp_idx, num_warps in padding_warp_ranges
+        if num_warps > 0
+    ]
     scheduler_task = None
     if use_clc_dynamic:
         scheduler_task = create_scheduler_task(work_queue, schedule_token_throttle, cfg)
-    clc_tail_padding_task = None
-    if use_clc_dynamic and cfg.clc_tail_padding_num_warps > 0:
-        clc_tail_padding_task = create_padding_task(
-            cfg,
-            work_queue,
-            warp_idx=cfg.clc_tail_padding_warp_idx,
-            num_warps=cfg.clc_tail_padding_num_warps,
-        )
 
     task_list = []
     if page_offsets_task is not None:
         task_list.append(page_offsets_task)
     if use_one_inst_qkv and not use_clc_dynamic:
         task_list.extend([load_task, correction_task, mma_task])
-        if padding_task is not None:
-            task_list.append(padding_task)
         task_list.append(softmax0_task)
     else:
         task_list.extend([load_task, softmax0_task])
         if softmax1_task is not None:
             task_list.append(softmax1_task)
         task_list.extend([correction_task, mma_task])
-        if padding_task is not None:
-            task_list.append(padding_task)
-    if clc_tail_padding_task is not None:
-        task_list.append(clc_tail_padding_task)
     if scheduler_task is not None:
         task_list.append(scheduler_task)
+    task_list.extend(padding_tasks)
     # ------------------------------------------------------------------
     # Resource dependency graph
     # ------------------------------------------------------------------
