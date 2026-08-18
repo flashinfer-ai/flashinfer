@@ -716,6 +716,13 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
         wheels.append(f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}")
     if not wheels:
         return
+    if _no_pip_installs():
+        # Reachable only if the wheel was already present, since the pre-flight
+        # probe needs it to import before anything is built.
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; runtime wheels left as installed"
+        )
+        return
 
     print(f"[BUILD_NVEP] installing runtime wheels --no-deps: {' '.join(wheels)}")
 
@@ -754,8 +761,9 @@ def _compile_deps_installed(specs) -> bool:
     """True when every spec is already satisfied. False on any doubt, so that an
     unreadable environment still reaches the install below."""
     try:
-        from importlib.metadata import version
-        from packaging.requirements import Requirement
+        from importlib.metadata import PackageNotFoundError, version
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.version import InvalidVersion
     except ImportError:
         return False
 
@@ -764,7 +772,7 @@ def _compile_deps_installed(specs) -> bool:
             req = Requirement(spec)
             if not req.specifier.contains(version(req.name), prereleases=True):
                 return False
-        except Exception:
+        except (PackageNotFoundError, InvalidRequirement, InvalidVersion):
             return False
     return True
 

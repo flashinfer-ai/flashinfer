@@ -23,8 +23,8 @@ def parse_requirements(path):
         with open(path, encoding="utf-8") as handle:
             lines = handle.read().splitlines()
     except OSError as exc:
-        print(f"skipping {path}: {exc}", file=sys.stderr)
-        return requirements
+        print(f"cannot read {path}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
     for raw in lines:
         line = raw.split("#", 1)[0].strip()
