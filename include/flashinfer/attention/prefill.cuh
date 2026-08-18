@@ -39,6 +39,7 @@
 #include "../utils.cuh"
 #include "cascade.cuh"
 #include "mask.cuh"
+#include "prefill_occupancy.cuh"
 #include "variants.cuh"
 namespace flashinfer {
 
@@ -51,49 +52,15 @@ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 DEFINE_HAS_MEMBER(maybe_k_cache_sf)
 DEFINE_HAS_MEMBER(maybe_v_cache_sf)
 
-// Type trait to detect packed NVFP4 KV cache types (__nv_fp4x2_e2m1 stores 2 FP4 per byte).
-template <typename T>
-struct is_fp4_type : std::false_type {};
-#if CUDA_VERSION >= 12080
-template <>
-struct is_fp4_type<__nv_fp4x2_e2m1> : std::true_type {};
-#endif
-template <typename T>
-inline constexpr bool is_fp4_type_v = is_fp4_type<T>::value;
+// is_fp4_type / is_fp4_type_v, NVFP4_SF_VEC_SIZE and the get_num_{warps_q,warps_kv,mma_q}
+// tile-shape helpers now live in prefill_occupancy.cuh, which the prefill planner
+// also includes so that both sides derive the CTA shape from one definition.
 
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
 constexpr uint32_t WARP_SIZE = 32;
-// Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
-constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
-
-constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
-  if (cta_tile_q == 32) {
-    return 1;  // HEAD_DIM_VO >= 512
-  }
-  if (cta_tile_q > 16) {
-    return 4;
-  } else {
-    return 1;
-  }
-}
-
-constexpr uint32_t get_num_warps_kv(const uint32_t cta_tile_kv) {
-  return 4 / get_num_warps_q(cta_tile_kv);
-}
-
-constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
-  if (cta_tile_q == 32) {
-    return 2;  // HEAD_DIM_VO >= 512
-  }
-  if (cta_tile_q > 64) {
-    return 2;
-  } else {
-    return 1;
-  }
-}
 
 // NVFP4 KV-cache scale-factor staging (one UE4M3 byte per NVFP4_SF_VEC_SIZE elements), used only
 // when DTypeKV is FP4. Kept as an empty base for other dtypes so it adds 0 bytes via EBO instead
@@ -4212,6 +4179,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // minimum *valid* tile rather than NUM_MMA_KV=1.
   constexpr uint32_t kMinValidMmaKV =
       (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  // PrefillPlanImpl budgets its split-KV grid against FA2PrefillCtaSmemLowerBound
+  // because it has none of the template parameters above in scope. That is only
+  // sound while the bound never exceeds what this launcher actually requires;
+  // pin it here for every instantiation the build produces.
+  static_assert(FA2PrefillCtaSmemLowerBound(CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
+                                            MakeFA2PrefillDTypeInfo<DTypeQ, DTypeKV>()) <=
+                    kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV,
+                "the planner's shared-memory lower bound exceeds this kernel's requirement");
   const int num_ctas_per_sm =
       max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   // The occupancy budget (max_smem_per_sm / num_ctas_per_sm) can exceed the
@@ -4411,6 +4386,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // minimum *valid* tile rather than NUM_MMA_KV=1.
   constexpr uint32_t kMinValidMmaKV =
       (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  // See the matching static_assert in BatchPrefillWithRaggedKVCacheDispatched.
+  static_assert(FA2PrefillCtaSmemLowerBound(CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
+                                            MakeFA2PrefillDTypeInfo<DTypeQ, DTypeKV>()) <=
+                    kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV,
+                "the planner's shared-memory lower bound exceeds this kernel's requirement");
   const int num_ctas_per_sm =
       max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   const int max_smem_per_threadblock =
