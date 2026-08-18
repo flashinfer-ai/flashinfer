@@ -650,6 +650,28 @@ def cute_bmm_fp8_can_implement(
     if m % 16 != 0 or n % 16 != 0 or k % 16 != 0:
         return False
 
+    # Alignment alone is not sufficient: the SM107 tactic space does not cover
+    # every aligned shape (small m/n in particular).  bmm_fp8_cute_dsl raises
+    # ValueError when no config is valid, so report False here instead and let
+    # the caller fall back to another backend.
+    # Derive the arguments exactly as bmm_fp8_cute_dsl does, so this probe
+    # cannot disagree with the run path.
+    try:
+        if not get_valid_sm107_configs(
+            m,
+            n,
+            k,
+            batch,
+            torch_dtype_to_cutlass(a.dtype),
+            torch_dtype_to_cutlass(dtype),
+            _detect_major_dim(a, ("m", "k")),
+            _detect_major_dim(b, ("k", "n")),
+            "n",
+        ):
+            return False
+    except Exception:
+        return False
+
     return True
 
 

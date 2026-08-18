@@ -52,10 +52,19 @@ fi
 # and installed here for CI only. The blk128 backend supports SM100/SM103, so we
 # install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
 # The correct PyPI distribution name is quack-kernels (top-level package: quack).
-SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
-if [ "${SM_MAJOR}" = "10" ]; then
+#
+# Match on the full capability, not just the major version: SM107 (Rubin) is
+# also major 10, but the blk128 backend is SM100/SM103 only (see
+# flashinfer/cute_dsl/sparse/sm100_blk128/, and the (10,0)/(10,3) allowlist in
+# tests/attention/test_vsa_block_sparse.py), so those tests skip on Rubin.
+# Installing quack there is not merely useless: quack-kernels 0.6.4 requires
+# nvidia-cutlass-dsl==4.6.2, and pip honours that pin by downgrading the DSL
+# for the whole session, removing cutlass.utils.rubin_helpers and the sm_107a
+# Arch member that every SM107 path depends on.
+SM_CAP=$(python -c "import torch; print('%d.%d' % torch.cuda.get_device_capability())" 2>/dev/null || echo "")
+if [ "${SM_CAP}" = "10.0" ] || [ "${SM_CAP}" = "10.3" ]; then
   echo "========================================"
-  echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "Detected SM${SM_CAP} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
   echo "========================================"
   pip install "quack-kernels==0.6.4"
   echo "quack-kernels install complete."
