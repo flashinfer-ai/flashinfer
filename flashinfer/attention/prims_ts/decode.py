@@ -1884,6 +1884,39 @@ def prims_ts_batch_decode_with_kv_cache(
     ``window_left=-1`` disables the left window; a
     non-negative value requires causal masking and includes the current token.
     No backend fallback or scheduling knob is exposed.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed or packed query tensor.
+    kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Combined or separate paged K/V storage.
+    workspace_buffer : torch.Tensor
+        Zero-initialized caller-owned byte workspace for this semantic key.
+    paged_kv_indptr, paged_kv_indices : torch.Tensor
+        Native CSR row offsets and physical page IDs.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths for each request.
+    max_seq_len : int
+        Static maximum K/V length used for policy selection and JIT caching.
+    seq_len_q : int
+        Fixed query length when ``qo_indptr`` is omitted.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    bmm1_scale, bmm2_scale : float, optional
+        QK and value/output scaling factors.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    out_dtype : torch.dtype, optional
+        Output dtype; defaults to ``out.dtype`` or the query dtype.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    kv_layout : {"HND"}
+        Layout of the paged K/V cache.
     """
 
     _validate_layout(kv_layout)
@@ -2036,6 +2069,13 @@ class BatchDecodePagedTSWrapper:
 
     @flashinfer_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
+        """Initialize an unplanned paged-decode wrapper.
+
+        Parameters
+        ----------
+        kv_layout : {"HND"}
+            Layout of the paged K/V cache.
+        """
         _validate_layout(kv_layout)
         self._kv_layout = kv_layout
         self._planned = False
@@ -2098,6 +2138,27 @@ class BatchDecodePagedTSWrapper:
         be mutated concurrently with a run or replay that reads it. One wrapper
         instance supports only one in-flight run or captured-graph replay because
         it owns mutable scratch; use separate wrappers for concurrent execution.
+
+        Parameters
+        ----------
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+            Native CSR page metadata retained by the plan.
+        num_qo_heads, num_kv_heads, head_dim, page_size : int
+            Attention head geometry and K/V page size.
+        seq_len_q : int
+            Fixed query length when ``qo_indptr`` is omitted.
+        qo_indptr : torch.Tensor, optional
+            Cumulative query offsets selecting packed-query mode.
+        max_seq_len_q : int, optional
+            Static packed-query length bound.
+        q_data_type, kv_data_type, o_data_type : torch.dtype
+            Query, K/V, and output dtypes used to compile the plan.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        max_kv_len : int, optional
+            Static K/V length bound; defaults to the metadata maximum.
         """
 
         _validate_mask(mask_type)
@@ -2321,6 +2382,17 @@ class BatchDecodePagedTSWrapper:
         keep the final offset equal to the planned packed tensor extent. For a
         causal plan, each updated delta must also remain no greater than the
         corresponding planned K/V length.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Runtime fixed or packed query tensor matching the plan.
+        paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+            Runtime combined or separate paged K/V storage.
+        bmm1_scale, bmm2_scale : float, optional
+            QK and value/output scaling factors.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
         """
 
         if not self._planned:
@@ -2401,6 +2473,33 @@ def batch_decode_with_paged_kv_cache(
     ``[B, SQ, Hq, D]``. Providing cumulative ``qo_indptr`` selects packed
     ``[total_q, Hq, D]`` query/output; the wrapper derives ``max_seq_len_q``
     once when it is omitted. No transpose is hidden here.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Fixed or packed query tensor.
+    paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Combined or separate paged K/V storage.
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+        Native CSR page metadata.
+    seq_len_q : int
+        Fixed query length when ``qo_indptr`` is omitted.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    kv_layout : {"HND"}
+        Layout of the paged K/V cache.
+    bmm1_scale, bmm2_scale : float, optional
+        QK and value/output scaling factors.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    out_dtype : torch.dtype, optional
+        Output dtype; defaults to ``out.dtype`` or the query dtype.
     """
 
     _validate_layout(kv_layout)
