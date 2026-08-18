@@ -37,6 +37,13 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
+
+The minimum Python version used by CI and build tooling is defined in
+`.python-version`. CI Docker images use a stable Conda environment name and
+derive their interpreter and site-packages paths from that file. When raising
+the minimum, also update `project.requires-python` and `tool.mypy.python_version`
+in `pyproject.toml`.
 
 ## Quick Start for Development
 
@@ -539,6 +546,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_NO_DOWNLOAD` | unset | `flashinfer/jit/cubin_loader.py` | Hard-fail if a cubin is missing locally instead of attempting to download. Useful in CI / locked-down environments. |
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
+| `FLASHINFER_DISABLE_TINYGEMM2_SM100` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103 `tinygemm2` backend and force the dispatcher to fall back to the legacy implementation. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 
 ##### API Dump / Logging Extensions
 
@@ -570,8 +578,11 @@ Used by `flashinfer.trace` / `fi_trace`.
 |----------|---------|---------|--------|
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
+| `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
+| `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
 | `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
+| `FLASHINFER_CUTILE_AUTOTUNE_DISABLED` | `0` | `flashinfer/quantization/kernels/cutile/rope_quantize_fp8_cutile.py` | Non-zero skips exhaustive cuTile RoPE-FP8 tuning and uses the built-in token-count heuristic. |
 | `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k algorithm (otherwise the dispatcher chooses based on shape). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
@@ -579,6 +590,31 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
+
+##### Experimental Packed-KDA Decode Tuning
+
+These low-level overrides are for benchmarking and kernel bring-up. Production
+users should normally leave the batch-size policy at its defaults.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FLASHINFER_KDA_T1_FAST_PATH` | `1` | `0` disables routing eligible recurrent KDA T=1 calls to the packed CuTe-DSL decode kernel. |
+| `FLASHINFER_PACKED_KDA_TILE_V` | batch policy | Override the V-dimension tile width with a supported packed-KDA tile size. |
+| `FLASHINFER_PACKED_KDA_ILP` | batch policy | Override the number of rows processed per instruction-level-parallel group. |
+| `FLASHINFER_PACKED_KDA_THREADS` | batch policy | Override CTA threads; the value divided by 16 must select a valid group count. |
+| `FLASHINFER_PACKED_KDA_EVICT_FIRST` | batch policy | Set to `1` or `0` to override the policy's first-use cache-eviction hint. |
+| `FLASHINFER_PACKED_KDA_CHUNKR` | policy-derived | Override rows per staged state-pool chunk. |
+| `FLASHINFER_PACKED_KDA_STAGES` | batch policy | Override cp.async pipeline depth; use `0` for register prefetch or at least `2` for pipelining. |
+| `FLASHINFER_PACKED_KDA_NO_CPASYNC` | `0` | `1` forces the register-prefetch kernel instead of cp.async staging. |
+| `FLASHINFER_PACKED_KDA_PERSIST` | `0` | `1` enables the persistent-CTA schedule when alignment and pipeline constraints permit it. |
+| `FLASHINFER_PACKED_KDA_TMA` | `0` | `1` uses TMA state-pool reads when the staged kernel is active; mutually exclusive with bulk stores. |
+| `FLASHINFER_PACKED_KDA_BULK` | `0` | `1` uses bulk stores for an eligible staged kernel; mutually exclusive with TMA reads. |
+| `FLASHINFER_PACKED_KDA_PRIVRING` | `1` | `1` selects private-ring synchronization when neither TMA nor bulk-store mode is active. |
+| `FLASHINFER_PACKED_KDA_MAXRREG` | `0` | Override the generated kernel's maximum-register tuning hint (`0` leaves it unspecified). |
+| `FLASHINFER_PACKED_KDA_L2HINT` | `256` | Override the generated kernel's L2-prefetch-size hint. |
+| `FLASHINFER_PACKED_KDA_HPC` | `1` | Override heads combined per CTA for eligible staged whole-head tiles. |
+| `FLASHINFER_PACKED_KDA_L2POL` | `0` | Override the experimental L2 cache-policy selector. |
+| `FLASHINFER_PACKED_KDA_MINBLOCKS` | `0` | Override the generated kernel's minimum-blocks-per-SM launch-bound hint. |
 
 ## Development Workflow
 

@@ -1408,7 +1408,11 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+                alpha=(
+                    alpha_for_cute_dsl_mxfp4
+                    if backend in ("cute-dsl", "b12x")
+                    else alpha
+                ),
                 out_dtype=res_dtype,
                 block_size=16
                 if use_nvfp4
@@ -1446,7 +1450,9 @@ def testMmFp4(args):
             b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
             a_descale=input_inv_s,
             b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-            alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+            alpha=(
+                alpha_for_cute_dsl_mxfp4 if backend in ("cute-dsl", "b12x") else alpha
+            ),
             out_dtype=res_dtype,
             block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,
@@ -2080,6 +2086,7 @@ def testMmBf16(args):
         "tgv",
         "cublaslt",
         "tinygemm",
+        "cute-dsl",
         "auto",
     ]
     res = []
@@ -2153,6 +2160,7 @@ def testMmBf16(args):
             "cublaslt",
             "tinygemm",
             "cutile",
+            "cute-dsl",
             "auto",
         ]:
             return flashinfer.mm_bf16(
@@ -2172,6 +2180,7 @@ def testMmBf16(args):
         reference_output_base = torch.mm(a, b).to(out_dtype)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -2180,9 +2189,12 @@ def testMmBf16(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for mm_bf16: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(cur_backend, a, b, bias, use_pdl, out_dtype)
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -2208,8 +2220,16 @@ def testMmBf16(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Only add bias to reference when comparing against tgv backend
-                if tested_backends[i] == "tgv" and bias is not None:
+                if (
+                    tested_backends[i]
+                    in (
+                        "cudnn",
+                        "tgv",
+                        "tinygemm",
+                        "cute-dsl",
+                    )
+                    and bias is not None
+                ):
                     reference_output = reference_output_base + bias.unsqueeze(0).to(
                         out_dtype
                     )

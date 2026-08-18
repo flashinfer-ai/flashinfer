@@ -23,9 +23,10 @@ support for recurrent KDA prefill.  The stable public dispatcher remains in
 ``flashinfer.kda``.
 """
 
+import functools
 import math
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
@@ -35,11 +36,20 @@ if TYPE_CHECKING:
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
-_FLASH_KDA_BETA_TMA_MIN_HEADS = 8
+_FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
+_FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS = 128
+_FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR = 21
+_FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
+_FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR = 263
+_FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR = 250
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
+
+_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan], bool]
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -59,9 +69,13 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128")
+            for variant in ("m64", "m128", "m128_n16", "persistent_m128")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
+        self._packed_metadata_lock = threading.Lock()
+        self._packed_metadata_tensor: Optional[torch.Tensor] = None
+        self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
+        self._packed_metadata: Optional[_PackedTaskMetadata] = None
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
 
@@ -74,8 +88,10 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial
-    state, beta padding, and M64/M128 TMA descriptor storage for the lifetime
-    of the graph.
+    state, beta padding, and schedule-specific M64/M128-N32/M128-N16 TMA
+    descriptor storage for the lifetime of the graph. Persistent M128 is an
+    eager-only B200/GB200 route; explicit workspaces use direct M128 or M64 so graph
+    capture never synchronizes sequence lengths to construct host task bins.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -122,6 +138,47 @@ def _is_contiguous_cuda_tensor(
     )
 
 
+def _is_token_row_strided_cuda_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and tensor.device == device
+        and tensor.dtype == dtype
+        and tensor.ndim >= 2
+        and tensor.stride(-1) == 1
+        and tensor.stride(-2) >= tensor.shape[-1]
+    )
+
+
+def _is_state_pool_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    device: torch.device,
+    num_heads: int,
+) -> bool:
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and tensor.device == device
+        and tensor.dtype == torch.bfloat16
+        and tensor.ndim == 4
+        and tensor.shape[0] > 0
+        and tensor.data_ptr() % 16 == 0
+        and tuple(tensor.shape[1:])
+        == (num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+        and tensor.stride(-1) == 1
+        and tensor.stride(-2) == _FLASH_KDA_HEAD_DIM
+        and tensor.stride(-3) == _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        and tensor.stride(0) >= num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        and tensor.stride(0) * tensor.element_size() % 16 == 0
+    )
+
+
 def _flash_kda_prefill_is_eligible(
     *,
     q: torch.Tensor,
@@ -143,14 +200,16 @@ def _flash_kda_prefill_is_eligible(
     initial_state_source: Optional[torch.Tensor],
     initial_state_indices: Optional[torch.Tensor],
     beta_is_logit: bool,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
 ) -> bool:
     """Return whether the call exactly matches the frozen FlashKDA contract."""
 
     if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
         return False
     if (
-        ssm_state_indices is not None
-        or num_accepted_tokens is not None
+        num_accepted_tokens is not None
         or initial_state_source is not None
         or initial_state_indices is not None
     ):
@@ -190,9 +249,11 @@ def _flash_kda_prefill_is_eligible(
             or tensor.shape != q.shape
         ):
             return False
-    if not _is_contiguous_cuda_tensor(
+    if not _is_token_row_strided_cuda_tensor(
         beta, dtype=torch.bfloat16, device=q.device
     ) or beta.shape != (batch_size, total_or_fixed_tokens, num_heads):
+        return False
+    if batch_size > 1 and beta.stride(0) != total_or_fixed_tokens * beta.stride(1):
         return False
     if not _is_contiguous_cuda_tensor(
         A_log, dtype=torch.float32, device=q.device
@@ -221,16 +282,48 @@ def _flash_kda_prefill_is_eligible(
         if num_sequences <= 0 or total_or_fixed_tokens <= num_sequences:
             return False
 
-    if initial_state is not None:
-        if not _is_contiguous_cuda_tensor(
-            initial_state, dtype=torch.bfloat16, device=q.device
-        ) or initial_state.shape != (
-            num_sequences,
-            num_heads,
-            _FLASH_KDA_HEAD_DIM,
-            _FLASH_KDA_HEAD_DIM,
+    if ssm_state_indices is not None:
+        if (
+            initial_state is None
+            or not _is_contiguous_cuda_tensor(
+                ssm_state_indices, dtype=torch.int32, device=q.device
+            )
+            or ssm_state_indices.ndim != 1
+            or ssm_state_indices.numel() != num_sequences
         ):
             return False
+    if initial_state is not None:
+        if not _is_state_pool_tensor(
+            initial_state,
+            device=q.device,
+            num_heads=num_heads,
+        ):
+            return False
+        if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
+            return False
+    if (
+        checkpoint_every_n_tokens < 0
+        or checkpoint_every_n_tokens > torch.iinfo(torch.int32).max
+        or checkpoint_every_n_tokens % 32 != 0
+    ):
+        return False
+    if checkpoint_every_n_tokens:
+        if (
+            not _is_contiguous_cuda_tensor(
+                state_checkpoints, dtype=torch.bfloat16, device=q.device
+            )
+            or state_checkpoints.ndim != 4
+            or tuple(state_checkpoints.shape[1:])
+            != (num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+            or not _is_contiguous_cuda_tensor(
+                checkpoint_cu_starts, dtype=torch.int64, device=q.device
+            )
+            or checkpoint_cu_starts.ndim != 1
+            or checkpoint_cu_starts.numel() != num_sequences + 1
+        ):
+            return False
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        return False
     if output is not None:
         if (
             not _is_contiguous_cuda_tensor(
@@ -243,11 +336,180 @@ def _flash_kda_prefill_is_eligible(
 
 
 def _select_flash_kda_prefill_variant(
-    *, fixed_layout: bool, num_sequences: int, num_heads: int
+    *,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    needs_direct_m128: bool = False,
+    use_persistent_m128: bool = False,
+    use_exact_n16: bool = False,
 ) -> "FlashKDAVariant":
-    if fixed_layout and num_sequences == 1 and num_heads == 64:
+    if num_heads == 12 or use_exact_n16:
+        return "m128_n16"
+    if (
+        not needs_direct_m128
+        and fixed_layout
+        and num_sequences == 1
+        and num_heads == 64
+    ):
         return "m64"
+    if use_persistent_m128:
+        return "persistent_m128"
     return "m128"
+
+
+@functools.cache
+def _flash_kda_device_sm_count(device: torch.device) -> int:
+    """Resolve and cache the physical SM count for one CUDA device."""
+
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _uses_measured_sm100_persistent_policy(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+) -> bool:
+    return compute_capability == (10, 0) and sm_count in (148, 152)
+
+
+def _requires_exact_n16_recurrence(
+    *,
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    uniform_sequences: bool,
+) -> bool:
+    """Select the measured N16 graph for the 148-SM H96/N128 holdout."""
+
+    return (
+        sm_count == 148
+        and not fixed_layout
+        and num_sequences == 128
+        and num_heads == 96
+        and uniform_sequences
+    )
+
+
+def _uniform_persistent_worker_count(total_tasks: int, *, sm_count: int) -> int:
+    if total_tasks <= 0 or sm_count <= 0:
+        raise ValueError("total_tasks and sm_count must be positive")
+    if total_tasks <= sm_count:
+        return total_tasks
+    trips = (total_tasks + sm_count - 1) // sm_count
+    if total_tasks % trips == 0:
+        balanced_workers = total_tasks // trips
+        if balanced_workers >= _FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS:
+            return balanced_workers
+    return sm_count
+
+
+def _make_uniform_head_grouped_bins(
+    *,
+    num_sequences: int,
+    num_heads: int,
+    worker_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    total_tasks = num_sequences * num_heads
+    if num_sequences <= 0 or num_heads <= 0 or not 0 < worker_count <= total_tasks:
+        raise ValueError("head-grouped bins require positive sequence/head/task counts")
+    task_ids: list[int] = []
+    task_offsets = [0]
+    for worker_idx in range(worker_count):
+        begin = worker_idx * total_tasks // worker_count
+        end = (worker_idx + 1) * total_tasks // worker_count
+        for head_major_idx in range(begin, end):
+            head_idx, ordered_seq_idx = divmod(head_major_idx, num_sequences)
+            task_ids.append(ordered_seq_idx * num_heads + head_idx)
+        task_offsets.append(len(task_ids))
+    return tuple(task_ids), tuple(task_offsets)
+
+
+def _make_lpt_task_bins(
+    ordered_sequence_lengths: tuple[int, ...],
+    *,
+    num_heads: int,
+    sm_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    total_tasks = len(ordered_sequence_lengths) * num_heads
+    if (
+        not ordered_sequence_lengths
+        or num_heads <= 0
+        or not 0 < sm_count <= total_tasks
+    ):
+        raise ValueError("LPT bins require positive sequence/head/task counts")
+    bins: list[list[int]] = [[] for _ in range(sm_count)]
+    loads = [0] * sm_count
+    for ordered_seq_idx, seq_len in enumerate(ordered_sequence_lengths):
+        chunk_count = (seq_len + 31) // 32
+        for head_idx in range(num_heads):
+            worker_idx = min(range(sm_count), key=lambda index: (loads[index], index))
+            bins[worker_idx].append(ordered_seq_idx * num_heads + head_idx)
+            loads[worker_idx] += chunk_count
+    task_ids: list[int] = []
+    task_offsets = [0]
+    for worker_tasks in bins:
+        task_ids.extend(worker_tasks)
+        task_offsets.append(len(task_ids))
+    return tuple(task_ids), tuple(task_offsets), tuple(loads)
+
+
+def _lpt_bins_are_balanced(loads: tuple[int, ...]) -> bool:
+    return bool(loads) and (
+        max(loads) * _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
+        <= sum(loads) * _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR
+    )
+
+
+def _persistent_task_plan(
+    sequence_lengths: tuple[int, ...],
+    *,
+    num_heads: int,
+    sm_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
+    """Build Cake's measured SM100 task plan, or return direct-route evidence."""
+
+    total_tasks = len(sequence_lengths) * num_heads
+    if sm_count not in (148, 152) or num_heads == 12 or total_tasks <= sm_count:
+        return None
+    sequence_order = tuple(
+        sorted(
+            range(len(sequence_lengths)),
+            key=lambda index: sequence_lengths[index],
+            reverse=True,
+        )
+    )
+    ordered_lengths = tuple(sequence_lengths[index] for index in sequence_order)
+    if len(set(sequence_lengths)) == 1:
+        if num_heads not in (64, 96):
+            return None
+        worker_count = _uniform_persistent_worker_count(
+            total_tasks,
+            sm_count=sm_count,
+        )
+        task_ids, task_offsets = _make_uniform_head_grouped_bins(
+            num_sequences=len(sequence_lengths),
+            num_heads=num_heads,
+            worker_count=worker_count,
+        )
+        return sequence_order, task_ids, task_offsets
+    if num_heads != 96:
+        return None
+    task_ids, task_offsets, loads = _make_lpt_task_bins(
+        ordered_lengths,
+        num_heads=num_heads,
+        sm_count=sm_count,
+    )
+    if sm_count == 152:
+        if not loads or (
+            max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
+            > sum(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR
+        ):
+            return None
+    elif not _lpt_bins_are_balanced(loads):
+        return None
+    return sequence_order, task_ids, task_offsets
 
 
 def _cached_tensor(
@@ -264,6 +526,23 @@ def _cached_tensor(
             tensor = factory()
             _flash_kda_tensor_cache[key] = tensor
         return tensor
+
+
+def _cached_int32_metadata(
+    *,
+    device: torch.device,
+    kind: str,
+    values: tuple[int, ...],
+) -> torch.Tensor:
+    key = (kind, *_stream_cache_key(device), values)
+    return _cached_tensor(
+        key,
+        lambda: torch.tensor(values, dtype=torch.int32, device=device),
+        capture_error=(
+            f"recurrent_kda {kind} metadata is not warmed for CUDA graph "
+            "capture; invoke the same shape once before capture"
+        ),
+    )
 
 
 def _fixed_cu_seqlens(
@@ -317,6 +596,30 @@ def _dummy_bf16(device: torch.device) -> torch.Tensor:
     )
 
 
+def _dummy_i32(device: torch.device) -> torch.Tensor:
+    key = ("dummy_i32", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.int32, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy int32 metadata is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
+def _dummy_i64(device: torch.device) -> torch.Tensor:
+    key = ("dummy_i64", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.int64, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy int64 metadata is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
 def _stream_cache_key(device: torch.device) -> tuple[int, int]:
     stream = torch.cuda.current_stream(device)
     device_index = (
@@ -333,6 +636,75 @@ def _get_stream_workspace(device: torch.device) -> _FlashKDAStreamWorkspace:
             workspace = _FlashKDAStreamWorkspace(device)
             _flash_kda_stream_workspaces[key] = workspace
         return workspace
+
+
+def _cached_packed_task_metadata(
+    workspace: _FlashKDAStreamWorkspace,
+    cu_seqlens: torch.Tensor,
+    *,
+    total_tokens: int,
+    num_heads: int,
+    sm_count: int,
+    build_persistent_plan: bool,
+) -> _PackedTaskMetadata:
+    """Cache host-built sequence order and optional persistent task bins."""
+
+    signature = (
+        int(cu_seqlens._version),
+        total_tokens,
+        num_heads,
+        sm_count,
+        build_persistent_plan,
+    )
+    with workspace._packed_metadata_lock:
+        cached_metadata = workspace._packed_metadata
+        if (
+            workspace._packed_metadata_tensor is cu_seqlens
+            and workspace._packed_metadata_signature == signature
+            and cached_metadata is not None
+        ):
+            return cached_metadata
+        offsets = tuple(int(value) for value in cu_seqlens.tolist())
+        if (
+            not offsets
+            or offsets[0] != 0
+            or offsets[-1] != total_tokens
+            or any(
+                right <= left for left, right in zip(offsets, offsets[1:], strict=False)
+            )
+        ):
+            raise ValueError(
+                "cu_seqlens must start at zero, be strictly increasing, "
+                "and end at the packed token count"
+            )
+        sequence_lengths = tuple(
+            right - left for left, right in zip(offsets, offsets[1:], strict=False)
+        )
+        sequence_order = tuple(
+            sorted(
+                range(len(sequence_lengths)),
+                key=lambda index: sequence_lengths[index],
+                reverse=True,
+            )
+        )
+        persistent_plan = (
+            _persistent_task_plan(
+                sequence_lengths,
+                num_heads=num_heads,
+                sm_count=sm_count,
+            )
+            if build_persistent_plan
+            else None
+        )
+        metadata = (
+            sequence_order,
+            persistent_plan,
+            len(set(sequence_lengths)) == 1,
+        )
+        workspace._packed_metadata_tensor = cu_seqlens
+        workspace._packed_metadata_signature = signature
+        workspace._packed_metadata = metadata
+        return metadata
 
 
 def _workspace_buffer(
@@ -379,11 +751,30 @@ def _beta_tma_source(
 ) -> torch.Tensor:
     batch_size, seq_len, num_heads = beta.shape
     total_tokens = batch_size * seq_len
-    beta_flat = beta.reshape(total_tokens, num_heads)
-    padded_tokens = max(total_tokens, 32)
-    padded_heads = max(num_heads, _FLASH_KDA_BETA_TMA_MIN_HEADS)
-    if padded_tokens == total_tokens and padded_heads == num_heads:
+    if beta.stride(-1) != 1:
+        raise ValueError("beta must have unit head stride")
+    if batch_size == 1:
+        beta_flat = beta[0]
+    else:
+        if beta.stride(0) != seq_len * beta.stride(1):
+            raise ValueError("beta batch/token dimensions must collapse without a copy")
+        beta_flat = beta.as_strided(
+            (total_tokens, num_heads),
+            (beta.stride(1), beta.stride(2)),
+        )
+    if (
+        total_tokens >= 32
+        and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        and beta_flat.data_ptr() % 16 == 0
+        and beta_flat.stride(0) * beta.element_size() % 16 == 0
+    ):
         return beta_flat
+    padded_tokens = max(total_tokens, 32)
+    padded_heads = (
+        (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
+        // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+    )
     shape = (padded_tokens, padded_heads)
     padded = _workspace_buffer(
         workspace=workspace,
@@ -460,10 +851,19 @@ def _storage_ranges_overlap(
 ) -> bool:
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
+
+    def storage_end(tensor: torch.Tensor) -> int:
+        max_element_offset = sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            if size > 0
+        )
+        return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
+
     left_start = left.data_ptr()
     right_start = right.data_ptr()
-    left_end = left_start + left.numel() * left.element_size()
-    right_end = right_start + right.numel() * right.element_size()
+    left_end = storage_end(left)
+    right_end = storage_end(right)
     return left_start < right_end and right_start < left_end
 
 
@@ -535,19 +935,19 @@ def _select_flash_kda_prefill_target(device: torch.device) -> "FlashKDATarget":
             "(SM100a; B200/GB200) or 10.3 (SM103a; B300/GB300); got "
             f"{compute_capability[0]}.{compute_capability[1]}"
         )
-    if _is_cuda_version_at_least("12.9"):
-        return "sm100f"
-    if compute_capability == (10, 0) and _is_cuda_version_at_least("12.8"):
+    if compute_capability == (10, 0) and not _is_cuda_version_at_least("12.9"):
+        if not _is_cuda_version_at_least("12.8"):
+            raise RuntimeError(
+                "frozen recurrent-KDA prefill on compute capability 10.0 "
+                "requires CUDA 12.8 or newer"
+            )
         return "sm100a"
-    if compute_capability == (10, 3):
+    if not _is_cuda_version_at_least("12.9"):
         raise RuntimeError(
             "frozen recurrent-KDA prefill on compute capability 10.3 requires "
             "CUDA 12.9 or newer for the sm_100f family target"
         )
-    raise RuntimeError(
-        "frozen recurrent-KDA prefill on compute capability 10.0 requires "
-        "CUDA 12.8 or newer"
-    )
+    return "sm100f"
 
 
 def _get_flash_kda_prefill_module(variant: "FlashKDAVariant", target: "FlashKDATarget"):
@@ -573,7 +973,17 @@ def _run_flash_kda_prefill(
     output: Optional[torch.Tensor],
     seq_order: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_indices: Optional[torch.Tensor],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    backend: Literal["cake"] = "cake",
+) -> (
+    tuple[torch.Tensor, Optional[torch.Tensor]]
+    | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+):
+    if backend != "cake":
+        raise ValueError(f"backend must be 'cake', got {backend!r}")
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(
@@ -584,6 +994,82 @@ def _run_flash_kda_prefill(
     batch_size, seq_len, num_heads, _ = q.shape
     fixed_layout = cu_seqlens is None
     num_sequences = batch_size if fixed_layout else cu_seqlens.numel() - 1
+    target = _select_flash_kda_prefill_target(q.device)
+    compute_capability = get_compute_capability(q.device)
+    sm_count = _flash_kda_device_sm_count(q.device)
+    stream_workspace = (
+        _get_stream_workspace(q.device) if prefill_workspace is None else None
+    )
+    needs_direct_m128 = (
+        state_indices is not None
+        or checkpoint_every_n_tokens != 0
+        or not beta.is_contiguous()
+        or seq_order is not None
+        or (
+            initial_state is not None
+            and initial_state.stride(0)
+            != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+        )
+    )
+    persistent_candidate = (
+        _uses_measured_sm100_persistent_policy(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+        )
+        and not needs_direct_m128
+        and prefill_workspace is None
+        and initial_state is not None
+        and num_heads != 12
+        and not (fixed_layout and num_sequences == 1 and num_heads == 64)
+        and num_sequences * num_heads > sm_count
+    )
+    automatic_sequence_order = None
+    persistent_plan = None
+    uniform_sequences = False
+    if (
+        not fixed_layout
+        and seq_order is None
+        and prefill_workspace is None
+        and not capturing
+    ):
+        assert cu_seqlens is not None
+        assert stream_workspace is not None
+        (
+            automatic_sequence_order,
+            persistent_plan,
+            uniform_sequences,
+        ) = _cached_packed_task_metadata(
+            stream_workspace,
+            cu_seqlens,
+            total_tokens=batch_size * seq_len,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            build_persistent_plan=persistent_candidate,
+        )
+    elif persistent_candidate:
+        assert fixed_layout
+        persistent_plan = _persistent_task_plan(
+            (seq_len,) * num_sequences,
+            num_heads=num_heads,
+            sm_count=sm_count,
+        )
+    use_exact_n16 = _requires_exact_n16_recurrence(
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+    )
+    if use_exact_n16:
+        persistent_plan = None
+    variant = _select_flash_kda_prefill_variant(
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        needs_direct_m128=needs_direct_m128,
+        use_persistent_m128=persistent_plan is not None,
+        use_exact_n16=use_exact_n16,
+    )
     if fixed_layout:
         cu_seqlens_i64 = _fixed_cu_seqlens(
             device=q.device, batch_size=batch_size, seq_len=seq_len
@@ -600,13 +1086,42 @@ def _run_flash_kda_prefill(
             if cu_seqlens.dtype == torch.int64
             else cu_seqlens.to(torch.int64)
         )
-    seq_order_i32 = _validate_prefill_seq_order(
-        seq_order,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        device=q.device,
-    )
+    persistent_task_ids = None
+    persistent_task_offsets = None
+    if persistent_plan is None:
+        if automatic_sequence_order is None:
+            seq_order_i32 = _validate_prefill_seq_order(
+                seq_order,
+                fixed_layout=fixed_layout,
+                num_sequences=num_sequences,
+                device=q.device,
+            )
+        else:
+            seq_order_i32 = _cached_int32_metadata(
+                device=q.device,
+                kind="automatic_seq_order",
+                values=automatic_sequence_order,
+            )
+    else:
+        sequence_order, task_ids, task_offsets = persistent_plan
+        seq_order_i32 = _cached_int32_metadata(
+            device=q.device,
+            kind="persistent_seq_order",
+            values=sequence_order,
+        )
+        persistent_task_ids = _cached_int32_metadata(
+            device=q.device,
+            kind="persistent_task_ids",
+            values=task_ids,
+        )
+        persistent_task_offsets = _cached_int32_metadata(
+            device=q.device,
+            kind="persistent_task_offsets",
+            values=task_offsets,
+        )
     dummy_state = _dummy_bf16(q.device)
+    dummy_i32 = _dummy_i32(q.device) if variant != "m64" else None
+    dummy_i64 = _dummy_i64(q.device) if variant != "m64" else None
 
     if output is None:
         if capturing:
@@ -634,6 +1149,9 @@ def _run_flash_kda_prefill(
         _FLASH_KDA_HEAD_DIM,
     )
     use_initial_state = initial_state is not None
+    use_state_indices = state_indices is not None
+    if use_state_indices and initial_state is None:
+        raise ValueError("state_indices requires an initial_state pool")
     if initial_state is not None:
         initial_state_arg = initial_state
         final_state_arg = initial_state
@@ -655,23 +1173,23 @@ def _run_flash_kda_prefill(
         final_state_arg = dummy_state
         store_final_state = False
         returned_state = None
+    state_slot_stride = (
+        initial_state.stride(0)
+        if initial_state is not None and initial_state.ndim == 4
+        else num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    )
 
     scale_value = (
         1.0 / math.sqrt(_FLASH_KDA_HEAD_DIM) if scale is None else float(scale)
     )
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    variant = _select_flash_kda_prefill_variant(
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-    )
-    target = _select_flash_kda_prefill_target(q.device)
     stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase
     if prefill_workspace is None:
-        workspace = _get_stream_workspace(q.device)
+        assert stream_workspace is not None
+        workspace = stream_workspace
     else:
         workspace = prefill_workspace
     # TVM FFI may release the GIL. Serialize the complete shared-workspace
@@ -716,29 +1234,99 @@ def _run_flash_kda_prefill(
         descriptor_storage = workspace._descriptor_storages[variant]
         module = _get_flash_kda_prefill_module(variant, target)
         try:
-            module.run(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                beta_tma,
-                A_log,
-                dt_bias,
-                cu_seqlens_i64,
-                seq_order_i32,
-                initial_state_arg,
-                out_buf,
-                final_state_arg,
-                descriptor_storage,
-                prepare_descriptors,
-                num_heads,
-                int(use_initial_state),
-                int(store_final_state),
-                scale_value,
-                float(lower_bound),
-                stream_ptr,
-            )
+            if variant == "m64":
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            elif variant == "persistent_m128":
+                assert persistent_task_ids is not None
+                assert persistent_task_offsets is not None
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    persistent_task_ids,
+                    persistent_task_offsets,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            else:
+                assert dummy_i32 is not None
+                assert dummy_i64 is not None
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    state_indices if state_indices is not None else dummy_i32,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    (
+                        state_checkpoints
+                        if state_checkpoints is not None
+                        else dummy_state
+                    ),
+                    (
+                        checkpoint_cu_starts
+                        if checkpoint_cu_starts is not None
+                        else dummy_i64
+                    ),
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    beta.stride(-2),
+                    state_slot_stride,
+                    int(use_state_indices),
+                    int(use_initial_state),
+                    int(store_final_state),
+                    checkpoint_every_n_tokens,
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
         except Exception:
             if prepare_descriptors:
                 workspace._descriptor_signatures.pop(variant, None)
@@ -747,7 +1335,8 @@ def _run_flash_kda_prefill(
             workspace._descriptor_signatures[variant] = signature
         if capturing and explicit_workspace:
             workspace._captured = True
-    return (
-        out_buf,
-        returned_state if output_final_state else None,
-    )
+    result = (out_buf, returned_state if output_final_state else None)
+    if checkpoint_every_n_tokens:
+        assert state_checkpoints is not None
+        return (*result, state_checkpoints)
+    return result

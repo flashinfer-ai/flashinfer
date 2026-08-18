@@ -13,8 +13,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.test_sharding.observations import EstimateRefresh, refresh_estimates
 from scripts.test_sharding.models import Plan
+from scripts.test_sharding.observations import (
+    EstimateRefresh,
+    ObservedCase,
+    refresh_estimates,
+)
 from scripts.test_sharding.scanner import (
     scan_cleaned_artifact_dirs,
     scan_observation_inputs,
@@ -23,11 +27,14 @@ from scripts.test_sharding.scanner import (
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command, help_text in (
         ("scan", "write reviewable observations without modifying estimates"),
-        ("refresh", "scan observations and update tracked estimate files"),
+        ("refresh", "scan observations and update local estimate files"),
     ):
         child = subparsers.add_parser(command, help=help_text)
         child.add_argument(
@@ -98,15 +105,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _prune_scope(manifest_path: Path) -> tuple[set[str], str]:
+def _prune_scope(manifest_path: Path) -> set[str]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("selection", {}).get("sanity_test"):
         raise ValueError("a sampled manifest cannot authorize pruning")
-    test_path = Path(manifest["test_path"]).resolve()
+    test_path = (REPO_ROOT / Path(manifest["test_path"])).resolve()
     if test_path != (REPO_ROOT / "tests").resolve():
         raise ValueError("pruning requires a complete collection rooted at tests/")
     plan = Plan.from_dict(manifest["plan"])
-    return {node.nodeid for node in plan.nodes}, plan.options.profile
+    return {node.nodeid for node in plan.nodes}
 
 
 def _validate_inputs(args: argparse.Namespace) -> None:
@@ -133,11 +140,18 @@ def _scan_inputs(args: argparse.Namespace):
     return observations, overheads, diagnostics
 
 
-def _refresh_scope(args: argparse.Namespace) -> tuple[set[str] | None, str | None]:
+def _refresh_scope(
+    args: argparse.Namespace, observations: list[ObservedCase]
+) -> tuple[set[str] | None, str | None]:
     if args.prune:
         if args.complete_collection_manifest is None:
             raise ValueError("--prune requires --complete-collection-manifest")
-        return _prune_scope(args.complete_collection_manifest)
+        profiles = {observation.profile for observation in observations}
+        if len(profiles) != 1:
+            raise ValueError(
+                "--prune requires observations from exactly one timing profile"
+            )
+        return _prune_scope(args.complete_collection_manifest), profiles.pop()
     if args.complete_collection_manifest is not None:
         raise ValueError("--complete-collection-manifest is only valid with --prune")
     return None, None
@@ -160,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             "refresh requires at least one eligible real testcase observation"
         )
-    keep_nodeids, prune_profile = _refresh_scope(args)
+    keep_nodeids, prune_profile = _refresh_scope(args, observations)
     refresh_estimates(
         observations,
         overheads,

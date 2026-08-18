@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -135,7 +135,7 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "ce0795149bb2a183db22de04a3fec3aca65fff04/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "5988e15c0e6d006c6a64c0f6c6748b4d3150c1af/batched_gemm-3d40263-3e19f0a/"
     )
@@ -153,8 +153,13 @@ class ArtifactPath:
     # (and KernelMap.KERNEL_MAP_HASH_RUBIN for the Rubin variant below).
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
     DEEPGEMM_RUBIN: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
-    DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
-    DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
+    DSL_FMHA: str = "5b34f84266cbc2135066ce96885b664992535670/fmha/cute-dsl/"
+    DSL_FMHA_ARCHS: tuple[str, ...] = (
+        "sm_100a",
+        "sm_103a",
+        "sm_107a",
+        "sm_110a",
+    )
 
 
 class CheckSumHash:
@@ -165,7 +170,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "c2d9399b2537be785882354a4f9902ed6c03136c0ea341e201eac40c3923e1dc"
+        "a8d5d3e86f5ee7dfecd36a8d6cf9a933ca0cb8225a2f954f0212c5db2d250f40"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
@@ -187,14 +192,16 @@ class CheckSumHash:
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "778738c3aa89872248fcfddd134b57ae516021471df992d4ba9b058ead546d56",
-            "sm_103a": "f57abef4c65968c99e93faa051d9b98cf789c82c805bd3a177fb3f2a426dac4f",
-            "sm_110a": "f2450d136221d7c355876140af860999fd5f5cdd16ffa4b06ff8b799c2106c29",
+            "sm_100a": "832c303bb9b386af590d3efc294681859829b91991975fd2e188a5d7dc30c461",
+            "sm_103a": "57322c10ddbbe9072c7ded41e2856fdf9d4276fbd79ac4bc825af0cd78844da6",
+            "sm_107a": "8480678539adf622f8395e875923471bce683be7158694556bd6c536eadeaa45",
+            "sm_110a": "4f6f0f3a868f0e9171c8ab217e6d2a87fde46b02a9417d8f55f1a779c53fa9fb",
         },
         "aarch64": {
-            "sm_100a": "10af42097962a92cbc8942a65dedf87259fdb8684d26c4f8326dbfbe4e8ff566",
-            "sm_103a": "2418ee60ced8eec216af5a44682151173c1ed63d5296c92c185bc3bef92f91cd",
-            "sm_110a": "6807c536800fba3c9ff516f4cc0a7b12bd5570dd94ab04704c9bc7daf9d1e821",
+            "sm_100a": "064cfcac21886c3e16b5007ca769f1b93111db7a63864db1e026a53e61fe20fe",
+            "sm_103a": "1631a884738d706f5bc39bf4032bcd54b25ba0a0d734c26f388dce4ae32093c9",
+            "sm_107a": "0348ef0b74dffa67c0c9662d3f567b26dccf46c356009f315860f31a9550e207",
+            "sm_110a": "8f16f510d159797432bda92d55d0d82d65d3e19080f9af1b751dec4146cdcbe6",
         },
     }
     map_checksums: dict[str, str] = {

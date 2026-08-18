@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import time
+import traceback
 from pathlib import Path
 
 
@@ -40,7 +41,11 @@ from scripts.test_sharding.state import (
     RunnerStateError,
     load_manifest,
 )
-from scripts.test_sharding.summary import exit_code_for_summary, publish_summary
+from scripts.test_sharding.summary import (
+    exit_code_for_summary,
+    publish_summary,
+    terminal_summary_lines,
+)
 
 
 EXIT_HELP = (
@@ -50,7 +55,7 @@ EXIT_HELP = (
     "3=configuration, manifest, collection, or infrastructure error"
 )
 DEFAULT_DEADLINE_SECONDS = 0
-DEFAULT_UNIT_TIMEOUT_SECONDS = 0
+DEFAULT_UNIT_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def _env_int(name: str, default: int) -> int:
@@ -79,6 +84,18 @@ def _configure_output() -> None:
             reconfigure(line_buffering=True)
 
 
+def _test_started_at(
+    operation_started_at: float, wrapper_started_at: float | None
+) -> float:
+    if wrapper_started_at is None:
+        return operation_started_at
+    if not math.isfinite(wrapper_started_at) or not (
+        0 < wrapper_started_at <= operation_started_at
+    ):
+        return operation_started_at
+    return wrapper_started_at
+
+
 def _positive(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -99,7 +116,9 @@ def _timeout_policy(value: str) -> str:
     return value
 
 
-def _auto_profile() -> str:
+def _auto_timing_profile() -> str:
+    """Label result telemetry without using the label for runtime planning."""
+
     cuda = "unknown"
     gpu = "unknown"
     try:
@@ -124,11 +143,18 @@ def _auto_profile() -> str:
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    timing_profile = os.environ.get("UNIT_TEST_TIMING_PROFILE") or None
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help=argparse.SUPPRESS,
+        help="used by task_run_unit_tests.sh to select plan-only mode",
+    )
+    parser.add_argument(
+        "--wrapper-started-at",
+        type=float,
+        help=(
+            "Unix start timestamp injected by the shell entry point for "
+            "elapsed-time reporting"
+        ),
     )
     parser.add_argument(
         "--junit-dir",
@@ -151,22 +177,36 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         help="source-local checkpoint target (UNIT_TEST_CHECKPOINT_SECONDS)",
     )
     parser.add_argument(
-        "--unknown-case-seconds",
+        "--default-case-seconds",
         type=_positive,
-        default=os.environ.get("UNIT_TEST_UNKNOWN_CASE_SECONDS", 1),
-        help="unknown-node estimate floor (UNIT_TEST_UNKNOWN_CASE_SECONDS)",
+        default=os.environ.get("UNIT_TEST_DEFAULT_CASE_SECONDS", 1),
+        help="default estimate for a node missing timing data (UNIT_TEST_DEFAULT_CASE_SECONDS)",
     )
     parser.add_argument(
-        "--timing-profile",
-        default=timing_profile if timing_profile is not None else argparse.SUPPRESS,
-        help=(
-            "stable timing profile (UNIT_TEST_TIMING_PROFILE)"
-            if timing_profile is not None
-            else (
-                "stable timing profile "
-                "(UNIT_TEST_TIMING_PROFILE; default: auto-detected)"
-            )
+        "--default-source-overhead-seconds",
+        type=_nonnegative,
+        default=os.environ.get("UNIT_TEST_DEFAULT_SOURCE_OVERHEAD_SECONDS", 30),
+        help="default per-source process overhead (UNIT_TEST_DEFAULT_SOURCE_OVERHEAD_SECONDS)",
+    )
+    parser.add_argument(
+        "--duration-estimates",
+        type=Path,
+        default=(
+            Path(os.environ["UNIT_TEST_DURATION_ESTIMATES"])
+            if os.environ.get("UNIT_TEST_DURATION_ESTIMATES")
+            else None
         ),
+        help="optional per-node duration CSV or CSV.gz (UNIT_TEST_DURATION_ESTIMATES)",
+    )
+    parser.add_argument(
+        "--overhead-estimates",
+        type=Path,
+        default=(
+            Path(os.environ["UNIT_TEST_OVERHEAD_ESTIMATES"])
+            if os.environ.get("UNIT_TEST_OVERHEAD_ESTIMATES")
+            else None
+        ),
+        help="optional per-source overhead CSV or CSV.gz (UNIT_TEST_OVERHEAD_ESTIMATES)",
     )
     parser.add_argument(
         "--shard-count",
@@ -218,7 +258,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--timeout-policy",
         type=_timeout_policy,
         choices=("resume", "skip", "fail"),
-        default=os.environ.get("UNIT_TEST_TIMEOUT_POLICY", "resume"),
+        default=os.environ.get("UNIT_TEST_TIMEOUT_POLICY", "fail"),
         help="handling for unexecuted nodes (UNIT_TEST_TIMEOUT_POLICY)",
     )
     parser.add_argument(
@@ -313,12 +353,11 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         )
 
     pytest_command_prefix = _pytest_command_prefix()
-    profile = getattr(args, "timing_profile", None) or _auto_profile()
     planning = PlanningOptions(
-        profile=profile,
         checkpoint_seconds=args.checkpoint_seconds,
         target_unit_seconds=args.target_unit_seconds,
-        unknown_case_seconds=args.unknown_case_seconds,
+        default_case_seconds=args.default_case_seconds,
+        default_source_overhead_seconds=args.default_source_overhead_seconds,
         shard_count=args.shard_count,
     )
     sample_rate = _env_int("SAMPLE_RATE", 5)
@@ -356,6 +395,16 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             attempt_settings=attempt if args.command == "run" else None,
             operation_started_at=operation_started_at,
             pytest_command_prefix=pytest_command_prefix,
+            duration_estimates=(
+                args.duration_estimates.resolve()
+                if args.duration_estimates is not None
+                else None
+            ),
+            overhead_estimates=(
+                args.overhead_estimates.resolve()
+                if args.overhead_estimates is not None
+                else None
+            ),
         )
     )
     print(("Created" if created else "Using") + f" plan in {junit_dir}", flush=True)
@@ -384,7 +433,6 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         print(
             "WARNING: estimated per-shard load exceeds the attempt deadline at "
             f"{args.workers} local worker(s); configure more workers/shards or expect resume",
-            file=sys.stderr,
         )
     if args.unit_timeout_seconds > 0:
         over_timeout = [
@@ -397,7 +445,6 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             print(
                 f"WARNING: {len(over_timeout)} atomic/checkpoint batch(es) are estimated "
                 "to exceed the unit timeout",
-                file=sys.stderr,
             )
     if args.command == "plan":
         return 0
@@ -409,6 +456,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         not in {"0", "false", "no"},
         memory_interval=_env_positive_float("MEMORY_MONITOR_INTERVAL", 2),
         pytest_command_prefix=pytest_command_prefix,
+        timing_profile=_auto_timing_profile(),
     )
     return execute_shard(
         repo_root=REPO_ROOT,
@@ -425,17 +473,23 @@ def main(argv: list[str] | None = None) -> int:
     if arguments[:1] == ["__shell-settings"]:
         return _shell_settings(arguments[1:])
     operation_started_at = time.time()
+    test_started_at = operation_started_at
     deadline_clock = DeadlineClock(
         started_at=operation_started_at,
         limit_seconds=0,
     )
+    args: argparse.Namespace | None = None
+    cause: str | None = None
     try:
         args = _parser().parse_args(arguments)
+        test_started_at = _test_started_at(
+            operation_started_at, getattr(args, "wrapper_started_at", None)
+        )
         deadline_clock = DeadlineClock(
             started_at=operation_started_at,
             limit_seconds=getattr(args, "deadline_seconds", 0),
         )
-        return _execute_command(args, operation_started_at)
+        result = _execute_command(args, operation_started_at)
     except CollectionTimeoutError as error:
         pending = "unknown" if error.pending_nodes is None else str(error.pending_nodes)
         deadline_fields = (
@@ -443,7 +497,8 @@ def main(argv: list[str] | None = None) -> int:
             if error.deadline_clock is not None
             else deadline_clock.status_fields()
         )
-        print(f"ERROR: {error}", file=sys.stderr)
+        cause = str(error)
+        print(f"ERROR: {error}")
         print(
             "PYTEST KILLED phase=collection reason=attempt-deadline "
             f"signal={error.termination_signal} "
@@ -451,7 +506,6 @@ def main(argv: list[str] | None = None) -> int:
             f"finalized={error.finalized_nodes} passed={error.passed} "
             f"failed={error.failed} skipped={error.skipped} "
             f"pending={pending} node=unknown",
-            file=sys.stderr,
             flush=True,
         )
         print(
@@ -461,20 +515,83 @@ def main(argv: list[str] | None = None) -> int:
             f"finalized={error.finalized_nodes} passed={error.passed} "
             f"failed={error.failed} skipped={error.skipped} pending={pending} "
             f"{deadline_fields}",
-            file=sys.stderr,
             flush=True,
         )
-        return 3
+        result = 3
     except (RunnerStateError, ValueError, OSError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        cause = f"{type(error).__name__}: {error}"
+        print(f"ERROR: {cause}")
         print(
             "RUNNER STATUS: state=failed "
             "reason=configuration-or-infrastructure-error "
             f"{deadline_clock.status_fields()}",
-            file=sys.stderr,
             flush=True,
         )
-        return 3
+        result = 3
+    except Exception as error:
+        cause = f"{type(error).__name__}: {error}"
+        print(f"ERROR: unexpected runner error: {cause}")
+        traceback.print_exc(file=sys.stdout)
+        print(
+            "RUNNER STATUS: state=failed reason=unexpected-infrastructure-error "
+            f"{deadline_clock.status_fields()}",
+            flush=True,
+        )
+        result = 3
+    summary = None
+    shard_index = None
+    if args is not None and hasattr(args, "junit_dir"):
+        try:
+            manifest = load_manifest(args.junit_dir.resolve())
+            if manifest is not None:
+                plan = Plan.from_dict(manifest["plan"])
+                summary = publish_summary(args.junit_dir.resolve(), plan)
+                shard_index = (
+                    None
+                    if getattr(args, "command", "") in {"finalize", "summarize"}
+                    else int(getattr(args, "shard_index", 0))
+                )
+        except Exception as summary_error:
+            detail = f"summary publication failed: {summary_error}"
+            cause = f"{cause}; {detail}" if cause else detail
+            print(f"ERROR: {detail}")
+            result = 3
+    status = {
+        0: "complete-without-failures"
+        if getattr(args, "command", "") != "plan"
+        else "plan-ready",
+        1: "complete-with-failures",
+        2: "incomplete-and-resumable",
+        3: "configuration-collection-or-infrastructure-error",
+    }.get(result, "abnormal-exit")
+    if cause is None:
+        if result == 0:
+            cause = (
+                "deterministic plan was written successfully"
+                if getattr(args, "command", "") == "plan"
+                else "requested test operation completed without failures"
+            )
+        elif result == 1:
+            cause = (
+                "one or more test nodes failed; failure status takes precedence "
+                "over incomplete work"
+            )
+        elif result == 2:
+            cause = "planned test nodes remain pending; run again to resume"
+        elif result == 3:
+            cause = "the current operation stopped because of an infrastructure error"
+    for line in terminal_summary_lines(
+        summary,
+        shard_index=shard_index,
+        runner_exit_code=result,
+        shell_exit_code=0 if result in {0, 2} else result,
+        status=status,
+        test_started_at=test_started_at,
+        test_ended_at=time.time(),
+        cause=cause,
+    ):
+        print(line)
+    return result
 
 
 if __name__ == "__main__":
