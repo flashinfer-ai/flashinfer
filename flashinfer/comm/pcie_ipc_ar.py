@@ -549,6 +549,20 @@ class PcieIpcAllReduceWorkspace:
             cached = self._tuned.get(key)
             if cached is not None:
                 return cached
+        # Resolving is collective and reads the verdict back to the host, so it
+        # cannot happen inside a graph capture. Say that here: the CUDA-level
+        # failure is "Cannot copy between CPU and CUDA tensors during CUDA
+        # graph capture", which names neither this workspace nor the fix.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"the launch configuration for shape {tuple(inp.shape)} dtype "
+                f"{inp.dtype} has not been resolved yet, and resolving it "
+                "inside a CUDA graph capture is not possible: the ranks agree "
+                "on it with a collective whose result is read back on the "
+                "host. Call workspace.prepare() with every shape you intend to "
+                "capture -- after tune(), which clears this cache -- or pass "
+                "config= explicitly at the call site."
+            )
         config = self._resolve_tuned(inp, seed, tuner)
         self._tuned[key] = config
         return config
@@ -683,6 +697,60 @@ class PcieIpcAllReduceWorkspace:
             int(config.variant),
             enable_pdl,
         )
+
+    def prepare(
+        self,
+        shapes: Sequence[Tuple[int, int]],
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> Dict[Tuple[int, int], Optional[IpcLaunchConfig]]:
+        """Resolve the launch configuration for each shape now. **Collective.**
+
+        Resolution is lazy by default: the first call at a given shape looks the
+        configuration up and then makes the group agree on it, which costs one
+        small reduction whose verdict is read back on the host. That is fine in
+        eager mode and impossible inside a CUDA graph capture, so a shape first
+        used inside a capture fails to capture.
+
+        This moves that work to a point the caller chooses. Nothing else
+        changes -- the same lookup, the same agreement, the same number of
+        collectives -- and afterwards every listed shape is served from the
+        in-process cache, so a capture of it touches no collective at all.
+
+        Call it **after** :meth:`tune`, which clears that cache, and list every
+        shape that will be captured: shapes left out are still resolved lazily
+        and still cannot be captured. Serving frameworks pad the batch to the
+        bucket they capture, so list the padded sizes, not the real ones.
+
+        Parameters
+        ----------
+        shapes : sequence of (batch, hidden)
+            Shapes to resolve. Every rank must pass the same list in the same
+            order -- resolution is collective, so a rank with a different list
+            deadlocks the group rather than disagreeing.
+        dtype : torch.dtype
+            Which of the two supported dtypes to resolve for. The cache is
+            keyed by dtype, so resolve each one that will be used.
+
+        Returns
+        -------
+        dict
+            ``{(batch, hidden): config}``, with ``None`` for shapes the kernels
+            do not support -- those fall back to another backend at call time
+            and never reach a capture.
+        """
+        shapes = [(int(batch), int(hidden)) for batch, hidden in shapes]
+        # Same reasoning as tune(): the loop below issues one collective per
+        # shape, so a rank with a different list hangs rather than disagrees.
+        self._joint_check(
+            {"error": None, "shapes": shapes, "dtype": str(dtype)},
+            "preparing launch configurations",
+        )
+        resolved: Dict[Tuple[int, int], Optional[IpcLaunchConfig]] = {}
+        for batch, hidden in shapes:
+            probe = torch.empty((batch, hidden), dtype=dtype, device=self.device)
+            resolved[(batch, hidden)] = self.tuned_launch_config(probe)
+        return resolved
 
     def tune(
         self,

@@ -1293,3 +1293,81 @@ def test_pcie_ipc_stray_tuning_session_degrades(world_size: int, tmp_path) -> No
     multi_process_parallel(
         world_size, _stray_tuning_worker, (str(tmp_path),), timeout_s=300
     )
+
+
+def _graph_capture_worker(world_size: int, rank: int, port: int) -> None:
+    """A shape must be prepared before it can be captured, and say so if not.
+
+    Resolving a launch configuration makes the group agree on it with a
+    reduction whose verdict is read back on the host, and neither the
+    collective nor the readback is legal inside a capture. Both halves are
+    pinned here: the unprepared shape must fail with an error that names the
+    remedy, and the prepared one must capture, replay, and still be correct.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        dtype = torch.bfloat16
+        hidden, batch = 4096, 4
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group, max_numel=batch * hidden, dtype=dtype
+        )
+        inp = torch.randint(
+            0, 16, (batch, hidden), dtype=torch.int32, device=device
+        ).to(dtype)
+        out = torch.empty_like(inp)
+
+        # The op has to be usable at all before the capture claims mean anything.
+        if not ws.supports(inp):
+            return
+        reference = inp.clone()
+        dist.all_reduce(reference, group=group)
+
+        # Unprepared: the guard fires before any collective is issued, so every
+        # rank raises at the same point and the group stays in step.
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+        unprepared = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(unprepared):
+                ws.all_reduce(inp, out=out)
+            raised = ""
+        except RuntimeError as exc:
+            raised = str(exc)
+        assert "prepare()" in raised, (
+            "capturing an unresolved shape should name prepare() as the "
+            f"remedy, got: {raised or 'no error at all'}"
+        )
+
+        # Prepared: capture, replay, and check the result really is the sum.
+        ws.prepare([(batch, hidden)], dtype=dtype)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+        prepared = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(prepared):
+            ws.all_reduce(inp, out=out)
+        out.zero_()
+        prepared.replay()
+        torch.cuda.synchronize(device)
+
+        wrong = torch.tensor([int((out != reference).sum().item())], device=device)
+        dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+        assert int(wrong.item()) == 0, (
+            f"the replayed graph produced {int(wrong.item())} wrong elements"
+        )
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pcie_ipc_prepare_makes_a_shape_capturable(world_size: int) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(world_size, _graph_capture_worker, timeout_s=300)
