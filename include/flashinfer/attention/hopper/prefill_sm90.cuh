@@ -243,17 +243,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       int num_kv_tiles = collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len,
                                                               kv_len, batch_idx);
       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
-        // Preserve producer/consumer barrier parity when skipping this tile.
-        // A following visible tile would otherwise wait on a missing arrival.
-        if (work_idx != 0) {
-          int lane_predicate = cute::elect_one_sync();
-          if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
-#pragma unroll
-            for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
-              shared_storage.barrier_O.arrive(cta_id, lane_predicate);
-            }
-          }
-        }
         collective_epilogue.store_zero(epilogue_params, shared_storage,
                                        threadIdx.x - NUM_COPY_THREADS, block_coord);
         continue;
