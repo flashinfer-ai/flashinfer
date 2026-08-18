@@ -212,3 +212,80 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
 
     assert torch.equal(out_without, out_with)
     assert torch.equal(lse_without, lse_with)
+
+
+def test_cudnn_prefill_token_indptr_strided_kv():
+    """Token-unit indptrs must be scaled by each tensor's own token stride.
+
+    With K and V as views into a single interleaved KV buffer the token stride
+    is 2 * num_kv_heads * head_dim, so the packed multiplier walked half a
+    sequence per request and silently returned wrong values.
+    """
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("cuDNN backend/frontend too old for direct token-unit seqlens")
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    batch_size, s_qo, s_kv = 2, 64, 128
+    num_qo_heads, num_kv_heads, head_dim = 8, 8, 128
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    qo_indptr = torch.cat([zero, torch.cumsum(actual_seq_lens_q, 0)]).int()
+    kv_indptr = torch.cat([zero, torch.cumsum(actual_seq_lens_kv, 0)]).int()
+
+    total_kv = int(actual_seq_lens_kv.sum())
+    q = torch.randn(
+        int(actual_seq_lens_q.sum()),
+        num_qo_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_contiguous = torch.randn(
+        total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_contiguous = torch.randn_like(k_contiguous)
+
+    kv = torch.empty(
+        total_kv, 2, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv[:, 0] = k_contiguous
+    kv[:, 1] = v_contiguous
+    k_view, v_view = kv[:, 0], kv[:, 1]
+
+    common = dict(
+        scale=float(1.0 / (head_dim**0.5)),
+        workspace_buffer=torch.empty(
+            512 * 1024 * 1024, dtype=torch.int8, device=device
+        ),
+        max_token_per_sequence=s_qo,
+        max_sequence_kv=s_kv,
+        actual_seq_lens_q=actual_seq_lens_q.view(batch_size, 1, 1, 1),
+        actual_seq_lens_kv=actual_seq_lens_kv.view(batch_size, 1, 1, 1),
+        causal=True,
+        return_lse=True,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_k=kv_indptr,
+        batch_offsets_units="tokens",
+    )
+
+    out_ref, lse_ref = cudnn_batch_prefill_with_kv_cache(
+        q, k_contiguous, v_contiguous, **common
+    )
+    out, lse = cudnn_batch_prefill_with_kv_cache(q, k_view, v_view, **common)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+    # cuDNN writes only the rows covered by actual_seq_lens_q; the padded rows of a
+    # dense LSE buffer are undefined, so comparing them would compare allocator garbage.
+    for b, length in enumerate(actual_seq_lens_q.tolist()):
+        torch.testing.assert_close(
+            lse[b, :length], lse_ref[b, :length], atol=1e-2, rtol=1e-2
+        )
