@@ -4730,8 +4730,6 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    use_fp16_softmax: Optional[bool] = None,
-    uses_spcompress: Optional[bool] = None,
     sage_attn_sfs: Tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -4742,6 +4740,8 @@ def trtllm_ragged_attention_deepseek(
     backend: str = "trtllm-gen",
     q_seq_lens_cpu: Optional[torch.Tensor] = None,
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    uses_spcompress: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5295,12 +5295,12 @@ def trtllm_batch_context_with_kv_cache(
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
-    use_fp16_softmax: Optional[bool] = None,
-    uses_spcompress: Optional[bool] = None,
     causal: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    uses_spcompress: Optional[bool] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
