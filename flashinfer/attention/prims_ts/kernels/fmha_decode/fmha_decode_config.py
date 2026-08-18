@@ -42,6 +42,7 @@ from .fmha_decode_constants import (
     MAX_CLUSTER_DIM_X,
     MAX_CLUSTER_PARTIAL_SMEM_BYTES,
     MAX_KV_STAGE_SMEM_KIB,
+    MAX_WARP_GROUPS,
     MIN_LOOP_ITERS_PER_SPLIT,
     PARALLEL_REDUCTION_BYTES_PER_SLICE,
     PARALLEL_REDUCTION_THREADS_PER_CTA,
@@ -508,6 +509,7 @@ class FmhaDecodeConfig:
 
     # ------------------------------------------------------------------
     # Warp specialization layout (4 warp groups × 4 warps = 16 warps total)
+    # NOTE: please update `_active_warp_roles` after new roles are added.
     # ------------------------------------------------------------------
     # Softmax0Task: WG0 (warps 0–3) handles even K/V instances (K0/V0).
     softmax0_warp_idx: int = 0  # WG0: warps 0-3
@@ -525,18 +527,12 @@ class FmhaDecodeConfig:
     # LoadTask: a single warp in WG3 issues TMA loads for Q/K/V.
     load_warp_idx: int = 13  # WG3: warp 13
     load_num_warps: int = 1
-    # Warp 14 is deliberately reused: paged-KV page prefetch and non-paged
-    # padding / CLC padding are mutually exclusive task layouts.
     # PageTableTask (paged-KV only): warp 14 prefetches logical→physical
     # page IDs that LoadTask consumes when issuing the TMA copies.
     page_offsets_warp_idx: int = 14  # WG3: warp 14 for paged-KV page table prefetch
     page_offsets_num_warps: int = 1
     # SMEM pipeline depth for the prefetched page-offset table.
     page_offsets_stages: int = 6
-    # PaddingTask (non-paged): warps 14–15 fill otherwise-idle WG3 task slots
-    # in the fixed 16-warp task-scheduling layout.
-    padding_warp_idx: int = 14  # WG3: warps 14-15
-    padding_num_warps: int = 2
     # SchedulerTask: under persistent scheduling, warp 13 runs the CLC tile
     # scheduler instead of doing TMA loads.
     scheduler_warp_idx: int = 13  # Persistent: warp 13
@@ -544,14 +540,18 @@ class FmhaDecodeConfig:
     # ClcLoadTask: under persistent scheduling, warp 15 issues the CLC
     # response loads.
     clc_load_warp_idx: int = 15
-    # ClcPaddingTask: warp 14 padding for the persistent layout.
-    clc_padding_warp_idx: int = 14
-    clc_padding_num_warps: int = 1
-    # One-inst Keeps persistent profiles retain a 16-warp CLC/barrier
-    # contract. A second padding task owns the otherwise-unused final
-    # warpgroup; two-inst profiles leave this disabled.
-    clc_tail_padding_warp_idx: int = 12
-    clc_tail_padding_num_warps: int = 0
+    # PaddingTask placement is derived after selecting the active task roles.
+    # Each active warp group is compacted first, then its unused tail warps are
+    # assigned to the corresponding padding task. Persistent layouts retain
+    # all four warp groups even when the last group contains only padding.
+    wg0_padding_warp_idx: int = 4
+    wg0_padding_num_warps: int = 0
+    wg1_padding_warp_idx: int = 8
+    wg1_padding_num_warps: int = 0
+    wg2_padding_warp_idx: int = 12
+    wg2_padding_num_warps: int = 0
+    wg3_padding_warp_idx: int = 16
+    wg3_padding_num_warps: int = 0
 
     # ------------------------------------------------------------------
     # Task-local register allocation
@@ -747,26 +747,13 @@ class FmhaDecodeConfig:
     @property
     def threads_per_cta(self) -> int:
         """CTA thread count implied by the configured task warp layout."""
-        warp_ranges = [
-            self.softmax0_warp_idx + self.softmax0_num_warps,
-            self.softmax1_warp_idx + self.softmax1_num_warps,
-            self.correction_warp_idx + self.correction_num_warps,
-            self.mma_warp_idx + self.mma_num_warps,
-            self.load_warp_idx + self.load_num_warps,
-            self.page_offsets_warp_idx + self.page_offsets_num_warps,
-            self.padding_warp_idx + self.padding_num_warps,
-        ]
-        if self.use_persistent_scheduler:
-            warp_ranges.extend(
-                (
-                    self.scheduler_warp_idx + self.scheduler_num_warps,
-                    # ClcLoadTask reuses LoadTask's loader-warp contract.
-                    self.clc_load_warp_idx + self.load_num_warps,
-                    self.clc_padding_warp_idx + self.clc_padding_num_warps,
-                    self.clc_tail_padding_warp_idx + self.clc_tail_padding_num_warps,
-                )
+        return (
+            max(
+                role.preferred_warp_idx + role.num_warps
+                for role in _active_warp_roles(self)
             )
-        return max(warp_ranges) * 32
+            * 32
+        )
 
     # ------------------------------------------------------------------
     # Inferred dtype attributes (derived from q_dtype / kv_dtype / out_dtype)
@@ -1808,14 +1795,9 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "correction_warp_idx", 4, explicit_fields)
             _set_if_implicit(cfg, "mma_warp_idx", 8, explicit_fields)
             _set_if_implicit(cfg, "page_offsets_warp_idx", 9, explicit_fields)
-            _set_if_implicit(cfg, "padding_warp_idx", 9, explicit_fields)
-            _set_if_implicit(cfg, "padding_num_warps", 2, explicit_fields)
             _set_if_implicit(cfg, "load_warp_idx", 11, explicit_fields)
             _set_if_implicit(cfg, "scheduler_warp_idx", 9, explicit_fields)
-            _set_if_implicit(cfg, "clc_padding_warp_idx", 10, explicit_fields)
             _set_if_implicit(cfg, "clc_load_warp_idx", 11, explicit_fields)
-            _set_if_implicit(cfg, "clc_tail_padding_warp_idx", 12, explicit_fields)
-            _set_if_implicit(cfg, "clc_tail_padding_num_warps", 4, explicit_fields)
         if cfg.tile_size_q == 128:
             _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "ordered_softmax_barrier_mode", 1, explicit_fields)
@@ -1828,6 +1810,149 @@ def _finalize_static_decode_config(
     # having to repeat the (... and not use_split_kv) check.
     if cfg.use_split_kv:
         cfg.use_persistent_scheduler = False
+
+
+@dataclass(frozen=True)
+class _WarpRole:
+    """One active task's configured warp placement."""
+
+    name: str
+    index_field: str
+    preferred_warp_idx: int
+    num_warps: int
+    is_padding: bool = False
+
+
+def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) -> None:
+    """Append padding warps to the tail of each warp group."""
+    num_warps_per_wg = [0] * MAX_WARP_GROUPS
+    total_num_wgs = 0
+    for role in roles:
+        if role.num_warps <= 0:
+            raise ValueError(f"{role.name} must use at least one warp")
+        preferred_wg = role.preferred_warp_idx // 4
+        preferred_wg_end = (role.preferred_warp_idx + role.num_warps - 1) // 4
+        if preferred_wg != preferred_wg_end:
+            raise ValueError(
+                f"{role.name} spans warp groups {preferred_wg} and {preferred_wg_end}; "
+                "each task role must fit within one warp group"
+            )
+        if preferred_wg < 0 or preferred_wg >= MAX_WARP_GROUPS:
+            raise ValueError(
+                f"{role.name} is assigned to unsupported warp group {preferred_wg}"
+            )
+        num_warps_per_wg[preferred_wg] += role.num_warps
+        total_num_wgs = max(total_num_wgs, preferred_wg + 1)
+    for wg_idx, num_warps in enumerate(num_warps_per_wg):
+        if num_warps > 4:
+            raise ValueError(
+                f"warp group {wg_idx} has {num_warps} active warps; at most 4 are allowed"
+            )
+
+    if cfg.use_persistent_scheduler:
+        total_num_wgs = MAX_WARP_GROUPS
+
+    for wg_idx, active_warps in enumerate(num_warps_per_wg):
+        padding_index_field = f"wg{wg_idx}_padding_warp_idx"
+        padding_count_field = f"wg{wg_idx}_padding_num_warps"
+        padding_warp_idx = wg_idx * 4 + active_warps
+        padding_num_warps = 4 - active_warps if wg_idx < total_num_wgs else 0
+        setattr(cfg, padding_index_field, padding_warp_idx)
+        setattr(cfg, padding_count_field, padding_num_warps)
+        if padding_num_warps > 0:
+            roles.append(
+                _WarpRole(
+                    f"wg{wg_idx}_padding",
+                    padding_index_field,
+                    padding_warp_idx,
+                    padding_num_warps,
+                    is_padding=True,
+                )
+            )
+
+
+def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
+    """Return the warp roles instantiated by the current kernel profile."""
+    roles = [
+        _WarpRole(
+            "softmax0",
+            "softmax0_warp_idx",
+            cfg.softmax0_warp_idx,
+            cfg.softmax0_num_warps,
+        ),
+        _WarpRole(
+            "correction",
+            "correction_warp_idx",
+            cfg.correction_warp_idx,
+            cfg.correction_num_warps,
+        ),
+        _WarpRole("mma", "mma_warp_idx", cfg.mma_warp_idx, cfg.mma_num_warps),
+    ]
+    if cfg.num_insts_kv != 1:
+        roles.append(
+            _WarpRole(
+                "softmax1",
+                "softmax1_warp_idx",
+                cfg.softmax1_warp_idx,
+                cfg.softmax1_num_warps,
+            )
+        )
+
+    if cfg.use_persistent_scheduler:
+        roles.extend(
+            (
+                _WarpRole(
+                    "scheduler",
+                    "scheduler_warp_idx",
+                    cfg.scheduler_warp_idx,
+                    cfg.scheduler_num_warps,
+                ),
+                _WarpRole(
+                    "load",
+                    "clc_load_warp_idx",
+                    cfg.clc_load_warp_idx,
+                    cfg.load_num_warps,
+                ),
+            )
+        )
+    else:
+        roles.append(
+            _WarpRole(
+                "load",
+                "load_warp_idx",
+                cfg.load_warp_idx,
+                cfg.load_num_warps,
+            )
+        )
+
+    if cfg.use_paged_kv:
+        roles.append(
+            _WarpRole(
+                "page_offsets",
+                "page_offsets_warp_idx",
+                cfg.page_offsets_warp_idx,
+                cfg.page_offsets_num_warps,
+            )
+        )
+    _append_padding_warp_roles(cfg, roles)
+    return roles
+
+
+def _finalize_warp_roles(cfg: FmhaDecodeConfig) -> None:
+    """Compact active warp indices and add paddings."""
+    warp_roles = sorted(
+        _active_warp_roles(cfg),
+        key=lambda role: (
+            role.preferred_warp_idx // 4,
+            role.is_padding,
+            role.preferred_warp_idx,
+        ),
+    )
+
+    next_warp_idx = 0
+    for role in warp_roles:
+        setattr(cfg, role.index_field, next_warp_idx)
+        next_warp_idx += role.num_warps
 
 
 def _make_static_decode_config(
@@ -1854,6 +1979,7 @@ def _make_static_decode_config(
         explicit_fields=explicit_fields,
     )
     _finalize_static_decode_config(cfg, explicit_fields)
+    _finalize_warp_roles(cfg)
     return cfg
 
 
@@ -3349,6 +3475,8 @@ def make_decode_config(
                 _fanout_was_explicit or grouped_q_launch is not None
             ),
         )
+
+    _finalize_warp_roles(cfg)
 
     _validate_profile_support(
         cfg=cfg,

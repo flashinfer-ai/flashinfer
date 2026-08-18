@@ -70,17 +70,19 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
-# JIT sources for the blk64 BSA kernel extension (compiled on-demand via
-# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/blk64/loader.py).
+# JIT sources for the sm100_blk64 BSA kernel extension (compiled on-demand via
+# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/sm100_blk64/loader.py).
 # These live inside the package tree rather than csrc/, so they must be
 # registered explicitly or they won't be included in non-editable installs.
-"flashinfer.cute_dsl.sparse.blk64" = [
+"flashinfer.cute_dsl.sparse.sm100_blk64" = [
   "*.cpp",
   "*.cu",
   "*.h",
   "*.hpp",
   "instantiations/*.cu",
 ]
+# Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+# runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
   "*.md",
   "src/a2a/*.cu",
@@ -120,7 +122,7 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/prims_ts/",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "build/",
 ]
@@ -145,7 +147,6 @@ extend-exclude = [
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
 ]
 force-exclude = true

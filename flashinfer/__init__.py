@@ -139,6 +139,7 @@ from .kda_prefill import (
 )
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
+from .kda_decode import packed_kda_decode as packed_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops

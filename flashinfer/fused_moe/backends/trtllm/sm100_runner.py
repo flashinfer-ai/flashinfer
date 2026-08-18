@@ -362,12 +362,14 @@ class MoERunner(TunableRunner):
                     list(da_body_workspace),
                     prepare_da_body,
                 )
-                if (
-                    kwargs.get("routing_input_mode")
-                    == RoutingInputMode.PackedPrecomputed
-                ):
+                if routing_logits is None:
+                    # FP8 per tensor scale, pre-computed routing.
                     result = self.moe_op.trtllm_fp8_per_tensor_scale_routed_moe(
+                        kwargs.get(
+                            "routing_input_mode", RoutingInputMode.PackedPrecomputed
+                        ),
                         topk_ids,
+                        topk_weights,
                         *common_args,
                     )
                 else:
