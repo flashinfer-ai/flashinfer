@@ -19,10 +19,14 @@ kernel-component model).
   (`ag_dev/investigate_blackwell`).
 - Copied subtree: `next/sources/` → `src/sources/`
 - DSL requirement: the kernels need `cutlass.utils.rubin_helpers`, which is
-  in NO public `nvidia-cutlass-dsl` release (<= 4.7.0) — only the internal
-  nightly `nvidia-cutlass-dsl-internal` (urm.nvidia.com). Validated here on
+  in NO public `nvidia-cutlass-dsl` release (<= 4.7.0; the 4.7.0 wheel
+  contains zero rubin files, and 4.8 had not shipped on public PyPI or the
+  internal index as of 2026-08-18) — only the internal nightly
+  `nvidia-cutlass-dsl-internal` (urm.nvidia.com). Validated here on
   `0.3.0+20260803235612.d88cc85` (installed by the sbatch scripts in
-  `.sqsh_build_logs/`).
+  `.sqsh_build_logs/`). When a public 4.8 ships, validate it with
+  `sbatch --export=ALL,SM107_DSL_SPEC="nvidia-cutlass-dsl==4.8.0"
+  .sqsh_build_logs/run_sm107_tests.sbatch`.
 
 ## Scope of this drop (inference only)
 
