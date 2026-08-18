@@ -341,7 +341,7 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
         """
@@ -376,6 +376,7 @@ class BlockSparseAttentionWrapper:
         self.M: Optional[int] = None
         self.N: Optional[int] = None
         self._backend = _BACKEND_ALIASES.get(backend, backend)
+        self._cake_vsa_plan: Optional[dict] = None
 
     def reset_workspace_buffer(
         self,
@@ -439,12 +440,14 @@ class BlockSparseAttentionWrapper:
         indptr : torch.Tensor, optional
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
-            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``cake``, ``vsa_sm100_blk128``,
+            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
-            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``cake``, ``vsa_sm100_blk128``,
+            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -506,7 +509,8 @@ class BlockSparseAttentionWrapper:
             for head ``h``.  For GQA (``num_qo_heads > num_kv_heads``), when providing
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
-            Only supported for the ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` backends.  When provided,
+            Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
+            and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
 
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -526,6 +530,47 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        if self._backend == "cake":
+            from flashinfer.cake_vsa import plan_cake_vsa
+
+            _vsa_common_checks(
+                "cake",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
+            )
+            if kv_data_type != q_data_type:
+                raise ValueError("cake backend requires matching Q/K/V dtypes")
+            self._cake_vsa_plan = plan_cake_vsa(
+                indptr,
+                indices,
+                block_mask,
+                M=M,
+                N=N,
+                R=R,
+                C=C,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_data_type=q_data_type,
+                sm_scale=sm_scale,
+                device=self.device,
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
@@ -1022,6 +1067,24 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        if self._backend == "cake":
+            from flashinfer.cake_vsa import run_cake_vsa
+
+            if scale_q is not None or scale_k is not None or scale_v is not None:
+                raise ValueError("cake backend does not accept FP8 scale tensors")
+            if self._cake_vsa_plan is None:
+                raise RuntimeError("plan() must be called before run()")
+            return run_cake_vsa(
+                self._cake_vsa_plan,
+                q,
+                k,
+                v,
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+                backend="cake",
+            )
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
