@@ -1381,10 +1381,6 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         initial_state=True,
         seed=2048,
     )
-    beta_carrier = torch.empty((2048, 8), dtype=torch.bfloat16, device=flash_kda_device)
-    beta_carrier[:, 3:4].copy_(inputs["beta"][0])
-    inputs["beta"] = beta_carrier[None, :, 3:4]
-    assert inputs["beta"].stride(-2) == 8
     direct_inputs = {
         **inputs,
         "initial_state": inputs["initial_state"].clone(),

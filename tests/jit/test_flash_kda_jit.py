@@ -269,6 +269,11 @@ def test_flash_kda_uri_and_jit_spec(
         assert "TensorView helper_done" in binding_text
         assert "kSmallBHGroupSize * total_tasks" in binding_text
         assert "EncodeSmallBHPacketTma(packet_workspace)" in binding_text
+        assert (
+            "const int64_t beta_token_stride = beta.stride(beta.ndim() - 2);"
+            in binding_text
+        )
+        assert "static_cast<int64_t>(beta_token_stride)" in binding_text
     assert (
         "#define FlashKDATensorMap flashkda_generated_FlashKDATensorMap" in binding_text
     )
