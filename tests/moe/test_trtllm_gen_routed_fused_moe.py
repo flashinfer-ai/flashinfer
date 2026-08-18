@@ -43,10 +43,18 @@ from flashinfer.fused_moe import (
     trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
-from flashinfer.utils import device_support_pdl, get_compute_capability
+from flashinfer.utils import (
+    device_support_pdl,
+    get_compute_capability,
+    is_sm100a_supported,
+)
 from .trtllm_gen_fused_moe_utils import (
+    FP4Moe,
     FP8BlockScaleMoe,
     QuantMode,
+    check_accuracy,
+    moe_args,
+    routing_reference,
     routing_reference_renormalize,
     routing_reference_renormalize_naive,
     routing_reference_topk,
@@ -1582,3 +1590,194 @@ def test_situ_mxfp4_mxfp8_logits_match_pre_routed(alpha_value, beta_value, clamp
             )
         ),
     )
+
+
+def test_nvfp4_routed_unpacked_lora_delta_compensation():
+    """Unpacked LoRA compensation matches packed routing and the FP4 reference."""
+    device = torch.device("cuda:0")
+    if not is_sm100a_supported(device):
+        pytest.skip("These tests require SM100/SM103 GPUs with CUDA 12.8 or newer.")
+
+    torch.manual_seed(7)
+    enable_pdl = device_support_pdl(device)
+    num_tokens, hidden_size, intermediate_size = 8, 256, 256
+    num_experts, local_num_experts, local_expert_offset, top_k = 16, 8, 4, 2
+    padding = 8
+
+    hidden_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    gemm1_weights_bf16 = (
+        torch.randn(
+            local_num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    gemm2_weights_bf16 = (
+        torch.randn(
+            local_num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    expert_factors = torch.arange(
+        1, local_num_experts + 1, device=device, dtype=torch.float32
+    ).to(torch.bfloat16)
+    gemm1_weights_bf16[:, 0, 0] = expert_factors
+    gemm2_weights_bf16[:, 0, 0] = expert_factors.flip(0)
+
+    local_topk_ids = torch.tensor(
+        [[0, 3], [2, 7], [1, 6], [5, 4], [0, 2], [6, 7], [1, 3], [4, 5]],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_ids = local_topk_ids + local_expert_offset
+    topk_weights = torch.tensor(
+        [
+            [0.625, 0.375],
+            [0.75, 0.25],
+            [0.5625, 0.4375],
+            [0.875, 0.125],
+            [0.8, 0.2],
+            [0.7, 0.3],
+            [0.6, 0.4],
+            [0.55, 0.45],
+        ],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    scores = torch.zeros(
+        num_tokens, local_num_experts, device=device, dtype=topk_weights.dtype
+    )
+    scores.scatter_(1, local_topk_ids.to(torch.int64), topk_weights)
+    permute_info = routing_reference(scores, top_k, padding)
+    torch.testing.assert_close(
+        permute_info["topKIndices"], local_topk_ids.to(torch.int64)
+    )
+    torch.testing.assert_close(permute_info["topKLogits"], topk_weights)
+
+    zero_delta = torch.zeros(
+        num_tokens, top_k, 2 * intermediate_size, device=device, dtype=torch.bfloat16
+    )
+    nonzero_delta = (
+        torch.arange(
+            num_tokens * top_k * 2 * intermediate_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        .reshape_as(zero_delta)
+        .remainder(17)
+        .sub(8)
+        .mul(0.015625)
+        .to(torch.bfloat16)
+    )
+    assert nonzero_delta.abs().max().item() > 0
+
+    moe_impl = FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4)
+    moe_impl._cache_permute_indices = {}
+    weights_data = moe_impl.quantize_weights(
+        gemm1_weights_bf16, gemm2_weights_bf16, hidden_bf16
+    )
+    reference_inputs = moe_impl.quantize_inputs(
+        hidden_bf16, weights_data["hidden_states_scale_global"]
+    )
+    reference_args = moe_args(
+        num_tokens,
+        local_num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        padding,
+        reference_inputs["hidden_states"],
+        reference_inputs["hidden_states_scale"],
+        weights_data["hidden_states_scale_global"],
+        scores,
+        weights_data["gemm1_weights"],
+        weights_data["gemm1_scales"],
+        weights_data["gemm1_scales_global"],
+        weights_data["gemm2_weights"],
+        weights_data["gemm2_scales"],
+        weights_data["gemm2_scales_global"],
+        permute_info,
+        False,
+        ActivationType.Swiglu,
+        gemm1_lora_delta=nonzero_delta,
+    )
+    reference, reference_args_dequant = moe_impl.compute_reference(reference_args)
+    static_data = moe_impl.prepare_static_weights_for_kernel(
+        reference_args_dequant,
+        reference_args,
+        gemm1_weights_bf16,
+        gemm2_weights_bf16,
+        hidden_size,
+        intermediate_size,
+        local_num_experts,
+        {"use_shuffled_weight": True, "layout": WeightLayout.MajorK},
+    )
+    assert torch.unique(static_data["scale_gate_fc1"]).numel() == local_num_experts
+
+    kernel_inputs = moe_impl.quantize_inputs(
+        hidden_bf16, weights_data["hidden_states_scale_global"], is_swizzling=False
+    )
+
+    def _run(routing_input, delta):
+        output = trtllm_fp4_block_scale_routed_moe(
+            routing_input,
+            None,
+            kernel_inputs["hidden_states"],
+            kernel_inputs["hidden_states_scale"],
+            static_data["gemm1_weights_fp4_shuffled"],
+            static_data["gemm1_scales_fp4_shuffled"],
+            None,
+            None,
+            None,
+            None,
+            static_data["gemm2_weights_fp4_shuffled"],
+            static_data["gemm2_scales_fp4_shuffled"],
+            None,
+            static_data["scale_c_fc1"],
+            static_data["scale_gate_fc1"],
+            static_data["scale_c_fc2"],
+            num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            None,
+            RoutingMethodType.Renormalize.value,
+            True,
+            enable_pdl,
+            ActivationType.Swiglu.value,
+            None,
+            None,
+            8192,
+            gemm1_lora_delta=delta,
+        )[0].to(torch.float)
+        assert output.shape == (num_tokens, hidden_size)
+        return output
+
+    unpacked_routing = (topk_ids.contiguous(), topk_weights.contiguous())
+    packed_routing = (topk_ids << 16) | (
+        topk_weights.view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    out_zero = _run(unpacked_routing, zero_delta)
+    out_unpacked = _run(unpacked_routing, nonzero_delta.clone())
+    out_packed = _run(packed_routing.contiguous(), nonzero_delta.clone())
+    assert out_zero.isfinite().all()
+    assert out_unpacked.isfinite().all()
+    assert out_packed.isfinite().all()
+    assert (out_unpacked - out_zero).abs().max().item() > 0.05
+
+    tolerances = moe_impl.get_tolerances()
+    check_accuracy(reference, out_unpacked, **tolerances)
+    check_accuracy(reference, out_packed, **tolerances)
+    torch.testing.assert_close(out_unpacked, out_packed, rtol=1e-3, atol=1e-3)

@@ -75,6 +75,10 @@ from flashinfer.fused_moe.api import (
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
+from flashinfer.fused_moe.prepare import (
+    prepare_trtllm_fp4_activations,
+    prepare_trtllm_fp4_weights,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -2487,6 +2491,58 @@ class TestFusedSharedExpertsBackendGating:
                 runner.check_support()
             checked += 1
         assert checked, "no non-supporting runners exercised"
+
+
+# 7. prepare_trtllm_fp4_* helpers (NVFP4 gaps from coverage)
+# ---------------------------------------------------------------------------
+# Activations NVFP4 path and invalid-variant rejection were weakly covered when
+# tests mostly went through TrtllmFp4Config.prepare_weights(variant=NVFP4).
+# variant=None default in prepare_trtllm_fp4_weights is deferred (Config always
+# passes an explicit QuantVariant).
+
+
+class TestPrepareTrtllmFp4Helpers:
+    _E, _I, _H = 2, 128, 256
+
+    def _bf16_weights(self):
+        E, I, H = self._E, self._I, self._H
+        return (
+            torch.randn(E, 2 * I, H, dtype=torch.bfloat16),
+            torch.randn(E, H, I, dtype=torch.bfloat16),
+        )
+
+    def test_prepare_weights_rejects_unsupported_variant(self):
+        w1, w2 = self._bf16_weights()
+        with pytest.raises(ValueError, match=r"NVFP4|MXFP4|W4A16"):
+            prepare_trtllm_fp4_weights(
+                w1,
+                w2,
+                variant=QuantVariant.BF16,
+                num_local_experts=self._E,
+                hidden_size=self._H,
+                intermediate_size=self._I,
+            )
+
+    def test_prepare_activations_rejects_unsupported_variant(self):
+        x = torch.randn(8, self._H, dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match=r"got .*BF16"):
+            prepare_trtllm_fp4_activations(
+                x,
+                variant=QuantVariant.BF16,
+            )
+
+    @sm100_required
+    def test_prepare_activations_nvfp4(self):
+        device = torch.device("cuda")
+        x = torch.randn(8, self._H, device=device, dtype=torch.bfloat16)
+        q, sf = TrtllmFp4Config.prepare_activations(x, variant=QuantVariant.NVFP4)
+        assert q.dtype == torch.uint8
+        assert q.shape == (8, self._H // 2)
+        assert sf is not None
+        assert tuple(sf.shape) == (8, self._H // 16)
+        assert sf.dtype == torch.float8_e4m3fn
+        assert torch.isfinite(sf.float()).all()
+        assert (sf.float() != 0).all()
 
 
 # ---------------------------------------------------------------------------
