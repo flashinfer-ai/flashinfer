@@ -8,7 +8,11 @@ from tests.utils_fp8 import to_float8
 
 
 @pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", [1, 48, 128])
+# m=256 is the smallest value the SM107 cute-dsl backend can serve: every
+# entry in SM107_AUTOTUNE_CONFIGS is 2-CTA with mma_tiler M=256, so the CTA
+# tile needs m >= 256 (and n >= 128).  Without it that backend has no
+# executable shape here at all.
+@pytest.mark.parametrize("m", [1, 48, 128, 256])
 @pytest.mark.parametrize("n", [64, 80, 10304])
 @pytest.mark.parametrize("k", [64, 256, 2688])
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -36,6 +40,14 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
         if input_dtype != mat2_dtype:
             pytest.skip(
                 "bmm_fp8 with cute-dsl backend requires A and B to have the same dtype."
+            )
+        # All SM107 configs are 2-CTA with mma_tiler M=256, giving a CTA tile of
+        # 256x128 once the 2x1 cluster is applied; a smaller problem cannot fill
+        # one tile and bmm_fp8 raises rather than silently picking a bad tactic.
+        if m < 256 or n < 128:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires m >= 256 and n >= 128 "
+                "(2-CTA tile); smaller problems have no valid SM107 config."
             )
     if (
         input_dtype == torch.float8_e5m2
