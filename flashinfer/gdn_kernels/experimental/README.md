@@ -146,6 +146,40 @@ differs from `flashinfer/gemm/specialized`'s eager
 the CuTe-DSL compile key but is a runtime value, so the full variant set
 cannot be precompiled from the registry alone.
 
+### `@flashinfer_api` on the op, not on the probe
+
+`gdn_fused_decode_step` carries `@flashinfer_api(trace=gdn_fused_decode_trace)`
+— template in `flashinfer/trace/templates/gdn.py`, row in `docs/fi_trace.rst`,
+example definition in `tests/trace/fi_trace_out/`.
+`gdn_fused_decode_step_supported` deliberately carries **no** decorator. The
+omission is intentional, for three reasons:
+
+- **Convention.** Support predicates in this repo are undecorated:
+  `is_sm90a_supported`, `is_sm100a_supported`, `is_sm120a_supported`,
+  `is_fa3_backend_supported`, `is_cutlass_backend_supported`,
+  `is_backend_supported`, `is_compute_capability_supported` and the rest of
+  `flashinfer/utils.py`, plus `is_trtllm_moe_supported`
+  (`flashinfer/fused_moe/core.py`), `is_mnnvl_fabric_supported`
+  (`flashinfer/comm/mnnvl.py`) and `is_cute_dsl_arch_supported`
+  (`flashinfer/cute_dsl/utils.py`). The one decorated capability probe,
+  `has_monomoe` (`flashinfer/fused_moe/monomoe.py`), sits *under*
+  `@functools.cache`, so it reaches the logging wrapper once per process
+  rather than once per call.
+- **Nothing to trace.** `fi_trace` records the shapes of a *kernel* call:
+  `docs/fi_trace.rst` presents `trace=` as the thing you attach when adding a
+  new kernel, and its output is the input format for flashinfer-bench. This
+  probe launches no kernel — it is host-side and capture-safe by contract — so
+  a trace template here would emit a benchmark definition for a function that
+  does no device work.
+- **Log volume.** `FLASHINFER_LOGLEVEL>=1` emits one line per decorated call,
+  and serving calls this probe once per GDN layer per decode step — 48 per
+  step for this model, and unlike `has_monomoe` the probe is not cached at
+  its outermost layer. That is 48 lines per step drowning a log whose purpose
+  is to show which kernels ran.
+
+Revisitable: if the probe should appear in API logs, a bare `@flashinfer_api`
+(no `trace=`) is the whole change — nothing here depends on its absence.
+
 ## Registry: `gdn_fused_decode_registry.json`
 
 The registry maps complete workload signatures to kernel implementations.
