@@ -35,6 +35,7 @@ from .gemm_svdquant import (
 )
 
 from .routergemm import (
+    mm_M1_16 as mm_M1_16,
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
@@ -114,6 +115,7 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "mm_M1_16",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
