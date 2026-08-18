@@ -18,9 +18,11 @@ kernel-component model).
   `92dd334` are identical to perf-report commit `47881ad2`
   (`ag_dev/investigate_blackwell`).
 - Copied subtree: `next/sources/` → `src/sources/`
-- DSL floor: upstream CI pins `nvidia-cutlass-dsl[cu13]==4.6.0`
-  (`ci/requirements.txt`); the kernels need `cutlass.utils.rubin_helpers`.
-  Validated here on 4.7.0.
+- DSL requirement: the kernels need `cutlass.utils.rubin_helpers`, which is
+  in NO public `nvidia-cutlass-dsl` release (<= 4.7.0) — only the internal
+  nightly `nvidia-cutlass-dsl-internal` (urm.nvidia.com). Validated here on
+  `0.3.0+20260803235612.d88cc85` (installed by the sbatch scripts in
+  `.sqsh_build_logs/`).
 
 ## Scope of this drop (inference only)
 

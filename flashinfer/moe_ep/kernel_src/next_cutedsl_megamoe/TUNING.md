@@ -50,11 +50,11 @@ are replayed verbatim through `Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`
 mega kernel launch (dispatch + FC1 + SwiGLU + FC2 + combine) via
 `sm107_block_scaled_mega_launch_thunk` over pre-staged inputs; the torch
 staging fallback is excluded, matching the upstream tester's span.
-Same protocol: 5 warmup + 20 measured iterations, per-iteration CUDA event
-pairs, and (since job 435886) the upstream per-iteration L2 flush — a 300MB
-throwaway ``randn`` outside the event window, replicating
-``tester/solver.py::perf_run`` exactly; "avg" is the mean of the four rank
-averages, "min-max" spans every rank sample. TFLOP/s = tokens x topk x 6 x hidden x intermediate / latency
+The timed loop replicates upstream ``tester/solver.py::perf_run`` exactly:
+5 warmup + 20 measured iterations, per-iteration CUDA event pairs, and the
+upstream per-iteration L2 flush (a 300MB throwaway ``randn`` enqueued
+outside the event window); "avg" is the mean of the four rank averages,
+"min-max" spans every rank sample. TFLOP/s = tokens x topk x 6 x hidden x intermediate / latency
 (balanced only — the balanced cost model is not meaningful for the
 imbalanced cases; matches the upstream convention).
 
@@ -67,9 +67,7 @@ samplers.
 Branch `sm107_support` @ vendored `92dd334`,
 `nvidia-cutlass-dsl-internal==0.3.0+20260803235612.d88cc85`, upstream
 L2-flush timing protocol. Raw samples:
-`.sqsh_build_logs/bench_sm107_mega_results_435886.jsonl`. (An earlier
-no-flush run, job 435057, produced averages within ~1% of these but with
-much wider min-max spreads — see "Reading the deltas".)
+`.sqsh_build_logs/bench_sm107_mega_results_435886.jsonl`.
 
 #### NVFP4, balanced routing
 
@@ -98,7 +96,7 @@ much wider min-max spreads — see "Reading the deltas".)
 Same harness, same shape, same replayed winner knobs with tile K 128 (the
 mxfp8 2x-mode instruction-K depth) instead of 256.  **The upstream report is
 NVFP4-only, so MXFP8 has no upstream baseline** — the reference column is our
-own NVFP4 measurement (job 435057); the ratio is the cost of doubling the
+own NVFP4 measurement (same job); the ratio is the cost of doubling the
 wire width (fp8 data + per-32 e8m0 scales vs fp4 + per-16 e4m3). Raw samples:
 `.sqsh_build_logs/bench_sm107_mega_results_435886.jsonl` (upstream L2-flush
 protocol).
@@ -132,27 +130,25 @@ nvfp4 winners), so a dedicated sweep may claw some of this back.
 
 #### Reading the deltas
 
-- **Balanced >= 8K matches upstream within ~2%** (+1.1% / +1.4% / +1.7%) at
-  8.0-8.6 PFLOP/s — the compute-bound regime, where a like-for-like
+- **Balanced >= 8K matches upstream within ~2%** (+0.3% / +1.4% / +1.8%)
+  at 8.1-8.6 PFLOP/s — the compute-bound regime, where a like-for-like
   comparison is meaningful. This validates the port end to end.
-- **Small sizes read FASTER than upstream (-14% to -41%), and the L2-flush
-  rerun proved it is NOT a harness artifact.** The initial hypothesis —
-  back-to-back launches overlapping across iterations — was tested by
-  replicating upstream's per-iteration L2 flush exactly (job 435886): the
-  min-max spreads tightened sharply (e.g. 1K: 216-270 -> 216-226 us) but
-  the averages moved <1.5%. The protocols now match line for line, so the
-  residual small-token gap (which shrinks from ~150 us at 1K to ~0 at 8K)
-  is an environment difference between the upstream Rubin TS4B node
-  (driver 615.31) and our hecate nodes — small sizes are dispatch/NVLink
-  latency-bound, where such differences live.
+- **Small sizes measure faster than the upstream report (-14% to -41%)
+  under the identical protocol** (same knobs, same warmup/iteration
+  counts, same per-iteration L2 flush, same event span). The gap shrinks
+  from ~150 us at 1K to ~0 at 8K, the profile of a fixed
+  latency/bandwidth term: small sizes are dispatch/NVLink latency-bound,
+  so this is an environment difference between the upstream Rubin TS4B
+  node (driver 615.31) and our hecate nodes, not a kernel or harness
+  difference.
 - **Power-law rows carry routing-draw noise (+/-10-20%).** The Zipf
   popularity permutation is seed-dependent; a different draw puts a
   different load on the hottest expert/rank, which gates the whole
-  collective (visible at 8K +20.5% vs 16K -1.3% with identical knobs
+  collective (visible at 8K +19.3% vs 16K -2.0% with identical knobs
   scaled). Comparisons against upstream's imbalanced rows are directional
   only.
-- Balanced-vs-power-law penalty on our numbers: +45% at 1K, +57% at 8K,
-  +50% at 32K — same qualitative growth-with-size trend as upstream's
+- Balanced-vs-power-law penalty on our numbers: +44% at 1K, +56% at 8K,
+  +49% at 32K — same qualitative growth-with-size trend as upstream's
   +7% -> +40%, amplified by the different routing draw.
 
 ## Tuner
