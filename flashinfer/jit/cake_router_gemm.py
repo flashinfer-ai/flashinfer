@@ -159,10 +159,7 @@ def _program_source(num_tokens: int, hidden_dim: int) -> Path:
         raise ValueError(f"num_tokens must be in [1, 16], got {num_tokens}")
     if hidden_dim not in (6144, 7168):
         raise ValueError(f"hidden_dim must be 6144 or 7168, got {hidden_dim}")
-    source = (
-        _source_dir()
-        / f"cake_router_gemm_m{num_tokens}_k{hidden_dim}_device.cu"
-    )
+    source = _source_dir() / f"cake_router_gemm_m{num_tokens}_k{hidden_dim}_device.cu"
     if not source.is_file():
         raise RuntimeError(
             f"Cake Router GEMM source package is incomplete for M={num_tokens}, "

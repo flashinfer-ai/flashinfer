@@ -16,9 +16,7 @@ def test_cake_router_gemm_source_matrix(num_tokens, hidden_dim):
 
     source = _program_source(num_tokens, hidden_dim)
     text = source.read_text(encoding="utf-8")
-    assert (
-        f"kernel_cake_blackwell_router_gemm_m{num_tokens}_k{hidden_dim}" in text
-    )
+    assert f"kernel_cake_blackwell_router_gemm_m{num_tokens}_k{hidden_dim}" in text
 
 
 # Positive tests
