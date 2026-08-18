@@ -1710,6 +1710,14 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
   const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
   const bool single_cta = (ctas_per_group == 1);
 
+  // The multi-CTA path uses a software barrier whose participants must all be
+  // resident concurrently.  Low-SM GPUs cannot provide that guarantee once a
+  // row spans multiple CTAs, so fail before launching instead of risking a
+  // permanent stream hang.  The barrier-free single-CTA path remains enabled.
+  if (!single_cta && num_sms <= 16) {
+    return cudaErrorNotSupported;
+  }
+
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
   if (num_groups == 0) num_groups = 1;
