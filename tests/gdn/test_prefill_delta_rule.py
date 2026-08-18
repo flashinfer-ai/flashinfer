@@ -1064,6 +1064,7 @@ def _test_prefill_kernel_state_dtype(
     seq_lens: list[int],
     scale: float,
     seed: int | None = None,
+    use_cp: str | bool = False,
 ):
     _skip_if_not_sm100()
 
@@ -1122,7 +1123,7 @@ def _test_prefill_kernel_state_dtype(
         True,
         output=our_o,
         output_state=our_state,
-        use_cp=False,
+        use_cp=use_cp,
     )
 
     torch.cuda.synchronize()
@@ -1195,3 +1196,22 @@ def test_prefill_kernel_state_dtype(
         scale,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_prefill_auto_dispatch_fp8_state(qkv_factory, state_dtype: torch.dtype):
+    with pytest.warns(
+        RuntimeWarning, match="FP8 initial_state.*falling back to non-CP"
+    ):
+        _test_prefill_kernel_state_dtype(
+            qkv_factory,
+            "bfloat16",
+            state_dtype,
+            1,
+            1,
+            1,
+            128,
+            [64],
+            1.0 / math.sqrt(128),
+            use_cp="auto",
+        )
