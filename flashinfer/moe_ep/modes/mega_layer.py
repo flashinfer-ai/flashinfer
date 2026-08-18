@@ -115,11 +115,6 @@ class MoEEpMegaLayer(nn.Module):
             )
         return self._workspace
 
-    @property
-    def supports_output_view(self) -> bool:
-        """Whether ``forward(return_workspace_view=True)`` is supported."""
-        return self._kernel.supports_output_view
-
     def warmup(self, t: Optional["MoEEpTensors"] = None) -> None:
         """Run one full eager forward so ``forward`` becomes graph-capturable.
 
@@ -182,26 +177,9 @@ class MoEEpMegaLayer(nn.Module):
             )
         return True
 
-    def forward(
-        self,
-        t: "MoEEpTensors",
-        *,
-        return_workspace_view: bool = False,
-    ) -> torch.Tensor:
-        """Run MegaMoE and return either an owned tensor or a workspace view.
-
-        The default allocates an owned output and preserves the existing API.
-        ``return_workspace_view=True`` is an opt-in for backends that support
-        it; the returned view aliases the session workspace and remains valid
-        under stream ordering until the next launch reuses that workspace.
-        """
+    def forward(self, t: "MoEEpTensors") -> torch.Tensor:
         ensure_bootstrap_dist_validated(self._bootstrap)
         quantize_input = self._resolve_quantize_input(t)
-
-        if return_workspace_view and not self.supports_output_view:
-            raise MoEEpConfigError(
-                "return_workspace_view=True is not supported by this MegaMoE backend"
-            )
 
         self._kernel.validate_forward(
             t,
@@ -220,17 +198,12 @@ class MoEEpMegaLayer(nn.Module):
 
         workspace = self._ensure_workspace()
 
-        y = None
-        if not return_workspace_view:
-            # Owned-output allocation must stay ahead of the staging round
-            # (allocator work between stage and compute can sync the device
-            # mid-round).
-            y = torch.empty(
-                t.num_tokens,
-                self._fleet_params.token_hidden_size,
-                dtype=torch.bfloat16,
-                device=t.hidden_states.device,
-            )
+        y = torch.empty(
+            t.num_tokens,
+            self._fleet_params.token_hidden_size,
+            dtype=torch.bfloat16,
+            device=t.hidden_states.device,
+        )
         self._kernel.stage_inputs(
             t,
             workspace,

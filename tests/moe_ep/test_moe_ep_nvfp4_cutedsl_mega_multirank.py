@@ -400,7 +400,6 @@ def _run_mega_layer(
     max_tokens: int = 64,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
-    check_output_view: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -515,19 +514,6 @@ def _run_mega_layer(
         # kernel's tail cleanup of its workspace counters/flags -- this is the
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
-
-        if check_output_view:
-            assert mega.supports_output_view
-            y_view = mega.forward(t, return_workspace_view=True)
-            torch.cuda.synchronize()
-            assert y_view.shape == (problem["num_tokens"], problem["hidden"])
-            assert y_view.data_ptr() == mega._workspace.output_activation.data_ptr()
-            y_view_copy = y_view.clone()
-            y_view_repeat = mega.forward(t, return_workspace_view=True)
-            torch.cuda.synchronize()
-            assert torch.equal(y_view_copy, y_layer)
-            assert torch.equal(y_view_repeat, y_layer)
-
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -637,26 +623,6 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (large tokens) matches reference"
     )
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("num_tokens", [64, 2048])
-def test_moe_ep_nvfp4_cutedsl_mega_layer_output_view(num_tokens):
-    """Public output-view API is bit-exact and reusable on every EP rank."""
-    _require_cuda()
-    rank, world_size = _launcher_ranks()
-    if world_size < 4:
-        pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(
-        rank,
-        world_size,
-        quantize_input=True,
-        num_tokens=num_tokens,
-        max_tokens=num_tokens,
-        check_output_view=True,
-    )
-    print(f"rank {rank}: output view matches copied output for {num_tokens} tokens")
 
 
 @pytest.mark.gpu_4

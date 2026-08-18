@@ -63,11 +63,6 @@ class SplitKernelBackend(ABC):
 class MegaKernelBackend(ABC):
     """Fused kernel backend that owns comm + local MoE on the mega EP path."""
 
-    # Backends opt in to returning a workspace-backed output view by setting
-    # this capability during backend registration.  Keep the default false so
-    # existing backends retain the materializing output path.
-    supports_output_view: bool = False
-
     def __init__(self, config: object) -> None:
         self._config = config
         self._transformed_weights: Any = None
