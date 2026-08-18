@@ -304,7 +304,12 @@ dcp_direct_reduce_trace = TraceTemplate(
     axes={
         "num_tokens": Var(description="Token count along dim 0."),
         "total_heads": Const(abbrev="h"),
-        "local_heads": Var(description="Heads owned by this rank."),
+        "local_heads": Var(
+            description=(
+                "Heads owned by this rank (H_total / world_size). "
+                "Read from optional caller ``out`` when provided."
+            )
+        ),
         "head_dim": Const(abbrev="d"),
     },
     inputs={
@@ -319,6 +324,17 @@ dcp_direct_reduce_trace = TraceTemplate(
         ),
         "slot": Scalar("int32"),
         "is_lse_base_on_e": Scalar("int32"),
+        "out": Tensor(
+            ["num_tokens", "local_heads", "head_dim"],
+            optional=True,
+            description="Caller-owned [T, H_local, D] destination.",
+        ),
+        "lse_out": Tensor(
+            ["num_tokens", "local_heads"],
+            optional=True,
+            dtype="float32",
+            description="Caller-owned [T, H_local] LSE destination.",
+        ),
     },
     outputs={
         "out": Tensor(

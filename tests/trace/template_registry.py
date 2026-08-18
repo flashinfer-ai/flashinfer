@@ -41,6 +41,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
+    "flashinfer.comm.dcp_direct_reduce",
     "flashinfer.concat_ops",
     "flashinfer.cudnn.decode",
     "flashinfer.cudnn.prefill",

@@ -205,6 +205,19 @@ class DcpA2aBaseline:
         self.lse[:t].copy_(lse)
 
 
+def _all_ranks_can_run_fi_a2a(group: dist.ProcessGroup) -> bool:
+    """Vote before DcpA2aBaseline so a failed probe cannot miss its barrier."""
+    try:
+        from flashinfer.comm.mnnvl import MnnvlMemory
+
+        local = bool(MnnvlMemory.supports_mnnvl())
+    except Exception:
+        local = False
+    gathered = [None] * group.size()
+    dist.all_gather_object(gathered, local)
+    return all(bool(v) for v in gathered)
+
+
 def _try_make(factory, rank: int):
     err = None
     obj = None
@@ -255,10 +268,14 @@ def main() -> None:
             "NCCL vs existing A2A is in benchmarks/bench_dcp_alltoall.py"
         )
 
-    fi_a2a = _try_make(
-        lambda: DcpA2aBaseline(group, max_tokens, h_local, HEAD_DIM, DTYPE),
-        rank,
-    )
+    fi_a2a = None
+    if _all_ranks_can_run_fi_a2a(group):
+        fi_a2a = _try_make(
+            lambda: DcpA2aBaseline(group, max_tokens, h_local, HEAD_DIM, DTYPE),
+            rank,
+        )
+    elif rank == 0:
+        print("FlashInfer DCP A2A baseline skipped: MNNVL not supported on all ranks")
     if rank == 0 and fi_a2a is not None:
         print(f"fi_a2a handle path: {fi_a2a.mnnvl_handle_path}")
 
@@ -272,11 +289,13 @@ def main() -> None:
         dist.barrier()
 
         fi_a2a_ms = (
-            _time_graph(lambda: fi_a2a.run(po, ps), po, ps)
+            _time_graph(lambda a2a=fi_a2a, o=po, s=ps: a2a.run(o, s), po, ps)
             if fi_a2a is not None
             else None
         )
-        direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
+        direct_ms = _time_graph(
+            lambda ws=workspace, o=po, s=ps: ws.run(o, s, slot=0), po, ps
+        )
 
         if rank == 0:
             a2a_str = "SKIPPED" if fi_a2a_ms is None else f"{fi_a2a_ms * 1e3:10.2f}"
