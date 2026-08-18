@@ -5,12 +5,12 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from .....core.validation.common import MoEEpConfigError, validate_mega_forward_inputs
+from ......core.validation.common import MoEEpConfigError, validate_mega_forward_inputs
 
 if TYPE_CHECKING:
     import torch
 
-    from .....config import FleetParams
+    from ......config import FleetParams
 
 
 def validate_sm90_push_nvfp4_forward_inputs(
@@ -27,12 +27,12 @@ def validate_sm90_push_nvfp4_forward_inputs(
 
     if not quantize_input:
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 accepts native bf16 activations and performs its "
+            "sm90_fp8_nvfp4_bf16_push_cuda accepts native bf16 activations and performs its "
             "wire conversion internally; MegaConfig.quantize_input must be True"
         )
     if topk_ids.ndim != 2 or topk_weights.ndim != 2:
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 routing tensors must be 2D [num_tokens, top_k]"
+            "sm90_fp8_nvfp4_bf16_push_cuda routing tensors must be 2D [num_tokens, top_k]"
         )
     validate_mega_forward_inputs(
         hidden_states,
@@ -49,28 +49,36 @@ def validate_sm90_push_nvfp4_forward_inputs(
         ("topk_weights", topk_weights, torch.float32),
     )
     if not hidden_states.is_cuda:
-        raise MoEEpConfigError("sm90_push_nvfp4 inputs must be CUDA tensors")
+        raise MoEEpConfigError(
+            "sm90_fp8_nvfp4_bf16_push_cuda inputs must be CUDA tensors"
+        )
     device = hidden_states.device
     for name, tensor, dtype in expected:
         if tensor.dtype != dtype:
             raise MoEEpConfigError(
-                f"sm90_push_nvfp4 {name} must be {dtype}, got {tensor.dtype}"
+                f"sm90_fp8_nvfp4_bf16_push_cuda {name} must be {dtype}, got {tensor.dtype}"
             )
         if tensor.device != device:
             raise MoEEpConfigError(
-                f"sm90_push_nvfp4 {name} must be on {device}, got {tensor.device}"
+                f"sm90_fp8_nvfp4_bf16_push_cuda {name} must be on {device}, got {tensor.device}"
             )
         if not tensor.is_contiguous():
-            raise MoEEpConfigError(f"sm90_push_nvfp4 {name} must be contiguous")
+            raise MoEEpConfigError(
+                f"sm90_fp8_nvfp4_bf16_push_cuda {name} must be contiguous"
+            )
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("", "0"):
         if torch.cuda.is_current_stream_capturing():
             raise MoEEpConfigError(
                 "FLASHINFER_VALIDATE_INPUTS is not supported during CUDA graph capture"
             )
         if not bool(torch.isfinite(hidden_states.float()).all()):
-            raise MoEEpConfigError("sm90_push_nvfp4 hidden_states must be finite")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda hidden_states must be finite"
+            )
         if not bool(torch.isfinite(topk_weights).all()):
-            raise MoEEpConfigError("sm90_push_nvfp4 topk_weights must be finite")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda topk_weights must be finite"
+            )
 
 
 __all__ = ["validate_sm90_push_nvfp4_forward_inputs"]

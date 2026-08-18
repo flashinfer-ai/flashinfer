@@ -487,7 +487,7 @@ class Sm90PushMoERunner:
         self._workspace = None
         self.runner = None
 
-    def bind_weights(self, weights: Sm90PushWeights) -> None:
+    def bind_weights(self, weights: object) -> None:
         """Bind a same-geometry weight bundle while the runner is idle."""
         self._require_weight_bindable()
         if weights is self._bound_weights:

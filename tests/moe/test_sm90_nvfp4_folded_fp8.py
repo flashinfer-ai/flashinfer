@@ -395,7 +395,7 @@ def test_folded_fp8_pair_rejects_inconsistent_mapping() -> None:
 
 def test_folded_fp8_bundle_is_rejected_by_nvfp4_backend_contract() -> None:
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         validate_transformed_mega_weights,
     )
 

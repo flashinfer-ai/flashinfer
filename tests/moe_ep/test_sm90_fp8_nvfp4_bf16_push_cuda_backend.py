@@ -64,16 +64,16 @@ _KEEP_ALIVE: list[object] = []
 
 
 def test_compute_rejects_weight_mismatch_after_completing_the_round() -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
         _Sm90PushNvFp4Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushNvFp4MegaKernelBackend(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=1)
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=1)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -172,7 +172,7 @@ def _build_layer(
         MegaConfig,
         MoEEpLayer,
         MoEWeightPack,
-        Sm90PushNvFp4MegaMoeConfig,
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
     total_experts = LOCAL_EXPERTS * world_size
@@ -183,7 +183,7 @@ def _build_layer(
     local_w2 = w2[begin:end].contiguous()
     transformed_weights = None
     if transformed:
-        from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
             load_modelopt_transformed_weights,
             quantize_bf16_to_nvfp4_checkpoint,
         )
@@ -226,7 +226,7 @@ def _build_layer(
             w2=local_w2,
         ),
         backend=MegaConfig(
-            megakernel=Sm90PushNvFp4MegaMoeConfig(
+            megakernel=Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
                 top_k=TOP_K,
                 nvfp4_mode=nvfp4_mode,
@@ -284,7 +284,7 @@ def _build_prepared_layer(megakernel, transformed_weights):
 
 
 def _reference(x, topk_ids, topk_weights, w13, w2):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         quantize_bf16_to_nvfp4_checkpoint,
     )
 
@@ -411,7 +411,7 @@ def test_modelopt_folded_fp8_weights_run_on_fp8_backend(
         Sm90PushFp8MegaMoeConfig,
         load_sm90_push_nvfp4_modelopt_folded_fp8_weights,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         quantize_bf16_to_nvfp4_checkpoint,
     )
 
@@ -468,10 +468,10 @@ def test_modelopt_folded_fp8_weights_run_on_fp8_backend(
 def test_folded_fp8_error_matches_online_w4a8() -> None:
     from flashinfer.moe_ep import (
         Sm90PushFp8MegaMoeConfig,
-        Sm90PushNvFp4MegaMoeConfig,
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
         make_sm90_push_nvfp4_folded_fp8_weights,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_transformed_weights_from_checkpoints,
         quantize_bf16_to_nvfp4_checkpoint,
     )
@@ -493,7 +493,7 @@ def test_folded_fp8_error_matches_online_w4a8() -> None:
     )
     x, ids, topk_weights = _make_inputs(16, LOCAL_EXPERTS, 53, device)
     online_layer = _build_prepared_layer(
-        Sm90PushNvFp4MegaMoeConfig(
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
             intermediate_size=INTERMEDIATE,
             top_k=TOP_K,
             nvfp4_mode="w4a8",
@@ -565,10 +565,10 @@ def test_folded_fp8_layout_mismatch_is_rejected(
         MoEEpConfigError,
         make_sm90_push_nvfp4_folded_fp8_weights,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.weights import (
         validate_transformed_mega_weights,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         quantize_bf16_to_nvfp4_checkpoint,
     )
 
@@ -648,7 +648,7 @@ print("UNEXPECTED-SURVIVAL")
 
 @requires_sm90
 def test_bf16_checkpoint_quantization_is_chunk_invariant(monkeypatch) -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         weights as nvfp4_weights,
     )
 

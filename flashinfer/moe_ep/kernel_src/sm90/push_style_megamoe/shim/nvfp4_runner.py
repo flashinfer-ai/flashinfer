@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import weakref
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeAlias, cast
 
 import torch
 
@@ -28,7 +28,7 @@ from .nvfp4_weights import (
 from .protocol import Sm90PushCombine, Sm90PushPipe, _run_guarded_phase
 from .runner import Sm90PushMoERunner
 
-W4A8WeightView = NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4
+W4A8WeightView: TypeAlias = NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4
 
 
 def _align(value: int, alignment: int = 128) -> int:
@@ -857,14 +857,7 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         ):
             raise ValueError("W4A16-RS w2 logical shape must be (E, H, I)")
 
-    def bind_weights(
-        self,
-        weights: (
-            Sm90PushNvFp4Weights
-            | Sm90PushNvFp4HotFoldedWeights
-            | Sm90PushNvFp4DualWeights
-        ),
-    ) -> None:
+    def bind_weights(self, weights: object) -> None:
         """Bind a same-mode, same-geometry NVFP4 bundle while idle."""
         self._require_weight_bindable()
         if weights is self._bound_weights:

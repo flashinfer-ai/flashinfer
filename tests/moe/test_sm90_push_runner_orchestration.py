@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.moe_ep import Sm90PushNvFp4MegaMoeConfig
+from flashinfer.moe_ep import Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_runner import (
     Sm90PushNvFp4MoERunner,
 )
@@ -172,7 +172,7 @@ def _run(runner):
 
 
 def test_nvfp4_static_tactic_defaults():
-    config = Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2)
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     assert config.nvfp4_mode == "w4a8"
     assert (config.rs_n_tactic, config.rs_stages, config.rs_stage_k) == (64, 3, 64)
 

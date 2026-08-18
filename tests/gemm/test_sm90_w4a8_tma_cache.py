@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from importlib import resources as importlib_resources
 from pathlib import Path
 
 import torch
@@ -31,12 +32,30 @@ from tests.gemm.test_sm90_w4a8_gemm import (
 )
 
 
+_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_SOURCE_TREE_PACKAGE_ROOT = (
+    Path(__file__).resolve().parents[2]
+    / "flashinfer"
+    / "moe_ep"
+    / "kernel_src"
+    / "sm90"
+    / "push_style_megamoe"
+)
+
+
+def _package_text(*parts: str) -> str:
+    source_tree = _SOURCE_TREE_PACKAGE_ROOT.joinpath(*parts)
+    if source_tree.is_file():
+        return source_tree.read_text(encoding="utf-8")
+
+    resource = importlib_resources.files(_PACKAGE_NAME)
+    for part in parts:
+        resource = resource / part
+    return resource.read_text(encoding="utf-8")
+
+
 def _source() -> str:
-    return (
-        Path(__file__).resolve().parents[2]
-        / "flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe/src/"
-        "nvfp4_w4a8_gemm/binding.cu"
-    ).read_text(encoding="utf-8")
+    return _package_text("src", "nvfp4_w4a8_gemm", "binding.cu")
 
 
 def _cache_stats(runner) -> tuple[int, ...]:

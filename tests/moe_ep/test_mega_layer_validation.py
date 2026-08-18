@@ -117,7 +117,7 @@ def test_mega_layer_accepts_transformed_layout_without_source_weights():
     )
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -147,7 +147,7 @@ def test_mega_layer_rejects_missing_source_and_transformed_weights():
 
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         pytest.raises(MoEEpConfigError, match="weights are required"),
     ):

@@ -6,15 +6,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
-
-#ifndef W4A8_EXPERT_N_MAJOR
-#define W4A8_EXPERT_N_MAJOR 0
-#endif
-
-#if W4A8_EXPERT_N_MAJOR != 0 && W4A8_EXPERT_N_MAJOR != 1
-#error "W4A8_EXPERT_N_MAJOR must be 0 or 1"
-#endif
 
 #ifndef SM90_PUSH_W4A8_PRODUCER_REGS
 // Keep production at 40 so N64 variants remain spill-free while preserving
@@ -205,62 +196,6 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
     return result;
   }
 
-#if W4A8_EXPERT_N_MAJOR
-  const uint64_t n_tile_count = static_cast<uint64_t>(n_tiles);
-  const int64_t signed_total_m_tiles = tile_prefix[bucket_experts];
-  if (signed_total_m_tiles < 0) {
-    return result;
-  }
-  const uint64_t total_m_tiles = static_cast<uint64_t>(signed_total_m_tiles);
-  if (total_m_tiles > std::numeric_limits<uint64_t>::max() / n_tile_count) {
-    return result;
-  }
-  const uint64_t total_tasks = total_m_tiles * n_tile_count;
-  if (task_index >= total_tasks) {
-    return result;
-  }
-
-  int32_t low = 0;
-  int32_t high = bucket_experts;
-  while (low < high) {
-    const int32_t middle = low + (high - low) / 2;
-    const int64_t signed_m_end = tile_prefix[middle + 1];
-    if (signed_m_end < 0) {
-      return result;
-    }
-    const uint64_t m_end = static_cast<uint64_t>(signed_m_end);
-    if (m_end > total_m_tiles || m_end > std::numeric_limits<uint64_t>::max() / n_tile_count) {
-      return result;
-    }
-    if (m_end * n_tile_count <= task_index) {
-      low = middle + 1;
-    } else {
-      high = middle;
-    }
-  }
-
-  const int32_t bucket_expert = low;
-  const int64_t signed_m_begin = tile_prefix[bucket_expert];
-  const int64_t signed_m_end = tile_prefix[bucket_expert + 1];
-  if (signed_m_begin < 0 || signed_m_end <= signed_m_begin) {
-    return result;
-  }
-  const uint64_t m_begin = static_cast<uint64_t>(signed_m_begin);
-  const uint64_t m_tiles = static_cast<uint64_t>(signed_m_end - signed_m_begin);
-  if (m_begin > total_m_tiles || m_begin > std::numeric_limits<uint64_t>::max() / n_tile_count) {
-    return result;
-  }
-  const uint64_t expert_task_begin = m_begin * n_tile_count;
-  if (task_index < expert_task_begin) {
-    return result;
-  }
-  const uint64_t local_task = task_index - expert_task_begin;
-  const uint64_t local_n_tile = local_task / m_tiles;
-  const uint64_t local_m_tile = local_task % m_tiles;
-  if (local_n_tile >= n_tile_count) {
-    return result;
-  }
-#else
   const uint64_t row_task = task_index / static_cast<uint64_t>(n_tiles);
   if (row_task >= static_cast<uint64_t>(tile_prefix[bucket_experts])) {
     return result;
@@ -282,7 +217,6 @@ map_grouped_task(uint64_t task_index, const int64_t* source_offsets, const int32
   const int32_t bucket_expert = low;
   const uint64_t local_m_tile = row_task - static_cast<uint64_t>(tile_prefix[bucket_expert]);
   const uint64_t local_n_tile = task_index % static_cast<uint64_t>(n_tiles);
-#endif
   const int32_t source_expert = expert_mapping[bucket_expert];
   if (source_expert < 0) {
     return result;

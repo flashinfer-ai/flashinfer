@@ -10,7 +10,7 @@ import torch
 from flashinfer.fused_moe.nvfp4_checkpoint import reference_dequantize_nvfp4
 
 from ._sm90_push_fp8_reference import reference_moe
-from .test_sm90_push_nvfp4_backend import (
+from .test_sm90_fp8_nvfp4_bf16_push_cuda_backend import (
     INTERMEDIATE,
     LOCAL_EXPERTS,
     TOKEN_CAPACITY,
@@ -25,7 +25,7 @@ from .test_sm90_push_nvfp4_backend import (
 
 
 def _checkpoints(device: torch.device, seed: int):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         quantize_bf16_to_nvfp4_checkpoint,
     )
 
@@ -43,9 +43,9 @@ def _nvfp4_config(
     hot_expert_count: int = 0,
     acknowledge_dual_residency: bool = False,
 ):
-    from flashinfer.moe_ep import Sm90PushNvFp4MegaMoeConfig
+    from flashinfer.moe_ep import Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig
 
-    return Sm90PushNvFp4MegaMoeConfig(
+    return Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=INTERMEDIATE,
         top_k=TOP_K,
         nvfp4_mode="w4a8",
@@ -74,7 +74,7 @@ def test_hot_folded_endpoints_match_existing_engines(
     hot_experts: int, payload_layout: int
 ) -> None:
     from flashinfer.moe_ep import Sm90PushFp8MegaMoeConfig
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_folded_fp8_weights_from_checkpoints,
         make_hot_folded_weights_from_checkpoints,
         make_transformed_weights_from_checkpoints,
@@ -136,7 +136,7 @@ def test_hot_folded_endpoints_match_existing_engines(
 def test_hot_folded_mixed_output_matches_hybrid_weight_oracle(
     payload_layout: int,
 ) -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_hot_folded_weights_from_checkpoints,
     )
 
@@ -184,7 +184,7 @@ def test_hot_folded_mixed_output_matches_hybrid_weight_oracle(
 
 @requires_sm90_fp8
 def test_dual_policy_matches_folded_execution_and_keeps_both_views() -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_dual_weights_from_checkpoints,
         make_hot_folded_weights_from_checkpoints,
     )
@@ -228,7 +228,7 @@ def test_dual_policy_matches_folded_execution_and_keeps_both_views() -> None:
 
 @requires_sm90_fp8
 def test_hot_folded_shared_workspace_rebind_a_b_a_preserves_results() -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_hot_folded_weights_from_checkpoints,
     )
 
@@ -258,7 +258,7 @@ def test_hot_folded_shared_workspace_rebind_a_b_a_preserves_results() -> None:
 
 @requires_sm90_fp8
 def test_hot_folded_two_layers_share_workspace_and_graph_replay() -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         make_hot_folded_weights_from_checkpoints,
     )
 

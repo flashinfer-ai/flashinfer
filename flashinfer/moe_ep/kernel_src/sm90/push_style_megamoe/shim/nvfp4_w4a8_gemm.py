@@ -15,7 +15,7 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 from ......jit.cpp_ext import is_cuda_version_at_least
 
 
-KERNEL_VERSION = 2
+KERNEL_VERSION = 3
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 SUPPORTED_RESIDUAL_SCHEMES = ("generic", "pow2")
 SUPPORTED_BLOCK_M = (64, 128)
@@ -30,28 +30,6 @@ _KNOB_SPECS = (
     ("decode_vector", "dv", "W4A8_DECODE_VECTOR", 1),
     ("generic_decode_lut", "dl", "W4A8_GENERIC_DECODE_LUT", 1),
     ("overlap", "ov", "W4A8_OVERLAP", 1),
-    ("single_ready", "sr", "W4A8_SINGLE_READY", 0),
-    ("residual_tma", "rt", "W4A8_RESIDUAL_TMA", 1),
-    (
-        "cross_stage_retire",
-        "cr",
-        "W4A8_CROSS_STAGE_RETIRE",
-        0,
-    ),
-    ("single_partial", "sp", "W4A8_SINGLE_PARTIAL", 1),
-    (
-        "split_m64_tail",
-        "mt",
-        "W4A8_SPLIT_M64_TAIL",
-        1,
-    ),
-    ("expert_n_major", "en", "W4A8_EXPERT_N_MAJOR", 0),
-    (
-        "empty_family_early_exit",
-        "ef",
-        "W4A8_EMPTY_FAMILY_EARLY_EXIT",
-        0,
-    ),
 )
 STATIC_VARIANT_COUNT = (
     len(SUPPORTED_GROUP_SIZES)
@@ -87,13 +65,6 @@ class _OptimizationKnobs:
     decode_vector: int
     generic_decode_lut: int
     overlap: int
-    single_ready: int
-    residual_tma: int
-    cross_stage_retire: int
-    single_partial: int
-    split_m64_tail: int
-    expert_n_major: int
-    empty_family_early_exit: int
     payload_layout: int
     prefer_n64_main: int
     m64_stages: int
@@ -105,13 +76,6 @@ def _optimization_knobs(
     decode_vector: bool | None = None,
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
-    single_ready: bool | None = None,
-    residual_tma: bool | None = None,
-    cross_stage_retire: bool | None = None,
-    single_partial: bool | None = None,
-    split_m64_tail: bool | None = None,
-    expert_n_major: bool | None = None,
-    empty_family_early_exit: bool | None = None,
     payload_layout: int | None = None,
     prefer_n64_main: bool | None = None,
     m64_stages: int | None = None,
@@ -122,13 +86,6 @@ def _optimization_knobs(
         "decode_vector": decode_vector,
         "generic_decode_lut": generic_decode_lut,
         "overlap": overlap,
-        "single_ready": single_ready,
-        "residual_tma": residual_tma,
-        "cross_stage_retire": cross_stage_retire,
-        "single_partial": single_partial,
-        "split_m64_tail": split_m64_tail,
-        "expert_n_major": expert_n_major,
-        "empty_family_early_exit": empty_family_early_exit,
     }
     values = {
         name: default if explicit[name] is None else int(bool(explicit[name]))
@@ -138,13 +95,6 @@ def _optimization_knobs(
         decode_vector=values["decode_vector"],
         generic_decode_lut=values["generic_decode_lut"],
         overlap=values["overlap"],
-        single_ready=values["single_ready"],
-        residual_tma=values["residual_tma"],
-        cross_stage_retire=values["cross_stage_retire"],
-        single_partial=values["single_partial"],
-        split_m64_tail=values["split_m64_tail"],
-        expert_n_major=values["expert_n_major"],
-        empty_family_early_exit=values["empty_family_early_exit"],
         payload_layout=4 if payload_layout is None else int(payload_layout),
         prefer_n64_main=int(bool(prefer_n64_main)),
         m64_stages=3 if m64_stages is None else int(m64_stages),
@@ -153,8 +103,6 @@ def _optimization_knobs(
             128 if tma_cache_capacity is None else int(tma_cache_capacity)
         ),
     )
-    if knobs.single_partial and knobs.cross_stage_retire:
-        raise ValueError("single_partial requires cross_stage_retire=0")
     if knobs.generic_decode_lut and not knobs.decode_vector:
         raise ValueError("generic_decode_lut requires decode_vector=True")
     if knobs.m64_stages not in (2, 3):
@@ -425,13 +373,6 @@ def get_sm90_push_nvfp4_w4a8_gemm_uri(
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     payload_layout: int | None = None,
-    single_ready: bool | None = None,
-    residual_tma: bool | None = None,
-    cross_stage_retire: bool | None = None,
-    single_partial: bool | None = None,
-    split_m64_tail: bool | None = None,
-    expert_n_major: bool | None = None,
-    empty_family_early_exit: bool | None = None,
     prefer_n64_main: bool | None = None,
     m64_stages: int | None = None,
     m128_stages: int | None = None,
@@ -441,13 +382,6 @@ def get_sm90_push_nvfp4_w4a8_gemm_uri(
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
         payload_layout=payload_layout,
-        single_ready=single_ready,
-        residual_tma=residual_tma,
-        cross_stage_retire=cross_stage_retire,
-        single_partial=single_partial,
-        split_m64_tail=split_m64_tail,
-        expert_n_major=expert_n_major,
-        empty_family_early_exit=empty_family_early_exit,
         prefer_n64_main=prefer_n64_main,
         m64_stages=m64_stages,
         m128_stages=m128_stages,
@@ -485,13 +419,6 @@ def gen_sm90_push_nvfp4_w4a8_gemm_module(
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     payload_layout: int | None = None,
-    single_ready: bool | None = None,
-    residual_tma: bool | None = None,
-    cross_stage_retire: bool | None = None,
-    single_partial: bool | None = None,
-    split_m64_tail: bool | None = None,
-    expert_n_major: bool | None = None,
-    empty_family_early_exit: bool | None = None,
     prefer_n64_main: bool | None = None,
     m64_stages: int | None = None,
     m128_stages: int | None = None,
@@ -501,13 +428,6 @@ def gen_sm90_push_nvfp4_w4a8_gemm_module(
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
         payload_layout=payload_layout,
-        single_ready=single_ready,
-        residual_tma=residual_tma,
-        cross_stage_retire=cross_stage_retire,
-        single_partial=single_partial,
-        split_m64_tail=split_m64_tail,
-        expert_n_major=expert_n_major,
-        empty_family_early_exit=empty_family_early_exit,
         prefer_n64_main=prefer_n64_main,
         m64_stages=m64_stages,
         m128_stages=m128_stages,
@@ -530,13 +450,6 @@ def load_sm90_push_nvfp4_w4a8_gemm_module(
     generic_decode_lut: bool | None = None,
     overlap: bool | None = None,
     payload_layout: int | None = None,
-    single_ready: bool | None = None,
-    residual_tma: bool | None = None,
-    cross_stage_retire: bool | None = None,
-    single_partial: bool | None = None,
-    split_m64_tail: bool | None = None,
-    expert_n_major: bool | None = None,
-    empty_family_early_exit: bool | None = None,
     prefer_n64_main: bool | None = None,
     m64_stages: int | None = None,
     m128_stages: int | None = None,
@@ -546,13 +459,6 @@ def load_sm90_push_nvfp4_w4a8_gemm_module(
         generic_decode_lut=generic_decode_lut,
         overlap=overlap,
         payload_layout=payload_layout,
-        single_ready=single_ready,
-        residual_tma=residual_tma,
-        cross_stage_retire=cross_stage_retire,
-        single_partial=single_partial,
-        split_m64_tail=split_m64_tail,
-        expert_n_major=expert_n_major,
-        empty_family_early_exit=empty_family_early_exit,
         prefer_n64_main=prefer_n64_main,
         m64_stages=m64_stages,
         m128_stages=m128_stages,
@@ -596,13 +502,6 @@ class Sm90W4A8GroupedGemm:
         overlap: bool | None = None,
         payload_layout: int | None = None,
         allow_legacy_layout: bool = False,
-        single_ready: bool | None = None,
-        residual_tma: bool | None = None,
-        cross_stage_retire: bool | None = None,
-        single_partial: bool | None = None,
-        split_m64_tail: bool | None = None,
-        expert_n_major: bool | None = None,
-        empty_family_early_exit: bool | None = None,
         prefer_n64_main: bool | None = None,
         m64_stages: int | None = None,
         m128_stages: int | None = None,
@@ -657,13 +556,6 @@ class Sm90W4A8GroupedGemm:
             generic_decode_lut=generic_decode_lut,
             overlap=overlap,
             payload_layout=payload_layout,
-            single_ready=single_ready,
-            residual_tma=residual_tma,
-            cross_stage_retire=cross_stage_retire,
-            single_partial=single_partial,
-            split_m64_tail=split_m64_tail,
-            expert_n_major=expert_n_major,
-            empty_family_early_exit=empty_family_early_exit,
             prefer_n64_main=prefer_n64_main,
             m64_stages=m64_stages,
             m128_stages=m128_stages,
@@ -691,7 +583,6 @@ class Sm90W4A8GroupedGemm:
             self.total_experts,
             mapping,
             device,
-            self.optimization_knobs.split_m64_tail,
         )
         if shared_schedule_workspace is not None:
             if not isinstance(shared_schedule_workspace, _W4A8ScheduleWorkspace):
@@ -701,7 +592,7 @@ class Sm90W4A8GroupedGemm:
             if shared_schedule_workspace.signature != self.schedule_signature:
                 raise ValueError(
                     "shared W4A8 schedule requires identical row capacity, experts, "
-                    "mapping, device, and M-tail policy"
+                    "mapping, and device"
                 )
             workspace = shared_schedule_workspace.tensor
             if workspace.device != device:
@@ -833,9 +724,7 @@ class Sm90W4A8GroupedGemm:
         return status
 
     def _required_resource_variants(self) -> tuple[str, ...]:
-        block_ms: tuple[int, ...] = (
-            (64, 128) if self.optimization_knobs.split_m64_tail else (128,)
-        )
+        block_ms = (64, 128)
         block_ns: tuple[int, ...]
         if self.optimization_knobs.prefer_n64_main:
             block_ns = (64,)
@@ -993,13 +882,6 @@ def create_sm90_push_nvfp4_w4a8_gemm(
     overlap: bool | None = None,
     payload_layout: int | None = None,
     allow_legacy_layout: bool = False,
-    single_ready: bool | None = None,
-    residual_tma: bool | None = None,
-    cross_stage_retire: bool | None = None,
-    single_partial: bool | None = None,
-    split_m64_tail: bool | None = None,
-    expert_n_major: bool | None = None,
-    empty_family_early_exit: bool | None = None,
     prefer_n64_main: bool | None = None,
     m64_stages: int | None = None,
     m128_stages: int | None = None,
@@ -1016,13 +898,6 @@ def create_sm90_push_nvfp4_w4a8_gemm(
         overlap=overlap,
         payload_layout=payload_layout,
         allow_legacy_layout=allow_legacy_layout,
-        single_ready=single_ready,
-        residual_tma=residual_tma,
-        cross_stage_retire=cross_stage_retire,
-        single_partial=single_partial,
-        split_m64_tail=split_m64_tail,
-        expert_n_major=expert_n_major,
-        empty_family_early_exit=empty_family_early_exit,
         prefer_n64_main=prefer_n64_main,
         m64_stages=m64_stages,
         m128_stages=m128_stages,

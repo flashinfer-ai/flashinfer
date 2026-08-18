@@ -6,9 +6,9 @@ from flashinfer.moe_ep import (
     BootstrapConfig,
     FleetParams,
     MoEEpConfigError,
-    Sm90PushNvFp4MegaMoeConfig,
+    Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
 )
-from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
     Sm90PushNvFp4MegaKernelBackend,
 )
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
@@ -29,7 +29,7 @@ def _checkpoint(experts: int, n: int, k: int) -> NVFP4Checkpoint:
 
 
 def test_e2m1_rne_midpoints_use_even_codes():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.weights import (
         _e2m1_codes,
     )
 
@@ -100,7 +100,7 @@ def test_weight_mode_mismatch_is_rejected():
 
 
 def test_modelopt_loader_requires_cuda_target_for_cpu_tensors():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.weights import (
         load_modelopt_transformed_weights,
     )
 
@@ -122,7 +122,7 @@ def test_modelopt_loader_requires_cuda_target_for_cpu_tensors():
 
 def test_modelopt_loader_builds_stage_contiguous_v4_views(monkeypatch):
     from flashinfer.fused_moe.sm90_nvfp4_repack import NVFP4SM90WeightViewV4
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.weights import (
         load_modelopt_transformed_weights,
     )
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
@@ -159,8 +159,10 @@ def test_modelopt_loader_builds_stage_contiguous_v4_views(monkeypatch):
         view.verify_checksums()
 
 
-def _validate(config: Sm90PushNvFp4MegaMoeConfig, monkeypatch) -> None:
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import backend
+def _validate(config: Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig, monkeypatch) -> None:
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        backend,
+    )
 
     monkeypatch.setattr(backend, "_validate_sm90_arch", lambda: None)
     instance = Sm90PushNvFp4MegaKernelBackend(config)
@@ -172,7 +174,7 @@ def _validate(config: Sm90PushNvFp4MegaMoeConfig, monkeypatch) -> None:
 
 def test_w4a8_accepts_bf16_wire_with_local_a8_quantization(monkeypatch):
     _validate(
-        Sm90PushNvFp4MegaMoeConfig(
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
             intermediate_size=128,
             top_k=1,
             nvfp4_mode="w4a8",
@@ -189,7 +191,7 @@ def test_rs_rejects_fp8_combine_wire(monkeypatch):
         MoEEpConfigError, match="w4a16_rs requires combine_dtype='bf16'"
     ):
         _validate(
-            Sm90PushNvFp4MegaMoeConfig(
+            Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=128,
                 top_k=1,
                 nvfp4_mode="w4a16_rs",
@@ -204,7 +206,7 @@ def test_rs_rejects_fp8_combine_wire(monkeypatch):
 def test_rs_rejects_fused_activation(monkeypatch):
     with pytest.raises(MoEEpConfigError, match="w4a16_rs requires fuse_act=False"):
         _validate(
-            Sm90PushNvFp4MegaMoeConfig(
+            Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=128,
                 top_k=1,
                 nvfp4_mode="w4a16_rs",
@@ -224,7 +226,7 @@ def test_rs_rejects_fused_activation(monkeypatch):
     ],
 )
 def test_rs_rejects_invalid_w4a8_layout_knobs(monkeypatch, field, value, match):
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=1,
         nvfp4_mode="w4a16_rs",
@@ -242,7 +244,7 @@ def test_rs_rejects_invalid_w4a8_layout_knobs(monkeypatch, field, value, match):
     [("group_size", 64), ("residual_scheme", "pow2")],
 )
 def test_rs_rejects_unused_w4a8_layout_knobs(monkeypatch, field, value):
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=1,
         nvfp4_mode="w4a16_rs",
@@ -267,7 +269,7 @@ def test_rs_rejects_unused_w4a8_layout_knobs(monkeypatch, field, value):
     ],
 )
 def test_rs_rejects_unsupported_tactic(monkeypatch, field, value, match):
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=1,
         nvfp4_mode="w4a16_rs",
@@ -282,7 +284,7 @@ def test_rs_rejects_unsupported_tactic(monkeypatch, field, value, match):
 
 def test_rs_accepts_fp8_payload_and_bf16_combine(monkeypatch):
     _validate(
-        Sm90PushNvFp4MegaMoeConfig(
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
             intermediate_size=128,
             top_k=1,
             nvfp4_mode="w4a16_rs",

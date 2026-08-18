@@ -16,6 +16,7 @@ limitations under the License.
 
 import ast
 import hashlib
+from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
@@ -148,12 +149,9 @@ def _load_safetensors_subset(
 
 
 def test_canonical_checkpoint_decoder_imports_only_stdlib_and_torch():
-    source_path = (
-        Path(__file__).resolve().parents[2]
-        / "flashinfer"
-        / "fused_moe"
-        / "nvfp4_checkpoint.py"
-    )
+    spec = find_spec("flashinfer.fused_moe.nvfp4_checkpoint")
+    assert spec is not None and spec.origin is not None
+    source_path = Path(spec.origin)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     imports = set()
     for node in ast.walk(tree):

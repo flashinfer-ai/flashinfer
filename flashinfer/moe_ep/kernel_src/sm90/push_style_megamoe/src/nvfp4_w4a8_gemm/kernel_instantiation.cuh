@@ -9,13 +9,6 @@ namespace flashinfer {
 namespace sm90_w4a8 {
 namespace detail {
 
-#if W4A8_RESIDUAL_TMA
-#define FLASHINFER_SM90_W4A8_RESIDUAL_LAUNCH_ARGUMENT params.residual_map
-#else
-#define FLASHINFER_SM90_W4A8_RESIDUAL_LAUNCH_ARGUMENT \
-  static_cast<const typename ResidualDecoder<Scheme>::Storage*>(params.residual)
-#endif
-
 template <typename Kernel>
 cudaError_t query_w4a8_kernel_resources(Kernel kernel, int threads, size_t dynamic_smem_bytes,
                                         W4A8KernelResources* resources) {
@@ -71,7 +64,7 @@ cudaError_t launch_w4a8_kernel_variant(bool debug_fp32, int32_t blocks, cudaStre
             params.row_capacity, params.logical_n, params.padded_n, params.padded_k,
             params.launch_n_tiles, params.n_tile_begin, params.bucket_experts,
             params.activation_scale_stride, params.alpha_per_expert, params.activation_map,
-            params.payload_map, FLASHINFER_SM90_W4A8_RESIDUAL_LAUNCH_ARGUMENT, params.group_scales);
+            params.payload_map, params.residual_map, params.group_scales);
   } else {
     grouped_w4a8_bf16_kernel<BlockM, BlockN, GroupSize, Scheme, PipelineStages>
         <<<blocks, kThreads, kSmemBytes, stream>>>(
@@ -80,7 +73,7 @@ cudaError_t launch_w4a8_kernel_variant(bool debug_fp32, int32_t blocks, cudaStre
             params.row_capacity, params.logical_n, params.padded_n, params.padded_k,
             params.launch_n_tiles, params.n_tile_begin, params.bucket_experts,
             params.activation_scale_stride, params.alpha_per_expert, params.activation_map,
-            params.payload_map, FLASHINFER_SM90_W4A8_RESIDUAL_LAUNCH_ARGUMENT, params.group_scales);
+            params.payload_map, params.residual_map, params.group_scales);
   }
   return cudaGetLastError();
 }
@@ -114,8 +107,6 @@ W4A8KernelVariant make_w4a8_alternate_kernel_variant() {
 }  // namespace detail
 }  // namespace sm90_w4a8
 }  // namespace flashinfer
-
-#undef FLASHINFER_SM90_W4A8_RESIDUAL_LAUNCH_ARGUMENT
 
 #define FLASHINFER_SM90_W4A8_ACCESSOR_NAME_IMPL(BlockM, BlockN) \
   get_w4a8_m##BlockM##_n##BlockN##_variants

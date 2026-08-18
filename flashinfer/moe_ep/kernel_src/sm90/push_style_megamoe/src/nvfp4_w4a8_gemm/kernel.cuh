@@ -27,64 +27,12 @@
 #error "W4A8_OVERLAP must be 0 or 1"
 #endif
 
-#ifndef W4A8_SINGLE_READY
-#define W4A8_SINGLE_READY 0
-#endif
-
-#ifndef W4A8_RESIDUAL_TMA
-#define W4A8_RESIDUAL_TMA 1
-#endif
-
-#ifndef W4A8_EMPTY_FAMILY_EARLY_EXIT
-#define W4A8_EMPTY_FAMILY_EARLY_EXIT 0
-#endif
-
-#ifndef W4A8_CROSS_STAGE_RETIRE
-#define W4A8_CROSS_STAGE_RETIRE 0
-#endif
-
-#ifndef W4A8_SINGLE_PARTIAL
-#define W4A8_SINGLE_PARTIAL 1
-#endif
-
-#ifndef W4A8_SPLIT_M64_TAIL
-#define W4A8_SPLIT_M64_TAIL 1
-#endif
-
 #ifndef W4A8_PAYLOAD_V4
 #define W4A8_PAYLOAD_V4 1
 #endif
 
-#if W4A8_SINGLE_READY != 0 && W4A8_SINGLE_READY != 1
-#error "W4A8_SINGLE_READY must be 0 or 1"
-#endif
-
-#if W4A8_RESIDUAL_TMA != 0 && W4A8_RESIDUAL_TMA != 1
-#error "W4A8_RESIDUAL_TMA must be 0 or 1"
-#endif
-
-#if W4A8_EMPTY_FAMILY_EARLY_EXIT != 0 && W4A8_EMPTY_FAMILY_EARLY_EXIT != 1
-#error "W4A8_EMPTY_FAMILY_EARLY_EXIT must be 0 or 1"
-#endif
-
-#if W4A8_CROSS_STAGE_RETIRE != 0 && W4A8_CROSS_STAGE_RETIRE != 1
-#error "W4A8_CROSS_STAGE_RETIRE must be 0 or 1"
-#endif
-
-#if W4A8_SINGLE_PARTIAL != 0 && W4A8_SINGLE_PARTIAL != 1
-#error "W4A8_SINGLE_PARTIAL must be 0 or 1"
-#endif
-
-#if W4A8_SPLIT_M64_TAIL != 0 && W4A8_SPLIT_M64_TAIL != 1
-#error "W4A8_SPLIT_M64_TAIL must be 0 or 1"
-#endif
-
 #if W4A8_PAYLOAD_V4 != 0 && W4A8_PAYLOAD_V4 != 1
 #error "W4A8_PAYLOAD_V4 must be 0 or 1"
-#endif
-
-#if W4A8_SINGLE_PARTIAL && W4A8_CROSS_STAGE_RETIRE
-#error "W4A8_SINGLE_PARTIAL requires per-stage retirement"
 #endif
 
 namespace flashinfer {
@@ -104,21 +52,16 @@ struct alignas(1024) W4A8SharedStorage {
 
   alignas(1024) uint8_t activation[kStages][BlockM * kBlockK];
   alignas(1024) uint8_t raw_payload[kStages][BlockN * kBlockK / 2];
-#if W4A8_RESIDUAL_TMA
 #if W4A8_PAYLOAD_V4
   alignas(1024) ResidualStorage residual[kStages][BlockN][kBlockK / kV3ResidualBlockK];
 #else
   alignas(1024) ResidualStorage
       residual[kStages][kBlockK / kV3PayloadTileK][BlockN][kV3ResidualsPerPayloadTile];
 #endif
-#endif
   alignas(1024) uint8_t decoded_weight[kStages][BlockN * kBlockK];
   alignas(8) uint64_t raw_full[kStages];
   alignas(8) uint64_t decoded_ready[kStages];
   alignas(8) uint64_t empty[kStages];
-#if W4A8_CROSS_STAGE_RETIRE
-  int32_t last_group[kStages];
-#endif
   GroupedTask task;
 };
 
@@ -172,34 +115,23 @@ template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme, int Pipe
 __device__ __forceinline__ void issue_tma_stage(
     W4A8SharedStorage<BlockM, BlockN, GroupSize, Scheme, PipelineStages>& storage,
     const GroupedTask& task, int k_stage, int32_t padded_n, int32_t padded_k,
-    const CUtensorMap& activation_map, const CUtensorMap& payload_map
-#if W4A8_RESIDUAL_TMA
-    ,
-    const CUtensorMap& residual_map
-#endif
-) {
+    const CUtensorMap& activation_map, const CUtensorMap& payload_map,
+    const CUtensorMap& residual_map) {
   using Storage = W4A8SharedStorage<BlockM, BlockN, GroupSize, Scheme, PipelineStages>;
   using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
   constexpr int kStages = Storage::kStages;
-  constexpr int kGroupsPerStage = Storage::kGroupsPerStage;
   constexpr int kActivationStageBytes = BlockM * kBlockK;
   constexpr int kRawStageBytes = BlockN * kBlockK / 2;
-#if W4A8_RESIDUAL_TMA
   constexpr int kResidualStageBytes =
       BlockN * (kBlockK / kV3ResidualBlockK) * sizeof(typename Storage::ResidualStorage);
-#else
-  constexpr int kResidualStageBytes = 0;
-#endif
   constexpr int kExpectedBytes = kActivationStageBytes + kRawStageBytes + kResidualStageBytes;
   const int stage = k_stage % kStages;
-  const int weight_n_tiles = padded_n / kV3PayloadTileN;
 #if W4A8_PAYLOAD_V4
+  (void)padded_n;
   const int weight_k_stages = padded_k / kBlockK;
 #else
+  const int weight_n_tiles = padded_n / kV3PayloadTileN;
   const int weight_k_tiles = padded_k / kV3PayloadTileK;
-#endif
-#if W4A8_CROSS_STAGE_RETIRE
-  storage.last_group[stage] = (k_stage + 1) * kGroupsPerStage - 1;
 #endif
   tma_load_2d(&activation_map, &storage.raw_full[stage], storage.activation[stage],
               k_stage * kBlockK, static_cast<int32_t>(task.m_begin));
@@ -207,11 +139,9 @@ __device__ __forceinline__ void issue_tma_stage(
   const int stage_cell = task.bucket_expert * weight_k_stages + k_stage;
   tma_load_3d(&payload_map, &storage.raw_full[stage], storage.raw_payload[stage], 0, task.n_begin,
               stage_cell);
-#if W4A8_RESIDUAL_TMA
   constexpr int kResidualRowsPerTmaRow = Scheme == ResidualScheme::kPow2 ? 2 : 1;
   tma_load_3d(&residual_map, &storage.raw_full[stage], &storage.residual[stage][0][0], 0,
               task.n_begin / kResidualRowsPerTmaRow, stage_cell);
-#endif
 #else
 #pragma unroll
   for (int k32 = 0; k32 < kBlockK / kV3PayloadTileK; ++k32) {
@@ -224,10 +154,8 @@ __device__ __forceinline__ void issue_tma_stage(
                   storage.raw_payload[stage] + k32 * BlockN * kV3PackedBytesPerRow +
                       n64 * kV3PayloadTileN * kV3PackedBytesPerRow,
                   0, 0, cell);
-#if W4A8_RESIDUAL_TMA
       tma_load_2d(&residual_map, &storage.raw_full[stage],
                   &storage.residual[stage][k32][n64 * kV3PayloadTileN][0], 0, cell);
-#endif
     }
   }
 #endif
@@ -257,13 +185,11 @@ __host__ __device__ constexpr int decode_tasks_per_stage() {
 #endif
 }
 
-#if !W4A8_SINGLE_READY
 template <int BlockN>
 __host__ __device__ constexpr int decoded_writer_threads() {
   constexpr int kTasks = decode_tasks_per_stage<BlockN>();
   return kTasks < kProducerThreads ? kTasks : kProducerThreads;
 }
-#endif
 
 template <int BlockN, ResidualScheme Scheme>
 __device__ __forceinline__ bool producer_decode_stage(
@@ -309,75 +235,6 @@ __device__ __forceinline__ bool producer_decode_stage(
         raw_payload + raw_index,
         decoded_weight + wgmma_swizzle_128b_offset(n_local, residual_in_stage * kV3ResidualBlockK),
         staged_residual[residual_index]);
-  }
-  return producer_thread < kDecodeTasks;
-#endif
-}
-
-template <int BlockN, ResidualScheme Scheme>
-__device__ __forceinline__ bool producer_decode_global_stage(
-    const GroupedTask& task, const uint8_t* raw_payload, uint8_t* decoded_weight, int k_stage,
-    int producer_thread, int32_t padded_k, int32_t padded_n,
-    const typename ResidualDecoder<Scheme>::Storage* residual) {
-  const int k_tiles = padded_k / kV3PayloadTileK;
-  const int n_tiles = padded_n / kV3PayloadTileN;
-#if W4A8_DECODE_VECTOR
-  constexpr int kDecodeTasks = decode_tasks_per_stage<BlockN>();
-  for (int decode_task = producer_thread; decode_task < kDecodeTasks;
-       decode_task += kProducerThreads) {
-    const int k32_in_stage = decode_task / BlockN;
-    const int n_local = decode_task % BlockN;
-    const int global_n = task.n_begin + n_local;
-    const int k_tile = k_stage * (kBlockK / kV3PayloadTileK) + k32_in_stage;
-#if W4A8_PAYLOAD_V4
-    const int64_t residual_index =
-        ((static_cast<int64_t>(task.bucket_expert) * (padded_k / kBlockK) + k_stage) * padded_n +
-         global_n) *
-            8 +
-        k32_in_stage * kV3ResidualsPerPayloadTile;
-    const int raw_index = (n_local * 4 + k32_in_stage) * kV3PackedBytesPerRow;
-#else
-    const int64_t residual_index =
-        v3_residual_offset(task.bucket_expert, k_tile, global_n / kV3PayloadTileN,
-                           global_n % kV3PayloadTileN, 0, k_tiles, n_tiles);
-    const int raw_index = (k32_in_stage * BlockN + n_local) * kV3PackedBytesPerRow;
-#endif
-    const int k_local = k32_in_stage * kV3PayloadTileK;
-    run_vector_task<Scheme>(
-        raw_payload + raw_index, decoded_weight + wgmma_swizzle_128b_offset(n_local, k_local),
-        decoded_weight + wgmma_swizzle_128b_offset(n_local, k_local + kV3ResidualBlockK),
-        residual[residual_index], residual[residual_index + 1]);
-  }
-  return producer_thread < kDecodeTasks;
-#else
-  constexpr int kDecodeTasks = decode_tasks_per_stage<BlockN>();
-  for (int decode_task = producer_thread; decode_task < kDecodeTasks;
-       decode_task += kProducerThreads) {
-    const int n_local = decode_task / (kBlockK / kV3ResidualBlockK);
-    const int residual_in_stage = decode_task % (kBlockK / kV3ResidualBlockK);
-    const int k32_in_stage = residual_in_stage / kV3ResidualsPerPayloadTile;
-    const int residual_in_k32 = residual_in_stage % kV3ResidualsPerPayloadTile;
-    const int global_n = task.n_begin + n_local;
-    const int k_tile = k_stage * (kBlockK / kV3PayloadTileK) + k32_in_stage;
-#if W4A8_PAYLOAD_V4
-    const int64_t residual_index =
-        ((static_cast<int64_t>(task.bucket_expert) * (padded_k / kBlockK) + k_stage) * padded_n +
-         global_n) *
-            8 +
-        residual_in_stage;
-    const int raw_index = (n_local * 4 + k32_in_stage) * kV3PackedBytesPerRow +
-                          residual_in_k32 * (kV3ResidualBlockK / 2);
-#else
-    const int64_t residual_index =
-        v3_residual_offset(task.bucket_expert, k_tile, global_n / kV3PayloadTileN,
-                           global_n % kV3PayloadTileN, residual_in_k32, k_tiles, n_tiles);
-    const int raw_index = (k32_in_stage * BlockN + n_local) * kV3PackedBytesPerRow +
-                          residual_in_k32 * (kV3ResidualBlockK / 2);
-#endif
-    run_scalar_task<Scheme>(
-        raw_payload + raw_index,
-        decoded_weight + wgmma_swizzle_128b_offset(n_local, residual_in_stage * kV3ResidualBlockK),
-        residual[residual_index]);
   }
   return producer_thread < kDecodeTasks;
 #endif
@@ -451,13 +308,7 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
     int64_t row_capacity, int32_t logical_n, int32_t padded_n, int32_t padded_k,
     int32_t launch_n_tiles, int32_t n_tile_begin, int32_t bucket_experts,
     int64_t activation_scale_stride, bool alpha_per_expert, const CUtensorMap& activation_map,
-    const CUtensorMap& payload_map,
-#if W4A8_RESIDUAL_TMA
-    const CUtensorMap& residual_map,
-#else
-    const typename ResidualDecoder<Scheme>::Storage* residual,
-#endif
-    const float* group_scales) {
+    const CUtensorMap& payload_map, const CUtensorMap& residual_map, const float* group_scales) {
   static_assert(std::is_same_v<Output, __nv_bfloat16> || std::is_same_v<Output, float>);
   static_assert(BlockM == 64 || BlockM == 128);
   static_assert(BlockN == 64 || BlockN == 128);
@@ -480,18 +331,10 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
   const int warp = static_cast<int>(threadIdx.x) / 32;
   const bool is_consumer = static_cast<int>(threadIdx.x) < kConsumerThreads;
 
-#if W4A8_EMPTY_FAMILY_EARLY_EXIT
-  if (tile_prefix[bucket_experts] == 0) {
-    return;
-  }
-#endif
-
   if (threadIdx.x == kConsumerThreads) {
     cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&activation_map));
     cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&payload_map));
-#if W4A8_RESIDUAL_TMA
     cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&residual_map));
-#endif
   }
 
   if constexpr (!std::is_same_v<Output, float>) {
@@ -518,12 +361,8 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
 #pragma unroll
       for (int stage = 0; stage < kStages; ++stage) {
         reinterpret_cast<FullBarrier*>(&storage.raw_full[stage])->init(1);
-#if W4A8_SINGLE_READY
-        reinterpret_cast<Barrier*>(&storage.decoded_ready[stage])->init(1);
-#else
         reinterpret_cast<Barrier*>(&storage.decoded_ready[stage])
             ->init(decoded_writer_threads<BlockN>());
-#endif
         reinterpret_cast<Barrier*>(&storage.empty[stage])->init(kConsumerWarps);
       }
       cutlass::arch::fence_view_async_shared();
@@ -537,12 +376,8 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
       if (producer_thread == 0) {
         reinterpret_cast<Barrier*>(&storage.empty[0])->wait(1);
         issue_tma_stage<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-            storage, storage.task, 0, padded_n, padded_k, activation_map, payload_map
-#if W4A8_RESIDUAL_TMA
-            ,
-            residual_map
-#endif
-        );
+            storage, storage.task, 0, padded_n, padded_k, activation_map, payload_map,
+            residual_map);
       }
 #endif
       for (int k_stage = 0; k_stage < k_stages; ++k_stage) {
@@ -554,12 +389,8 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
         reinterpret_cast<Barrier*>(&storage.empty[stage])->wait((generation + 1) & 1);
         if (producer_thread == 0) {
           issue_tma_stage<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-              storage, storage.task, k_stage, padded_n, padded_k, activation_map, payload_map
-#if W4A8_RESIDUAL_TMA
-              ,
-              residual_map
-#endif
-          );
+              storage, storage.task, k_stage, padded_n, padded_k, activation_map, payload_map,
+              residual_map);
         }
 #endif
         raw_full->wait(generation & 1);
@@ -570,16 +401,11 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
           const int next_generation = next_k_stage / kStages;
           reinterpret_cast<Barrier*>(&storage.empty[next_stage])->wait((next_generation + 1) & 1);
           issue_tma_stage<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-              storage, storage.task, next_k_stage, padded_n, padded_k, activation_map, payload_map
-#if W4A8_RESIDUAL_TMA
-              ,
-              residual_map
-#endif
-          );
+              storage, storage.task, next_k_stage, padded_n, padded_k, activation_map, payload_map,
+              residual_map);
         }
 #endif
         const bool wrote =
-#if W4A8_RESIDUAL_TMA
 #if W4A8_PAYLOAD_V4
             producer_decode_stage<BlockN, Scheme>(storage.raw_payload[stage],
                                                   &storage.residual[stage][0][0],
@@ -589,36 +415,17 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
                                                   &storage.residual[stage][0][0][0],
                                                   storage.decoded_weight[stage], producer_thread);
 #endif
-#else
-            producer_decode_global_stage<BlockN, Scheme>(
-                storage.task, storage.raw_payload[stage], storage.decoded_weight[stage], k_stage,
-                producer_thread, padded_k, padded_n, residual);
-#endif
         if (wrote) {
           fence_decoded_writer();
         }
         cutlass::arch::NamedBarrier(kProducerThreads, kProducerNamedBarrier).sync();
-#if W4A8_SINGLE_READY
-        if (producer_thread == 0) {
-          decoded_ready->arrive();
-        }
-#else
         if (wrote) {
           decoded_ready->arrive();
         }
-#endif
       }
     } else {
       float final_accum[WGMMA::kNumAccum] = {0.0F};
-#if W4A8_SINGLE_PARTIAL
       float partial[WGMMA::kNumAccum];
-#else
-      float partial[2][WGMMA::kNumAccum];
-#endif
-#if W4A8_CROSS_STAGE_RETIRE
-      float pending_activation_scale0 = 0.0F;
-      float pending_activation_scale1 = 0.0F;
-#endif
       const int math_wg = static_cast<int>(threadIdx.x) / 128;
       const int row0 = warp * 16 + lane / 4;
       const int row1 = row0 + 8;
@@ -627,89 +434,6 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
       const bool row0_valid = global_row0 < storage.task.m_end;
       const bool row1_valid = global_row1 < storage.task.m_end;
 
-#if W4A8_CROSS_STAGE_RETIRE
-      for (int k_stage = 0; k_stage < k_stages; ++k_stage) {
-        const int stage = k_stage % kStages;
-        const int generation = k_stage / kStages;
-        reinterpret_cast<Barrier*>(&storage.decoded_ready[stage])->wait(generation & 1);
-
-#pragma unroll
-        for (int group = 0; group < kGroupsPerStage; ++group) {
-          const int global_group = k_stage * kGroupsPerStage + group;
-          const int current_slot = global_group & 1;
-          // Mark the slot defined without emitting instructions; the group's
-          // first WGMMA runs with scale_d=false and overwrites every value.
-#pragma unroll
-          for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            asm volatile("" : "=f"(partial[current_slot][i]));
-          }
-          deep_gemm::warpgroup_arrive();
-#pragma unroll
-          for (int mma = 0; mma < kMmaPerGroup; ++mma) {
-            const int k_local = group * GroupSize + mma * WGMMA::K;
-            const auto desc_a = deep_gemm::make_smem_desc(
-                storage.activation[stage] + math_wg * WGMMA::M * kBlockK + k_local, 1);
-            const auto desc_b =
-                deep_gemm::make_smem_desc(storage.decoded_weight[stage] + k_local, 1);
-            WGMMA::wgmma(desc_a, desc_b, partial[current_slot], mma != 0);
-          }
-          deep_gemm::warpgroup_commit_batch();
-#pragma unroll
-          for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            deep_gemm::warpgroup_fence_operand(partial[current_slot][i]);
-          }
-
-          if (global_group != 0) {
-            deep_gemm::warpgroup_wait<1>();
-            const int retired_slot = current_slot ^ 1;
-#pragma unroll
-            for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-              deep_gemm::warpgroup_fence_operand(partial[retired_slot][i]);
-            }
-            const int retired_group = global_group - 1;
-            const int retired_k_stage = retired_group / kGroupsPerStage;
-            const int retired_stage = retired_k_stage % kStages;
-            const int retired_local_group = retired_group % kGroupsPerStage;
-            const float* retired_group_scales =
-                quant_group_scales<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-                    storage, storage.task, retired_group, retired_stage, retired_local_group,
-                    padded_n, padded_k, group_scales);
-            retire_quant_group<BlockN, GroupSize>(
-                final_accum, partial[retired_slot], pending_activation_scale0,
-                pending_activation_scale1, retired_group_scales, retired_group,
-                storage.last_group[retired_stage], &storage.empty[retired_stage], lane);
-          }
-
-          if (group == 0) {
-            const int64_t activation_scale_base =
-                static_cast<int64_t>(k_stage) * activation_scale_stride +
-                storage.task.padded_m_begin;
-            pending_activation_scale0 =
-                row0_valid ? __ldg(activation_scales + activation_scale_base + row0) : 0.0F;
-            pending_activation_scale1 =
-                row1_valid ? __ldg(activation_scales + activation_scale_base + row1) : 0.0F;
-          }
-        }
-      }
-
-      deep_gemm::warpgroup_wait<0>();
-      const int final_group = k_stages * kGroupsPerStage - 1;
-      const int final_k_stage = final_group / kGroupsPerStage;
-      const int final_stage = final_k_stage % kStages;
-      const int final_local_group = final_group % kGroupsPerStage;
-#pragma unroll
-      for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-        deep_gemm::warpgroup_fence_operand(partial[final_group & 1][i]);
-      }
-      const float* final_group_scales =
-          quant_group_scales<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-              storage, storage.task, final_group, final_stage, final_local_group, padded_n,
-              padded_k, group_scales);
-      retire_quant_group<BlockN, GroupSize>(
-          final_accum, partial[final_group & 1], pending_activation_scale0,
-          pending_activation_scale1, final_group_scales, final_group,
-          storage.last_group[final_stage], &storage.empty[final_stage], lane);
-#else
       for (int k_stage = 0; k_stage < k_stages; ++k_stage) {
         const int stage = k_stage % kStages;
         const int generation = k_stage / kStages;
@@ -724,18 +448,10 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
 #pragma unroll
         for (int group = 0; group < kGroupsPerStage; ++group) {
           const int global_group = k_stage * kGroupsPerStage + group;
-#if W4A8_SINGLE_PARTIAL
 #pragma unroll
           for (int i = 0; i < WGMMA::kNumAccum; ++i) {
             asm volatile("" : "=f"(partial[i]));
           }
-#else
-          const int current_slot = group & 1;
-#pragma unroll
-          for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            asm volatile("" : "=f"(partial[current_slot][i]));
-          }
-#endif
           deep_gemm::warpgroup_arrive();
 #pragma unroll
           for (int mma = 0; mma < kMmaPerGroup; ++mma) {
@@ -744,15 +460,10 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
                 storage.activation[stage] + math_wg * WGMMA::M * kBlockK + k_local, 1);
             const auto desc_b =
                 deep_gemm::make_smem_desc(storage.decoded_weight[stage] + k_local, 1);
-#if W4A8_SINGLE_PARTIAL
             WGMMA::wgmma(desc_a, desc_b, partial, mma != 0);
-#else
-            WGMMA::wgmma(desc_a, desc_b, partial[current_slot], mma != 0);
-#endif
           }
           deep_gemm::warpgroup_commit_batch();
 
-#if W4A8_SINGLE_PARTIAL
 #pragma unroll
           for (int i = 0; i < WGMMA::kNumAccum; ++i) {
             deep_gemm::warpgroup_fence_operand(partial[i]);
@@ -769,51 +480,8 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
           retire_quant_group<BlockN, GroupSize>(
               final_accum, partial, activation_scale0, activation_scale1, current_group_scales,
               global_group, (k_stage + 1) * kGroupsPerStage - 1, &storage.empty[stage], lane);
-#else
-#pragma unroll
-          for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            deep_gemm::warpgroup_fence_operand(partial[current_slot][i]);
-          }
-          if (group != 0) {
-            deep_gemm::warpgroup_wait<1>();
-            const int retired_slot = current_slot ^ 1;
-#pragma unroll
-            for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-              deep_gemm::warpgroup_fence_operand(partial[retired_slot][i]);
-            }
-            const int retired_group = global_group - 1;
-            const int retired_local_group = group - 1;
-            const float* retired_group_scales =
-                quant_group_scales<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-                    storage, storage.task, retired_group, stage, retired_local_group, padded_n,
-                    padded_k, group_scales);
-            accumulate_scaled_partial<BlockN, GroupSize>(final_accum, partial[retired_slot],
-                                                         activation_scale0, activation_scale1,
-                                                         retired_group_scales, lane);
-          }
-#endif
         }
-
-#if !W4A8_SINGLE_PARTIAL
-        deep_gemm::warpgroup_wait<0>();
-        constexpr int kFinalLocalGroup = kGroupsPerStage - 1;
-        const int final_slot = kFinalLocalGroup & 1;
-#pragma unroll
-        for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-          deep_gemm::warpgroup_fence_operand(partial[final_slot][i]);
-        }
-        const int final_group = (k_stage + 1) * kGroupsPerStage - 1;
-        const float* final_group_scales =
-            quant_group_scales<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(
-                storage, storage.task, final_group, stage, kFinalLocalGroup, padded_n, padded_k,
-                group_scales);
-        retire_quant_group<BlockN, GroupSize>(final_accum, partial[final_slot], activation_scale0,
-                                              activation_scale1, final_group_scales, final_group,
-                                              final_group, &storage.empty[stage], lane);
-#endif
       }
-#endif
-
       const float global_alpha = __ldg(alpha + (alpha_per_expert ? storage.task.bucket_expert : 0));
 #pragma unroll
       for (int i = 0; i < WGMMA::kNumAccum / 4; ++i) {
@@ -860,15 +528,6 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
 #endif
 }
 
-#if W4A8_RESIDUAL_TMA
-#define FLASHINFER_SM90_W4A8_RESIDUAL_PARAMETER __grid_constant__ const CUtensorMap residual_map
-#define FLASHINFER_SM90_W4A8_RESIDUAL_ARGUMENT residual_map
-#else
-#define FLASHINFER_SM90_W4A8_RESIDUAL_PARAMETER \
-  const typename ResidualDecoder<Scheme>::Storage* residual
-#define FLASHINFER_SM90_W4A8_RESIDUAL_ARGUMENT residual
-#endif
-
 #define FLASHINFER_SM90_W4A8_KERNEL_PARAMETERS(OutputType)                                         \
   OutputType *output, const float *activation_scales, const float *alpha,                          \
       const int32_t *expert_mapping, const int64_t *source_offsets, const int64_t *tile_prefix,    \
@@ -876,8 +535,8 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
       int32_t padded_k, int32_t launch_n_tiles, int32_t n_tile_begin, int32_t bucket_experts,      \
       int64_t activation_scale_stride, bool alpha_per_expert,                                      \
       __grid_constant__ const CUtensorMap activation_map,                                          \
-      __grid_constant__ const CUtensorMap payload_map, FLASHINFER_SM90_W4A8_RESIDUAL_PARAMETER,    \
-      const float *group_scales
+      __grid_constant__ const CUtensorMap payload_map,                                             \
+      __grid_constant__ const CUtensorMap residual_map, const float *group_scales
 
 template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme, int PipelineStages>
 __global__ __launch_bounds__(
@@ -892,7 +551,7 @@ __global__ __launch_bounds__(
       storage, output, activation_scales, alpha, expert_mapping, source_offsets, tile_prefix,
       task_counter, row_capacity, logical_n, padded_n, padded_k, launch_n_tiles, n_tile_begin,
       bucket_experts, activation_scale_stride, alpha_per_expert, activation_map, payload_map,
-      FLASHINFER_SM90_W4A8_RESIDUAL_ARGUMENT, group_scales);
+      residual_map, group_scales);
 }
 
 template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme, int PipelineStages>
@@ -908,24 +567,26 @@ __global__ __launch_bounds__(
       storage, output, activation_scales, alpha, expert_mapping, source_offsets, tile_prefix,
       task_counter, row_capacity, logical_n, padded_n, padded_k, launch_n_tiles, n_tile_begin,
       bucket_experts, activation_scale_stride, alpha_per_expert, activation_map, payload_map,
-      FLASHINFER_SM90_W4A8_RESIDUAL_ARGUMENT, group_scales);
+      residual_map, group_scales);
 }
 
 #undef FLASHINFER_SM90_W4A8_KERNEL_PARAMETERS
-#undef FLASHINFER_SM90_W4A8_RESIDUAL_ARGUMENT
-#undef FLASHINFER_SM90_W4A8_RESIDUAL_PARAMETER
 
+template <ResidualScheme Scheme>
 struct alignas(1024) DebugDecodeSharedStorage {
+  using ResidualStorage = typename ResidualDecoder<Scheme>::Storage;
   alignas(1024) uint8_t raw_payload[kV3PayloadTileN * kBlockK / 2];
+  alignas(1024) ResidualStorage residual[kV3PayloadTileN * (kBlockK / kV3ResidualBlockK)];
   alignas(1024) uint8_t decoded_weight[kV3PayloadTileN * kBlockK];
-  GroupedTask task;
 };
 
+template <ResidualScheme Scheme>
 __host__ __device__ constexpr size_t debug_decode_smem_bytes() {
-  return sizeof(DebugDecodeSharedStorage);
+  return sizeof(DebugDecodeSharedStorage<Scheme>);
 }
 
-static_assert(debug_decode_smem_bytes() <= kSm90OptInSharedMemoryBytes);
+static_assert(debug_decode_smem_bytes<ResidualScheme::kGeneric>() <= kSm90OptInSharedMemoryBytes);
+static_assert(debug_decode_smem_bytes<ResidualScheme::kPow2>() <= kSm90OptInSharedMemoryBytes);
 
 template <ResidualScheme Scheme>
 __global__ __launch_bounds__(kProducerThreads, 1) void debug_decode_v3_kernel(
@@ -933,7 +594,7 @@ __global__ __launch_bounds__(kProducerThreads, 1) void debug_decode_v3_kernel(
     const typename ResidualDecoder<Scheme>::Storage* residual, int32_t experts, int32_t k_tiles,
     int32_t n_tiles) {
   extern __shared__ __align__(1024) uint8_t dynamic_shared[];
-  auto& storage = *reinterpret_cast<DebugDecodeSharedStorage*>(dynamic_shared);
+  auto& storage = *reinterpret_cast<DebugDecodeSharedStorage<Scheme>*>(dynamic_shared);
   if (experts <= 0 || n_tiles <= 0 || k_tiles <= 0 || k_tiles % 4 != 0) {
     return;
   }
@@ -967,15 +628,36 @@ __global__ __launch_bounds__(kProducerThreads, 1) void debug_decode_v3_kernel(
           expert, k_stage * 4 + k32_in_stage, n_tile, n_in_tile, packed_k, k_tiles, n_tiles)];
 #endif
     }
-    if (threadIdx.x == 0) {
-      storage.task = GroupedTask{expert, expert, n_tile * kV3PayloadTileN, 0, 0, 0, true};
+    constexpr int kResidualsPerStage = kV3PayloadTileN * (kBlockK / kV3ResidualBlockK);
+    for (int local = static_cast<int>(threadIdx.x); local < kResidualsPerStage;
+         local += kProducerThreads) {
+      const int32_t n_in_tile = local / (kBlockK / kV3ResidualBlockK);
+      const int32_t residual_in_stage = local % (kBlockK / kV3ResidualBlockK);
+      const int32_t global_n = n_tile * kV3PayloadTileN + n_in_tile;
+#if W4A8_PAYLOAD_V4
+      const int64_t source_index =
+          ((static_cast<int64_t>(expert) * k_stages + k_stage) * (n_tiles * kV3PayloadTileN) +
+           global_n) *
+              (kBlockK / kV3ResidualBlockK) +
+          residual_in_stage;
+      const int32_t destination_index = local;
+#else
+      const int32_t k32_in_stage = residual_in_stage / kV3ResidualsPerPayloadTile;
+      const int32_t residual_in_k32 = residual_in_stage % kV3ResidualsPerPayloadTile;
+      const int32_t k_tile = k_stage * (kBlockK / kV3PayloadTileK) + k32_in_stage;
+      const int64_t source_index =
+          v3_residual_offset(expert, k_tile, n_tile, n_in_tile, residual_in_k32, k_tiles, n_tiles);
+      const int32_t destination_index =
+          (k32_in_stage * kV3PayloadTileN + n_in_tile) * kV3ResidualsPerPayloadTile +
+          residual_in_k32;
+#endif
+      storage.residual[destination_index] = residual[source_index];
     }
     __syncthreads();
 
-    producer_decode_global_stage<kV3PayloadTileN, Scheme>(
-        storage.task, storage.raw_payload, storage.decoded_weight, k_stage,
-        static_cast<int>(threadIdx.x), k_tiles * kV3PayloadTileK, n_tiles * kV3PayloadTileN,
-        residual);
+    producer_decode_stage<kV3PayloadTileN, Scheme>(storage.raw_payload, storage.residual,
+                                                   storage.decoded_weight,
+                                                   static_cast<int>(threadIdx.x));
     __syncthreads();
 
     constexpr int kDecodedBytes = kV3PayloadTileN * kBlockK;

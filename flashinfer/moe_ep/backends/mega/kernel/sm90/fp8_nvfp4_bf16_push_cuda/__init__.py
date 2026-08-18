@@ -1,7 +1,7 @@
-"""SM90 push NVFP4 mega-MoE backend."""
+"""SM90 FP8/NVFP4/BF16 push-CUDA mega-MoE backend."""
 
 from .backend import Sm90PushNvFp4MegaKernelBackend
-from .config import Sm90PushNvFp4MegaMoeConfig
+from .config import Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig
 from .weights import (
     estimate_residency,
     load_modelopt_dual_weights,
@@ -28,7 +28,7 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "Sm90PushNvFp4MegaKernelBackend",
-    "Sm90PushNvFp4MegaMoeConfig",
+    "Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig",
     "TransformedMegaWeights",
     "estimate_residency",
     "load_modelopt_dual_weights",

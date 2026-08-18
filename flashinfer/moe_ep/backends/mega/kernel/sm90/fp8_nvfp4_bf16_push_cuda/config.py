@@ -1,4 +1,4 @@
-"""Configuration for the SM90 push NVFP4 mega-MoE backend."""
+"""Configuration for the SM90 FP8/NVFP4/BF16 push-CUDA mega-MoE backend."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Literal
 
 
 @dataclass
-class Sm90PushNvFp4MegaMoeConfig:
+class Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig:
     """Static dimensions, NVFP4 layout, and push-wire choices.
 
     ``packed`` remains the lowest-memory default (241.5 MiB versus 336.1 MiB
@@ -20,7 +20,7 @@ class Sm90PushNvFp4MegaMoeConfig:
 
     intermediate_size: int
     top_k: int
-    kernel_name: str = "sm90_push_nvfp4"
+    kernel_name: str = "sm90_fp8_nvfp4_bf16_push_cuda"
     nvfp4_mode: Literal["w4a8", "w4a16_rs"] = "w4a8"
     weight_policy: Literal["packed", "folded", "hot_folded", "dual"] = "packed"
     hot_expert_count: int = 0
@@ -44,4 +44,4 @@ class Sm90PushNvFp4MegaMoeConfig:
     init_timeout_s: float = 600.0
 
 
-__all__ = ["Sm90PushNvFp4MegaMoeConfig"]
+__all__ = ["Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig"]

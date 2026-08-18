@@ -8,8 +8,27 @@ from unittest import mock
 import pytest
 
 
+def test_deprecated_sm90_push_nvfp4_name_resolves_to_canonical_backend():
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
+        Sm90PushNvFp4MegaKernelBackend,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        kernel_name="sm90_push_nvfp4",
+    )
+    with pytest.warns(DeprecationWarning, match="sm90_push_nvfp4"):
+        backend = create_mega_kernel(config)
+
+    assert isinstance(backend, Sm90PushNvFp4MegaKernelBackend)
+    assert backend.kernel_name() == "sm90_fp8_nvfp4_bf16_push_cuda"
+
+
 def _make_backend(config, *, process_group=None, rank=1, world_size=2):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
     )
 
@@ -97,16 +116,16 @@ def test_nvfp4_production_rs_runner_uses_frozen_kernel_variant(monkeypatch):
 
 
 def test_nvfp4_staging_rebinds_layer_weights_and_records_lease():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
         _Sm90PushNvFp4Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushNvFp4MegaKernelBackend(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -137,16 +156,16 @@ def test_nvfp4_staging_rebinds_layer_weights_and_records_lease():
 
 
 def test_nvfp4_compute_finishes_round_before_rejecting_different_weights():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
         _Sm90PushNvFp4Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushNvFp4MegaKernelBackend(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -176,16 +195,16 @@ def test_nvfp4_compute_finishes_round_before_rejecting_different_weights():
     [("idle", False), ("poisoned", True)],
 )
 def test_nvfp4_compute_mirrors_runner_poison_state(runner_state, expected_poisoned):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
         _Sm90PushNvFp4Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushNvFp4MegaKernelBackend(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -208,11 +227,11 @@ def test_nvfp4_compute_mirrors_runner_poison_state(runner_state, expected_poison
 
 
 def test_nvfp4_workspace_pool_key_covers_construction_state():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
 
-    config = Sm90PushNvFp4MegaMoeConfig(intermediate_size=256, top_k=2)
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=256, top_k=2)
     fleet = SimpleNamespace(
         num_experts=8,
         max_tokens_per_rank=64,
@@ -303,10 +322,10 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
 
 def test_nvfp4_dual_policy_requires_explicit_residency_acknowledgement():
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         backend as backend_module,
     )
 
@@ -316,7 +335,7 @@ def test_nvfp4_dual_policy_requires_explicit_residency_acknowledgement():
         token_hidden_size=128,
     )
     bootstrap = SimpleNamespace(world_size=2, stream=0)
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         weight_policy="dual",
@@ -345,10 +364,10 @@ def test_nvfp4_dual_policy_requires_explicit_residency_acknowledgement():
 )
 def test_nvfp4_rejects_invalid_w4a8_tuning_config(changes, message):
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         backend as backend_module,
     )
 
@@ -359,7 +378,7 @@ def test_nvfp4_rejects_invalid_w4a8_tuning_config(changes, message):
     )
     bootstrap = SimpleNamespace(world_size=2, stream=0)
     config = replace(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2),
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2),
         **changes,
     )
     with (
@@ -371,10 +390,10 @@ def test_nvfp4_rejects_invalid_w4a8_tuning_config(changes, message):
 
 
 def test_nvfp4_rs_ignores_the_w4a8_payload_layout_selector():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         backend as backend_module,
     )
 
@@ -384,7 +403,7 @@ def test_nvfp4_rs_ignores_the_w4a8_payload_layout_selector():
         token_hidden_size=128,
     )
     bootstrap = SimpleNamespace(world_size=2, stream=0)
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         nvfp4_mode="w4a16_rs",
@@ -402,10 +421,10 @@ def test_nvfp4_rs_ignores_the_w4a8_payload_layout_selector():
 
 def test_nvfp4_w4a8_legacy_layout_requires_explicit_opt_in():
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         backend as backend_module,
     )
 
@@ -415,7 +434,7 @@ def test_nvfp4_w4a8_legacy_layout_requires_explicit_opt_in():
         token_hidden_size=128,
     )
     bootstrap = SimpleNamespace(world_size=2, stream=0)
-    config = Sm90PushNvFp4MegaMoeConfig(
+    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         payload_layout=3,
@@ -437,7 +456,7 @@ def test_nvfp4_w4a8_legacy_layout_requires_explicit_opt_in():
 
 
 def test_nvfp4_residency_estimate_separates_policy_components():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
         estimate_residency,
     )
 
@@ -488,12 +507,12 @@ def test_nvfp4_residency_estimate_separates_policy_components():
 
 
 def test_nvfp4_destroy_uses_workspace_pool_refcount(monkeypatch):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.backend import (
         Sm90PushNvFp4MegaKernelBackend,
         _Sm90PushNvFp4Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4.config import (
-        Sm90PushNvFp4MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda.config import (
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel import workspace_pool
 
@@ -501,10 +520,11 @@ def test_nvfp4_destroy_uses_workspace_pool_refcount(monkeypatch):
     monkeypatch.setattr(workspace_pool, "_KEY_BY_ID", {})
     runner = mock.Mock()
     workspace = _Sm90PushNvFp4Workspace(pipe=object(), runner=runner)
-    first = workspace_pool.acquire_workspace(("sm90_push_nvfp4",), lambda: workspace)
-    second = workspace_pool.acquire_workspace(("sm90_push_nvfp4",), lambda: workspace)
+    key = ("sm90_fp8_nvfp4_bf16_push_cuda",)
+    first = workspace_pool.acquire_workspace(key, lambda: workspace)
+    second = workspace_pool.acquire_workspace(key, lambda: workspace)
     backend = Sm90PushNvFp4MegaKernelBackend(
-        Sm90PushNvFp4MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
 
     backend.destroy(first)

@@ -5,13 +5,13 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, Literal, Mapping, TypeAlias, cast
 
-from .....core.validation.common import MoEEpConfigError
-from .....weights import MoEWeightPack
+from ......core.validation.common import MoEEpConfigError
+from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
     import torch
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         Sm90PushNvFp4DualWeights,
         Sm90PushNvFp4HotFoldedWeights,
         Sm90PushNvFp4Weights,
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 def __getattr__(name: str) -> object:
     if name == "TransformedMegaWeights":
-        from .....kernel_src.sm90.push_style_megamoe import (
+        from ......kernel_src.sm90.push_style_megamoe import (
             Sm90PushNvFp4DualWeights,
             Sm90PushNvFp4HotFoldedWeights,
             Sm90PushNvFp4Weights,
@@ -68,7 +68,7 @@ def quantize_bf16_to_nvfp4_checkpoint(
     """Quantize canonical BF16 expert weights into the linear NVFP4 contract."""
 
     import torch
-    from ......fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
+    from .......fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
 
     if weights.dtype != torch.bfloat16 or weights.ndim != 3:
         raise MoEEpConfigError("weights must be contiguous BF16 [E,N,K]")
@@ -147,7 +147,7 @@ def make_transformed_weights_from_checkpoints(
     residual_scheme: str,
     payload_layout: Literal[3, 4] = 4,
 ):
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         make_sm90_push_nvfp4_weights_from_checkpoints,
     )
 
@@ -176,7 +176,7 @@ def make_folded_fp8_weights_from_checkpoints(
     ``interleave_gate_up`` must match the config's ``fuse_fc1_epilogue`` value.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         make_sm90_push_folded_fp8_weights_from_checkpoints,
     )
 
@@ -202,12 +202,12 @@ def make_hot_folded_weights_from_checkpoints(
     suffix remain resident, and forward calls select them by the frozen local-
     expert prefix without host-side routing decisions.
 
-    Use ``MegaConfig(megakernel=Sm90PushNvFp4MegaMoeConfig(
+    Use ``MegaConfig(megakernel=Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
     nvfp4_mode="w4a8"), preprocess_weights=False,
     transformed_weights=bundle)`` and construct the layer with ``weights=None``.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints,
     )
 
@@ -236,7 +236,7 @@ def make_dual_weights_from_checkpoints(
     selecting the doubled representation accidentally.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         make_sm90_push_nvfp4_dual_weights_from_checkpoints,
     )
 
@@ -261,7 +261,7 @@ def estimate_residency(
 ):
     """Return geometry-derived packed and folded resident byte counts."""
 
-    from .....kernel_src.sm90.push_style_megamoe import estimate_nvfp4_residency
+    from ......kernel_src.sm90.push_style_megamoe import estimate_nvfp4_residency
 
     return estimate_nvfp4_residency(
         local_experts,
@@ -285,7 +285,7 @@ def load_modelopt_transformed_weights(
     payload_layout: Literal[3, 4] = 4,
     device: "torch.device | str | None" = None,
 ):
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         load_sm90_push_nvfp4_modelopt_weights,
     )
 
@@ -320,7 +320,7 @@ def load_modelopt_folded_fp8_weights(
     CUDA source tensors remain owned by the caller.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         load_sm90_push_nvfp4_modelopt_folded_fp8_weights,
     )
 
@@ -350,12 +350,12 @@ def load_modelopt_hot_folded_weights(
     provided. The returned folded prefix and packed suffix remain resident;
     forward calls perform no folding or host-side expert selection.
 
-    Use ``MegaConfig(megakernel=Sm90PushNvFp4MegaMoeConfig(
+    Use ``MegaConfig(megakernel=Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
     nvfp4_mode="w4a8"), preprocess_weights=False,
     transformed_weights=bundle)`` and construct the layer with ``weights=None``.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         load_sm90_push_nvfp4_modelopt_hot_folded_weights,
     )
 
@@ -387,7 +387,7 @@ def load_modelopt_dual_weights(
     ``acknowledge_dual_residency=True``.
     """
 
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         load_sm90_push_nvfp4_modelopt_dual_weights,
     )
 
@@ -415,12 +415,12 @@ def validate_transformed_mega_weights(
     weight_policy: str = "packed",
     hot_expert_count: int = 0,
 ) -> None:
-    from ......fused_moe.sm90_nvfp4_repack import (
+    from .......fused_moe.sm90_nvfp4_repack import (
         NVFP4RSWeightView,
         NVFP4SM90WeightViewV3,
         NVFP4SM90WeightViewV4,
     )
-    from .....kernel_src.sm90.push_style_megamoe import (
+    from ......kernel_src.sm90.push_style_megamoe import (
         Sm90PushNvFp4DualWeights,
         Sm90PushNvFp4HotFoldedWeights,
         Sm90PushNvFp4Weights,
@@ -444,7 +444,7 @@ def validate_transformed_mega_weights(
             payload_layout=payload_layout,
             weight_policy="packed",
         )
-        from ..sm90_push_fp8.weights import (
+        from ..fp8_fp8_bf16_push_cuda.weights import (
             validate_transformed_mega_weights as validate_fp8_weights,
         )
 
@@ -482,7 +482,7 @@ def validate_transformed_mega_weights(
         if transformed_weights.hot_fp8 is not None:
             hot = transformed_weights.hot_fp8
             expected_hot = transformed_weights.hot_experts
-            from ..sm90_push_fp8.weights import (
+            from ..fp8_fp8_bf16_push_cuda.weights import (
                 validate_transformed_mega_weights as validate_fp8_weights,
             )
 
@@ -507,33 +507,33 @@ def validate_transformed_mega_weights(
             ):
                 if not isinstance(view, w4a8_view_types):
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} is not a W4A8 view"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} is not a W4A8 view"
                     )
                 if view.manifest.layout_version != payload_layout:
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} payload layout does not match config"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} payload layout does not match config"
                     )
                 if tuple(view.manifest.logical_shape) != shape:
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} logical shape must be {shape}"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} logical shape must be {shape}"
                     )
                 if view.manifest.group_size != group_size:
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} group_size does not match config"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} group_size does not match config"
                     )
                 if view.manifest.residual_scheme != residual_scheme:
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} residual_scheme does not match config"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} residual_scheme does not match config"
                     )
                 if not view.packed_e2m1.is_cuda:
                     raise MoEEpConfigError(
-                        f"sm90_push_nvfp4 {label} must be on a CUDA device"
+                        f"sm90_fp8_nvfp4_bf16_push_cuda {label} must be on a CUDA device"
                     )
             cold_w13 = cast("NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4", cold.w13)
             cold_w2 = cast("NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4", cold.w2)
             if cold_w13.packed_e2m1.device != cold_w2.packed_e2m1.device:
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 cold weights must share a CUDA device"
+                    "sm90_fp8_nvfp4_bf16_push_cuda cold weights must share a CUDA device"
                 )
             if (
                 transformed_weights.hot_fp8 is not None
@@ -541,20 +541,20 @@ def validate_transformed_mega_weights(
                 != transformed_weights.hot_fp8.w13_fp8.device
             ):
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 hot and cold weights must share a CUDA device"
+                    "sm90_fp8_nvfp4_bf16_push_cuda hot and cold weights must share a CUDA device"
                 )
         return
 
     if not isinstance(transformed_weights, Sm90PushNvFp4Weights):
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 transformed weights must be "
+            "sm90_fp8_nvfp4_bf16_push_cuda transformed weights must be "
             f"Sm90PushNvFp4Weights, got {type(transformed_weights).__name__}"
         )
     if weight_policy != "packed":
         raise MoEEpConfigError("packed NVFP4 weights require weight_policy='packed'")
     if transformed_weights.nvfp4_mode != nvfp4_mode:
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 weight mode does not match config: "
+            "sm90_fp8_nvfp4_bf16_push_cuda weight mode does not match config: "
             f"{transformed_weights.nvfp4_mode!r} != {nvfp4_mode!r}"
         )
     expected_shapes = (
@@ -569,31 +569,33 @@ def validate_transformed_mega_weights(
             strict=True,
         ):
             if not isinstance(view, w4a8_view_types):
-                raise MoEEpConfigError(f"sm90_push_nvfp4 {label} is not a W4A8 view")
+                raise MoEEpConfigError(
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} is not a W4A8 view"
+                )
             if view.manifest.layout_version != payload_layout:
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} payload layout does not match config"
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} payload layout does not match config"
                 )
             if tuple(view.manifest.logical_shape) != shape:
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} logical shape must be {shape}, got "
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} logical shape must be {shape}, got "
                     f"{tuple(view.manifest.logical_shape)}"
                 )
             if view.manifest.group_size != group_size:
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} group_size does not match config"
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} group_size does not match config"
                 )
             if view.manifest.residual_scheme != residual_scheme:
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} residual_scheme does not match config"
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} residual_scheme does not match config"
                 )
             if tuple(view.manifest.expert_mapping) != tuple(range(num_local_experts)):
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} must map every local expert in order"
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} must map every local expert in order"
                 )
             if not view.packed_e2m1.is_cuda:
                 raise MoEEpConfigError(
-                    f"sm90_push_nvfp4 {label} must be on a CUDA device"
+                    f"sm90_fp8_nvfp4_bf16_push_cuda {label} must be on a CUDA device"
                 )
         w13_view = cast(
             "NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4",
@@ -604,27 +606,33 @@ def validate_transformed_mega_weights(
             transformed_weights.w2,
         )
         if w13_view.packed_e2m1.device != w2_view.packed_e2m1.device:
-            raise MoEEpConfigError("sm90_push_nvfp4 weights must share a CUDA device")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda weights must share a CUDA device"
+            )
         return
     if nvfp4_mode != "w4a16_rs":
         raise MoEEpConfigError(f"unsupported nvfp4_mode {nvfp4_mode!r}")
     w13, w2 = transformed_weights.w13, transformed_weights.w2
     if not isinstance(w13, NVFP4RSWeightView) or not isinstance(w2, NVFP4RSWeightView):
-        raise MoEEpConfigError("sm90_push_nvfp4 RS mode requires two RS views")
+        raise MoEEpConfigError(
+            "sm90_fp8_nvfp4_bf16_push_cuda RS mode requires two RS views"
+        )
     if tuple(w13.payload.shape[:3]) != (
         num_local_experts,
         (2 * intermediate_size) // 64,
         hidden_size // 16,
     ):
-        raise MoEEpConfigError("sm90_push_nvfp4 w13 RS shape mismatch")
+        raise MoEEpConfigError("sm90_fp8_nvfp4_bf16_push_cuda w13 RS shape mismatch")
     if tuple(w2.payload.shape[:3]) != (
         num_local_experts,
         hidden_size // 64,
         intermediate_size // 16,
     ):
-        raise MoEEpConfigError("sm90_push_nvfp4 w2 RS shape mismatch")
+        raise MoEEpConfigError("sm90_fp8_nvfp4_bf16_push_cuda w2 RS shape mismatch")
     if not w13.payload.is_cuda or w13.payload.device != w2.payload.device:
-        raise MoEEpConfigError("sm90_push_nvfp4 RS weights must share a CUDA device")
+        raise MoEEpConfigError(
+            "sm90_fp8_nvfp4_bf16_push_cuda RS weights must share a CUDA device"
+        )
 
 
 def preprocess_mega_weights(
@@ -644,16 +652,16 @@ def preprocess_mega_weights(
 
     if nvfp4_mode not in ("w4a8", "w4a16_rs"):
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
+            "sm90_fp8_nvfp4_bf16_push_cuda nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
         )
     if not isinstance(weights, MoEWeightPack):
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 weights must be MoEWeightPack, got "
+            "sm90_fp8_nvfp4_bf16_push_cuda weights must be MoEWeightPack, got "
             f"{type(weights).__name__}"
         )
     if weights.w13_scale is not None or weights.w2_scale is not None:
         raise MoEEpConfigError(
-            "sm90_push_nvfp4 canonical preprocessing accepts BF16 weights only; "
+            "sm90_fp8_nvfp4_bf16_push_cuda canonical preprocessing accepts BF16 weights only; "
             "pass Sm90PushNvFp4Weights through MegaConfig.transformed_weights "
             "for a quantized checkpoint"
         )
@@ -664,14 +672,16 @@ def preprocess_mega_weights(
     for name, tensor, shape in expected:
         if tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
             raise MoEEpConfigError(
-                f"sm90_push_nvfp4 {name} must be BF16 with shape {shape}"
+                f"sm90_fp8_nvfp4_bf16_push_cuda {name} must be BF16 with shape {shape}"
             )
         if not tensor.is_cuda or not tensor.is_contiguous():
             raise MoEEpConfigError(
-                f"sm90_push_nvfp4 {name} must be a contiguous CUDA tensor"
+                f"sm90_fp8_nvfp4_bf16_push_cuda {name} must be a contiguous CUDA tensor"
             )
     if weights.w13.device != weights.w2.device:
-        raise MoEEpConfigError("sm90_push_nvfp4 w13 and w2 must share a device")
+        raise MoEEpConfigError(
+            "sm90_fp8_nvfp4_bf16_push_cuda w13 and w2 must share a device"
+        )
     w13_checkpoint = quantize_bf16_to_nvfp4_checkpoint(weights.w13)
     w2_checkpoint = quantize_bf16_to_nvfp4_checkpoint(weights.w2)
     if weight_policy == "packed":

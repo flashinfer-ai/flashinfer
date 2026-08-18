@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import ast
+from importlib import resources as importlib_resources
 import re
 import subprocess
 import sys
-from importlib import resources as importlib_resources
 from pathlib import Path
 from types import SimpleNamespace
 

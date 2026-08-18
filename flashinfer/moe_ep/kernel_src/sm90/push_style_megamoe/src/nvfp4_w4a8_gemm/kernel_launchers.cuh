@@ -31,15 +31,10 @@ struct W4A8KernelLaunchParams {
   int32_t bucket_experts;
   int64_t activation_scale_stride;
   bool alpha_per_expert;
-#if !W4A8_RESIDUAL_TMA
-  const void* residual;
-#endif
   const float* group_scales;
   CUtensorMap activation_map;
   CUtensorMap payload_map;
-#if W4A8_RESIDUAL_TMA
   CUtensorMap residual_map;
-#endif
 };
 
 struct W4A8KernelResources {

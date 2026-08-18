@@ -179,10 +179,8 @@ struct W4A8WeightTmaCacheKey {
 struct W4A8WeightTmaMaps {
   CUtensorMap payload_n64{};
   CUtensorMap payload_n128{};
-#if W4A8_RESIDUAL_TMA
   CUtensorMap residual_n64{};
   CUtensorMap residual_n128{};
-#endif
 };
 
 struct W4A8WeightTmaCacheEntry {
@@ -193,9 +191,6 @@ struct W4A8WeightTmaCacheEntry {
 struct W4A8ResolvedTmaMaps {
   W4A8ActivationTmaMaps activation{};
   W4A8WeightTmaMaps weight{};
-#if !W4A8_RESIDUAL_TMA
-  const void* residual = nullptr;
-#endif
   const float* group_scales = nullptr;
 };
 
@@ -268,13 +263,8 @@ __global__ void prepare_grouped_schedule_kernel(
       return;
     }
     const int64_t rows = end - begin;
-#if W4A8_SPLIT_M64_TAIL
     const int64_t tiles_m64 = m64_tile_count(rows);
     const int64_t tiles_m128 = m128_tile_count(rows);
-#else
-    constexpr int64_t tiles_m64 = 0;
-    const int64_t tiles_m128 = ceil_div_nonnegative(rows, 128);
-#endif
     if (tiles_m64 > std::numeric_limits<int64_t>::max() - prefix_m64 ||
         tiles_m128 > std::numeric_limits<int64_t>::max() - prefix_m128) {
       tile_prefix_m64[0] = -1;
@@ -499,7 +489,7 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
 
   template <ResidualScheme Scheme>
   void configure_debug_decode_kernel(int opt_in_smem) {
-    constexpr size_t kSmemBytes = debug_decode_smem_bytes();
+    constexpr size_t kSmemBytes = debug_decode_smem_bytes<Scheme>();
     TVM_FFI_ICHECK_LE(kSmemBytes, static_cast<size_t>(std::max(opt_in_smem, 0)))
         << "configure_workspace: operand-byte debug kernel requires " << kSmemBytes
         << " shared-memory bytes, device permits " << opt_in_smem;
@@ -806,17 +796,10 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
                                        const TensorView& residual, const TensorView& group_scales) {
     TVM_FFI_ICHECK(tma_encoder_ != nullptr) << "grouped_run: TMA encoder is unavailable";
     W4A8ResolvedTmaMaps resolved{};
-#if !W4A8_RESIDUAL_TMA
-    resolved.residual = residual.data_ptr();
-#endif
     resolved.group_scales = static_cast<const float*>(group_scales.data_ptr());
     const uintptr_t activation_address = reinterpret_cast<uintptr_t>(activation.data_ptr());
     const uintptr_t payload_address = reinterpret_cast<uintptr_t>(payload.data_ptr());
-#if W4A8_RESIDUAL_TMA
     const uintptr_t residual_address = reinterpret_cast<uintptr_t>(residual.data_ptr());
-#else
-    constexpr uintptr_t residual_address = 0;
-#endif
     const int64_t rows = activation.size(0);
     const W4A8ActivationTmaCacheKey activation_key{activation_address, rows, padded_k_};
     if (!activation_tma_cache_valid_ || !(activation_tma_cache_key_ == activation_key)) {
@@ -849,14 +832,12 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
       entry.maps.payload_n128 = make_payload_tma_map(
           const_cast<uint8_t*>(static_cast<const uint8_t*>(payload.data_ptr())), bucket_experts_,
           padded_n_, padded_k_, 128, tma_encoder_);
-#if W4A8_RESIDUAL_TMA
       entry.maps.residual_n64 = make_residual_tma_map(
           const_cast<uint8_t*>(static_cast<const uint8_t*>(residual.data_ptr())), bucket_experts_,
           padded_n_, padded_k_, 64, residual_scheme_, tma_encoder_);
       entry.maps.residual_n128 = make_residual_tma_map(
           const_cast<uint8_t*>(static_cast<const uint8_t*>(residual.data_ptr())), bucket_experts_,
           padded_n_, padded_k_, 128, residual_scheme_, tma_encoder_);
-#endif
       weight_tma_cache_.push_front(entry);
       ++weight_tma_cache_misses_;
       if (weight_tma_cache_.size() > tma_cache_capacity_) {
@@ -916,15 +897,10 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
         bucket_experts_,
         padded_scale_stride_,
         alpha.ndim() == 1,
-#if !W4A8_RESIDUAL_TMA
-        tma_maps.residual,
-#endif
         tma_maps.group_scales,
         BlockM == 64 ? tma_maps.activation.m64 : tma_maps.activation.m128,
         BlockN == 64 ? tma_maps.weight.payload_n64 : tma_maps.weight.payload_n128,
-#if W4A8_RESIDUAL_TMA
         BlockN == 64 ? tma_maps.weight.residual_n64 : tma_maps.weight.residual_n128,
-#endif
     };
     // An empty M-family prefix makes every persistent block exit at its first task mapping.
     const cudaError_t status = variant.launch(DebugFp32, blocks, stream, params);
@@ -944,11 +920,9 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
       launch_tile_family<DebugFp32, 128, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, n64_tiles, 0,
           resources[1][0].blocks_per_sm, tma_maps, stream);
-#if W4A8_SPLIT_M64_TAIL
       launch_tile_family<DebugFp32, 64, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, n64_tiles, 0,
           resources[0][0].blocks_per_sm, tma_maps, stream);
-#endif
       return;
     }
     const int32_t n128_tiles = padded_n_ / 128;
@@ -956,20 +930,16 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     launch_tile_family<DebugFp32, 128, 128, GroupSize, Scheme>(
         output, activation_scales, alpha, expert_mapping, offsets, n128_tiles, 0,
         resources[1][1].blocks_per_sm, tma_maps, stream);
-#if W4A8_SPLIT_M64_TAIL
     launch_tile_family<DebugFp32, 64, 128, GroupSize, Scheme>(
         output, activation_scales, alpha, expert_mapping, offsets, n128_tiles, 0,
         resources[0][1].blocks_per_sm, tma_maps, stream);
-#endif
     if (has_n64_tail) {
       launch_tile_family<DebugFp32, 128, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, 1, n128_tiles * 2,
           resources[1][0].blocks_per_sm, tma_maps, stream);
-#if W4A8_SPLIT_M64_TAIL
       launch_tile_family<DebugFp32, 64, 64, GroupSize, Scheme>(
           output, activation_scales, alpha, expert_mapping, offsets, 1, n128_tiles * 2,
           resources[0][0].blocks_per_sm, tma_maps, stream);
-#endif
     }
   }
 
@@ -1063,10 +1033,12 @@ class Sm90W4A8GroupedGemmRunner final : public tvm::ffi::ModuleObj {
     const int64_t resident_blocks =
         static_cast<int64_t>(std::max(sm_count_, 1)) * debug_decode_blocks_per_sm_;
     const int blocks = static_cast<int>(std::min(tasks, resident_blocks));
-    debug_decode_v3_kernel<Scheme><<<blocks, kProducerThreads, debug_decode_smem_bytes(), stream>>>(
-        static_cast<uint8_t*>(output.data_ptr()), static_cast<const uint8_t*>(payload.data_ptr()),
-        static_cast<const ResidualStorage*>(residual.data_ptr()), bucket_experts_,
-        padded_k_ / kV3PayloadTileK, padded_n_ / kV3PayloadTileN);
+    debug_decode_v3_kernel<Scheme>
+        <<<blocks, kProducerThreads, debug_decode_smem_bytes<Scheme>(), stream>>>(
+            static_cast<uint8_t*>(output.data_ptr()),
+            static_cast<const uint8_t*>(payload.data_ptr()),
+            static_cast<const ResidualStorage*>(residual.data_ptr()), bucket_experts_,
+            padded_k_ / kV3PayloadTileK, padded_n_ / kV3PayloadTileN);
     const cudaError_t status = cudaGetLastError();
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "debug_decode: kernel launch failed: " << cudaGetErrorString(status);

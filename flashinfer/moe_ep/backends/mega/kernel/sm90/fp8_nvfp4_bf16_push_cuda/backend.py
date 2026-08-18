@@ -1,4 +1,4 @@
-"""SM90 push NVFP4 mega-MoE kernel backend."""
+"""SM90 FP8/NVFP4/BF16 push-CUDA mega-MoE kernel backend."""
 
 from __future__ import annotations
 
@@ -9,22 +9,22 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .....config import BootstrapConfig, FleetParams
-from .....core.kernel.base import MegaKernelBackend
-from .....core.kernel.registry import register_mega_kernel
-from .....core.runtime import TORCH_DIST
-from .....core.validation.common import (
+from ......config import BootstrapConfig, FleetParams
+from ......core.kernel.base import MegaKernelBackend
+from ......core.kernel.registry import register_mega_kernel
+from ......core.runtime import TORCH_DIST
+from ......core.validation.common import (
     MoEEpArchError,
     MoEEpConfigError,
     validate_mega_fleet_params,
 )
-from .....weights import MoEWeightPack
-from .config import Sm90PushNvFp4MegaMoeConfig
+from ......weights import MoEWeightPack
+from .config import Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig
 from .staging import validate_sm90_push_nvfp4_forward_inputs
 from .weights import preprocess_mega_weights, validate_transformed_mega_weights
 
 if TYPE_CHECKING:
-    from .....tensors import MoEEpTensors
+    from ......tensors import MoEEpTensors
 
 
 @dataclass
@@ -53,7 +53,7 @@ def _validate_sm90_arch() -> None:
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major != 9:
         raise MoEEpArchError(
-            "sm90_push_nvfp4 requires an SM90 (Hopper) device; "
+            "sm90_fp8_nvfp4_bf16_push_cuda requires an SM90 (Hopper) device; "
             f"host has sm_{major}{minor}"
         )
 
@@ -74,12 +74,15 @@ def _set_process_group_timeout(group: Any, timeout_s: float) -> None:
     set_pg_timeout(timeout, group)
 
 
-@register_mega_kernel("sm90_push_nvfp4")
+@register_mega_kernel(
+    "sm90_fp8_nvfp4_bf16_push_cuda", deprecated_aliases=("sm90_push_nvfp4",)
+)
 class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Sm90PushNvFp4MegaMoeConfig) -> None:
-        if not isinstance(config, Sm90PushNvFp4MegaMoeConfig):
+    def __init__(self, config: Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig) -> None:
+        if not isinstance(config, Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig):
             raise TypeError(
-                "sm90_push_nvfp4 config must be Sm90PushNvFp4MegaMoeConfig, got "
+                "sm90_fp8_nvfp4_bf16_push_cuda config must be "
+                "Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig, got "
                 f"{type(config).__name__}"
             )
         super().__init__(config)
@@ -87,7 +90,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm90_push_nvfp4"
+        return "sm90_fp8_nvfp4_bf16_push_cuda"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         del bootstrap
@@ -108,27 +111,27 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
         )
         if bootstrap.world_size > 32:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 supports a single-node EP group of at most 32 ranks"
+                "sm90_fp8_nvfp4_bf16_push_cuda supports a single-node EP group of at most 32 ranks"
             )
         if config.top_k not in (1, 2, 4, 6, 8):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 top_k must be one of (1, 2, 4, 6, 8)"
+                "sm90_fp8_nvfp4_bf16_push_cuda top_k must be one of (1, 2, 4, 6, 8)"
             )
         if config.intermediate_size <= 0 or config.intermediate_size % 128:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 intermediate_size must be a positive multiple of 128"
+                "sm90_fp8_nvfp4_bf16_push_cuda intermediate_size must be a positive multiple of 128"
             )
         if config.intermediate_size > 16384:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 activation staging requires intermediate_size <= 16384"
+                "sm90_fp8_nvfp4_bf16_push_cuda activation staging requires intermediate_size <= 16384"
             )
         if config.nvfp4_mode not in ("w4a8", "w4a16_rs"):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
+                "sm90_fp8_nvfp4_bf16_push_cuda nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
             )
         if config.weight_policy not in ("packed", "folded", "hot_folded", "dual"):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 weight_policy must be packed, folded, "
+                "sm90_fp8_nvfp4_bf16_push_cuda weight_policy must be packed, folded, "
                 "hot_folded, or dual"
             )
         local_experts = fleet_params.num_experts // bootstrap.world_size
@@ -136,7 +139,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             0 <= config.hot_expert_count <= local_experts
         ):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 hot_expert_count must be in the local expert range"
+                "sm90_fp8_nvfp4_bf16_push_cuda hot_expert_count must be in the local expert range"
             )
         if config.weight_policy == "packed" and config.hot_expert_count != 0:
             raise MoEEpConfigError("packed weight_policy requires hot_expert_count=0")
@@ -171,100 +174,112 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             1 <= config.tma_cache_capacity <= 128
         ):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 tma_cache_capacity must be in [1, 128]"
+                "sm90_fp8_nvfp4_bf16_push_cuda tma_cache_capacity must be in [1, 128]"
             )
         try:
             n64_expected_m_per_sm = float(config.n64_expected_m_per_sm)
         except (TypeError, ValueError) as exc:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 n64_expected_m_per_sm must be finite and positive"
+                "sm90_fp8_nvfp4_bf16_push_cuda n64_expected_m_per_sm must be finite and positive"
             ) from exc
         if not math.isfinite(n64_expected_m_per_sm) or n64_expected_m_per_sm <= 0.0:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 n64_expected_m_per_sm must be finite and positive"
+                "sm90_fp8_nvfp4_bf16_push_cuda n64_expected_m_per_sm must be finite and positive"
             )
         if config.payload_layout not in (3, 4):
-            raise MoEEpConfigError("sm90_push_nvfp4 payload_layout must be 3 or 4")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda payload_layout must be 3 or 4"
+            )
         if type(config.allow_legacy_layout) is not bool:
-            raise MoEEpConfigError("sm90_push_nvfp4 allow_legacy_layout must be a bool")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda allow_legacy_layout must be a bool"
+            )
         if (
             config.nvfp4_mode == "w4a8"
             and config.payload_layout == 3
             and not config.allow_legacy_layout
         ):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 payload_layout=3 is a legacy oracle and requires "
+                "sm90_fp8_nvfp4_bf16_push_cuda payload_layout=3 is a legacy oracle and requires "
                 "allow_legacy_layout=True"
             )
         if config.payload_dtype not in ("fp8", "bf16"):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 payload_dtype must be 'fp8' or 'bf16'"
+                "sm90_fp8_nvfp4_bf16_push_cuda payload_dtype must be 'fp8' or 'bf16'"
             )
         if config.combine_dtype not in ("fp8", "bf16"):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 combine_dtype must be 'fp8' or 'bf16'"
+                "sm90_fp8_nvfp4_bf16_push_cuda combine_dtype must be 'fp8' or 'bf16'"
             )
         if config.grouped_combine and config.combine_dtype != "fp8":
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 grouped_combine requires combine_dtype='fp8'"
+                "sm90_fp8_nvfp4_bf16_push_cuda grouped_combine requires combine_dtype='fp8'"
             )
         if config.group_size not in (32, 64, 128):
-            raise MoEEpConfigError("sm90_push_nvfp4 group_size must be 32, 64, or 128")
+            raise MoEEpConfigError(
+                "sm90_fp8_nvfp4_bf16_push_cuda group_size must be 32, 64, or 128"
+            )
         if config.residual_scheme not in ("generic", "pow2"):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 residual_scheme must be 'generic' or 'pow2'"
+                "sm90_fp8_nvfp4_bf16_push_cuda residual_scheme must be 'generic' or 'pow2'"
             )
         if config.nvfp4_mode == "w4a16_rs":
             if config.group_size != 128 or config.residual_scheme != "generic":
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 w4a16_rs requires group_size=128 and "
+                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires group_size=128 and "
                     "residual_scheme='generic'"
                 )
             if config.combine_dtype != "bf16" or config.grouped_combine:
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 w4a16_rs requires combine_dtype='bf16' "
+                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires combine_dtype='bf16' "
                     "and grouped_combine=False"
                 )
             if config.fuse_act:
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 w4a16_rs requires fuse_act=False"
+                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires fuse_act=False"
                 )
             if config.rs_n_tactic != 64:
-                raise MoEEpConfigError("sm90_push_nvfp4 rs_n_tactic must be 64")
+                raise MoEEpConfigError(
+                    "sm90_fp8_nvfp4_bf16_push_cuda rs_n_tactic must be 64"
+                )
             if config.rs_stages != 3:
-                raise MoEEpConfigError("sm90_push_nvfp4 rs_stages must be 3")
+                raise MoEEpConfigError(
+                    "sm90_fp8_nvfp4_bf16_push_cuda rs_stages must be 3"
+                )
             if config.rs_stage_k != 64:
-                raise MoEEpConfigError("sm90_push_nvfp4 rs_stage_k must be 64")
+                raise MoEEpConfigError(
+                    "sm90_fp8_nvfp4_bf16_push_cuda rs_stage_k must be 64"
+                )
             if (
                 fleet_params.token_hidden_size % config.rs_stage_k
                 or config.intermediate_size % config.rs_stage_k
             ):
                 raise MoEEpConfigError(
-                    "sm90_push_nvfp4 RS K dimensions must be divisible by rs_stage_k"
+                    "sm90_fp8_nvfp4_bf16_push_cuda RS K dimensions must be divisible by rs_stage_k"
                 )
         try:
             capacity_factor = float(config.capacity_factor)
         except (TypeError, ValueError) as exc:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 capacity_factor must be finite and in (0, 1]"
+                "sm90_fp8_nvfp4_bf16_push_cuda capacity_factor must be finite and in (0, 1]"
             ) from exc
         if not math.isfinite(capacity_factor) or not (0.0 < capacity_factor <= 1.0):
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 capacity_factor must be finite and in (0, 1]"
+                "sm90_fp8_nvfp4_bf16_push_cuda capacity_factor must be finite and in (0, 1]"
             )
         try:
             timeout_s = float(config.init_timeout_s)
         except (TypeError, ValueError) as exc:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 init_timeout_s must be finite and positive"
+                "sm90_fp8_nvfp4_bf16_push_cuda init_timeout_s must be finite and positive"
             ) from exc
         if not math.isfinite(timeout_s) or timeout_s <= 0.0:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 init_timeout_s must be finite and positive"
+                "sm90_fp8_nvfp4_bf16_push_cuda init_timeout_s must be finite and positive"
             )
         if bootstrap.stream != 0:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 launches on the current torch CUDA stream; "
+                "sm90_fp8_nvfp4_bf16_push_cuda launches on the current torch CUDA stream; "
                 "BootstrapConfig.stream must be 0"
             )
 
@@ -312,19 +327,19 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
         self._transformed_weights = transformed_weights
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> _Sm90PushNvFp4Workspace:
-        from .....kernel_src.sm90.push_style_megamoe import (
+        from ......kernel_src.sm90.push_style_megamoe import (
             Sm90PushCombine,
             Sm90PushConfig,
             Sm90PushNvFp4MoERunner,
             Sm90PushPayload,
             Sm90PushPipe,
         )
-        from ......comm.mnnvl import TorchDistBackend
+        from .......comm.mnnvl import TorchDistBackend
 
         transformed_weights = self._transformed_weights
         if transformed_weights is None:
             raise RuntimeError(
-                "sm90_push_nvfp4 weights must be prepared before workspace allocation"
+                "sm90_fp8_nvfp4_bf16_push_cuda weights must be prepared before workspace allocation"
             )
         config = self._kernel_config
         comm = TorchDistBackend(group=self.ep_comm_group)
@@ -342,12 +357,12 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
         ]
         if timeout_failures:
             raise RuntimeError(
-                "sm90_push_nvfp4 failed to configure the EP process-group timeout: "
+                "sm90_fp8_nvfp4_bf16_push_cuda failed to configure the EP process-group timeout: "
                 + " | ".join(timeout_failures)
             )
         if any(peer_timeout != timeout_s for peer_timeout, _error in timeout_reports):
             raise RuntimeError(
-                "sm90_push_nvfp4 init_timeout_s must match on every EP rank; got "
+                "sm90_fp8_nvfp4_bf16_push_cuda init_timeout_s must match on every EP rank; got "
                 f"{[peer_timeout for peer_timeout, _error in timeout_reports]}"
             )
         pipe = Sm90PushPipe(
@@ -395,7 +410,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
         transformed_weights = self._transformed_weights
-        from .....kernel_src.sm90.push_style_megamoe import (
+        from ......kernel_src.sm90.push_style_megamoe import (
             Sm90PushNvFp4DualWeights,
             Sm90PushNvFp4HotFoldedWeights,
         )
@@ -409,7 +424,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             else (config.nvfp4_mode,)
         )
         return (
-            "sm90_push_nvfp4",
+            "sm90_fp8_nvfp4_bf16_push_cuda",
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -463,12 +478,16 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
     @staticmethod
     def _live_workspace(workspace: Any) -> _Sm90PushNvFp4Workspace:
         if not isinstance(workspace, _Sm90PushNvFp4Workspace):
-            raise TypeError("sm90_push_nvfp4 workspace must be created by this backend")
+            raise TypeError(
+                "sm90_fp8_nvfp4_bf16_push_cuda workspace must be created by this backend"
+            )
         if workspace.destroyed:
-            raise RuntimeError("sm90_push_nvfp4 workspace has been destroyed")
+            raise RuntimeError(
+                "sm90_fp8_nvfp4_bf16_push_cuda workspace has been destroyed"
+            )
         if workspace.poisoned:
             raise RuntimeError(
-                "sm90_push_nvfp4 workspace is poisoned by an earlier failure"
+                "sm90_fp8_nvfp4_bf16_push_cuda workspace is poisoned by an earlier failure"
             )
         return workspace
 
@@ -481,13 +500,13 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
     ) -> None:
         if not quantize_input:
             raise MoEEpConfigError(
-                "sm90_push_nvfp4 requires MegaConfig.quantize_input=True"
+                "sm90_fp8_nvfp4_bf16_push_cuda requires MegaConfig.quantize_input=True"
             )
         ws = self._live_workspace(workspace)
         transformed_weights = self._transformed_weights
         if transformed_weights is None:
             raise RuntimeError(
-                "sm90_push_nvfp4 weights must be preprocessed or validated before "
+                "sm90_fp8_nvfp4_bf16_push_cuda weights must be preprocessed or validated before "
                 "staging"
             )
         try:
@@ -518,7 +537,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
         num_tokens = ws.staged_tokens
         if num_tokens is None or staged_weights is None:
             raise RuntimeError(
-                "sm90_push_nvfp4 compute() requires a successful stage_inputs()"
+                "sm90_fp8_nvfp4_bf16_push_cuda compute() requires a successful stage_inputs()"
             )
         weights_mismatch = (
             transformed_weights is not staged_weights
@@ -535,11 +554,11 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             ws.staged_tokens = None
         if result is not output:
             raise RuntimeError(
-                "sm90_push_nvfp4 runner must return the caller-provided output"
+                "sm90_fp8_nvfp4_bf16_push_cuda runner must return the caller-provided output"
             )
         if weights_mismatch:
             raise RuntimeError(
-                "sm90_push_nvfp4 compute received a different weight bundle; the "
+                "sm90_fp8_nvfp4_bf16_push_cuda compute received a different weight bundle; the "
                 "staged round completed with its bound weights"
             )
         return output
@@ -548,7 +567,9 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
         if workspace is None:
             return
         if not isinstance(workspace, _Sm90PushNvFp4Workspace):
-            raise TypeError("sm90_push_nvfp4 workspace must be created by this backend")
+            raise TypeError(
+                "sm90_fp8_nvfp4_bf16_push_cuda workspace must be created by this backend"
+            )
         super().destroy(workspace)
 
 

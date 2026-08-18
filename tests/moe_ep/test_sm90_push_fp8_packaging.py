@@ -21,10 +21,18 @@ _BACKEND_PACKAGE_NAME = (
     "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda"
 )
 _NVFP4_BACKEND_PACKAGE_NAME = (
-    "flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4"
+    "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda"
 )
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE_PATH = "flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe"
+_SOURCE_TREE_PACKAGE_ROOT = (
+    Path(__file__).resolve().parents[2]
+    / "flashinfer"
+    / "moe_ep"
+    / "kernel_src"
+    / "sm90"
+    / "push_style_megamoe"
+)
 _CUDA_RESOURCES = (
     "src/a2a/sm90_push_a2a_ops.cu",
     "src/a2a/sm90_push_a2a.cuh",
@@ -95,6 +103,17 @@ def _backend_sources(package_name: str = _BACKEND_PACKAGE_NAME):
     return sorted(_python_resources(package_root), key=str)
 
 
+def _package_text(*parts: str) -> str:
+    source_tree = _SOURCE_TREE_PACKAGE_ROOT.joinpath(*parts)
+    if source_tree.is_file():
+        return source_tree.read_text(encoding="utf-8")
+
+    resource = resources.files(_PACKAGE_NAME)
+    for part in parts:
+        resource = resource / part
+    return resource.read_text(encoding="utf-8")
+
+
 def test_sm90_push_package_data_contains_cuda_sources():
     pyproject_path = _PROJECT_ROOT / "pyproject.toml"
     if not pyproject_path.is_file():
@@ -125,9 +144,9 @@ def test_sm90_push_runtime_resources_expose_packaged_cuda_sources():
         assert resource.read_text(encoding="utf-8").strip()
 
 
-def test_sm90_push_nvfp4_backend_python_resources_are_packaged():
+def test_sm90_fp8_nvfp4_bf16_push_cuda_backend_resources_are_packaged():
     package_root = resources.files(
-        "flashinfer.moe_ep.backends.mega.kernel.sm90_push_nvfp4"
+        "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda"
     )
     for relative_path in _NVFP4_BACKEND_PYTHON_RESOURCES:
         resource = _resource_at(package_root, relative_path)
@@ -154,7 +173,9 @@ def test_sm90_push_prebuilt_wheel_contains_runtime_package():
             *_DOCUMENT_RESOURCES,
         )
     }
-    backend_path = "flashinfer/moe_ep/backends/mega/kernel/sm90_push_nvfp4"
+    backend_path = (
+        "flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_nvfp4_bf16_push_cuda"
+    )
     required.update(
         f"{backend_path}/{relative_path}"
         for relative_path in _NVFP4_BACKEND_PYTHON_RESOURCES
@@ -188,6 +209,8 @@ def test_sm90_push_backend_imports_kernel_package_through_public_boundaries():
                 assert suffix in ("", ".shim") or suffix.startswith(".shim."), (
                     f"{path} bypasses the SM90 push package boundary with import {target!r}"
                 )
+
+
 def test_sm90_push_nvfp4_shim_imports_resolve_to_top_level_packages():
     package_root = resources.files(_PACKAGE_NAME)
     package = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim"
@@ -212,7 +235,10 @@ def test_sm90_push_nvfp4_shim_imports_resolve_to_top_level_packages():
 
 @pytest.mark.parametrize(
     "backend",
-    ("sm90.fp8_fp8_bf16_push_cuda", "sm90_push_nvfp4"),
+    (
+        "sm90.fp8_fp8_bf16_push_cuda",
+        "sm90.fp8_nvfp4_bf16_push_cuda",
+    ),
 )
 def test_sm90_push_weight_helpers_defer_kernel_package_import(backend):
     project_root = Path(__file__).resolve().parents[2]
@@ -505,21 +531,12 @@ def test_sm90_push_nvfp4_gemm_requires_cuda_12_0(module_name, tmp_path, monkeypa
 
 
 def test_sm90_push_nvfp4_launchers_use_direct_runtime_launches():
-    project_root = Path(__file__).resolve().parents[2]
-    source_root = (
-        project_root
-        / "flashinfer"
-        / "moe_ep"
-        / "kernel_src"
-        / "sm90"
-        / "push_style_megamoe"
-        / "src"
-    )
     for directory in ("nvfp4_w4a8_gemm", "nvfp4_rs_gemm"):
         source = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in sorted((source_root / directory).iterdir())
-            if path.suffix in (".cu", ".cuh")
+            _package_text(*relative_path.split("/"))
+            for relative_path in _CUDA_RESOURCES
+            if relative_path.startswith(f"src/{directory}/")
+            and relative_path.endswith((".cu", ".cuh"))
         )
         assert "<<<" in source
         assert "cudaKernel_t" not in source
