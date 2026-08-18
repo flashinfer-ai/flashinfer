@@ -770,6 +770,22 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 return [-1]
             valid_tactics = valid_tactics if valid_tactics else all_tactics
 
+            # For MoE problems that are supported by gather-A grouped gemm fusion,
+            # we drop the dense TMA-WS configs from tactics as they are constantly
+            # outperformed by the gather-A counterparts.
+            if stage == 1:
+                try:
+                    is_gather_a = self.fused_moe_runner.get_tactic_is_gather_a
+                    is_tma_ws = self.fused_moe_runner.get_tactic_is_tma_ws
+                    has_gather_a = any(is_gather_a(t) for t in valid_tactics)
+                except AttributeError:
+                    has_gather_a = False
+                if has_gather_a:
+                    kept = [
+                        t for t in valid_tactics if is_gather_a(t) or not is_tma_ws(t)
+                    ]
+                    valid_tactics = kept or valid_tactics
+
             if not self.use_w4_group_scaling:
                 return valid_tactics
 
@@ -1391,6 +1407,9 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
+    if not input.is_contiguous():
+        raise ValueError("cutlass_fused_moe requires a contiguous input tensor")
+
     major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 

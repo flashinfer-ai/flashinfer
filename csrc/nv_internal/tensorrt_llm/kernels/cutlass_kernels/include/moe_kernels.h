@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_tma_warp_specialized_traits.h"
 #ifdef ENABLE_FP4
 #include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
@@ -522,10 +523,22 @@ class CutlassMoeFCRunnerInterface {
       void const* weights1, void const* weights2, float const* alpha_scale_flat1,
       float const* alpha_scale_flat2,
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
-      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
-      void const* bias1, void const* bias2, void* gemm1_output, void* gemm2_output,
-      float const* router_scales, int const* permuted_row_to_unpermuted_row, bool enable_pdl,
-      cudaStream_t stream) = 0;
+      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
+      int const* permuted_source_token_ids, QuantParams quant_params, void const* bias1,
+      void const* bias2, void* gemm1_output, void* gemm2_output, float const* router_scales,
+      int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream) = 0;
+
+  // Profiler-only: run the expand (unpermute->permute row copy) kernel with the
+  // runner's activation types. GEMM1 profiling launches it in the timed region
+  // for non-gather tactics so the autotuner compares dense tactics (which
+  // require the expand) and gather-A tactics (which replace it with the id side
+  // kernel) by total marginal cost.
+  virtual void runProfilerExpandInput(void const* unpermuted_input, void* permuted_output,
+                                      float const* unpermuted_scales,
+                                      int const* permuted_row_to_unpermuted_row,
+                                      int64_t const* expert_first_token_offset, int64_t num_rows,
+                                      int64_t hidden_size, int k, int num_experts_per_node,
+                                      bool enable_pdl, cudaStream_t stream) = 0;
 
   virtual std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedLowLatencyDispatch(
@@ -626,6 +639,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_block_scaling =
       use_fp4 || use_mxfp8 || (use_wfp4afp8 && !use_sm90_humming_pre_mma);
 
+  static constexpr bool supports_gather_a_input =
+      std::is_same_v<T, InputType> && isValidSM90GatherAMOESpecialisation<T, WeightType>();
+
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
 
@@ -657,7 +673,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override {
     return filterMxfp8Tactics(
-        moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused()));
+        moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused(),
+                                    gemm_id == MoeGemmId::GEMM_1 && supports_gather_a_input));
   }
 
   int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) override {
@@ -667,7 +684,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id) {
     using RunnerType = decltype(moe_gemm_runner_);
     return filterMxfp8Tactics(
-        RunnerType::getConfigs(sm, gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm)));
+        RunnerType::getConfigs(sm, gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm),
+                               gemm_id == MoeGemmId::GEMM_1 && supports_gather_a_input));
   }
 
   // MXFP8 shares the FP8 activation/weight types, so the underlying gemm
@@ -822,6 +840,13 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
   }
 
+  void runProfilerExpandInput(void const* unpermuted_input, void* permuted_output,
+                              float const* unpermuted_scales,
+                              int const* permuted_row_to_unpermuted_row,
+                              int64_t const* expert_first_token_offset, int64_t num_rows,
+                              int64_t hidden_size, int k, int num_experts_per_node, bool enable_pdl,
+                              cudaStream_t stream) override;
+
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedDispatch(
       int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
@@ -831,17 +856,18 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void const* weights1, void const* weights2, float const* alpha_scale_flat1,
       float const* alpha_scale_flat2,
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
-      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
-      void const* bias1, void const* bias2, void* gemm1_output, void* gemm2_output,
-      float const* router_scales, int const* permuted_row_to_unpermuted_row, bool enable_pdl,
-      cudaStream_t stream) override {
+      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
+      int const* permuted_source_token_ids, QuantParams quant_params, void const* bias1,
+      void const* bias2, void* gemm1_output, void* gemm2_output, float const* router_scales,
+      int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream) override {
     return Self::computeStridesTmaWarpSpecialized(
         expert_first_token_offset, layout_info1, layout_info2, num_tokens, expanded_num_tokens,
         gemm1_n, gemm1_k, gemm2_n, gemm2_k, num_experts_per_node,
         reinterpret_cast<T const*>(gemm1_in), reinterpret_cast<T const*>(gemm2_in),
         reinterpret_cast<WeightType const*>(weights1),
         reinterpret_cast<WeightType const*>(weights2), alpha_scale_flat1, alpha_scale_flat2,
-        fp4_act_flat1, fp4_act_flat2, quant_params, reinterpret_cast<ScaleBiasType const*>(bias1),
+        fp4_act_flat1, fp4_act_flat2, permuted_source_token_ids, quant_params,
+        reinterpret_cast<ScaleBiasType const*>(bias1),
         reinterpret_cast<ScaleBiasType const*>(bias2),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm2_output), router_scales,
@@ -896,8 +922,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
       float const* alpha_scale_flat2,
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
-      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
-      ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
+      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
+      int const* permuted_source_token_ids, QuantParams quant_params, ScaleBiasType const* bias1,
+      ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
       UnfusedGemmOutputType* gemm2_output, float const* router_scales,
       int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream);
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -1014,6 +1041,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   int* blocked_row_to_unpermuted_row_{};
   T* permuted_data_{};
   float* permuted_token_final_scales_{};
+  int* permuted_source_token_ids_{};
 
   int64_t* expert_first_token_offset_{};
 
@@ -1141,6 +1169,7 @@ struct GemmProfilerBackend {
   constexpr static int64_t NUM_WORKSPACES = NUM_FUSION_TYPES * NUM_SWAP_AB_TYPES;
   TmaWarpSpecializedGroupedGemmInput mTmaInputCache[NUM_FUSION_TYPES][NUM_SWAP_AB_TYPES]
                                                    [NUM_ROUTING_SAMPLES];
+  TmaWarpSpecializedGroupedGemmInput mTmaInputCacheGatherA[NUM_ROUTING_SAMPLES];
   QuantParams mQuantParams;
 
   bool mBias{};
@@ -1187,11 +1216,20 @@ struct GemmProfilerBackend {
         "Sm90Wfp4Afp8ScaleMode must be set exactly for SM90 FP8 activation x packed MXFP4 weight.");
   }
 
+  // Whether gather-A GEMM1 tactics can show up while profiling: GEMM1 on SM90
+  // with unquantized 16-bit same-type activations/weights. This is the
+  // RUNTIME MIRROR of isValidSM90GatherAMOESpecialisation.
+  bool supportsGatherA() const {
+    return mSM == 90 && mGemmToProfile == GemmToProfile::GEMM_1 && !mMinLatencyMode &&
+           mDType == mWType &&
+           (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16);
+  }
+
   void prepareRouting(int num_tokens, char* workspace, bool enable_pdl, cudaStream_t stream);
   void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
   void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
                           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, bool swap_ab,
-                          bool enable_pdl, cudaStream_t stream);
+                          bool gather_a, bool enable_pdl, cudaStream_t stream);
 };
 
 // Populates a buffer with random values for use with MOE benchmarking

@@ -537,6 +537,33 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
+def test_moe_rejects_noncontiguous_input():
+    """Every GEMM1 input path (the expand copy and the SM90 gather-A tactics)
+    addresses activation rows as ``base + row * hidden`` through raw pointers
+    and never sees torch strides, so a non-contiguous view used to be silently
+    misread. The wrapper must fail fast instead.
+    """
+    dtype = torch.bfloat16
+    num_experts, top_k, hidden, inter = 8, 2, 256, 128
+    x_wide = torch.randn(4, 2 * hidden, dtype=dtype).cuda()
+    x = x_wide[:, :hidden]  # row stride 2*hidden -> not contiguous
+    assert not x.is_contiguous()
+    router_logits = torch.randn(4, num_experts, dtype=torch.float32).cuda()
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    w31_weight = torch.randn(num_experts, 2 * inter, hidden, dtype=dtype).cuda()
+    w2_weight = torch.randn(num_experts, hidden, inter, dtype=dtype).cuda()
+    with pytest.raises(ValueError, match="contiguous"):
+        fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            dtype,
+            quant_scales=None,
+        )
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)

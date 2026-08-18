@@ -703,9 +703,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
 
     // Get specific profile configs according to the profile_id.
-    // Fallback tactic is set to be 0
+    // profile_id == -1 (the autotuner's do_preparation / fallback sentinel) must
+    // resolve to a profile valid for the GEMM being profiled: mAllProfiles is
+    // [gemm1 tactics | gemm2 tactics], and gemm1 tactics may carry gather_a
+    // (unsupported under GEMM_2 profiling).
     // TODO: use the best tactic id found offline for a better default inference perf
-    auto profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
+    int64_t const default_id =
+        (gemm_idx == 2 && static_cast<int64_t>(mAllProfiles.size()) > mGemm1TacticCount)
+            ? mGemm1TacticCount
+            : 0;
+    auto profile = profile_id == -1 ? mAllProfiles[default_id] : mAllProfiles[profile_id];
 
     auto stream = get_stream(input.device());
 
@@ -796,6 +803,26 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         }
         return static_cast<int64_t>(
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
+      });
+    } else if (name == "get_tactic_is_gather_a") {
+      // Returns 1 if the tactic gathers its A operand rows through an index array
+      // (TMA-WS gather-A mainloop), 0 otherwise (or for out-of-range tactic ids).
+      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return 0;
+        }
+        return static_cast<int64_t>(mAllProfiles[tactic_id].gather_a);
+      });
+    } else if (name == "get_tactic_is_tma_ws") {
+      // Returns 1 if the tactic is a TMA warp-specialized (SM90+) config, 0 for legacy
+      // (SM80) configs or out-of-range tactic ids.
+      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return 0;
+        }
+        return static_cast<int64_t>(mAllProfiles[tactic_id].is_tma_warp_specialized);
       });
     } else if (name == "get_valid_tactics_for_shape") {
       return Function::FromTyped(
