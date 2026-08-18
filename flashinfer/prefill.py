@@ -5689,6 +5689,27 @@ def fmha_v2_prefill_sm120(
     omitted, the kernel uses the corresponding host-encoded scale.
 
     This entry point is validated for SM120. SM121 support is not enabled.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        Contiguous FP8 E4M3 Q, K, and V tensors in BSHD layout.
+    out : torch.Tensor
+        Caller-owned contiguous BF16 output tensor in BSHD layout.
+    num_heads, head_dim, seq_len : int
+        Fixed attention geometry shared by every batch item.
+    scale_softmax : float
+        Softmax scale passed to the FMHA kernel.
+    scale_bmm1, scale_bmm2 : float, optional
+        Host-encoded QK and V dequantization scales.
+    causal : bool
+        Apply bottom-right causal masking when true.
+    return_lse : bool
+        Return the log-sum-exp tensor together with ``out``.
+    lse : torch.Tensor, optional
+        Caller-owned contiguous FP32 ``[B, S, H, 2]`` LSE tensor.
+    scale_bmm1_d, scale_bmm2_d : torch.Tensor, optional
+        Persistent one-element FP32 CUDA scale tensors overriding host scales.
     """
     if not is_sm12x_supported(query.device) or torch.cuda.get_device_capability(
         query.device

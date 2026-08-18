@@ -397,20 +397,28 @@ def _paths_in_fragment(fragment: str) -> list[str]:
     return paths
 
 
-def iter_markdown_paths(text: str) -> list[str]:
-    """Extract paths from code spans, fenced code blocks, and table rows."""
-    paths: list[str] = []
+def iter_markdown_path_locations(text: str) -> list[tuple[str, int]]:
+    """Extract paths and their first line from Markdown path-bearing contexts."""
+    paths: dict[str, int] = {}
     for match in _INLINE_CODE_RE.finditer(text):
-        paths.extend(_paths_in_fragment(match.group(1)))
+        line_number = text.count("\n", 0, match.start()) + 1
+        for path in _paths_in_fragment(match.group(1)):
+            paths[path] = min(paths.get(path, line_number), line_number)
 
     in_fence = False
-    for line in text.splitlines():
+    for line_number, line in enumerate(text.splitlines(), 1):
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
         if in_fence or "|" in line:
-            paths.extend(_paths_in_fragment(_INLINE_CODE_RE.sub("", line)))
-    return list(dict.fromkeys(paths))
+            for path in _paths_in_fragment(_INLINE_CODE_RE.sub("", line)):
+                paths[path] = min(paths.get(path, line_number), line_number)
+    return list(paths.items())
+
+
+def iter_markdown_paths(text: str) -> list[str]:
+    """Extract paths from code spans, fenced code blocks, and table rows."""
+    return [path for path, _ in iter_markdown_path_locations(text)]
 
 
 def check_quickref_paths_exist() -> list[Finding]:
@@ -419,7 +427,7 @@ def check_quickref_paths_exist() -> list[Finding]:
     text = CLAUDE_MD.read_text("utf-8", "replace")
     out: list[Finding] = []
     seen: set[str] = set()
-    for path in iter_markdown_paths(text):
+    for path, line in iter_markdown_path_locations(text):
         # Skip URLs, glob-like patterns, env var demo strings
         if path.startswith(("http", "/")):
             continue
@@ -444,7 +452,9 @@ def check_quickref_paths_exist() -> list[Finding]:
         out.append(
             Finding(
                 check=QUICKREF_PATHS,
-                location="CLAUDE.md",
+                location=f"CLAUDE.md:{line}",
+                file="CLAUDE.md",
+                line=line,
                 message=f"Referenced path does not exist: `{path}`",
             )
         )
@@ -468,7 +478,7 @@ def check_skill_refs_exist() -> list[Finding]:
         except Exception:
             continue
 
-        for path in iter_markdown_paths(text):
+        for path, line in iter_markdown_path_locations(text):
             if path.startswith(("http", "/")):
                 continue
             if any(ch in path for ch in ("*", "?")):
@@ -483,7 +493,9 @@ def check_skill_refs_exist() -> list[Finding]:
             out.append(
                 Finding(
                     check=SKILL_REFS,
-                    location=str(rel),
+                    location=f"{rel}:{line}",
+                    file=str(rel),
+                    line=line,
                     message=f"Referenced path does not exist: `{path}`",
                 )
             )
