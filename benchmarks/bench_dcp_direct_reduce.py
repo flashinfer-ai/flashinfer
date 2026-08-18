@@ -259,6 +259,23 @@ class DcpA2aBaseline:
         self.lse[:t].copy_(lse)
 
 
+def _try_make(factory, rank: int):
+    err = None
+    obj = None
+    try:
+        obj = factory()
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, err)
+    errs = [e for e in gathered if e]
+    if errs:
+        if rank == 0:
+            print("FlashInfer DCP A2A baseline skipped:", errs[0])
+        return None
+    return obj
+
+
 def main() -> None:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -285,8 +302,19 @@ def main() -> None:
     caller_s = torch.empty(max_tokens, h_local, dtype=torch.float32, device=device)
 
     if rank == 0:
-        print(f"{'T':>5} {'direct':>10} {'nccl':>10} {'nccl_symm':>10} {'d/nccl':>8}")
-        print("us; direct=DCPDirectReduceWorkspace; nccl_symm=NCCL on symm_mem buffers")
+        print(
+            f"{'T':>5} {'fi_a2a':>10} {'nccl':>10} {'nccl_symm':>10} "
+            f"{'direct':>10} {'d/a2a':>8} {'d/nccl':>8}"
+        )
+        print(
+            "us; fi_a2a=decode_cp_a2a_alltoall+merge; "
+            "nccl=NCCL A2A+merge; direct=DCPDirectReduceWorkspace"
+        )
+
+    fi_a2a = _try_make(
+        lambda: DcpA2aBaseline(group, max_tokens, h_local, HEAD_DIM, DTYPE),
+        rank,
+    )
 
     for t in TOKEN_ROWS:
         po = torch.randn(t, TOTAL_HEADS, HEAD_DIM, dtype=DTYPE, device=device)
@@ -297,16 +325,25 @@ def main() -> None:
         nccl_symm = NcclBaseline(group, t, h_local, HEAD_DIM, DTYPE, symmetric=True)
         nccl.run(po, ps)
         nccl_symm.run(po, ps)
+        if fi_a2a is not None:
+            fi_a2a.run(po, ps)
         dist.barrier()
 
-        direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
+        fi_a2a_ms = (
+            _time_graph(lambda: fi_a2a.run(po, ps), po, ps)
+            if fi_a2a is not None
+            else None
+        )
         nccl_ms = _time_graph(lambda: nccl.run(po, ps), po, ps)
         nccl_symm_ms = _time_graph(lambda: nccl_symm.run(po, ps), po, ps)
+        direct_ms = _time_graph(lambda: workspace.run(po, ps, slot=0), po, ps)
 
         if rank == 0:
+            a2a_str = "SKIPPED" if fi_a2a_ms is None else f"{fi_a2a_ms * 1e3:10.2f}"
+            d_a2a = "n/a" if fi_a2a_ms is None else f"{direct_ms / fi_a2a_ms:8.3f}"
             print(
-                f"{t:5d} {direct_ms * 1e3:10.2f} {nccl_ms * 1e3:10.2f} "
-                f"{nccl_symm_ms * 1e3:10.2f} {direct_ms / nccl_ms:8.3f}"
+                f"{t:5d} {a2a_str:>10} {nccl_ms * 1e3:10.2f} {nccl_symm_ms * 1e3:10.2f} "
+                f"{direct_ms * 1e3:10.2f} {d_a2a:>8} {direct_ms / nccl_ms:8.3f}"
             )
 
     dist.destroy_process_group()
