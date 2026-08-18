@@ -209,8 +209,20 @@ served by the composable path (and reported unsupported by the probe).
 Keep the registry trimmed to the measured-win surface, and let the
 **end-to-end** measurement decide it — a row is a promise about serving
 behaviour, not about the kernel in isolation.  The shipped surface is
-decode batches `1/2/4/8` of the Qwen3.5-27B layer geometry in the `SD`
-layout on SM120, per impl.  Batches 16/24/32 are deliberately absent even
+decode batches `1/2/4/8` in the `SD` layout on SM120, per impl, for exactly
+one GDN layer geometry: `hidden=5120`, `n_ba=96`, `qkv_dim=10240`, 16 qk /
+48 v heads, `d=128`, `conv_width=4`, `conv_state_len=3`.
+
+**Which checkpoints those rows are valid for.** The geometry was captured
+from `nvidia/Qwen3.6-27B-NVFP4`, and the end-to-end serving sweep that
+chose the batch window ran on that checkpoint.  Matching is on the numbers
+and the device `cc` alone — no row names a model, and nothing in the
+dispatch path reads a model name — so *any* checkpoint whose GDN layer has
+exactly these sizes dispatches here, and a checkpoint from a neighbouring
+release (Qwen3.5-class GDN layers, other 27B variants) does so if and only
+if its layer sizes are identical, which is a property of that checkpoint
+rather than of the family name.  Anything else falls through to the
+composable path.  Batches 16/24/32 are deliberately absent even
 though the kernel is faster than the stock chain there in a kernel A/B
 (1.49x at 16, 1.16x at 32 under CUDA-graph replay): the serving sweep that
 covered them did not reproduce a win at the engine level, so those batches
@@ -241,6 +253,20 @@ dispatch, kernel or consumer code has to move.
    - `launch_count() -> int`, `compiled_variant_keys() -> list[str]` —
      introspection for benchmarks and tests (a CUDA-graph capture counts
      once; replays do not re-run host code).
+
+   `execute` is called with the tensors' device already current (dispatch
+   enters `torch.cuda.device(hidden_states.device)`), because a call is not
+   guaranteed to arrive on the ambient device — TP > 1 serving drives rank
+   *r*'s layers on `cuda:r`.  Take the launch stream from that device by
+   name anyway: `torch.cuda.current_stream(device)`, not
+   `torch.cuda.current_stream()`.  A test parses the impl modules and fails
+   on the bare form, since a single-GPU box cannot tell the two apart.
+
+   Both state pools are updated **in place**, so the same buffer is read and
+   written within one call.  A kernel that spells that as separate input and
+   output pointers (the CUDA impl does, to keep the phases readable) must not
+   mark those pointers `__restrict__`: they alias by construction, and the
+   promise would let the compiler hoist a pool load across a pool store.
 
    Any per-device state an impl keeps across calls (scratch buffers, a
    persistent grid barrier) is shared by every call on that device, so

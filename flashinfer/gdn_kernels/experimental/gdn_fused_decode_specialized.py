@@ -204,6 +204,7 @@ def _registry_index() -> dict:
 
 
 def _rows_for_impl(impl: str) -> tuple:
+    """Registry rows served by ``impl`` -- the impl's own dispatch surface."""
     return tuple(row for row in load_gdn_fused_decode_registry() if row["impl"] == impl)
 
 
@@ -591,61 +592,72 @@ def try_run_gdn_fused_decode_specialized(
     rows = match_gdn_fused_decode_signature(signature, hidden_states.device)
     if not rows:
         return None
-    capturing = torch.cuda.is_current_stream_capturing()
-    skipped_unready = False
-    for backend in _AUTO_BACKEND_ORDER:
-        impl, row = _impl_for_backend(backend, rows)
-        if row is None or impl is None or row["impl"] in _failed_impls:
-            continue
-        if capturing and not impl.ready_for_graph_capture(
-            hidden_states, conv_state, scale
-        ):
-            skipped_unready = True
-            continue
-        try:
-            result = impl.execute(
-                hidden_states,
-                w_ba,
-                mixed_qkv,
-                conv_weight,
-                conv_bias,
-                conv_state,
-                A_log,
-                dt_bias,
-                scale,
-                ssm_state,
-                state_indices,
-                out=out,
-            )
-        except Exception as exc:
-            # A kernel failure on the auto path must never break the
-            # composable path; latch this impl off for the process.
-            #
-            # Say so loudly enough that a measurement run cannot mistake it
-            # for a cosmetic warning: from here on a DIFFERENT kernel serves
-            # these calls, every gate downstream stays green, and any number
-            # produced after this line describes that other kernel.
-            _latch_impl_off(row["impl"])
+    # Everything below runs with the tensors' device current.  The impls take
+    # the launch stream from the *ambient* device (that is what
+    # ``torch.cuda.current_stream()`` and tvm_ffi's stream hook both read), so
+    # a call made on a non-ambient device -- e.g. a TP rank driving cuda:1
+    # from a thread whose current device is cuda:0 -- would otherwise pick up
+    # another device's stream.  ``is_current_stream_capturing()`` reads the
+    # ambient device too, so it is inside the block as well.  Cost when the
+    # device is already current is one C-level device exchange, which is why
+    # this wraps the whole dispatch rather than each impl call.
+    with torch.cuda.device(hidden_states.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+        skipped_unready = False
+        for backend in _AUTO_BACKEND_ORDER:
+            impl, row = _impl_for_backend(backend, rows)
+            if row is None or impl is None or row["impl"] in _failed_impls:
+                continue
+            if capturing and not impl.ready_for_graph_capture(
+                hidden_states, conv_state, scale
+            ):
+                skipped_unready = True
+                continue
+            try:
+                result = impl.execute(
+                    hidden_states,
+                    w_ba,
+                    mixed_qkv,
+                    conv_weight,
+                    conv_bias,
+                    conv_state,
+                    A_log,
+                    dt_bias,
+                    scale,
+                    ssm_state,
+                    state_indices,
+                    out=out,
+                )
+            except Exception as exc:
+                # A kernel failure on the auto path must never break the
+                # composable path; latch this impl off for the process.
+                #
+                # Say so loudly enough that a measurement run cannot mistake
+                # it for a cosmetic warning: from here on a DIFFERENT kernel
+                # serves these calls, every gate downstream stays green, and
+                # any number produced after this line describes that other
+                # kernel.
+                _latch_impl_off(row["impl"])
+                jit_logger.warning_once(
+                    "Specialized fused GDN decode impl '%s' failed (%s); not "
+                    "dispatching it again in this process. A different "
+                    "implementation now serves these calls -- any measurement "
+                    "taken from here on describes that one, not '%s'.",
+                    row["impl"],
+                    type(exc).__name__,
+                    row["impl"],
+                )
+            else:
+                _attest_served(row["impl"])
+                return result
+        if capturing and skipped_unready:
             jit_logger.warning_once(
-                "Specialized fused GDN decode impl '%s' failed (%s); not "
-                "dispatching it again in this process. A different "
-                "implementation now serves these calls -- any measurement "
-                "taken from here on describes that one, not '%s'.",
-                row["impl"],
-                type(exc).__name__,
-                row["impl"],
+                "CUDA-graph capture hit a registered gdn_fused_decode_step "
+                "signature before any specialized backend was compiled and "
+                "warmed; capturing the composable path instead. Run one eager "
+                "call per (batch size, scale, conv-state layout) before "
+                "capture to enable the specialized kernels."
             )
-        else:
-            _attest_served(row["impl"])
-            return result
-    if capturing and skipped_unready:
-        jit_logger.warning_once(
-            "CUDA-graph capture hit a registered gdn_fused_decode_step "
-            "signature before any specialized backend was compiled and "
-            "warmed; capturing the composable path instead. Run one eager "
-            "call per (batch size, scale, conv-state layout) before capture "
-            "to enable the specialized kernels."
-        )
     return None
 
 

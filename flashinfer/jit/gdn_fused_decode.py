@@ -30,6 +30,13 @@ _GDN_FUSED_DECODE_KERNEL_DIR = (
 
 
 def gen_gdn_fused_decode_module() -> JitSpec:
+    """JIT spec for the persistent SM120 fused-GDN-decode CUDA kernel.
+
+    Single translation unit, compiled with the ``sm120a`` flags (hence the
+    CUDA >= 12.8 requirement the callers gate on).  The source lives next to
+    its Python impl module under ``gdn_kernels/experimental/kernel/`` rather
+    than in ``csrc/``: it is only ever built for this one op.
+    """
     return gen_jit_spec(
         "gdn_fused_decode_sm120",
         [_GDN_FUSED_DECODE_KERNEL_DIR / "gdn_fused_decode_sm120.cu"],

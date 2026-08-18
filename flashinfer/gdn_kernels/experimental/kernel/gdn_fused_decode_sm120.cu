@@ -88,17 +88,28 @@ __device__ __forceinline__ void grid_barrier(volatile unsigned* barrier, int nbl
 // the (single) delta task of each warp are prefetched before the barrier so
 // their long-scoreboard latency overlaps the gemv/conv phases (the state pool
 // is only written after the barrier, each row by the warp that prefetched it).
+//
+// Aliasing: the op updates both state pools IN PLACE, so the launcher passes
+// the same pointer for (conv_state, updated_conv) and for (ssm_state,
+// ssm_out).  Those four parameters therefore carry no __restrict__ -- the
+// pools are read and written through two different parameters, which is
+// exactly what restrict promises does not happen, and promising it would let
+// the compiler reorder a pool load across a pool store.  The remaining
+// pointers are genuinely disjoint buffers and keep the qualifier.  The read
+// path pays for this: loads from the pools can no longer be promoted to
+// ld.global.nc.  Only this impl is affected -- the registry prefers the
+// CuTe-DSL kernel for every shipped row -- and correctness is not a thing to
+// trade for a read-only-cache hint.
 template <bool kB1>
 __global__ void gdn_fused_decode_kernel(
     const bf16* __restrict__ hidden, const bf16* __restrict__ w_ba,
     const bf16* __restrict__ mixed_qkv, const bf16* __restrict__ conv_weight,
-    const bf16* __restrict__ conv_bias, const bf16* __restrict__ conv_state,
-    const float* __restrict__ A_log, const bf16* __restrict__ dt_bias,
-    const float* __restrict__ ssm_state, const int* __restrict__ state_indices, float scale,
-    long state_stride_0, long qkv_stride, long conv_stride_p, long conv_stride_c,
-    long conv_stride_t, bf16* __restrict__ output, bf16* __restrict__ updated_conv,
-    float* __restrict__ ssm_out, float* __restrict__ ba_part, bf16* __restrict__ conv_out,
-    unsigned* __restrict__ barrier, int B) {
+    const bf16* __restrict__ conv_bias, const bf16* conv_state, const float* __restrict__ A_log,
+    const bf16* __restrict__ dt_bias, const float* ssm_state, const int* __restrict__ state_indices,
+    float scale, long state_stride_0, long qkv_stride, long conv_stride_p, long conv_stride_c,
+    long conv_stride_t, bf16* __restrict__ output, bf16* updated_conv, float* ssm_out,
+    float* __restrict__ ba_part, bf16* __restrict__ conv_out, unsigned* __restrict__ barrier,
+    int B) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int nthreads = gridDim.x * blockDim.x;
   const int Beff = kB1 ? 1 : B;

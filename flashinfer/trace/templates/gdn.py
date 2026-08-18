@@ -858,10 +858,11 @@ def _gdn_fused_decode_init(
     """Build inputs for ``flashinfer.gdn_fused_decode_step``.
 
     The layer geometry is baked in rather than exposed as kwargs: it is the
-    registry's dispatch surface (Qwen3.5-27B, ``hidden=5120``,
-    ``qkv_dim=10240``, 16 qk heads / 48 v heads, ``d=128``), and the fused op
-    only accelerates geometries a registry row lists — a scaled-down variant
-    would trace an op that never dispatches.
+    registry's dispatch surface (``hidden=5120``, ``qkv_dim=10240``, 16 qk
+    heads / 48 v heads, ``d=128``, captured from
+    ``nvidia/Qwen3.6-27B-NVFP4``), and the fused op only accelerates
+    geometries a registry row lists — a scaled-down variant would trace an
+    op that never dispatches.
 
     Distributions follow ``tests/gdn/test_fused_decode.py::_make_inputs``:
     small-scale ``randn`` activations and weights (the b/a GEMV sums over

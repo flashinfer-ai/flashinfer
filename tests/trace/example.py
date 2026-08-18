@@ -692,7 +692,7 @@ flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
 
-# ── GDN fused decode step (Qwen3.5-27B TP=1, the registry's SM120 geometry) ──
+# ── GDN fused decode step (the registry's SM120 geometry, TP=1) ──────────────
 # Suppressed like the other optional-dependency examples: on a non-SM120 card
 # the op falls back to its composable path (which still traces), and the trace
 # is emitted before any kernel dispatch either way.

@@ -114,6 +114,14 @@ def _signatures(rows):
 
 
 def _make_inputs(row, seed=42):
+    """Build one input set for a registry row, on the row's own geometry.
+
+    Distributions match ``tests/gdn/test_fused_decode.py::_make_inputs`` so a
+    timing run and the correctness suite exercise the same numeric regime:
+    small-scale ``randn`` activations, a row-strided ``mixed_qkv`` view like
+    the one serving passes, an SD or DS conv pool per ``row["conv_layout"]``,
+    and one distinct state-pool slot per batch row.
+    """
     import torch
 
     torch.manual_seed(seed)
@@ -161,6 +169,7 @@ def _impl_call(impl, inputs):
     """
 
     def call():
+        """One direct launch of this impl on the prepared inputs."""
         impl.execute(
             inputs["hidden_states"],
             inputs["w_ba"],
@@ -248,6 +257,7 @@ def _time_call(fn, args):
 
 
 def _sig_fields(key):
+    """Expand a signature key tuple back into its named registry fields."""
     b, hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, state_len, layout = key
     return {
         "b": b,
@@ -275,6 +285,7 @@ def _empty_registry(specialized_gdn):
 
     @contextlib.contextmanager
     def _ctx():
+        """Swap the registry loader for one returning no rows, then restore."""
         original = specialized_gdn.load_gdn_fused_decode_registry
         specialized_gdn.load_gdn_fused_decode_registry = tuple
         try:
@@ -320,6 +331,7 @@ def run_default_phase(args, signatures, specialized_gdn):
         inputs = _make_inputs(entry["row"])
 
         def call():
+            """One call through the public op, which picks its own impl."""
             gdn_fused_decode_step(**inputs)
 
         call()
@@ -387,6 +399,8 @@ def run_composable_phase(args, signatures, specialized_gdn):
             inputs = _make_inputs(row)
 
             def call():
+                """One call through the public op with the registry emptied,
+                i.e. its composable torch path."""
                 gdn_fused_decode_step(**inputs)
 
             call()
@@ -417,6 +431,7 @@ def run_composable_phase(args, signatures, specialized_gdn):
 
 
 def _print_comparison(comparison):
+    """Print the human-readable comparison table (times in microseconds)."""
     header = (
         f"{'(B, layout)':>12} | {'stock graph (us)':>17} | "
         f"{'dispatched (us)':>16} | {'dispatched x':>13} | "
@@ -426,6 +441,7 @@ def _print_comparison(comparison):
     print("-" * len(header))
 
     def fmt(value, scale=1.0, suffix=""):
+        """Render an optional measurement; a missing one prints as "-"."""
         return "-" if value is None else f"{value * scale:.1f}{suffix}"
 
     for row in comparison:
@@ -452,6 +468,12 @@ def _print_comparison(comparison):
 
 
 def run_all(args):
+    """Run both phases, join them per signature and emit the comparison.
+
+    Order matters: the composable phase runs first, while no dispatch has
+    warmed a variant, so its "nothing specialized launched" proof cannot be
+    confused by launch counters that moved earlier in the process.
+    """
     import torch  # noqa: F401  (fail early on a CPU-only box)
 
     from flashinfer.gdn_kernels.experimental import (
@@ -466,6 +488,7 @@ def run_all(args):
     enabled = run_default_phase(args, signatures, specialized_gdn)
 
     def key(row):
+        """Join key between the two phases: one registered signature."""
         return (row["b"], row["conv_layout"])
 
     by_sig = {key(r): r for r in stock["rows"]}
@@ -520,6 +543,7 @@ def run_all(args):
 
 
 def main():
+    """Command-line entry point."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", help="write the combined results JSON here")
     parser.add_argument("--iters", type=int, default=200, help="timed iterations")

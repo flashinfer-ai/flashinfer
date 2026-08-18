@@ -80,6 +80,16 @@ def pre_kernel(
     part: cute.Tensor,  # [B, N_BA] f32, zeroed before launch
     Bc: cutlass.Constexpr,
 ):
+    """First of the two launches: conv1d state update and the b/a GEMV.
+
+    One grid does both, since neither depends on the other: blocks
+    ``[0, B*NCONV)`` shift the conv-state rows, append the new input and write
+    the silu-activated conv output to ``qkv_act``; the remaining blocks
+    accumulate K-split partials of ``hidden @ w_ba`` into ``part`` with
+    gpu-scope atomics (hence the memset of ``part`` before the launch).  It
+    signals PDL launch dependents up front so ``delta_kernel``'s ``ssm_state``
+    prefetch overlaps this entire body.
+    """
     # Combined conv + K-split GEMV in one launch. Blocks [0, B*NCONV) do conv;
     # blocks [B*NCONV, ...) accumulate GEMV partials with gpu-scope atomics.
     # Early PDL signal so delta_kernel's ssm_state prefetch overlaps the FULL
@@ -140,6 +150,14 @@ def delta_kernel(
     output: cute.Tensor,  # [B, 1, HV, D] bf16
     scale: cutlass.Constexpr,
 ):
+    """Second launch: gates, qk-L2-norm and the gated delta-rule update.
+
+    One warp owns one ``ssm_state`` row: it prefetches the row before waiting
+    on PDL (``pre_kernel`` never touches ``ssm_state``, so the long-latency
+    fp32 loads overlap the whole first kernel), reduces the b/a GEMV partials
+    into the beta and decay gates, and writes the updated row back in place
+    plus this row's slice of the attention output.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     hh = bidx // NRB  # global head index (b_idx*HV + h)
@@ -308,6 +326,11 @@ def fused_launch(
     B: cutlass.Constexpr,
     scale: cutlass.Constexpr,
 ):
+    """Host-side launcher: ``pre_kernel`` then ``delta_kernel``, PDL-chained.
+
+    Compiled once per (batch size, scale, conv-state stride mode); ``B`` and
+    ``scale`` are constexpr because both shape the generated code.
+    """
     pre_kernel(
         mixed_qkv,
         conv_weight,
@@ -425,12 +448,12 @@ def execute(
         _workspace_cache[wkey] = workspace
     part, qkv_act = workspace
     order_after_previous_stream(_workspace_stream, dev)
-    cuda_driver.cuMemsetD32Async(
-        int(part.data_ptr()),
-        0,
-        B * N_BA,
-        cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
-    )
+    # Take the stream from the tensors' device explicitly rather than from the
+    # ambient one: the dispatcher makes that device current before calling in,
+    # but an impl that reads torch.cuda.current_stream() with no argument would
+    # silently follow the ambient device if that ever stopped being true.
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+    cuda_driver.cuMemsetD32Async(int(part.data_ptr()), 0, B * N_BA, stream)
 
     # conv_state is a logical [P, QKV_DIM, CONV_STATE_LEN] view over either a
     # transposed SD pool (stride-1 channels, vLLM default) or a DS-dense pool
@@ -454,8 +477,6 @@ def execute(
     m_out = from_dlpack(output, enable_tvm_ffi=True).mark_layout_dynamic()
     m_qa = from_dlpack(qkv_act, enable_tvm_ffi=True).mark_layout_dynamic()
     m_part = from_dlpack(part, enable_tvm_ffi=True).mark_layout_dynamic()
-
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
     key = (B, scale_f, cs_ld)
     fn = _compiled.get(key)

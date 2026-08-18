@@ -53,6 +53,10 @@ flashinfer/gdn_kernels/experimental/README.md):
   probe memo it has to invalidate;
 - the CuTe-DSL impl staying inside the DSL surface its DEPLOYED version
   offers, not the one a dev box happens to have;
+- multi-device dispatch: a call whose tensors live on a device other than
+  the ambient one must still reach the kernel (TP > 1 serving does exactly
+  that) and must leave the caller's ambient device alone, and no impl may
+  take its launch stream from an unnamed device;
 - the probe memo more generally: it must answer a repeated question
   cheaply without ever outliving the registry it was derived from.
 """
@@ -149,17 +153,24 @@ ATOL, RTOL = 5e-3, 5e-3
 
 
 def _skip_if_no_cuda() -> None:
+    """Skip when the node has no CUDA device."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
 
 def _skip_if_no_specialized() -> None:
+    """Skip unless this node can run the registered specialized kernels."""
     _skip_if_no_cuda()
     if not is_sm120a_supported(torch.device("cuda")):
         pytest.skip("the registered specialized fused GDN kernels target SM120")
 
 
 def _impl(name: str):
+    """The impl module ``name``, or skip when it cannot load here.
+
+    An impl may be legitimately unavailable (the CuTe-DSL one needs the
+    optional nvidia-cutlass-dsl package), which is a skip, not a failure.
+    """
     module = specialized_gdn._load_impl(name)
     if module is None:
         pytest.skip(f"impl {name!r} unavailable on this node")
@@ -204,6 +215,14 @@ def _make_inputs(
     device="cuda",
     saturate_gate: bool = False,
 ) -> dict:
+    """Build one input set for the registered layer geometry.
+
+    Scales are chosen so the gates stay in their ordinary range; pass
+    ``saturate_gate`` for the overflow regime random inputs never reach.
+    ``padded_pool`` reproduces vLLM's padded ssm-pool row stride, and
+    ``conv_layout`` picks the physical conv-pool layout.  Each batch row gets
+    its own pool slot, walking downwards from ``POOL - 1``.
+    """
     assert B < POOL, "every batch row needs its own state-pool slot"
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -249,6 +268,7 @@ def _run_reference(
     seed: int,
     conv_layout: str = "SD",
     saturate_gate: bool = False,
+    device="cuda",
 ):
     """Composable-path result on an identically-seeded fresh input set."""
     ref_inputs = _make_inputs(
@@ -257,6 +277,7 @@ def _run_reference(
         seed=seed,
         conv_layout=conv_layout,
         saturate_gate=saturate_gate,
+        device=device,
     )
     out = gfd._gdn_fused_decode_step_fallback(
         ref_inputs["hidden_states"],
@@ -293,6 +314,7 @@ def _guard_args(inputs: dict) -> tuple:
 
 
 def _matched_rows(inputs: dict):
+    """Registry rows this input set dispatches to (empty when none)."""
     signature = specialized_gdn.signature_from_tensors(*_guard_args(inputs))
     if signature is None:
         return []
@@ -461,6 +483,7 @@ def test_unrecognized_conv_state_strides_fall_back():
     cuda = _impl(_CUDA_IMPL)
 
     def _make():
+        """Inputs whose conv-state pool has an unrecognized stride pattern."""
         inputs = _make_inputs(1, padded_pool=False, seed=17)
         backing = (
             torch.randn(POOL, QKV_DIM, 2 * CONV_STATE_LEN, device="cuda").bfloat16()
@@ -481,6 +504,12 @@ def test_unrecognized_conv_state_strides_fall_back():
 
 
 def test_supported_probe():
+    """The routing probe answers exactly the registry as shipped.
+
+    It is the consumer's gating decision, so it must accept the registered
+    batches and layout and decline everything else -- unregistered batches,
+    a geometry that is not ours, and unknown layout tags.
+    """
     _skip_if_no_specialized()
     for batch in REGISTERED_BATCHES:
         assert gfd.gdn_fused_decode_step_supported(batch)
@@ -507,6 +536,7 @@ def test_registry_drives_dispatch_both_ways(monkeypatch):
     cuda = _impl(_CUDA_IMPL)
 
     def _counts():
+        """(cutedsl, cuda) launch counters, for before/after comparisons."""
         return (
             cutedsl.launch_count() if cutedsl is not None else 0,
             cuda.launch_count(),
@@ -565,6 +595,7 @@ def test_no_environment_gate(monkeypatch):
     cuda = _impl(_CUDA_IMPL)
 
     def _counts():
+        """(cutedsl, cuda) launch counters, for before/after comparisons."""
         return (
             cutedsl.launch_count() if cutedsl is not None else 0,
             cuda.launch_count(),
@@ -655,13 +686,17 @@ def test_importing_flashinfer_does_not_import_a_kernel():
     optional dependency.  Pinned here because the lazy imports that make it
     true are easy to "simplify" away.
     """
+    # No trailing dot on the kernel-package prefix: the impl package itself
+    # (``...experimental.kernel``) is as much an eager import as any module
+    # under it -- importing it runs the package __init__ -- and a trailing dot
+    # would only match the submodules.
     probe = (
         "import sys, flashinfer;"
         "assert callable(flashinfer.gdn_fused_decode_step);"
         "assert callable(flashinfer.gdn_fused_decode_step_supported);"
         "eager = [m for m in sys.modules"
         " if 'gdn_fused_decode_specialized' in m"
-        " or '.experimental.kernel.' in m];"
+        " or '.experimental.kernel' in m];"
         "print(eager)"
     )
     # Hand the child this interpreter's search path so it imports the same
@@ -711,6 +746,7 @@ def test_routing_probe_keeps_its_keyword_geometry():
 
 
 def test_non_registered_batch_falls_back():
+    """An unregistered batch size runs the composable path and stays correct."""
     _skip_if_no_specialized()
     inputs = _make_inputs(3, padded_pool=False, seed=11)  # B=3 not registered
     out, _, _ = gdn_fused_decode_step(**inputs)
@@ -762,6 +798,7 @@ def test_kernel_failure_latches_impl_off(monkeypatch):
     cuda = _impl(_CUDA_IMPL)
 
     def _boom(*args, **kwargs):
+        """Stand-in for a kernel that fails at launch."""
         raise RuntimeError("injected kernel failure")
 
     monkeypatch.setattr(cutedsl, "execute", _boom)
@@ -820,6 +857,7 @@ def test_graph_capture_after_warmup(impl_name: str, monkeypatch):
     )
 
     def _boom(*args, **kwargs):
+        """Fail loudly if the composable path is reached at all."""
         raise AssertionError("composable fallback used during capture of a warm impl")
 
     real_fallback = gfd._gdn_fused_decode_step_fallback
@@ -870,6 +908,7 @@ def test_graph_capture_with_cold_caches_bakes_composable(monkeypatch):
     real_fallback = gfd._gdn_fused_decode_step_fallback
 
     def _spy(*args, **kwargs):
+        """Count composable-path calls, then run the real one."""
         calls["fallback"] += 1
         return real_fallback(*args, **kwargs)
 
@@ -935,6 +974,7 @@ def test_capture_never_compiles_a_cold_impl(monkeypatch):
     real_fallback = gfd._gdn_fused_decode_step_fallback
 
     def _spy(*args, **kwargs):
+        """Count composable-path calls, then run the real one."""
         calls["fallback"] += 1
         return real_fallback(*args, **kwargs)
 
@@ -1011,6 +1051,94 @@ def test_portable_cute_math_primitives_exist_in_the_installed_dsl():
     assert not missing, f"installed cute.math is missing {missing}"
 
 
+def _bare_current_stream_calls(path: pathlib.Path) -> list:
+    """Lines calling ``...current_stream()`` with no explicit device."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "current_stream"
+        and not node.args
+        and not node.keywords
+    ]
+
+
+def test_impl_modules_name_the_device_they_take_a_stream_from():
+    """An impl must read the launch stream off the tensors' device.
+
+    ``torch.cuda.current_stream()`` with no argument answers for the AMBIENT
+    device.  Dispatch makes the tensors' device current before calling an
+    impl, so the two agree today -- but an impl that relies on that silently
+    launches onto another device's stream the moment it is called from
+    anywhere else (a bare ``impl.execute`` in a harness, or a future dispatch
+    path).  Cheap to keep right, invisible on a single-GPU box, so it is
+    pinned here.  AST-parsed, so it needs neither a GPU nor cutlass.
+    """
+    kernel_dir = pathlib.Path(specialized_gdn.__file__).parent / "kernel"
+    offenders = {}
+    for impl_name in SHIPPED_IMPLS:
+        path = kernel_dir / f"gdn_fused_decode_{impl_name}.py"
+        assert path.is_file(), f"impl module not found at {path}"
+        lines = _bare_current_stream_calls(path)
+        if lines:
+            offenders[path.name] = lines
+    assert not offenders, (
+        f"impl modules call current_stream() with no device: {offenders}. "
+        "Pass the tensors' device explicitly, e.g. "
+        "torch.cuda.current_stream(hidden_states.device)."
+    )
+
+
+def test_dispatch_serves_a_call_on_a_non_ambient_device():
+    """A call whose tensors live on a device other than the current one must
+    still dispatch, and must not disturb the caller's ambient device.
+
+    TP > 1 serving drives rank r's layers on ``cuda:r``; the ambient device of
+    the calling thread is not guaranteed to be that one.  The impls take their
+    launch stream (and, through tvm_ffi, their launch context) from the
+    current device, so dispatch sets it.  Without that the launch picks up
+    ``cuda:0``'s stream: at best the kernel raises and the failure latch turns
+    the impl off *for the whole process* -- every later call on every rank
+    quietly runs the composable path -- at worst it runs unordered against the
+    stream the caller is actually synchronizing.  Single-GPU CI cannot see any
+    of that.
+    """
+    _skip_if_no_specialized()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    if not is_sm120a_supported(torch.device("cuda:1")):
+        pytest.skip("the registered specialized fused GDN kernels target SM120")
+
+    B, seed = 4, 20260818
+    device = torch.device("cuda:1")
+    inputs = _make_inputs(B, padded_pool=False, seed=seed, device=device)
+    assert _matched_rows(inputs), "test geometry must be registered on cuda:1"
+
+    with torch.cuda.device(0):
+        assert torch.cuda.current_device() == 0
+        out, conv_state, ssm_state = gdn_fused_decode_step(**inputs)
+        # Dispatch may make the tensors' device current; it must put the
+        # caller's back.
+        assert torch.cuda.current_device() == 0
+    torch.cuda.synchronize(device)
+
+    stats = specialized_gdn.gdn_fused_decode_stats()
+    assert stats["served_impls"], (
+        "the call on cuda:1 did not reach a specialized impl -- it fell "
+        f"through to the composable path (failed_impls={stats['failed_impls']})"
+    )
+    assert stats["failed_impls"] == []
+
+    ref_out, ref_conv, ref_ssm = _run_reference(
+        B, padded_pool=False, seed=seed, device=device
+    )
+    torch.testing.assert_close(out, ref_out, atol=ATOL, rtol=RTOL)
+    assert torch.equal(conv_state, ref_conv)
+    torch.testing.assert_close(ssm_state, ref_ssm, atol=ATOL, rtol=RTOL)
+
+
 def test_dispatch_attests_which_impl_served(monkeypatch):
     """A served call must be attributable to a named impl.
 
@@ -1044,6 +1172,7 @@ def test_a_latched_impl_never_attests_as_served(monkeypatch):
     cuda = _impl(_CUDA_IMPL)
 
     def _boom(*args, **kwargs):
+        """Reproduce the DSL-surface failure shape: a missing attribute."""
         raise AttributeError("injected: module has no attribute 'max'")
 
     monkeypatch.setattr(cutedsl, "execute", _boom)

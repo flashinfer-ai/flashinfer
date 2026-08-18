@@ -66,6 +66,13 @@ def _module_is_resident() -> bool:
 
 
 def _get_barrier(device: torch.device) -> torch.Tensor:
+    """The device's grid-barrier buffer, allocated (and zeroed) on first use.
+
+    Cached per device: the kernel's barrier resets its own arrival counter and
+    spins on a monotonic generation, so one zeroed buffer serves every launch
+    on that device and no per-call memset is needed.  Allocating here rather
+    than per call is also what makes capture-readiness checkable in advance.
+    """
     key = str(device)
     barrier = _barrier_cache.get(key)
     if barrier is None:

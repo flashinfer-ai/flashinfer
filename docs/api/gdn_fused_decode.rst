@@ -3,6 +3,8 @@
 flashinfer.gdn_fused_decode_step
 ================================
 
+.. currentmodule:: flashinfer
+
 Fused single-token Gated Delta-Rule decode step over paged conv/ssm state
 pools. It folds the whole per-layer serving chain — the b/a projection GEMV,
 the depthwise causal conv1d state update, the q/k/v head split and the gated
@@ -20,8 +22,6 @@ The implementation (dispatch, workload registry and kernels) lives under
 ``flashinfer/gdn_kernels/experimental/``; see its ``README.md`` for the
 registry schema and the impl-module interface. *Experimental* describes where
 that code lives, not how the op is called.
-
-.. currentmodule:: flashinfer
 
 .. autosummary::
     :toctree: ../generated
