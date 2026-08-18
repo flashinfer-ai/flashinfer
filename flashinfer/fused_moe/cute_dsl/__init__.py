@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuteDSL-based Fused MoE Kernels for NVFP4 and MXFP8 x MXFP4 on Blackwell and Rubin GPUs.
+CuteDSL-based Fused MoE Kernels for NVFP4 and MXFP8 x MXFP4.
 """
 
 from ...cute_dsl.utils import is_cute_dsl_available
