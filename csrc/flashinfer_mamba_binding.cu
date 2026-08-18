@@ -48,6 +48,9 @@ void selective_state_update(
     int64_t cache_steps,
     Optional<TensorView> cu_seqlens,           // (N + 1,)
     Optional<TensorView> num_accepted_tokens,  // (N,)
+    Optional<TensorView> xab_x,               // checkpointing: (batch, K, nheads, dim)
+    Optional<TensorView> xab_dt,              // checkpointing: (batch, K, nheads)
+    Optional<TensorView> xab_B,               // checkpointing: (batch, K, ngroups, dstate)
     int64_t algorithm);  // SSUAlgorithm: 0=auto, 1=simple, 2=vertical, 3=horizontal
 
 }  // namespace flashinfer::mamba
