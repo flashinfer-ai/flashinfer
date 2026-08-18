@@ -35,6 +35,9 @@ CakeBatchDeepGemmShape = Literal[
     "n4096_k7168",
     "large_nk",
     "short_m_n6144_k7168",
+    "pack_scales_m224",
+    "swap_m224",
+    "tail128",
 ]
 CakeBatchDeepGemmTarget = Literal["sm100a", "sm103a"]
 
@@ -89,11 +92,38 @@ CAKE_BATCH_DEEPGEMM_METADATA: dict[
         use_fast_math=False,
     ),
     "short_m_n6144_k7168": CakeBatchDeepGemmMetadata(
-        n=6144,
-        k=7168,
+        n=0,
+        k=0,
         variant=4,
         symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_large_nk_cta1",
         source="cake_batch_deepgemm_fp8_short_m_n6144_k7168.cu",
+        smem_bytes=203776,
+        use_fast_math=False,
+    ),
+    "pack_scales_m224": CakeBatchDeepGemmMetadata(
+        n=0,
+        k=0,
+        variant=5,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_pack_scales_m224",
+        source="cake_batch_deepgemm_fp8_pack_scales_m224.cu",
+        smem_bytes=10752,
+        use_fast_math=False,
+    ),
+    "swap_m224": CakeBatchDeepGemmMetadata(
+        n=0,
+        k=0,
+        variant=6,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224",
+        source="cake_batch_deepgemm_fp8_swap_m224.cu",
+        smem_bytes=202752,
+        use_fast_math=False,
+    ),
+    "tail128": CakeBatchDeepGemmMetadata(
+        n=0,
+        k=0,
+        variant=7,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_large_nk_cta1_tail128",
+        source="cake_batch_deepgemm_fp8_tail128.cu",
         smem_bytes=203776,
         use_fast_math=False,
     ),
@@ -102,6 +132,14 @@ CAKE_BATCH_DEEPGEMM_METADATA: dict[
 _GENERIC_NK = frozenset(
     {
         (7168, 2048),
+        (6144, 7168),
+        (7168, 3072),
+        (4096, 4096),
+        (4096, 2048),
+    }
+)
+_SWAP_M224_PROFILE_NK = frozenset(
+    {
         (6144, 7168),
         (7168, 3072),
         (4096, 4096),
@@ -199,6 +237,7 @@ def _tensor_map_device(
     global_strides: tuple[int, ...],
     box_dims: tuple[int, ...],
     swizzle,
+    l2_promotion=cbd.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
 ) -> torch.Tensor:
     key = (
         tensor.device,
@@ -208,6 +247,7 @@ def _tensor_map_device(
         global_strides,
         box_dims,
         swizzle,
+        l2_promotion,
     )
     cached = _TENSOR_MAP_CACHE.get(key)
     if cached is not None:
@@ -224,7 +264,7 @@ def _tensor_map_device(
             (cbd.cuuint32_t(1),) * rank,
             cbd.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
             swizzle,
-            cbd.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            l2_promotion,
             cbd.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
         )
     )
@@ -248,7 +288,7 @@ def _tensor_maps(
     n = b.shape[1]
     swizzle_128 = cbd.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     uint8 = cbd.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
-    if (n, k) == (4096, 7168):
+    if shape == "n4096_k7168":
         a_desc = _tensor_map_device(
             a,
             data_type=uint8,
@@ -267,13 +307,18 @@ def _tensor_maps(
         )
     else:
         k_box = 1 if shape == "n512_k128" else 2
-        b_rows = 128 if shape in {"n512_k128", "short_m_n6144_k7168"} else 64
+        a_rows = 112 if shape == "swap_m224" else 128
+        b_rows = (
+            128
+            if shape in {"n512_k128", "short_m_n6144_k7168", "swap_m224", "tail128"}
+            else 64
+        )
         a_desc = _tensor_map_device(
             a,
             data_type=uint8,
             global_dims=(128, m, k // 128, batch),
             global_strides=(k, 128, m * k),
-            box_dims=(128, 128, k_box, 1),
+            box_dims=(128, a_rows, k_box, 1),
             swizzle=swizzle_128,
         )
         b_desc = _tensor_map_device(
@@ -293,23 +338,103 @@ def _tensor_maps(
             box_dims=(64, 128, 1),
             swizzle=cbd.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
         )
+    elif shape == "swap_m224":
+        c_desc = _tensor_map_device(
+            out,
+            data_type=cbd.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            global_dims=(n, batch * m),
+            global_strides=(n * 2,),
+            box_dims=(64, 16),
+            swizzle=cbd.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+            l2_promotion=cbd.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        )
     else:
         c_desc = a_desc
     return a_desc, b_desc, c_desc
 
 
-def _select_route(n: int, k: int, expected_m: int) -> CakeBatchDeepGemmShape:
+def _select_route(
+    batch: int, m: int, n: int, k: int, expected_m: int
+) -> CakeBatchDeepGemmShape | Literal["m224_tail128"]:
     if (n, k) == (128, 512):
         return "n128_k512"
     if (n, k) == (512, 128):
         return "n512_k128"
+    if (batch, m, n, k) == (64, 256, 7168, 2048):
+        return "m224_tail128"
+    if (
+        (expected_m in {230, 1228} and (n, k) in _SWAP_M224_PROFILE_NK)
+        or (batch, m, n, k) == (1, 8192, 7168, 2048)
+        or (batch, m, n, k) == (1, 16384, 4096, 7168)
+        or (batch, m, n, k) == (8, 1024, 4096, 7168)
+    ):
+        return "swap_m224"
     if (n, k) == (4096, 7168):
         return "n4096_k7168"
-    if (n, k) == (6144, 7168) and expected_m == 24:
+    if ((n, k) == (7168, 2048) and m <= 256) or (
+        expected_m == 24 and (n, k) in _GENERIC_NK
+    ):
         return "short_m_n6144_k7168"
     if (n, k) in _GENERIC_NK:
         return "large_nk"
     raise ValueError(f"unsupported Cake batch DeepGEMM shape: N={n}, K={k}")
+
+
+_PACKED_SCALE_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _packed_scale_workspaces(
+    a: torch.Tensor, batch: int, m: int, n: int, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stream = torch.cuda.current_stream(a.device)
+    key = (a.device, stream.cuda_stream, batch, m, n, k)
+    cached = _PACKED_SCALE_WORKSPACE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    packed_cols = k // (128 * 4)
+    with torch.cuda.device(a.device):
+        cached = (
+            torch.empty((batch, packed_cols, m), dtype=torch.int32, device=a.device),
+            torch.empty(
+                (batch, packed_cols, n // 128), dtype=torch.int32, device=a.device
+            ),
+        )
+    _PACKED_SCALE_WORKSPACE_CACHE[key] = cached
+    return cached
+
+
+def _run_module(
+    shape: CakeBatchDeepGemmShape,
+    target: CakeBatchDeepGemmTarget,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: torch.Tensor,
+    sfa_packed: torch.Tensor,
+    sfb_packed: torch.Tensor,
+    expected_m: int,
+    compute_m_cap: int,
+    *,
+    descriptor_shape: CakeBatchDeepGemmShape | None = None,
+) -> None:
+    a_desc, b_desc, c_desc = _tensor_maps(a, b, out, descriptor_shape or shape)
+    get_cake_batch_deepgemm_module(shape, target).run(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        out,
+        a_desc,
+        b_desc,
+        c_desc,
+        sfa_packed,
+        sfb_packed,
+        expected_m,
+        compute_m_cap,
+    )
 
 
 def run_cake_batch_deepgemm_fp8(
@@ -321,25 +446,76 @@ def run_cake_batch_deepgemm_fp8(
     out: torch.Tensor,
     expected_m: int,
 ) -> None:
-    shape = _select_route(b.shape[1], a.shape[2], expected_m)
+    batch, m, k = a.shape
+    n = b.shape[1]
+    route = _select_route(batch, m, n, k, expected_m)
     capability = torch.cuda.get_device_capability(a.device)
     target = {(10, 0): "sm100a", (10, 3): "sm103a"}.get(capability)
     if target is None:
         raise ValueError(
             f"Cake batch DeepGEMM requires SM100 or SM103, got {capability}"
         )
-    a_desc, b_desc, c_desc = _tensor_maps(a, b, out, shape)
-    get_cake_batch_deepgemm_module(shape, target).run(
+    if route in {"swap_m224", "m224_tail128"}:
+        sfa_packed, sfb_packed = _packed_scale_workspaces(a, batch, m, n, k)
+        _run_module(
+            "pack_scales_m224",
+            target,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            out,
+            sfa_packed,
+            sfb_packed,
+            expected_m,
+            224 if route == "m224_tail128" else m,
+            descriptor_shape="swap_m224",
+        )
+        _run_module(
+            "swap_m224",
+            target,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            out,
+            sfa_packed,
+            sfb_packed,
+            expected_m,
+            224 if route == "m224_tail128" else m,
+        )
+        if route == "m224_tail128":
+            _run_module(
+                "tail128",
+                target,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                masked_m,
+                out,
+                sfa_packed,
+                sfb_packed,
+                expected_m,
+                224,
+            )
+        return
+
+    _run_module(
+        route,
+        target,
         a,
         b,
         a_scale,
         b_scale,
         masked_m,
         out,
-        a_desc,
-        b_desc,
-        c_desc,
+        a_scale.view(torch.int32),
+        b_scale.view(torch.int32),
         expected_m,
+        m,
     )
 
 
