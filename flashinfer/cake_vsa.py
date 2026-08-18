@@ -266,9 +266,7 @@ def plan_cake_vsa(
     row_counts = dense.sum(dim=-1, dtype=torch.int32)
     min_selected_blocks = int(row_counts.min().item())
     max_selected_blocks = int(row_counts.max().item())
-    uniform_selected_blocks = bool(
-        torch.all(row_counts == max_selected_blocks).item()
-    )
+    uniform_selected_blocks = bool(torch.all(row_counts == max_selected_blocks).item())
     if min_selected_blocks <= 0:
         raise ValueError("every Cake VSA block row must select at least one block")
     shared_indptr = shared_indices = None
