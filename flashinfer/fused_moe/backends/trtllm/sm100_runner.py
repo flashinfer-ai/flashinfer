@@ -26,7 +26,11 @@ from flashinfer.fused_moe.shared.inputs import (
     RoutingInputMode,
     unpack_trtllm_moe_output,
 )
-from flashinfer.fused_moe.shared.tuning import make_moe_tuning_config, moe_topk_ids_init
+from flashinfer.fused_moe.shared.tuning import (
+    make_moe_tuning_config,
+    make_repeating_tensor_initializer,
+    moe_topk_ids_init,
+)
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -90,15 +94,20 @@ class MoERunner(TunableRunner):
         routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
+        init_packed_topk_ids = (
+            make_repeating_tensor_initializer(moe_inputs.topk_ids)
+            if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0
+            else moe_topk_ids_init(
+                self.num_experts,
+                packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
+            )
+        )
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(
-                self.num_experts,
-                packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
-            ),
+            init_packed_topk_ids=init_packed_topk_ids,
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )

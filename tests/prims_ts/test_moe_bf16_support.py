@@ -38,6 +38,7 @@ from flashinfer.prims_ts.moe.runner import (
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     SfLayout,
     SfSmemToTmemCopy,
+    TileScheduler,
     make_config,
     validate_config,
 )
@@ -274,6 +275,57 @@ def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
         validate_config(make_config(**invalid_fc2))
 
 
+def test_kimi_k3_n192_fc1_k128_s5_no_unroll_is_buildable():
+    comment = "MxFp4xMxFp8_FC1_HighThroughput_tileN_192_K128S5NoUnroll"
+    configs_by_comment = {cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()}
+    baseline = configs_by_comment["MxFp4xMxFp8_FC1_HighThroughput_tileN_192"]
+    target = configs_by_comment[comment]
+    actual_changes = {
+        key: (baseline.options.get(key), target.options.get(key))
+        for key in baseline.options.keys() | target.options.keys()
+        if baseline.options.get(key) != target.options.get(key)
+    }
+    assert actual_changes == {
+        "num_stages_a": (3, 5),
+        "num_stages_b": (3, 5),
+        "num_stages_smem_sfa": (3, 5),
+        "num_stages_smem_sfb": (3, 5),
+        "num_stages_tmem_sfa": (3, 5),
+        "num_stages_tmem_sfb": (3, 5),
+        "tile_k": (256, 128),
+        "use_unroll_loop_2x_for_mma": (True, False),
+    }
+    kwargs = dict(
+        activation_type=int(ActivationType.Situ),
+        num_tokens=8192,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+    )
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 192:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        if pair.fc1.prims_ts_gemm_config_index != target.global_index:
+            continue
+        fc1 = pair.fc1.cfg.build()
+        assert fc1.tile_k == 128
+        assert (
+            fc1.num_stages_a,
+            fc1.num_stages_b,
+            fc1.num_stages_smem_sfa,
+            fc1.num_stages_smem_sfb,
+            fc1.num_stages_tmem_sfa,
+            fc1.num_stages_tmem_sfb,
+        ) == (5,) * 6
+        assert fc1.use_unroll_loop_2x_for_mma == 0
+        return
+
+    pytest.fail(f"no Kimi K3 N192 FC1 tactic found for {comment}")
+
+
 def test_config_mapper_reuses_gated_tactics_for_kimi_k3_situ():
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
         [-1, -1],
@@ -302,6 +354,145 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
     )
 
     assert capacity == 183 * 128
+
+
+def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
+    kwargs = dict(
+        activation_type=int(ActivationType.Situ),
+        num_tokens=32,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+        enable_pdl=True,
+    )
+    expected_flags = (0, 1, 1)
+    found = False
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 8:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc2 = pair.fc2.cfg.kwargs
+        flags = (
+            fc2["use_unroll_loop_2x_for_mma"],
+            fc2["use_clc_fast_drain"],
+            fc2["use_work_throttle"],
+        )
+        if not (
+            fc2["mma_m"] == 128
+            and fc2["mma_n"] == 8
+            and fc2["tile_n"] == 8
+            and fc2["tile_k"] == 512
+            and fc2["num_stages_a"] == 3
+            and fc2["num_stages_b"] == 3
+            and fc2["num_stages_tmem_acc"] == 2
+            and fc2["tile_scheduler"] == int(TileScheduler.PERSISTENT)
+            and flags == expected_flags
+        ):
+            continue
+
+        pair.fc2.cfg.build()
+        found = True
+
+    assert found
+
+
+def test_kimi_k3_high_throughput_fast_drain_fc2_config_is_buildable():
+    kwargs = dict(
+        activation_type=int(ActivationType.Situ),
+        num_tokens=256,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+        enable_pdl=True,
+    )
+    expected_flags = (0, 1)
+    found = False
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 128:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc2 = pair.fc2.cfg.kwargs
+        flags = (
+            fc2["use_unroll_loop_2x_for_mma"],
+            fc2["use_clc_fast_drain"],
+        )
+        if not (
+            fc2["mma_m"] == 256
+            and fc2["mma_n"] == 128
+            and fc2["cluster_m"] == 2
+            and fc2["tile_n"] == 128
+            and fc2["epi_tile_n"] == 64
+            and fc2["tile_k"] == 256
+            and fc2["sf_layout_b"] == int(SfLayout.R128c4)
+            and fc2["num_stages_a"] == 4
+            and fc2["num_stages_b"] == 4
+            and fc2["num_stages_c_smem"] == 1
+            and fc2["num_stages_smem_sfa"] == 4
+            and fc2["num_stages_smem_sfb"] == 4
+            and fc2["num_stages_tmem_sfa"] == 4
+            and fc2["num_stages_tmem_sfb"] == 4
+            and fc2["num_stages_tmem_acc"] == 2
+            and fc2["tile_scheduler"] == int(TileScheduler.PERSISTENT)
+            and flags == expected_flags
+        ):
+            continue
+
+        pair.fc2.cfg.build()
+        found = True
+
+    assert found
+
+
+def test_kimi_k3_high_throughput_tma_oob_fc1_is_buildable():
+    configs_by_comment = {
+        cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()
+    }
+    baseline = configs_by_comment["MxFp4xMxFp8_FC1_HighThroughputFusedLdgsts"]
+    winner = configs_by_comment[
+        "MxFp4xMxFp8_FC1_KimiK3HighThroughputTmaOob"
+    ]
+    actual_changes = {
+        key: (baseline.options.get(key), winner.options.get(key))
+        for key in baseline.options.keys() | winner.options.keys()
+        if baseline.options.get(key) != winner.options.get(key)
+    }
+    assert actual_changes == {
+        "use_tma_oob_opt": (False, True),
+        "use_work_throttle": (False, True),
+    }
+
+    kwargs = dict(
+        activation_type=int(ActivationType.Situ),
+        num_tokens=256,
+        top_k=16,
+        num_local_experts=56,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+        enable_pdl=True,
+    )
+    built_by_global_index = {}
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 128:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        global_index = pair.fc1.prims_ts_gemm_config_index
+        if global_index not in (baseline.global_index, winner.global_index):
+            continue
+        built_by_global_index[global_index] = pair.fc1.cfg.build()
+
+    baseline_built = built_by_global_index[baseline.global_index]
+    winner_built = built_by_global_index[winner.global_index]
+    assert (
+        baseline_built.use_tma_oob_opt,
+        baseline_built.use_work_throttle,
+        winner_built.use_tma_oob_opt,
+        winner_built.use_work_throttle,
+    ) == (0, 0, 1, 1)
 
 
 def test_config_mapper_exposes_gpt_oss_low_latency_fc1():

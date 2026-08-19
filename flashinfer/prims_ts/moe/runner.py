@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import (
     make_moe_tuning_config,
+    make_repeating_tensor_initializer,
     moe_topk_ids_init,
 )
 from flashinfer.jit.core import logger
@@ -440,7 +441,7 @@ class _PrimsTsMoERunnerMixin:
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         return (
-            ("prims_ts_moe_config_version", 1),
+            ("prims_ts_moe_config_version", 2),
             ("dtype_act", int(self.dtype_act)),
             ("dtype_weights", int(self.dtype_weights)),
             ("fp8_quantization_type", int(self.fp8_quantization_type)),
@@ -1123,14 +1124,18 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
+        init_packed_topk_ids = (
+            make_repeating_tensor_initializer(moe_inputs.topk_ids)
+            if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0
+            else _moe_topk_ids_init_for_routing(self.num_experts, routing_input_mode)
+        )
+
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
-                self.num_experts, routing_input_mode
-            ),
+            init_packed_topk_ids=init_packed_topk_ids,
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )

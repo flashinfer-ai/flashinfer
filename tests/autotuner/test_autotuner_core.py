@@ -37,6 +37,9 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TuningConfig,
     TunableRunner,
+)
+from flashinfer.fused_moe.shared.tuning import make_repeating_tensor_initializer
+from flashinfer.fused_moe.utils import (
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
@@ -73,6 +76,35 @@ class DummyRunner(TunableRunner):
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         return inputs[0]
+
+
+def test_repeating_tensor_initializer_preserves_runtime_values():
+    source = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+    initializer = make_repeating_tensor_initializer(source)
+
+    actual = initializer((5, 3), torch.int32, torch.device("cpu"))
+
+    assert torch.equal(
+        actual,
+        torch.tensor(
+            [
+                [10, 11, 12],
+                [20, 21, 22],
+                [10, 11, 12],
+                [20, 21, 22],
+                [10, 11, 12],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    actual[0, 0] = -1
+    assert source[0, 0] == 10
+
+
+def test_repeating_tensor_initializer_rejects_mismatched_width():
+    initializer = make_repeating_tensor_initializer(torch.ones(2, 3))
+    with pytest.raises(ValueError, match="Cannot initialize shape"):
+        initializer((4, 2), torch.float32, torch.device("cpu"))
 
 
 def test_find_nearest_profile_passthrough_without_specs():
@@ -977,6 +1009,73 @@ def test_cuda_graph_profile_replay_change_reprofiles(monkeypatch):
     tuner.choose_one("profile_policy_test", [runner], config, inputs)
 
     assert seen_replays == [1, 20]
+
+
+def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    hot_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=False)
+    cold_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    seen_policies = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_policies.append(self._profiling_policy(tuning_config))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], hot_config, inputs)
+    tuner._profiling_cache_policies.clear()
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], cold_config, inputs)
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], cold_config, inputs)
+
+    assert seen_policies == [
+        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "hot"),
+        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold"),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
+    class AddRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    tuner = AutoTuner(warmup=1, repeat=2)
+    runner = AddRunner(valid_tactics=(0,))
+    inputs = [
+        torch.ones(1024, device="cuda"),
+        torch.empty(1024, device="cuda"),
+    ]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cuda_graph_profile_replays=2,
+    )
+    allocations = []
+    original_empty = torch.empty
+
+    def tracked_empty(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        if kwargs.get("dtype") == torch.int8:
+            allocations.append((result.numel(), result.device))
+        return result
+
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
+    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr("flashinfer.autotuner.delay_kernel", lambda delay_us: None)
+
+    latency = tuner._profile_single_kernel(runner, inputs, 0, config)
+
+    assert latency >= 0
+    assert allocations == [(8192, inputs[0].device)]
 
 
 def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():

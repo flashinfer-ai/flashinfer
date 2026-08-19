@@ -7,6 +7,7 @@ import inspect
 import itertools
 import json
 import os
+import statistics
 import tempfile
 import threading
 import weakref
@@ -470,14 +471,17 @@ class TuningConfig:
                 ...         ),
                 ...     )
                 ... )
-        use_cold_l2_cache (bool): Whether to use cold L2 cache.
-            This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
-            Notice that not all tuning processes can benefit from this feature.
+        use_cold_l2_cache (bool): Whether to measure every profiled invocation
+            with a cold L2 cache. A buffer twice the device L2 size is written
+            immediately before each sample. The flush is ordered before the
+            sample's start event, so its cost is excluded from the reported
+            kernel latency.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
-        cuda_graph_profile_replays (int): Number of back-to-back CUDA graph
-            warmup replays followed by the same number of timed replays. Values
-            greater than one measure sustained execution instead of the first
-            isolated replay.
+        cuda_graph_profile_replays (int): Number of CUDA graph samples per
+            profiling repeat. With ``use_cold_l2_cache=False`` these are
+            back-to-back replays and measure sustained execution. With
+            ``use_cold_l2_cache=True`` every replay is independently preceded
+            by a full L2 flush.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -875,10 +879,11 @@ def autotune(
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
             ``"fp8_gemm"``, ``"mxfp8_gemm"``.
-        cuda_graph_profile_replays: Optional number of back-to-back CUDA graph
-            warmup replays followed by the same number of timed replays for
-            every operation profiled in this context. ``None`` inherits the
-            enclosing context or each operation's ``TuningConfig`` value.
+        cuda_graph_profile_replays: Number of CUDA graph samples per profiling
+            repeat. Operations configured for hot L2 use back-to-back replays;
+            operations configured with ``use_cold_l2_cache=True`` flush L2
+            before every replay. ``None`` inherits the enclosing context or
+            each operation's ``TuningConfig`` value.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
@@ -1539,6 +1544,8 @@ class AutoTuner:
                         return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
+            # Persisted entries do not record per-entry measurement policy,
+            # so a non-default replay or L2 policy requests fresh profiling.
             use_file_config = not (
                 self.is_tuning_mode and requested_policy != default_policy
             )
@@ -2150,12 +2157,14 @@ class AutoTuner:
             tuning_config (TuningConfig): Tuning configuration
 
         Returns:
-            Average execution time in milliseconds
+            Execution time in milliseconds. Cold-L2 profiling returns the
+            median isolated-invocation latency; hot profiling retains the
+            existing average over back-to-back invocations.
 
         Note:
-            The method performs warmup runs, then measures multiple iterations
-            to get an average execution time. Stream synchronization and delays
-            are used to ensure accurate timing.
+            The method performs warmup runs, then measures multiple iterations.
+            Stream synchronization and delays are used to ensure accurate
+            timing.
 
             All runner invocations inside this method (warmup + measurement)
             execute under ``_profile_measurement_scope`` so that runners can
@@ -2174,6 +2183,76 @@ class AutoTuner:
 
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
+
+        def cold_l2_profile(stream: torch.cuda.Stream, repeat: int) -> float:
+            """Measure isolated invocations without charging for the L2 flush."""
+            profile_replays = (
+                tuning_config.cuda_graph_profile_replays
+                if tuning_config.use_cuda_graph
+                else 1
+            )
+            if profile_replays < 1:
+                raise ValueError("cuda_graph_profile_replays must be at least one")
+
+            device = next(
+                (
+                    tensor.device
+                    for tensor in inputs
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+                ),
+                None,
+            )
+            if device is None:
+                raise ValueError("Cold-L2 profiling requires at least one CUDA tensor")
+
+            # Twice L2 matches the standalone benchmark policy and prevents
+            # static operands passed through kwargs (for example MoE weights)
+            # from remaining resident between samples.
+            flush_buffer = torch.empty(
+                2 * self._get_l2_cache_size_in_bytes(device.index),
+                dtype=torch.int8,
+                device=device,
+            )
+            num_samples = repeat * profile_replays
+            starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
+            ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
+            graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
+
+            def _run_once():
+                runner(inputs, tactic=tactic, **kwargs)
+
+            with torch.cuda.stream(stream):
+                if graph is not None:
+                    with torch.cuda.graph(graph):
+                        _run_once()
+                    # Exercise the captured graph before collecting samples;
+                    # every measured replay below is cold independently.
+                    graph.replay()
+
+                stream.synchronize()
+                delay_kernel(
+                    self._CUDA_GRAPH_DELAY_MICRO_SECS
+                    if graph is not None
+                    else self.stream_delay_micro_secs
+                )
+
+                for sample_idx in range(num_samples):
+                    flush_buffer.zero_()
+                    starts[sample_idx].record(stream)
+                    if graph is not None:
+                        graph.replay()
+                    else:
+                        _run_once()
+                    ends[sample_idx].record(stream)
+
+                # One synchronization after all samples keeps host overhead
+                # out of the per-invocation measurements.
+                stream.synchronize()
+
+            samples = [
+                start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
+            ]
+            return statistics.median(samples)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
@@ -2278,7 +2357,11 @@ class AutoTuner:
                 for _ in range(self.warmup):
                     runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                avg_time = pure_profile(stream, self.repeat)
+                avg_time = (
+                    cold_l2_profile(stream, self.repeat)
+                    if tuning_config.use_cold_l2_cache
+                    else pure_profile(stream, self.repeat)
+                )
         except BaseException as e:  # noqa: BLE001
             # Catch everything (incl. KeyboardInterrupt / SystemExit): this
             # rank must still reach the all-reduce below or peers already
@@ -2515,19 +2598,28 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        if not tuning_config.use_cuda_graph:
-            return ("cuda_graph_profile_replays", None)
         return (
             "cuda_graph_profile_replays",
-            int(tuning_config.cuda_graph_profile_replays),
+            (
+                int(tuning_config.cuda_graph_profile_replays)
+                if tuning_config.use_cuda_graph
+                else None
+            ),
+            "l2_cache_policy",
+            "cold" if tuning_config.use_cold_l2_cache else "hot",
         )
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Policy assumed for cache entries created before provenance tracking."""
-        if not tuning_config.use_cuda_graph:
-            return ("cuda_graph_profile_replays", None)
-        return ("cuda_graph_profile_replays", 1)
+        return (
+            "cuda_graph_profile_replays",
+            1 if tuning_config.use_cuda_graph else None,
+            # The legacy input-rotation implementation did not evict static
+            # operands, so old persisted entries are treated as hot-L2.
+            "l2_cache_policy",
+            "hot",
+        )
 
     def _create_tensor_like(
         self,
