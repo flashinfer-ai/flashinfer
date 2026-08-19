@@ -1023,8 +1023,11 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
 // BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
 inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
                                 batchedGemm::gemm::BiasType bias_type, int32_t num_tokens,
-                                int32_t top_k, int32_t intermediate_size) {
+                                int32_t top_k, int32_t intermediate_size,
+                                bool allow_bias_with_none_type = false) {
   if (bias_type == batchedGemm::gemm::BiasType::None) {
+    TVM_FFI_ICHECK(allow_bias_with_none_type || !gemm1_bias.has_value())
+        << "gemm1_bias must not be provided when gemm1_bias_type is None.";
     return;
   }
   TVM_FFI_ICHECK(bias_type == batchedGemm::gemm::BiasType::Mn)
@@ -1349,11 +1352,11 @@ class FusedMoeLauncher {
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
   }
 
-  void check_moe_common() const {
+  void check_moe_common(bool allow_bias_with_none_type = false) const {
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
-                        args->intermediate_size);
+                        args->intermediate_size, allow_bias_with_none_type);
   }
 
   // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
@@ -1891,8 +1894,9 @@ class StagedMoeLauncher : public FusedMoeLauncher {
     }
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (has_precomputed_weights) {
-      FusedMoeLauncher::expert_weights = alloc_tensor(
-          {args->num_tokens, args->top_k}, expert_weights.dtype(), hidden_states.device());
+      // Caller-owned precomputed weights are consumed directly by the routing kernel.
+      // Slot 0 in collect_routing_outputs() is intentionally undefined in this
+      // mode; Python substitutes the caller tensor for downstream use.
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
       auto ew_dtype =
@@ -3707,7 +3711,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   int32_t* precomputed_expert_ids() const override { return unpacked_expert_ids(expert_indices); }
 
   void check_moe() const override {
-    FusedMoeLauncher::check_moe_common();
+    FusedMoeLauncher::check_moe_common(/*allow_bias_with_none_type=*/true);
 
     TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn) << "hidden_states must be fp8.";
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {

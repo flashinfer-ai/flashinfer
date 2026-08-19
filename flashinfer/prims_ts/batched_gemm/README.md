@@ -283,8 +283,10 @@ timing:
 python -m batched_gemm.batched_gemm_run --benchmark --skip-ref-check
 ```
 
-> Run as a **module** from the `dense_gemm_ts/` directory — the runner uses
-> package-relative imports. Shape and feature knobs (`--tile-n`, `--dtype-a`,
+> Run as a **module** — the runner uses package-relative imports, e.g.
+> `python -m flashinfer.prims_ts.batched_gemm.batched_gemm_run` (the command
+> blocks above use the short form, which requires `flashinfer/prims_ts/` as the
+> working directory). Shape and feature knobs (`--tile-n`, `--dtype-a`,
 > `--tile-scheduler`, …) are listed in `--help`.
 
 To run the unit tests:
