@@ -73,6 +73,10 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )
+from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
+    Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
 from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm107_mxfp8_mega_weights,
@@ -86,11 +90,13 @@ from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
 # the vLLM integration patch). New code should use the Sm<arch>... names.
 # These WILL BE REMOVED in a future release, together with the matching
 # deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
-# "mxfp8_cutedsl", "sm90_pull_fp8" — see core/kernel/registry.py).
+# "mxfp8_cutedsl", "sm90_pull_fp8", "sm90_push_fp8" — see
+# core/kernel/registry.py).
 DeepGemmMegaMoeConfig = Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
 
 from .config import (
     BootstrapConfig,
@@ -163,6 +169,7 @@ __all__ = [
     "Mxfp8CutedslMegaMoeConfig",
     "Nvfp4CutedslMegaMoeConfig",
     "Sm90PullFp8MegaMoeConfig",
+    "Sm90PushFp8MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
@@ -228,6 +235,7 @@ __all__ = [
     "preprocess_sm107_mxfp8_mega_weights",
     "preprocess_sm107_nvfp4_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
+    "preprocess_sm90_push_fp8_mega_weights",
     "run_split_kernel",
     "supports_fault_tolerance",
     "validate_arch_for_backend",

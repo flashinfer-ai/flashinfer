@@ -17,17 +17,19 @@ Oracle conventions (pinned against ``deep_gemm`` sources):
   * ``silu(gate) * up * topk_weight`` folded BEFORE the fc1-out fp8 round-trip
   * combine: plain sum over topk (weight already folded)
 
-The deep_gemm symmetric buffer requires an initialized process group, so run
-under a single-process torchrun::
+The deep_gemm symmetric buffer requires an initialized process group. Under
+torchrun the usual ``env://`` rendezvous is used; under plain ``pytest`` (CI
+unit-test jobs) the test self-bootstraps a 1-rank group via an explicit
+``tcp://`` init so no torchrun launch is needed::
 
-    torchrun --standalone --nproc_per_node=1 -m pytest \\
-        tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \\
+    pytest tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \\
         -m arch_blackwell
 """
 
 from __future__ import annotations
 
 import os
+import socket
 from datetime import timedelta
 
 import pytest
@@ -230,7 +232,10 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
     import deep_gemm
     import torch.distributed as dist
 
-    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+        preprocess_mega_weights,
+    )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
@@ -239,7 +244,25 @@ def test_deep_gemm_mega_kernel_matches_torch_reference():
     )
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
+        if "RANK" in os.environ:
+            # torchrun launch: use its env:// rendezvous.
+            dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
+        else:
+            # Plain-pytest launch (CI unit-test jobs): self-bootstrap a 1-rank
+            # group with an explicit tcp:// store instead of mutating the
+            # RANK/MASTER_* env vars, which would leak to later tests in the
+            # same pytest process. The freed port can theoretically be
+            # snatched before torch rebinds it; acceptable for a test.
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://127.0.0.1:{port}",
+                rank=0,
+                world_size=1,
+                timeout=_PG_TIMEOUT,
+            )
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
 
     problem = _make_problem()

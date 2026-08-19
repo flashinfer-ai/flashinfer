@@ -6,10 +6,15 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Repo**: NVIDIA CuTeDSL MegaMoE kernel team's repo (see `ACKNOWLEDGEMENT.md`
-  for authors/contacts). <!-- TODO: pin the repo URL -->
-- **Vendored commit**: <!-- TODO: record the upstream SHA of the current src/ drop -->
-- **Last synced**: <!-- TODO: date of the current drop -->
+- **Repo**: <https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe>
+  (NVIDIA-internal GitLab; see `ACKNOWLEDGEMENT.md` for authors/contacts).
+- **Vendored commit**: not recorded — the current `src/` drop was taken
+  2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
+  PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
+  then the only pinned points are the two files synced ahead of the drop
+  (see pending diffs below, `50117315d`).
+- **Last synced**: 2026-07-13 (full drop); 2026-08-10 partial re-sync of
+  `inputs_process.py` + `host_utils.py` (see pending diffs).
 - **Vendored subset**: the four kernel packages only (`common/`, `src/`,
   `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
   (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
@@ -45,6 +50,17 @@ replace, what to audit) lives in `SKILL.md`.
   `host_utils` nowhere). The harness was validated green (3/3 cases, dsl
   4.6.1 + 4.7.0) with the newer `host_utils` before this was understood.
   Resolves at the next full re-sync once the tree moves past that commit.
+- `src/moe_nvfp4_swapab/kernel_fc12.py` carries the flashinfer-upstream
+  singleton-expert TMA-modes fix (flashinfer-ai/flashinfer `4fbac49f`,
+  PR #4296, applied 2026-08-12 during the TOT merge): the compact expert
+  mode of singleton weight tensors stays dynamic so the runtime expert
+  extent remains visible in FC1/FC2 weight TMA descriptors. Confirm the
+  kernel-team repo has an equivalent before the next re-sync.
+- `src/moe_nvfp4_swapab/runner_common.py` carries a local
+  `_check_triton_flat_index` guard (added for PR #4113 review) on the
+  int32-indexed Triton helpers (`_rcp_approx_kernel`, `_swiglu_pair_kernel`);
+  `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
+  the > 2**31-element combine round-trip. Send upstream on the next re-sync.
 
 ## Related trees
 

@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(
+    config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
@@ -44,6 +46,8 @@ def _resolve_gate_up_clamp(config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig)
     "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
 )
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config

@@ -55,10 +55,16 @@ static_assert(static_cast<int>(ActType::SwiGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
 static_assert(static_cast<int>(ActType::GeGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+#ifndef TLLM_RUBIN_FEATURES
+// The pinned Rubin BMM package (TRTLLM_GEN_BMM_RUBIN) predates SiTuGlu: its
+// gemmGatedAct::ActType is {SwiGlu, GeGlu, None} with None == 2, so these two
+// symbols/values exist only in the Blackwell package. Drop this guard when the
+// Rubin pin is bumped to a package that carries SiTuGlu.
 static_assert(static_cast<int>(ActType::SiTuGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SiTuGlu));
 static_assert(static_cast<int>(ActType::None) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::None));
+#endif
 
 // Type of the element-wise activation to apply after the Gemm
 enum class EltwiseActType {

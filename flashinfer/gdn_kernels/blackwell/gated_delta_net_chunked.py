@@ -4387,8 +4387,6 @@ class GatedDeltaNetChunkedKernel:
         tCsO = thr_o_r2s.partition_D(sO)
 
         sub_tile_size = 32
-        max_coord = tTR_tCcShared[cute.size(tTR_tCcShared) - 1]
-
         sV_vt_view = utils.gemm.sm100.transform_partitioned_tensor_layout(sV)
         tCsV = thr_v_s2r.partition_S(sV_vt_view)
 
@@ -4409,7 +4407,10 @@ class GatedDeltaNetChunkedKernel:
         # the per-row gate work until the previous state has been published
         # and decayed, keeping its register fragment in one contiguous region.
         gate_handle = load_gate_consumer.wait_and_advance()
-        cumprod_total = sCumprod[max_coord[1], 0, gate_handle.index]
+        # valid_len = max(0, min(self.b_t, seqlen_b - chunk_iter * self.b_t))
+        # gamma_end = 1.0 if valid_len == 0 else sCumprod[valid_len - 1, 0, gate_handle.index]
+        # OOB alpha is padded with 1 before the prefix scan, so the last physical slot equals gamma_end.
+        cumprod_total = sCumprod[self.b_t - 1, 0, gate_handle.index]
 
         kv_prev_handle = kv_acc_consumer.current_handle()
         if valid_state:

@@ -27,7 +27,9 @@ from flashinfer.moe_ep.core.kernel.registry import (
 
 
 def _config(**overrides) -> Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
-    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=1024, top_k=4, **overrides)
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=1024, top_k=4, **overrides
+    )
 
 
 class TestSm90PullFp8Config:
@@ -56,7 +58,10 @@ class TestSm90PullFp8Config:
         backend = create_mega_kernel(_config())
         assert isinstance(backend, Sm90PullFp8MegaKernelBackend)
         assert backend.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"
-        assert Sm90PullFp8MegaKernelBackend.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"
+        assert (
+            Sm90PullFp8MegaKernelBackend.kernel_name()
+            == "sm90_fp8_fp8_bf16_pull_cutedsl"
+        )
 
     def test_registry_lists_kernel_in_unknown_error(self) -> None:
         bogus = dataclasses.replace(_config(), kernel_name="definitely_not_a_kernel")
@@ -66,7 +71,10 @@ class TestSm90PullFp8Config:
     def test_public_reexports(self) -> None:
         import flashinfer.moe_ep as moe_ep
 
-        assert moe_ep.Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig is Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+        assert (
+            moe_ep.Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+            is Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+        )
         assert callable(moe_ep.preprocess_sm90_pull_fp8_mega_weights)
         assert "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig" in moe_ep.__all__
         assert "preprocess_sm90_pull_fp8_mega_weights" in moe_ep.__all__

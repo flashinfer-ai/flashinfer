@@ -248,6 +248,7 @@ def test_validate_compute_consistency_requires_do_finalize():
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
+        MoEFinalizeConfig,
         QuantConfig,
         QuantVariant,
         RoutingConfig,
@@ -268,14 +269,15 @@ def test_validate_compute_consistency_requires_do_finalize():
             local_num_experts=2,
         ),
         backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
-        execution=ExecutionConfig(tune_max_num_tokens=128, do_finalize=False),
+        execution=ExecutionConfig(tune_max_num_tokens=128),
+        finalize=MoEFinalizeConfig(do_finalize=False),
     )
     with pytest.raises(MoEEpConfigError, match="do_finalize"):
         validate_compute_consistency(fleet, bootstrap, moe_config)
 
     ok_config = dataclasses.replace(
         moe_config,
-        execution=dataclasses.replace(moe_config.execution, do_finalize=True),
+        finalize=dataclasses.replace(moe_config.finalize, do_finalize=True),
     )
     validate_compute_consistency(fleet, bootstrap, ok_config)
 
@@ -365,3 +367,31 @@ def test_nixl_ep_capacity_below_world_size_rejected():
         validate_fleet_params(
             _split(num_experts=8), backend="nixl_ep", world_size=4, topology_capacity=2
         )
+
+
+# ------------------------------------------------------------------ bootstrap device
+
+
+def test_bootstrap_device_resolution_prefers_explicit_device(monkeypatch):
+    """A host framework's explicit device wins over LOCAL_RANK and rank."""
+    from flashinfer.moe_ep.core.runtime.bootstrap import _resolve_local_device
+
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    bootstrap = BootstrapConfig(world_size=8, rank=3, device=0)
+    assert _resolve_local_device(bootstrap) == 0
+
+
+def test_bootstrap_device_resolution_env_then_rank(monkeypatch):
+    """Without an explicit device: LOCAL_RANK env, then rank (torchrun)."""
+    from flashinfer.moe_ep.core.runtime.bootstrap import _resolve_local_device
+
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    assert _resolve_local_device(BootstrapConfig(world_size=8, rank=3)) == 5
+
+    monkeypatch.delenv("LOCAL_RANK")
+    assert _resolve_local_device(BootstrapConfig(world_size=8, rank=3)) == 3
+
+
+def test_bootstrap_rejects_negative_device():
+    with pytest.raises(ValueError, match="device"):
+        BootstrapConfig(world_size=8, rank=3, device=-1)

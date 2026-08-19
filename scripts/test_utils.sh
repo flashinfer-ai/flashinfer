@@ -54,6 +54,7 @@ fi
 : "${MEMORY_MONITOR_LOG_INTERVAL:=0}"  # Emit periodic samples to the CI log when >0
 : "${PYTEST_FILE_TIMEOUT_SECONDS:=7200}"  # Per-test-file timeout; 0 disables
 : "${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS:=300}"  # Grace period before SIGKILL after timeout
+: "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS:=false}"  # Fail setup when CI artifacts are absent
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -187,7 +188,21 @@ install_precompiled_kernels() {
         return
     fi
 
+    case "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" in
+        true|false) ;;
+        *)
+            echo "ERROR: UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS must be true or false, got '${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}'." >&2
+            return 2
+            ;;
+    esac
+
+    if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ] && [ -z "${JIT_ARCH:-}" ]; then
+        echo "ERROR: UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS=true requires JIT_ARCH." >&2
+        return 1
+    fi
+
     JIT_ARCH_EFFECTIVE=""
+    local missing_artifacts=false
     # Map CUDA_VERSION to CUDA_STREAM for artifact lookup
     if [[ "${CUDA_VERSION}" == cu* ]]; then
         CUDA_STREAM="${CUDA_VERSION}"
@@ -233,16 +248,32 @@ install_precompiled_kernels() {
             echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
             pip install -q "${DIST_CUBIN_DIR}"/*.whl
         else
-            echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            missing_artifacts=true
+            if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+                echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            else
+                echo "WARNING: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}; tests will use JIT compilation." >&2
+            fi
         fi
 
         if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
             echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
             pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
         else
-            echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            missing_artifacts=true
+            if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+                echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            else
+                echo "WARNING: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}; tests will use JIT compilation." >&2
+            fi
         fi
         echo ""
+    else
+        echo "WARNING: JIT_ARCH is unset; skipping precompiled kernel artifact lookup and using JIT compilation." >&2
+    fi
+
+    if [ "${missing_artifacts}" = "true" ] && [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+        return 1
     fi
 }
 
@@ -257,15 +288,19 @@ install_and_verify() {
 
         # Sync dependencies from the branch's requirements.txt
         pip install -r requirements.txt
+        pip install -r requirements-test.txt
+        python -c "import pytest_timeout"
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
         # version skew between libs-base and libs-cu13.
-        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
+            pip install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
         fi
 
-        # Install local python sources
-        pip install -e . -v --no-deps
+        # Install local python sources. The env var keeps --no-build-isolation
+        # from activating the build hooks' own downloads (see setup_test_env.sh).
+        FLASHINFER_BUILD_NO_PIP=1 \
+            pip install -e . -v --no-deps --no-build-isolation
         echo ""
 
         # Verify installation

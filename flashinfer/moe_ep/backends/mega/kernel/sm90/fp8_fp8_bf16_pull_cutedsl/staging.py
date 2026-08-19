@@ -66,6 +66,11 @@ def stage_mega_moe_inputs(
     """
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
+        # An empty batch must not inherit the previous stage's routing or
+        # token count: clear the sentinel plane and record 0 so a later
+        # compute(output=None) sees the empty batch.
+        topk_idx_out.fill_(-1)
+        _note_staged_tokens(topk_idx_out, 0)
         return
     if hidden % 64 != 0:
         raise ValueError("hidden_size must be a multiple of 64.")

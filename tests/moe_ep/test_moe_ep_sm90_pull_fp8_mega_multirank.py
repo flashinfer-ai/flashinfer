@@ -535,7 +535,9 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_swap_ab_matches_reference():
         fp8_scale_mode="per_tensor",
         swap_ab=True,
     )
-    print(f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference")
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -647,108 +649,112 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
         hidden = problem["hidden"]
 
         symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-            kind=problem["kind"],
-            fp8_scale_mode=fp8_scale_mode,
-            fc1_activation_dequant_scale=FC1_ACT_SCALE,
-        )
-        # Snapshot exactly what the kernel consumes (this rank's shard).
-        x_local = symm_buffer.x[:n].clone()
-        x_sf_local = symm_buffer.x_sf[:n].clone()
-
-        transformed_l1, transformed_l2 = _preprocess_weights(problem)
-
-        y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
-        hopper_fp8_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=n,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fast_math=problem["fast_math"],
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        symm_buffer.destroy()
-
-        # Reassemble the global problem from the operands each rank staged.
-        x_g = _all_gather_stack(x_local)  # (R, n, hidden) fp8
-        idx_g = _all_gather_stack(problem["topk_ids"])  # (R, n, K) int64
-        w_g = _all_gather_stack(problem["topk_weights"])  # (R, n, K) fp32
-        # The per-tensor reference multiplies via torch._scaled_mm, which
-        # needs column-major B (K stride-1, as preprocess_mega_weights lays
-        # out); ship the contiguous transpose and transpose back so the
-        # gather does not silently re-stride the weights to row-major.
-        fc1_w_g = _all_gather_stack(transformed_l1[0].mT).mT  # (R, E_local, H, 2I)
-        fc2_w_g = _all_gather_stack(transformed_l2[0].mT).mT  # (R, E_local, I, H)
-        fc1_sf_g = _all_gather_stack(transformed_l1[1])
-        fc2_sf_g = _all_gather_stack(transformed_l2[1])
-
-        common_kwargs = dict(
-            input_activation=x_g,
-            input_topk_idx=idx_g,
-            input_topk_weights=w_g,
-            fc1_weight=fc1_w_g,
-            fc1_weight_sf=fc1_sf_g,
-            fc2_weight=fc2_w_g,
-            fc2_weight_sf=fc2_sf_g,
-            ab_dtype=torch.float8_e4m3fn,
-            ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
-            fp8_accum_mode="1xacc",
-            mma_tiler_k=128,
-            fc2_output_dtype=torch.bfloat16,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fp8_scale_mode=fp8_scale_mode,
-        )
-        if fp8_scale_mode == "blockwise":
-            sf_cols = hidden // Fp8BlockScaleK
-            x_sf_g = _all_gather_stack(x_sf_local[:, :sf_cols].clone())
-            combine_ref = compute_megamoe_reference_fp8(
-                input_activation_sf=x_sf_g,
-                fc1_activation_block_scale=x_sf_g,
-                fc1_weight_block_scale=fc1_sf_g,
-                fc2_weight_block_scale=fc2_sf_g,
-                fc2_activation_block_scale=None,  # derived per token, like the kernel
-                **common_kwargs,
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x,
+                symm_buffer.x_sf,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+                kind=problem["kind"],
+                fp8_scale_mode=fp8_scale_mode,
+                fc1_activation_dequant_scale=FC1_ACT_SCALE,
             )
-        else:
-            # Static per-tensor activation scales are identical on every EP
-            # rank by contract, so the local (1,) legs stand in globally.
-            combine_ref = compute_megamoe_reference_fp8(
-                input_activation_sf=_all_gather_stack(x_sf_local),  # unused (ABI)
-                fc1_activation_dequant_scale=transformed_l1[2],
-                fc1_weight_dequant_scale=_all_gather_stack(transformed_l1[3]),
-                fc2_activation_dequant_scale=transformed_l2[2],
-                fc2_weight_dequant_scale=_all_gather_stack(transformed_l2[3]),
-                **common_kwargs,
-            )
-        # deepgemm graph folds topk weights before fc1-out quantization, so
-        # the per-topk terms reduce with a plain sum; compare this rank's slice.
-        y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
 
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
-        print(
-            f"[sm90 fp8 multirank oracle rank {rank} {fp8_scale_mode} "
-            f"swap_ab={swap_ab}] rel_l2={rel_l2.item():.4g} "
-            f"max|d|={(yk - y_ref).abs().max().item():.4g} "
-            f"amax(ref)={y_ref.abs().max().item():.4g}"
-        )
-        # Single-GPU oracle tolerances (drop mega_runner: atol=rtol=1e-2),
-        # valid because the problem is conditioned to O(1) outputs and kernel
-        # + reference share the same gathered fp8 operands.
-        torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
-        assert rel_l2.item() < 0.02
-        return rank
+            transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+            y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
+            hopper_fp8_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # Reassemble the global problem from the operands each rank staged.
+            x_g = _all_gather_stack(x_local)  # (R, n, hidden) fp8
+            idx_g = _all_gather_stack(problem["topk_ids"])  # (R, n, K) int64
+            w_g = _all_gather_stack(problem["topk_weights"])  # (R, n, K) fp32
+            # The per-tensor reference multiplies via torch._scaled_mm, which
+            # needs column-major B (K stride-1, as preprocess_mega_weights lays
+            # out); ship the contiguous transpose and transpose back so the
+            # gather does not silently re-stride the weights to row-major.
+            fc1_w_g = _all_gather_stack(transformed_l1[0].mT).mT  # (R, E_local, H, 2I)
+            fc2_w_g = _all_gather_stack(transformed_l2[0].mT).mT  # (R, E_local, I, H)
+            fc1_sf_g = _all_gather_stack(transformed_l1[1])
+            fc2_sf_g = _all_gather_stack(transformed_l2[1])
+
+            common_kwargs = dict(
+                input_activation=x_g,
+                input_topk_idx=idx_g,
+                input_topk_weights=w_g,
+                fc1_weight=fc1_w_g,
+                fc1_weight_sf=fc1_sf_g,
+                fc2_weight=fc2_w_g,
+                fc2_weight_sf=fc2_sf_g,
+                ab_dtype=torch.float8_e4m3fn,
+                ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
+                fp8_accum_mode="1xacc",
+                mma_tiler_k=128,
+                fc2_output_dtype=torch.bfloat16,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fp8_scale_mode=fp8_scale_mode,
+            )
+            if fp8_scale_mode == "blockwise":
+                sf_cols = hidden // Fp8BlockScaleK
+                x_sf_g = _all_gather_stack(x_sf_local[:, :sf_cols].clone())
+                combine_ref = compute_megamoe_reference_fp8(
+                    input_activation_sf=x_sf_g,
+                    fc1_activation_block_scale=x_sf_g,
+                    fc1_weight_block_scale=fc1_sf_g,
+                    fc2_weight_block_scale=fc2_sf_g,
+                    fc2_activation_block_scale=None,  # derived per token, like the kernel
+                    **common_kwargs,
+                )
+            else:
+                # Static per-tensor activation scales are identical on every EP
+                # rank by contract, so the local (1,) legs stand in globally.
+                combine_ref = compute_megamoe_reference_fp8(
+                    input_activation_sf=_all_gather_stack(x_sf_local),  # unused (ABI)
+                    fc1_activation_dequant_scale=transformed_l1[2],
+                    fc1_weight_dequant_scale=_all_gather_stack(transformed_l1[3]),
+                    fc2_activation_dequant_scale=transformed_l2[2],
+                    fc2_weight_dequant_scale=_all_gather_stack(transformed_l2[3]),
+                    **common_kwargs,
+                )
+            # deepgemm graph folds topk weights before fc1-out quantization, so
+            # the per-topk terms reduce with a plain sum; compare this rank's slice.
+            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+            print(
+                f"[sm90 fp8 multirank oracle rank {rank} {fp8_scale_mode} "
+                f"swap_ab={swap_ab}] rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                f"amax(ref)={y_ref.abs().max().item():.4g}"
+            )
+            # Single-GPU oracle tolerances (drop mega_runner: atol=rtol=1e-2),
+            # valid because the problem is conditioned to O(1) outputs and kernel
+            # + reference share the same gathered fp8 operands.
+            torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
+            assert rel_l2.item() < 0.02
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 

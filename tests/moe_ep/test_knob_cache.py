@@ -173,7 +173,9 @@ def test_backend_warns_on_auto_knobs():
 
     with pytest.warns(UserWarning, match="offline"):
         create_mega_kernel(
-            Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2, knobs="auto")
+            Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=128, top_k=2, knobs="auto"
+            )
         )
 
 

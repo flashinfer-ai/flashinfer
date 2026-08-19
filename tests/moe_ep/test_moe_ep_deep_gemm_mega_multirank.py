@@ -194,7 +194,10 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     import deep_gemm
     import torch
 
-    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+        preprocess_mega_weights,
+    )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )

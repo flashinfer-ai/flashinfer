@@ -8,6 +8,7 @@
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # 4-GPU Rubin sm107 block-scaled (mxfp8 + nvfp4) mega multirank
+#   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
@@ -85,8 +86,29 @@ run_section() {
   fi
 }
 
+# Run pytest and exit the interpreter WITHOUT finalization (os._exit).
+# The full unit suite accumulates native heap damage somewhere in the
+# GPU/DSL/transport stack: with every test PASSING, the process can still
+# abort in CPython teardown ("malloc(): unaligned tcache chunk detected"
+# after the pytest summary, observed 2026-08-12 job 2388315) or, earlier,
+# inside the first heavy import after the suite (the nvfp4 warmup case
+# below). Skipping interpreter finalization sidesteps the teardown
+# detonation; the pytest exit code (all-tests result) is preserved.
+# Root-causing the corruption needs an ASAN/valgrind pass — tracked in the
+# runbook's unit-suite notes.
+pytest_no_finalize() {
+  "${PY}" -c '
+import os, sys
+import pytest
+rc = int(pytest.main(sys.argv[1:]))
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(rc)
+' "$@"
+}
+
 run_unit() {
-  "${PY}" -m pytest tests/moe_ep/ -v \
+  pytest_no_finalize tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
@@ -105,7 +127,18 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
     --ignore=tests/moe_ep/test_mega_cuda_graph.py \
-    -k "not multirank_roundtrip"
+    -k "not multirank_roundtrip" \
+    --deselect "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # Run the nvfp4 symm-buffer-sharing test in its own interpreter. In-suite it
+  # crashes the process (Fatal Python error: Aborted) inside the nvfp4 layer
+  # warmup's kernel-module imports — the same suite-accumulated heap damage
+  # (see pytest_no_finalize above), detonating at the first big
+  # import/compile burst instead of at teardown. Passes 100% standalone,
+  # per-file, and in every subset tried (see moe_ep runbook "unit suite"
+  # notes; observed since 2026-07-22).
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
 }
 
 run_multirank() {
@@ -197,7 +230,8 @@ run_oracle() {
     -m arch_blackwell || rc=1
 
   # deep_gemm's symm buffer needs an initialized process group (no
-  # MEGA_NO_DIST equivalent), hence the 1-proc torchrun.
+  # MEGA_NO_DIST equivalent). The test self-bootstraps a 1-rank group under
+  # plain pytest; the 1-proc torchrun here also exercises its env:// path.
   "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \
@@ -272,6 +306,18 @@ run_mega_sm107() {
     -m "gpu_4 and arch_rubin"
 }
 
+# 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
+# Own target rather than folded into `multirank` (upstream PR #4069 runs it
+# there): on non-Hopper nodes the arch-marked files collect 0 tests and
+# torchrun turns pytest exit 5 into a failure.
+NPROC_SM90_PUSH="${NPROC_SM90_PUSH:-2}"
+run_sm90_push() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_fp8_kernel.py \
+    tests/moe_ep/test_sm90_push_fp8_backend.py -v
+}
+
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
 # survives, so it runs under torchrun -m pytest) and a smoke half (a rank that
 # really dies). The smoke half cannot be a pytest test: torchrun reports the
@@ -297,7 +343,9 @@ run_ft() {
       tests/moe_ep/smoke_ft_ep.py --backend "${backend}" 2>&1)" || true
     echo "${out}"
     local ok
-    ok="$(printf '%s' "${out}" | grep -c 'SMOKE_RESULT:' || true)"
+    # Count occurrences, not lines: the survivors' prints go through
+    # torchrun's stdout multiplexing and can interleave onto a single line.
+    ok="$(printf '%s' "${out}" | grep -o 'SMOKE_RESULT:' | wc -l)"
     if [ "${ok}" -ne "${expected_ok}" ]; then
       echo "FT smoke (${backend}): expected ${expected_ok} SMOKE_RESULT lines, got ${ok}" >&2
       rc=1
@@ -371,11 +419,12 @@ case "${1:-all}" in
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   mega_sm107) run_section "sm107 block-scaled mega multirank (Rubin)" run_mega_sm107; print_summary ;;
+  sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

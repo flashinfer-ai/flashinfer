@@ -40,6 +40,10 @@ if TYPE_CHECKING:
 class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     """Fused Rubin nvfp4 block-scaled inference MoE over the NVLink symmetric heap."""
 
+    # compute(output=None) returns a workspace view (same contract as the
+    # sm100 cutedsl backends; upstream capability flag from the TOT merge).
+    supports_output_view = True
+
     def __init__(self, config: Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config

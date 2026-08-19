@@ -45,6 +45,12 @@ ALIAS_ROWS = [
         "Sm90PullFp8MegaMoeConfig",
         "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     ),
+    (
+        "sm90_push_fp8",
+        "sm90_fp8_fp8_bf16_push_cuda",
+        "Sm90PushFp8MegaMoeConfig",
+        "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
+    ),
 ]
 
 IDS = [row[0] for row in ALIAS_ROWS]
@@ -54,8 +60,9 @@ IDS = [row[0] for row in ALIAS_ROWS]
 def test_registry_alias_resolves_to_canonical_backend(
     alias: str, canonical: str, _old: str, _new: str
 ) -> None:
-    assert registry._MEGA_KERNEL_REGISTRY[alias] is (
-        registry._MEGA_KERNEL_REGISTRY[canonical]
+    assert (
+        registry._MEGA_KERNEL_REGISTRY[alias]
+        is (registry._MEGA_KERNEL_REGISTRY[canonical])
     )
     assert registry._MEGA_KERNEL_DEPRECATED_ALIASES[alias] == canonical
 
