@@ -24,8 +24,9 @@ The canonical TRTLLM FP4 and BF16 helpers are exposed as
 ``TrtllmFp4Config.prepare_weights(...)`` /
 ``CuteDslConfig.prepare_weights(...)`` /
 ``TrtllmBf16Config.prepare_weights(...)`` / ... static helpers (see ``api.py``).
-The SM90 Humming-style MXFP4 x FP8 helper is currently exposed as a flat helper
-for the CUTLASS fused-MoE path.
+CUTLASS fused-MoE paths (BF16, NVFP4, per-tensor FP8, DeepSeek block FP8,
+MXFP8, W4A16, W4A8, Humming) have matching ``Cutlass*Config.prepare_weights``
+helpers in this module.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from ..trace.templates.moe import (
     sm90_mixed_gemm_scale_interleave_trace,
     sm90_mixed_gemm_weight_interleave_trace,
 )
-from ..utils import get_compute_capability
+from ..utils import get_compute_capability, round_up
 
 # Module-level permute-index caches. Permute indices depend on weight geometry
 # and layout parameters, so matching keys are safe to reuse across calls.
@@ -1341,6 +1342,502 @@ def prepare_cutlass_w4a16_weights(
         "fc1_expert_scales": w1_scale,
         "fc2_expert_weights": w2,
         "fc2_expert_scales": w2_scale,
+    }
+
+
+_NVFP4_SF_VEC_SIZE = 16
+_NVFP4_SF_SWIZZLE_ROWS = 128
+
+
+def _nvfp4_swizzled_scale_shape(rows: int, cols: int) -> Tuple[int, int]:
+    """CUTLASS 128x4 swizzled NVFP4 scale layout for an ``[N, K]`` matrix."""
+    return (
+        round_up(rows, _NVFP4_SF_SWIZZLE_ROWS),
+        round_up(cols // _NVFP4_SF_VEC_SIZE, 4),
+    )
+
+
+def prepare_cutlass_nvfp4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the CUTLASS NVFP4 view consumed by ``CutlassNvfp4Runner``.
+
+    Canonical source is BF16 ``w1_bf16 [E, 2*I, H]`` in semantic ``[up, gate]``
+    order and ``w2_bf16 [E, H, I]``. Each expert is quantized independently with
+    ``fp4_quantize`` (``sf_vec_size=16``, swizzled scales) so 128-row swizzle
+    tiles never cross expert boundaries. Global scales are fixed at 1.0 to
+    match the other unified NVFP4 prepares; the kernel still receives the
+    six-tensor CUTLASS ``quant_scales`` contract.
+
+    Do not reuse TRTLLM shuffled or BlockMajorK tensors: CUTLASS consumes the
+    packed uint8 payload plus the swizzled ``fp4_quantize`` scale buffer.
+    """
+    from ..quantization.fp4_quantization import fp4_quantize
+
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            "prepare_cutlass_nvfp4_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    if (
+        hidden_size % _NVFP4_SF_VEC_SIZE != 0
+        or intermediate_size % _NVFP4_SF_VEC_SIZE != 0
+    ):
+        raise ValueError(
+            "Cutlass NVFP4 requires hidden_size and intermediate_size "
+            f"divisible by {_NVFP4_SF_VEC_SIZE}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"Cutlass NVFP4 preparation requires CUDA, got {device}.")
+
+    w1_bf16 = w1_bf16.to(device).contiguous()
+    w2_bf16 = w2_bf16.to(device).contiguous()
+    # Unit global scale keeps prepare aligned with the other unified NVFP4
+    # backends. Per-expert amax scales remain a flat-API concern.
+    global_scale = torch.ones(1, device=device, dtype=torch.float32)
+
+    def quantize_experts(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        packed_rows = []
+        scale_rows = []
+        scale_shape = _nvfp4_swizzled_scale_shape(weight.shape[1], weight.shape[2])
+        for expert in range(num_local_experts):
+            packed, scale = fp4_quantize(
+                weight[expert],
+                global_scale=global_scale,
+                sf_vec_size=_NVFP4_SF_VEC_SIZE,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=True,
+            )
+            packed_rows.append(packed)
+            scale_rows.append(scale.view(*scale_shape))
+        return torch.stack(packed_rows), torch.stack(scale_rows)
+
+    w1_q, w1_block_scale = quantize_experts(w1_bf16)
+    w2_q, w2_block_scale = quantize_experts(w2_bf16)
+    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    act_global = torch.ones((), device=device, dtype=torch.float32)
+    return {
+        "fc1_expert_weights": w1_q,
+        "fc2_expert_weights": w2_q,
+        "fc1_act_global_scale": act_global,
+        "fc1_weight_block_scale": w1_block_scale,
+        "fc1_dequant_scale": ones,
+        "fc2_act_global_scale": act_global.clone(),
+        "fc2_weight_block_scale": w2_block_scale,
+        "fc2_dequant_scale": ones.clone(),
+    }
+
+
+def _require_canonical_cutlass_bf16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    name: str,
+    alignment: Optional[int] = None,
+    require_cuda: bool = False,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.device]:
+    """Validate canonical BF16 expert weights and move them onto ``device``."""
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            f"{name} expects BF16 weights, got w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    if alignment is not None and (
+        hidden_size % alignment != 0 or intermediate_size % alignment != 0
+    ):
+        raise ValueError(
+            f"{name} requires hidden_size and intermediate_size divisible by "
+            f"{alignment}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if require_cuda and device.type != "cuda":
+        raise ValueError(f"{name} requires CUDA, got {device}.")
+    return w1_bf16.to(device).contiguous(), w2_bf16.to(device).contiguous(), device
+
+
+def prepare_cutlass_fp8_per_tensor_activations(
+    hidden_states_bf16: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, H]`` BF16 activations to E4M3 plus a scalar dequant scale."""
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_cutlass_fp8_per_tensor_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = hidden_states_bf16.float().abs().amax()
+    dequant = torch.where(
+        amax > 0, amax / fp8_max, torch.ones_like(amax, dtype=torch.float32)
+    ).to(torch.float32)
+    quantized = (hidden_states_bf16.float() / dequant).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn), dequant.reshape(())
+
+
+def prepare_cutlass_fp8_per_tensor_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the unshuffled per-tensor FP8 view for ``CutlassFp8PerTensorRunner``.
+
+    Each expert uses one E4M3 multiplier. The returned ``fc1_dequant`` /
+    ``fc2_dequant`` tensors are the CUTLASS dequant scales (``amax / fp8_max``),
+    not TRTLLM's inverted calibration multipliers.
+    """
+    w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_fp8_per_tensor_weights",
+        device=device,
+    )
+    w1_q, w1_mult = _quantize_fp8_per_expert(w1_bf16)
+    w2_q, w2_mult = _quantize_fp8_per_expert(w2_bf16)
+    return {
+        "fc1_expert_weights": w1_q,
+        "fc2_expert_weights": w2_q,
+        "fc1_dequant": (1.0 / w1_mult).contiguous(),
+        "fc2_dequant": (1.0 / w2_mult).contiguous(),
+    }
+
+
+def prepare_cutlass_fp8_block_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the DeepSeek 128x128 FP8 block-scale view for CUTLASS.
+
+    Reuses the unified DeepSeek weight quantizer and leaves tensors unshuffled.
+    ``hidden_size`` and ``intermediate_size`` must be divisible by 128.
+    """
+    w1_bf16, w2_bf16, _device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_fp8_block_weights",
+        alignment=128,
+        device=device,
+    )
+    w1_q, w1_scale = _deepseek_fp8_quantize_weights(w1_bf16)
+    w2_q, w2_scale = _deepseek_fp8_quantize_weights(w2_bf16)
+    return {
+        "fc1_expert_weights": w1_q.contiguous(),
+        "fc2_expert_weights": w2_q.contiguous(),
+        "fc1_block_scale": w1_scale.contiguous(),
+        "fc2_block_scale": w2_scale.contiguous(),
+    }
+
+
+def prepare_cutlass_mxfp8_activations(
+    hidden_states_bf16: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, H]`` BF16 activations to MXFP8 with swizzled scales."""
+    from ..quantization.fp8_quantization import mxfp8_quantize
+
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_cutlass_mxfp8_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    if hidden_states_bf16.shape[1] % 32 != 0:
+        raise ValueError(
+            "MXFP8 activations require hidden_size divisible by 32, got "
+            f"{hidden_states_bf16.shape[1]}."
+        )
+    return mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=True, alignment=32)
+
+
+def _quantize_mxfp4_experts(
+    weight: torch.Tensor, num_local_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from ..quantization.fp4_quantization import mxfp4_quantize
+
+    packed_rows = []
+    scale_rows = []
+    for expert in range(num_local_experts):
+        packed, scale = mxfp4_quantize(weight[expert])
+        packed_rows.append(packed)
+        scale_rows.append(scale)
+    return torch.stack(packed_rows), torch.stack(scale_rows)
+
+
+def prepare_cutlass_mxfp8_mxfp4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the CUTLASS MXFP4 weight view consumed with MXFP8 activations."""
+    w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_mxfp8_mxfp4_weights",
+        alignment=32,
+        require_cuda=True,
+        device=device,
+    )
+    w1_q, w1_scale = _quantize_mxfp4_experts(w1_bf16, num_local_experts)
+    w2_q, w2_scale = _quantize_mxfp4_experts(w2_bf16, num_local_experts)
+    fake_input_scale = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    return {
+        "fc1_expert_weights": w1_q.contiguous(),
+        "fc2_expert_weights": w2_q.contiguous(),
+        "fc1_expert_scales": w1_scale.contiguous(),
+        "fc2_expert_scales": w2_scale.contiguous(),
+        "fc1_input_scale": fake_input_scale,
+        "fc2_input_scale": fake_input_scale.clone(),
+    }
+
+
+def _pack_mxfp8_weight_scales(
+    scale_u8: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
+    num_experts = scale_u8.size(0)
+    aligned_rows = round_up(rows, 128)
+    aligned_k_scales = round_up(cols // 32, 4)
+    return (
+        scale_u8.contiguous()
+        .view(num_experts, aligned_rows, aligned_k_scales)
+        .view(torch.int32)
+        .contiguous()
+    )
+
+
+def _quantize_mxfp8_experts(
+    weight: torch.Tensor, num_local_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from ..quantization.fp8_quantization import mxfp8_quantize
+
+    packed_rows = []
+    scale_rows = []
+    for expert in range(num_local_experts):
+        packed, scale = mxfp8_quantize(
+            weight[expert], is_sf_swizzled_layout=True, alignment=32
+        )
+        packed_rows.append(packed)
+        scale_rows.append(scale)
+    return torch.stack(packed_rows), torch.stack(scale_rows)
+
+
+def prepare_cutlass_mxfp8_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the CUTLASS MXFP8 weight view consumed with MXFP8 activations."""
+    w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_mxfp8_weights",
+        alignment=32,
+        require_cuda=True,
+        device=device,
+    )
+    w1_q, w1_scale = _quantize_mxfp8_experts(w1_bf16, num_local_experts)
+    w2_q, w2_scale = _quantize_mxfp8_experts(w2_bf16, num_local_experts)
+    fake_input_scale = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    return {
+        "fc1_expert_weights": w1_q.contiguous(),
+        "fc2_expert_weights": w2_q.contiguous(),
+        "fc1_expert_scales": _pack_mxfp8_weight_scales(
+            w1_scale, 2 * intermediate_size, hidden_size
+        ),
+        "fc2_expert_scales": _pack_mxfp8_weight_scales(
+            w2_scale, hidden_size, intermediate_size
+        ),
+        "fc1_input_scale": fake_input_scale,
+        "fc2_input_scale": fake_input_scale.clone(),
+    }
+
+
+def _quantize_int4_grouped(
+    weight: torch.Tensor, group_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric INT4 pack with per-group BF16 scales along the last dimension."""
+    if weight.ndim != 3 or weight.shape[-1] % group_size != 0:
+        raise ValueError(
+            "INT4 grouped quantization requires a 3D tensor whose last dim is "
+            f"divisible by {group_size}; got {tuple(weight.shape)}."
+        )
+    experts, rows, cols = weight.shape
+    blocks = weight.to(torch.float32).reshape(
+        experts, rows, cols // group_size, group_size
+    )
+    amax = blocks.abs().amax(dim=-1)
+    scale = torch.where(amax > 0, amax / 7.0, torch.ones_like(amax))
+    quantized = (blocks / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
+    quantized = quantized.reshape(experts, rows, cols)
+    even = (quantized[..., 0::2] & 0xF).to(torch.uint8)
+    odd = (quantized[..., 1::2] & 0xF).to(torch.uint8)
+    packed = even | (odd << 4)
+    return packed.contiguous(), scale.to(torch.bfloat16).contiguous()
+
+
+def prepare_cutlass_w4a8_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the SM90 packed INT4 view for ``CutlassW4A8Runner``.
+
+    Canonical BF16 weights are quantized in groups of 128, then folded with the
+    mixed-input INT4 interleave. Activation prequant scales are identity so the
+    kernel can quantize BF16 activations internally.
+    """
+    group_size = 128
+    w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_w4a8_weights",
+        alignment=group_size,
+        require_cuda=True,
+        device=device,
+    )
+    w1_packed, w1_scale = _quantize_int4_grouped(w1_bf16, group_size)
+    w2_packed, w2_scale = _quantize_int4_grouped(w2_bf16, group_size)
+    w1_il = interleave_moe_weights_for_sm90_mixed_gemm(w1_packed, "int4")
+    w2_il = interleave_moe_weights_for_sm90_mixed_gemm(w2_packed, "int4")
+    w1_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(w1_scale, group_size)
+    w2_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(w2_scale, group_size)
+    ones_h = torch.ones(hidden_size, device=device, dtype=torch.bfloat16)
+    ones_i = torch.ones(intermediate_size, device=device, dtype=torch.bfloat16)
+    ones_e = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    empty = torch.empty(0, device=device, dtype=torch.bfloat16)
+    return {
+        "fc1_expert_weights": w1_il,
+        "fc2_expert_weights": w2_il,
+        "fc1_expert_scales": w1_scale_il,
+        "fc2_expert_scales": w2_scale_il,
+        "fc1_act_scale": ones_h,
+        "fc2_act_scale": ones_i,
+        "fc1_zero": empty,
+        "fc2_zero": empty.clone(),
+        "fc1_alpha": ones_e,
+        "fc2_alpha": ones_e.clone(),
+    }
+
+
+def prepare_cutlass_humming_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the Humming MXFP4 x FP8 mixed-input view for SM90 CUTLASS.
+
+    Logical MXFP4 is produced with the architecture-independent Torch
+    quantizer, then rewritten and interleaved by
+    :func:`preprocess_moe_weights_for_sm90_mixed_gemm_humming`.
+    """
+    humming_epilogue_compensation = 64.0
+    w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name="prepare_cutlass_humming_weights",
+        alignment=128,
+        require_cuda=True,
+        device=device,
+    )
+
+    def quantize(weight: torch.Tensor, rows: int, cols: int):
+        packed, scales = _quantize_mxfp4_linear(
+            weight.view(num_local_experts * rows, cols)
+        )
+        return (
+            packed.view(num_local_experts, rows, cols // 2),
+            scales.view(num_local_experts, rows, cols // 32),
+        )
+
+    w1_packed, w1_scale = quantize(w1_bf16, 2 * intermediate_size, hidden_size)
+    w2_packed, w2_scale = quantize(w2_bf16, hidden_size, intermediate_size)
+    w1_il, w1_scale_il, w1_residual = (
+        preprocess_moe_weights_for_sm90_mixed_gemm_humming(w1_packed, w1_scale)
+    )
+    w2_il, w2_scale_il, w2_residual = (
+        preprocess_moe_weights_for_sm90_mixed_gemm_humming(w2_packed, w2_scale)
+    )
+    reserved = torch.ones((), device=device, dtype=torch.float32)
+    return {
+        "fc1_expert_weights": w1_il,
+        "fc2_expert_weights": w2_il,
+        "fc1_expert_scales": w1_scale_il,
+        "fc2_expert_scales": w2_scale_il,
+        "fc1_residual_scale": (
+            w1_residual * humming_epilogue_compensation
+        ).contiguous(),
+        "fc2_residual_scale": (
+            w2_residual * humming_epilogue_compensation
+        ).contiguous(),
+        "fc2_act_global": reserved,
     }
 
 
