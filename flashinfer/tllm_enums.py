@@ -26,8 +26,10 @@ class RoutingMethodType(IntEnum):
     MiniMax2 = (7,)
     # Sigmoid: Sigmoid -> TopK (no renormalization)
     Sigmoid = (8,)
+    # TopKSigmoid: TopK -> Sigmoid (no renormalization)
+    TopKSigmoid = (9,)
     # Unspecified
-    Unspecified = (9,)
+    Unspecified = (10,)
 
     # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
     # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
