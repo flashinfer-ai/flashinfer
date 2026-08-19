@@ -165,9 +165,7 @@ def test_cake_vsa_blk64_per_head_partial_blocks():
     q2k_indices = torch.topk(mask.to(torch.int8), selected, dim=-1).indices.to(
         torch.int32
     )
-    q2k_num = torch.full(
-        (heads, mb), selected, dtype=torch.int32, device=device
-    )
+    q2k_num = torch.full((heads, mb), selected, dtype=torch.int32, device=device)
     direct_wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
     direct_wrapper.plan(
         None,
@@ -189,9 +187,7 @@ def test_cake_vsa_blk64_per_head_partial_blocks():
 
     scale = 1.0 / math.sqrt(head_dim)
     scores = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * scale
-    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(
-        block_size, 2
-    )
+    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(block_size, 2)
     token_offset = torch.arange(N, device=device) % block_size
     block_id = torch.arange(N, device=device) // block_size
     token_mask &= (token_offset < kv_block_lens[block_id])[None, None, :]

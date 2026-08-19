@@ -322,12 +322,16 @@ def plan_cake_vsa(
             raise ValueError("every Cake VSA block row must select at least one block")
         if R == 64:
             q2k_num = row_counts.contiguous()
-            q2k_indices = torch.argsort(
-                dense.to(torch.int8),
-                dim=-1,
-                descending=True,
-                stable=True,
-            ).to(torch.int32).contiguous()
+            q2k_indices = (
+                torch.argsort(
+                    dense.to(torch.int8),
+                    dim=-1,
+                    descending=True,
+                    stable=True,
+                )
+                .to(torch.int32)
+                .contiguous()
+            )
 
     planned_kv_block_lens = None
     if R == 64:
@@ -342,11 +346,7 @@ def plan_cake_vsa(
                 device=device, dtype=torch.int32
             ).contiguous()
     shared_indptr = shared_indices = None
-    if (
-        R != 64
-        and dense is not None
-        and torch.equal(dense, dense[:1].expand_as(dense))
-    ):
+    if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(dense, indptr, indices)
     return {
         "M": M,
