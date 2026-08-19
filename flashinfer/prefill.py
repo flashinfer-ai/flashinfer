@@ -2645,6 +2645,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         *args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        o_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
@@ -2665,6 +2666,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         *args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        o_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
@@ -2686,6 +2688,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_scale: Optional[Union[float, torch.Tensor]] = None,
         k_scale: Optional[Union[float, torch.Tensor]] = None,
         v_scale: Optional[Union[float, torch.Tensor]] = None,
+        o_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -2725,6 +2728,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+        o_scale : Optional[Union[float, torch.Tensor]]
+            The quantization scale of the output: the output is multiplied by
+            ``o_scale`` before conversion to an fp8 ``o_data_type`` (unit scale
+            saturates e4m3 at 448).  If not provided, will be set to ``1.0``.
+            Floats are converted internally to the ``(1, 1, 1, 1)`` fp32 GPU
+            tensor cuDNN expects; pass such a tensor directly to avoid the
+            per-call copy (e.g. under CUDA graph capture).  Only supported by
+            the cudnn backend (with an fp8 ``q``); other backends raise
+            ``NotImplementedError`` when it is set.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
@@ -2802,6 +2814,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
                     f"where total_tokens = qo_indptr[-1]."
                 )
+
+        if o_scale is not None and self._backend != "cudnn":
+            raise NotImplementedError(
+                f"o_scale is only supported by the cudnn backend on the paged "
+                f"prefill path, got backend={self._backend!r}"
+            )
 
         if self._backend == "cute-dsl":
             if q_scale is not None or k_scale is not None or v_scale is not None:
@@ -2955,6 +2973,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
+            if o_scale is not None and not isinstance(o_scale, torch.Tensor):
+                # cudnn_batch_prefill_with_kv_cache takes o_scale as a
+                # (1, 1, 1, 1) fp32 GPU tensor; floats are converted here,
+                # tensors pass through as-is.
+                o_scale = torch.tensor(
+                    o_scale, device=q.device, dtype=torch.float32
+                ).reshape(1, 1, 1, 1)
+
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed
@@ -2971,6 +2997,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                o_scale=o_scale,
                 batch_offsets_q=self._qo_indptr_buf,
                 batch_offsets_o=self._qo_indptr_buf,
                 out=out,
@@ -3972,7 +3999,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-        o_scale: Optional[float] = None,
+        o_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -4000,8 +4027,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The calibration scale of fp8 or nvfp4 key, if not provided, will be set to ``1.0``.
         v_scale: Optional[float]
             The calibration scale of fp8 or nvfp4 value, if not provided, will be set to ``1.0``.
-        o_scale: Optional[float]
-            The calibration scale of output, if not provided, will be set to ``1.0``.
+        o_scale: Optional[Union[float, torch.Tensor]]
+            The quantization scale of the output: the output is multiplied by
+            ``o_scale`` before conversion to an fp8 output dtype (unit scale
+            saturates e4m3 at 448).  If not provided, will be set to ``1.0``.
+            Consumed by the cutlass (float only) and cudnn backends; for the
+            cudnn backend floats are converted internally to the
+            ``(1, 1, 1, 1)`` fp32 GPU tensor cuDNN expects — pass such a
+            tensor directly to avoid the per-call copy (e.g. under CUDA graph
+            capture).  The cute-dsl backend rejects it with
+            ``NotImplementedError``; the remaining backends (fa2/fa3,
+            fmha_v2) silently ignore it, so the output is emitted unscaled.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
@@ -4244,6 +4280,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(batch_size, 1, 1, 1)
 
+            if o_scale is not None and not isinstance(o_scale, torch.Tensor):
+                # cudnn_batch_prefill_with_kv_cache takes o_scale as a
+                # (1, 1, 1, 1) fp32 GPU tensor; floats are converted here,
+                # tensors pass through as-is.
+                o_scale = torch.tensor(
+                    o_scale, device=q.device, dtype=torch.float32
+                ).reshape(1, 1, 1, 1)
+
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k,
@@ -4259,6 +4303,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                o_scale=o_scale,
                 batch_offsets_q=self._qo_indptr_buf,
                 batch_offsets_k=self._kv_indptr_buf,
                 batch_offsets_v=self._v_indptr_buf,
@@ -4266,6 +4311,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 is_cuda_graph_compatible=self._use_cuda_graph,
                 out=out,
                 lse=lse,
+                # The graph's O dtype must match the buffer actually bound
+                # (out is always allocated/validated above); without this an
+                # fp8 q with a non-fp8 out would build an fp8-O graph around
+                # a wider buffer.
+                o_data_type=out.dtype,
             )
 
             return (out, lse) if return_lse else out
