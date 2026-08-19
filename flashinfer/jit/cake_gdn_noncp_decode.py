@@ -198,9 +198,7 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     """Compile and load one checksum-verified Cake GDN host entrypoint."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
-        raise CakeGDNUnsupportedError(
-            f"unsupported Cake GDN architecture: {arch!r}"
-        )
+        raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
     host = record["host_binding"]
@@ -356,11 +354,7 @@ def select_cake_gdn_prefill_variant(
         raise CakeGDNUnsupportedError(f"unsupported state dtype {state_dtype}")
     min_heads = min(num_q_heads, num_v_heads)
     num_o_heads = max(num_q_heads, num_v_heads)
-    if (
-        min_heads <= 0
-        or num_k_heads != min_heads
-        or num_o_heads % min_heads
-    ):
+    if min_heads <= 0 or num_k_heads != min_heads or num_o_heads % min_heads:
         raise CakeGDNUnsupportedError("unsupported GDN head mapping")
     if (
         num_seqs <= 0
