@@ -1670,15 +1670,21 @@ def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
 
 
 @pytest.mark.parametrize(
-    ("num_heads", "forced_split"),
-    [(4, None), (8, None), (16, None), (32, None), (4, 4)],
+    ("num_heads", "num_sequences", "forced_split"),
+    [
+        (4, 7, None),
+        (8, 7, None),
+        (16, 7, None),
+        (32, 7, None),
+        (4, 7, 4),
+        (32, 16, None),
+    ],
 )
 def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inputs(
-    flash_kda_device, monkeypatch, num_heads, forced_split
+    flash_kda_device, monkeypatch, num_heads, num_sequences, forced_split
 ):
     generator = torch.Generator(device=flash_kda_device).manual_seed(2248 + num_heads)
-    num_sequences = 7
-    state_slots = 12
+    state_slots = 2 * num_sequences + 1
     case = _make_case(
         flash_kda_device,
         num_sequences=num_sequences,
@@ -1763,10 +1769,8 @@ def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inpu
         device=flash_kda_device,
         generator=generator,
     )
-    state_indices = torch.tensor(
-        [1, 3, 5, 7, 8, 10, 11],
-        dtype=torch.int32,
-        device=flash_kda_device,
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
     )
     logical_initial = torch.randn(
         (state_slots, num_heads, _D, _D),
