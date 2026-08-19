@@ -604,21 +604,28 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         tuned = _run(2, algorithm="auto")
         warm = _run(2, algorithm="auto")
 
-    selected_tactic = next(iter(tuner.profiling_cache.values()))[0]
-    assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
+    profiled_configs = {
+        cache_key.file_key: tactic
+        for cache_key, (tactic, _) in tuner.profiling_cache.items()
+        if cache_key.runner_class_name == "CheckpointingSSURunner"
+    }
+    assert profiled_configs
+    assert all(
+        isinstance(tactic, tuple) and len(tactic) == 4
+        for tactic in profiled_configs.values()
+    )
     for tuned_tensor, warm_tensor in zip(tuned, warm, strict=True):
         torch.testing.assert_close(tuned_tensor, warm_tensor, rtol=0, atol=0)
 
     tuner.clear_cache()
     with autotune(False, cache=str(cache_path)):
         cached = _run(2, algorithm="auto")
-    cached_tactics = [
-        tactic
-        for runner_name, tactic in tuner._file_configs.values()
+    cached_configs = {
+        file_key: tactic
+        for file_key, (runner_name, tactic) in tuner._file_configs.items()
         if runner_name == "CheckpointingSSURunner"
-    ]
-    assert cached_tactics
-    assert set(cached_tactics) == {selected_tactic}
+    }
+    assert cached_configs == profiled_configs
     for tuned_tensor, cached_tensor in zip(tuned, cached, strict=True):
         torch.testing.assert_close(tuned_tensor, cached_tensor, rtol=0, atol=0)
 
