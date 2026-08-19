@@ -27,8 +27,14 @@ from typing import Any, ClassVar, List
 
 import torch
 
-from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
-from ..utils import next_positive_power_of_2
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
+from ..utils import next_positive_power_of_2, round_up
 from .api import (
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
@@ -344,6 +350,29 @@ class MoERunner(TunableRunner):
         return self._cache_key_extras()
 
 
+def _mxfp8_swizzled_act_sf_numel(num_tokens: int, hidden_size: int) -> int:
+    """Byte count of a 128x4-swizzled MXFP8 activation scale buffer."""
+    return round_up(num_tokens, 128) * round_up(hidden_size // 32, 4)
+
+
+def _infer_mxfp8_swizzled_act_sf_numel(shapes: list) -> int:
+    """ConstraintSpec callback: ``input_sf`` numel from hidden_states ``[M, H]``."""
+    return _mxfp8_swizzled_act_sf_numel(shapes[1][0], shapes[1][1])
+
+
+def _require_cutlass_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    if tensor.dtype is not dtype:
+        raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}.")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} shape {tuple(tensor.shape)} != expected {shape}.")
+
+
 # ---------------------------------------------------------------------------
 # CUTLASS runners — dense BF16 and mixed-input W4A16
 # ---------------------------------------------------------------------------
@@ -393,6 +422,20 @@ class _CutlassRunnerBase(MoERunner):
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
             )
+        if self._use_mxfp8_act_scaling and (
+            self.config.quant.swizzled_scale_factors is False
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} requires swizzled MXFP8 input_sf; "
+                "linear scales (swizzled_scale_factors=False) are not supported."
+            )
+        if self._use_deepseek_fp8_block_scale:
+            from ..jit.cpp_ext import is_cuda_version_at_least
+
+            if not is_cuda_version_at_least("12.8"):
+                raise NotImplementedError(
+                    "FP8 block scaling not implemented for CUDA 12.6 or lower."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -467,6 +510,18 @@ class _CutlassRunnerBase(MoERunner):
         ).unsqueeze(0)
         inputs[2].copy_((token_offsets * top_k + slots) % num_experts)
         inputs[3].fill_(1.0 / top_k)
+        if self._use_mxfp8_act_scaling:
+            hidden_states = inputs[1]
+            inputs[-1] = torch.full(
+                (
+                    _mxfp8_swizzled_act_sf_numel(
+                        hidden_states.shape[0], hidden_states.shape[1]
+                    ),
+                ),
+                127,
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
         return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
@@ -616,6 +671,15 @@ class _CutlassRunnerBase(MoERunner):
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
         )
+        constraint_specs: tuple[ConstraintSpec, ...] = ()
+        if self._use_mxfp8_act_scaling:
+            constraint_specs = (
+                ConstraintSpec(
+                    4 + len(weight_inputs),
+                    0,
+                    _infer_mxfp8_swizzled_act_sf_numel,
+                ),
+            )
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -627,6 +691,7 @@ class _CutlassRunnerBase(MoERunner):
                     ),
                 ),
             ),
+            constraint_specs=constraint_specs,
             use_cuda_graph=True,
             inputs_pre_hook=self._prepare_tuning_inputs,
         )
@@ -647,10 +712,24 @@ class _CutlassRunnerBase(MoERunner):
 
     def _validate_activation_scale(self, act: MoEActivationPack) -> None:
         if self._use_mxfp8_act_scaling:
-            if act.hidden_states_scale is None:
+            scale = act.hidden_states_scale
+            num_tokens, hidden_size = act.hidden_states_q.shape
+            expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+            if (
+                scale is None
+                or scale.dtype is not torch.uint8
+                or scale.numel() != expected
+                or not scale.is_contiguous()
+            ):
+                got = (
+                    None
+                    if scale is None
+                    else (scale.dtype, tuple(scale.shape), scale.is_contiguous())
+                )
                 raise ValueError(
-                    f"{type(self).__name__} requires hidden_states_scale as MXFP8 "
-                    "input_sf."
+                    f"{type(self).__name__} requires a contiguous uint8 swizzled "
+                    f"input_sf with {expected} elements for M={num_tokens}, "
+                    f"H={hidden_size}; got {got}."
                 )
             return
         if self._x_dtype is torch.float8_e4m3fn:
@@ -671,7 +750,10 @@ class _CutlassRunnerBase(MoERunner):
     ) -> List[torch.Tensor]:
         if self._use_mxfp8_act_scaling or self._x_dtype is torch.float8_e4m3fn:
             assert act.hidden_states_scale is not None
-            return [act.hidden_states_scale]
+            scale = act.hidden_states_scale
+            if self._use_mxfp8_act_scaling:
+                scale = scale.reshape(-1)
+            return [scale]
         return []
 
     def _pack_weight_inputs(
@@ -769,6 +851,7 @@ class _CutlassRunnerBase(MoERunner):
             use_packed_weights=self._use_packed_weights,
             use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             use_fused_finalize=self._use_fused_finalize,
+            swizzled_input_sf=True,
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
         )
@@ -1149,6 +1232,32 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
                 f"{expected_w1}/{expected_w2}."
             )
         self._validate_weight_storage((w1, w2, w1_scale, w2_scale, a1_scale, a2_scale))
+        expected_s1 = num_experts * _mxfp8_swizzled_act_sf_numel(
+            2 * intermediate_size, hidden_size
+        )
+        expected_s2 = num_experts * _mxfp8_swizzled_act_sf_numel(
+            hidden_size, intermediate_size
+        )
+        if w1_scale.dtype is not torch.uint8 or w2_scale.dtype is not torch.uint8:
+            raise TypeError("Cutlass MXFP8xMXFP4 weight scales must be uint8.")
+        if w1_scale.numel() != expected_s1 or w2_scale.numel() != expected_s2:
+            raise ValueError(
+                "Cutlass MXFP8xMXFP4 weight scale sizes "
+                f"{w1_scale.numel()}/{w2_scale.numel()} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        _require_cutlass_tensor(
+            a1_scale,
+            name="fc1_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        _require_cutlass_tensor(
+            a2_scale,
+            name="fc2_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
         return [
             w1.view(torch.int64),
             w2.view(torch.int64),
@@ -1203,6 +1312,34 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
                 f"Cutlass MXFP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
+        expected_s1 = (
+            num_experts,
+            round_up(2 * intermediate_size, 128),
+            round_up(hidden_size // 32, 4) // 4,
+        )
+        expected_s2 = (
+            num_experts,
+            round_up(hidden_size, 128),
+            round_up(intermediate_size // 32, 4) // 4,
+        )
+        _require_cutlass_tensor(
+            w1_scale, name="fc1_expert_scales", dtype=torch.int32, shape=expected_s1
+        )
+        _require_cutlass_tensor(
+            w2_scale, name="fc2_expert_scales", dtype=torch.int32, shape=expected_s2
+        )
+        _require_cutlass_tensor(
+            a1_scale,
+            name="fc1_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        _require_cutlass_tensor(
+            a2_scale,
+            name="fc2_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
         self._validate_weight_storage((w1, w2, w1_scale, w2_scale, a1_scale, a2_scale))
         return [w1, w2, w1_scale, w2_scale, a1_scale, a2_scale]
 
@@ -1249,6 +1386,55 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
                 f"Cutlass W4A8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
+        expected_s1 = (
+            num_experts,
+            2 * intermediate_size // 64,
+            hidden_size // 128,
+            8,
+            8,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            8,
+            8,
+        )
+        w1_scale, w2_scale = tensors[2], tensors[3]
+        act1, act2, zero1, zero2, alpha1, alpha2 = tensors[4:]
+        _require_cutlass_tensor(
+            w1_scale,
+            name="fc1_expert_scales",
+            dtype=torch.bfloat16,
+            shape=expected_s1,
+        )
+        _require_cutlass_tensor(
+            w2_scale,
+            name="fc2_expert_scales",
+            dtype=torch.bfloat16,
+            shape=expected_s2,
+        )
+        _require_cutlass_tensor(
+            act1, name="fc1_act_scale", dtype=torch.bfloat16, shape=(hidden_size,)
+        )
+        _require_cutlass_tensor(
+            act2,
+            name="fc2_act_scale",
+            dtype=torch.bfloat16,
+            shape=(intermediate_size,),
+        )
+        _require_cutlass_tensor(
+            zero1, name="fc1_zero", dtype=torch.bfloat16, shape=(0,)
+        )
+        _require_cutlass_tensor(
+            zero2, name="fc2_zero", dtype=torch.bfloat16, shape=(0,)
+        )
+        _require_cutlass_tensor(
+            alpha1, name="fc1_alpha", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            alpha2, name="fc2_alpha", dtype=torch.float32, shape=(num_experts,)
+        )
         self._validate_weight_storage(tensors)
         return list(tensors)
 
@@ -1294,6 +1480,35 @@ class CutlassHummingRunner(_CutlassRunnerBase):
                 f"{tuple(w1.shape)}/{tuple(w2.shape)} != expected "
                 f"{expected_w1}/{expected_w2}."
             )
+        expected_s1 = (
+            num_experts,
+            2 * intermediate_size // 64,
+            hidden_size // 128,
+            16,
+            16,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            16,
+            16,
+        )
+        _require_cutlass_tensor(
+            w1_scale, name="fc1_expert_scales", dtype=torch.uint8, shape=expected_s1
+        )
+        _require_cutlass_tensor(
+            w2_scale, name="fc2_expert_scales", dtype=torch.uint8, shape=expected_s2
+        )
+        _require_cutlass_tensor(
+            r1, name="fc1_residual_scale", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            r2, name="fc2_residual_scale", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            a2, name="fc2_act_global", dtype=torch.float32, shape=()
+        )
         self._validate_weight_storage((w1, w2, w1_scale, w2_scale, r1, r2, a2))
         return [w1, w2, w1_scale, w2_scale, r1, r2, a2]
 
