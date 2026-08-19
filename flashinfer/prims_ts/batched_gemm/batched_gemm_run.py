@@ -1496,6 +1496,7 @@ def _parse_overrides(args):
         "num_stages_tmem_sfa": args.num_stages_tmem_sfa,
         "num_stages_tmem_sfb": args.num_stages_tmem_sfb,
         "num_stages_c_smem": args.num_stages_c_smem,
+        "tmem_ldst_max_num_regs": args.tmem_ldst_max_num_regs,
         "use_tma_oob_opt": args.use_tma_oob_opt,
         "use_tma_store": args.use_tma_store,
         "num_load_b_warps": args.num_load_b_warps,
@@ -3887,6 +3888,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-stages-tmem-sfa", type=int, default=5)
     parser.add_argument("--num-stages-tmem-sfb", type=int, default=5)
     parser.add_argument("--num-stages-c-smem", type=int, default=2)
+    parser.add_argument(
+        "--tmem-ldst-max-num-regs",
+        type=int,
+        choices=(32, 64),
+        default=32,
+        help="Maximum register width for TMEM load/store instructions.",
+    )
     parser.add_argument("--use-tma-oob-opt", type=int, default=1)
     parser.add_argument("--use-tma-store", type=int, default=0)
     parser.add_argument("--num-load-b-warps", type=int, default=1)

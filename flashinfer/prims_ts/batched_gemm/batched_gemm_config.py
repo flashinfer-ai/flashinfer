@@ -220,7 +220,7 @@ class BatchedGemmConfig:
     tile that does not exceed :attr:`tmem_ldst_max_num_regs`.
     """
 
-    tmem_ldst_max_num_regs: int = 64
+    tmem_ldst_max_num_regs: int = 32
     """Maximum register count for one TMEM load; either ``32`` or ``64``.
 
     Matches TRTLLM-gen's ``tmemLdstMaxNumRegs`` control. The non-transposed

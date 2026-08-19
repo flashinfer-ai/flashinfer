@@ -108,6 +108,27 @@ def test_along_n_cta_swizzle_rejects_non_persistent_scheduler():
 
 
 @pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        ([], 32),
+        (["--tmem-ldst-max-num-regs", "32"], 32),
+        (["--tmem-ldst-max-num-regs", "64"], 64),
+    ),
+)
+def test_tmem_ldst_max_num_regs_cli_mapping(argv, expected):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    args = build_arg_parser().parse_args(argv)
+    cfg = make_config(**_parse_overrides(args))
+
+    assert cfg.tmem_ldst_max_num_regs == expected
+
+
+@pytest.mark.parametrize(
     ("max_regs", "epi_tile_n", "expected_overlap_loads"),
     ((32, 64, 2), (64, 64, 1), (64, 128, 2)),
 )
