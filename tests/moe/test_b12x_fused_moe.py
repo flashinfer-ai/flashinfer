@@ -3118,5 +3118,92 @@ class TestRelu2Activation:
         assert not (output == 0).all(), "All zeros after ReLU2 CUDA graph replay"
 
 
+def _make_cpu_wrapper(monkeypatch, **shared):
+    """Build a B12xMoEWrapper without a GPU: fake CUDA 13, CPU buffers."""
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    return b12x_moe_mod.B12xMoEWrapper(
+        num_experts=8,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=128,
+        use_cuda_graph=True,
+        max_num_tokens=1024,  # crosses the static/dynamic cutover
+        device="cpu",
+        **shared,
+    )
+
+
+def test_wrapper_defaults_allocate_own_buffers(monkeypatch):
+    """Without sharing, each wrapper allocates its own workspaces and output."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    second = _make_cpu_wrapper(monkeypatch)
+
+    assert len(allocs) == 4  # static + dynamic per wrapper
+    assert second._static_workspace is not first._static_workspace
+    assert second._dynamic_workspace is not first._dynamic_workspace
+    assert second._moe_output is not first._moe_output
+
+
+def test_wrapper_shared_buffers_are_reused(monkeypatch):
+    """Injected shared buffers are reused instead of fresh allocations."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    assert len(allocs) == 2  # static + dynamic
+
+    # Spy on the output factory: sharing must skip the output allocation too.
+    real_empty = torch.empty
+    output_allocs = []
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *a, **kw: output_allocs.append((a, kw)) or real_empty(*a, **kw),
+    )
+
+    second = _make_cpu_wrapper(
+        monkeypatch,
+        shared_static_workspace=first._static_workspace,
+        shared_dynamic_workspace=first._dynamic_workspace,
+        shared_output=first._moe_output,
+    )
+
+    assert len(allocs) == 2  # nothing new allocated
+    assert not output_allocs
+    assert second._static_workspace is first._static_workspace
+    assert second._dynamic_workspace is first._dynamic_workspace
+    assert second._moe_output is first._moe_output
+
+
+def test_wrapper_shared_output_is_validated(monkeypatch):
+    """Incompatible shared_output buffers are rejected at construction."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    monkeypatch.setattr(
+        moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
+    )
+    bad = torch.zeros((4, 64), dtype=torch.float32)  # too small, wrong dtype
+    with pytest.raises(ValueError, match="shared_output"):
+        _make_cpu_wrapper(monkeypatch, shared_output=bad)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
