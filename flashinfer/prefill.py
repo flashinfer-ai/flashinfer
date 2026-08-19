@@ -6123,6 +6123,7 @@ def trtllm_batch_context_with_kv_cache(
 
     if backend == "cake":
         from .cake_fmha import (
+            cake_fmha_route_is_optimized,
             get_cake_fmha_context_module,
             select_cake_fmha_context_route,
         )
@@ -6150,8 +6151,9 @@ def trtllm_batch_context_with_kv_cache(
             skip_softmax_threshold_scale_factor=(skip_softmax_threshold_scale_factor),
             is_causal=causal,
             lse=lse,
+            kv_layout=kv_layout,
         )
-        if cake_route is None:
+        if not cake_fmha_route_is_optimized(cake_route):
             # compat_v1 takes host scalar scales. Optimized context routes
             # decline device-bound scale tensors until a pointer body exists.
             if isinstance(bmm1_scale, torch.Tensor):

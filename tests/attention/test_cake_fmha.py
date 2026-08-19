@@ -67,6 +67,31 @@ def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
     assert cake_api.cake_fmha_manifest()["product"] == "cake_fmha"
 
 
+def test_cake_fmha_high_level_registry_covers_every_product_component() -> None:
+    assert cake_api._optimized_route_coverage() == (1_798, 1_798)
+    routed_components = {
+        component
+        for components in cake_api._OPTIMIZED_ROUTE_COMPONENTS.values()
+        for component in components
+    }
+    assert routed_components | {"compat_v1"} == {
+        "compat_v1",
+        "context_bf16",
+        "context_fp16_hd256",
+        "context_fp8",
+        "context_fp8_hd256",
+        "context_hd256_support",
+        "context_nvfp4",
+        "decode_native_bf16",
+        "decode_native_fp16_hd512",
+        "decode_native_fp16_nhd",
+        "decode_quant_bf16q",
+        "decode_quant_fp8",
+        "decode_quant_fp8_reduce",
+        "decode_quant_nvfp4",
+    }
+
+
 def test_cake_fmha_jit_spec_uses_versioned_standalone_sources(monkeypatch) -> None:
     import flashinfer.jit.core as jit_core
 
@@ -244,12 +269,177 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         use_scale_ptr=True,
         retain_kv_l2=True,
     )
+    assert cake_api.cake_fmha_route_is_optimized(route)
     assert (
         cake_api.select_cake_fmha_decode_route(
             query.device, **{**kwargs, "uses_shared_paged_kv_idx": False}
         )
         is None
     )
+
+
+def test_cake_fmha_decode_routes_cover_the_312_new_matrix_cells(monkeypatch) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+
+    def select(query, key, out, *, kv_layout, shared, scales=None):
+        batch_size = 2
+        return cake_api.select_cake_fmha_decode_route(
+            query.device,
+            query=query,
+            key_cache=key,
+            value_cache=torch.empty_like(key),
+            out=out,
+            block_tables=torch.zeros(
+                (batch_size, 2) if shared else (batch_size, 2, 2),
+                dtype=torch.int32,
+            ),
+            seq_lens=torch.tensor([32, 32], dtype=torch.int32),
+            batch_size=batch_size,
+            q_len=1,
+            max_seq_len=32,
+            window_left=-1,
+            bmm1_scale=0.125,
+            bmm2_scale=1.0,
+            o_scale=1.0,
+            sinks=None,
+            kv_layout=kv_layout,
+            uses_shared_paged_kv_idx=shared,
+            cum_seq_lens_q=None,
+            key_block_scales=None if scales is None else scales,
+            value_block_scales=None if scales is None else torch.empty_like(scales),
+            skip_softmax_threshold_scale_factor=None,
+            enable_block_sparse_attention=False,
+            lse=None,
+        )
+
+    fp16_q = torch.empty((2, 4, 128), dtype=torch.float16)
+    fp16_route = select(
+        fp16_q,
+        torch.empty((4, 2, 32, 128), dtype=torch.float16),
+        torch.empty_like(fp16_q),
+        kv_layout="NHD",
+        shared=False,
+    )
+    assert fp16_route is not None
+    assert fp16_route.component == "decode_native_fp16_nhd"
+
+    bf16_q = torch.empty((2, 4, 128), dtype=torch.bfloat16)
+    bf16q_route = select(
+        bf16_q,
+        torch.empty((4, 2, 16, 128), dtype=torch.float8_e4m3fn),
+        torch.empty_like(bf16_q),
+        kv_layout="HND",
+        shared=True,
+    )
+    assert bf16q_route is not None
+    assert bf16q_route.component == "decode_quant_bf16q"
+
+    fp8_q = torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn)
+    nvfp4_route = select(
+        fp8_q,
+        torch.empty((4, 2, 16, 64), dtype=torch.uint8),
+        torch.empty_like(fp8_q),
+        kv_layout="HND",
+        shared=True,
+        scales=torch.empty((4, 2, 16, 8), dtype=torch.float8_e4m3fn),
+    )
+    assert nvfp4_route is not None
+    assert nvfp4_route.component == "decode_quant_nvfp4"
+
+    for route in (fp16_route, bf16q_route, nvfp4_route):
+        assert not cake_api.cake_fmha_route_is_optimized(route)
+
+
+def test_cake_fmha_context_routes_cover_the_86_new_matrix_cells(monkeypatch) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+
+    def select(query, key, out, *, kv_layout, shared, causal, scales=None):
+        return cake_api.select_cake_fmha_context_route(
+            query.device,
+            query=query,
+            key_cache=key,
+            value_cache=torch.empty_like(key),
+            out=out,
+            block_tables=torch.zeros(
+                (2, 2) if shared else (2, 2, 2), dtype=torch.int32
+            ),
+            seq_lens=torch.tensor([16, 16], dtype=torch.int32),
+            batch_size=2,
+            max_q_len=8,
+            max_kv_len=16,
+            window_left=-1,
+            bmm1_scale=0.125,
+            bmm2_scale=1.0,
+            sinks=None,
+            uses_shared_paged_kv_idx=shared,
+            cum_seq_lens_q=torch.tensor([0, 8, 16], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 16, 32], dtype=torch.int32),
+            key_block_scales=None if scales is None else scales,
+            value_block_scales=None if scales is None else torch.empty_like(scales),
+            skip_softmax_threshold_scale_factor=None,
+            is_causal=causal,
+            lse=None,
+            kv_layout=kv_layout,
+        )
+
+    fp16_q = torch.empty((16, 4, 256), dtype=torch.float16)
+    fp16_route = select(
+        fp16_q,
+        torch.empty((4, 2, 16, 256), dtype=torch.float16),
+        torch.empty_like(fp16_q),
+        kv_layout="NHD",
+        shared=False,
+        causal=False,
+    )
+    assert fp16_route is not None
+    assert fp16_route.component == "context_fp16_hd256"
+
+    fp8_q = torch.empty((16, 4, 256), dtype=torch.float8_e4m3fn)
+    fp8_hd256_route = select(
+        fp8_q,
+        torch.empty((4, 2, 16, 256), dtype=torch.float8_e4m3fn),
+        torch.empty_like(fp8_q, dtype=torch.bfloat16),
+        kv_layout="NHD",
+        shared=False,
+        causal=True,
+    )
+    assert fp8_hd256_route is not None
+    assert fp8_hd256_route.component == "context_fp8_hd256"
+
+    fp8_q = torch.empty((16, 4, 128), dtype=torch.float8_e4m3fn)
+    nvfp4_route = select(
+        fp8_q,
+        torch.empty((4, 2, 16, 64), dtype=torch.uint8),
+        torch.empty_like(fp8_q),
+        kv_layout="HND",
+        shared=True,
+        causal=True,
+        scales=torch.empty((4, 2, 16, 8), dtype=torch.float8_e4m3fn),
+    )
+    assert nvfp4_route is not None
+    assert nvfp4_route.component == "context_nvfp4"
+
+    for route in (fp16_route, fp8_hd256_route, nvfp4_route):
+        assert not cake_api.cake_fmha_route_is_optimized(route)
+
+
+def test_unexported_candidate_routes_fail_closed_to_compat(monkeypatch) -> None:
+    sentinel = object()
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "load_cake_fmha_compat_module", lambda target: sentinel)
+    route = cake_api.CakeFmhaDecodeRoute(
+        target="sm100a",
+        batch_size=1,
+        q_len=1,
+        num_q_heads=8,
+        num_kv_heads=1,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=True,
+        component="decode_quant_bf16q",
+    )
+    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
 
 
 def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
@@ -298,6 +488,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         return_lse=True,
         enable_sink=False,
     )
+    assert cake_api.cake_fmha_route_is_optimized(route)
     assert (
         cake_api.select_cake_fmha_context_route(
             query.device,
@@ -348,6 +539,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         return_lse=False,
         enable_sink=False,
     )
+    assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:

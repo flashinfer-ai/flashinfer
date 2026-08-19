@@ -37,6 +37,15 @@ class CakeFmhaDecodeRoute:
     has_window: bool
     use_scale_ptr: bool
     retain_kv_l2: bool
+    component: Literal[
+        "decode_native_bf16",
+        "decode_native_fp16_hd512",
+        "decode_native_fp16_nhd",
+        "decode_quant_bf16q",
+        "decode_quant_fp8",
+        "decode_quant_nvfp4",
+    ] = "decode_native_bf16"
+    page_size: int = 16
 
 
 @dataclass(frozen=True)
@@ -44,7 +53,13 @@ class CakeFmhaContextRoute:
     """One exact manifest-backed optimized context specialization."""
 
     target: CakeFmhaTarget
-    component: Literal["context_bf16", "context_fp8"]
+    component: Literal[
+        "context_bf16",
+        "context_fp16_hd256",
+        "context_fp8",
+        "context_fp8_hd256",
+        "context_nvfp4",
+    ]
     num_m_blocks: int
     num_q_heads: int
     num_kv_heads: int
@@ -54,6 +69,85 @@ class CakeFmhaContextRoute:
     is_causal: bool
     return_lse: bool
     enable_sink: bool
+
+
+# These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
+# the component sequences explicit: hd256 needs its staging/scatter support,
+# and split-KV NVFP4 decode may also need the shared reduction component.
+_OPTIMIZED_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "ctx_bf16_hnd_hd128_hgpack_03df_v2": ("context_bf16",),
+    "ctx_fp16_nhd_hd256_stage16_v1": (
+        "context_hd256_support",
+        "context_fp16_hd256",
+    ),
+    "ctx_fp8_bf16_nhd_hd256_stage16_v1": (
+        "context_hd256_support",
+        "context_fp8_hd256",
+    ),
+    "ctx_fp8_hnd_hd128_hgpack_48b5_v1": ("context_fp8",),
+    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": ("context_nvfp4",),
+    "decode_native_bf16_v1_bece": ("decode_native_bf16",),
+    "decode_native_fp16_hd512_v1_66b1": ("decode_native_fp16_hd512",),
+    "decode_native_fp16_nhd_v1_f32d": ("decode_native_fp16_nhd",),
+    "decode_quantized_bf16q_9d8b_v1": ("decode_quant_bf16q",),
+    "decode_quantized_fp8_8e5b_v1": (
+        "decode_quant_fp8",
+        "decode_quant_fp8_reduce",
+    ),
+    "decode_quantized_nvfp4_8e5b_v1": (
+        "decode_quant_nvfp4",
+        "decode_quant_fp8_reduce",
+    ),
+}
+
+# Only these components have an authenticated FlashInfer TVM-FFI adapter in
+# the checked-in package.  Candidate routes whose adapter is part of the final
+# export remain fail-closed to compat_v1 until that export and binding digest
+# are updated together.
+_AUTHENTICATED_JIT_COMPONENTS = frozenset(
+    {"compat_v1", "context_bf16", "context_fp8", "decode_native_bf16"}
+)
+
+
+def _route_components(route: CakeFmhaDecodeRoute | CakeFmhaContextRoute) -> tuple[str, ...]:
+    if isinstance(route, CakeFmhaDecodeRoute):
+        route_name = {
+            "decode_native_bf16": "decode_native_bf16_v1_bece",
+            "decode_native_fp16_hd512": "decode_native_fp16_hd512_v1_66b1",
+            "decode_native_fp16_nhd": "decode_native_fp16_nhd_v1_f32d",
+            "decode_quant_bf16q": "decode_quantized_bf16q_9d8b_v1",
+            "decode_quant_fp8": "decode_quantized_fp8_8e5b_v1",
+            "decode_quant_nvfp4": "decode_quantized_nvfp4_8e5b_v1",
+        }[route.component]
+    else:
+        route_name = {
+            "context_bf16": "ctx_bf16_hnd_hd128_hgpack_03df_v2",
+            "context_fp16_hd256": "ctx_fp16_nhd_hd256_stage16_v1",
+            "context_fp8": "ctx_fp8_hnd_hd128_hgpack_48b5_v1",
+            "context_fp8_hd256": "ctx_fp8_bf16_nhd_hd256_stage16_v1",
+            "context_nvfp4": "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1",
+        }[route.component]
+    return _OPTIMIZED_ROUTE_COMPONENTS[route_name]
+
+
+def cake_fmha_route_is_optimized(
+    route: CakeFmhaDecodeRoute | CakeFmhaContextRoute | None,
+) -> bool:
+    """Return whether ``route`` has a fully authenticated runnable adapter."""
+
+    return route is not None and all(
+        component in _AUTHENTICATED_JIT_COMPONENTS
+        for component in _route_components(route)
+    )
+
+
+def _optimized_route_coverage() -> tuple[int, int]:
+    """Return (routed, total) optimized cells from the authenticated manifest."""
+
+    route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
+    total = sum(count for name, count in route_counts.items() if name != "cake_fmha_compat_v1")
+    routed = sum(route_counts.get(name, 0) for name in _OPTIMIZED_ROUTE_COMPONENTS)
+    return routed, total
 
 
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
@@ -109,31 +203,23 @@ def select_cake_fmha_decode_route(
     value_block_scales: torch.Tensor | None,
     skip_softmax_threshold_scale_factor: float | None,
     enable_block_sparse_attention: bool,
+    lse: torch.Tensor | None = None,
 ) -> CakeFmhaDecodeRoute | None:
-    """Select BF16 decode only when the exported route preserves every input."""
+    """Select an exact product decode route without broadening its contract."""
 
     if q_len is None or q_len <= 0 or batch_size <= 0 or max_seq_len <= 0:
         return None
-    if kv_layout != "HND" or not uses_shared_paged_kv_idx:
-        return None
     if cum_seq_lens_q is not None or enable_block_sparse_attention:
-        return None
-    if key_block_scales is not None or value_block_scales is not None:
         return None
     if skip_softmax_threshold_scale_factor not in (None, 0.0):
         return None
-    if any(
-        tensor.dtype != torch.bfloat16
-        for tensor in (query, key_cache, value_cache, out)
-    ):
-        return None
-    if query.ndim != 3 or not query.is_contiguous() or query.shape[2] != 128:
+    if query.ndim != 3 or not query.is_contiguous():
         return None
     if out.shape != query.shape or not out.is_contiguous():
         return None
     if key_cache.ndim != 4 or value_cache.ndim != 4:
         return None
-    if key_cache.shape != value_cache.shape or key_cache.shape[2:] != (16, 128):
+    if key_cache.shape != value_cache.shape:
         return None
     if key_cache.stride(3) != 1 or value_cache.stride(3) != 1:
         return None
@@ -145,37 +231,145 @@ def select_cake_fmha_decode_route(
         return None
     if not 1 <= num_q_heads // num_kv_heads <= 8:
         return None
-    if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
-        return None
     if block_tables.dtype not in (torch.int32, torch.uint32):
         return None
-    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size:
+    if uses_shared_paged_kv_idx:
+        if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
+            return None
+    elif block_tables.ndim != 3 or block_tables.shape[:2] != (batch_size, 2):
+        return None
+    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size or not seq_lens.is_contiguous():
         return None
     if seq_lens.dtype not in (torch.int32, torch.uint32):
-        return None
-    if isinstance(bmm2_scale, torch.Tensor) or float(bmm2_scale) != 1.0:
-        return None
-    if o_scale is not None and float(o_scale) != 1.0:
         return None
     if sinks is not None and (
         not isinstance(sinks, torch.Tensor)
         or sinks.dtype != torch.float32
         or sinks.numel() != num_q_heads
+        or not sinks.is_contiguous()
     ):
         return None
 
+    page_size = int(key_cache.shape[2])
     local_blocks = max(1, (max_seq_len + 127) // 128)
-    return CakeFmhaDecodeRoute(
-        target=_cake_fmha_target(device),
-        batch_size=batch_size,
-        q_len=q_len,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        has_sink=sinks is not None,
-        has_window=window_left >= 0,
-        use_scale_ptr=isinstance(bmm1_scale, torch.Tensor),
-        retain_kv_l2=local_blocks <= 9,
-    )
+
+    def route(component, *, selected_page_size: int = page_size):
+        return CakeFmhaDecodeRoute(
+            target=_cake_fmha_target(device),
+            batch_size=batch_size,
+            q_len=q_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            has_sink=sinks is not None,
+            has_window=window_left >= 0,
+            use_scale_ptr=isinstance(bmm1_scale, torch.Tensor),
+            retain_kv_l2=local_blocks <= 9,
+            component=component,
+            page_size=selected_page_size,
+        )
+
+    dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
+    no_block_scales = key_block_scales is None and value_block_scales is None
+    if dtypes == (torch.bfloat16,) * 4:
+        if (
+            query.shape[2] == 128
+            and key_cache.shape[2:] == (16, 128)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            return route("decode_native_bf16", selected_page_size=16)
+        return None
+
+    if dtypes == (torch.float16,) * 4:
+        if (
+            query.shape[2] == 128
+            and key_cache.shape[2:] == (32, 128)
+            and kv_layout == "NHD"
+            and not uses_shared_paged_kv_idx
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            return route("decode_native_fp16_nhd", selected_page_size=32)
+        if (
+            query.shape[2] == 512
+            and key_cache.shape[2:] == (64, 512)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and no_block_scales
+            and sinks is None
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            return route("decode_native_fp16_hd512", selected_page_size=64)
+        return None
+
+    quant_extensions_absent = sinks is None and lse is None and window_left == -1
+    if (
+        dtypes == (torch.float8_e4m3fn,) * 4
+        and q_len == 1
+        and query.shape[2] == 128
+        and page_size in (16, 32)
+        and kv_layout == "HND"
+        and uses_shared_paged_kv_idx
+        and num_q_heads // num_kv_heads == 8
+        and no_block_scales
+        and quant_extensions_absent
+        and max_seq_len >= 512
+        and max_seq_len % 128 == 0
+    ):
+        return route("decode_quant_fp8")
+
+    if (
+        dtypes
+        == (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+        )
+        and q_len == 1
+        and query.shape[2] == 128
+        and page_size in (16, 32)
+        and kv_layout in ("HND", "NHD")
+        and no_block_scales
+        and quant_extensions_absent
+    ):
+        return route("decode_quant_bf16q")
+
+    if (
+        dtypes
+        == (
+            torch.float8_e4m3fn,
+            torch.uint8,
+            torch.uint8,
+            torch.float8_e4m3fn,
+        )
+        and q_len == 1
+        and query.shape[2] == 128
+        and key_cache.shape[3] == 64
+        and page_size in (16, 32)
+        and kv_layout == "HND"
+        and quant_extensions_absent
+        and key_block_scales is not None
+        and value_block_scales is not None
+        and key_block_scales.dtype == torch.float8_e4m3fn
+        and value_block_scales.dtype == torch.float8_e4m3fn
+        and key_block_scales.ndim == 4
+        and value_block_scales.shape == key_block_scales.shape
+        and key_block_scales.shape[:3] == key_cache.shape[:3]
+        and key_block_scales.shape[3] == 8
+        and key_block_scales.stride(3) == 1
+        and value_block_scales.stride(3) == 1
+    ):
+        return route("decode_quant_nvfp4")
+    return None
 
 
 def get_cake_fmha_decode_module(
@@ -183,7 +377,7 @@ def get_cake_fmha_decode_module(
 ):
     """Load an optimized decode module, or the authenticated portable fallback."""
 
-    if route is None:
+    if route is None or not cake_fmha_route_is_optimized(route):
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
@@ -251,33 +445,23 @@ def select_cake_fmha_context_route(
     skip_softmax_threshold_scale_factor: float | None,
     is_causal: bool,
     lse: torch.Tensor | None,
+    kv_layout: str = "HND",
 ) -> CakeFmhaContextRoute | None:
-    """Select BF16 context only when the exported route preserves every input."""
+    """Select an exact product context route without broadening its contract."""
 
     if batch_size <= 0 or max_q_len <= 0 or max_kv_len <= 0 or window_left != -1:
         return None
     if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
         return None
-    if key_block_scales is not None or value_block_scales is not None:
-        return None
     if skip_softmax_threshold_scale_factor not in (None, 0.0):
         return None
-    tensor_dtypes = {tensor.dtype for tensor in (query, key_cache, value_cache, out)}
-    if tensor_dtypes == {torch.bfloat16}:
-        component: Literal["context_bf16", "context_fp8"] = "context_bf16"
-        if float(bmm2_scale) != 1.0:
-            return None
-    elif tensor_dtypes == {torch.float8_e4m3fn}:
-        component = "context_fp8"
-    else:
-        return None
-    if query.ndim != 3 or query.shape[2] != 128 or query.stride(2) != 1:
+    if query.ndim != 3 or query.stride(2) != 1:
         return None
     if out.shape != query.shape or not out.is_contiguous():
         return None
     if key_cache.ndim != 4 or value_cache.ndim != 4:
         return None
-    if key_cache.shape != value_cache.shape or key_cache.shape[3] != 128:
+    if key_cache.shape != value_cache.shape:
         return None
     if key_cache.stride(3) != 1 or value_cache.stride(3) != 1:
         return None
@@ -332,10 +516,96 @@ def select_cake_fmha_context_route(
     ):
         return None
 
-    pack_g = _context_pack_g(max_q_len, max_kv_len, num_q_heads, num_kv_heads)
-    tok_per_stage = 128 // pack_g
-    num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
-    total_bh = batch_size * (num_q_heads // pack_g)
+    dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
+    no_block_scales = key_block_scales is None and value_block_scales is None
+    component = None
+    if (
+        dtypes == (torch.bfloat16,) * 4
+        and query.shape[2] == 128
+        and key_cache.shape[3] == 128
+        and kv_layout == "HND"
+        and no_block_scales
+        and float(bmm2_scale) == 1.0
+    ):
+        component = "context_bf16"
+    elif (
+        dtypes == (torch.float8_e4m3fn,) * 4
+        and query.shape[2] == 128
+        and key_cache.shape[3] == 128
+        and kv_layout == "HND"
+        and no_block_scales
+    ):
+        component = "context_fp8"
+    elif (
+        dtypes == (torch.float16,) * 4
+        and query.shape[2] == 256
+        and key_cache.shape[3] == 256
+        and kv_layout == "NHD"
+        and not uses_shared_paged_kv_idx
+        and no_block_scales
+        and not is_causal
+        and sinks is None
+        and lse is None
+        and float(bmm2_scale) == 1.0
+    ):
+        component = "context_fp16_hd256"
+    elif (
+        dtypes
+        == (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+        )
+        and query.shape[2] == 256
+        and key_cache.shape[3] == 256
+        and kv_layout == "NHD"
+        and not uses_shared_paged_kv_idx
+        and no_block_scales
+        and is_causal
+        and sinks is None
+        and lse is None
+    ):
+        component = "context_fp8_hd256"
+    elif (
+        dtypes
+        == (
+            torch.float8_e4m3fn,
+            torch.uint8,
+            torch.uint8,
+            torch.float8_e4m3fn,
+        )
+        and query.shape[2] == 128
+        and key_cache.shape[2:] == (16, 64)
+        and kv_layout == "HND"
+        and uses_shared_paged_kv_idx
+        and is_causal
+        and sinks is None
+        and lse is None
+        and key_block_scales is not None
+        and value_block_scales is not None
+        and key_block_scales.dtype == torch.float8_e4m3fn
+        and value_block_scales.dtype == torch.float8_e4m3fn
+        and key_block_scales.shape == value_block_scales.shape
+        and key_block_scales.shape[:3] == key_cache.shape[:3]
+        and key_block_scales.shape[3] == 8
+        and key_block_scales.stride(3) == 1
+        and value_block_scales.stride(3) == 1
+    ):
+        component = "context_nvfp4"
+    if component is None:
+        return None
+
+    if component in ("context_fp16_hd256", "context_fp8_hd256"):
+        pack_g = 1
+        num_m_blocks = (max_q_len + 127) // 128
+        l2_swizzle = 1
+    else:
+        pack_g = _context_pack_g(max_q_len, max_kv_len, num_q_heads, num_kv_heads)
+        tok_per_stage = 128 // pack_g
+        num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
+        total_bh = batch_size * (num_q_heads // pack_g)
+        l2_swizzle = 8 if total_bh % 8 == 0 else 1
     return CakeFmhaContextRoute(
         target=_cake_fmha_target(device),
         component=component,
@@ -344,7 +614,7 @@ def select_cake_fmha_context_route(
         num_kv_heads=num_kv_heads,
         pack_g=pack_g,
         page_size=page_size,
-        l2_swizzle=8 if total_bh % 8 == 0 else 1,
+        l2_swizzle=l2_swizzle,
         is_causal=is_causal,
         return_lse=lse is not None,
         enable_sink=sinks is not None,
@@ -356,7 +626,7 @@ def get_cake_fmha_context_module(
 ):
     """Load an optimized context module, or the authenticated portable fallback."""
 
-    if route is None:
+    if route is None or not cake_fmha_route_is_optimized(route):
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
@@ -423,6 +693,7 @@ __all__ = [
     "cake_batch_context_with_kv_cache",
     "cake_batch_decode_with_kv_cache",
     "cake_fmha_manifest",
+    "cake_fmha_route_is_optimized",
     "get_cake_fmha_context_module",
     "get_cake_fmha_decode_module",
     "get_cake_fmha_module",
