@@ -50,6 +50,7 @@ try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as gdn_decode_bf16_state,
         gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
+        gated_delta_rule_t1_wide_vec as gdn_decode_bf16_state_t1_wide_vec,
     )
 
     GDN_DECODE_BF16_STATE_AVAILABLE = True
@@ -3507,18 +3508,20 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 @pytest.mark.parametrize(
-    "state_dtype,batch_size,num_v_heads",
+    "state_dtype,batch_size,num_v_heads,num_tokens",
     [
-        pytest.param(torch.float32, 2, 64, id="fp32-inline"),
-        pytest.param(torch.float32, 3, 64, id="fp32-warp"),
-        pytest.param(torch.bfloat16, 2, 32, id="bf16-ilp4"),
-        pytest.param(torch.bfloat16, 2, 64, id="bf16-wide-vec"),
+        pytest.param(torch.float32, 2, 64, 2, id="fp32-inline"),
+        pytest.param(torch.float32, 3, 64, 2, id="fp32-warp"),
+        pytest.param(torch.bfloat16, 2, 32, 2, id="bf16-ilp4"),
+        pytest.param(torch.bfloat16, 2, 64, 2, id="bf16-wide-vec"),
+        pytest.param(torch.bfloat16, 2, 64, 1, id="bf16-t1-wide-vec"),
     ],
 )
 def test_gdn_decode_mtp_cache_steps_stride(
     state_dtype: torch.dtype,
     batch_size: int,
     num_v_heads: int,
+    num_tokens: int,
 ):
     """Honor the physical cache stride when ``cache_steps > T``.
 
@@ -3534,7 +3537,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    B, T, cache_steps = batch_size, 2, 4
+    B, T, cache_steps = batch_size, num_tokens, 4
     H, HV, K, V = 16, num_v_heads, 128, 128
 
     q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
@@ -3578,6 +3581,19 @@ def test_gdn_decode_mtp_cache_steps_stride(
             initial_state=initial_state.clone(),
             intermediate_states_buffer=cache_padded,
             use_qk_l2norm=True,
+        )
+    elif T == 1:
+        out_exact = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_padded,
+            use_qk_l2norm_in_kernel=True,
         )
     else:
         out_exact = gdn_decode_bf16_state_mtp(

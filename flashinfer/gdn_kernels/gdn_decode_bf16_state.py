@@ -1960,6 +1960,7 @@ def gdn_wide_vec_kernel_t1(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2368,14 +2369,15 @@ def gdn_wide_vec_kernel_t1(
                         r_hb1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb3[i] = cutlass.BFloat16(r_h[3, i])
-                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # The intermediate_states buffer is sized
+                    # [B, cache_steps, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
                     # slot). Using cache_idx here writes OOB whenever
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145. Int64 widening per PR #3230.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -2649,6 +2651,7 @@ def _run_wide_vec_t1(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2687,6 +2690,7 @@ def _run_wide_vec_t1(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -3429,6 +3433,7 @@ def gated_delta_rule_t1_wide_vec(
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     else:
+        cache_steps = T_val
         intermediate_states = h0_source[:1, :1, :1]
         effective_disable_final = disable_state_update
 
@@ -3454,6 +3459,7 @@ def gated_delta_rule_t1_wide_vec(
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
         T_val,
+        cache_steps,
         H_val,
         HV_val,
         K_val,
@@ -3527,6 +3533,7 @@ def gated_delta_rule_t1_wide_vec(
                 scale,
                 HV_val,
                 T_val,
+                cache_steps,
                 H_val,
                 K_val,
                 V_val,
@@ -3625,10 +3632,9 @@ def gated_delta_rule_mtp(
         intermediate_states_buffer: Optional
             [B, cache_steps, HV, V, K] bf16, where cache_steps >= T. This
             buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
-            the per-call batch index (i_n), not by the pool slot. Sizing its
-            first dimension larger than B silently wastes memory; sizing it
-            smaller than B triggers an assertion (see the OOB fix mirroring
-            upstream PR #3145).
+            the per-call batch index (i_n), not by the pool slot. Its first
+            dimension must equal B (see the OOB fix mirroring upstream
+            PR #3145).
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
