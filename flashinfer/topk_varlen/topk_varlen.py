@@ -24,9 +24,11 @@ Backend choices
 ---------------
 ``"radix"``          — CuTe DSL single-pass multi-CTA radix top-K; native
                        varlen support (no logit masking). Requires Blackwell
-                       (sm_100+) and nvidia-cutlass-dsl. No ``pre_idx`` needed.
+                       (sm_100+, incl. Rubin sm_107) and nvidia-cutlass-dsl.
+                       No ``pre_idx`` needed.
 ``"gvr"``            — GVR (Guess-Verify-Refine) load-balance kernel.
-                       Requires Blackwell (sm_100+), nvidia-cutlass-dsl, and a
+                       Requires a datacentre Blackwell-class GPU (sm_100/103,
+                       or Rubin sm_107), nvidia-cutlass-dsl, and a
                        ``pre_idx`` hint from the previous decode step.
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
@@ -66,22 +68,59 @@ from ..utils import (
 # ---------------------------------------------------------------------------
 
 # All SM tiers FlashInfer ships kernels for.
-_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
+_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 
 # CuTe DSL radix backend: all Blackwell-plus tiers.
-_BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
+#
+# Rubin (SM107) runs the Blackwell CuTe-DSL kernels as-is: they use only
+# family-portable ops (block/warp scans, ``cute.arch.barrier``,
+# ``shuffle_sync_up``, ``warp_redux_sync``, griddepcontrol) with no
+# arch-specific ``tcgen05``/block-scaled MMA, so the DSL compiles them for
+# ``sm_107a`` natively. ``_cute_dsl_supports_arch`` below keeps a DSL that
+# predates the device from being selected.
+_BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
 
-# GVR is B200-class only (SM100/103). The non-LB (cluster_size=1) GVR CuTe-DSL
-# kernel fails to build on sm_120a: libNVVM rejects the generated device IR
-# (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't use GVR
-# even without load balancing. The LB path additionally needs cluster_size=4
-# programmatic multicast, which SM120/121's 1×1×1 cluster shape lacks. radix
+# GVR is B200-class only (SM100/103/107). The non-LB (cluster_size=1) GVR
+# CuTe-DSL kernel fails to build on sm_120a: libNVVM rejects the generated
+# device IR (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't
+# use GVR even without load balancing. The LB path additionally needs
+# cluster_size=4 programmatic multicast, which SM120/121's 1×1×1 cluster shape
+# lacks. Rubin keeps both (datacentre cluster shape, same PTX surface). radix
 # serves SM110+.
-_GVR_CCS = [100, 103]
+_GVR_CCS = [100, 103, 107]
 
 # ---------------------------------------------------------------------------
 # Backend requirement checkers
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can target this compute capability.
+
+    The compute-capability lists above say which tiers FlashInfer *has* kernels
+    for; this says whether the *installed* DSL can emit code for the device. The
+    two differ on new silicon: a DSL release predating Rubin resolves ``sm_107a``
+    to a ``KeyError`` deep inside ``cute.compile``. Consulting this here makes
+    ``backend="auto"`` fall back to ``radix_cutlass`` instead, and makes
+    ``is_backend_supported`` report the truth. Mirrors
+    ``flashinfer.norm._cute_dsl_supports_arch``.
+    """
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+        return is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the capability probe itself break top-k dispatch.
+        return True
+
+
+def _cute_dsl_ready(device: torch.device) -> bool:
+    """``True`` when the CuTe-DSL backends are usable on ``device``."""
+    if not _CUTE_DSL_AVAILABLE:
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return _cute_dsl_supports_arch(major, minor)
 
 
 @supported_compute_capability(_ALL_CCS)
@@ -123,7 +162,7 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+    if not (_cute_dsl_ready(logits.device) and pre_idx is not None):
         return False
     # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
     # raise inside the kernel's __init__ during compilation.
@@ -870,8 +909,8 @@ def _radix_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):
-    """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE
+    """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required."""
+    return _cute_dsl_ready(logits.device)
 
 
 def _run_radix(
@@ -1039,7 +1078,8 @@ def top_k_varlen(
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
-                              (Blackwell sm_100+; native varlen, no ``pre_idx``,
+                              (Blackwell sm_100+ incl. Rubin sm_107; native
+                              varlen, no ``pre_idx``,
                               no logit masking).
         ``"gvr"``           — GVR kernel (Blackwell sm_100+ only; requires
                               ``pre_idx``). ``load_balance`` selects the LB vs
