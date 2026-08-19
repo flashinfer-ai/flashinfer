@@ -82,8 +82,8 @@ enum class EltwiseActType {
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {
-  batchedGemm::trtllm::gen::Dtype dtypeA;
-  batchedGemm::trtllm::gen::Dtype dtypeB;
+  batchedGemm::trtllm::gen::Dtype dtypeAct;
+  batchedGemm::trtllm::gen::Dtype dtypeWeights;
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
   EltwiseActType eltwiseActType{EltwiseActType::None};
@@ -91,7 +91,6 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool fusedAct{false};
   bool routeAct{false};
   bool staticBatch{false};
-  bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
   bool useShuffledMatrix{false};
