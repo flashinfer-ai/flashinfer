@@ -22,13 +22,13 @@
 #define uint64_t cake_kda_generated_uint64_t
 #define int32_t cake_kda_generated_int32_t
 #define int16_t cake_kda_generated_int16_t
-#define LoomTensorMap cake_kda_generated_LoomTensorMap
-#define LoomTensorMapPack cake_kda_generated_LoomTensorMapPack
+#define CakeKDATensorMap cake_kda_generated_CakeKDATensorMap
+#define CakeKDATensorMapPack cake_kda_generated_CakeKDATensorMapPack
 #define CUtensorMap cake_kda_generated_CUtensorMap
 #include "cake_kda_bf16_fused_m128_unbounded_softplus.cu"
 #undef CUtensorMap
-#undef LoomTensorMapPack
-#undef LoomTensorMap
+#undef CakeKDATensorMapPack
+#undef CakeKDATensorMap
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -94,21 +94,21 @@ void RunM128UnboundedSoftplus(TensorView q, TensorView k, TensorView v, TensorVi
 
   kernel_cake_kda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.q),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.q),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.k),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.k),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.v),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.v),
       reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.g),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.g),
       reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.beta),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.beta),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      reinterpret_cast<cake_kda_generated_LoomTensorMap const*>(tma.out),
+      reinterpret_cast<cake_kda_generated_CakeKDATensorMap const*>(tma.out),
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), 0.0f,

@@ -15,7 +15,7 @@
  */
 
 // clang-format off
-// Generated from a recurrent-KDA Loom schedule.
+// Frozen Cake recurrent-KDA export; do not edit by hand.
 // Raw generated body SHA256: ccba953a1294e44f54efd5144efbadc69edcbe692fded41af680c12b78c1d73b
 // Normalized generated SHA256: 0cb65b0ed4cbd63dbaaa06711318b191e0759ef7b515cf79e4df5b71b8f4bda7
 // BEGIN FROZEN GENERATED BODY
@@ -25,9 +25,9 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(128) CakeKDATensorMap { uint64_t opaque[16]; };
 template <int N>
-struct __align__(128) LoomTensorMapPack { LoomTensorMap maps[N]; };
+struct __align__(128) CakeKDATensorMapPack { CakeKDATensorMap maps[N]; };
 
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
@@ -40,7 +40,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_KDA_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
