@@ -74,7 +74,7 @@ class CakeFmhaContextRoute:
 # These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
 # the component sequences explicit: hd256 needs its staging/scatter support,
 # and split-KV NVFP4 decode may also need the shared reduction component.
-_OPTIMIZED_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
+_PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
     "ctx_bf16_hnd_hd128_hgpack_03df_v2": ("context_bf16",),
     "ctx_fp16_nhd_hd256_stage16_v1": (
         "context_hd256_support",
@@ -127,7 +127,7 @@ def _route_components(route: CakeFmhaDecodeRoute | CakeFmhaContextRoute) -> tupl
             "context_fp8_hd256": "ctx_fp8_bf16_nhd_hd256_stage16_v1",
             "context_nvfp4": "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1",
         }[route.component]
-    return _OPTIMIZED_ROUTE_COMPONENTS[route_name]
+    return _PRODUCT_ROUTE_COMPONENTS[route_name]
 
 
 def cake_fmha_route_is_optimized(
@@ -141,13 +141,17 @@ def cake_fmha_route_is_optimized(
     )
 
 
-def _optimized_route_coverage() -> tuple[int, int]:
-    """Return (routed, total) optimized cells from the authenticated manifest."""
+def _manifest_optimized_route_accounting() -> tuple[int, int]:
+    """Return registered/total optimized counts recorded by the manifest.
+
+    This is a route-name drift check, not selector parity.  Exact selector
+    coverage requires replaying the independent pinned capability corpus.
+    """
 
     route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
     total = sum(count for name, count in route_counts.items() if name != "cake_fmha_compat_v1")
-    routed = sum(route_counts.get(name, 0) for name in _OPTIMIZED_ROUTE_COMPONENTS)
-    return routed, total
+    registered = sum(route_counts.get(name, 0) for name in _PRODUCT_ROUTE_COMPONENTS)
+    return registered, total
 
 
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:

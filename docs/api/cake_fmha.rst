@@ -26,6 +26,16 @@ qualified for HND pages, a shared K/V page table, and GQA group size eight;
 other valid FP8 decode shapes remain Cake-owned and use the authenticated
 complete-domain component.
 
+The manifest's per-route counts are inventory metadata, not a proof that a
+particular high-level selector revision reproduces the pinned matrix.  Before
+promotion, both a fresh source checkout and the installed wheel must replay the
+independent pinned capability corpus (80,768 raw cells, 57,280 valid cells) and
+match its route intent exactly: 1,400 existing optimized cells plus 398 added
+optimized cells, while the remaining 55,482 valid cells select
+``compat_v1``.  The same source and wheel runs must then exercise the selected
+route on SM100a and SM103a; representative family tests and manifest-count
+accounting do not replace that gate.
+
 The distributed-context-parallel feature remains additive.  Supplying
 ``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects
 the authenticated ``cake_fmha_dcp_spec`` profile; ordinary calls continue to

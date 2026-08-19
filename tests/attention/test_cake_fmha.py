@@ -67,11 +67,14 @@ def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
     assert cake_api.cake_fmha_manifest()["product"] == "cake_fmha"
 
 
-def test_cake_fmha_high_level_registry_covers_every_product_component() -> None:
-    assert cake_api._optimized_route_coverage() == (1_798, 1_798)
+def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> None:
+    manifest_route_counts = cake_api.cake_fmha_manifest()["capability"]["route_counts"]
+    manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
+    assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
+    assert cake_api._manifest_optimized_route_accounting() == (1_798, 1_798)
     routed_components = {
         component
-        for components in cake_api._OPTIMIZED_ROUTE_COMPONENTS.values()
+        for components in cake_api._PRODUCT_ROUTE_COMPONENTS.values()
         for component in components
     }
     assert routed_components | {"compat_v1"} == {
@@ -278,7 +281,7 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     )
 
 
-def test_cake_fmha_decode_routes_cover_the_312_new_matrix_cells(monkeypatch) -> None:
+def test_cake_fmha_decode_candidate_selection_for_unexported_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
 
     def select(query, key, out, *, kv_layout, shared, scales=None):
@@ -350,7 +353,7 @@ def test_cake_fmha_decode_routes_cover_the_312_new_matrix_cells(monkeypatch) -> 
         assert not cake_api.cake_fmha_route_is_optimized(route)
 
 
-def test_cake_fmha_context_routes_cover_the_86_new_matrix_cells(monkeypatch) -> None:
+def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
 
     def select(query, key, out, *, kv_layout, shared, causal, scales=None):
