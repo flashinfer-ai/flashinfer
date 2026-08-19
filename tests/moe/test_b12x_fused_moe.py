@@ -145,6 +145,78 @@ def test_gated_dynamic_optimized_capability_bounds(overrides, expected):
 
 
 @cute_dsl_available
+def test_borrowed_dense_methods_resolve_on_moe_kernels():
+    """MoE kernels invoke dense b12x methods with their own ``self``.
+
+    They do not subclass the dense kernel, so any class-level helper those
+    borrowed methods reach through ``self`` must be mirrored on the MoE
+    classes -- otherwise adding one breaks every MoE borrower at trace time.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
+        MoEGatedDynamicKernel,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.generic import (
+        MoEDynamicKernel,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_micro_kernel import (
+        MoEMicroKernel,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_static_kernel import (
+        MoEStaticKernel,
+    )
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
+        Sm120B12xBlockScaledDenseGemmKernel as dense_cls,
+    )
+
+    borrowers = (
+        MoEStaticKernel,
+        MoEMicroKernel,
+        MoEDynamicKernel,
+        MoEGatedDynamicKernel,
+    )
+
+    def _self_attrs(source):
+        return {
+            node.attr
+            for node in ast.walk(ast.parse(textwrap.dedent(source)))
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        }
+
+    borrowed = set()
+    for cls in borrowers:
+        module_tree = ast.parse(inspect.getsource(inspect.getmodule(cls)))
+        for node in ast.walk(module_tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "_dense_cls"
+            ):
+                borrowed.add(node.attr)
+    assert borrowed, "expected the MoE kernels to borrow dense b12x methods"
+
+    for name in sorted(borrowed):
+        # Only class-level attributes matter here; per-instance state is
+        # supplied by each MoE kernel's own __init__.
+        needed = sorted(
+            attr
+            for attr in _self_attrs(inspect.getsource(getattr(dense_cls, name)))
+            if hasattr(dense_cls, attr)
+        )
+        for cls in borrowers:
+            missing = [attr for attr in needed if not hasattr(cls, attr)]
+            assert not missing, (
+                f"{cls.__name__} borrows {dense_cls.__name__}.{name} but is "
+                f"missing {missing}"
+            )
+
+
+@cute_dsl_available
 def test_gated_dynamic_constructor_rejects_unsupported_geometry():
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
         MoEGatedDynamicKernel,

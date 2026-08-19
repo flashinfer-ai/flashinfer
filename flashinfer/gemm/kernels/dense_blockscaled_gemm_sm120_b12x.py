@@ -600,7 +600,9 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
-        partitioned_sfa = self._collapse_to_vmk(partitioned_sfa)
+        # Class-resolved: the b12x MoE kernels borrow this method with a foreign
+        # ``self`` that does not define ``_collapse_to_vmk``.
+        partitioned_sfa = DenseGemmKernel._collapse_to_vmk(partitioned_sfa)
         return cute.make_fragment_like(partitioned_sfa)
 
     def _partition_fragment_SFB(
@@ -616,7 +618,7 @@ class DenseGemmKernel:
         partitioned_sfb = thr_tensor[thr_vnk, (None, None)]
         partitioned_sfb = cute.group_modes(cute.flatten(partitioned_sfb), 0, 2)
         partitioned_sfb = cute.group_modes(partitioned_sfb, 1, 3)
-        partitioned_sfb = self._collapse_to_vmk(partitioned_sfb)
+        partitioned_sfb = DenseGemmKernel._collapse_to_vmk(partitioned_sfb)
         return cute.make_fragment_like(partitioned_sfb)
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
