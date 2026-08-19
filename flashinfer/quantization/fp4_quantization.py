@@ -1340,6 +1340,7 @@ def nvfp4_quantize(
     backend: str = "cuda",
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ):
     r"""Quantize input tensor to NVFP4 format.
 
@@ -1375,6 +1376,10 @@ def nvfp4_quantize(
         ``a_global_sf`` is the inverse base scale multiplier (typically
         ``1 / (448 * 6)``) and the function also returns per-token FP32
         scales.
+    out_scale : torch.Tensor, optional
+        Scalar the returned per-token scales are multiplied by.  Only for
+        ``per_token_activation=True`` with ``backend="cute-dsl"``.  Does not
+        change the quantized values.
     expanded_idx_to_permuted_idx : torch.Tensor, optional
         Optional row-remapping buffer for per-token activation
         quantization.
@@ -1399,6 +1404,8 @@ def nvfp4_quantize(
             raise ValueError(
                 "Per-token NVFP4 quantization only supports sf_vec_size=16"
             )
+        if out_scale is not None and backend != "cute-dsl":
+            raise ValueError("out_scale is only supported with backend='cute-dsl'")
 
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
@@ -1460,11 +1467,14 @@ def nvfp4_quantize(
                 ),
                 sf_layout=_sf_layout_map[sf_layout],
                 enable_pdl=enable_pdl,
+                out_scale=out_scale,
             )
         else:
             raise ValueError(
                 f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'."
             )
+    elif out_scale is not None:
+        raise ValueError("out_scale is only supported with per_token_activation=True")
     elif backend == "cuda":
         if expanded_idx_to_permuted_idx is not None:
             raise ValueError(

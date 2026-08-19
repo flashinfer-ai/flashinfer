@@ -57,6 +57,7 @@ from .gemm_mm_fp4_cute_dsl import (
     _compile_block_scaled_gemm,
     _mm_fp4_cache_key,
     _prepare_alpha_for_launch,
+    per_token_alpha_mode,
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_cute_dsl import (
@@ -4992,6 +4993,18 @@ def _get_sm100_block_scaled_tactics(
     return valid_tactics
 
 
+# FP4 backends with a per-row alpha epilogue, by the compute capability major
+# that builds it.
+_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR = {
+    10: ("cute-dsl",),
+}
+
+
+def _is_per_token_alpha(alpha_tensor) -> bool:
+    """True when ``alpha_tensor`` holds one dequant scale per output row."""
+    return alpha_tensor is not None and alpha_tensor.numel() > 1
+
+
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
@@ -5848,9 +5861,7 @@ def _check_mm_fp4_problem_size(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -5881,7 +5892,19 @@ def _check_mm_fp4_problem_size(
     if alpha is not None and alpha.dtype != torch.float:
         raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
     if alpha is not None and alpha.numel() != 1:
-        raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
+        if alpha.numel() != a.shape[0]:
+            raise ValueError(
+                "alpha must be a scalar, or one scale per row of a for the "
+                f"per-token path. Got {alpha.numel()} for m={a.shape[0]}."
+            )
+        per_token_backends = sorted(
+            set().union(*_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.values())
+        )
+        if backend != "auto" and backend not in per_token_backends:
+            raise ValueError(
+                f"per-token alpha is only supported by the {per_token_backends} "
+                f"backends, got backend={backend!r}."
+            )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -5996,7 +6019,7 @@ def _cutlass_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
+    a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
@@ -6264,6 +6287,8 @@ def _cute_dsl_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
+            per_token_alpha = _is_per_token_alpha(alpha_tensor)
+
             if do_preparation:
                 try:
                     precompile_mm_fp4_tactics(
@@ -6276,6 +6301,7 @@ def _cute_dsl_gemm_fp4_runner(
                         out_dtype,
                         _CUTE_DSL_MM_FP4_KERNEL_CACHE,
                         a.device,
+                        per_token_alpha,
                     )
                 except Exception as e:  # noqa: BLE001 -- serial fallback is intentional
                     logger.warning(
@@ -6318,9 +6344,17 @@ def _cute_dsl_gemm_fp4_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
+            alpha_mode = per_token_alpha_mode(per_token_alpha, swap_ab)
+            cache_key = _mm_fp4_cache_key(
+                sf_vec_size, tactic, enable_pdl, out_dtype, alpha_mode
+            )
 
             if kernel_type == "sm103" and Sm103Kernel is not None:
+                if alpha_mode is not None:
+                    raise ValueError(
+                        "The SM103 3xFP4 CuTe-DSL kernel has no per-token alpha "
+                        "epilogue."
+                    )
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -6335,6 +6369,7 @@ def _cute_dsl_gemm_fp4_runner(
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
+                    alpha_mode,
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
@@ -6353,9 +6388,14 @@ def _cute_dsl_gemm_fp4_runner(
                 batch_size=batch_size,
                 cache_module_name="mm_fp4",
                 device_index=get_device_index(a.device),
+                per_token_alpha=alpha_mode,
             )
 
-            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+            alpha_for_launch = (
+                alpha_tensor.reshape(m).contiguous()
+                if per_token_alpha
+                else _prepare_alpha_for_launch(alpha_tensor, a.device)
+            )
 
             # swap_ab compiled kernel expects column-major mC with shape
             # (sym_n, sym_m) = (m, n).  Reinterpret out's storage as
@@ -6724,6 +6764,23 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 )
 
 
+# Alpha has to follow the M the tuner picks for its profiling shapes, or the
+# kernel reads past the caller's alpha while profiling a larger bucket.
+_MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA = TuningConfig(
+    use_cuda_graph=_MM_FP4_TUNING_CONFIG_128x4.use_cuda_graph,
+    use_cold_l2_cache=_MM_FP4_TUNING_CONFIG_128x4.use_cold_l2_cache,
+    dynamic_tensor_specs=_MM_FP4_TUNING_CONFIG_128x4.dynamic_tensor_specs,
+    constraint_specs=(
+        *_MM_FP4_TUNING_CONFIG_128x4.constraint_specs,
+        ConstraintSpec(
+            4,  # alpha_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -6803,7 +6860,11 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar.
+        Global scale tensor, float scalar, or a float32 tensor of ``m``
+        elements holding one dequant scale per row of ``a`` (activations
+        quantized with a dynamic per-token NVFP4 global scale). The per-token
+        form is served by ``"cute-dsl"`` on SM10X; ``backend="auto"`` narrows
+        to it.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -6884,10 +6945,30 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
+    # A backend without a per-row epilogue would silently consume alpha[0] for
+    # every row, so narrow the candidates instead of letting the tuner pick one.
+    per_token_alpha = _is_per_token_alpha(alpha)
+    if per_token_alpha:
+        arch_backends = _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.get(major, ())
+        supported = [bk for bk in backends if bk in arch_backends]
+        if not supported and backend == "auto":
+            # cute-dsl is never in the auto list, yet on SM10X it is the only
+            # backend with a per-row epilogue.
+            supported = list(arch_backends)
+        if not supported:
+            raise ValueError(
+                f"Per-token alpha is implemented on SM{major}{minor} only by "
+                f"{sorted(arch_backends)}, got backends {backends}."
+            )
+        backends = supported
+
     tuner = AutoTuner.get()
-    tuning_config = (
-        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
-    )
+    if use_8x4_sf_layout:
+        tuning_config = _MM_FP4_TUNING_CONFIG_8x4
+    elif per_token_alpha:
+        tuning_config = _MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA
+    else:
+        tuning_config = _MM_FP4_TUNING_CONFIG_128x4
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(tuning_config),
