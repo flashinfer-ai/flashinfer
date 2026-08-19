@@ -80,6 +80,9 @@ class MoEEpMegaLayer(nn.Module):
         )
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
+        self._bootstrap_validated = False
+        self._forward_validated = False
+        self._forward_signature: tuple[Any, ...] | None = None
 
         if backend.transformed_weights is not None:
             self._transformed = backend.transformed_weights
@@ -114,6 +117,11 @@ class MoEEpMegaLayer(nn.Module):
                 self._bootstrap, self._fleet_params
             )
         return self._workspace
+
+    @property
+    def output_buffer(self) -> torch.Tensor:
+        """Stable zero-copy output owned by the pooled mega workspace."""
+        return self._kernel.workspace_output(self._ensure_workspace())
 
     def warmup(self, t: Optional["MoEEpTensors"] = None) -> None:
         """Run one full eager forward so ``forward`` becomes graph-capturable.
@@ -177,15 +185,51 @@ class MoEEpMegaLayer(nn.Module):
             )
         return True
 
-    def forward(self, t: "MoEEpTensors") -> torch.Tensor:
-        ensure_bootstrap_dist_validated(self._bootstrap)
-        quantize_input = self._resolve_quantize_input(t)
+    def stage_inputs(self, t: "MoEEpTensors") -> None:
+        """Validate and stage one iteration without launching the mega kernel.
 
-        self._kernel.validate_forward(
-            t,
-            self._fleet_params,
-            quantize_input=quantize_input,
+        Keeping staging separate lets frameworks capture its fixed-shape GPU
+        work while replaying a backend-owned compute graph eagerly. This is
+        useful when nesting that graph would discard backend-specific launch
+        scheduling such as Green Context partitioning.
+        """
+        if not self._bootstrap_validated:
+            ensure_bootstrap_dist_validated(self._bootstrap)
+            self._bootstrap_validated = True
+        quantize_input = self._resolve_quantize_input(t)
+        signature = (
+            t.hidden_states.device,
+            t.hidden_states.dtype,
+            t.hidden_states.ndim,
+            t.hidden_states.shape[1] if t.hidden_states.ndim > 1 else None,
+            t.topk_ids.device,
+            t.topk_ids.dtype,
+            t.topk_ids.ndim,
+            t.topk_ids.shape[1] if t.topk_ids.ndim > 1 else None,
+            t.topk_weights.device,
+            t.topk_weights.dtype,
+            t.topk_weights.ndim,
+            t.topk_weights.shape[1] if t.topk_weights.ndim > 1 else None,
         )
+
+        if not self._forward_validated:
+            self._kernel.validate_forward(
+                t,
+                self._fleet_params,
+                quantize_input=quantize_input,
+            )
+            self._forward_validated = True
+            self._forward_signature = signature
+        elif signature != self._forward_signature:
+            raise MoEEpConfigError(
+                "MegaMoE steady-state input signature changed; the backend "
+                "requires stable device, dtype, rank, hidden size, and top-k"
+            )
+        elif t.num_tokens > self._fleet_params.max_tokens_per_rank:
+            raise MoEEpConfigError(
+                f"{t.num_tokens} tokens exceed MegaMoE capacity "
+                f"{self._fleet_params.max_tokens_per_rank}"
+            )
 
         if self._transformed is None:
             if not self._mega_config.preprocess_weights:
@@ -198,22 +242,52 @@ class MoEEpMegaLayer(nn.Module):
 
         workspace = self._ensure_workspace()
 
+        caller_output = t.output
+        if caller_output is not None and (
+            caller_output.dtype != torch.bfloat16
+            or caller_output.device != t.hidden_states.device
+            or caller_output.ndim != 2
+            or caller_output.shape[0] < t.num_tokens
+            or caller_output.shape[1] != self._fleet_params.token_hidden_size
+        ):
+            raise MoEEpConfigError(
+                "MegaMoE caller output must be a bf16 CUDA tensor with shape "
+                f"at least ({t.num_tokens}, {self._fleet_params.token_hidden_size}); "
+                f"got shape={tuple(caller_output.shape)}, "
+                f"dtype={caller_output.dtype}, device={caller_output.device}"
+            )
+        self._kernel.stage_inputs(
+            t,
+            workspace,
+            quantize_input=quantize_input,
+        )
+
+    def compute_staged(self, *, output: torch.Tensor | None) -> torch.Tensor:
+        """Launch the mega kernel using inputs staged by :meth:`stage_inputs`."""
+        if self._workspace is None or self._transformed is None:
+            raise MoEEpConfigError(
+                "compute_staged() requires a prior warmup/stage_inputs() call"
+            )
+        return self._kernel.compute(
+            self._workspace,
+            self._transformed,
+            output=output,
+        )
+
+    def forward(self, t: "MoEEpTensors") -> torch.Tensor:
+        self.stage_inputs(t)
+        result = self.compute_staged(output=t.output)
+        caller_output = t.output
+        if caller_output is not None:
+            return result
         y = torch.empty(
             t.num_tokens,
             self._fleet_params.token_hidden_size,
             dtype=torch.bfloat16,
             device=t.hidden_states.device,
         )
-        self._kernel.stage_inputs(
-            t,
-            workspace,
-            quantize_input=quantize_input,
-        )
-        return self._kernel.compute(
-            workspace,
-            self._transformed,
-            output=y,
-        )
+        y.copy_(result)
+        return y
 
     def destroy(self) -> None:
         if self._workspace is not None:

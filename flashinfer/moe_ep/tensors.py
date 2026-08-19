@@ -32,6 +32,7 @@ class MoEEpTensors:
     fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
+    output: Optional["torch.Tensor"] = None
 
     @property
     def num_tokens(self) -> int:

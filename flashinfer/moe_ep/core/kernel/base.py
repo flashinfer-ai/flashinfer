@@ -209,6 +209,17 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
 
+    def workspace_output(self, workspace: Any) -> "torch.Tensor":
+        """Return the stable output tensor owned by ``workspace``.
+
+        Backends that support zero-copy framework integration override this
+        method. Keeping the accessor on the backend avoids exposing private,
+        backend-specific workspace layouts to callers.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a workspace output"
+        )
+
     @abstractmethod
     def compute(
         self,
