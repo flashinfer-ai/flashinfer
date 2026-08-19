@@ -258,6 +258,69 @@ def test_cake_ssd_combined_updates_caller_buffers():
     assert actual[0].untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
 
 
+def test_cake_ssd_combined_writes_selected_checkpoint_state():
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(varlen=True)
+    sequence_start = 96
+    checkpoint_length = 128
+    checkpoint_token = sequence_start + checkpoint_length
+    checkpoint_state = torch.empty_like(arguments["initial_states"][:1])
+    full_arguments = {
+        **arguments,
+        # Expose sequence 1's checkpoint inside physical chunk 1 as a logical
+        # segment boundary. This is the packed shape used by SGLang.
+        "chunk_indices": torch.tensor(
+            [0, 0, 1, 1], dtype=torch.int32, device="cuda"
+        ),
+        "chunk_offsets": torch.tensor(
+            [0, 96, 0, 96], dtype=torch.int32, device="cuda"
+        ),
+        "seq_chunk_cumsum": torch.tensor(
+            [0, 1, 4], dtype=torch.int32, device="cuda"
+        ),
+        "checkpoint_token_indices": torch.tensor(
+            [-1, checkpoint_token], dtype=torch.int32, device="cuda"
+        ),
+        "checkpoint_state_slots": torch.tensor(
+            [-1, 0], dtype=torch.int32, device="cuda"
+        ),
+        "checkpoint_states": checkpoint_state,
+    }
+    SSDCombined(**constructor, backend="cake").run(*tensors, **full_arguments)
+
+    x, dt, A, B, C = tensors
+    prefix_tensors = (
+        x[:, sequence_start:checkpoint_token].contiguous(),
+        dt[:, sequence_start:checkpoint_token].contiguous(),
+        A,
+        B[:, sequence_start:checkpoint_token].contiguous(),
+        C[:, sequence_start:checkpoint_token].contiguous(),
+    )
+    prefix_arguments = {
+        **arguments,
+        "z": arguments["z"][:, sequence_start:checkpoint_token].contiguous(),
+        "initial_states": arguments["initial_states"][1:2].contiguous(),
+        "seq_idx": torch.zeros(
+            (1, checkpoint_length), dtype=torch.int32, device="cuda"
+        ),
+        "chunk_indices": torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "chunk_offsets": torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "seq_chunk_cumsum": torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+    }
+    _, expected_state = SSDCombined(**constructor, backend="cute").run(
+        *prefix_tensors, **prefix_arguments
+    )
+    torch.testing.assert_close(
+        checkpoint_state,
+        expected_state,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 def test_cake_ssd_combined_allocation_output_lifetime():
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):

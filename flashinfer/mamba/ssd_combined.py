@@ -503,6 +503,9 @@ class SSDCombined:
         chunk_offsets: Optional[torch.Tensor] = None,
         seq_chunk_cumsum: Optional[torch.Tensor] = None,
         update_seq_chunk_cumsum: bool = False,
+        checkpoint_token_indices: Optional[torch.Tensor] = None,
+        checkpoint_state_slots: Optional[torch.Tensor] = None,
+        checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -538,6 +541,17 @@ class SSDCombined:
                 If None, an internal buffer is allocated and computed.
             update_seq_chunk_cumsum: If True, (re)compute seq_chunk_cumsum into
                 the provided tensor.  Defaults to False.
+            checkpoint_token_indices: Optional contiguous int32 vector with one
+                exclusive token boundary per sequence.  Batched boundaries are
+                sequence-relative; packed-varlen boundaries are absolute in the
+                packed token axis.  Negative entries disable capture.
+            checkpoint_state_slots: Optional contiguous int32 vector mapping
+                each sequence to a row in ``checkpoint_states``.  Negative entries
+                disable capture.  Must be provided with the other checkpoint
+                arguments.  Supported by the Cake backend.
+            checkpoint_states: Optional caller-owned contiguous output with shape
+                ``[num_checkpoints, nheads, headdim, dstate]`` and state dtype.
+                Supported by the Cake backend.
             out: Optional caller-owned contiguous output storage with shape
                 ``[batch, nheads, headdim, nchunks, chunk_size]``. A fresh tensor
                 is allocated when omitted.
@@ -589,8 +603,23 @@ class SSDCombined:
                 chunk_offsets=chunk_offsets,
                 seq_chunk_cumsum=seq_chunk_cumsum,
                 update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+                checkpoint_token_indices=checkpoint_token_indices,
+                checkpoint_state_slots=checkpoint_state_slots,
+                checkpoint_states=checkpoint_states,
                 out=out,
                 return_final_states=return_final_states,
+            )
+
+        if any(
+            value is not None
+            for value in (
+                checkpoint_token_indices,
+                checkpoint_state_slots,
+                checkpoint_states,
+            )
+        ):
+            raise ValueError(
+                "selective checkpoint state outputs require SSDCombined backend='cake'"
             )
 
         _, _, ngroups, dstate = B.shape
@@ -809,6 +838,9 @@ def ssd_combined_fwd(
     chunk_offsets: Optional[torch.Tensor] = None,
     seq_chunk_cumsum: Optional[torch.Tensor] = None,
     update_seq_chunk_cumsum: bool = False,
+    checkpoint_token_indices: Optional[torch.Tensor] = None,
+    checkpoint_state_slots: Optional[torch.Tensor] = None,
+    checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
 ):
@@ -850,6 +882,9 @@ def ssd_combined_fwd(
         chunk_offsets=chunk_offsets,
         seq_chunk_cumsum=seq_chunk_cumsum,
         update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+        checkpoint_token_indices=checkpoint_token_indices,
+        checkpoint_state_slots=checkpoint_state_slots,
+        checkpoint_states=checkpoint_states,
         out=out,
         return_final_states=return_final_states,
     )
