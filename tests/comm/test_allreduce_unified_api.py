@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
+import torch.distributed as dist
 from mpi4py import MPI
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
@@ -16,6 +17,7 @@ from flashinfer.comm import (
     allreduce_fusion,
     AllReduceFusionPattern,
     AllReduceFusionWorkspace,
+    NCCLLocalAllReduceFusionWorkspace,
 )
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
@@ -131,7 +133,13 @@ def run_allreduce_fusion_test(
         )
 
 
-def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion: bool):
+def prepare_test_data(
+    seq_len: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    fusion: bool,
+    eps: float,
+):
     """Prepare test data distributed across MPI ranks."""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -160,9 +168,7 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
         # Fused case: AllReduce + Residual Add + RMS Norm
         allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
         residual_out = allreduce_result + residual  # Add residual
-        norm_out = rmsnorm(
-            residual_out, norm_weight, torch.finfo(dtype).eps, enable_pdl=False
-        )
+        norm_out = rmsnorm(residual_out, norm_weight, eps, enable_pdl=False)
 
         reference_output = (norm_out, residual_out)
     else:
@@ -235,7 +241,7 @@ def run_allreduce_test(
         test_data = []
         for seq_len in seq_lens:
             (x_local, residual, norm_weight), reference_output = prepare_test_data(
-                seq_len, hidden_size, dtype, fusion
+                seq_len, hidden_size, dtype, fusion, eps
             )
             test_data.append(
                 (seq_len, x_local, residual, norm_weight, reference_output)
@@ -335,6 +341,69 @@ def test_allreduce_nccl_local(
         hidden_size=7168,
         backend="nccl_local",
     )
+
+
+def _mock_nccl_group(monkeypatch, *, world_size: int = 4, rank: int = 1):
+    group = object()
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda candidate: "nccl")
+    monkeypatch.setattr(dist, "get_world_size", lambda candidate: world_size)
+    monkeypatch.setattr(dist, "get_rank", lambda candidate: rank)
+    return group
+
+
+def test_nccl_local_workspace_accepts_matching_group_metadata(monkeypatch):
+    group = _mock_nccl_group(monkeypatch)
+    workspace = NCCLLocalAllReduceFusionWorkspace(
+        world_size=4,
+        rank=1,
+        max_token_num=8,
+        hidden_dim=16,
+        dtype=torch.float16,
+        group=group,
+    )
+    assert workspace.group is group
+
+
+@pytest.mark.parametrize("world_size,rank", [(3, 1), (4, 0)])
+def test_nccl_local_workspace_rejects_mismatched_group_metadata(
+    monkeypatch,
+    world_size: int,
+    rank: int,
+):
+    group = _mock_nccl_group(monkeypatch)
+    with pytest.raises(ValueError, match="must match the provided process group"):
+        NCCLLocalAllReduceFusionWorkspace(
+            world_size=world_size,
+            rank=rank,
+            max_token_num=8,
+            hidden_dim=16,
+            dtype=torch.float16,
+            group=group,
+        )
+
+
+def test_nccl_local_allreduce_ignores_weight_bias(monkeypatch):
+    group = _mock_nccl_group(monkeypatch)
+    monkeypatch.setattr(dist, "all_reduce", lambda output, group: None)
+    workspace = NCCLLocalAllReduceFusionWorkspace(
+        world_size=4,
+        rank=1,
+        max_token_num=8,
+        hidden_dim=16,
+        dtype=torch.float16,
+        group=group,
+    )
+    input_tensor = torch.arange(32, dtype=torch.float16).reshape(2, 16)
+
+    result = allreduce_fusion(
+        input=input_tensor,
+        workspace=workspace,
+        pattern=AllReduceFusionPattern.kAllReduce,
+        weight_bias=1.0,
+    )
+
+    torch.testing.assert_close(result, input_tensor)
 
 
 @pytest.mark.parametrize("seq_len", [64, 256])
