@@ -25,8 +25,8 @@
 #define TMEM_TMEM_SHARED_INPUT_OFFSET 448
 #define NUM_Q_PIPE_STAGES 2
 #define NUM_K_PIPE_STAGES 3
-#define NUM_V_PIPE_STAGES 3
-#define NUM_T_PIPE_STAGES 2
+#define NUM_V_PIPE_STAGES 2
+#define NUM_T_PIPE_STAGES 4
 #define NUM_GATE_PIPE_STAGES 5
 #define NUM_AINV_PIPE_STAGES 3
 #define NUM_QK_PIPE_STAGES 2
@@ -42,7 +42,7 @@
 #define SMEM_SMEM_V_OFF 82944
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_SMEM_T_OFF 132096
+#define SMEM_SMEM_T_OFF 115712
 #define SMEM_SMEM_T_STAGE_BYTES 8192
 #define SMEM_SMEM_T_STRIDE 8192
 #define SMEM_SMEM_AINV_OFF 148480
@@ -87,7 +87,7 @@ __device__ __forceinline__ void mma_ts_step(
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
+kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -101,29 +101,29 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
-    __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    __half* smem_q = reinterpret_cast<__half*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
-    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    __half* smem_k = reinterpret_cast<__half*>(smem_raw + 33792);
     const int smem_k_addr = smem + 33792;
-    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
+    __half* smem_v = reinterpret_cast<__half*>(smem_raw + 82944);
     const int smem_v_addr = smem + 82944;
-    __nv_bfloat16* smem_t = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_t_addr = smem + 132096;
-    __nv_bfloat16* smem_ainv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
+    __half* smem_t = reinterpret_cast<__half*>(smem_raw + 115712);
+    const int smem_t_addr = smem + 115712;
+    __half* smem_ainv = reinterpret_cast<__half*>(smem_raw + 148480);
     const int smem_ainv_addr = smem + 148480;
-    __nv_bfloat16* smem_qk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+    __half* smem_qk = reinterpret_cast<__half*>(smem_raw + 173056);
     const int smem_qk_addr = smem + 173056;
-    __nv_bfloat16* smem_o = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    __half* smem_o = reinterpret_cast<__half*>(smem_raw + 189440);
     const int smem_o_addr = smem + 189440;
     float* smem_cumsumlog = reinterpret_cast<float*>(smem_raw + 222208);
     const int smem_cumsumlog_addr = smem + 222208;
     float* smem_cumprod = reinterpret_cast<float*>(smem_raw + 223488);
     const int smem_cumprod_addr = smem + 223488;
-    __nv_bfloat16* smem_k_trans = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    __half* smem_k_trans = reinterpret_cast<__half*>(smem_raw + 33792);
     const int smem_k_trans_addr = smem + 33792;
 
-    // Mbarrier init (29 groups, 59 barriers)
-    // Mbarriers at smem_raw[0..472)
+    // Mbarrier init (29 groups, 61 barriers)
+    // Mbarriers at smem_raw[0..488)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -145,89 +145,91 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
             mbarrier_init(smem + 64, 2);
             mbarrier_init(smem + 72, 2);
             // --- pipeline 'v_pipe' ---
-            // load_v_full: 3 barriers, init_count=1
+            // load_v_full: 2 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
-            mbarrier_init(smem + 96, 1);
-            // load_v_empty: 3 barriers, init_count=4
+            // load_v_empty: 2 barriers, init_count=4
+            mbarrier_init(smem + 96, 4);
             mbarrier_init(smem + 104, 4);
-            mbarrier_init(smem + 112, 4);
-            mbarrier_init(smem + 120, 4);
             // --- pipeline 't_pipe' ---
-            // load_t_full: 2 barriers, init_count=1
+            // load_t_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 120, 1);
             mbarrier_init(smem + 128, 1);
             mbarrier_init(smem + 136, 1);
-            // load_t_empty: 2 barriers, init_count=4
+            // load_t_empty: 4 barriers, init_count=4
             mbarrier_init(smem + 144, 4);
             mbarrier_init(smem + 152, 4);
+            mbarrier_init(smem + 160, 4);
+            mbarrier_init(smem + 168, 4);
             // --- pipeline 'gate_pipe' ---
             // load_gate_full: 5 barriers, init_count=32
-            mbarrier_init(smem + 160, 32);
-            mbarrier_init(smem + 168, 32);
             mbarrier_init(smem + 176, 32);
             mbarrier_init(smem + 184, 32);
             mbarrier_init(smem + 192, 32);
+            mbarrier_init(smem + 200, 32);
+            mbarrier_init(smem + 208, 32);
             // load_gate_empty: 5 barriers, init_count=256
-            mbarrier_init(smem + 200, 256);
-            mbarrier_init(smem + 208, 256);
             mbarrier_init(smem + 216, 256);
             mbarrier_init(smem + 224, 256);
             mbarrier_init(smem + 232, 256);
+            mbarrier_init(smem + 240, 256);
+            mbarrier_init(smem + 248, 256);
             // --- pipeline 'one_stage' ---
             // q_state_acc_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 240, 1);
-            // q_state_acc_empty: 1 barriers, init_count=128
-            mbarrier_init(smem + 248, 128);
-            // kv_acc_full: 1 barriers, init_count=1
             mbarrier_init(smem + 256, 1);
-            // kv_acc_empty: 1 barriers, init_count=128
+            // q_state_acc_empty: 1 barriers, init_count=128
             mbarrier_init(smem + 264, 128);
+            // kv_acc_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 272, 1);
+            // kv_acc_empty: 1 barriers, init_count=128
+            mbarrier_init(smem + 280, 128);
             // --- pipeline 'cg0_acc_pipe' ---
             // cg0_acc_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 272, 1);
-            mbarrier_init(smem + 280, 1);
+            mbarrier_init(smem + 288, 1);
+            mbarrier_init(smem + 296, 1);
             // cg0_acc_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 288, 128);
-            mbarrier_init(smem + 296, 128);
+            mbarrier_init(smem + 304, 128);
+            mbarrier_init(smem + 312, 128);
             // --- pipeline 'one_stage' ---
             // cg1_acc_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 304, 1);
+            mbarrier_init(smem + 320, 1);
             // cg1_acc_empty: 1 barriers, init_count=128
-            mbarrier_init(smem + 312, 128);
+            mbarrier_init(smem + 328, 128);
             // --- pipeline 'ainv_pipe' ---
             // ainv_ready: 3 barriers, init_count=128
-            mbarrier_init(smem + 320, 128);
-            mbarrier_init(smem + 328, 128);
             mbarrier_init(smem + 336, 128);
+            mbarrier_init(smem + 344, 128);
+            mbarrier_init(smem + 352, 128);
             // ainv_empty: 3 barriers, init_count=1
-            mbarrier_init(smem + 344, 1);
-            mbarrier_init(smem + 352, 1);
             mbarrier_init(smem + 360, 1);
+            mbarrier_init(smem + 368, 1);
+            mbarrier_init(smem + 376, 1);
             // --- pipeline 'qk_pipe' ---
             // qk_ready: 2 barriers, init_count=128
-            mbarrier_init(smem + 368, 128);
-            mbarrier_init(smem + 376, 128);
+            mbarrier_init(smem + 384, 128);
+            mbarrier_init(smem + 392, 128);
             // qk_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 384, 1);
-            mbarrier_init(smem + 392, 1);
+            mbarrier_init(smem + 400, 1);
+            mbarrier_init(smem + 408, 1);
             // --- pipeline 'one_stage' ---
             // state_input_ready: 1 barriers, init_count=128
-            mbarrier_init(smem + 400, 128);
-            // state_input_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 408, 1);
-            // vks_ready: 1 barriers, init_count=128
             mbarrier_init(smem + 416, 128);
-            // nv_ready: 1 barriers, init_count=128
-            mbarrier_init(smem + 424, 128);
-            // decay_v_ready: 1 barriers, init_count=128
+            // state_input_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 424, 1);
+            // vks_ready: 1 barriers, init_count=128
             mbarrier_init(smem + 432, 128);
+            // nv_ready: 1 barriers, init_count=128
+            mbarrier_init(smem + 440, 128);
+            // decay_v_ready: 1 barriers, init_count=128
+            mbarrier_init(smem + 448, 128);
             // --- pipeline 'o_pipe' ---
             // o_store_ready: 2 barriers, init_count=128
-            mbarrier_init(smem + 440, 128);
-            mbarrier_init(smem + 448, 128);
+            mbarrier_init(smem + 456, 128);
+            mbarrier_init(smem + 464, 128);
             // o_store_empty: 2 barriers, init_count=32
-            mbarrier_init(smem + 456, 32);
-            mbarrier_init(smem + 464, 32);
+            mbarrier_init(smem + 472, 32);
+            mbarrier_init(smem + 480, 32);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
@@ -235,9 +237,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 472);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 488);
     if (warp == 4) {
-        int _tmem_hold = smem + 472;
+        int _tmem_hold = smem + 488;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -251,30 +253,30 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
     #define load_k_full_addr (mbar_base + 32)
     #define load_k_empty_addr (mbar_base + 56)
     #define load_v_full_addr (mbar_base + 80)
-    #define load_v_empty_addr (mbar_base + 104)
-    #define load_t_full_addr (mbar_base + 128)
+    #define load_v_empty_addr (mbar_base + 96)
+    #define load_t_full_addr (mbar_base + 112)
     #define load_t_empty_addr (mbar_base + 144)
-    #define load_gate_full_addr (mbar_base + 160)
-    #define load_gate_empty_addr (mbar_base + 200)
-    #define q_state_acc_full_addr (mbar_base + 240)
-    #define q_state_acc_empty_addr (mbar_base + 248)
-    #define kv_acc_full_addr (mbar_base + 256)
-    #define kv_acc_empty_addr (mbar_base + 264)
-    #define cg0_acc_full_addr (mbar_base + 272)
-    #define cg0_acc_empty_addr (mbar_base + 288)
-    #define cg1_acc_full_addr (mbar_base + 304)
-    #define cg1_acc_empty_addr (mbar_base + 312)
-    #define ainv_ready_addr (mbar_base + 320)
-    #define ainv_empty_addr (mbar_base + 344)
-    #define qk_ready_addr (mbar_base + 368)
-    #define qk_empty_addr (mbar_base + 384)
-    #define state_input_ready_addr (mbar_base + 400)
-    #define state_input_empty_addr (mbar_base + 408)
-    #define vks_ready_addr (mbar_base + 416)
-    #define nv_ready_addr (mbar_base + 424)
-    #define decay_v_ready_addr (mbar_base + 432)
-    #define o_store_ready_addr (mbar_base + 440)
-    #define o_store_empty_addr (mbar_base + 456)
+    #define load_gate_full_addr (mbar_base + 176)
+    #define load_gate_empty_addr (mbar_base + 216)
+    #define q_state_acc_full_addr (mbar_base + 256)
+    #define q_state_acc_empty_addr (mbar_base + 264)
+    #define kv_acc_full_addr (mbar_base + 272)
+    #define kv_acc_empty_addr (mbar_base + 280)
+    #define cg0_acc_full_addr (mbar_base + 288)
+    #define cg0_acc_empty_addr (mbar_base + 304)
+    #define cg1_acc_full_addr (mbar_base + 320)
+    #define cg1_acc_empty_addr (mbar_base + 328)
+    #define ainv_ready_addr (mbar_base + 336)
+    #define ainv_empty_addr (mbar_base + 360)
+    #define qk_ready_addr (mbar_base + 384)
+    #define qk_empty_addr (mbar_base + 400)
+    #define state_input_ready_addr (mbar_base + 416)
+    #define state_input_empty_addr (mbar_base + 424)
+    #define vks_ready_addr (mbar_base + 432)
+    #define nv_ready_addr (mbar_base + 440)
+    #define decay_v_ready_addr (mbar_base + 448)
+    #define o_store_ready_addr (mbar_base + 456)
+    #define o_store_empty_addr (mbar_base + 472)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -370,10 +372,14 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                         for (int _pair = 0; _pair < 4; _pair++) {
                             asm volatile(
                                 "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                ".reg .b16 h_lo, h_hi;\n\t"
+                                ".reg .b32 f_lo, f_hi;\n\t"
+                                "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                "mov.b64 %0, {f_lo, f_hi};\n\t"
                                 "}\n"
-                                : "=f"((&t_bits_cg0_f32[_pair * 2])[0]), "=f"((&t_bits_cg0_f32[_pair * 2])[1])
+                                : "=l"(*reinterpret_cast<unsigned long long*>(&t_bits_cg0_f32[_pair * 2]))
                                 : "r"(t_bits_cg0[_pair]));
                         }
                         {
@@ -425,8 +431,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                         unsigned int t_signed_bits_cg0[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(t_bits_cg0_f32[_lp*2 + 0], t_bits_cg0_f32[_lp*2+1 + 0]));
-                            t_signed_bits_cg0[_lp] = *(uint32_t*)&_bf2;
+                            __half2 _h2 = __float22half2_rn(make_float2(t_bits_cg0_f32[_lp*2 + 0], t_bits_cg0_f32[_lp*2+1 + 0]));
+                            t_signed_bits_cg0[_lp] = *(uint32_t*)&_h2;
                         }
                         int t_store_row_cg0 = t_col_tile_cg0 * 16 + (lane & 7) + (lane & 16) / 2;
                         int t_store_col_lane_cg0 = warp_cg0 * 16 + (lane & 8);
@@ -466,8 +472,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     unsigned int qk_bits_cg0[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                        qk_bits_cg0[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                        qk_bits_cg0[_lp] = *(uint32_t*)&_h2;
                     }
                     int qk_store_row_cg0 = qk_logical_row_base_cg0 + (lane & 7) + (lane & 8);
                     int qk_store_col_lane_cg0 = (lane & 16) / 2;
@@ -488,7 +494,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     gate_stage_cg0 += 1;
                     if (gate_stage_cg0 == 5) { gate_stage_cg0 = 0; gate_phase_cg0 ^= 1; }
                     t_stage_cg0 += 1;
-                    if (t_stage_cg0 == 2) { t_stage_cg0 = 0; t_phase_cg0 ^= 1; }
+                    if (t_stage_cg0 == 4) { t_stage_cg0 = 0; t_phase_cg0 ^= 1; }
                     ainv_stage_cg0 += 1;
                     if (ainv_stage_cg0 == 3) { ainv_stage_cg0 = 0; ainv_empty_phase_cg0 ^= 1; }
                     qk_stage_cg0 += 1;
@@ -609,8 +615,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     unsigned int state_input_bits_cg1[64];
                     #pragma unroll
                     for (int _lp = 0; _lp < 64; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_values_cg1[_lp*2 + 0], state_values_cg1[_lp*2+1 + 0]));
-                        state_input_bits_cg1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(state_values_cg1[_lp*2 + 0], state_values_cg1[_lp*2+1 + 0]));
+                        state_input_bits_cg1[_lp] = *(uint32_t*)&_h2;
                     }
                     #pragma unroll
                     for (int state_col_block_cg1_1 = 0; state_col_block_cg1_1 < 4; state_col_block_cg1_1++) {
@@ -711,13 +717,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     unsigned int ks_frag_hi_cg1_f16[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ks_frag_lo_cg1[_lp*2 + 0], ks_frag_lo_cg1[_lp*2+1 + 0]));
-                        ks_frag_lo_cg1_f16[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(ks_frag_lo_cg1[_lp*2 + 0], ks_frag_lo_cg1[_lp*2+1 + 0]));
+                        ks_frag_lo_cg1_f16[_lp] = *(uint32_t*)&_h2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ks_frag_hi_cg1[_lp*2 + 0], ks_frag_hi_cg1[_lp*2+1 + 0]));
-                        ks_frag_hi_cg1_f16[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(ks_frag_hi_cg1[_lp*2 + 0], ks_frag_hi_cg1[_lp*2+1 + 0]));
+                        ks_frag_hi_cg1_f16[_lp] = *(uint32_t*)&_h2;
                     }
                     float qs_frag_early_cg1[32];
                     int qs_addr_early_cg1 = taddr + 128 + (unsigned int)tmem_row_base_cg1;
@@ -737,10 +743,10 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     #pragma unroll
                     for (int vks_pair_cg1 = 0; vks_pair_cg1 < 16; vks_pair_cg1++) {
                         uint32_t _packed16x2_sub_0;
-                        asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_packed16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
+                        asm volatile("sub.rn.f16x2 %0, %1, %2;" : "=r"(_packed16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
                         vks_bits_lo_cg1[vks_pair_cg1] = _packed16x2_sub_0;
                         uint32_t _packed16x2_sub_1;
-                        asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_packed16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
+                        asm volatile("sub.rn.f16x2 %0, %1, %2;" : "=r"(_packed16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
                         vks_bits_hi_cg1[vks_pair_cg1] = _packed16x2_sub_1;
                     }
                     asm volatile(
@@ -830,13 +836,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     unsigned int nv_bits_hi_cg1[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
-                        nv_bits_lo_cg1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
+                        nv_bits_lo_cg1[_lp] = *(uint32_t*)&_h2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
-                        nv_bits_hi_cg1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
+                        nv_bits_hi_cg1[_lp] = *(uint32_t*)&_h2;
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x128b.x8.b32"
@@ -858,13 +864,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     unsigned int decay_bits_hi_cg1[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
-                        decay_bits_lo_cg1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
+                        decay_bits_lo_cg1[_lp] = *(uint32_t*)&_h2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
-                        decay_bits_hi_cg1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
+                        decay_bits_hi_cg1[_lp] = *(uint32_t*)&_h2;
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x128b.x8.b32"
@@ -900,8 +906,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                             unsigned int o_bits_cg1[16];
                             #pragma unroll
                             for (int _lp = 0; _lp < 16; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_3[_lp*2 + 0], _tmem_load_3[_lp*2+1 + 0]));
-                                o_bits_cg1[_lp] = *(uint32_t*)&_bf2;
+                                __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_3[_lp*2 + 0], _tmem_load_3[_lp*2+1 + 0]));
+                                o_bits_cg1[_lp] = *(uint32_t*)&_h2;
                             }
                             #pragma unroll
                             for (int o_group_cg1 = 0; o_group_cg1 < 4; o_group_cg1++) {
@@ -935,7 +941,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     gate_stage_cg1 += 1;
                     if (gate_stage_cg1 == 5) { gate_stage_cg1 = 0; gate_phase_cg1 ^= 1; }
                     v_stage_cg1 += 1;
-                    if (v_stage_cg1 == 3) { v_stage_cg1 = 0; v_phase_cg1 ^= 1; }
+                    if (v_stage_cg1 == 2) { v_stage_cg1 = 0; v_phase_cg1 ^= 1; }
                     o_stage_cg1 += 1;
                     if (o_stage_cg1 == 2) { o_stage_cg1 = 0; o_empty_phase_cg1 ^= 1; }
                 }
@@ -1020,7 +1026,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68158608;\n\t"
+                    "mov.b32 id, 68157456;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1141,9 +1147,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
             unsigned int _phase_load_t_empty = 1;
             unsigned int _phase_load_v_empty = 1;
             if (blockIdx.x / num_sab_heads < ((int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y] + cp_chunk_len - 1) / cp_chunk_len) {
-                int q_head = sab_head_3 * num_q_heads / num_sab_heads;
-                int k_head = sab_head_3 * num_k_heads / num_sab_heads;
-                int v_head = sab_head_3 * num_v_heads / num_sab_heads;
+                int q_head = sab_head_3;
+                int k_head = sab_head_3;
+                int v_head = sab_head_3;
                 unsigned int q_stage = 0;
                 unsigned int k_stage = 0;
                 unsigned int v_stage = 0;
@@ -1175,7 +1181,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                         mbarrier_arrive_expect_tx(load_t_full_addr + (t_stage) * 8, 8192);
                         tma_4d_gmem2smem(smem_t_addr + t_stage * 8192, (&T), 0, 0, sab_head_3, t_block_start_3 + t_block, load_t_full_addr + (t_stage) * 8);
                         t_stage += 1;
-                        if (t_stage == 2) { t_stage = 0; _phase_load_t_empty ^= 1; }
+                        if (t_stage == 4) { t_stage = 0; _phase_load_t_empty ^= 1; }
                         mbarrier_wait(load_v_empty_addr + (v_stage) * 8, _phase_load_v_empty);
                         if (block_idx == 0) {
                             asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"((uint64_t)(tensormap_workspace + (cta_slot_base_tma + 256))) : "memory");
@@ -1183,7 +1189,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                         mbarrier_arrive_expect_tx(load_v_full_addr + (v_stage) * 8, 16384);
                         tma_4d_gmem2smem(smem_v_addr + v_stage * 16384, tensormap_workspace + (cta_slot_base_tma + 256), 0, block_offset, 0, v_head, load_v_full_addr + (v_stage) * 8);
                         v_stage += 1;
-                        if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
+                        if (v_stage == 2) { v_stage = 0; _phase_load_v_empty ^= 1; }
                     }
                     #pragma unroll
                     for (int __5 = 0; __5 < 2; __5++) {
@@ -1198,16 +1204,16 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                         if (k_stage == 3) { k_stage = 0; _phase_load_k_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __7 = 0; __7 < 3; __7++) {
+                    for (int __7 = 0; __7 < 2; __7++) {
                         mbarrier_wait(load_v_empty_addr + (v_stage) * 8, _phase_load_v_empty);
                         v_stage += 1;
-                        if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
+                        if (v_stage == 2) { v_stage = 0; _phase_load_v_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __8 = 0; __8 < 2; __8++) {
+                    for (int __8 = 0; __8 < 4; __8++) {
                         mbarrier_wait(load_t_empty_addr + (t_stage) * 8, _phase_load_t_empty);
                         t_stage += 1;
-                        if (t_stage == 2) { t_stage = 0; _phase_load_t_empty ^= 1; }
+                        if (t_stage == 4) { t_stage = 0; _phase_load_t_empty ^= 1; }
                     }
                 }
             }
@@ -1283,7 +1289,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135267472;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
@@ -1326,7 +1332,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135267472;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
@@ -1375,7 +1381,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135267472;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
@@ -1411,7 +1417,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135267472;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
@@ -1442,7 +1448,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 136381584;\n\t"
+                    "mov.b32 id, 136380432;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"

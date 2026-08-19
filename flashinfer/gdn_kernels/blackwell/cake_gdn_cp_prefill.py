@@ -238,7 +238,9 @@ def _build_plan(
     max_seqlen = max(seq_lens)
     generic_tail = any(length % (2 * _BLOCK) != 0 for length in seq_lens)
     if q.dtype == torch.float16 and not generic_tail and hq == hk == hv:
-        prefill_kernel = "cp_prefill_equal_head"
+        prefill_kernel = (
+            "cp_prefill_equal_head_h32" if hq == 32 else "cp_prefill_equal_head"
+        )
     elif generic_tail:
         prefill_kernel = f"cp_prefill_generic{dtype_suffix}"
     else:
