@@ -26,11 +26,13 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""SM100 grouped GEMM for NVFP4 expert weights and BF16 activations.
+"""SM100/SM103 dense GEMM for NVFP4 weights and BF16 activations.
 
-Each routed-row tile selects one expert through FlashInfer's MoE sort metadata.
 The kernel decodes each 16-value E2M1 weight block and its E4M3 scale to BF16,
-then executes BF16 tensor-core MMA with FP32 accumulation.
+then executes BF16 ``tcgen05`` MMA with FP32 accumulation.  It is intentionally
+kept separate from the fused-MoE kernel: the Python entrypoint supplies a
+dense weight, activation, scale, and output ABI, and the device scheduler
+derives all tile coordinates directly from the GEMM shape.
 """
 
 from math import ceil, log2
@@ -47,36 +49,24 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-
-from flashinfer.tllm_enums import (
-    ActivationType,
-    DEFAULT_SWIGLU_ALPHA,
-    DEFAULT_SWIGLU_BETA,
-    DEFAULT_SWIGLU_LIMIT,
-)
-
-from ..moe_utils import validate_cute_dsl_moe_situ_config
-from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
-from .utils import (
-    blk_reduce_bf16,
-    f32_reciprocal,
-    fmin,
-    gelu_tanh_f32,
+from cutlass.cute.arch import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
-    situ_f32,
-    tanh_f32,
+)
+
+from .dense_gemm_bf16_fp4_sm100_utils import (
+    blk_reduce_bf16,
+    decode_nvfp4_fragment_to_bf16,
+    fmin,
 )
 
 
 _NVFP4_SCALE_GRANULARITY_M = 1
 _NVFP4_SCALE_GRANULARITY_K = 16
-_TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
-_TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
 
 
-class Sm100W4A16GroupedGemmKernel:
-    """Warp-specialized grouped GEMM for the W4A16 MoE pipeline."""
+class Sm100DenseGemmBf16Fp4Kernel:
+    """Warp-specialized dense GEMM for SM100/SM103 W4A16 workloads."""
 
     def __init__(
         self,
@@ -84,66 +74,27 @@ class Sm100W4A16GroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mnk: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
-        group_count: int,
-        activation_type: Optional[int],
-        swiglu_alpha: float,
-        swiglu_beta: float,
-        swiglu_limit: float,
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-        use_fused_finalize: bool,
         enable_pdl: bool,
-        use_clc_scheduler: bool,
         raster_along_m: bool,
         transform_fragment_size: int,
     ):
-        """Initialize the W4A16 grouped GEMM configuration."""
-        self.group_count = group_count
+        """Initialize the dense W4A16 GEMM configuration."""
+        self.group_count = 1
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = mma_tiler_mnk
-        if activation_type not in (
-            None,
-            ActivationType.Swiglu.value,
-            ActivationType.GegluTanh.value,
-            ActivationType.Relu2.value,
-        ):
-            raise ValueError(
-                f"unsupported W4A16 epilogue activation: {activation_type}"
-            )
-        self.fuse_activation = activation_type is not None
-        self.use_clc_scheduler = use_clc_scheduler
+        self.fuse_activation = False
+        self.use_clc_scheduler = False
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
-        if activation_type is None:
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU parameters require an activation")
-        else:
-            validate_cute_dsl_moe_situ_config(
-                ActivationType(activation_type), situ_beta, situ_linear_beta
-            )
-        self.activation_type = activation_type
-        self.gated = activation_type in (
-            ActivationType.Swiglu.value,
-            ActivationType.GegluTanh.value,
-        )
-        self.swiglu_alpha = swiglu_alpha
-        self.swiglu_beta = swiglu_beta
-        self.swiglu_limit = swiglu_limit
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
-        self.parameterized_swiglu = (
-            swiglu_alpha != DEFAULT_SWIGLU_ALPHA
-            or swiglu_beta != DEFAULT_SWIGLU_BETA
-            or swiglu_limit != DEFAULT_SWIGLU_LIMIT
-        )
-        self.output_m_factor = 2 if self.gated else 1
-        if self.gated and use_fused_finalize:
-            raise ValueError(
-                "W4A16 fused finalize is only implemented for the non-gated epilogue"
-            )
-        self.use_fused_finalize = use_fused_finalize
+        self.gated = False
+        self.swiglu_alpha = 1.0
+        self.swiglu_beta = 0.0
+        self.swiglu_limit = 0.0
+        self.parameterized_swiglu = False
+        self.output_m_factor = 1
+        self.use_fused_finalize = False
         self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -559,18 +510,11 @@ class Sm100W4A16GroupedGemmKernel:
         weight_ptr: cute.Pointer,
         weight_sf_ptr: cute.Pointer,
         activation_ptr: cute.Pointer,
-        tile_idx_to_expert_idx_ptr: cute.Pointer,
-        tile_idx_to_mn_limit_ptr: cute.Pointer,
-        num_non_exiting_tiles_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
-        permuted_idx_to_expanded_idx_ptr: Optional[cute.Pointer],
-        token_final_scales_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
-        num_tokens: cutlass.Int64,
-        top_k: cutlass.Int64,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -592,50 +536,13 @@ class Sm100W4A16GroupedGemmKernel:
         output_m = m // self.output_m_factor
         output_layout = cute.make_ordered_layout((output_m, n, 1), order=(0, 1, 2))
         output = cute.make_tensor(output_ptr, output_layout)
-        final_output = (
-            cute.make_tensor(
-                output_ptr,
-                cute.make_ordered_layout((output_m, num_tokens, 1), order=(0, 1, 2)),
-            )
-            if cutlass.const_expr(self.use_fused_finalize)
-            else output
-        )
-        num_route_tiles = n // self.mma_tiler[1]
-        tile_idx_to_expert_idx = cute.make_tensor(
-            tile_idx_to_expert_idx_ptr, cute.make_layout((num_route_tiles,))
-        )
-        tile_idx_to_mn_limit = cute.make_tensor(
-            tile_idx_to_mn_limit_ptr, cute.make_layout((num_route_tiles,))
-        )
-        num_non_exiting_tiles = cute.make_tensor(
-            num_non_exiting_tiles_ptr, cute.make_layout((1,))
-        )
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((self.group_count,)))
-        permuted_idx_to_expanded_idx = (
-            cute.make_tensor(permuted_idx_to_expanded_idx_ptr, cute.make_layout((n,)))
-            if cutlass.const_expr(self.use_fused_finalize)
-            else None
-        )
-        token_final_scales = (
-            cute.make_tensor(
-                token_final_scales_ptr,
-                cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
-            )
-            if cutlass.const_expr(self.use_fused_finalize)
-            else None
-        )
         return self(
             weights,
             weight_sf,
             activations,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            num_non_exiting_tiles,
             alpha,
             output,
-            final_output,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
             max_active_clusters,
             stream,
         )
@@ -646,18 +553,12 @@ class Sm100W4A16GroupedGemmKernel:
         a: cute.Tensor,
         a_scale: cute.Tensor,
         b: cute.Tensor,
-        tile_idx_to_expert_idx: cute.Tensor,
-        tile_idx_to_mn_limit: cute.Tensor,
-        num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         c: cute.Tensor,
-        final_output: cute.Tensor,
-        permuted_idx_to_expanded_idx: Optional[cute.Tensor],
-        token_final_scales: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """Configure and launch the grouped GEMM."""
+        """Configure and launch the dense GEMM."""
         self.a_dtype: type[cutlass.Numeric] = a.element_type
         self.a_scale_dtype: type[cutlass.Numeric] = a_scale.element_type
         self.b_dtype: type[cutlass.Numeric] = b.element_type
@@ -757,7 +658,7 @@ class Sm100W4A16GroupedGemmKernel:
 
         @cute.struct
         class SharedStorage:
-            # Routed-tile scheduling metadata.
+            # Dense-tile scheduling metadata shared by the specialized warps.
             tile_info: cute.struct.MemRange[cutlass.Int32, 4 * self.num_tile_info_stage]
             a_load2trans_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_load2trans_stage
@@ -803,13 +704,10 @@ class Sm100W4A16GroupedGemmKernel:
             tma_atom_c,
             tma_tensor_c,
             c,
-            final_output,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            num_non_exiting_tiles,
+            c,
             alpha,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
+            None,
+            None,
             self.group_count,
             self.cluster_layout_vmnk,
             self.smem_layout_a,
@@ -843,9 +741,6 @@ class Sm100W4A16GroupedGemmKernel:
         mC_mnl: cute.Tensor,
         tensor_c: cute.Tensor,
         final_output: cute.Tensor,
-        tile_idx_to_expert_idx: cute.Tensor,
-        tile_idx_to_mn_limit: cute.Tensor,
-        num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         permuted_idx_to_expanded_idx: Optional[cute.Tensor],
         token_final_scales: Optional[cute.Tensor],
@@ -863,7 +758,7 @@ class Sm100W4A16GroupedGemmKernel:
             utils.PersistentTileSchedulerParams,
         ],
     ):
-        """Run the persistent W4A16 grouped GEMM."""
+        """Run the persistent W4A16 dense GEMM."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -908,8 +803,7 @@ class Sm100W4A16GroupedGemmKernel:
             mcast_mode_mn=(1, 0),  # multicast for A will only happen on the M-mode
             defer_sync=True,
         )
-        # Initialize transform2mma pipeline, which tracks the dependencies between the transformation
-        # of A and MMA's consumption of transformed A
+        # Track dependencies between A transformation and MMA consumption.
         cta_v_size = cute.size(cluster_layout_vmnk, mode=[0])
         trans2mma_pipeline = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.a_trans2mma_full_mbar_ptr.data_ptr(),
@@ -936,8 +830,7 @@ class Sm100W4A16GroupedGemmKernel:
             mcast_mode_mn=(0, 1),  # multicast for B will only happen on the N-mode
             defer_sync=True,
         )
-        # Initialize accumulator pipeline, which tracks the dependencies between
-        # MMA's computation of accumulators and epilogue warps' consumption of accumulators
+        # Track dependencies between MMA and the accumulator epilogue consumers.
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
@@ -1195,7 +1088,10 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_info_stage
             )
-            num_non_exiting_tiles_value = num_non_exiting_tiles[0]
+            dense_n = cutlass.Int32(cute.size(tensor_c.shape[1]))
+            dense_num_tiles = cutlass.Int32(
+                cute.ceil_div(dense_n, self.cta_tile_shape_mnk[1])
+            )
             if cutlass.const_expr(self.use_clc_scheduler):
                 tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
                     tile_sched_params,
@@ -1214,11 +1110,11 @@ class Sm100W4A16GroupedGemmKernel:
                 while not_last_tile:
                     tile_coord_mnl = work_tile.tile_idx
                     route_tile_idx = tile_coord_mnl[1]
-                    is_routed_tile = work_tile.is_valid_tile and (
-                        route_tile_idx < num_non_exiting_tiles_value
+                    is_dense_tile = work_tile.is_valid_tile and (
+                        route_tile_idx < dense_num_tiles
                     )
 
-                    if is_routed_tile or not work_tile.is_valid_tile:
+                    if is_dense_tile or not work_tile.is_valid_tile:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
 
                     if work_tile.is_valid_tile and is_first_cta_in_cluster:
@@ -1228,19 +1124,17 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                         clc_producer_state.advance()
 
-                    if is_routed_tile or not work_tile.is_valid_tile:
+                    if is_dense_tile or not work_tile.is_valid_tile:
                         cur_sTile_info = sTile_info[
                             (None, tile_info_producer_state.index)
                         ]
                         route_start = cutlass.Int32(-1)
                         group_idx = cutlass.Int32(group_count)
                         distance_to_boundary = cutlass.Int32(-1)
-                        if is_routed_tile:
+                        if is_dense_tile:
                             route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                            distance_to_boundary = (
-                                tile_idx_to_mn_limit[route_tile_idx] - route_start
-                            )
+                            group_idx = cutlass.Int32(0)
+                            distance_to_boundary = dense_n - route_start
                         with cute.arch.elect_one():
                             cur_sTile_info[0] = tile_coord_mnl[0]
                             cur_sTile_info[1] = route_start
@@ -1287,17 +1181,15 @@ class Sm100W4A16GroupedGemmKernel:
                             + cta_tile_offset_n
                         )
                         not_last_tile = work_tile.is_valid_tile and (
-                            route_tile_idx < num_non_exiting_tiles_value
+                            route_tile_idx < dense_num_tiles
                         )
                         route_start = cutlass.Int32(-1)
                         group_idx = cutlass.Int32(group_count)
                         distance_to_boundary = cutlass.Int32(-1)
                         if not_last_tile:
                             route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                            distance_to_boundary = (
-                                tile_idx_to_mn_limit[route_tile_idx] - route_start
-                            )
+                            group_idx = cutlass.Int32(0)
+                            distance_to_boundary = dense_n - route_start
                         cur_sTile_info = sTile_info[
                             (None, tile_info_producer_state.index)
                         ]
@@ -1328,30 +1220,26 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                         # The runtime scheduler leaves its outer mode unbounded.
                         # With N as the inner mode, terminate on the finite M
-                        # extent and skip padded routed tiles within each M tile.
+                        # extent.
                         has_work = work_tile.is_valid_tile and (
                             cluster_tile_coord_mnl[0]
                             < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
                         )
-                        is_routed_tile = has_work and (
-                            route_tile_idx < num_non_exiting_tiles_value
-                        )
+                        is_dense_tile = has_work and (route_tile_idx < dense_num_tiles)
 
-                        if is_routed_tile or not has_work:
+                        if is_dense_tile or not has_work:
                             tile_info_pipeline.producer_acquire(
                                 tile_info_producer_state
                             )
                             route_start = cutlass.Int32(-1)
                             group_idx = cutlass.Int32(group_count)
                             distance_to_boundary = cutlass.Int32(-1)
-                            if is_routed_tile:
+                            if is_dense_tile:
                                 route_start = (
                                     route_tile_idx * self.cta_tile_shape_mnk[1]
                                 )
-                                group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                                distance_to_boundary = (
-                                    tile_idx_to_mn_limit[route_tile_idx] - route_start
-                                )
+                                group_idx = cutlass.Int32(0)
+                                distance_to_boundary = dense_n - route_start
                             cur_sTile_info = sTile_info[
                                 (None, tile_info_producer_state.index)
                             ]
@@ -1422,7 +1310,6 @@ class Sm100W4A16GroupedGemmKernel:
                             b_load2mma_producer_state
                         ),
                         mcast_mask=b_full_mcast_mask,
-                        cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_LAST),
                     )
                     b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
                     b_load2mma_producer_state.advance()
@@ -1509,7 +1396,6 @@ class Sm100W4A16GroupedGemmKernel:
                             a_load2trans_producer_state
                         ),
                         mcast_mask=a_full_mcast_mask,
-                        cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
                     )
                     cute.copy(
                         tma_atom_s,
@@ -1984,92 +1870,47 @@ class Sm100W4A16GroupedGemmKernel:
                                 (gate[i], gate[i + 1]),
                                 (gated_alpha_f32, gated_alpha_f32),
                             )
-                            if cutlass.const_expr(
-                                self.activation_type == ActivationType.Swiglu.value
-                                and self.situ_beta is not None
-                            ):
-                                # Keep the Python float so situ_f32 can fold
-                                # 1 / beta at trace time instead of emitting a
-                                # per-element div.rn.f32.
-                                situ_beta = self.situ_beta
-                                situ_gate_pair = (
-                                    situ_f32(gate_pair[0], situ_beta, fastmath=True),
-                                    situ_f32(gate_pair[1], situ_beta, fastmath=True),
+                            if cutlass.const_expr(self.parameterized_swiglu):
+                                gate_pair = (
+                                    fmin(gate_pair[0], swiglu_limit, nan=True),
+                                    fmin(gate_pair[1], swiglu_limit, nan=True),
                                 )
-                                if cutlass.const_expr(
-                                    self.situ_linear_beta is not None
-                                ):
-                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
-                                    inv_linear_beta = cutlass.Float32(
-                                        f32_reciprocal(self.situ_linear_beta)
-                                    )
-                                    up_pair = (
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[0] * inv_linear_beta, fastmath=True
-                                        ),
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[1] * inv_linear_beta, fastmath=True
-                                        ),
-                                    )
-                                result = cute.arch.mul_packed_f32x2(
-                                    up_pair, situ_gate_pair
-                                )
-                            elif cutlass.const_expr(
-                                self.activation_type == ActivationType.GegluTanh.value
-                            ):
-                                result = cute.arch.mul_packed_f32x2(
-                                    up_pair,
-                                    (
-                                        gelu_tanh_f32(gate_pair[0], fastmath=True),
-                                        gelu_tanh_f32(gate_pair[1], fastmath=True),
+                                up_pair = (
+                                    -fmin(
+                                        -fmin(up_pair[0], swiglu_limit, nan=True),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                    -fmin(
+                                        -fmin(up_pair[1], swiglu_limit, nan=True),
+                                        swiglu_limit,
+                                        nan=True,
                                     ),
                                 )
-                            elif cutlass.const_expr(
-                                self.activation_type == ActivationType.Swiglu.value
-                            ):
-                                if cutlass.const_expr(self.parameterized_swiglu):
-                                    gate_pair = (
-                                        fmin(gate_pair[0], swiglu_limit, nan=True),
-                                        fmin(gate_pair[1], swiglu_limit, nan=True),
-                                    )
-                                    up_pair = (
-                                        -fmin(
-                                            -fmin(up_pair[0], swiglu_limit, nan=True),
-                                            swiglu_limit,
-                                            nan=True,
-                                        ),
-                                        -fmin(
-                                            -fmin(up_pair[1], swiglu_limit, nan=True),
-                                            swiglu_limit,
-                                            nan=True,
-                                        ),
-                                    )
-                                gate_log2e = cute.arch.mul_packed_f32x2(
-                                    gate_pair,
-                                    (
-                                        neg_swiglu_alpha_log2_e,
-                                        neg_swiglu_alpha_log2_e,
-                                    ),
+                            gate_log2e = cute.arch.mul_packed_f32x2(
+                                gate_pair,
+                                (
+                                    neg_swiglu_alpha_log2_e,
+                                    neg_swiglu_alpha_log2_e,
+                                ),
+                            )
+                            sigmoid = cute.arch.add_packed_f32x2(
+                                (
+                                    cute.math.exp2(gate_log2e[0], fastmath=True),
+                                    cute.math.exp2(gate_log2e[1], fastmath=True),
+                                ),
+                                (1.0, 1.0),
+                            )
+                            sigmoid = (
+                                cute.arch.rcp_approx(sigmoid[0]),
+                                cute.arch.rcp_approx(sigmoid[1]),
+                            )
+                            silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
+                            if cutlass.const_expr(self.parameterized_swiglu):
+                                up_pair = cute.arch.add_packed_f32x2(
+                                    up_pair, (swiglu_beta, swiglu_beta)
                                 )
-                                sigmoid = cute.arch.add_packed_f32x2(
-                                    (
-                                        cute.math.exp2(gate_log2e[0], fastmath=True),
-                                        cute.math.exp2(gate_log2e[1], fastmath=True),
-                                    ),
-                                    (1.0, 1.0),
-                                )
-                                sigmoid = (
-                                    cute.arch.rcp_approx(sigmoid[0]),
-                                    cute.arch.rcp_approx(sigmoid[1]),
-                                )
-                                silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
-                                if cutlass.const_expr(self.parameterized_swiglu):
-                                    up_pair = cute.arch.add_packed_f32x2(
-                                        up_pair, (swiglu_beta, swiglu_beta)
-                                    )
-                                result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                            result = cute.arch.mul_packed_f32x2(up_pair, silu)
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]
@@ -2211,24 +2052,18 @@ class Sm100W4A16GroupedGemmKernel:
                             hidden_base = (
                                 work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                             )
-                            valid_elements = (
-                                cutlass.Int64(final_output.shape[0]) - hidden_base
+                            scatter_out = cute.domain_offset(
+                                (hidden_base, reduce_token_idx, 0), final_output
                             )
-                            if valid_elements > 0:
-                                scatter_out = cute.domain_offset(
-                                    (hidden_base, reduce_token_idx, 0), final_output
-                                )
-                                copy_elements = cutlass.Int32(
-                                    cutlass.min(
-                                        cutlass.Int64(self.cta_tile_shape_mnk[0]),
-                                        valid_elements,
-                                    )
-                                )
-                                blk_reduce_bf16(
-                                    scatter_out,
-                                    sFinalize[(reduce_route, None)],
-                                    copy_elements * (self.c_dtype.width // 8),
-                                )
+                            copy_elements = cutlass.min(
+                                cutlass.Int32(self.cta_tile_shape_mnk[0]),
+                                cutlass.Int32(final_output.shape[0]) - hidden_base,
+                            )
+                            blk_reduce_bf16(
+                                scatter_out,
+                                sFinalize[(reduce_route, None)],
+                                copy_elements * (self.c_dtype.width // 8),
+                            )
 
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -2248,7 +2083,7 @@ class Sm100W4A16GroupedGemmKernel:
                             tRS_rC,
                             tRS_sC[(None, None, None, c_buffer)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                        # Make the shared-memory store visible to the TMA store.
                         cute.arch.fence_proxy(
                             "async.shared",
                             space="cta",

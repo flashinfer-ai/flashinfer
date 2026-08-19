@@ -45,9 +45,9 @@ def validate_compute_consistency(
             f"rank * local_num_experts ({expected_offset}) for rank {rank}."
         )
 
-    if not compute_config.execution.do_finalize:
+    if not compute_config.finalize.do_finalize:
         raise MoEEpConfigError(
-            "compute_config.execution.do_finalize must be True for MoE-EP: the "
+            "compute_config.finalize.do_finalize must be True for MoE-EP: the "
             "bridge consumes a finalized [M, hidden] output and RANK_MAJOR/HT need "
             "the runner's weighted local pre-reduce."
         )
