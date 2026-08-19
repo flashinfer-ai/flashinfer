@@ -558,3 +558,119 @@ class TestFp4Fc2HT:
             padding_regs=48,
         )
         assert result, "FP4 FC2 HT256 fused-UTCCP failed"
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize("tmem_ldst_max_num_regs", (32, 64))
+    def test_ht_tile256_k256_no_swap(self, tmem_ldst_max_num_regs):
+        """Regression for non-swap overlap output-subtile addressing."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            SfLayout,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=256,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_m=128,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            cluster_m=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            sf_bits=8,
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=1,
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            tmem_ldst_max_num_regs=tmem_ldst_max_num_regs,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "FP4 FC2 non-swap HT256 overlap failed"
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize(
+        ("epi_tile_n", "tmem_ldst_max_num_regs"),
+        ((64, 32), (128, 64)),
+    )
+    def test_ht_tile256_k256_no_swap_multi_work_tile_overlap(
+        self, epi_tile_n, tmem_ldst_max_num_regs
+    ):
+        """Exercise both TMEM windows on persistent resident clusters.
+
+        The old epilogue released TMEM after preserving only one T2R fragment
+        and addressed every later work tile from physical window zero.  This
+        shape has more CLC work than one hardware wave, so resident clusters
+        must consume multiple work tiles and alternate their overlap window.
+        """
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=2048,
+            top_k=1,
+            problem_n=8192,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_m=128,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=epi_tile_n,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            cluster_m=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            sf_bits=8,
+            **uniform_pipeline_stage_overrides(4),
+            tile_scheduler=1,
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            tmem_ldst_max_num_regs=tmem_ldst_max_num_regs,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, (
+            "FP4 FC2 persistent overlap handoff failed: "
+            f"epi_tile_n={epi_tile_n}, "
+            f"tmem_ldst_max_num_regs={tmem_ldst_max_num_regs}"
+        )

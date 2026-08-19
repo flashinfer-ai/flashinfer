@@ -200,9 +200,15 @@ class TmemCResource(MemoryResource):
             t2r_init = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
             t2r_1_init = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
         else:
-            epi_t2r_repx = self.cfg.epi_tile_n // 4
+            epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
             t2r_init = cutlass.vector.full([max(1, epi_t2r_repx)], 0.0, cutlass.Float32)
-            t2r_1_init = cutlass.vector.full([1], 0.0, cutlass.Float32)
+            overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+            secondary_repx = (
+                epi_t2r_repx
+                if self.cfg.use_tile256_tmem_overlap and overlap_loads == 2
+                else 1
+            )
+            t2r_1_init = cutlass.vector.full([secondary_repx], 0.0, cutlass.Float32)
         return t2r_init, t2r_1_init
 
     @cute.jit
@@ -739,6 +745,42 @@ class TmemCResource(MemoryResource):
         work_attrs=WorkAttr.AUXILIARY,
     )
     @cute.jit
+    def preload_non_swap_overlap(
+        self,
+        stage_info: StageInfo,
+    ) -> tuple[cutlass.Float32, cutlass.Float32, Int32]:
+        """Copy the complete shared TMEM region before releasing its stage.
+
+        The two ``tile_n``-column accumulator windows are
+        ``tile_n - epi_tile_n`` columns apart, so their shared region is
+        exactly ``epi_tile_n`` columns wide.  Preserving that region requires
+        ``epi_tile_n / non_swap_tmem_load_num_regs`` loads.  Which logical
+        output columns occupy the shared physical region alternates with the
+        local window: the tail overlap calls for window 0 and the head overlap
+        calls for window 1.
+        """
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        num_calls = self.cfg.tile_n // epi_t2r_repx
+        overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+        first_output_call = (Int32(1) - self._epi_local_idx) * Int32(
+            num_calls - overlap_loads
+        )
+        t2r_rmem, _, t2r_output_call_idx = self._consumer_work_impl(
+            stage_info, first_output_call
+        )
+        if cutlass.const_expr(overlap_loads == 2):
+            t2r_rmem_1, _, _ = self._consumer_work_impl(
+                stage_info, first_output_call + Int32(1)
+            )
+        else:
+            _, t2r_rmem_1 = self._t2r_default_values()
+        return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
+
+    @consumer_work_decorator(
+        returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx),
+        work_attrs=WorkAttr.AUXILIARY,
+    )
+    @cute.jit
     def load_overlap_subtile(
         self,
         stage_info: StageInfo,
@@ -748,6 +790,19 @@ class TmemCResource(MemoryResource):
         if cutlass.const_expr(
             self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
         ):
+            if cutlass.const_expr(not self.cfg.is_swap_ab):
+                epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+                num_calls = self.cfg.tile_n // epi_t2r_repx
+                overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+                logical_call_idx = Int32(subtile_idx) + self._epi_local_idx * Int32(
+                    overlap_loads
+                )
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = self._consumer_work_impl(
+                    stage_info, logical_call_idx
+                )
+                if cutlass.const_expr(subtile_idx == num_calls - overlap_loads - 1):
+                    self._epi_local_idx = self._epi_local_idx ^ Int32(1)
+                return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
             t2r_rmem, t2r_rmem_1, t2r_output_call_idx = self._consumer_work_impl(
                 stage_info, subtile_idx + Int32(1)
             )
@@ -763,7 +818,8 @@ class TmemCResource(MemoryResource):
     def _consumer_work_impl(self, stage_info: StageInfo, logical_call_idx):
         """T2R: load TMEM accumulator sub-tile into registers.
 
-        non-swapAB: 32x32b, 1 reg per TMEM column, epi_t2r_repx cols per call.
+        non-swapAB: 32x32b, 1 reg per TMEM column, capped by
+        tmem_ldst_max_num_regs.
         swapAB: 16x256b, 4 regs per 8 columns, two 16-row loads.
         """
         base_col = self.tmem_raw_addr & 0xFFFF
@@ -844,9 +900,18 @@ class TmemCResource(MemoryResource):
             return (slice0, slice1, call_idx_for_output)
         else:
             # 32x32b: 1 reg per column
-            epi_t2r_repx = self.cfg.epi_tile_n // 4
+            epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
             row_offset = warp_in_group * 32
             col_offset = logical_call_idx * epi_t2r_repx
+            if cutlass.const_expr(
+                self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
+            ):
+                # Match the producer's ping-pong window exactly.  The logical
+                # output index remains unchanged; only the physical TMEM
+                # address advances by 256 - epi_tile_n columns for window 1.
+                col_offset += self._epi_local_idx * Int32(
+                    self.cfg.tile_n - self.cfg.epi_tile_n
+                )
             col_id = base_col + self._alloc_c.offset + stage_col_offset + col_offset
             current_addr = ((base_row + row_offset) << 16) | col_id
 
@@ -855,4 +920,11 @@ class TmemCResource(MemoryResource):
             c_rmem = prims.tcgen05_ld(shape, tmem, num=max(1, epi_t2r_repx))
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
-            return (c_rmem, cutlass.vector.full([1], 0.0, cutlass.Float32), Int32(0))
+            # The max-overlap epilogue uses this index for the global C column.
+            # Returning zero aliases every logical subtile onto the first one.
+            _, t2r_rmem_1 = self._t2r_default_values()
+            return (
+                c_rmem,
+                t2r_rmem_1,
+                Int32(logical_call_idx),
+            )

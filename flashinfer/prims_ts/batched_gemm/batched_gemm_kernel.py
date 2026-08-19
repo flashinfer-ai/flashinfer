@@ -3118,7 +3118,7 @@ def gemm(
     if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
         tma_store_cols = cfg.epi_tile_n
     else:
-        tma_store_cols = min(16, max(8, cfg.tile_n))
+        tma_store_cols = cfg.non_swap_tma_store_cols
     if cutlass.const_expr(cfg.has_epilogue_quant):
         if cutlass.const_expr(cfg.use_tma_store):
             if cutlass.const_expr(cfg.uses_mxfp8_output_quant):
@@ -3176,11 +3176,17 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
+            if cutlass.const_expr(cfg.dtype_c_bits == 16):
+                tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(
+                    tma_store_cols * 2
+                )
+            else:
+                tma_c_swizzle = cuda.TensorMapSwizzle.none
             tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                 tensor=c_tensor,
                 box_dims=(cfg.tile_m, tma_store_cols),
                 stride_order=(1, 0),
-                swizzle=cuda.TensorMapSwizzle.none,
+                swizzle=tma_c_swizzle,
                 tma_format=tma_c_format,
             )
 
