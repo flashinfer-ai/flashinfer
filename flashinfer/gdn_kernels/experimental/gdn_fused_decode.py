@@ -123,6 +123,34 @@ def gdn_fused_decode_step_supported(
     )
 
 
+def _scatter_live_rows(
+    pool: torch.Tensor,
+    slot: torch.Tensor,
+    pad: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """``pool[slot[i]] = rows[i]`` for every batch row ``i`` that is not padding.
+
+    ``index_copy_`` has no per-row mask, and compacting the live rows out of
+    the batch needs ``nonzero`` -- a device-to-host sync, which is illegal
+    inside a CUDA-graph capture, and this composable path is exactly what gets
+    captured for every shape the specialized kernels do not serve.  So the
+    padded rows are folded onto slot 0 and made to carry precisely the bytes
+    slot 0 must end up with: the new value of the live row that owns slot 0 if
+    there is one, otherwise slot 0's current content.  Every writer to the
+    duplicated destination then stores identical bytes, which makes
+    ``index_copy_``'s duplicate-index nondeterminism unobservable and leaves
+    every slot outside the live set byte-for-byte unchanged.
+    """
+    owns_zero = ~pad & (slot == 0)
+    # Unique argmax whenever a live row owns slot 0; the tie when none does is
+    # harmless because ``owns_zero.any()`` discards the value in that case.
+    donor = torch.argmax(owns_zero.to(torch.int64)).reshape(1)
+    slot_zero = torch.where(owns_zero.any(), rows.index_select(0, donor), pool[0:1])
+    mask = pad.reshape((-1,) + (1,) * (rows.dim() - 1))
+    pool.index_copy_(0, slot.clamp_min(0), torch.where(mask, slot_zero, rows))
+
+
 def _gdn_fused_decode_step_fallback(
     hidden_states: torch.Tensor,
     w_ba: torch.Tensor,
@@ -141,6 +169,8 @@ def _gdn_fused_decode_step_fallback(
     """Composable torch implementation (any CUDA arch); pools update in place.
 
     ``scale`` follows the public op: ``None`` or ``0.0`` means ``1/sqrt(D)``.
+    A negative ``state_indices`` entry marks a padded batch row: it leaves both
+    pools untouched and its output row is zero (see the op docstring).
     """
     B = hidden_states.shape[0]
     hv = A_log.shape[0]
@@ -150,6 +180,17 @@ def _gdn_fused_decode_step_fallback(
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(d)
     idx = state_indices.to(torch.long)
+    # Padding contract (see the op docstring and :func:`_scatter_live_rows`):
+    # a negative slot index is an inactive batch row.  Every gather below uses
+    # ``safe_idx`` so such a row reads slot 0 instead of running off the front
+    # of the pool -- torch's own negative-index rules are not the ones we want
+    # here (``index_select`` rejects them with a device-side assert, advanced
+    # indexing wraps to the END of the pool) -- and nothing it computes is ever
+    # written back.  A read of slot 0 has no side effect; a genuine per-row
+    # skip of the gather would need data-dependent compaction, which is not
+    # capture-safe, and the specialized kernels do that skip anyway.
+    pad = idx < 0
+    safe_idx = idx.clamp_min(0)
 
     # 1) in_proj_ba GEMV: bf16 operands, fp32 accumulation, bf16 result.
     ba = (hidden_states.float() @ w_ba.float()).to(torch.bfloat16)
@@ -158,14 +199,14 @@ def _gdn_fused_decode_step_fallback(
 
     # 2) causal conv1d update (depthwise, silu), fp32 math, bf16 out; the pool
     #    keeps the last width-1 raw inputs per channel and updates in place.
-    st = conv_state.index_select(0, idx)
+    st = conv_state.index_select(0, safe_idx)
     x_t = mixed_qkv.to(conv_state.dtype)
     window = torch.cat([st, x_t.unsqueeze(-1)], dim=-1)
     y = (window.float() * conv_weight.float().unsqueeze(0)).sum(dim=-1)
     y = y + conv_bias.float()
     y = y * torch.sigmoid(y)
     conv_out = y.to(torch.bfloat16)
-    conv_state.index_copy_(0, idx, window[..., 1:])
+    _scatter_live_rows(conv_state, idx, pad, window[..., 1:])
 
     # 3) q/k/v head split.
     q = conv_out[:, : h_q * d].view(B, h_q, d).float()
@@ -187,14 +228,18 @@ def _gdn_fused_decode_step_fallback(
     )  # (B, HV)
     beta = torch.sigmoid(b_gate.float())  # (B, HV)
 
-    state = ssm_state[idx]  # (B, HV, V, K) view gather -> copy
+    state = ssm_state[safe_idx]  # (B, HV, V, K) view gather -> copy
     state = state * g[:, :, None, None]
     old_v = torch.einsum("bhk,bhvk->bhv", k, state)
     delta = beta[:, :, None] * (v - old_v)
     state = state + delta[..., None] * k[:, :, None, :]
     attn_out = scale * torch.einsum("bhk,bhvk->bhv", q, state)
 
-    ssm_state[idx] = state
+    _scatter_live_rows(ssm_state, idx, pad, state)
+    # A padded row computed against a slot it does not own; the contract says
+    # its output row is zero.  masked_fill rather than a multiply: the gathered
+    # garbage can be non-finite and 0 * inf is NaN.
+    attn_out = attn_out.masked_fill(pad[:, None, None], 0.0)
     result = attn_out.unsqueeze(1).to(torch.bfloat16)
     if out is not None:
         out.copy_(result)
@@ -261,7 +306,30 @@ def gdn_fused_decode_step(
         K-last), row stride may be padded (``stride(0) >= HV*V*K``). Updated
         in place.
     state_indices : torch.Tensor
-        Per-batch pool slot indices of shape ``[B]``, int32.
+        Per-batch pool slot indices of shape ``[B]``, int32. Both pools are
+        indexed with the same value, so each batch entry reads and writes the
+        same slot.
+
+        **Padding / inactive rows**: a **negative** index (vLLM's
+        ``PAD_SLOT_ID`` is ``-1``) marks a batch entry that owns no pool
+        slot — the rows a CUDA-graph replay carries between the live request
+        count and the captured batch size. Such an entry is **skipped
+        entirely**: neither ``conv_state`` nor ``ssm_state`` is read or
+        written for it, and its ``output`` row is written as **zero**. This
+        is the same contract the float32 path of
+        :func:`~flashinfer.gated_delta_rule_decode_pretranspose` documents,
+        so the two FlashInfer GDN decode entry points treat padding
+        identically. The check is in-kernel by necessity: inspecting index
+        *values* on the host costs a device-to-host sync per layer per decode
+        step and is impossible under graph capture, which is the regime that
+        produces padded rows.
+
+        Indices ``>= P`` (the pool's leading extent) are a **caller bug, not
+        a padding convention**. They are deliberately neither clamped nor
+        skipped — clamping would corrupt a real slot silently and skipping
+        would turn an index-arithmetic error into a silently missing state
+        update — so the resulting access is out of bounds and its effect is
+        undefined. Only negative values mean padding.
     use_qk_l2norm : bool
         Apply L2 normalization to q and k. Default ``True``.
     out : torch.Tensor, optional

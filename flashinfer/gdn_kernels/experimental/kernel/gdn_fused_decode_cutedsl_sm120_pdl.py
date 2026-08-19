@@ -105,26 +105,35 @@ def pre_kernel(
         tile = bidx % NCONV
         c = tile * 256 + tidx
         pp = cutlass.Int32(state_indices[b_idx])
-        st0_bf = conv_state[pp, c, 0]
-        st1_bf = conv_state[pp, c, 1]
-        st2_bf = conv_state[pp, c, 2]
-        st0 = st0_bf.to(cutlass.Float32)
-        st1 = st1_bf.to(cutlass.Float32)
-        st2 = st2_bf.to(cutlass.Float32)
-        xbf = mixed_qkv[b_idx, c]
-        xx = xbf.to(cutlass.Float32)
-        w0 = conv_weight[c, 0].to(cutlass.Float32)
-        w1 = conv_weight[c, 1].to(cutlass.Float32)
-        w2 = conv_weight[c, 2].to(cutlass.Float32)
-        w3 = conv_weight[c, 3].to(cutlass.Float32)
-        bb = conv_bias[c].to(cutlass.Float32)
-        y = cutlass.Float32(st0 * w0 + st1 * w1 + st2 * w2 + xx * w3 + bb)
-        ey = cute.math.exp(cutlass.Float32(-y), fastmath=False)
-        yv = cutlass.Float32(y / cutlass.Float32(cutlass.Float32(1.0) + ey))
-        qkv_act[b_idx, c] = yv.to(cutlass.BFloat16)
-        conv_state[pp, c, 0] = st1_bf
-        conv_state[pp, c, 1] = st2_bf
-        conv_state[pp, c, 2] = xbf
+        # A negative slot index (vLLM's PAD_SLOT_ID = -1) marks a padded batch
+        # row -- what a CUDA-graph replay carries between the live request
+        # count and the captured batch size.  It owns no conv-state row, so
+        # neither read nor write one for it; ``delta_kernel`` skips the same
+        # row and zeroes its output.  The predicate depends only on ``bidx``,
+        # so it is block-uniform: one taken branch per block, not divergence.
+        # ``qkv_act`` is left untouched for such a row -- it is per-call
+        # scratch that only the skipped delta blocks would read.
+        if pp >= 0:
+            st0_bf = conv_state[pp, c, 0]
+            st1_bf = conv_state[pp, c, 1]
+            st2_bf = conv_state[pp, c, 2]
+            st0 = st0_bf.to(cutlass.Float32)
+            st1 = st1_bf.to(cutlass.Float32)
+            st2 = st2_bf.to(cutlass.Float32)
+            xbf = mixed_qkv[b_idx, c]
+            xx = xbf.to(cutlass.Float32)
+            w0 = conv_weight[c, 0].to(cutlass.Float32)
+            w1 = conv_weight[c, 1].to(cutlass.Float32)
+            w2 = conv_weight[c, 2].to(cutlass.Float32)
+            w3 = conv_weight[c, 3].to(cutlass.Float32)
+            bb = conv_bias[c].to(cutlass.Float32)
+            y = cutlass.Float32(st0 * w0 + st1 * w1 + st2 * w2 + xx * w3 + bb)
+            ey = cute.math.exp(cutlass.Float32(-y), fastmath=False)
+            yv = cutlass.Float32(y / cutlass.Float32(cutlass.Float32(1.0) + ey))
+            qkv_act[b_idx, c] = yv.to(cutlass.BFloat16)
+            conv_state[pp, c, 0] = st1_bf
+            conv_state[pp, c, 1] = st2_bf
+            conv_state[pp, c, 2] = xbf
     else:
         g = bidx - Bc * NCONV
         b_idx = g // KS
@@ -172,140 +181,154 @@ def delta_kernel(
 
     pp = cutlass.Int32(state_indices[b_idx])
 
-    # fp32 state loads issued before the PDL wait: pre_kernel never writes
-    # ssm_state, so these long-latency loads overlap its whole body.
-    k0 = lane
-    k1 = lane + 32
-    k2 = lane + 64
-    k3 = lane + 96
-    sv0 = ssm_state[pp, h, v, k0]
-    sv1 = ssm_state[pp, h, v, k1]
-    sv2 = ssm_state[pp, h, v, k2]
-    sv3 = ssm_state[pp, h, v, k3]
+    # A negative slot index (vLLM's PAD_SLOT_ID = -1) marks a padded batch
+    # row: it owns no pool slot, so neither state pool may be read or written
+    # for it and its output row is zero -- the same contract the fp32 path of
+    # gated_delta_rule_decode_pretranspose already documents.  The predicate
+    # depends only on bidx, so it is block-uniform: one taken branch per
+    # block, and the warp-wide shuffles below are never reached under a
+    # partial mask.  Both arms wait on PDL: the padded arm reads nothing
+    # pre_kernel wrote and would be correct without it, but keeping the wait
+    # uniform across blocks keeps the launch's dependency semantics simple.
+    if pp >= 0:
+        # fp32 state loads issued before the PDL wait: pre_kernel never writes
+        # ssm_state, so these long-latency loads overlap its whole body.
+        k0 = lane
+        k1 = lane + 32
+        k2 = lane + 64
+        k3 = lane + 96
+        sv0 = ssm_state[pp, h, v, k0]
+        sv1 = ssm_state[pp, h, v, k1]
+        sv2 = ssm_state[pp, h, v, k2]
+        sv3 = ssm_state[pp, h, v, k3]
 
-    cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()
 
-    qbase = qhd * D
-    kbase = H_Q * D + qhd * D
-    q0 = qkv_act[b_idx, qbase + k0].to(cutlass.Float32)
-    q1 = qkv_act[b_idx, qbase + k1].to(cutlass.Float32)
-    q2 = qkv_act[b_idx, qbase + k2].to(cutlass.Float32)
-    q3 = qkv_act[b_idx, qbase + k3].to(cutlass.Float32)
-    kk0 = qkv_act[b_idx, kbase + k0].to(cutlass.Float32)
-    kk1 = qkv_act[b_idx, kbase + k1].to(cutlass.Float32)
-    kk2 = qkv_act[b_idx, kbase + k2].to(cutlass.Float32)
-    kk3 = qkv_act[b_idx, kbase + k3].to(cutlass.Float32)
-    vvv = qkv_act[b_idx, 2 * H_Q * D + h * D + v].to(cutlass.Float32)
+        qbase = qhd * D
+        kbase = H_Q * D + qhd * D
+        q0 = qkv_act[b_idx, qbase + k0].to(cutlass.Float32)
+        q1 = qkv_act[b_idx, qbase + k1].to(cutlass.Float32)
+        q2 = qkv_act[b_idx, qbase + k2].to(cutlass.Float32)
+        q3 = qkv_act[b_idx, qbase + k3].to(cutlass.Float32)
+        kk0 = qkv_act[b_idx, kbase + k0].to(cutlass.Float32)
+        kk1 = qkv_act[b_idx, kbase + k1].to(cutlass.Float32)
+        kk2 = qkv_act[b_idx, kbase + k2].to(cutlass.Float32)
+        kk3 = qkv_act[b_idx, kbase + k3].to(cutlass.Float32)
+        vvv = qkv_act[b_idx, 2 * H_Q * D + h * D + v].to(cutlass.Float32)
 
-    # Redundant per-thread gate computation (no smem/sync needed). The fp32
-    # gate sums round through bf16 to match the composable path's GEMV output
-    # dtype before the sigmoid/softplus gates.
-    b_sum = part[b_idx, h]
-    a_sum = part[b_idx, HV + h]
-    b_bf = b_sum.to(cutlass.BFloat16).to(cutlass.Float32)
-    a_bf = a_sum.to(cutlass.BFloat16).to(cutlass.Float32)
-    eb = cute.math.exp(cutlass.Float32(-b_bf), fastmath=False)
-    beta = cutlass.Float32(1.0) / cutlass.Float32(cutlass.Float32(1.0) + eb)
-    dtb = dt_bias[h].to(cutlass.Float32)
-    x = cutlass.Float32(a_bf + dtb)
-    # softplus via the overflow-free identity
-    #     softplus(x) = max(x, 0) + log(1 + exp(-|x|)),
-    # branch-free.  The naive log(1 + exp(x)) sends exp(x) to +inf for
-    # x > ~88.7 in fp32, which collapses the decay gate to exactly 0 instead
-    # of exp(-exp(A_log) * x) -- a silently wrong gate whenever exp(A_log) is
-    # small enough for the true gate to stay O(1).  The identity agrees with
-    # torch.nn.functional.softplus (threshold=20, i.e. the composable path)
-    # and with the CUDA impl's `x > 20 ? x : log1p(exp(x))` to fp32 rounding
-    # over the whole range: worst case 1e-6 on the resulting gate, three
-    # orders below the bf16 tolerance the correctness tests use.
-    #
-    # ``max(x, 0)`` is built out of ``absf`` rather than a max primitive on
-    # purpose.  ``cute.math`` only gained ``max`` in nvidia-cutlass-dsl 4.6,
-    # where the module became a re-export of ``cutlass._mlir_helpers.math``;
-    # 4.5's hand-written ``cute.math`` exports 19 names and ``max`` is not
-    # among them, so ``cute.math.max`` raises AttributeError there.  ``absf``
-    # is in every release this repo supports -- 4.5 defines it, and 4.6+
-    # deliberately keeps ``absf`` as an alias of the new ``abs``.  The
-    # supported set is pinned by
-    # ``test_cutedsl_impl_only_uses_portable_cute_math_primitives``.
-    #
-    #     max(x, 0) == 0.5*x + 0.5*|x|
-    #
-    # exact in fp32 for either sign (halving is exact and the two halves are
-    # either equal or exact opposites) and, unlike ``0.5*(x + |x|)``, free of
-    # the overflow that doubling a large x would introduce.
-    x_abs = cute.math.absf(x, fastmath=False)
-    x_pos = cutlass.Float32(cutlass.Float32(0.5) * x + cutlass.Float32(0.5) * x_abs)
-    ex = cute.math.exp(cutlass.Float32(-x_abs), fastmath=False)
-    sp = cutlass.Float32(
-        x_pos
-        + cute.math.log(cutlass.Float32(cutlass.Float32(1.0) + ex), fastmath=False)
-    )
-    eal = cute.math.exp(A_log[h], fastmath=False)
-    arg = cutlass.Float32(-cutlass.Float32(eal * sp))
-    g = cute.math.exp(arg, fastmath=False)
+        # Redundant per-thread gate computation (no smem/sync needed). The fp32
+        # gate sums round through bf16 to match the composable path's GEMV output
+        # dtype before the sigmoid/softplus gates.
+        b_sum = part[b_idx, h]
+        a_sum = part[b_idx, HV + h]
+        b_bf = b_sum.to(cutlass.BFloat16).to(cutlass.Float32)
+        a_bf = a_sum.to(cutlass.BFloat16).to(cutlass.Float32)
+        eb = cute.math.exp(cutlass.Float32(-b_bf), fastmath=False)
+        beta = cutlass.Float32(1.0) / cutlass.Float32(cutlass.Float32(1.0) + eb)
+        dtb = dt_bias[h].to(cutlass.Float32)
+        x = cutlass.Float32(a_bf + dtb)
+        # softplus via the overflow-free identity
+        #     softplus(x) = max(x, 0) + log(1 + exp(-|x|)),
+        # branch-free.  The naive log(1 + exp(x)) sends exp(x) to +inf for
+        # x > ~88.7 in fp32, which collapses the decay gate to exactly 0 instead
+        # of exp(-exp(A_log) * x) -- a silently wrong gate whenever exp(A_log) is
+        # small enough for the true gate to stay O(1).  The identity agrees with
+        # torch.nn.functional.softplus (threshold=20, i.e. the composable path)
+        # and with the CUDA impl's `x > 20 ? x : log1p(exp(x))` to fp32 rounding
+        # over the whole range: worst case 1e-6 on the resulting gate, three
+        # orders below the bf16 tolerance the correctness tests use.
+        #
+        # ``max(x, 0)`` is built out of ``absf`` rather than a max primitive on
+        # purpose.  ``cute.math`` only gained ``max`` in nvidia-cutlass-dsl 4.6,
+        # where the module became a re-export of ``cutlass._mlir_helpers.math``;
+        # 4.5's hand-written ``cute.math`` exports 19 names and ``max`` is not
+        # among them, so ``cute.math.max`` raises AttributeError there.  ``absf``
+        # is in every release this repo supports -- 4.5 defines it, and 4.6+
+        # deliberately keeps ``absf`` as an alias of the new ``abs``.  The
+        # supported set is pinned by
+        # ``test_cutedsl_impl_only_uses_portable_cute_math_primitives``.
+        #
+        #     max(x, 0) == 0.5*x + 0.5*|x|
+        #
+        # exact in fp32 for either sign (halving is exact and the two halves are
+        # either equal or exact opposites) and, unlike ``0.5*(x + |x|)``, free of
+        # the overflow that doubling a large x would introduce.
+        x_abs = cute.math.absf(x, fastmath=False)
+        x_pos = cutlass.Float32(cutlass.Float32(0.5) * x + cutlass.Float32(0.5) * x_abs)
+        ex = cute.math.exp(cutlass.Float32(-x_abs), fastmath=False)
+        sp = cutlass.Float32(
+            x_pos
+            + cute.math.log(cutlass.Float32(cutlass.Float32(1.0) + ex), fastmath=False)
+        )
+        eal = cute.math.exp(A_log[h], fastmath=False)
+        arg = cutlass.Float32(-cutlass.Float32(eal * sp))
+        g = cute.math.exp(arg, fastmath=False)
 
-    qsq = cutlass.Float32(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
-    ksq = cutlass.Float32(kk0 * kk0 + kk1 * kk1 + kk2 * kk2 + kk3 * kk3)
-    qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 16)
-    qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 8)
-    qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 4)
-    qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 2)
-    qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 1)
-    ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 16)
-    ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 8)
-    ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 4)
-    ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 2)
-    ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 1)
-    q_rms = cute.math.rsqrt(
-        cutlass.Float32(qsq + cutlass.Float32(1e-6)), fastmath=False
-    )
-    k_rms = cute.math.rsqrt(
-        cutlass.Float32(ksq + cutlass.Float32(1e-6)), fastmath=False
-    )
-    qn0 = cutlass.Float32(q0 * q_rms)
-    qn1 = cutlass.Float32(q1 * q_rms)
-    qn2 = cutlass.Float32(q2 * q_rms)
-    qn3 = cutlass.Float32(q3 * q_rms)
-    kn0 = cutlass.Float32(kk0 * k_rms)
-    kn1 = cutlass.Float32(kk1 * k_rms)
-    kn2 = cutlass.Float32(kk2 * k_rms)
-    kn3 = cutlass.Float32(kk3 * k_rms)
+        qsq = cutlass.Float32(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
+        ksq = cutlass.Float32(kk0 * kk0 + kk1 * kk1 + kk2 * kk2 + kk3 * kk3)
+        qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 16)
+        qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 8)
+        qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 4)
+        qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 2)
+        qsq = qsq + cute.arch.shuffle_sync_bfly(qsq, 1)
+        ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 16)
+        ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 8)
+        ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 4)
+        ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 2)
+        ksq = ksq + cute.arch.shuffle_sync_bfly(ksq, 1)
+        q_rms = cute.math.rsqrt(
+            cutlass.Float32(qsq + cutlass.Float32(1e-6)), fastmath=False
+        )
+        k_rms = cute.math.rsqrt(
+            cutlass.Float32(ksq + cutlass.Float32(1e-6)), fastmath=False
+        )
+        qn0 = cutlass.Float32(q0 * q_rms)
+        qn1 = cutlass.Float32(q1 * q_rms)
+        qn2 = cutlass.Float32(q2 * q_rms)
+        qn3 = cutlass.Float32(q3 * q_rms)
+        kn0 = cutlass.Float32(kk0 * k_rms)
+        kn1 = cutlass.Float32(kk1 * k_rms)
+        kn2 = cutlass.Float32(kk2 * k_rms)
+        kn3 = cutlass.Float32(kk3 * k_rms)
 
-    ov = cutlass.Float32(
-        kn0 * cutlass.Float32(g * sv0)
-        + kn1 * cutlass.Float32(g * sv1)
-        + kn2 * cutlass.Float32(g * sv2)
-        + kn3 * cutlass.Float32(g * sv3)
-    )
-    ov = ov + cute.arch.shuffle_sync_bfly(ov, 16)
-    ov = ov + cute.arch.shuffle_sync_bfly(ov, 8)
-    ov = ov + cute.arch.shuffle_sync_bfly(ov, 4)
-    ov = ov + cute.arch.shuffle_sync_bfly(ov, 2)
-    ov = ov + cute.arch.shuffle_sync_bfly(ov, 1)
-    old_v = ov  # all lanes hold the sum
-    new_v = cutlass.Float32(
-        beta * vvv + cutlass.Float32(cutlass.Float32(1.0) - beta) * old_v
-    )
-    d = cutlass.Float32(new_v - old_v)
+        ov = cutlass.Float32(
+            kn0 * cutlass.Float32(g * sv0)
+            + kn1 * cutlass.Float32(g * sv1)
+            + kn2 * cutlass.Float32(g * sv2)
+            + kn3 * cutlass.Float32(g * sv3)
+        )
+        ov = ov + cute.arch.shuffle_sync_bfly(ov, 16)
+        ov = ov + cute.arch.shuffle_sync_bfly(ov, 8)
+        ov = ov + cute.arch.shuffle_sync_bfly(ov, 4)
+        ov = ov + cute.arch.shuffle_sync_bfly(ov, 2)
+        ov = ov + cute.arch.shuffle_sync_bfly(ov, 1)
+        old_v = ov  # all lanes hold the sum
+        new_v = cutlass.Float32(
+            beta * vvv + cutlass.Float32(cutlass.Float32(1.0) - beta) * old_v
+        )
+        d = cutlass.Float32(new_v - old_v)
 
-    hs0 = cutlass.Float32(g * sv0 + kn0 * d)
-    hs1 = cutlass.Float32(g * sv1 + kn1 * d)
-    hs2 = cutlass.Float32(g * sv2 + kn2 * d)
-    hs3 = cutlass.Float32(g * sv3 + kn3 * d)
-    ssm_state[pp, h, v, k0] = hs0
-    ssm_state[pp, h, v, k1] = hs1
-    ssm_state[pp, h, v, k2] = hs2
-    ssm_state[pp, h, v, k3] = hs3
-    outp = cutlass.Float32(qn0 * hs0 + qn1 * hs1 + qn2 * hs2 + qn3 * hs3)
-    outp = outp + cute.arch.shuffle_sync_bfly(outp, 16)
-    outp = outp + cute.arch.shuffle_sync_bfly(outp, 8)
-    outp = outp + cute.arch.shuffle_sync_bfly(outp, 4)
-    outp = outp + cute.arch.shuffle_sync_bfly(outp, 2)
-    outp = outp + cute.arch.shuffle_sync_bfly(outp, 1)
-    if lane == 0:
-        out_v = cutlass.Float32(outp * cutlass.Float32(scale))
-        output[b_idx, 0, h, v] = out_v.to(cutlass.BFloat16)
+        hs0 = cutlass.Float32(g * sv0 + kn0 * d)
+        hs1 = cutlass.Float32(g * sv1 + kn1 * d)
+        hs2 = cutlass.Float32(g * sv2 + kn2 * d)
+        hs3 = cutlass.Float32(g * sv3 + kn3 * d)
+        ssm_state[pp, h, v, k0] = hs0
+        ssm_state[pp, h, v, k1] = hs1
+        ssm_state[pp, h, v, k2] = hs2
+        ssm_state[pp, h, v, k3] = hs3
+        outp = cutlass.Float32(qn0 * hs0 + qn1 * hs1 + qn2 * hs2 + qn3 * hs3)
+        outp = outp + cute.arch.shuffle_sync_bfly(outp, 16)
+        outp = outp + cute.arch.shuffle_sync_bfly(outp, 8)
+        outp = outp + cute.arch.shuffle_sync_bfly(outp, 4)
+        outp = outp + cute.arch.shuffle_sync_bfly(outp, 2)
+        outp = outp + cute.arch.shuffle_sync_bfly(outp, 1)
+        if lane == 0:
+            out_v = cutlass.Float32(outp * cutlass.Float32(scale))
+            output[b_idx, 0, h, v] = out_v.to(cutlass.BFloat16)
+    else:
+        cute.arch.griddepcontrol_wait()
+        if lane == 0:
+            output[b_idx, 0, h, v] = cutlass.BFloat16(0.0)
 
 
 @cute.jit

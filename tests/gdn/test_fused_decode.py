@@ -34,6 +34,12 @@ flashinfer/gdn_kernels/experimental/README.md):
 - the gate numerics where random inputs never go: a decay-gate input past
   the fp32 exp() overflow point must still track the composable path, so no
   impl can ship a softplus that silently collapses the gate to zero;
+- the batch SHAPE random inputs never produce either: padded rows carrying
+  vLLM's PAD_SLOT_ID (-1), which a CUDA-graph replay hands to every
+  registered batch size.  Every path must skip such a row rather than use
+  it as a pool offset, and the pools are allocated behind a guard region so
+  "wrote in front of the pool base" is an assertion rather than corruption
+  of an unrelated allocation;
 - the internal preference order (cute_dsl before cuda) and its fallthrough
   to the composable path;
 - no environment gate: the retired kill switch (and any other
@@ -452,6 +458,292 @@ def test_saturated_decay_gate_matches_composable(impl_name: str, B: int, monkeyp
     assert ref_ssm.abs().max() > 1e-2, "reference gate must not be degenerate"
     torch.testing.assert_close(out, ref_out, atol=ATOL, rtol=RTOL)
     torch.testing.assert_close(ssm_state, ref_ssm, atol=ATOL, rtol=RTOL)
+
+
+# ===========================================================================
+# Padded batch rows (a negative state index == vLLM's PAD_SLOT_ID)
+# ===========================================================================
+# A CUDA-graph replay carries the captured batch size, not the live request
+# count, and vLLM fills the rows in between with PAD_SLOT_ID = -1.  The
+# registry ships exactly the capture sizes (1/2/4/8), so this shape reaches
+# the kernels in production -- while every random-input test above hands out
+# one distinct, valid slot per row and therefore never produces it.
+#
+# The pools are allocated with unused slots IN FRONT of the base, because the
+# failure this pins is not a wrong number: a negative index multiplies the
+# page stride, so the read and the write land *below* the pool.  One guard
+# slot is exactly enough -- the most negative offset either kernel can form is
+# -1 * page_stride -- and it turns "corrupts whatever the allocator handed out
+# next" into an assertion this file can make.
+PAD_GUARD_SLOTS = 1
+PAD_POOL = 8  # >= the largest batch the padded cases below use
+PAD_CONV_SLOT_ELEMS = CONV_STATE_LEN * QKV_DIM
+PAD_SSM_SLOT_ELEMS = HV * D * D
+
+PAD_CASES = {
+    # The minimal reproducer: one live row, one padded row.
+    "one_live_one_pad": (2, [4, -1]),
+    # The shape serving actually produces: a graph captured at batch 8
+    # replaying with three live requests.
+    "graph_b8_three_live": (8, [5, 2, 7, -1, -1, -1, -1, -1]),
+}
+
+
+def _pad_pool_views(conv_backing: torch.Tensor, ssm_backing: torch.Tensor):
+    """The (conv_state, ssm_state) op views over guard-prefixed backings."""
+    return (
+        conv_backing[PAD_GUARD_SLOTS:].transpose(-1, -2),
+        ssm_backing.as_strided(
+            (PAD_POOL, HV, D, D),
+            (PADDED_ROW_STRIDE, D * D, D, 1),
+            PAD_GUARD_SLOTS * PADDED_ROW_STRIDE,
+        ),
+    )
+
+
+def _make_padded_inputs(B: int, slots, *, seed: int, device="cuda"):
+    """One input set for the registered geometry with an explicit index vector.
+
+    ``slots`` is the exact per-row ``state_indices`` content (``-1`` marking a
+    padded row).  Returns the op kwargs plus the two backing allocations, whose
+    leading ``PAD_GUARD_SLOTS`` slots are not part of the pools and must stay
+    untouched.  The ssm pool keeps vLLM's padded page stride, which is also
+    what makes the out-of-bounds offset land squarely inside the guard.
+    """
+    assert len(slots) == B
+    assert all(s < PAD_POOL for s in slots)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    conv_backing = (
+        torch.randn(
+            PAD_GUARD_SLOTS + PAD_POOL, CONV_STATE_LEN, QKV_DIM, device=device
+        ).bfloat16()
+        * 0.5
+    )
+    ssm_backing = (
+        torch.randn(
+            (PAD_GUARD_SLOTS + PAD_POOL) * PADDED_ROW_STRIDE, device=device
+        ).float()
+        * 0.05
+    )
+    conv_state, ssm_state = _pad_pool_views(conv_backing, ssm_backing)
+    inputs = {
+        "hidden_states": torch.randn(B, HIDDEN, device=device).bfloat16() * 0.5,
+        "w_ba": torch.randn(HIDDEN, N_BA, device=device).bfloat16() * 0.02,
+        "mixed_qkv": (torch.randn(B, QKV_DIM + 2048, device=device).bfloat16() * 0.5)[
+            :, :QKV_DIM
+        ],
+        "conv_weight": torch.randn(QKV_DIM, CONV_WIDTH, device=device).bfloat16() * 0.3,
+        "conv_bias": torch.randn(QKV_DIM, device=device).bfloat16() * 0.1,
+        "conv_state": conv_state,
+        "A_log": torch.randn(HV, device=device).float() * 0.5,
+        "dt_bias": torch.randn(HV, device=device).bfloat16() * 0.1,
+        "scale": 1.0 / math.sqrt(D),
+        "ssm_state": ssm_state,
+        "state_indices": torch.tensor(slots, dtype=torch.int32, device=device),
+        "use_qk_l2norm": True,
+    }
+    return inputs, conv_backing, ssm_backing
+
+
+def _run_padded_reference(inputs: dict, conv_backing, ssm_backing):
+    """Composable-path result on cloned pools, so the fused call can be
+    compared against it without either run seeing the other's mutations."""
+    conv_clone, ssm_clone = conv_backing.clone(), ssm_backing.clone()
+    conv_state, ssm_state = _pad_pool_views(conv_clone, ssm_clone)
+    out, _, _ = gfd._gdn_fused_decode_step_fallback(
+        inputs["hidden_states"],
+        inputs["w_ba"],
+        inputs["mixed_qkv"],
+        inputs["conv_weight"],
+        inputs["conv_bias"],
+        conv_state,
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["scale"],
+        ssm_state,
+        inputs["state_indices"],
+        inputs["use_qk_l2norm"],
+    )
+    return out, conv_clone, ssm_clone
+
+
+def _assert_only_live_slots_changed(
+    backing, before, slots, *, slot_elems: int, slot_stride: int, name: str
+) -> None:
+    """Every element outside the live slots' own rows is byte-identical.
+
+    Covers the guard region in front of the pool, the slots no batch row
+    named, and -- for the ssm pool -- the padding between page strides.  The
+    check is on BYTES, not on a tolerance: this is the property that actually
+    failed, and nothing here is supposed to be recomputed.
+    """
+    base = PAD_GUARD_SLOTS * slot_stride
+    flat, flat_before = backing.reshape(-1), before.reshape(-1)
+    assert torch.equal(flat[:base], flat_before[:base]), (
+        f"{name}: memory BEFORE the pool base was written -- a negative "
+        f"state index was used as a pool offset"
+    )
+    restored = flat.clone()
+    for slot in sorted({int(s) for s in slots if s >= 0}):
+        lo = base + slot * slot_stride
+        restored[lo : lo + slot_elems] = flat_before[lo : lo + slot_elems]
+    assert torch.equal(restored, flat_before), (
+        f"{name}: a slot outside the live set changed"
+    )
+
+
+def _assert_padded_call_is_correct(inputs, conv_backing, ssm_backing, slots) -> None:
+    """Run the op over ``inputs`` and check the whole padding contract."""
+    live = [i for i, slot in enumerate(slots) if slot >= 0]
+    padded = [i for i, slot in enumerate(slots) if slot < 0]
+    assert live and padded, "the case must have both live and padded rows"
+
+    ref_out, ref_conv, ref_ssm = _run_padded_reference(
+        inputs, conv_backing, ssm_backing
+    )
+    conv_before, ssm_before = conv_backing.clone(), ssm_backing.clone()
+    out, _, _ = gdn_fused_decode_step(**inputs)
+
+    # (a) live rows agree with the composable path, pools included.
+    torch.testing.assert_close(out[live], ref_out[live], atol=ATOL, rtol=RTOL)
+    for slot in {int(slots[i]) for i in live}:
+        assert torch.equal(
+            conv_backing[PAD_GUARD_SLOTS + slot], ref_conv[PAD_GUARD_SLOTS + slot]
+        )
+    ref_ssm_view = _pad_pool_views(ref_conv, ref_ssm)[1]
+    for slot in {int(slots[i]) for i in live}:
+        torch.testing.assert_close(
+            inputs["ssm_state"][slot], ref_ssm_view[slot], atol=ATOL, rtol=RTOL
+        )
+
+    # (b) padded rows are exactly zero, not merely small or finite.
+    assert torch.count_nonzero(out[padded]) == 0, (
+        "padded batch rows must produce a zero output row"
+    )
+
+    # (c)+(d) neither pool changed outside the live slots, and nothing was
+    # written in front of either pool base.
+    _assert_only_live_slots_changed(
+        conv_backing,
+        conv_before,
+        slots,
+        slot_elems=PAD_CONV_SLOT_ELEMS,
+        slot_stride=PAD_CONV_SLOT_ELEMS,
+        name="conv_state pool",
+    )
+    _assert_only_live_slots_changed(
+        ssm_backing,
+        ssm_before,
+        slots,
+        slot_elems=PAD_SSM_SLOT_ELEMS,
+        slot_stride=PADDED_ROW_STRIDE,
+        name="ssm_state pool",
+    )
+    # The composable path is held to the same contract, on its own clones.
+    _assert_only_live_slots_changed(
+        ref_conv,
+        conv_before,
+        slots,
+        slot_elems=PAD_CONV_SLOT_ELEMS,
+        slot_stride=PAD_CONV_SLOT_ELEMS,
+        name="conv_state pool (composable path)",
+    )
+    _assert_only_live_slots_changed(
+        ref_ssm,
+        ssm_before,
+        slots,
+        slot_elems=PAD_SSM_SLOT_ELEMS,
+        slot_stride=PADDED_ROW_STRIDE,
+        name="ssm_state pool (composable path)",
+    )
+    assert torch.count_nonzero(ref_out[padded]) == 0
+
+
+@pytest.mark.parametrize("impl_name", SHIPPED_IMPLS)
+@pytest.mark.parametrize("case", sorted(PAD_CASES))
+def test_padded_state_indices_are_skipped(impl_name: str, case: str, monkeypatch):
+    """A negative state index must skip the row, not index below the pool.
+
+    ``state_indices`` carries no in-band "inactive" value other than a
+    negative one, and both pools are addressed as ``index * page_stride``, so
+    an unguarded negative index reads AND writes memory in front of the pool
+    -- silently, with a finite-looking output and no CUDA error.  Every
+    shipped impl must instead skip such a row entirely (no pool read, no pool
+    write) and write its output row as zero, which is the contract
+    ``gated_delta_rule_decode_pretranspose``'s float32 path already documents.
+
+    Asserted here: live rows still match the composable path; padded rows are
+    exactly zero; and -- the property that actually failed -- no byte outside
+    the live slots changes, including the guard region allocated in front of
+    each pool base.
+    """
+    _skip_if_no_specialized()
+    impl = _impl(impl_name)
+    B, slots = PAD_CASES[case]
+
+    inputs, conv_backing, ssm_backing = _make_padded_inputs(B, slots, seed=20260819 + B)
+    assert {row["impl"] for row in _matched_rows(inputs)} >= {impl_name}, (
+        "test geometry must be registered for this impl"
+    )
+    _restrict_registry_to(monkeypatch, impl_name)
+
+    launches_before = impl.launch_count()
+    _assert_padded_call_is_correct(inputs, conv_backing, ssm_backing, slots)
+    assert impl.launch_count() == launches_before + 1, (
+        "the specialized impl must have served the call, or this test proves "
+        "nothing about the kernel"
+    )
+
+
+@pytest.mark.parametrize("case", sorted(PAD_CASES))
+def test_padded_state_indices_on_the_composable_path(case: str, monkeypatch):
+    """The composable path owes the caller the same padding contract.
+
+    It serves every geometry the registry does not list, so a consumer that
+    passes PAD_SLOT_ID must not get one answer from the kernels and another
+    (here: an unrecoverable device-side assert out of ``index_select``) from
+    the fallback.  The registry is emptied rather than the batch changed, so
+    the case is identical to the dispatched one.
+    """
+    _skip_if_no_cuda()
+    B, slots = PAD_CASES[case]
+    monkeypatch.setattr(specialized_gdn, "load_gdn_fused_decode_registry", lambda: ())
+    inputs, conv_backing, ssm_backing = _make_padded_inputs(B, slots, seed=20260819 + B)
+    assert not _matched_rows(inputs)
+    _assert_padded_call_is_correct(inputs, conv_backing, ssm_backing, slots)
+
+
+def test_padded_rows_do_not_disturb_the_live_rows():
+    """Padding rows onto a batch must not change what the live rows compute.
+
+    The statement a serving stack actually depends on: a graph captured at 8
+    replaying with three live requests must give those three requests the same
+    answer -- output and both pool slots -- as a batch of 8 in which the same
+    three rows are live and the rest happen to hold real slots.  Same batch
+    size, so the same compiled kernel variant serves both, and the rows are
+    independent by construction; only the padding differs.  A kernel that
+    "handled" padding by folding the padded rows onto some real slot would
+    pass the zero-output check above and fail this one.
+    """
+    _skip_if_no_specialized()
+    live = [5, 2, 7]
+    padded_slots = live + [-1] * 5
+    # The same batch with the trailing rows pointed at their own real slots.
+    all_live_slots = live + [0, 1, 3, 4, 6]
+
+    padded_inputs = _make_padded_inputs(8, padded_slots, seed=20260819)[0]
+    out_padded, padded_conv, padded_ssm = gdn_fused_decode_step(**padded_inputs)
+
+    dense_inputs = _make_padded_inputs(8, all_live_slots, seed=20260819)[0]
+    out_dense, dense_conv, dense_ssm = gdn_fused_decode_step(**dense_inputs)
+
+    torch.testing.assert_close(out_padded[:3], out_dense[:3], atol=ATOL, rtol=RTOL)
+    for slot in live:
+        assert torch.equal(padded_conv[slot], dense_conv[slot])
+        torch.testing.assert_close(
+            padded_ssm[slot], dense_ssm[slot], atol=ATOL, rtol=RTOL
+        )
 
 
 def test_internal_preference_is_cutedsl_then_cuda(monkeypatch):

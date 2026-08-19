@@ -108,6 +108,20 @@ __device__ __forceinline__ void grid_barrier(volatile unsigned* barrier, int nbl
 // their long-scoreboard latency overlaps the gemv/conv phases (the state pool
 // is only written after the barrier, each row by the warp that prefetched it).
 //
+// Padded batch rows: a NEGATIVE state index (vLLM's PAD_SLOT_ID = -1) marks a
+// batch row that owns no pool slot -- what a CUDA-graph replay carries in the
+// rows between the live request count and the captured batch size. Such a row
+// is skipped in every phase that touches a pool (no read and no write of
+// conv_state / ssm_state) and its output rows are written as zero, matching
+// the fp32 path of gated_delta_rule_decode_pretranspose. The check has to be
+// here rather than on the host: reading index VALUES host-side costs a
+// device-to-host sync per layer per decode step and is impossible under graph
+// capture. Each guard is uniform over the threads that share a batch row
+// (warp-uniform in the delta phase, where the warp-wide shuffles below make
+// divergence unacceptable), so it costs one predicated branch, not divergence.
+// Indices >= P are NOT padding and are not checked -- see the note on
+// state_indices in the FFI entry point below.
+//
 // Aliasing: the op updates both state pools IN PLACE, so the launcher passes
 // the same pointer for (conv_state, updated_conv) and for (ssm_state,
 // ssm_out).  Those four parameters therefore carry no __restrict__ -- the
@@ -180,6 +194,10 @@ __global__ void gdn_fused_decode_kernel(
       c = t % QKV_DIM;
     }
     int idx = state_indices[b];
+    // Padded row: owns no conv-state slot, so neither shift it nor append to
+    // it. conv_out for this row stays whatever the scratch held -- the delta
+    // phase skips the same row, so nothing reads it.
+    if (idx < 0) continue;
     // conv_state addressing is stride-parameterized: the pool arrives as a
     // logical [P, QKV_DIM, CONV_STATE_LEN] view of either a DS-dense pool
     // (strides p,3,1 -> per-thread 3-element rows) or a transposed SD pool
@@ -228,10 +246,15 @@ __global__ void gdn_fused_decode_kernel(
       b = tmp / HV;
     }
     int idx = state_indices[b];
-    pre_row_base = (long)idx * state_stride_0 + (long)h * (D * D);
-    const float4* base_srow = (const float4*)(ssm_state + pre_row_base + (long)v0 * D);
+    // A padded row has no state row to prefetch. pre_row_base stays -1, which
+    // no live row_base can equal, so the delta phase never mistakes the
+    // (unwritten) s_pre registers for this warp's prefetched rows.
+    if (idx >= 0) {
+      pre_row_base = (long)idx * state_stride_0 + (long)h * (D * D);
+      const float4* base_srow = (const float4*)(ssm_state + pre_row_base + (long)v0 * D);
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_WARP; ++r) s_pre[r] = base_srow[r * (D / 4) + lane];
+      for (int r = 0; r < ROWS_PER_WARP; ++r) s_pre[r] = base_srow[r * (D / 4) + lane];
+    }
   }
 
   grid_barrier(barrier, gridDim.x);
@@ -258,6 +281,19 @@ __global__ void gdn_fused_decode_kernel(
     const bf16* kb = co + H_Q * D + j * D;
     int k0 = lane * 4;
     int idx = state_indices[b];
+    if (idx < 0) {
+      // Padded row: no state row to read or write; its output rows are zero.
+      // b (hence idx) is warp-uniform -- first_row is a multiple of
+      // ROWS_PER_WARP and the whole warp shares w -- so the whole warp takes
+      // this branch together and the warp-wide shuffles below are never
+      // reached with a partial mask.
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r)
+          output[((long)b * HV + h) * D + v0 + r] = __float2bfloat16(0.0f);
+      }
+      continue;
+    }
     long row_base = (long)idx * state_stride_0 + (long)h * (D * D);
     float4 s4[ROWS_PER_WARP];
     if (w == gwarp && row_base == pre_row_base) {
@@ -487,6 +523,21 @@ void gdn_fused_decode(TensorView hidden_states, TensorView w_ba, TensorView mixe
   TVM_FFI_ICHECK_EQ(ssm_state.size(1), HV);
   TVM_FFI_ICHECK_EQ(ssm_state.size(2), D);
   TVM_FFI_ICHECK_EQ(ssm_state.size(3), D);
+  // state_indices holds SHAPE checks only, deliberately. Its VALUES are a
+  // per-row property that lives on the device: a host-side range check would
+  // need a device-to-host copy of the index vector on every layer of every
+  // decode step, and cannot run at all inside a CUDA-graph capture (which is
+  // the regime that produces padded rows in the first place). So the two value
+  // classes are handled where they can be:
+  //  - NEGATIVE (vLLM's PAD_SLOT_ID = -1) is the padding convention. The
+  //    kernel skips those rows entirely -- neither pool is read or written --
+  //    and zeroes their output rows, matching the fp32 path of
+  //    gated_delta_rule_decode_pretranspose.
+  //  - >= P (the pool's leading extent) is a CALLER BUG, not padding, and is
+  //    left undefined rather than clamped or silently skipped: clamping would
+  //    corrupt a real slot without a diagnostic, and skipping would turn a
+  //    caller's index arithmetic error into silently missing state updates.
+  //    Conflating it with -1 would make both failure modes invisible.
   TVM_FFI_ICHECK_EQ(state_indices.size(0), B);
   TVM_FFI_ICHECK_EQ(output.size(0), B);
   TVM_FFI_ICHECK_EQ(output.size(1), 1);

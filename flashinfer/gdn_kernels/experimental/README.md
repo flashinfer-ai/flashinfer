@@ -235,6 +235,15 @@ Field semantics (schema_version 1):
   is checked by the dispatch guard
   (`signature_from_tensors`).  Kernels needing different dtypes or scale
   semantics need a `schema_version` bump.
+- `state_indices` **values** are not per-row either, and are not checked by
+  the dispatch guard at all — they live on the device, and reading them
+  host-side would cost a device-to-host sync per layer per decode step and
+  is impossible under CUDA-graph capture.  A **negative** index (vLLM's
+  `PAD_SLOT_ID = -1`) marks a padded batch row: every implementation must
+  leave both pools untouched for it and write its output row as zero, the
+  same contract `gated_delta_rule_decode_pretranspose`'s float32 path
+  documents.  An index `>= P` is a caller bug, is deliberately neither
+  clamped nor skipped, and is undefined.
 
 Matching is exact equality of every signature field plus the device's `cc`.
 Rows must describe the *complete* dispatch surface: anything not matched is
@@ -278,7 +287,13 @@ dispatch, kernel or consumer code has to move.
      conv_state, A_log, dt_bias, scale, ssm_state, state_indices, out=None)
      -> (output, conv_state, ssm_state)` — run the fused step on the
      caller's current stream, updating both pools in place; compile lazily
-     on eager calls; raise on failure.
+     on eager calls; raise on failure.  **Padded rows**: for any batch row
+     whose `state_indices` entry is negative, touch neither pool (no read
+     and no write) and write that row's `output` as zero.  The guard belongs
+     in the kernel — the host cannot look at index values without a sync,
+     and the shape that carries padding is the CUDA-graph one.  Make the
+     predicate uniform over whatever unit shares a batch row (block or warp)
+     so it costs a branch rather than divergence.
    - `ready_for_graph_capture(hidden_states, conv_state, scale) -> bool` —
      True only when this exact call can be recorded into a CUDA graph
      without compiling, synchronizing, or allocating persistent state.
