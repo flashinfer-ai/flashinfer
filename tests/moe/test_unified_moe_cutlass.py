@@ -12,7 +12,6 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CutlassBf16Config,
     CutlassBf16Runner,
-    CutlassConfig,
     CutlassFp8BlockConfig,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig,
@@ -91,10 +90,6 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert not CutlassW4A8Config.supported(100)
     assert not CutlassHummingConfig.supported(100)
     assert not CutlassBf16Config.supported(130)
-    assert CutlassConfig is not CutlassBf16Config
-    assert not CutlassConfig.supported(90)
-    assert BackendOptions((CutlassConfig(),)).valid_for(90) == []
-    assert CutlassConfig not in _BACKEND_RUNNERS
     assert _BACKEND_RUNNERS[CutlassBf16Config] is CutlassBf16Runner
     assert _BACKEND_RUNNERS[CutlassNvfp4Config] is CutlassNvfp4Runner
     assert _BACKEND_RUNNERS[CutlassW4A16Config] is CutlassW4A16Runner
@@ -184,11 +179,6 @@ def test_failed_support_check_does_not_authorize_build():
         runner.check_support()
     with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
         runner.build()
-
-
-def test_legacy_cutlass_config_is_deprecated():
-    with pytest.warns(DeprecationWarning, match="CutlassConfig is deprecated"):
-        CutlassConfig()
 
 
 def test_prepare_cutlass_bf16_weights_preserves_canonical_layout():
@@ -691,16 +681,6 @@ def test_cutlass_direct_execution_requires_explicit_build(monkeypatch, execute):
         execute(runner)
 
     assert backend_calls == []
-
-
-def test_legacy_cutlass_config_is_not_runnable(monkeypatch):
-    from flashinfer.fused_moe import layer as layer_module
-
-    monkeypatch.setattr(layer_module, "get_compute_capability", lambda device: (9, 0))
-    config = _config(backend=BackendOptions((CutlassConfig(),)))
-
-    with pytest.raises(RuntimeError, match="none of the configured backends"):
-        MoELayer(config, device=torch.device("cuda"))
 
 
 def test_cutlass_autotuner_preparation_initializes_both_gemms():

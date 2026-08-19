@@ -32,7 +32,6 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-from typing_extensions import deprecated
 
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
@@ -578,33 +577,6 @@ class TrtllmMxInt4Config:
         return "TrtllmMxInt4Config()"
 
 
-@deprecated(
-    "CutlassConfig is deprecated and non-runnable; use a quant-specific "
-    "Cutlass*Config (CutlassBf16Config, CutlassNvfp4Config, ...) instead."
-)
-@dataclass(frozen=True)
-class CutlassConfig:
-    """Legacy quantization-neutral CUTLASS configuration placeholder.
-
-    .. deprecated::
-        Use a quant-specific ``Cutlass*Config`` instead.
-
-    This type is preserved for source compatibility, but it is intentionally
-    not registered with :class:`MoELayer` and therefore is not runnable. Select
-    a concrete tensor contract such as :class:`CutlassBf16Config` or
-    :class:`CutlassNvfp4Config` instead.
-    """
-
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        # Compatibility-only placeholder: it has no registered runner and must
-        # never be surfaced as a dispatch candidate by BackendOptions.valid_for().
-        return False
-
-    def __repr__(self) -> str:
-        return "CutlassConfig()"
-
-
 @dataclass(frozen=True)
 class CutlassBf16Config:
     """CUTLASS BF16 backend for the unified MoE API.
@@ -1132,7 +1104,6 @@ BackendConfigType = Union[
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
     CutlassBf16Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
@@ -1153,7 +1124,6 @@ ALL_BACKEND_CONFIGS = (
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
     CutlassBf16Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
