@@ -3644,9 +3644,7 @@ def test_gdn_decode_bf16_dense_cache_int64_boundary():
     # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
     # state pool compact and leave the 4.02 GiB cache uninitialized so the test
     # exercises the boundary without unnecessary initialization traffic.
-    cache = torch.empty(
-        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
-    )
+    cache = torch.empty(B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device)
     output = gdn_decode_bf16_state_t1_wide_vec(
         A_log=A_log,
         a=a,
