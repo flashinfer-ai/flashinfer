@@ -3161,11 +3161,11 @@ mono_moe_trace = TraceTemplate(
 )
 
 
-glm5_fused_moe_trace = TraceTemplate(
+glm5_low_latency_moe_trace = TraceTemplate(
     op_type="moe",
-    name_prefix="glm5_fused_moe",
+    name_prefix="glm5_low_latency_moe",
     description=(
-        "Low-token fused GLM5 MoE for Blackwell: sigmoid top-8 routing, "
+        "GLM5 low-latency MoE for Blackwell: sigmoid top-8 routing, "
         "block-FP8 up/down projections, one shared expert, and local TP reduction."
     ),
     axes={

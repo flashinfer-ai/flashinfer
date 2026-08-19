@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the GLM5 fused MoE on rank-specific TP8 tensor dumps.
+"""Benchmark the specialized GLM5 low-latency MoE on rank-specific TP8 dumps.
 
 Example::
 
-    torchrun --nproc_per_node=8 benchmarks/bench_glm5_fused_moe.py \
+    torchrun --nproc_per_node=8 benchmarks/bench_glm5_low_latency_moe.py \
       --dump-dir ~/dev/debug_output --warmup 20 --iterations 100
 
 The reported CUDA time covers fused routing, expert-up, SwiGLU, expert-down,
@@ -35,9 +35,9 @@ import torch
 import torch.distributed as dist
 
 from flashinfer.fused_moe import (
-    alloc_glm5_fused_moe_workspace,
-    glm5_fused_moe,
-    prepare_glm5_fused_moe_weights,
+    alloc_glm5_low_latency_moe_workspace,
+    glm5_low_latency_moe,
+    prepare_glm5_low_latency_moe_weights,
 )
 
 
@@ -109,7 +109,7 @@ def main() -> None:
         hidden_states.float(), router_weight.float().transpose(0, 1)
     ).contiguous()
 
-    weights = prepare_glm5_fused_moe_weights(
+    weights = prepare_glm5_low_latency_moe_weights(
         _load(dump_dir, rank, weight_layer, "shared_gate_up_weight_org", device),
         _load(
             dump_dir,
@@ -143,13 +143,13 @@ def main() -> None:
             device,
         ),
     )
-    workspace = alloc_glm5_fused_moe_workspace(
+    workspace = alloc_glm5_low_latency_moe_workspace(
         args.tokens, weights.shared_down_weight.shape[1], device
     )
     output = torch.empty_like(hidden_states)
 
     def run() -> torch.Tensor:
-        return glm5_fused_moe(
+        return glm5_low_latency_moe(
             hidden_states,
             router_logits,
             routing_bias,

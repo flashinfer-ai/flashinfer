@@ -1,4 +1,4 @@
-# GLM5 low-token fused MoE
+# GLM5 low-latency MoE
 
 This backend is a shape-specialized Blackwell decode path for the GLM5 MoE
 layer. It fuses no-aux sigmoid top-k routing, activation quantization, the
@@ -26,13 +26,13 @@ with FlashInfer's JIT, AOT, trace, test, and benchmark infrastructure.
 | Activations/output | BF16 input, FP16 expert handoff, BF16 output |
 | Weights/scales | FP8 E4M3 with FP32 128x128 block scales |
 
-`glm5_fused_moe` returns the local TP contribution. The serving framework must
+`glm5_low_latency_moe` returns the local TP contribution. The serving framework must
 all-reduce that tensor across TP ranks before applying the residual connection.
 The router GEMM that produces `router_logits` is also outside this operator.
 
 ## Weight preparation
 
-Call `prepare_glm5_fused_moe_weights` once during model loading. The raw GLM5
+Call `prepare_glm5_low_latency_moe_weights` once during model loading. The raw GLM5
 checkpoint conventions are:
 
 - shared gate/up: `[gate, up]`, shape `[2 * I, 6144]`;
@@ -45,7 +45,7 @@ The up-projection helper normalizes the half ordering and packs the weight into
 weights remain row-major and are staged with TMA at runtime. Preparation is not
 part of decode latency.
 
-For repeated calls, allocate `Glm5FusedMoeWorkspace` once and pass both it and
+For repeated calls, allocate `Glm5LowLatencyMoeWorkspace` once and pass both it and
 an `out` tensor. This avoids allocator work in the serving loop and keeps tensor
 addresses stable for CUDA graph capture.
 
@@ -78,10 +78,10 @@ all-reduce, matching the operator boundary described above.
 Run the replay and benchmark with:
 
 ```bash
-FLASHINFER_GLM5_MOE_DUMP_DIR=/path/to/dumps \
+FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR=/path/to/dumps \
   torchrun --nproc_per_node=8 -m pytest \
-  tests/moe/test_glm5_fused_moe.py -v -m "gpu_8 and arch_blackwell"
+  tests/moe/test_glm5_low_latency_moe.py -v -m "gpu_8 and arch_blackwell"
 
-torchrun --nproc_per_node=8 benchmarks/bench_glm5_fused_moe.py \
+torchrun --nproc_per_node=8 benchmarks/bench_glm5_low_latency_moe.py \
   --dump-dir /path/to/dumps --tokens 4 --warmup 20 --iterations 100
 ```

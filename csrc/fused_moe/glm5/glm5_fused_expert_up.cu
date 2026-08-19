@@ -1189,7 +1189,7 @@ void Glm5FusedExpertUp(TensorView scores, TensorView hidden_in, TensorView bias,
 
     int64_t const M = scores.size(0);
     TVM_FFI_ICHECK(M >= 1 && M <= 4)
-        << "GLM5 fused MoE supports 1 <= num_tokens <= 4, got " << M;
+        << "GLM5 low-latency MoE supports 1 <= num_tokens <= 4, got " << M;
     TVM_FFI_ICHECK(scores.size(1) == kNumExperts)
         << "scores must have shape [M, 256]";
     TVM_FFI_ICHECK(hidden_in.size(0) == M && hidden_in.size(1) == kHidden)

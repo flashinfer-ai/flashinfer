@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-JIT loader for the low-token GLM5 block-FP8 fused MoE kernels.
+JIT loader for the GLM5 low-latency block-FP8 MoE kernels.
 """
 
 import functools
@@ -33,7 +33,7 @@ _INCLUDE_FILES = ["topk_reduce.cuh"]
 _FLASHINFER_SUPPORT_HEADERS = ["tvm_ffi_utils.h"]
 
 
-def _get_glm5_moe_csrc_dir() -> Path:
+def _get_glm5_low_latency_moe_csrc_dir() -> Path:
     standard_path = jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "glm5"
     if standard_path.exists():
         return standard_path
@@ -43,23 +43,24 @@ def _get_glm5_moe_csrc_dir() -> Path:
         return dev_path
 
     raise FileNotFoundError(
-        f"GLM5 fused MoE sources were not found under {standard_path} or {dev_path}."
+        "GLM5 low-latency MoE sources were not found under "
+        f"{standard_path} or {dev_path}."
     )
 
 
 @functools.cache
-def gen_glm5_moe_module():
-    """Create the SM100-family JIT specification for GLM5 fused MoE."""
-    csrc_dir = _get_glm5_moe_csrc_dir()
+def gen_glm5_low_latency_moe_module():
+    """Create the SM100-family JIT specification for GLM5 low-latency MoE."""
+    csrc_dir = _get_glm5_low_latency_moe_csrc_dir()
     dev_root = Path(__file__).parent.parent.parent
-    uri = "glm5_fused_moe_sm100"
+    uri = "glm5_low_latency_moe_sm100"
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
     def _copy(name: str) -> Path:
         source = csrc_dir / name
         if not source.exists():
-            raise FileNotFoundError(f"GLM5 fused MoE source not found: {source}")
+            raise FileNotFoundError(f"GLM5 low-latency MoE source not found: {source}")
         destination = gen_directory / name
         shutil.copy(source, destination)
         return destination
@@ -99,11 +100,11 @@ def gen_glm5_moe_module():
             *jit_env.CUTLASS_INCLUDE_DIRS,
         ],
     )
-    logger.info("Generated GLM5 fused MoE JIT spec: %s", spec.name)
+    logger.info("Generated GLM5 low-latency MoE JIT spec: %s", spec.name)
     return spec
 
 
 @functools.cache
-def load_glm5_moe_module():
-    """Build and load the GLM5 fused MoE module."""
-    return gen_glm5_moe_module().build_and_load()
+def load_glm5_low_latency_moe_module():
+    """Build and load the GLM5 low-latency MoE module."""
+    return gen_glm5_low_latency_moe_module().build_and_load()

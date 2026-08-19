@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Low-token block-FP8 fused MoE specialized for the GLM5 decode shape.
+Low-latency block-FP8 MoE specialized for the GLM5 decode shape.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.moe import glm5_fused_moe_trace
+from ..trace.templates.moe import glm5_low_latency_moe_trace
 from ..utils import backend_requirement, supported_compute_capability
 
 
@@ -51,8 +51,8 @@ _UP_BYTES_PER_COL_QUAD = 4
 
 
 @dataclass(frozen=True)
-class Glm5FusedMoeWeights:
-    """Prepared tensors accepted by :func:`glm5_fused_moe`."""
+class Glm5LowLatencyMoeWeights:
+    """Prepared tensors accepted by :func:`glm5_low_latency_moe`."""
 
     expert_gate_up_weight: torch.Tensor
     expert_gate_up_scale: torch.Tensor
@@ -73,7 +73,7 @@ class Glm5FusedMoeWeights:
 
 
 @dataclass(frozen=True)
-class Glm5FusedMoeWorkspace:
+class Glm5LowLatencyMoeWorkspace:
     """Reusable output buffers for allocation-free decode calls."""
 
     topk_weights: torch.Tensor
@@ -81,19 +81,19 @@ class Glm5FusedMoeWorkspace:
     expert_slots: torch.Tensor
 
 
-def alloc_glm5_fused_moe_workspace(
+def alloc_glm5_low_latency_moe_workspace(
     num_tokens: int,
     local_intermediate_size: int,
     device: torch.device | str,
-) -> Glm5FusedMoeWorkspace:
-    """Allocate the temporary buffers used by :func:`glm5_fused_moe`."""
+) -> Glm5LowLatencyMoeWorkspace:
+    """Allocate the temporary buffers used by :func:`glm5_low_latency_moe`."""
     if not 1 <= num_tokens <= _MAX_TOKENS:
         raise ValueError(
-            f"GLM5 fused MoE supports 1 <= M <= {_MAX_TOKENS}, got {num_tokens}."
+            f"GLM5 low-latency MoE supports 1 <= M <= {_MAX_TOKENS}, got {num_tokens}."
         )
     if local_intermediate_size not in (256, 512):
         raise ValueError("local_intermediate_size must be 256 (TP8) or 512 (TP4).")
-    return Glm5FusedMoeWorkspace(
+    return Glm5LowLatencyMoeWorkspace(
         topk_weights=torch.empty(
             (num_tokens, _TOP_K), dtype=torch.float32, device=device
         ),
@@ -112,17 +112,18 @@ def _pack_up_weight_side(weight: torch.Tensor) -> torch.Tensor:
     """Pack ``[..., I, H]`` FP8 rows into the expert-up MMA lane layout."""
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError(
-            f"GLM5 fused MoE expects float8_e4m3fn gate/up weights, got {weight.dtype}."
+            "GLM5 low-latency MoE expects float8_e4m3fn gate/up weights, "
+            f"got {weight.dtype}."
         )
     if weight.shape[-1] != _HIDDEN_SIZE:
         raise ValueError(
-            f"GLM5 fused MoE expects hidden size {_HIDDEN_SIZE}, "
+            f"GLM5 low-latency MoE expects hidden size {_HIDDEN_SIZE}, "
             f"got {weight.shape[-1]}."
         )
     inter_per_tp = weight.shape[-2]
     if inter_per_tp not in (256, 512):
         raise ValueError(
-            "GLM5 fused MoE expects local intermediate size 256 (TP8) or "
+            "GLM5 low-latency MoE expects local intermediate size 256 (TP8) or "
             f"512 (TP4), got {inter_per_tp}."
         )
 
@@ -217,7 +218,7 @@ def _interleave_packed_gate_up(
     return combined
 
 
-def pack_glm5_fused_moe_gate_up_weight(
+def pack_glm5_low_latency_moe_gate_up_weight(
     shared_gate_up_weight: torch.Tensor,
     routed_up_gate_weight: torch.Tensor,
 ) -> torch.Tensor:
@@ -267,7 +268,7 @@ def pack_glm5_fused_moe_gate_up_weight(
     return packed
 
 
-def pack_glm5_fused_moe_gate_up_scale(
+def pack_glm5_low_latency_moe_gate_up_scale(
     shared_gate_up_scale: torch.Tensor,
     routed_up_gate_scale: torch.Tensor,
 ) -> torch.Tensor:
@@ -286,7 +287,7 @@ def pack_glm5_fused_moe_gate_up_scale(
         shared_gate_up_scale.dtype != torch.float32
         or routed_up_gate_scale.dtype != torch.float32
     ):
-        raise TypeError("GLM5 fused MoE gate/up scales must be float32.")
+        raise TypeError("GLM5 low-latency MoE gate/up scales must be float32.")
 
     scale_rows = shared_gate_up_scale.shape[0] // 2
     packed = torch.empty(
@@ -300,7 +301,7 @@ def pack_glm5_fused_moe_gate_up_scale(
     return packed
 
 
-def prepare_glm5_fused_moe_weights(
+def prepare_glm5_low_latency_moe_weights(
     shared_gate_up_weight: torch.Tensor,
     shared_gate_up_scale: torch.Tensor,
     routed_up_gate_weight: torch.Tensor,
@@ -309,13 +310,13 @@ def prepare_glm5_fused_moe_weights(
     routed_down_scale: torch.Tensor,
     shared_down_weight: torch.Tensor,
     shared_down_scale: torch.Tensor,
-) -> Glm5FusedMoeWeights:
+) -> Glm5LowLatencyMoeWeights:
     """Prepare raw GLM5 TP4/TP8 block-FP8 weights for repeated decode calls."""
-    return Glm5FusedMoeWeights(
-        expert_gate_up_weight=pack_glm5_fused_moe_gate_up_weight(
+    return Glm5LowLatencyMoeWeights(
+        expert_gate_up_weight=pack_glm5_low_latency_moe_gate_up_weight(
             shared_gate_up_weight, routed_up_gate_weight
         ),
-        expert_gate_up_scale=pack_glm5_fused_moe_gate_up_scale(
+        expert_gate_up_scale=pack_glm5_low_latency_moe_gate_up_scale(
             shared_gate_up_scale, routed_up_gate_scale
         ),
         routed_down_weight=routed_down_weight.contiguous(),
@@ -326,13 +327,13 @@ def prepare_glm5_fused_moe_weights(
 
 
 @functools.cache
-def _get_glm5_moe_module():
-    from ..jit.glm5_moe import load_glm5_moe_module
+def _get_glm5_low_latency_moe_module():
+    from ..jit.glm5_moe import load_glm5_low_latency_moe_module
 
-    return load_glm5_moe_module()
+    return load_glm5_low_latency_moe_module()
 
 
-def _check_glm5_fused_moe_shapes(
+def _check_glm5_low_latency_moe_shapes(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -348,7 +349,7 @@ def _check_glm5_fused_moe_shapes(
     num_tokens = hidden_states.shape[0]
     if not 1 <= num_tokens <= _MAX_TOKENS:
         raise ValueError(
-            f"GLM5 fused MoE supports 1 <= M <= {_MAX_TOKENS}, got {num_tokens}."
+            f"GLM5 low-latency MoE supports 1 <= M <= {_MAX_TOKENS}, got {num_tokens}."
         )
     if tuple(hidden_states.shape) != (num_tokens, _HIDDEN_SIZE):
         raise ValueError("hidden_states must have shape [M, 6144].")
@@ -395,7 +396,7 @@ def _check_glm5_fused_moe_shapes(
 
 
 @supported_compute_capability([100, 103])
-def _check_glm5_fused_moe_supported(
+def _check_glm5_low_latency_moe_supported(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -407,11 +408,11 @@ def _check_glm5_fused_moe_supported(
     shared_down_scale: torch.Tensor,
     routed_scaling_factor: float = 2.5,
     out: Optional[torch.Tensor] = None,
-    workspace: Optional[Glm5FusedMoeWorkspace] = None,
+    workspace: Optional[Glm5LowLatencyMoeWorkspace] = None,
     packed_weight_stages: int = 2,
     use_tma: bool = True,
 ) -> bool:
-    num_tokens, inter_per_tp = _check_glm5_fused_moe_shapes(
+    num_tokens, inter_per_tp = _check_glm5_low_latency_moe_shapes(
         hidden_states,
         router_logits,
         routing_bias,
@@ -434,9 +435,11 @@ def _check_glm5_fused_moe_supported(
         shared_down_scale,
     )
     if any(not tensor.is_cuda for tensor in tensors):
-        raise ValueError("All GLM5 fused MoE inputs must be CUDA tensors.")
+        raise ValueError("All GLM5 low-latency MoE inputs must be CUDA tensors.")
     if any(tensor.device != hidden_states.device for tensor in tensors):
-        raise ValueError("All GLM5 fused MoE inputs must be on the same CUDA device.")
+        raise ValueError(
+            "All GLM5 low-latency MoE inputs must be on the same CUDA device."
+        )
     if hidden_states.dtype != torch.bfloat16 or routing_bias.dtype != torch.bfloat16:
         raise TypeError("hidden_states and routing_bias must be bfloat16.")
     if router_logits.dtype != torch.float32:
@@ -456,7 +459,7 @@ def _check_glm5_fused_moe_supported(
             shared_down_scale,
         )
     ):
-        raise TypeError("GLM5 fused MoE scales must be float32.")
+        raise TypeError("GLM5 low-latency MoE scales must be float32.")
     if out is not None and (
         out.device != hidden_states.device
         or out.dtype != torch.bfloat16
@@ -489,9 +492,9 @@ def _check_glm5_fused_moe_supported(
     return True
 
 
-@backend_requirement({}, common_check=_check_glm5_fused_moe_supported)
-@flashinfer_api(trace=glm5_fused_moe_trace)
-def glm5_fused_moe(
+@backend_requirement({}, common_check=_check_glm5_low_latency_moe_supported)
+@flashinfer_api(trace=glm5_low_latency_moe_trace)
+def glm5_low_latency_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -503,16 +506,16 @@ def glm5_fused_moe(
     shared_down_scale: torch.Tensor,
     routed_scaling_factor: float = 2.5,
     out: Optional[torch.Tensor] = None,
-    workspace: Optional[Glm5FusedMoeWorkspace] = None,
+    workspace: Optional[Glm5LowLatencyMoeWorkspace] = None,
     packed_weight_stages: int = 2,
     use_tma: bool = True,
 ) -> torch.Tensor:
-    """Run the GLM5 low-token block-FP8 fused MoE path on SM100/SM103.
+    """Run the GLM5 low-latency block-FP8 MoE path on SM100/SM103.
 
     This specialized decode kernel supports 256 routed experts, one shared
     expert, top-8 sigmoid routing, hidden size 6144, ``M <= 4``, and local
     intermediate size 256 (TP8) or 512 (TP4). Call
-    :func:`prepare_glm5_fused_moe_weights` once when loading model weights.
+    :func:`prepare_glm5_low_latency_moe_weights` once when loading model weights.
 
     The returned tensor is this TP rank's local contribution. Distributed
     callers must all-reduce it across TP ranks before the residual connection.
@@ -528,10 +531,10 @@ def glm5_fused_moe(
         selection; normalized expert weights use the unbiased sigmoid scores.
     expert_gate_up_weight : torch.Tensor
         Packed FP8 gate/up weights from
-        :func:`pack_glm5_fused_moe_gate_up_weight`.
+        :func:`pack_glm5_low_latency_moe_gate_up_weight`.
     expert_gate_up_scale : torch.Tensor
         Packed FP32 block scales from
-        :func:`pack_glm5_fused_moe_gate_up_scale`.
+        :func:`pack_glm5_low_latency_moe_gate_up_scale`.
     routed_down_weight, shared_down_weight : torch.Tensor
         Raw row-major FP8 down-projection weights.
     routed_down_scale, shared_down_scale : torch.Tensor
@@ -540,9 +543,9 @@ def glm5_fused_moe(
         Scale applied after normalizing the selected sigmoid scores.
     out : Optional[torch.Tensor]
         Optional BF16 output buffer with shape ``[M, 6144]``.
-    workspace : Optional[Glm5FusedMoeWorkspace]
+    workspace : Optional[Glm5LowLatencyMoeWorkspace]
         Reusable temporaries allocated by
-        :func:`alloc_glm5_fused_moe_workspace`. Supplying this and ``out``
+        :func:`alloc_glm5_low_latency_moe_workspace`. Supplying this and ``out``
         makes repeated decode calls allocation-free.
     packed_weight_stages : int
         Number of packed gate/up pipeline stages, either 1 or 2.
@@ -555,7 +558,7 @@ def glm5_fused_moe(
     torch.Tensor
         BF16 TP-local MoE contribution with shape ``[M, 6144]``.
     """
-    num_tokens, inter_per_tp = _check_glm5_fused_moe_shapes(
+    num_tokens, inter_per_tp = _check_glm5_low_latency_moe_shapes(
         hidden_states,
         router_logits,
         routing_bias,
@@ -573,11 +576,11 @@ def glm5_fused_moe(
             device=hidden_states.device,
         )
     if workspace is None:
-        workspace = alloc_glm5_fused_moe_workspace(
+        workspace = alloc_glm5_low_latency_moe_workspace(
             num_tokens, inter_per_tp, hidden_states.device
         )
 
-    module = _get_glm5_moe_module()
+    module = _get_glm5_low_latency_moe_module()
     module.glm5_fused_expert_up(
         router_logits,
         hidden_states,

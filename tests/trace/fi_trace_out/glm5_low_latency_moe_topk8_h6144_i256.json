@@ -1,9 +1,9 @@
 {
-  "name": "glm5_fused_moe_topk8_h6144_i256",
-  "description": "Low-token fused GLM5 MoE for Blackwell: sigmoid top-8 routing, block-FP8 up/down projections, one shared expert, and local TP reduction.",
+  "name": "glm5_low_latency_moe_topk8_h6144_i256",
+  "description": "GLM5 low-latency MoE for Blackwell: sigmoid top-8 routing, block-FP8 up/down projections, one shared expert, and local TP reduction.",
   "op_type": "moe",
   "tags": [
-    "fi_api:flashinfer.fused_moe.glm5.glm5_fused_moe",
+    "fi_api:flashinfer.fused_moe.glm5.glm5_low_latency_moe",
     "status:verified",
     "quantization:float8_e4m3fn",
     "arch:sm100-family"

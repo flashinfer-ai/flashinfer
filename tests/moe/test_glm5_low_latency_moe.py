@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the Blackwell GLM5 low-token fused MoE path.
+"""Tests for the Blackwell GLM5 low-latency MoE path.
 
 The eight-GPU replay uses per-rank tensors dumped from a GLM5 TP8 serving run::
 
-    FLASHINFER_GLM5_MOE_DUMP_DIR=~/dev/debug_output \
+    FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR=~/dev/debug_output \
       torchrun --nproc_per_node=8 -m pytest \
-      tests/moe/test_glm5_fused_moe.py -v -m "gpu_8 and arch_blackwell"
+      tests/moe/test_glm5_low_latency_moe.py -v -m "gpu_8 and arch_blackwell"
 """
 
 from __future__ import annotations
@@ -30,13 +30,13 @@ import pytest
 import torch
 
 from flashinfer.fused_moe.glm5 import (
-    _check_glm5_fused_moe_shapes,
+    _check_glm5_low_latency_moe_shapes,
     _interleave_packed_gate_up,
     _pack_up_weight_side,
-    alloc_glm5_fused_moe_workspace,
-    glm5_fused_moe,
-    pack_glm5_fused_moe_gate_up_scale,
-    prepare_glm5_fused_moe_weights,
+    alloc_glm5_low_latency_moe_workspace,
+    glm5_low_latency_moe,
+    pack_glm5_low_latency_moe_gate_up_scale,
+    prepare_glm5_low_latency_moe_weights,
 )
 
 _NUM_EXPERTS = 256
@@ -99,7 +99,7 @@ def test_glm5_gate_up_scale_ordering() -> None:
     routed = torch.arange(_NUM_EXPERTS * 4 * 48, dtype=torch.float32).reshape(
         _NUM_EXPERTS, 4, 48
     )
-    packed = pack_glm5_fused_moe_gate_up_scale(shared, routed)
+    packed = pack_glm5_low_latency_moe_gate_up_scale(shared, routed)
 
     assert torch.equal(packed[0], shared)
     assert torch.equal(packed[1:, :2], routed[:, 2:])
@@ -127,10 +127,10 @@ def test_glm5_shape_contract_on_meta_tensors() -> None:
         torch.empty((_HIDDEN_SIZE, inter), device="meta", dtype=torch.float8_e4m3fn),
         torch.empty((48, inter // 128), device="meta", dtype=torch.float32),
     )
-    assert _check_glm5_fused_moe_shapes(*args) == (4, inter)
+    assert _check_glm5_low_latency_moe_shapes(*args) == (4, inter)
 
     with pytest.raises(ValueError, match="supports 1 <= M <= 4"):
-        _check_glm5_fused_moe_shapes(
+        _check_glm5_low_latency_moe_shapes(
             torch.empty((5, _HIDDEN_SIZE), device="meta", dtype=torch.bfloat16),
             torch.empty((5, _NUM_EXPERTS), device="meta", dtype=torch.float32),
             *args[2:],
@@ -156,11 +156,13 @@ def _load_dump(
 @pytest.mark.gpu_8
 @pytest.mark.arch_blackwell
 @pytest.mark.solo
-def test_glm5_fused_moe_tp8_dump_replay() -> None:
+def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
     """Replay all TP8 ranks against saved per-rank PyTorch reference output."""
-    dump_env = os.environ.get("FLASHINFER_GLM5_MOE_DUMP_DIR")
+    dump_env = os.environ.get("FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR")
     if not dump_env:
-        pytest.skip("set FLASHINFER_GLM5_MOE_DUMP_DIR to run the GLM5 dump replay")
+        pytest.skip(
+            "set FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR to run the GLM5 dump replay"
+        )
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -185,7 +187,7 @@ def test_glm5_fused_moe_tp8_dump_replay() -> None:
         hidden_states.float(), router_weight.float().transpose(0, 1)
     ).contiguous()
 
-    prepared = prepare_glm5_fused_moe_weights(
+    prepared = prepare_glm5_low_latency_moe_weights(
         _load_dump(dump_dir, rank, weight_layer, "shared_gate_up_weight_org", device),
         _load_dump(
             dump_dir,
@@ -224,7 +226,7 @@ def test_glm5_fused_moe_tp8_dump_replay() -> None:
     ]
 
     threshold = _ERROR_THRESHOLDS_BY_RANK[rank]
-    workspace = alloc_glm5_fused_moe_workspace(
+    workspace = alloc_glm5_low_latency_moe_workspace(
         hidden_states.shape[0], prepared.shared_down_weight.shape[1], device
     )
     output = torch.empty_like(hidden_states)
@@ -235,7 +237,7 @@ def test_glm5_fused_moe_tp8_dump_replay() -> None:
         (2, False),
     ):
         with torch.inference_mode():
-            actual = glm5_fused_moe(
+            actual = glm5_low_latency_moe(
                 hidden_states,
                 router_logits,
                 routing_bias,
