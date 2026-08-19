@@ -381,14 +381,16 @@ def _cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 32
 
 
 def _pack_kv_cache_fp4(kv_cache):
-    """bf16 KV cache [num_blocks, block_size, 1, D] -> (fused uint8 [num_blocks, block_size, 1, D//2+4], dequant bf16)."""
+    """bf16 KV cache [num_blocks, block_size, 1, D] -> fused uint8
+    [num_blocks, block_size, 1, (D/2)+4] (data bytes then SF bytes), plus the
+    dequantized bf16 reference."""
     num_blocks, block_size, num_heads, head_dim = kv_cache.shape
     x_scaled, sf = _per_token_cast_to_fp4(kv_cache.view(-1, head_dim), gran_k=32)
     x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(
         num_blocks, block_size, 1, head_dim
     )
     x_fp4 = torch.empty(
-        (num_blocks, block_size * (head_dim // 2 + 4)),
+        (num_blocks, block_size * ((head_dim // 2) + 4)),
         device=kv_cache.device,
         dtype=torch.uint8,
     )
@@ -398,9 +400,9 @@ def _pack_kv_cache_fp4(kv_cache):
     x_fp4[:, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(
         torch.uint8
     )
-    return x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4), x_back.to(
-        kv_cache.dtype
-    )
+    return x_fp4.view(
+        num_blocks, block_size, num_heads, (head_dim // 2) + 4
+    ), x_back.to(kv_cache.dtype)
 
 
 @torch.no_grad()

@@ -175,7 +175,7 @@ def _cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 32
     return x * sf[:, torch.arange(n, device=packed.device) // gran_k]
 
 
-def _kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = False):
+def _kv_cache_cast_to_fp4(x: torch.Tensor, is_kv_sf_interleaved: bool = False):
     num_blocks, block_size, num_heads, head_dim = x.shape
     x_scaled, sf = _per_token_cast_to_fp4(x.view(-1, head_dim), gran_k=32)
     x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(
@@ -190,7 +190,7 @@ def _kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = Fa
         num_blocks, block_size * head_dim // 2
     ).view(torch.uint8)
     sf_per_block = sf.view(num_blocks, block_size)
-    if remove_online_sf_transpose and block_size == 128:
+    if is_kv_sf_interleaved and block_size == 128:
         sf_per_block = (
             sf_per_block.reshape(num_blocks, 4, 32)
             .transpose(-1, -2)
@@ -770,92 +770,43 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
     assert diff < 0.02, f"cosine diff {diff:.3e} too large"
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("avg_ctx", [256, 4096])
-def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
-    """next_n=4 is handled via internal atom-split."""
+def test_fp4_next_n4_rejected():
+    """FP4 supports next_n up to 3; 4 is rejected rather than emulated.
+
+    An earlier version decomposed next_n=4 into two next_n=2 atoms, which cost
+    a per-call page-table duplication and context-length rebuild, and made a
+    caller-supplied schedule_meta silently wrong (the split changes the batch
+    the scheduler must describe).  The kernel asserts next_n in {1,2,3}; the
+    API now reports that directly.
+    """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
 
     from flashinfer import fp4_paged_mqa_logits
 
-    torch.manual_seed(7)
     device = "cuda"
-    num_heads, head_dim, block_size = 64, 128, 64
-    next_n = 4
-    max_model_len = max(avg_ctx * 2, 2048)
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 256
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
 
-    context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
-    block_table, num_total_blocks = _make_paged_kv(
-        batch_size, block_size, context_lens, device
-    )
-
-    q_f32 = torch.randn(
-        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
-    )
-    kv_cache = torch.randn(
-        num_total_blocks,
-        block_size,
-        1,
-        head_dim,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    weights = torch.randn(
-        batch_size * next_n, num_heads, device=device, dtype=torch.float32
-    )
-
-    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, head_dim), gran_k=32)
-    q_fp4 = q_packed.view(torch.uint8).view(
-        batch_size, next_n, num_heads, head_dim // 2
-    )
-    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
-    q_sim = (
-        _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32)
-        .view(batch_size, next_n, num_heads, head_dim)
-        .to(torch.bfloat16)
-    )
-    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
-
-    ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, context_lens, block_table, max_model_len
-    )
-    out = fp4_paged_mqa_logits(
-        q_fp4,
-        sf_q,
-        kv_fused,
-        weights,
-        context_lens,
-        block_table,
-        max_model_len,
-        output_dtype=torch.bfloat16,
-    )
-
-    positions = (
-        torch.arange(max_model_len, device=device)
-        .unsqueeze(0)
-        .expand(batch_size * next_n, -1)
-    )
-    offsets = torch.arange(batch_size * next_n, device=device)
-    limits = (context_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
-    neginf_mask = ~(positions <= limits)
-    out_m = out.float().masked_fill(neginf_mask, 0)
-    ref_m = ref.float().masked_fill(neginf_mask, 0)
-    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
-    out_clean = out_m.masked_fill(~finite, 0)
-    ref_clean = ref_m.masked_fill(~finite, 0)
-    valid = (~neginf_mask) & finite
-    if valid.any():
-        torch.testing.assert_close(
-            out_clean[valid], ref_clean[valid], atol=1e-2, rtol=1e-2
+    for next_n, should_pass in ((3, True), (4, False), (5, False)):
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
         )
-    diff = _calc_cosine_diff(out_clean, ref_clean)
-    assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        args = (q, sf_q, kv, w, context_lens, block_table, ctx)
+        if should_pass:
+            fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
+        else:
+            with pytest.raises(ValueError, match=r"next_n in 1\.\.3"):
+                fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
-def test_fp4_paged_mqa_logits_remove_sf_transpose(block_size):
-    """remove_online_sf_transpose=True path (requires block_size=128)."""
+def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
+    """is_kv_sf_interleaved=True path (requires block_size=128)."""
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
 
@@ -892,27 +843,25 @@ def test_fp4_paged_mqa_logits_remove_sf_transpose(block_size):
     )
     sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
 
-    # Pre-transposed KV SF
-    kv_fused_transposed, kv_sim = _kv_cache_cast_to_fp4(
-        kv_cache, remove_online_sf_transpose=(block_size == 128)
+    # Pre-interleaved KV SF
+    kv_fused_interleaved, kv_sim = _kv_cache_cast_to_fp4(
+        kv_cache, is_kv_sf_interleaved=(block_size == 128)
     )
 
     out = fp4_paged_mqa_logits(
         q_fp4,
         sf_q,
-        kv_fused_transposed,
+        kv_fused_interleaved,
         weights,
         context_lens,
         block_table,
         max_model_len,
         output_dtype=torch.bfloat16,
-        remove_online_sf_transpose=(block_size == 128),
+        is_kv_sf_interleaved=(block_size == 128),
     )
 
-    # Also run with online transpose for cross-check
-    kv_fused_online, _ = _kv_cache_cast_to_fp4(
-        kv_cache, remove_online_sf_transpose=False
-    )
+    # Also run with the in-kernel rearrangement for cross-check
+    kv_fused_online, _ = _kv_cache_cast_to_fp4(kv_cache, is_kv_sf_interleaved=False)
     out_online = fp4_paged_mqa_logits(
         q_fp4,
         sf_q,
@@ -922,7 +871,7 @@ def test_fp4_paged_mqa_logits_remove_sf_transpose(block_size):
         block_table,
         max_model_len,
         output_dtype=torch.bfloat16,
-        remove_online_sf_transpose=False,
+        is_kv_sf_interleaved=False,
     )
 
     # Mask to valid (in-context, finite) positions before comparing
@@ -1167,7 +1116,7 @@ def test_fp4_head_dim_num_heads_validation():
     with pytest.raises(ValueError, match="requires num_heads == 64"):
         fp4_paged_mqa_logits(q, sf_q, kv, w, context_lens, block_table, max_ml)
 
-    # next_n beyond what the kernel (1-3) plus wrapper atom-split (4) covers.
+    # next_n beyond what the kernel supports (1-3).
     q5 = torch.zeros(B, 5, num_heads, 64, dtype=torch.uint8, device=device)
     sf5 = torch.zeros(B, 5, num_heads, dtype=torch.int32, device=device)
     kv5 = torch.zeros(ntb, block_size, 1, 68, dtype=torch.uint8, device=device)
@@ -1222,3 +1171,202 @@ def test_precompile_variants():
         "a precompiled fp8 config still triggered a build; the precompile "
         "config list has drifted from what the API actually compiles"
     )
+
+
+def test_fp4_is_kv_sf_interleaved_guard():
+    """is_kv_sf_interleaved=True is only valid at block_size=128.
+
+    The kernel silently forces the flag back to False for other page sizes, so
+    a caller who pre-arranged SF for UTCCP would get it interleaved twice
+    -- wrong logits with no error. The API must reject the combination.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+    from flashinfer import fp4_paged_mqa_logits
+
+    device, B, next_n, H, D, ctx, max_ml = "cuda", 2, 1, 64, 128, 512, 512
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+
+    for block_size, should_raise in ((32, True), (64, True), (128, False)):
+        block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        if should_raise:
+            with pytest.raises(ValueError, match="is_kv_sf_interleaved"):
+                fp4_paged_mqa_logits(
+                    q,
+                    sf_q,
+                    kv,
+                    w,
+                    context_lens,
+                    block_table,
+                    max_ml,
+                    is_kv_sf_interleaved=True,
+                )
+        else:
+            fp4_paged_mqa_logits(
+                q,
+                sf_q,
+                kv,
+                w,
+                context_lens,
+                block_table,
+                max_ml,
+                is_kv_sf_interleaved=True,
+            )
+
+
+@pytest.mark.parametrize(
+    "sub,valid",
+    [
+        (1, True),
+        (2, True),
+        (4, True),
+        (16, True),
+        (0, False),
+        (3, False),
+        (32, False),
+        (64, False),
+    ],
+)
+def test_num_epi_subtiles_guard(sub, valid):
+    """num_epi_subtiles must divide num_heads with the quotient a multiple of 4.
+
+    Previously this escaped to a bare assertion inside kernel construction at
+    JIT time; both APIs now reject it at the boundary.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device, B, next_n, H, D, block_size, ctx, max_ml = (
+        "cuda",
+        2,
+        1,
+        64,
+        128,
+        64,
+        512,
+        512,
+    )
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    q8 = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q4 = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+
+    if valid:
+        fp8_paged_mqa_logits(
+            q8, kv8, w, context_lens, block_table, max_ml, num_epi_subtiles=sub
+        )
+        fp4_paged_mqa_logits(
+            q4, sf4, kv4, w, context_lens, block_table, max_ml, num_epi_subtiles=sub
+        )
+    else:
+        with pytest.raises(ValueError, match="num_epi_subtiles"):
+            fp8_paged_mqa_logits(
+                q8, kv8, w, context_lens, block_table, max_ml, num_epi_subtiles=sub
+            )
+        with pytest.raises(ValueError, match="num_epi_subtiles"):
+            fp4_paged_mqa_logits(
+                q4, sf4, kv4, w, context_lens, block_table, max_ml, num_epi_subtiles=sub
+            )
+
+
+def test_next_n_and_weights_contract():
+    """weights shape/dtype are validated, and pin next_n without a next_n arg."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device, B, next_n, H, D, block_size, ctx, max_ml = (
+        "cuda",
+        2,
+        2,
+        64,
+        128,
+        64,
+        512,
+        512,
+    )
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    q8 = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q4 = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+
+    # next_n is not an API parameter: it is q.shape[1] by definition, and a q
+    # that disagrees with the other tensors is caught by the weights and sf_q
+    # cross-checks without needing the caller to restate it.
+    q8_bad = torch.zeros(B, next_n + 1, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="weights must be"):
+        fp8_paged_mqa_logits(q8_bad, kv8, w, context_lens, block_table, max_ml)
+    q4_bad = torch.zeros(B, next_n + 1, H, D // 2, dtype=torch.uint8, device=device)
+    # Either cross-check may fire first depending on ordering; both prove the
+    # inconsistency is caught without an explicit next_n argument.
+    with pytest.raises(ValueError, match="(weights|sf_q) must be"):
+        fp4_paged_mqa_logits(q4_bad, sf4, kv4, w, context_lens, block_table, max_ml)
+
+    # weights shape and dtype are now validated (previously unchecked).
+    bad_shape = torch.randn(B * next_n + 1, H, device=device, dtype=torch.float32)
+    bad_dtype = torch.randn(B * next_n, H, device=device, dtype=torch.bfloat16)
+    for bad_w, pat in (
+        (bad_shape, "weights must be"),
+        (bad_dtype, "weights must be float32"),
+    ):
+        with pytest.raises(ValueError, match=pat):
+            fp8_paged_mqa_logits(q8, kv8, bad_w, context_lens, block_table, max_ml)
+        with pytest.raises(ValueError, match=pat):
+            fp4_paged_mqa_logits(q4, sf4, kv4, bad_w, context_lens, block_table, max_ml)
+
+
+def test_fp4_sf_vec_size_contract():
+    """sf_vec_size drives both sf_q packing and the KV row's scale-factor bytes."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+    from flashinfer import fp4_paged_mqa_logits
+
+    device, B, next_n, H, D, block_size, ctx, max_ml = (
+        "cuda",
+        2,
+        1,
+        64,
+        128,
+        64,
+        512,
+        512,
+    )
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+
+    fp4_paged_mqa_logits(
+        q, sf_q, kv, w, context_lens, block_table, max_ml, sf_vec_size=32
+    )
+    for bad in (16, 64):
+        with pytest.raises(ValueError, match="sf_vec_size must be 32"):
+            fp4_paged_mqa_logits(
+                q, sf_q, kv, w, context_lens, block_table, max_ml, sf_vec_size=bad
+            )
+
+    # The KV row's scale-factor bytes are derived from sf_vec_size, so a row
+    # sized for a different SF count is rejected with the arithmetic spelled out.
+    kv_bad = torch.zeros(
+        ntb, block_size, 1, D // 2 + 8, dtype=torch.uint8, device=device
+    )
+    with pytest.raises(ValueError, match="scale-factor bytes"):
+        fp4_paged_mqa_logits(q, sf_q, kv_bad, w, context_lens, block_table, max_ml)
