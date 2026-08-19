@@ -433,6 +433,8 @@ class BlockSparseAttentionWrapper:
         non_blocking: bool = True,
         block_mask: Optional[torch.Tensor] = None,
         kv_block_lens: Optional[torch.Tensor] = None,
+        q2k_indices: Optional[torch.Tensor] = None,
+        q2k_num: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -517,6 +519,14 @@ class BlockSparseAttentionWrapper:
             Number of valid tokens in every KV block, shape ``(NB,)``. Entries
             must be in ``[1, C]``. Supported by the ``cake`` block-64 route;
             when omitted, every block is treated as having ``C`` valid tokens.
+        q2k_indices : torch.Tensor, optional
+            Direct per-head KV-block selections, contiguous int32 with shape
+            ``(num_qo_heads, MB, topk)``. Supported by the ``cake`` block-64
+            route and mutually exclusive with ``block_mask`` and BSR metadata.
+        q2k_num : torch.Tensor, optional
+            Number of valid entries in each direct selection row, contiguous
+            int32 with shape ``(num_qo_heads, MB)``. When omitted, every direct
+            row uses the full ``topk`` dimension.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -560,6 +570,8 @@ class BlockSparseAttentionWrapper:
                 indices,
                 block_mask,
                 kv_block_lens,
+                q2k_indices,
+                q2k_num,
                 M=M,
                 N=N,
                 R=R,

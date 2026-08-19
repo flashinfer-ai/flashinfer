@@ -162,6 +162,31 @@ def test_cake_vsa_blk64_per_head_partial_blocks():
     )
     output, lse = wrapper.run(q, k, v, return_lse=True)
 
+    q2k_indices = torch.topk(mask.to(torch.int8), selected, dim=-1).indices.to(
+        torch.int32
+    )
+    q2k_num = torch.full(
+        (heads, mb), selected, dtype=torch.int32, device=device
+    )
+    direct_wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    direct_wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        block_size,
+        block_size,
+        heads,
+        heads,
+        head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q2k_indices=q2k_indices,
+        q2k_num=q2k_num,
+        kv_block_lens=kv_block_lens,
+    )
+    direct_output, direct_lse = direct_wrapper.run(q, k, v, return_lse=True)
+
     scale = 1.0 / math.sqrt(head_dim)
     scores = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * scale
     token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(
@@ -177,3 +202,5 @@ def test_cake_vsa_blk64_per_head_partial_blocks():
     reference_lse = torch.logsumexp(scores, dim=-1).transpose(0, 1)
     torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(direct_output, reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(direct_lse, reference_lse, atol=1e-2, rtol=1e-2)

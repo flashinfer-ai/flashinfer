@@ -214,6 +214,8 @@ def plan_cake_vsa(
     indices: Optional[torch.Tensor],
     block_mask: Optional[torch.Tensor],
     kv_block_lens: Optional[torch.Tensor],
+    q2k_indices: Optional[torch.Tensor],
+    q2k_num: Optional[torch.Tensor],
     *,
     M: int,
     N: int,
@@ -233,6 +235,10 @@ def plan_cake_vsa(
         raise ValueError("Cake VSA supports square 64- or 128-token blocks")
     if kv_block_lens is not None and R != 64:
         raise ValueError("kv_block_lens is supported only by Cake blk64")
+    if q2k_indices is not None and R != 64:
+        raise ValueError("q2k_indices is supported only by Cake blk64")
+    if q2k_num is not None and q2k_indices is None:
+        raise ValueError("q2k_num requires q2k_indices")
     if M % R or N % C:
         raise ValueError("M and N must be divisible by the Cake VSA block size")
     if head_dim not in (64, 96, 128):
@@ -256,31 +262,75 @@ def plan_cake_vsa(
     ):
         raise ValueError("Cake BF16 GQA routes require Hq=8 and group size 2, 4, or 8")
     mb, nb = M // R, N // C
-    dense = _dense_mask(
-        indptr,
-        indices,
-        block_mask,
-        mb=mb,
-        nb=nb,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        device=device,
-    )
-    row_counts = dense.sum(dim=-1, dtype=torch.int32)
-    min_selected_blocks = int(row_counts.min().item())
-    max_selected_blocks = int(row_counts.max().item())
-    uniform_selected_blocks = bool(torch.all(row_counts == max_selected_blocks).item())
-    if min_selected_blocks <= 0:
-        raise ValueError("every Cake VSA block row must select at least one block")
-    q2k_indices = q2k_num = planned_kv_block_lens = None
+    dense = None
+    if q2k_indices is not None:
+        if block_mask is not None or indptr is not None or indices is not None:
+            raise ValueError(
+                "q2k_indices is mutually exclusive with block_mask and BSR metadata"
+            )
+        if (
+            q2k_indices.dtype != torch.int32
+            or q2k_indices.device != device
+            or not q2k_indices.is_contiguous()
+            or q2k_indices.ndim != 3
+            or tuple(q2k_indices.shape[:2]) != (num_qo_heads, mb)
+        ):
+            raise ValueError(
+                "q2k_indices must be contiguous int32 [num_qo_heads, MB, topk] "
+                "on the wrapper device"
+            )
+        max_selected_blocks = int(q2k_indices.shape[2])
+        if max_selected_blocks <= 0 or max_selected_blocks > nb:
+            raise ValueError("q2k_indices topk must be in [1, NB]")
+        uniform_selected_blocks = q2k_num is None
+        if q2k_num is None:
+            q2k_num = torch.full(
+                (num_qo_heads, mb),
+                max_selected_blocks,
+                dtype=torch.int32,
+                device=device,
+            )
+        elif (
+            q2k_num.dtype != torch.int32
+            or q2k_num.device != device
+            or not q2k_num.is_contiguous()
+            or tuple(q2k_num.shape) != (num_qo_heads, mb)
+        ):
+            raise ValueError(
+                "q2k_num must be contiguous int32 [num_qo_heads, MB] on the "
+                "wrapper device"
+            )
+        row_counts = q2k_num
+    else:
+        dense = _dense_mask(
+            indptr,
+            indices,
+            block_mask,
+            mb=mb,
+            nb=nb,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            device=device,
+        )
+        row_counts = dense.sum(dim=-1, dtype=torch.int32)
+        min_selected_blocks = int(row_counts.min().item())
+        max_selected_blocks = int(row_counts.max().item())
+        uniform_selected_blocks = bool(
+            torch.all(row_counts == max_selected_blocks).item()
+        )
+        if min_selected_blocks <= 0:
+            raise ValueError("every Cake VSA block row must select at least one block")
+        if R == 64:
+            q2k_num = row_counts.contiguous()
+            q2k_indices = torch.argsort(
+                dense.to(torch.int8),
+                dim=-1,
+                descending=True,
+                stable=True,
+            ).to(torch.int32).contiguous()
+
+    planned_kv_block_lens = None
     if R == 64:
-        q2k_num = row_counts.contiguous()
-        q2k_indices = torch.argsort(
-            dense.to(torch.int8),
-            dim=-1,
-            descending=True,
-            stable=True,
-        ).to(torch.int32).contiguous()
         if kv_block_lens is None:
             planned_kv_block_lens = torch.full(
                 (nb,), C, dtype=torch.int32, device=device
@@ -291,12 +341,12 @@ def plan_cake_vsa(
             planned_kv_block_lens = kv_block_lens.to(
                 device=device, dtype=torch.int32
             ).contiguous()
-            min_block_len = int(planned_kv_block_lens.min().item())
-            max_block_len = int(planned_kv_block_lens.max().item())
-            if min_block_len <= 0 or max_block_len > C:
-                raise ValueError("kv_block_lens entries must be in [1, C]")
     shared_indptr = shared_indices = None
-    if R != 64 and torch.equal(dense, dense[:1].expand_as(dense)):
+    if (
+        R != 64
+        and dense is not None
+        and torch.equal(dense, dense[:1].expand_as(dense))
+    ):
         shared_indptr, shared_indices = _shared_bsr(dense, indptr, indices)
     return {
         "M": M,
