@@ -153,6 +153,17 @@ output_column_dict = {
         "update_state",
         "use_qk_l2norm",
     ],
+    "kda": [
+        # Which variant the policy chose, and whether this device's thresholds
+        # were measured or inherited from another SM count. A time taken under
+        # fallback thresholds is not a time taken under tuned ones, and no
+        # other column distinguishes them.
+        "kda_variant",
+        "kda_variant_policy",
+        "sm_count",
+        "packed",
+        "has_initial_state",
+    ],
     "msa": [
         "topk",
         "max_k_tiles",
@@ -198,6 +209,7 @@ full_output_columns = (
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
+    + output_column_dict["kda"]
     + output_column_dict["msa"]
     + output_column_dict["general"]
 )
@@ -300,6 +312,9 @@ benchmark_apis = {
         "gated_delta_rule_decode",
         "gated_delta_rule_mtp",
         "chunk_gated_delta_rule",
+    ],
+    "kda": [
+        "recurrent_kda_prefill",
     ],
     "sparse_attention": [
         "MSAProxyScore",
@@ -1070,6 +1085,28 @@ routine_cc_to_supported_backends = {
         "10.3": ["flashinfer", "fla"],
         "11.0": [],
         "12.0": [],
+        "12.1": [],
+    },
+    # KDA prefill on SM120a only. The SM100-family Cake prefill backend is a
+    # different kernel with a different contract and is not benchmarked here;
+    # listing it under 10.0/10.3 would put two unrelated implementations in one
+    # column.
+    "recurrent_kda_prefill": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": [],
+        "10.3": [],
+        "11.0": [],
+        "12.0": [
+            "flashinfer",
+            "flashinfer-decomp",
+            "flashinfer-fused",
+            "cutekda",
+            "flash-kda",
+        ],
         "12.1": [],
     },
 }
