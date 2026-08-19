@@ -7152,7 +7152,7 @@
       ]
     }
   ],
-  "generator_commit": "1f1cf97ca162087a8d37744eabf4932b7d282f92",
+  "generator_commit": "7b365ca859325e15558ac2087004d6773829cbd8",
   "kernels": [
     {
       "abi": [
@@ -8890,9 +8890,9 @@
           ]
         ],
         "entry": "run_cp_prefill",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_4559c18224",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_0252ceba67",
         "path": "host/cake_cp_prefill.cc",
-        "sha256": "5e27cf8eda043c0078b0008fbd196923720a29dca96b41ad9af389a21758f69c",
+        "sha256": "0add78c15b974e016e039feba334b2e758b0e718769d85b7500f53d8fa54fca4",
         "size_bytes": 22377
       },
       "name": "cp_prefill",
@@ -8903,7 +8903,7 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill.cu",
-          "sha256": "043e58fba847e4e3f7995acf585e54a5f8b11d4c561cb1de3aeaa5e19ce528bf",
+          "sha256": "8ae95ff0aa1cc8934d2943e78efe3df133b121d6075d29bb0ad3da3e1eb41410",
           "size_bytes": 138106
         }
       ],
@@ -9060,9 +9060,9 @@
           ]
         ],
         "entry": "run_cp_prefill_equal_head",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_8f43f339b3",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_aad29d90d1",
         "path": "host/cake_cp_prefill_equal_head.cc",
-        "sha256": "47c64cf957a4037e590b4dd4b7c2b9124eb581779c7287cfd13264005ae7c7bd",
+        "sha256": "ae0c3603607093b07ff190db919029391e54a7ae4672f8b93594d8056a5f1912",
         "size_bytes": 22432
       },
       "name": "cp_prefill_equal_head",
@@ -9073,11 +9073,181 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_equal_head.cu",
-          "sha256": "15b772fd432d5ea077f9d5a0be0e2c777da81b87b145c5c674682b7599ce9d64",
+          "sha256": "d8893940e18cc9ad6f01e10fe1e2876e83d73b17680b7f54111c17312f6da532",
           "size_bytes": 138027
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1",
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "abi": [
+        {
+          "name": "Q",
+          "type": "cake.PtrType(elem_ty=, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "K",
+          "type": "cake.PtrType(elem_ty=, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "V",
+          "type": "cake.PtrType(elem_ty=, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "T",
+          "type": "cake.PtrType(elem_ty=, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "O",
+          "type": "cake.PtrType(elem_ty=, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "alpha",
+          "type": "cake.PtrType(elem_ty=float32, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "cu_seqlens",
+          "type": "cake.PtrType(elem_ty=int64, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "fixed_state",
+          "type": "cake.PtrType(elem_ty=float32, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "initial_state_workspace",
+          "type": "cake.PtrType(elem_ty=float32, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "tensormap_workspace",
+          "type": "cake.PtrType(elem_ty=uint8, const=False, volatile=False, space=cake.MemSpace.gmem)"
+        },
+        {
+          "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "num_q_heads",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "num_k_heads",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "num_v_heads",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "num_sab_heads",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "scale",
+          "type": "ffi.std.PrimTy(dtype=float32)"
+        }
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1",
+      "dynamic_smem_bytes": 224768,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "tma_buffer",
+            "Q"
+          ],
+          [
+            "tma_buffer",
+            "K"
+          ],
+          [
+            "tma_buffer",
+            "V"
+          ],
+          [
+            "tma_buffer",
+            "T"
+          ],
+          [
+            "tma_buffer",
+            "O"
+          ],
+          [
+            "buffer",
+            "alpha"
+          ],
+          [
+            "buffer",
+            "cu_seqlens"
+          ],
+          [
+            "buffer",
+            "fixed_state"
+          ],
+          [
+            "buffer",
+            "initial_state_workspace"
+          ],
+          [
+            "buffer",
+            "tensormap_workspace"
+          ],
+          [
+            "parameter",
+            "cp_chunk_len"
+          ],
+          [
+            "parameter",
+            "num_q_heads"
+          ],
+          [
+            "parameter",
+            "num_k_heads"
+          ],
+          [
+            "parameter",
+            "num_v_heads"
+          ],
+          [
+            "parameter",
+            "num_sab_heads"
+          ],
+          [
+            "parameter",
+            "scale"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_cp_prefill_equal_head_h32",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_7376e4716a",
+        "path": "host/cake_cp_prefill_equal_head_h32.cc",
+        "sha256": "c17e28be7db649375113b40e3cdced3cbff90033fa70df79c8ca07523e8d5e1e",
+        "size_bytes": 22452
+      },
+      "name": "cp_prefill_equal_head_h32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_cp_prefill_equal_head_h32.cu",
+          "sha256": "29e24d8846f536d80edc24324ccb8f16eb97fa8cc9423a6cdb9d36ed4729359c",
+          "size_bytes": 138114
+        }
+      ],
+      "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1",
       "threads": 384,
       "tma_abi": "grid_constant"
     },
@@ -9230,9 +9400,9 @@
           ]
         ],
         "entry": "run_cp_prefill_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_a1d5c0c9fe",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_983cc01b0c",
         "path": "host/cake_cp_prefill_bf16.cc",
-        "sha256": "aa3f6c9eeae4339eb603f259593edb7dfac28b60d2678631cedd93c83df3e1d8",
+        "sha256": "9c4343e4fc8e0155afe68b21478f2e15e84b077b8fc63387fef188850d8f33a9",
         "size_bytes": 22407
       },
       "name": "cp_prefill_bf16",
@@ -9243,7 +9413,7 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_bf16.cu",
-          "sha256": "8eeba89f8f97fa8d01903bfa7fa4090fedd657790629ad3305425975ddcf3cdc",
+          "sha256": "778be0c49dc901e3882206341a7963bc87492708168a387115f6ebad9fa8eb5a",
           "size_bytes": 138111
         }
       ],
@@ -9400,9 +9570,9 @@
           ]
         ],
         "entry": "run_cp_prefill_generic",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_0ca9bd962d",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_767c4c42b0",
         "path": "host/cake_cp_prefill_generic.cc",
-        "sha256": "39e200f300bf6285c6bf8378dad8b3ca52196d12690ad253b19cd7abfd49caf7",
+        "sha256": "9525e5ef0e7c977c7e3b7659bd5b76880c9ebafbb5cd1ed413fb303be6fc7f4b",
         "size_bytes": 22417
       },
       "name": "cp_prefill_generic",
@@ -9413,7 +9583,7 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_generic.cu",
-          "sha256": "4488a29074f744b301a0afa102e19216d926e13c84e08e09bc77ad7cae4b8c78",
+          "sha256": "5f2d505025abdafe1c0621cc79d8867bbbedaa5e23dc7f00340baa9aa4ce00c0",
           "size_bytes": 140082
         }
       ],
@@ -9570,9 +9740,9 @@
           ]
         ],
         "entry": "run_cp_prefill_generic_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_e8bf892b97",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_cbf797af91",
         "path": "host/cake_cp_prefill_generic_bf16.cc",
-        "sha256": "d288eb16a64347d5f60f21b05cbbdc784410e93c653083e4156ffa00d84ef3be",
+        "sha256": "631706d8beed66ec6765c126a1275aba8934eb9efb8027a0affdf99aba5cc5b1",
         "size_bytes": 22447
       },
       "name": "cp_prefill_generic_bf16",
@@ -9583,7 +9753,7 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_generic_bf16.cu",
-          "sha256": "9d4e0148220389508e072bee3ca8e74defa2f50e2f71453e95196eabe331565d",
+          "sha256": "0cb07914ec397bdda265007a70245e44f012b2681560d21f609198b3ba08f08d",
           "size_bytes": 140087
         }
       ],
@@ -9635,12 +9805,17 @@
       "float16": [
         "t_precompute",
         "mn_precompute",
-        "cp_prefill_equal_head, cp_prefill, or cp_prefill_generic"
+        "cp_prefill_equal_head_h32, cp_prefill_equal_head, cp_prefill, or cp_prefill_generic"
       ],
       "state_io": "typed gather/scatter selected independently from state dtype; FP32 checkpoint copy reuses state_gather_fp32"
     },
     "replay": "tight-bound CUDA Graph for non-in-place state and direct captured native composite for in-place state; four ordered semantic stages and four to seven Cake kernels according to state IO form",
-    "stage4_equal_head_dispatch": "aligned float16 equal-head inputs use cp_prefill_equal_head; generic-tail, BF16, GQA, and GVA inputs retain their existing kernels",
+    "stage4_equal_head_dispatch": "aligned float16 equal-head H32 inputs use cp_prefill_equal_head_h32; other aligned float16 equal-head inputs use cp_prefill_equal_head; generic-tail, BF16, GQA, and GVA inputs retain their existing kernels",
+    "stage4_h32_ring_config": {
+      "T_STAGES": 4,
+      "V_STAGES": 2,
+      "dynamic_smem_bytes": 224768
+    },
     "stage4_tail_dispatch": "exact-full-block kernel iff every sequence length is divisible by 128; otherwise generic-tail kernel",
     "tensor_map_abi": "grid_constant for every TMA-backed stage; no process-lifetime descriptor arena"
   },

@@ -99,6 +99,7 @@ def test_generated_source_inventory_and_hashes() -> None:
         "state_fixup_utcmma128",
         "cp_prefill",
         "cp_prefill_equal_head",
+        "cp_prefill_equal_head_h32",
         "cp_prefill_bf16",
         "cp_prefill_generic",
         "cp_prefill_generic_bf16",
@@ -168,6 +169,7 @@ def test_long_row_dispatch_is_exact(
     ("seq_lens", "dtype", "heads", "expected_prefill"),
     [
         ((128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
+        ((128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
         ((128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ((65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
         ((128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
