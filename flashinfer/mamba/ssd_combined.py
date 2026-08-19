@@ -281,6 +281,7 @@ class SSDCombined:
         has_varlen: bool = False,
         has_z: bool = False,
         seq_idx_dtype=torch.int64,
+        backend: str = "cute",
     ):
         from ..utils import get_compute_capability
 
@@ -308,6 +309,33 @@ class SSDCombined:
         self._has_varlen = has_varlen
         self._has_z = has_z
         self._state_torch_dtype = state_dtype
+        self._backend = backend
+
+        if backend not in ("cute", "cake"):
+            raise ValueError(
+                f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
+            )
+        if backend == "cake":
+            from ..jit.mamba.cake_ssd_combined import CakeSSDCombined
+
+            self._cake_runner = CakeSSDCombined(
+                chunk_size,
+                nheads,
+                headdim,
+                dstate,
+                ngroups,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                has_d=has_d,
+                d_has_hdim=d_has_hdim,
+                has_initial_states=has_initial_states,
+                has_varlen=has_varlen,
+                has_z=has_z,
+                seq_idx_dtype=seq_idx_dtype,
+            )
+            self._seq_cumsum_key = None
+            self._seq_cumsum_buf = None
+            return
 
         # Resolve dtypes
         assert io_dtype == torch.bfloat16, f"io_dtype must be bfloat16, got {io_dtype}"
@@ -365,7 +393,7 @@ class SSDCombined:
         self._fstate_shape = None
         self._fstate_torch = None
 
-        self._seq_cumsum_size = 0
+        self._seq_cumsum_key = None
         self._seq_cumsum_buf = None
 
     # -- buffer cache helpers --------------------------------------------------
@@ -383,13 +411,14 @@ class SSDCombined:
 
     def _get_or_alloc_seq_cumsum(self, num_seqs, device):
         size = num_seqs + 1
-        if self._seq_cumsum_size != size:
+        key = (device.index, size)
+        if self._seq_cumsum_key != key:
             self._seq_cumsum_buf = torch.zeros(
                 size,
                 dtype=torch.int32,
                 device=device,
             )
-            self._seq_cumsum_size = size
+            self._seq_cumsum_key = key
         else:
             self._seq_cumsum_buf.zero_()
         return self._seq_cumsum_buf
@@ -479,9 +508,28 @@ class SSDCombined:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
-        Parameters match ``ssd_combined_fwd`` — see its docstring for details.
-
         Args:
+            x: Input tensor of shape ``[batch, seqlen, nheads, headdim]``.
+            dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
+            A: Float32 state-transition coefficients of shape ``[nheads]``.
+            B: Input projection of shape
+                ``[batch, seqlen, ngroups, dstate]``.
+            C: Output projection with the same shape and dtype as ``B``.
+            D: Optional skip coefficient with shape ``[nheads]`` or
+                ``[nheads, headdim]``, according to ``d_has_hdim``.
+            z: Optional gating tensor with the same shape and dtype as ``x``.
+            dt_bias: Optional step-size bias of shape ``[nheads]``.
+            dt_softplus: Whether to apply softplus to ``dt + dt_bias``.
+            dt_limit: Inclusive lower and upper limits for processed step sizes.
+            initial_states: Optional initial state tensor of shape
+                ``[num_seqs, nheads, headdim, dstate]`` in varlen mode, or
+                ``[batch, nheads, headdim, dstate]`` in batched mode.
+            seq_idx: Optional int32/int64 packed-sequence IDs of shape
+                ``[batch, seqlen]``.
+            chunk_indices: Optional int32 physical-chunk index for every logical
+                varlen segment.
+            chunk_offsets: Optional int32 in-chunk start offset for every logical
+                varlen segment.
             seq_chunk_cumsum: Optional int32 tensor of shape [num_seqs + 1].
                 If provided with update_seq_chunk_cumsum=False (default), treated
                 as pre-computed and the internal computation is skipped.
@@ -490,19 +538,62 @@ class SSDCombined:
                 If None, an internal buffer is allocated and computed.
             update_seq_chunk_cumsum: If True, (re)compute seq_chunk_cumsum into
                 the provided tensor.  Defaults to False.
+            out: Optional caller-owned contiguous output storage with shape
+                ``[batch, nheads, headdim, nchunks, chunk_size]``. A fresh tensor
+                is allocated when omitted.
+            return_final_states: Whether to return the final state for every
+                batch element or packed sequence.
+
+        Returns:
+            A pair containing token-major output with shape
+            ``[batch, seqlen, nheads, headdim]`` and either the final states or
+            ``None`` when ``return_final_states`` is false.
         """
+        # Keep backend-independent public validation ahead of dispatch so Cake
+        # and CuTe expose the same exception type and message for shared API
+        # errors.  Backend-specific domain checks remain in their runners.
         chunk_size = self.chunk_size
-
         batch, seqlen, nheads, headdim = x.shape
-        _, _, ngroups, dstate = B.shape
         nchunks = seqlen // chunk_size
-
         assert seqlen % chunk_size == 0, (
             f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
         )
-
-        # A is always fp32
         assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
+        if out is not None:
+            assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
+                f"out shape {out.shape} doesn't match "
+                f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
+            )
+            assert out.dtype == x.dtype, (
+                f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
+            )
+            assert out.is_contiguous(), (
+                "out must be contiguous in (B, EH, D, C, L) layout"
+            )
+
+        if self._backend == "cake":
+            return self._cake_runner.run(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                seq_chunk_cumsum=seq_chunk_cumsum,
+                update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+                out=out,
+                return_final_states=return_final_states,
+            )
+
+        _, _, ngroups, dstate = B.shape
 
         # Validate varlen arguments
         if seq_idx is not None:
@@ -531,18 +622,6 @@ class SSDCombined:
             assert chunk_indices.shape == chunk_offsets.shape, (
                 f"chunk_indices and chunk_offsets must have the same shape, "
                 f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
-            )
-
-        if out is not None:
-            assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
-                f"out shape {out.shape} doesn't match "
-                f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
-            )
-            assert out.dtype == x.dtype, (
-                f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
-            )
-            assert out.is_contiguous(), (
-                "out must be contiguous in (B, EH, D, C, L) layout"
             )
 
         # Triton kernel outputs dt_processed directly in io_dtype (bf16),
@@ -628,7 +707,9 @@ class SSDCombined:
                     d_tensor = D.t()
             else:
                 if D.dim() == 2:
-                    d_tensor = D[:, 0].unsqueeze(0)  # (1, nheads)
+                    # CuTe requires the head dimension to be contiguous even
+                    # when the public API accepts D with a trailing singleton.
+                    d_tensor = D[:, 0].unsqueeze(0).contiguous()  # (1, nheads)
                 else:
                     d_tensor = D.unsqueeze(0)  # (1, nheads)
 
@@ -709,3 +790,66 @@ class SSDCombined:
         # fstate_torch is (B, EH, D, N) — already in the expected return layout
         fstate_out = fstate_torch if return_final_states else None
         return out_view, fstate_out
+
+
+def ssd_combined_fwd(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    dt_softplus: bool = False,
+    dt_limit: Tuple[float, float] = (0.0, float("inf")),
+    initial_states: Optional[torch.Tensor] = None,
+    seq_idx: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
+    seq_chunk_cumsum: Optional[torch.Tensor] = None,
+    update_seq_chunk_cumsum: bool = False,
+    out: Optional[torch.Tensor] = None,
+    return_final_states: bool = True,
+):
+    """Run the source-built Cake SSDCombined backend for its focused domain."""
+
+    _, _, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    state_dtype = initial_states.dtype if initial_states is not None else torch.bfloat16
+    runner = SSDCombined(
+        128,
+        nheads,
+        headdim,
+        dstate,
+        ngroups,
+        io_dtype=x.dtype,
+        state_dtype=state_dtype,
+        has_d=D is not None,
+        d_has_hdim=D is not None and D.ndim == 2,
+        has_initial_states=initial_states is not None,
+        has_varlen=seq_idx is not None,
+        has_z=z is not None,
+        seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
+        backend="cake",
+    )
+    return runner.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        seq_chunk_cumsum=seq_chunk_cumsum,
+        update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+        out=out,
+        return_final_states=return_final_states,
+    )
