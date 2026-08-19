@@ -462,9 +462,7 @@ def _packed_m32_tensor_maps(
     return a_desc, b_desc, c_desc, sfa_desc, sfb_desc
 
 
-def _select_packed_m32_route(
-    n: int, k: int, expected_m: int
-) -> CakeBatchDeepGemmShape:
+def _select_packed_m32_route(n: int, k: int, expected_m: int) -> CakeBatchDeepGemmShape:
     if (n, k) == (4096, 7168):
         if expected_m <= 1:
             return "m32_n4096_k7168_s6e1_g1"

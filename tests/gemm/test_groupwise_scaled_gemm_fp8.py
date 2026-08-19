@@ -532,9 +532,7 @@ def test_fp8_groupwise_batch_deepgemm_cake_native_packed_scales(
     b_scale = b_scale_storage.as_strided(
         (group_size, n, packed_cols), (n * packed_cols, 1, n)
     )
-    masked_m = torch.full(
-        (group_size,), expected_m, device="cuda", dtype=torch.int32
-    )
+    masked_m = torch.full((group_size,), expected_m, device="cuda", dtype=torch.int32)
 
     out = batch_deepgemm_fp8_nt_groupwise(
         a_fp8,

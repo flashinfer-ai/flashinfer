@@ -8635,32 +8635,31 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
             "Cake batch DeepGEMM FP8 requires int32 masked_m with shape [B]"
         )
     if packed_scales:
-        if batch != 64 or m not in {256, 512} or (n, k) not in {
-            (4096, 7168),
-            (7168, 2048),
-        }:
+        if (
+            batch != 64
+            or m not in {256, 512}
+            or (n, k)
+            not in {
+                (4096, 7168),
+                (7168, 2048),
+            }
+        ):
             raise ValueError(
                 "Cake packed UE8M0 scales support the serving boundary "
                 "B=64, M in {256,512}, and N/K in {(4096,7168),(7168,2048)}"
             )
         packed_cols = k // 512
         if a_scale.shape != (batch, m, packed_cols):
-            raise ValueError(
-                "Cake packed UE8M0 requires a_scale shape [B,M,K/512]"
-            )
+            raise ValueError("Cake packed UE8M0 requires a_scale shape [B,M,K/512]")
         if b_scale.shape != (batch, n, packed_cols):
-            raise ValueError(
-                "Cake packed UE8M0 requires b_scale shape [B,N,K/512]"
-            )
+            raise ValueError("Cake packed UE8M0 requires b_scale shape [B,N,K/512]")
         if a_scale.stride() != (m * packed_cols, 1, m):
             raise ValueError(
-                "Cake packed UE8M0 requires MN-major a_scale stride "
-                "[M*K/512,1,M]"
+                "Cake packed UE8M0 requires MN-major a_scale stride [M*K/512,1,M]"
             )
         if b_scale.stride() != (n * packed_cols, 1, n):
             raise ValueError(
-                "Cake packed UE8M0 requires MN-major b_scale stride "
-                "[N*K/512,1,N]"
+                "Cake packed UE8M0 requires MN-major b_scale stride [N*K/512,1,N]"
             )
     else:
         if a_scale.shape != (batch, m, k // 128):

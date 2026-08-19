@@ -290,9 +290,7 @@ def test_cake_batch_deepgemm_source_routes(batch, m, n, k, expected_m, route):
         (256, 7168, 2048, 8, "m32_n7168_k2048_s5e2_g8", 24),
     ],
 )
-def test_cake_batch_deepgemm_packed_m32_routes(
-    m, n, k, expected_m, route, cta_reserve
-):
+def test_cake_batch_deepgemm_packed_m32_routes(m, n, k, expected_m, route, cta_reserve):
     assert cake_batch_deepgemm._select_packed_m32_route(n, k, expected_m) == route
     assert cake_batch_deepgemm._packed_m32_cta_reserve(m, k, expected_m) == cta_reserve
 
@@ -351,9 +349,13 @@ def test_cake_batch_deepgemm_packed_m32_tensor_maps(monkeypatch):
     b_scale = object()
     out = object()
 
-    assert cake_batch_deepgemm._packed_m32_tensor_maps(
-        a, b, a_scale, b_scale, out
-    ) == (1, 2, 3, 4, 5)
+    assert cake_batch_deepgemm._packed_m32_tensor_maps(a, b, a_scale, b_scale, out) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+    )
     assert calls[0][1]["box_dims"] == (128, 16, 2, 1)
     assert calls[1][1]["box_dims"] == (128, 128, 2, 1)
     assert calls[2][1]["box_dims"] == (64, 16)
