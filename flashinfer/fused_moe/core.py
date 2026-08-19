@@ -5859,8 +5859,9 @@ def trtllm_fp8_per_channel_scale_moe(
         routing_method_type: Type of routing method to use (default: 0)
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
-        activation_type (int): Type of activation function (default: 3 - Swiglu)
+        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 8192)
+        activation_type: Type of activation function (default: 3 - Swiglu)
+        norm_topk_prob: Whether to normalize the top-k probabilities (default: True)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
@@ -5930,7 +5931,71 @@ def trtllm_fp8_per_channel_scale_routed_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """FP8 per-token activation/per-channel weight MoE with pre-computed routing."""
+    r"""FP8 per-token activation/per-channel weight MoE with pre-computed routing.
+
+    Parameters
+    ----------
+    topk_ids : torch.Tensor
+        ``[seq_len, top_k]`` int32 tensor of packed expert indices and weights
+        with format ``(expert_id << 16) | (weight_bf16.view(int16))``.
+    routing_bias : Optional[torch.Tensor]
+        ``[num_experts]`` tensor of routing bias. May be ``None``.
+    hidden_states : torch.Tensor
+        ``[seq_len, hidden_size]`` tensor of input hidden states.
+    hidden_states_scale : torch.Tensor
+        ``[seq_len, 1]`` FP32 per-token dequantization multipliers.
+    gemm1_weights : torch.Tensor
+        ``[num_experts, M, hidden_size]`` FP8 first-layer weights, where ``M`` is
+        ``2 * intermediate_size`` for gated activations and ``intermediate_size``
+        otherwise.
+    gemm1_per_channel_weight_scale : torch.Tensor
+        ``[local_num_experts, M]`` per-channel output scales for GEMM1, in the
+        same shuffled row order as ``gemm1_weights``.
+    gemm1_per_channel_gate_weight_scale : torch.Tensor
+        ``[local_num_experts, M]`` per-channel weight dequantization multipliers
+        for GEMM1, in the same shuffled row order as ``gemm1_weights``.
+    gemm2_weights : torch.Tensor
+        ``[num_experts, hidden_size, intermediate_size]`` FP8 second-layer weights.
+    gemm2_per_channel_weight_scale : torch.Tensor
+        ``[local_num_experts, hidden_size]`` per-channel dequantization
+        multipliers for GEMM2, in the same shuffled row order as ``gemm2_weights``.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Number of experts to route to per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Number of groups to consider for top-k routing.
+    intermediate_size : int
+        Size of the intermediate layer.
+    local_expert_offset : int
+        Offset of local experts in the global expert space.
+    local_num_experts : int
+        Number of experts handled by this device.
+    routed_scaling_factor : Optional[float]
+        Scaling factor for routing.
+    use_routing_scales_on_input : bool
+        Whether to apply routing scales to the input (default ``False``).
+    routing_method_type : int
+        Routing method (default ``0``). Matches
+        :class:`flashinfer.tllm_enums.RoutingMethodType`.
+    do_finalize : bool
+        Whether to finalize the output (default ``True``).
+    enable_pdl : Optional[bool]
+        Whether to enable Programmatic Dependent Launch. ``None`` lets the
+        runtime auto-select on SM90+.
+    tune_max_num_tokens : int
+        Maximum number of tokens for autotuning (default ``8192``).
+    activation_type : int
+        Activation type (default ``3`` — Swiglu).
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Final MoE output when ``do_finalize`` is ``True``; otherwise
+        ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+    """
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         None,  # routing_logits
         topk_ids,
