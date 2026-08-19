@@ -59,9 +59,13 @@ def test_cake_backend_accepts_single_group_boundary(num_experts):
         num_experts=num_experts,
         n_group=1,
         topk_group=1,
-        topk=min(8, num_experts),
+        topk=1,
     )
 
 
 def test_cake_backend_rejects_single_group_above_boundary():
     assert not _supported(num_experts=385, n_group=1, topk_group=1)
+
+
+def test_cake_backend_preserves_source_single_group_topk_constraint():
+    assert not _supported(num_experts=256, n_group=1, topk_group=1, topk=8)
