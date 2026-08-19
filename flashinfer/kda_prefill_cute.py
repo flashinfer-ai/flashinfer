@@ -14,9 +14,8 @@
 
 """CuTe DSL BT=16 recurrent-KDA prefill adapter.
 
-The kernel implementation is ported from DKG MR 26001.  This module keeps its
-FlashInfer-facing validation, allocation, stream, and state semantics separate
-from the generated-style kernel source.
+This module keeps its FlashInfer-facing validation, allocation, stream, and
+state semantics separate from the kernel source.
 """
 
 import math
@@ -273,7 +272,7 @@ def _run_cute_dsl_kda_prefill(
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
 ):
-    """Launch the ported DKG BT=16 prefill kernel on the current stream."""
+    """Launch the CuTe DSL BT=16 prefill kernel on the current stream."""
 
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:

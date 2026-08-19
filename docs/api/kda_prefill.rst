@@ -23,12 +23,12 @@ unsupported contracts. Decode retains the existing KDA decode routing.
 ``backend="cake"`` and ``backend="cute-dsl"`` select a backend strictly and
 raise when its contract is unsupported.
 
-For multi-token prefill, ``backend="cute-dsl"`` selects the BT=16 kernel ported
-from DKG MR 26001. It supports contiguous BF16 Q, K, V, G, and beta with one
-shared head count and head dimension 128, the in-kernel lower-bound gate, fixed
-or packed-varlen layout, BF16 recurrent state, explicit ``seq_order``, and the
-same checkpoint contract as Cake. Packed offsets and checkpoint starts must be
-int64 during CUDA graph capture. The CuTe DSL schedule is non-persistent.
+For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
+It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
+head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
+layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
+contract as Cake. Packed offsets and checkpoint starts must be int64 during
+CUDA graph capture. The CuTe DSL schedule is non-persistent.
 
 Optimized Blackwell prefill subset
 -----------------------------------

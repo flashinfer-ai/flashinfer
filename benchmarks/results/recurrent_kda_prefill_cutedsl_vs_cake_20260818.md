@@ -18,9 +18,8 @@ affect recurrent-KDA performance.
 - Reported value: median of the two run medians
 - Common tensors: BF16 Q/K/V/G/beta and state, K/V head dimension 128,
   in-kernel QK L2 normalization and gate, beta logits, lower bound -5.0
-- B200: `umbriel-b200-091`, Slurm job 3759226, NVIDIA B200, CC 10.0
-- B300: `umb-b300-dp-186`, Slurm job 3759225, NVIDIA B300 SXM6 AC,
-  CC 10.3
+- B200: NVIDIA B200, CC 10.0
+- B300: NVIDIA B300 SXM6 AC, CC 10.3
 
 `Speedup` is Cake / CuTe DSL, so values above 1 mean CuTe DSL is faster.
 

@@ -3,15 +3,12 @@
 
 """KDA chunked BT=16 forward kernel using direct CUTLASS primitives.
 
-Ported from DKG MR 26001, source head
-``6bee84720d8a4b23b2390ccfe8bf2c32c2b8ae08``. The implementation uses direct
-CUTLASS primitives rather than RTS or `cute.make_tiled_mma`-based
-orchestration. The current body implements the chunk-size 16 KDA schedule:
+The current body implements the chunk-size 16 KDA schedule:
 
   load q/k/v/gate
   L2-normalize q/k
   exp2(g), exp2(-g), stage final-token exp2(g) as exp2(g_last)
-  super-MMA: kk/qk/blockwise inverse + apply beta
+  auxiliary MMA warp: kk/qk/blockwise inverse + apply beta
   tcgen05-MMA: state*k/state*q/new-v/kv-update/qkv
   store o
 
@@ -881,7 +878,7 @@ def _blockwise_inverse_unit_lower_bt16_mma(
     strict_lower: torch.Tensor,
     mma_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """BT=16 blockwise inverse mirroring the device super-MMA stage.
+    """BT=16 blockwise inverse mirroring the device auxiliary-MMA stage.
 
     Hierarchical (GDN-style) block inverse expressed entirely as MMAs:
 
@@ -928,7 +925,7 @@ def _blockwise_inverse_unit_lower_bt16_mma(
 
 @dataclass(frozen=True)
 class PairwiseF16MmaTiles:
-    """Input-dtype-rounded tiles owned by the KDA super-MMA warp."""
+    """Input-dtype-rounded tiles owned by the KDA auxiliary-MMA warp."""
 
     kk: torch.Tensor
     qk: torch.Tensor
@@ -1001,7 +998,7 @@ def raw_f32_exchange_smem_index(token_coord, dim):
 
 @cute.jit
 def k_inv_s128_smem_index(token_coord, key_dim):
-    """Return the physical s128 SMEM index for the K-inverse super-MMA RHS."""
+    """Return the physical s128 SMEM index for the K-inverse auxiliary-MMA RHS."""
 
     return raw_f16_s128_smem_index(token_coord, key_dim)
 
@@ -1073,7 +1070,7 @@ def _kda_pairwise_mma_tiles(
     beta_chunk: torch.Tensor,
     mma_dtype: torch.dtype,
 ) -> PairwiseF16MmaTiles:
-    """Reference contract for the BT=16 KK/QK/inverse super-MMA path."""
+    """Reference contract for the BT=16 KK/QK/inverse auxiliary-MMA path."""
 
     expected_tile_shape = (BT, DK)
     if q_decay.shape[-2:] != expected_tile_shape:
@@ -2112,7 +2109,7 @@ def super_mma_sw128_decay_ldmatrix_index(
     col_offset,
     k_block: cutlass.Constexpr,
 ):
-    """Return the SW128 row-segment index used by super-MMA `ldmatrix.x4`.
+    """Return the SW128 row-segment index used by the auxiliary-MMA warp.
 
     The decay tile is stored in the tcgen05 B-operand K-box-major layout with
     only the constant half-atom interleave; the tcgen05 descriptor reads the
@@ -2547,7 +2544,7 @@ def super_mma_stage_blockwise_inverse(
     """Produce `A_inv` via the blockwise inverse, register-carried, all-MMA.
 
     Hierarchical (GDN-style) block inverse of the unit-lower `A = I + L`,
-    expressed entirely as the pairwise m16n8k16 HMMA pattern:
+    expressed entirely as pairwise tensor-core MMA operations:
 
         D    = blockdiag(L11, L22)        (strict-lower 8x8 diagonal blocks)
         Binv = (I - D)(I + D^2)(I + D^4)  -- EXACT: each 8x8 unit-lower
@@ -2562,14 +2559,14 @@ def super_mma_stage_blockwise_inverse(
     block-diagonal chain never materializes them — D^2/D^4 stay O(10) — so
     the result sits at the exact-inverse floor: adversarial d_state vs the
     fp32 pipeline drops from 0.33-0.55 (16x16 fp16 Neumann) to 0.05-0.07.
-    Chain and combine operands are FP16 (FP32 HMMA accumulate), never bf16;
+    Chain and combine operands are FP16 with FP32 accumulation, never bf16;
     only the final staged tile is rounded to the input dtype, matching a
     bf16 INV store.
 
-    Cost: 12 HMMAs (2 squares + 2 updates + 2 combine products) — the same
+    Cost: 12 MMA operations (2 squares + 2 updates + 2 combine products) — the same
     count as the 16x16 Neumann chain with one fewer pack/round/add update
     stage; measured engine-kernel time is ~0.4% BELOW the Neumann baseline
-    (issue-bound super-MMA warp region, so avoiding non-HMMA work is what
+    (issue-bound auxiliary-MMA warp region, so avoiding non-MMA work is what
     matters).
     """
 
@@ -2754,7 +2751,7 @@ def super_mma_stage_pairwise_pipeline(
     lane,
     input_dtype: cutlass.Constexpr,
 ) -> None:
-    """Run the KK/L/inverse sequence inside the super-MMA warp.
+    """Run the KK/L/inverse sequence inside the auxiliary-MMA warp.
 
     The caller has already waited `cg0_k_half_ready` (first half-DK of
     k_inv/k_decay staged); the full `cg0_k_ready` wait happens here, between
@@ -2813,7 +2810,7 @@ def super_mma_stage_pairwise_pipeline(
 
 @cute.jit
 def pairwise_ready_arrive(pairwise_ready_mbar) -> None:
-    """Signal that the super-MMA pairwise/A_inv workspace is ready."""
+    """Signal that the auxiliary-MMA pairwise/A_inv workspace is ready."""
 
     prims.fence_proxy(
         prims.Proxy.ASYNC_SHARED,
@@ -2825,7 +2822,7 @@ def pairwise_ready_arrive(pairwise_ready_mbar) -> None:
 
 @cute.jit
 def pairwise_ready_wait(pairwise_ready_mbar, pairwise_ready_phase):
-    """Wait for the super-MMA pairwise/A_inv workspace."""
+    """Wait for the auxiliary-MMA pairwise/A_inv workspace."""
 
     while not prims.mbarrier_wait_parity(
         pairwise_ready_mbar,
@@ -2838,7 +2835,7 @@ def pairwise_ready_wait(pairwise_ready_mbar, pairwise_ready_phase):
 
 @cute.jit
 def pairwise_consumed_arrive(pairwise_consumed_mbar) -> None:
-    """UTCBAR-release a pairwise SMEM stage after tcgen05 consumption."""
+    """Release a pairwise SMEM stage after tcgen05 consumption."""
 
     if prims.elect_sync():
         prims.tcgen05_commit(pairwise_consumed_mbar, group=prims.CTAGroup.CTA_1)
@@ -4954,7 +4951,7 @@ def kernel(
                 prims.mbarrier_init(tma_mbar.subview(stage), 1)
             for stage in cutlass.range_constexpr(RAW_STAGE_COUNT):
                 # Four owner-CG0 warps consume q/k/gate, four CG1 warps
-                # consume v/beta, and the standalone super-MMA warp consumes
+                # consume v/beta, and the standalone auxiliary-MMA warp consumes
                 # beta while constructing the pairwise tile.
                 prims.mbarrier_init(raw_consumed_mbar.subview(stage), 9)
             for stage in cutlass.range_constexpr(BETA_TILE_STAGE_COUNT):
@@ -5017,9 +5014,9 @@ def kernel(
     #   q/k inverse norm   : 16 each, staged once per decay stage
     #   exp_g_last         : 128, CG0-local and staged once per decay stage
     #   state decay        : row 15 of the fp32 gate-prefix exchange tile
-    #   q_decay/k_decay    : tcgen05 SW128 operands shared with super-MMA
+    #   q_decay/k_decay    : tcgen05 SW128 operands shared with auxiliary MMA
     #   k_restore          : tcgen05 SW128 N-major final-state operand
-    #   k_inv              : 16 x 128 token-major for super-MMA RHS
+    #   k_inv              : 16 x 128 token-major for auxiliary-MMA RHS
     #   A inverse/QK       : 16 x 16 each, plus transposed tcgen05 operands
     #   state              : external/kernel ABI is VK `[DV, DK]`; reference
     #                        math can view it as KV `[DK, DV]` by transposing.
@@ -5166,7 +5163,7 @@ def kernel(
                     cg0_k_half_ready_mbar.subview(decay_stage),
                     (chunk // DECAY_STAGE_COUNT) % 2,
                 )
-                # KDA schedule owner: standalone super-MMA warp.  The first
+                # KDA schedule owner: standalone auxiliary-MMA warp.  The first
                 # KK half runs on the half-DK arrival; the pipeline waits the
                 # full cg0_k_ready on its own before the second half.
                 super_mma_stage_pairwise_pipeline(
