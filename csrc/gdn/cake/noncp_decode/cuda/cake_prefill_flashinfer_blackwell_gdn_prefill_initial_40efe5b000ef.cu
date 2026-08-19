@@ -1332,22 +1332,22 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                                 :: "r"(state_inp_addr_3), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_8_bf16[15]))
                                 : "memory");
-                            const float2 _scale2_0 = {chunk_decay_cg1, chunk_decay_cg1};
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_5)[_ls], _scale2_0);
                             const float2 _scale2_1 = {chunk_decay_cg1, chunk_decay_cg1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_6)[_ls], _scale2_1);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_5)[_ls], _scale2_1);
                             const float2 _scale2_2 = {chunk_decay_cg1, chunk_decay_cg1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_7)[_ls], _scale2_2);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_6)[_ls], _scale2_2);
                             const float2 _scale2_3 = {chunk_decay_cg1, chunk_decay_cg1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_8)[_ls], _scale2_3);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_7)[_ls], _scale2_3);
+                            const float2 _scale2_4 = {chunk_decay_cg1, chunk_decay_cg1};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_8)[_ls], _scale2_4);
                             tmem_st_x32_f32(state_addr_0, _tmem_load_5);
                             tmem_st_x32_f32(state_addr_1, _tmem_load_6);
                             tmem_st_x32_f32(state_addr_2, _tmem_load_7);
@@ -1480,10 +1480,10 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
                                     mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_11)[_ls], reinterpret_cast<const float2*>(cg1_cumprod_frag)[_ls]);
-                                const float2 _scale2_4 = {scale, scale};
+                                const float2 _scale2_5 = {scale, scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_11)[_ls], _scale2_4);
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_11)[_ls], _scale2_5);
                                 asm volatile(
                                     "tcgen05.st.sync.aligned.16x256b.x8.b32"
                                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
@@ -1610,9 +1610,9 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                                 int o_raw_col_cg1 = (o_dim_base_cg1 & 63 ^ (o_token_pair_cg1 & 3) << 4 ^ o_token_parity_cg1 << 3) + o_token_parity_cg1 * 64;
                                 int o_stsm_offset_cg1 = (o_raw_row_cg1 * 128 + o_raw_col_cg1) * 2;
                                 const int o_pack_base_cg1 = token_group_cg1 * 4;
-                                uint32_t _stmatrix_addr_5 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1 + o_stsm_offset_cg1));
+                                uint32_t _stmatrix_addr_6 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1 + o_stsm_offset_cg1));
                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                    :: "r"(_stmatrix_addr_5), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 3]))
+                                    :: "r"(_stmatrix_addr_6), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_14_bf16[o_pack_base_cg1 + 3]))
                                     : "memory");
                             }
                         }
@@ -1696,22 +1696,22 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                             " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                             :: "r"(state_inp_addr_3_1), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_28_bf16[15]))
                             : "memory");
-                        const float2 _scale2_6 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_25)[_ls], _scale2_6);
                         const float2 _scale2_7 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_26)[_ls], _scale2_7);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_25)[_ls], _scale2_7);
                         const float2 _scale2_8 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_27)[_ls], _scale2_8);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_26)[_ls], _scale2_8);
                         const float2 _scale2_9 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_28)[_ls], _scale2_9);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_27)[_ls], _scale2_9);
+                        const float2 _scale2_10 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_28)[_ls], _scale2_10);
                         tmem_st_x32_f32(state_addr_0_1, _tmem_load_25);
                         tmem_st_x32_f32(state_addr_1_1, _tmem_load_26);
                         tmem_st_x32_f32(state_addr_2_1, _tmem_load_27);
@@ -1844,10 +1844,10 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_31)[_ls], reinterpret_cast<const float2*>(cg1_cumprod_frag_1)[_ls]);
-                            const float2 _scale2_10 = {scale, scale};
+                            const float2 _scale2_11 = {scale, scale};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_31)[_ls], _scale2_10);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_31)[_ls], _scale2_11);
                             asm volatile(
                                 "tcgen05.st.sync.aligned.16x256b.x8.b32"
                                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
@@ -1974,9 +1974,9 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(CakeTensorMap const* Q, CakeTens
                             int o_raw_col_cg1_1 = (o_dim_base_cg1_1 & 63 ^ (o_token_pair_cg1_1 & 3) << 4 ^ o_token_parity_cg1_1 << 3) + o_token_parity_cg1_1 * 64;
                             int o_stsm_offset_cg1_1 = (o_raw_row_cg1_1 * 128 + o_raw_col_cg1_1) * 2;
                             const int o_pack_base_cg1_1 = token_group_cg1_1 * 4;
-                            uint32_t _stmatrix_addr_11 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1_1 + o_stsm_offset_cg1_1));
+                            uint32_t _stmatrix_addr_12 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1_1 + o_stsm_offset_cg1_1));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                :: "r"(_stmatrix_addr_11), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 3]))
+                                :: "r"(_stmatrix_addr_12), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_34_bf16[o_pack_base_cg1_1 + 3]))
                                 : "memory");
                         }
                     }

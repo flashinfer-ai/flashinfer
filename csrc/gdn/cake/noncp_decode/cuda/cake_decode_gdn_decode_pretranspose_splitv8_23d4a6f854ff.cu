@@ -101,7 +101,8 @@ kernel_gdn_decode_pretranspose_splitv8(__nv_bfloat16* __restrict__ q, __nv_bfloa
     }
     asm volatile("cp.async.commit_group;");
     {
-        uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + qk_base + k_start);
+        uint2 _vld_0;
+        _vld_0 = *reinterpret_cast<const uint2*>(q + qk_base + k_start);
         uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -115,7 +116,8 @@ kernel_gdn_decode_pretranspose_splitv8(__nv_bfloat16* __restrict__ q, __nv_bfloa
         }
     }
     {
-        uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + qk_base + k_start);
+        uint2 _vld_1;
+        _vld_1 = *reinterpret_cast<const uint2*>(k + qk_base + k_start);
         uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -145,7 +147,8 @@ kernel_gdn_decode_pretranspose_splitv8(__nv_bfloat16* __restrict__ q, __nv_bfloa
     float sum_q = sum_q_pair.x + sum_q_pair.y;
     float sum_k = sum_k_pair.x + sum_k_pair.y;
     {
-        uint2 _vld_2 = *reinterpret_cast<const uint2*>(v + vh_base + k_start);
+        uint2 _vld_2;
+        _vld_2 = *reinterpret_cast<const uint2*>(v + vh_base + k_start);
         uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {

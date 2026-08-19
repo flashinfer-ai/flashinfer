@@ -1236,7 +1236,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial_bf16state(CakeTensorMap const* Q
                         #pragma unroll
                         for (int state_vec_init = 0; state_vec_init < 8; state_vec_init++) {
                             {
-                                uint2 _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_base_init + (long long)(state_col_block_init * 32) + (long long)(state_vec_init * 4));
+                                uint2 _vld_0;
+                                _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_base_init + (long long)(state_col_block_init * 32) + (long long)(state_vec_init * 4));
                                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2031,7 +2032,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial_bf16state(CakeTensorMap const* Q
                         int empty_state_col = empty_state_vec * 4;
                         float _vec_load_0[4];
                         {
-                            uint2 _vld_13 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            uint2 _vld_13;
+                            _vld_13 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
                             uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {

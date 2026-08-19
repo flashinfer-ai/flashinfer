@@ -95,7 +95,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         long long q_base = (long long)n * q_stride_p0 + (long long)t_pre * q_stride_p1 + (long long)qk_h * q_stride_p2;
         long long k_base = (long long)n * k_stride_p0 + (long long)t_pre * k_stride_p1 + (long long)qk_h * k_stride_p2;
         {
-            uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + q_base + (long long)k_start);
+            uint2 _vld_0;
+            _vld_0 = *reinterpret_cast<const uint2*>(q + q_base + (long long)k_start);
             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
@@ -109,7 +110,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
             }
         }
         {
-            uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + k_base + (long long)k_start);
+            uint2 _vld_1;
+            _vld_1 = *reinterpret_cast<const uint2*>(k + k_base + (long long)k_start);
             uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
@@ -191,7 +193,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
     }
     __syncthreads();
     {
-        uint2 _vld_2 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_a * 128) + (long long)k_start);
+        uint2 _vld_2;
+        _vld_2 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_a * 128) + (long long)k_start);
         uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -205,7 +208,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         }
     }
     {
-        uint2 _vld_3 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_b * 128) + (long long)k_start);
+        uint2 _vld_3;
+        _vld_3 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_b * 128) + (long long)k_start);
         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -219,7 +223,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         }
     }
     {
-        uint2 _vld_4 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_c * 128) + (long long)k_start);
+        uint2 _vld_4;
+        _vld_4 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_c * 128) + (long long)k_start);
         uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -233,7 +238,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         }
     }
     {
-        uint2 _vld_5 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_d * 128) + (long long)k_start);
+        uint2 _vld_5;
+        _vld_5 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_d * 128) + (long long)k_start);
         uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
@@ -327,7 +333,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         {
             long long v_base = (long long)n * v_stride_p0 + (long long)t * v_stride_p1 + (long long)h * v_stride_p2;
             {
-                uint2 _vld_6 = *reinterpret_cast<const uint2*>(v + v_base + (long long)v_row_a);
+                uint2 _vld_6;
+                _vld_6 = *reinterpret_cast<const uint2*>(v + v_base + (long long)v_row_a);
                 uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {

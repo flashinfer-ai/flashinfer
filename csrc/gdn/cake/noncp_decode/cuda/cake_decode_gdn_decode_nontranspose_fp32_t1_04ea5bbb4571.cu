@@ -91,7 +91,8 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
     if (warp_local == 0) {
         int qk_lane_base = lane_local * 4;
         {
-            uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + q_base + (long long)qk_lane_base);
+            uint2 _vld_0;
+            _vld_0 = *reinterpret_cast<const uint2*>(q + q_base + (long long)qk_lane_base);
             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
@@ -105,7 +106,8 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
             }
         }
         {
-            uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + k_base + (long long)qk_lane_base);
+            uint2 _vld_1;
+            _vld_1 = *reinterpret_cast<const uint2*>(k + k_base + (long long)qk_lane_base);
             uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {

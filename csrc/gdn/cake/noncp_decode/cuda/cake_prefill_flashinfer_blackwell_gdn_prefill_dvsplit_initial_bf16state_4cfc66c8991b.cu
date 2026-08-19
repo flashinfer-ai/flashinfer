@@ -1245,14 +1245,26 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state(CakeTensorMap 
                                 const int state_reg_base_init = state_col_group_init * 4;
                                 {
                                     {
-                                        const __nv_bfloat16* _bf16_ptr_0 = reinterpret_cast<const __nv_bfloat16*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
-                                        state_init_frag[state_reg_base_init] = __bfloat162float(_bf16_ptr_0[0]);
-                                        state_init_frag[state_reg_base_init + 1] = __bfloat162float(_bf16_ptr_0[1]);
+                                        uint32_t _bf16x2_bits_0;
+                                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
+                                        asm volatile(
+                                            "{\n\t"
+                                            "shl.b32 %0, %2, 16;\n\t"
+                                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                                            "}\n"
+                                            : "=f"((&state_init_frag[state_reg_base_init])[0]), "=f"((&state_init_frag[state_reg_base_init])[1])
+                                            : "r"(_bf16x2_bits_0));
                                     }
                                     {
-                                        const __nv_bfloat16* _bf16_ptr_1 = reinterpret_cast<const __nv_bfloat16*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
-                                        state_init_frag[state_reg_base_init + 2] = __bfloat162float(_bf16_ptr_1[0]);
-                                        state_init_frag[state_reg_base_init + 2 + 1] = __bfloat162float(_bf16_ptr_1[1]);
+                                        uint32_t _bf16x2_bits_1;
+                                        _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
+                                        asm volatile(
+                                            "{\n\t"
+                                            "shl.b32 %0, %2, 16;\n\t"
+                                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                                            "}\n"
+                                            : "=f"((&state_init_frag[state_reg_base_init + 2])[0]), "=f"((&state_init_frag[state_reg_base_init + 2])[1])
+                                            : "r"(_bf16x2_bits_1));
                                     }
                                 }
                             }
@@ -1931,7 +1943,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state(CakeTensorMap 
                             long long empty_output_bot_base = output_state_head_base_cg1 + (long long)(value_split_idx_1 * 64 + empty_state_row_bot) * 128;
                             float _vec_load_0[4];
                             {
-                                uint2 _vld_10 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_top_base + (long long)empty_state_col);
+                                uint2 _vld_10;
+                                _vld_10 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_top_base + (long long)empty_state_col);
                                 uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1946,7 +1959,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state(CakeTensorMap 
                             }
                             float _vec_load_1[4];
                             {
-                                uint2 _vld_11 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_bot_base + (long long)empty_state_col);
+                                uint2 _vld_11;
+                                _vld_11 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_bot_base + (long long)empty_state_col);
                                 uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {

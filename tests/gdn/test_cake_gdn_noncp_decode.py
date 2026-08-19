@@ -58,12 +58,12 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("22df7a1f42f913a96a3bae126c67e711269be7ca")
-    assert manifest["contract_row_count"] == 1767
-    assert manifest["architecture_row_count"] == 3534
-    assert manifest["admitted_architecture_rows"] == 3474
+    assert manifest["generator_commit"] == ("eb862f0aa7742c1eb0b6275e48ef3d70ac53e1c3")
+    assert manifest["contract_row_count"] == 1768
+    assert manifest["architecture_row_count"] == 3536
+    assert manifest["admitted_architecture_rows"] == 3476
     assert manifest["fail_closed_architecture_rows"] == 60
-    assert manifest["variant_count"] == len(manifest["variants"]) == 80
+    assert manifest["variant_count"] == len(manifest["variants"]) == 82
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -125,6 +125,36 @@ def test_prefill_resolver_selects_frozen_dynamic_head_specializations() -> None:
     assert heads_record["specializations"]["HEAD_GROUP_LOG2"] == 0
     assert group_record["specializations"]["NUM_O_HEADS_LOG2"] == -1
     assert group_record["specializations"]["HEAD_GROUP_LOG2"] == -1
+
+
+def test_prefill_resolver_selects_sglang_tp4_bf16_indexed_row() -> None:
+    route = _prefill(
+        arch="sm_103a",
+        io_dtype="bfloat16",
+        state_dtype="bfloat16",
+        num_seqs=5,
+        total_seq_len=5 * 64,
+        max_seq_len=64,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=8,
+        use_initial_state=True,
+        store_final_state=True,
+        use_state_indices=True,
+    )
+
+    assert route.route_id == "cake.gdn_prefill.noncp.dvsplit"
+    record = cake_gdn._kernel_record(route.variant_name)
+    assert record["specializations"] == {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1,
+    }
 
 
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:

@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "2c21a54502aa4c234cdbf16a7cb51a95bbd427936054c16386cf1ca0d7005bdd"
-_GENERATOR_COMMIT = "22df7a1f42f913a96a3bae126c67e711269be7ca"
+_MANIFEST_SHA256 = "de4f74c8ba9526bd75c073bbf177d7737e3c31d4c84a0abc66865818bd86da63"
+_GENERATOR_COMMIT = "eb862f0aa7742c1eb0b6275e48ef3d70ac53e1c3"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -108,12 +108,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1767,
-        3534,
-        3474,
+        1768,
+        3536,
+        3476,
         60,
-        80,
-        80,
+        82,
+        82,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
