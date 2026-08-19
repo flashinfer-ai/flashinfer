@@ -41,41 +41,37 @@ from flashinfer.autotuner import autotune
 from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
-    MoEActivationPack,
-    MoELayer,
-    MoEWeightPack,
-    RoutingInputMode,
-    TrtllmFp4RoutedRunner,
-)
-from flashinfer.fused_moe.runners import (
-    CuteDslNvfp4Runner,
-    MoERunner,
-    TrtllmBf16RoutedRunner,
-    TrtllmFp8BlockRunner,
-    TrtllmFp8PerTensorRunner,
-    TrtllmMxInt4RoutedRunner,
-)
-from flashinfer.fused_moe.api import (
     ActivationConfig,
     ActivationType,
     BackendOptions,
     CuteDslConfig,
+    CuteDslNvfp4Runner,
     CutlassConfig,
     CutlassBf16Config,
     ExecutionConfig,
     MoEFinalizeConfig,
     ExpertConfig,
+    MoEActivationPack,
     MoEConfig,
+    MoELayer,
+    MoEWeightPack,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
+    RoutingInputMode,
     RoutingMethodType,
     TrtllmBf16Config,
+    TrtllmBf16RoutedRunner,
     TrtllmFp4Config,
+    TrtllmFp4RoutedRunner,
     TrtllmFp8BlockConfig,
+    TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorConfig,
+    TrtllmFp8PerTensorRunner,
     TrtllmMxInt4Config,
+    TrtllmMxInt4RoutedRunner,
 )
+from flashinfer.fused_moe.runners import MoERunner
 from flashinfer.utils import get_compute_capability
 
 

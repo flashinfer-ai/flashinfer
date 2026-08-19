@@ -14,9 +14,9 @@
 
 """CUPTI benchmark for recurrent-KDA prefill public API shapes.
 
-The default case set combines the original H64/H96 coverage with six H12
-shapes representing Kimi-K3's per-rank head count under TP8.  ``--case-set``
-can select either group independently.
+The default case set combines the original H64/H96 coverage, six H12 shapes
+representing Kimi-K3's per-rank head count under TP8, and four fixed-layout
+small-BH shapes. ``--case-set`` can select each group independently.
 
 The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
@@ -148,7 +148,13 @@ LEGACY_CASES = (
     Case("h64_uniform", 64, (1024,) * 8, True, 10005),
 )
 H12_CASES = _load_h12_cases()
-CASES = LEGACY_CASES + H12_CASES
+SMALL_BH_CASES = (
+    Case("h8_fixed_65536", 8, (65536,), False, 11000),
+    Case("h4_fixed_65536_holdout", 4, (65536,), False, 11001),
+    Case("h1_fixed_131072", 1, (131072,), False, 11002),
+    Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
+)
+CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
 
 def _require_cupti() -> None:
@@ -560,16 +566,19 @@ def main() -> None:
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12"),
+        choices=("all", "legacy", "h12", "small_bh"),
         default="all",
-        help="Run all cases, the original H64/H96 cases, or the Kimi-K3 TP8 H12 cases.",
+        help=(
+            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
+            "cases, or the fixed-layout small-BH cases."
+        ),
     )
     parser.add_argument(
         "--state-rotations",
         type=int,
         help=(
             "Override the number of preinitialized same-input state slots per "
-            "mutable path. By default legacy cases use "
+            "mutable path. By default legacy and small-BH cases use "
             f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
             f"{DEFAULT_H12_STATE_ROTATIONS} slots."
         ),
@@ -656,6 +665,7 @@ def main() -> None:
         "all": CASES,
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
+        "small_bh": SMALL_BH_CASES,
     }[args.case_set]
     results = []
     for case in selected_cases:

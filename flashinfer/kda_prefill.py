@@ -39,11 +39,18 @@ _FLASH_KDA_HEAD_DIM = 128
 _FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
+_FLASH_KDA_SMALL_BH_DESCRIPTOR_STORAGE_BYTES = 7 * 128
 _FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS = 128
 _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR = 21
 _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
 _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR = 263
 _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR = 250
+_FLASH_KDA_SMALL_BH_GROUP_SIZE = 8
+_FLASH_KDA_SMALL_BH_RING_STAGES = 35
+_FLASH_KDA_SMALL_BH_PACKET_ROWS = 123
+_FLASH_KDA_SMALL_BH_PACKET_ELEMENTS = 128
+_FLASH_KDA_SMALL_BH_MAX_TASKS = 8
+_FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH = 2048
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
@@ -63,13 +70,27 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._lock = threading.Lock()
         self._state_scratch: Optional[torch.Tensor] = None
         self._beta_padding: Optional[torch.Tensor] = None
+        self._small_bh_packet_workspace: Optional[torch.Tensor] = None
+        self._small_bh_packet_ready: Optional[torch.Tensor] = None
+        self._small_bh_packet_consumed: Optional[torch.Tensor] = None
+        self._small_bh_helper_done: Optional[torch.Tensor] = None
         self._descriptor_storages = {
             variant: torch.empty(
-                _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,
+                (
+                    _FLASH_KDA_SMALL_BH_DESCRIPTOR_STORAGE_BYTES
+                    if variant == "small_bh_m128"
+                    else _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128", "m128_n16", "persistent_m128")
+            for variant in (
+                "m64",
+                "m128",
+                "m128_n16",
+                "persistent_m128",
+                "small_bh_m128",
+            )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
         self._packed_metadata_lock = threading.Lock()
@@ -89,7 +110,8 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial
     state, beta padding, and schedule-specific M64/M128-N32/M128-N16 TMA
-    descriptor storage for the lifetime of the graph. Persistent M128 is an
+    descriptor storage and small-BH packet-ring storage for the lifetime of
+    the graph. Persistent M128 is an
     eager-only B200/GB200 route; explicit workspaces use direct M128 or M64 so graph
     capture never synchronizes sequence lengths to construct host task bins.
 
@@ -342,6 +364,7 @@ def _select_flash_kda_prefill_variant(
     num_heads: int,
     needs_direct_m128: bool = False,
     use_persistent_m128: bool = False,
+    use_small_bh_m128: bool = False,
     use_exact_n16: bool = False,
 ) -> "FlashKDAVariant":
     if num_heads == 12 or use_exact_n16:
@@ -353,6 +376,8 @@ def _select_flash_kda_prefill_variant(
         and num_heads == 64
     ):
         return "m64"
+    if use_small_bh_m128:
+        return "small_bh_m128"
     if use_persistent_m128:
         return "persistent_m128"
     return "m128"
@@ -371,6 +396,28 @@ def _uses_measured_sm100_persistent_policy(
     sm_count: int,
 ) -> bool:
     return compute_capability == (10, 0) and sm_count in (148, 152)
+
+
+def _should_use_small_bh_owner_helper(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    sequence_length: int,
+) -> bool:
+    """Select the fixed small-BH region whose eight-CTA groups fully reside."""
+
+    total_tasks = num_sequences * num_heads
+    return (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and fixed_layout
+        and 0 < total_tasks <= _FLASH_KDA_SMALL_BH_MAX_TASKS
+        and num_heads <= _FLASH_KDA_SMALL_BH_MAX_TASKS
+        and sequence_length >= _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH
+        and _FLASH_KDA_SMALL_BH_GROUP_SIZE * total_tasks <= sm_count
+    )
 
 
 def _requires_exact_n16_recurrence(
@@ -714,14 +761,22 @@ def _workspace_buffer(
     device: torch.device,
     numel: int,
     capture_error: str,
+    dtype: torch.dtype = torch.bfloat16,
+    zero_on_allocate: bool = False,
 ) -> torch.Tensor:
     buffer = getattr(workspace, attribute)
     capturing = torch.cuda.is_current_stream_capturing()
     if buffer is None or buffer.numel() < numel:
         if capturing:
             raise RuntimeError(capture_error)
-        buffer = torch.empty(numel, dtype=torch.bfloat16, device=device)
+        factory = torch.zeros if zero_on_allocate else torch.empty
+        buffer = factory(numel, dtype=dtype, device=device)
         setattr(workspace, attribute, buffer)
+    elif buffer.dtype != dtype:
+        raise RuntimeError(
+            f"recurrent_kda workspace buffer {attribute} has dtype "
+            f"{buffer.dtype}, expected {dtype}"
+        )
     return buffer[:numel]
 
 
@@ -794,6 +849,59 @@ def _beta_tma_source(
     return padded
 
 
+def _small_bh_workspace(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    device: torch.device,
+    total_tasks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    packet_slots = total_tasks * _FLASH_KDA_SMALL_BH_RING_STAGES
+    packet_shape = (
+        packet_slots * _FLASH_KDA_SMALL_BH_PACKET_ROWS,
+        _FLASH_KDA_SMALL_BH_PACKET_ELEMENTS,
+    )
+    capture_error = (
+        "recurrent_kda small-BH packet workspace is not large enough for "
+        "CUDA graph capture; warm the largest small-BH shape on this stream "
+        "before capture"
+    )
+    packet_workspace = _workspace_buffer(
+        workspace=workspace,
+        attribute="_small_bh_packet_workspace",
+        device=device,
+        numel=math.prod(packet_shape),
+        capture_error=capture_error,
+    ).view(packet_shape)
+    packet_ready = _workspace_buffer(
+        workspace=workspace,
+        attribute="_small_bh_packet_ready",
+        device=device,
+        numel=packet_slots,
+        capture_error=capture_error,
+        dtype=torch.uint32,
+        zero_on_allocate=True,
+    )
+    packet_consumed = _workspace_buffer(
+        workspace=workspace,
+        attribute="_small_bh_packet_consumed",
+        device=device,
+        numel=packet_slots,
+        capture_error=capture_error,
+        dtype=torch.uint32,
+        zero_on_allocate=True,
+    )
+    helper_done = _workspace_buffer(
+        workspace=workspace,
+        attribute="_small_bh_helper_done",
+        device=device,
+        numel=total_tasks,
+        capture_error=capture_error,
+        dtype=torch.uint32,
+        zero_on_allocate=True,
+    )
+    return packet_workspace, packet_ready, packet_consumed, helper_done
+
+
 def _tensor_descriptor_signature(tensor: torch.Tensor) -> tuple:
     return (
         tensor.data_ptr(),
@@ -811,10 +919,14 @@ def _descriptor_signature(
     g: torch.Tensor,
     beta_tma: torch.Tensor,
     out: torch.Tensor,
+    packet_workspace: Optional[torch.Tensor] = None,
 ) -> tuple:
-    return tuple(
+    signature = tuple(
         _tensor_descriptor_signature(tensor) for tensor in (q, k, v, g, beta_tma, out)
     )
+    if packet_workspace is not None:
+        signature += (_tensor_descriptor_signature(packet_workspace),)
+    return signature
 
 
 def _bind_workspace(
@@ -1011,6 +1123,14 @@ def _run_flash_kda_prefill(
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         )
     )
+    small_bh_candidate = not needs_direct_m128 and _should_use_small_bh_owner_helper(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=seq_len,
+    )
     persistent_candidate = (
         _uses_measured_sm100_persistent_policy(
             compute_capability=compute_capability,
@@ -1068,6 +1188,7 @@ def _run_flash_kda_prefill(
         num_heads=num_heads,
         needs_direct_m128=needs_direct_m128,
         use_persistent_m128=persistent_plan is not None,
+        use_small_bh_m128=small_bh_candidate,
         use_exact_n16=use_exact_n16,
     )
     if fixed_layout:
@@ -1204,6 +1325,21 @@ def _run_flash_kda_prefill(
             explicit=explicit_workspace,
         )
         beta_tma = _beta_tma_source(beta, workspace)
+        packet_workspace = None
+        packet_ready = None
+        packet_consumed = None
+        helper_done = None
+        if variant == "small_bh_m128":
+            (
+                packet_workspace,
+                packet_ready,
+                packet_consumed,
+                helper_done,
+            ) = _small_bh_workspace(
+                workspace=workspace,
+                device=q.device,
+                total_tasks=num_sequences * num_heads,
+            )
         if initial_state is None and output_final_state and explicit_workspace:
             final_state_arg = _state_scratch(
                 workspace=workspace,
@@ -1219,6 +1355,7 @@ def _run_flash_kda_prefill(
             g=g,
             beta_tma=beta_tma,
             out=out_buf,
+            packet_workspace=packet_workspace,
         )
         warmed_signature = workspace._descriptor_signatures.get(variant)
         if capturing:
@@ -1250,6 +1387,38 @@ def _run_flash_kda_prefill(
                     out_buf,
                     final_state_arg,
                     descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            elif variant == "small_bh_m128":
+                assert packet_workspace is not None
+                assert packet_ready is not None
+                assert packet_consumed is not None
+                assert helper_done is not None
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    descriptor_storage,
+                    packet_workspace,
+                    packet_ready,
+                    packet_consumed,
+                    helper_done,
                     prepare_descriptors,
                     num_heads,
                     int(use_initial_state),
