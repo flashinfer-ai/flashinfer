@@ -47,7 +47,7 @@ jobs:
 
   build:
     name: Build and test CI image (${{ matrix.cuda.label }}, ${{ matrix.arch }})
-    runs-on: [self-hosted, linux, x64, cpu, on-demand]
+    runs-on: [self-hosted, linux, "${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}", cpu, on-demand]
     needs: generate-tag
     timeout-minutes: 360
     strategy:
@@ -59,9 +59,6 @@ jobs:
       IMAGE_TAG: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
