@@ -430,12 +430,8 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
         pytest.param(384, 1, 1, 1, id="single384"),
     ],
 )
-@pytest.mark.parametrize(
-    "data_type", [torch.float32, torch.float16, torch.bfloat16]
-)
-@pytest.mark.parametrize(
-    "bias_type", [torch.float32, torch.float16, torch.bfloat16]
-)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_type", [torch.float32, torch.float16, torch.bfloat16])
 def test_dsv3_fused_routing_backend_correctness(
     backend, num_experts, n_group, topk_group, topk, data_type, bias_type
 ):
@@ -464,9 +460,7 @@ def test_dsv3_fused_routing_backend_correctness(
 
     topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
     topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
-    routing_replay_out = torch.empty(
-        num_tokens, topk, device="cuda", dtype=torch.int16
-    )
+    routing_replay_out = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int16)
     fused_topk_deepseek(
         scores,
         bias,
