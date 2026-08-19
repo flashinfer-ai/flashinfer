@@ -243,8 +243,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                            num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
                            topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
                            topk_group * n_group >= topk;
-  bool const cake_single_group =
-      cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  bool const cake_single_group = cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
   int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
   bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
                                 (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
