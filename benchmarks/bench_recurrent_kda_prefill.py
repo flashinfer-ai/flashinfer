@@ -22,9 +22,10 @@ The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
 device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
-B200 on the direct schedule family. ``--backend`` compares the public API's
-auto, CuTe DSL, and Cake selections without changing the case set. The resolved
-backend, schedule variant, and target are recorded during untimed warmup. With
+B200 on the direct schedule family. ``--backend`` selects one public API
+backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
+over the same case set. The resolved backend, schedule variant, and target are
+recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
 
@@ -624,7 +625,10 @@ def main() -> None:
         "--backend",
         choices=("auto", "cute-dsl", "cake"),
         default="auto",
-        help="Backend passed to the public recurrent_kda API.",
+        help=(
+            "Select one backend for this invocation of the public recurrent_kda "
+            "API; run separate commands to compare backends."
+        ),
     )
     parser.add_argument(
         "--flash-kda-peer",

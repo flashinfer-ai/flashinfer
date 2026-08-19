@@ -413,7 +413,9 @@ class RecurrentKDAPrefillWrapper:
     order, and chunk metadata in place when those totals remain unchanged.
 
     This wrapper is specific to the CuTe DSL backend and intentionally uses
-    its non-persistent schedule.
+    its non-persistent schedule. One wrapper instance is a single-writer
+    resource: do not call ``plan`` concurrently with ``run`` or while a kernel
+    launched by ``run`` may still be reading the wrapper's planned buffers.
     """
 
     def __init__(

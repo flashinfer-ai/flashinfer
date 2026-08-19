@@ -106,7 +106,8 @@ def _is_cute_dsl_kda_prefill_eligible(
         ):
             return False
     if (
-        beta.device != q.device
+        not isinstance(beta, torch.Tensor)
+        or beta.device != q.device
         or beta.dtype != torch.bfloat16
         or beta.shape != (batch_size, token_count, num_heads)
         or not beta.is_contiguous()
@@ -138,6 +139,7 @@ def _is_cute_dsl_kda_prefill_eligible(
     else:
         if (
             batch_size != 1
+            or not isinstance(cu_seqlens, torch.Tensor)
             or cu_seqlens.device != q.device
             or cu_seqlens.dtype not in (torch.int32, torch.int64)
             or cu_seqlens.ndim != 1
@@ -148,7 +150,8 @@ def _is_cute_dsl_kda_prefill_eligible(
         num_sequences = cu_seqlens.numel() - 1
 
     if seq_order is not None and (
-        cu_seqlens is None
+        not isinstance(seq_order, torch.Tensor)
+        or cu_seqlens is None
         or seq_order.device != q.device
         or seq_order.dtype != torch.int32
         or seq_order.ndim != 1
@@ -160,6 +163,7 @@ def _is_cute_dsl_kda_prefill_eligible(
     if ssm_state_indices is not None:
         if (
             initial_state is None
+            or not isinstance(ssm_state_indices, torch.Tensor)
             or ssm_state_indices.device != q.device
             or ssm_state_indices.dtype != torch.int32
             or ssm_state_indices.ndim != 1
@@ -169,7 +173,8 @@ def _is_cute_dsl_kda_prefill_eligible(
             return False
     if initial_state is not None:
         if (
-            initial_state.device != q.device
+            not isinstance(initial_state, torch.Tensor)
+            or initial_state.device != q.device
             or initial_state.dtype != torch.bfloat16
             or initial_state.ndim != 4
             or initial_state.shape[0] <= 0
@@ -185,7 +190,8 @@ def _is_cute_dsl_kda_prefill_eligible(
         if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
             return False
     if output is not None and (
-        output.device != q.device
+        not isinstance(output, torch.Tensor)
+        or output.device != q.device
         or output.dtype != torch.bfloat16
         or output.shape != q.shape
         or not output.is_contiguous()

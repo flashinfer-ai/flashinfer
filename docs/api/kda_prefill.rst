@@ -14,6 +14,13 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
     RecurrentKDAPrefillWorkspace
 
+.. currentmodule:: flashinfer.kda
+
+.. autosummary::
+    :toctree: ../generated
+
+    RecurrentKDAPrefillWrapper
+
 Backend selection
 -----------------
 
@@ -27,8 +34,9 @@ For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
 It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
 head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
 layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
-contract as Cake. Packed offsets and checkpoint starts must be int64 during
-CUDA graph capture. The CuTe DSL schedule is non-persistent.
+contract as Cake. ``checkpoint_cu_starts`` must always be int64. Packed
+``cu_seqlens`` must be int64 during CUDA graph capture. The CuTe DSL schedule
+is non-persistent.
 
 Optimized Blackwell prefill subset
 -----------------------------------

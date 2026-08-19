@@ -63,6 +63,14 @@ def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
     with pytest.raises(ValueError, match="total token count is fixed"):
         wrapper.plan(torch.tensor([0, 0, 2, 2, 13], device=cuda_device))
 
+    with pytest.raises(ValueError, match="number of sequences is fixed"):
+        wrapper.plan(torch.tensor([0, 2, 12], device=cuda_device))
+
+    chunk_wrapper = RecurrentKDAPrefillWrapper(cuda_device)
+    chunk_wrapper.plan(torch.tensor([0, 16, 16, 32], device=cuda_device))
+    with pytest.raises(ValueError, match="chunk count is fixed"):
+        chunk_wrapper.plan(torch.tensor([0, 1, 17, 32], device=cuda_device))
+
     with pytest.raises(ValueError, match="non-decreasing"):
         RecurrentKDAPrefillWrapper(cuda_device).plan(
             torch.tensor([0, 2, 1, 12], device=cuda_device)
@@ -194,12 +202,14 @@ def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
     assert recurrent_kda(**_cpu_route_tensors()) is sentinel
 
 
-def test_public_prefill_cake_keeps_checkpoint_contract(monkeypatch):
+def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
+    monkeypatch,
+):
     sentinel = (object(), object(), object())
     monkeypatch.setattr(
         kda_prefill_cute_api,
         "_is_cute_dsl_kda_prefill_eligible",
-        lambda **kwargs: pytest.fail("checkpointing must bypass CuTe DSL"),
+        lambda **kwargs: pytest.fail("backend='cake' must not probe CuTe DSL"),
     )
     monkeypatch.setattr(
         kda_prefill_api,
@@ -426,22 +436,22 @@ def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
     assert result[1] is None
     args, kwargs = calls[0]
     assert args[7] is cu_seqlens
-    assert tuple(kwargs) == (
+    assert set(kwargs) == {
         "state_indices",
         "seq_order",
         "planned_cu_chunks",
         "planned_total_chunks",
-    )
+    }
     assert kwargs["seq_order"] is seq_order
     assert kwargs["state_indices"] is None
     assert kwargs["planned_cu_chunks"] is None
     assert kwargs["planned_total_chunks"] is None
 
 
-def test_cute_dsl_lpt_sequence_order_is_content_cached():
+def test_cute_dsl_lpt_sequence_order_is_content_cached(monkeypatch):
     kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
-    kernel_module._CU_CONTENTS_MEMO.clear()
-    kernel_module._LPT_SEQUENCE_ORDER_CACHE.clear()
+    monkeypatch.setattr(kernel_module, "_CU_CONTENTS_MEMO", {})
+    monkeypatch.setattr(kernel_module, "_LPT_SEQUENCE_ORDER_CACHE", {})
     cu_seqlens = torch.tensor(
         [0, 1300, 1847, 3895, 4858, 5129, 8192], dtype=torch.int64
     )
@@ -578,6 +588,51 @@ def _make_inputs(
             torch.tensor(offsets, dtype=torch.int64, device="cuda") if packed else None
         ),
     }
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "beta",
+        "cu_seqlens",
+        "seq_order",
+        "ssm_state_indices",
+        "initial_state",
+        "output",
+    ),
+)
+def test_public_prefill_auto_falls_back_for_non_tensor_arguments(
+    flash_kda_device,
+    monkeypatch,
+    field,
+):
+    with torch.cuda.device(flash_kda_device):
+        inputs = _make_inputs(
+            seq_lens=[3, 5],
+            num_heads=1,
+            packed=True,
+            initial_state=True,
+        )
+    kwargs = _strict_prefill_kwargs(inputs)
+    kwargs[field] = object()
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: pytest.fail("ineligible call must not run CuTe DSL"),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+
+    assert recurrent_kda(**kwargs) is sentinel
 
 
 def _reference(inputs, *, lower_bound=-5.0, scale=None):
