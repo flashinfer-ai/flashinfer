@@ -22,7 +22,7 @@ score loads are hoisted ahead of the loop when topk is small.
 from __future__ import annotations
 
 import os
-from typing import ClassVar, Dict, Optional
+from typing import ClassVar, Dict, Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
 
@@ -170,12 +170,34 @@ class TopkReduce:
     # topk loop (small enough to not bloat registers; a CTA-broadcast read).
     _prefetch_limit: ClassVar[int] = 16
 
+    _Float32Value = Union[Tuple[Float32, Float32], Float32]
+
     def __init__(
-        self, hidden: int, num_topk: int, combine_format: CombineFormat
+        self,
+        hidden: int,
+        num_topk: int,
+        combine_format: CombineFormat,
+        *,
+        sm_arch: str,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.combine_format = combine_format
+        arch_code = sm_arch.removeprefix("sm_")
+        if arch_code[-1:] in ("a", "f"):
+            arch_code = arch_code[:-1]
+        if not sm_arch.startswith("sm_") or not arch_code.isdigit():
+            raise ValueError(f"sm_arch must have the form 'sm_XX', got {sm_arch!r}.")
+        arch_number = int(arch_code)
+        if arch_number < 90:
+            raise ValueError(f"sm_arch must target SM90 or newer, got {sm_arch!r}.")
+        self.use_scalar_math = arch_number < 100
+        if self.use_scalar_math and combine_format.name != "bf16":
+            raise ValueError(
+                f"sm_arch={sm_arch!r} only supports BF16 combine, "
+                f"got {combine_format.name!r}."
+            )
+        self.sm_arch = sm_arch
         self.hidden_per_thread = self._hidden_per_thread[combine_format.name]
         # hidden must tile cleanly both into worker slices and into scale blocks.
         align = max(
@@ -191,6 +213,52 @@ class TopkReduce:
         # number of CTAs; prefetch only when topk is small enough to hoist.
         self.require_predicate = self.hidden_tiles % self._threads != 0
         self.prefetch = self.num_topk <= self._prefetch_limit
+
+    @cute.jit
+    def _fma(
+        self,
+        lhs: _Float32Value,
+        rhs: Float32,
+        acc: _Float32Value,
+    ) -> _Float32Value:
+        """Architecture-selected FP32 FMA with a scalar multiplier."""
+        if cutlass.const_expr(self.use_scalar_math):
+            # CUTLASS DSL 4.6 exposes explicit scalar math through cute.math;
+            # the CI-pinned 4.5.2 wheel needs the equivalent PTX fallback.
+            if cutlass.const_expr(hasattr(cute.math, "fma")):
+                return cute.math.fma(lhs, rhs, acc)
+            return Float32(
+                llvm.inline_asm(
+                    T.f32(),
+                    [lhs.ir_value(), rhs.ir_value(), acc.ir_value()],
+                    "fma.rn.f32 $0, $1, $2, $3;",
+                    "=f,f,f,f",
+                    has_side_effects=False,
+                )
+            )
+        return cute.arch.fma_packed_f32x2(lhs, (rhs, rhs), acc)
+
+    @cute.jit
+    def _fmul(
+        self,
+        lhs: _Float32Value,
+        rhs: Float32,
+    ) -> _Float32Value:
+        """Architecture-selected FP32 multiply with a scalar multiplier."""
+        if cutlass.const_expr(self.use_scalar_math):
+            # Keep the same 4.6 public-API / 4.5.2 PTX split as _fma.
+            if cutlass.const_expr(hasattr(cute.math, "mul")):
+                return cute.math.mul(lhs, rhs)
+            return Float32(
+                llvm.inline_asm(
+                    T.f32(),
+                    [lhs.ir_value(), rhs.ir_value()],
+                    "mul.rn.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    has_side_effects=False,
+                )
+            )
+        return cute.arch.mul_packed_f32x2(lhs, (rhs, rhs))
 
     # -- launcher -------------------------------------------------------------
 
@@ -316,13 +384,6 @@ class TopkReduce:
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
 
-        score_dtype = (
-            topk_score.dtype
-            if cutlass.const_expr(topk_score is not None)
-            else cutlass.Float32
-        )
-        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
-
         if (not needs_guard) or token_idx < reduced_output.shape[0]:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             terms = cute.zipped_divide(
@@ -335,13 +396,6 @@ class TopkReduce:
                 (hidden_per_thread,),
             )[(None,), (hidden_tile_idx,)]
 
-            if cutlass.const_expr(topk_score is not None):
-                if cutlass.const_expr(prefetch):
-                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
-            else:
-                for k in cutlass.range_constexpr(num_topk):
-                    score_reg[k] = score_dtype(1)
-
             load_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 cutlass.BFloat16,
@@ -349,27 +403,57 @@ class TopkReduce:
             )
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
 
+            score_dtype = (
+                topk_score.dtype
+                if cutlass.const_expr(topk_score is not None)
+                else cutlass.Float32
+            )
+            score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                term = cute.make_rmem_tensor(
+                    (hidden_per_thread,),
+                    cutlass.BFloat16,
+                )
                 cute.copy(load_atom, terms[k, None], term)
                 if cutlass.const_expr(topk_score is not None and not prefetch):
                     score_reg[k] = topk_score[token_idx, Int32(k)]
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                score = Float32(score_reg[k])
 
-                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    value_pair = (Float32(term[i]), Float32(term[i + 1]))
-                    if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
-                            value_pair, score_pair, (acc[i], acc[i + 1])
-                        )
-                    else:
-                        if cutlass.const_expr(topk_score is not None):
-                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(
-                                value_pair, score_pair
+                if cutlass.const_expr(self.use_scalar_math):
+                    for i in cutlass.range_constexpr(hidden_per_thread):
+                        value = Float32(term[i])
+                        if cutlass.const_expr(k == 0):
+                            if cutlass.const_expr(topk_score is not None):
+                                acc[i] = self._fmul(value, score)
+                            else:
+                                acc[i] = value
+                        else:
+                            acc[i] = self._fma(value, score, acc[i])
+                else:
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = self._fma(
+                                value_pair,
+                                score,
+                                (acc[i], acc[i + 1]),
                             )
                         else:
-                            acc[i] = value_pair[0]
-                            acc[i + 1] = value_pair[1]
+                            if cutlass.const_expr(topk_score is not None):
+                                acc[i], acc[i + 1] = self._fmul(
+                                    value_pair,
+                                    score,
+                                )
+                            else:
+                                acc[i] = value_pair[0]
+                                acc[i + 1] = value_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -459,21 +543,24 @@ class TopkReduce:
                         score_reg[k] = topk_score[token_idx, Int32(k)]
 
                 scale = Float32(scale_reg[k])  # e8m0 -> f32
-                scale_pair = (scale, scale)
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                score = Float32(score_reg[k])
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    dequant_pair = cute.arch.mul_packed_f32x2(
-                        (value[i], value[i + 1]), scale_pair
+                    dequant_pair = self._fmul(
+                        (value[i], value[i + 1]),
+                        scale,
                     )
                     if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
-                            dequant_pair, score_pair, (acc[i], acc[i + 1])
+                        acc[i], acc[i + 1] = self._fma(
+                            dequant_pair,
+                            score,
+                            (acc[i], acc[i + 1]),
                         )
                     else:
                         if cutlass.const_expr(topk_score is not None):
-                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(
-                                dequant_pair, score_pair
+                            acc[i], acc[i + 1] = self._fmul(
+                                dequant_pair,
+                                score,
                             )
                         else:
                             acc[i] = dequant_pair[0]
@@ -574,20 +661,23 @@ class TopkReduce:
 
                 # amax (bf16) -> per-element scale; (1/6) folds the fp4 grid max.
                 scale = Float32(scale_reg[k]) * Float32(Nvfp4E2M1RcpLimit)
-                scale_pair = (scale, scale)
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                score = Float32(score_reg[k])
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    dequant_pair = cute.arch.mul_packed_f32x2(
-                        (value[i], value[i + 1]), scale_pair
+                    dequant_pair = self._fmul(
+                        (value[i], value[i + 1]),
+                        scale,
                     )
                     if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
-                            dequant_pair, score_pair, (acc[i], acc[i + 1])
+                        acc[i], acc[i + 1] = self._fma(
+                            dequant_pair,
+                            score,
+                            (acc[i], acc[i + 1]),
                         )
                     elif cutlass.const_expr(topk_score is not None):
-                        acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(
-                            dequant_pair, score_pair
+                        acc[i], acc[i + 1] = self._fmul(
+                            dequant_pair,
+                            score,
                         )
                     else:
                         acc[i] = dequant_pair[0]

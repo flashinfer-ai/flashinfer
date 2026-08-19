@@ -246,3 +246,20 @@ def bsa_attn_sm100_blk128_fwd(
             )
 
     return out, lse
+
+
+def bsa_attn_fwd(*args, **kwargs):
+    """Deprecated alias for bsa_attn_sm100_blk128_fwd.
+
+    .. deprecated:: 0.6.18
+        Use :func:`bsa_attn_sm100_blk128_fwd` instead.
+    """
+    import warnings
+
+    warnings.warn(
+        "bsa_attn_fwd is deprecated and will be removed in a future release. "
+        "Use bsa_attn_sm100_blk128_fwd instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return bsa_attn_sm100_blk128_fwd(*args, **kwargs)

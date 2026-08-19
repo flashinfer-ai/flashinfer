@@ -2256,7 +2256,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                    RoutingMethodType::RenormalizeNaive ||
                static_cast<RoutingMethodType>(routing_method_type) ==
                    RoutingMethodType::SigmoidRenorm ||
-               static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Sigmoid) {
+               static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Sigmoid ||
+               static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::TopKSigmoid) {
       TVM_FFI_ICHECK(args->top_k <= 32 && args->top_k > 0)
           << "Current routing kernel (no groups) only supports top_k<=32 && top_k>0.";
     } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -2920,7 +2922,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 4> mBaseSupportedTileNums = {8, 16, 32, 64};
 
-  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                                   bool use_per_token_scaling) {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
@@ -2930,7 +2933,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       // kernels (its only 192-tile kernels are FP8), and launchers are built
       // eagerly for every advertised tile, so advertising 192 there fails
       // runner construction outright.
-      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+      // The exported per-token NVFP4 tile-192 path produces non-finite outputs (#4486).
+      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1 &&
+           !use_per_token_scaling) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
@@ -3329,7 +3334,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
 
-    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
+    std::vector<int32_t> tile_sizes =
+        getSupportedTileNums(dtype_act, dtype_weights, use_per_token_scaling);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
@@ -3976,8 +3982,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   // Determine supported tile sizes
-  std::vector<int32_t> mSupportedTileN =
-      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
+  std::vector<int32_t> mSupportedTileN = FP4BlockScaleLauncher::getSupportedTileNums(
+      mDtypeAct, mDtypeWeights, per_token_scales.has_value());
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

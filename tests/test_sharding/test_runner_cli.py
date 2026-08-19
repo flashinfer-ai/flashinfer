@@ -565,6 +565,36 @@ def test_sm90():
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
+def test_pytest_root_is_stable_for_repository_and_external_scopes(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    test_file = suite / "test_sample.py"
+    test_file.write_text("def test_case(): pass\n", encoding="utf-8")
+
+    assert runner._pytest_root(REPO_ROOT, REPO_ROOT / "tests") == REPO_ROOT.resolve()
+    assert runner._pytest_root(REPO_ROOT, suite) == suite.resolve()
+    assert runner._pytest_root(REPO_ROOT, test_file) == suite.resolve()
+
+
+def test_collection_preserves_external_pytest_config(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "pytest.ini").write_text(
+        "[pytest]\npython_files = check_*.py\n",
+        encoding="utf-8",
+    )
+    (suite / "check_sample.py").write_text(
+        "def test_case(): pass\n",
+        encoding="utf-8",
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+
+    assert [node["nodeid"] for node in nodes] == ["check_sample.py::test_case"]
+
+
 def test_collection_termination_uses_configured_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -670,6 +700,7 @@ def test_worker_exception_is_reported_as_infrastructure_error(
         plan=plan,
         execution=execution,
         operation_started_at=time.time(),
+        test_path=REPO_ROOT / "tests",
     )
 
     assert result == 3
@@ -760,6 +791,7 @@ def test_setup_error_is_not_masked_when_lease_cleanup_also_fails(
             plan=plan,
             execution=execution,
             operation_started_at=time.time(),
+            test_path=REPO_ROOT / "tests",
         )
 
     assert "cannot close shard leases" in capsys.readouterr().out
@@ -820,6 +852,7 @@ def test_partial_shard_lease_claim_is_rolled_back(
             plan=plan,
             execution=execution,
             operation_started_at=time.time(),
+            test_path=REPO_ROOT / "tests",
         )
 
     leases = tmp_path / "junit" / "attempts" / "attempt-0001" / "leases"
@@ -966,6 +999,7 @@ def test_lease_heartbeat_failure_aborts_work_and_is_reported(
         plan=plan,
         execution=execution,
         operation_started_at=time.time(),
+        test_path=REPO_ROOT / "tests",
     )
 
     assert result == 3
@@ -1005,7 +1039,11 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
 
 def test_plan_run_and_completed_reuse_publish_resumable_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pytest 9 may otherwise inherit the repository root for this external
+    # temporary suite, which used to leak pytest-of-*/... prefixes into node IDs.
+    monkeypatch.setenv("PYTEST_ADDOPTS", f"--rootdir={REPO_ROOT}")
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "conftest.py").write_text(

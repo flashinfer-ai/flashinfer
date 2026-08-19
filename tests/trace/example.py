@@ -22,6 +22,7 @@ gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
@@ -74,6 +75,9 @@ msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
+prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
+prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -119,6 +123,10 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
+from flashinfer.attention.prims_ts.block_sparse import (
+    block_sparse_attention,
+    block_sparse_attention_with_paged_kv_cache,
+)
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
@@ -618,6 +626,88 @@ k_r = torch.randn(512, num_kv, head_dim, dtype=torch.bfloat16, device=device)
 v_r = torch.randn(512, num_kv, head_dim, dtype=torch.bfloat16, device=device)
 rag.run(q_r, k_r, v_r)
 
+# ── PrimTS block-sparse (fixed-top-k MHA, compact BSHD) ───────────────────
+# Trace directly so this example covers the public schemas without compiling
+# the SM100/SM103 kernel or executing an unplanned reusable wrapper.
+bs_B, bs_Sq, bs_Skv, bs_H, bs_D = 2, 128, 512, 8, 128
+bs_q_block, bs_kv_block, bs_topk = 64, 64, 4
+bs_num_q_blocks = (bs_Sq + bs_q_block - 1) // bs_q_block
+bs_num_rows = bs_B * bs_H * bs_num_q_blocks
+bs_q = torch.randn(bs_B, bs_Sq, bs_H, bs_D, dtype=torch.float16, device=device)
+bs_k = torch.randn(bs_B, bs_Skv, bs_H, bs_D, dtype=torch.float16, device=device)
+bs_v = torch.randn_like(bs_k)
+bs_row_bases = (
+    torch.arange(bs_B * bs_H, dtype=torch.int32, device=device)
+    * (bs_num_q_blocks * bs_topk)
+).reshape(bs_B, bs_H, 1)
+bs_row_offsets = (
+    torch.arange(bs_num_q_blocks + 1, dtype=torch.int32, device=device) * bs_topk
+)
+bs_block_indptr = (bs_row_bases + bs_row_offsets).contiguous()
+bs_block_indices = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=device).repeat(
+    bs_num_rows
+)
+bs_valid_bits = torch.full(
+    (bs_B, (bs_Skv + 31) // 32),
+    0xFFFFFFFF,
+    dtype=torch.uint32,
+    device=device,
+)
+bs_out = torch.empty_like(bs_q)
+
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    block_indptr=bs_block_indptr,
+    block_indices=bs_block_indices,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    kv_valid_bits=bs_valid_bits,
+    mask_type="dense",
+    out=bs_out,
+)
+
+# ── PrimTS paged block-sparse (both public cache forms) ──────────────────
+bs_page_size = 64
+bs_pages_per_request = bs_Skv // bs_page_size
+bs_num_pages = bs_B * bs_pages_per_request
+bs_paged_kv_indptr = (
+    torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
+)
+bs_paged_kv_indices = torch.arange(bs_num_pages, dtype=torch.int32, device=device)
+bs_seq_lens_kv = torch.tensor(
+    [bs_Skv - bs_page_size // 2, bs_Skv], dtype=torch.int32, device=device
+)
+bs_k_cache = torch.randn(
+    bs_num_pages,
+    bs_H,
+    bs_page_size,
+    bs_D,
+    dtype=torch.float16,
+    device=device,
+)
+bs_v_cache = torch.randn_like(bs_k_cache)
+bs_combined_cache = torch.stack((bs_k_cache, bs_v_cache), dim=1)
+
+for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
+    block_sparse_attention_with_paged_kv_cache.fi_trace(
+        save_dir=SAVE_DIR,
+        q=bs_q,
+        paged_kv_cache=bs_paged_cache,
+        paged_kv_indptr=bs_paged_kv_indptr,
+        paged_kv_indices=bs_paged_kv_indices,
+        block_indptr=bs_block_indptr,
+        block_indices=bs_block_indices,
+        q_block_size=bs_q_block,
+        kv_block_size=bs_kv_block,
+        seq_len_kv=bs_Skv,
+        seq_lens_kv=bs_seq_lens_kv,
+        kv_valid_bits=bs_valid_bits,
+        mask_type="dense",
+        out=bs_out,
+    )
 # ── MLA paged decode (DeepSeek-V3 TP=8, h=16/ckv=512/kpe=64) ─────────────────
 mla_b, mla_h, ckv, kpe = 128, 16, 512, 64
 
@@ -713,6 +803,31 @@ flashinfer.kda_decode.recurrent_kda(
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
 )
+
+# ── serving-native packed Kimi K3 KDA decode ────────────────────────────────
+# The trace is emitted before the exact-SM kernel is loaded, so suppressing an
+# unsupported-device/JIT error still leaves a useful definition JSON.
+with contextlib.suppress(Exception):
+    pk_B, pk_H, pk_D = 4, 12, 128
+    pk_hidden = pk_H * pk_D
+    pk_mixed_qkv = torch.randn(pk_B, 3 * pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_gate = torch.randn(pk_B, pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_beta = torch.randn(pk_B, pk_H, dtype=torch.bfloat16, device=device)
+    pk_A_log = torch.randn(pk_H, dtype=torch.float32, device=device)
+    pk_dt_bias = torch.randn(pk_hidden, dtype=torch.float32, device=device)
+    pk_state = torch.zeros(pk_B, pk_H, pk_D, pk_D, dtype=torch.bfloat16, device=device)
+    pk_indices = torch.arange(pk_B, dtype=torch.int32, device=device)
+    pk_output = torch.empty(pk_B, 1, pk_H, pk_D, dtype=torch.bfloat16, device=device)
+    flashinfer.packed_kda_decode(
+        pk_mixed_qkv,
+        pk_raw_gate,
+        pk_raw_beta,
+        pk_A_log,
+        pk_dt_bias,
+        pk_state,
+        pk_indices,
+        output=pk_output,
+    )
 
 # ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
 fk_N, fk_H, fk_D = 4, 12, 128

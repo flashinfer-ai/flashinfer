@@ -100,7 +100,7 @@ band, that is a real signal, not marginality.
 | `bash tests/moe_ep/run_tests.sh unit` | 1 (host-only) | none — mocks + single GPU, no multirank |
 | `bash tests/moe_ep/run_tests.sh multirank` | 4 | NCCL-EP (NIXL-EP too if built) |
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
-| `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
+| `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + BF16 + NVFP4 + MXFP8 |
 
 - **unit** — host-only pytest (mocks + single-GPU). The full run accumulates
   native heap damage somewhere in the GPU/DSL/transport stack: with every
@@ -119,7 +119,7 @@ band, that is a real signal, not marginality.
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
-- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank
+- **mega** — 4-GPU DeepGEMM + BF16 + NVFP4 + MXFP8 mega parity, plus single-rank
   MXFP8 preprocess-vs-reference check.
 
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
