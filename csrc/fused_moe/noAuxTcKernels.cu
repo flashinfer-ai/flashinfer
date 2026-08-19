@@ -239,9 +239,16 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out) {
 #ifdef FLASHINFER_CAKE_BACKEND
-  bool const cake_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
-  int64_t const cake_experts_per_group = num_experts / n_group;
-  bool const cake_multi_group = (n_group != 1) && (num_experts <= NumDeepseekExperts) &&
+  bool const cake_common = num_tokens > 0 && num_experts > 0 && n_group > 0 &&
+                           num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
+                           topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
+                           topk_group * n_group >= topk;
+  bool const cake_single_group =
+      cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
+  bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
+                                (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
+                                (cake_experts_per_group >= 2) &&
                                 (cake_experts_per_group <= WARP_SIZE) &&
                                 (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
   TLLM_CHECK_WITH_INFO(cake_single_group || cake_multi_group,

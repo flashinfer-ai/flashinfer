@@ -14,6 +14,48 @@ from flashinfer.utils import (
 )
 
 
+_CAKE_DTYPES = frozenset((torch.float16, torch.bfloat16, torch.float32))
+
+
+def _is_cake_dsv3_fused_routing_supported(
+    *,
+    capability: tuple[int, int],
+    num_tokens: int,
+    num_experts: int,
+    n_group: int,
+    topk_group: int,
+    topk: int,
+    score_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+) -> bool:
+    """Return whether the call is inside Cake's executable NoAuxTc contract."""
+
+    if capability not in ((10, 0), (10, 3)):
+        return False
+    if score_dtype not in _CAKE_DTYPES or bias_dtype not in _CAKE_DTYPES:
+        return False
+    if num_tokens <= 0 or num_experts <= 0 or n_group <= 0:
+        return False
+    if num_experts % n_group != 0:
+        return False
+    if topk <= 0 or topk > 8 or topk > num_experts:
+        return False
+    if topk_group <= 0 or topk_group > n_group or topk_group * n_group < topk:
+        return False
+
+    if n_group == 1:
+        return num_experts <= 384
+
+    experts_per_group = num_experts // n_group
+    return (
+        n_group <= 8
+        and topk_group <= 4
+        and num_experts <= 256
+        and 2 <= experts_per_group <= 32
+        and experts_per_group * topk_group <= 128
+    )
+
+
 @supported_compute_capability([89, 90, 100, 103, 107, 120, 121])
 def _check_dsv3_fused_routing_supported(
     scores,
@@ -233,9 +275,19 @@ def fused_topk_deepseek(
     utilization.
     """
     capability = torch.cuda.get_device_capability(scores.device)
+    use_cake = _is_cake_dsv3_fused_routing_supported(
+        capability=capability,
+        num_tokens=scores.shape[0],
+        num_experts=scores.shape[1],
+        n_group=n_group,
+        topk_group=topk_group,
+        topk=topk,
+        score_dtype=scores.dtype,
+        bias_dtype=bias.dtype,
+    )
     module = (
         get_dsv3_fused_routing_module(backend="cake")
-        if capability in ((10, 0), (10, 3))
+        if use_cake
         else get_dsv3_fused_routing_module(backend="default")
     )
     module.NoAuxTc(
