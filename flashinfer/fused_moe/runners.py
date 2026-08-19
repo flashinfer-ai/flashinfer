@@ -1073,15 +1073,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type not in (ActivationType.Swiglu, ActivationType.Relu2):
+        activation = self.config.activation.type
+        if activation not in (ActivationType.Swiglu, ActivationType.Relu2):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
             )
         variant = self.config.quant.variant
         if variant in self.supported_quant_variants:
-            if self.config.quant.per_token_scale and variant is not QuantVariant.NVFP4:            
+            if self.config.quant.per_token_scale and variant is not QuantVariant.NVFP4:
                 raise NotImplementedError(
-                    f"{type(self).__name__} does not support per-token scale for {variant.name}."
+                    f"{type(self).__name__} does not support per-token scale for "
+                    f"QuantVariant.{variant.name}."
                 )
 
             from ..utils import get_compute_capability
