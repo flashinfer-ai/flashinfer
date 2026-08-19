@@ -41,40 +41,37 @@ from flashinfer.autotuner import autotune
 from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
-    MoEActivationPack,
-    MoELayer,
-    MoEWeightPack,
-    RoutingInputMode,
-    TrtllmFp4RoutedRunner,
-)
-from flashinfer.fused_moe.runners import (
-    CuteDslNvfp4Runner,
-    MoERunner,
-    TrtllmBf16RoutedRunner,
-    TrtllmFp8BlockRunner,
-    TrtllmFp8PerTensorRunner,
-    TrtllmMxInt4RoutedRunner,
-)
-from flashinfer.fused_moe.api import (
     ActivationConfig,
     ActivationType,
     BackendOptions,
     CuteDslConfig,
+    CuteDslNvfp4Runner,
     CutlassConfig,
     CutlassBf16Config,
     ExecutionConfig,
+    MoEFinalizeConfig,
     ExpertConfig,
+    MoEActivationPack,
     MoEConfig,
+    MoELayer,
+    MoEWeightPack,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
+    RoutingInputMode,
     RoutingMethodType,
     TrtllmBf16Config,
+    TrtllmBf16RoutedRunner,
     TrtllmFp4Config,
+    TrtllmFp4RoutedRunner,
     TrtllmFp8BlockConfig,
+    TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorConfig,
+    TrtllmFp8PerTensorRunner,
     TrtllmMxInt4Config,
+    TrtllmMxInt4RoutedRunner,
 )
+from flashinfer.fused_moe.runners import MoERunner
 from flashinfer.utils import get_compute_capability
 
 
@@ -207,9 +204,15 @@ class TestReprRoundTrip:
         assert _eval_repr(cfg) == cfg
 
     def test_execution_config_custom(self):
-        cfg = ExecutionConfig(
-            do_finalize=False, enable_pdl=True, tune_max_num_tokens=1024
-        )
+        cfg = ExecutionConfig(enable_pdl=True, tune_max_num_tokens=1024)
+        assert _eval_repr(cfg) == cfg
+
+    def test_finalize_config_default(self):
+        cfg = MoEFinalizeConfig()
+        assert _eval_repr(cfg) == cfg
+
+    def test_finalize_config_custom(self):
+        cfg = MoEFinalizeConfig(do_finalize=False, use_fused_finalize=False)
         assert _eval_repr(cfg) == cfg
 
     def test_backend_options_multi(self):
@@ -670,7 +673,7 @@ class TestMoERunnerSupport:
     def test_fp8_block_unfinalized_not_supported(self):
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
-            execution=ExecutionConfig(do_finalize=False),
+            finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
         runner.config = cfg
@@ -711,7 +714,7 @@ class TestMoERunnerSupport:
 
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.BF16),
-            execution=ExecutionConfig(do_finalize=False),
+            finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
         runner.config = cfg

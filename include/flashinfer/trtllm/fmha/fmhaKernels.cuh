@@ -131,7 +131,9 @@ class TllmGenFmhaKernel {
   }
 
   void setupKernelSmem(CUfunction func, KernelMeta const& kernelMeta) const {
-#if CUDA_VERSION >= 13030
+    // CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE and the ALLOW_OVERSIZED enum value require
+    // CUDA >= 13.4; CUDA 13.3 only ships the launch-attribute half of this API.
+#if CUDA_VERSION >= 13040
     if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
       cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
                                     CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
@@ -147,7 +149,7 @@ class TllmGenFmhaKernel {
   void appendOversizedSmemLaunchAttr(CUlaunchAttribute* launch_attribute,
                                      CUlaunchConfig& launch_config,
                                      KernelMeta const& kernelMeta) const {
-#if CUDA_VERSION >= 13030
+#if CUDA_VERSION >= 13040
     if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
       IKL_LOG_DEBUG(
           "TRTLLM-Gen launch info: using oversized shared memory for kernel %s (smem=%u bytes)",
@@ -164,7 +166,7 @@ class TllmGenFmhaKernel {
     CUdevice device;
     cuErrCheck(cuCtxGetDevice(&device));
     int smem_bytes = 0;
-#if CUDA_VERSION >= 13030
+#if CUDA_VERSION >= 13040
     if (smArch == kSM_107) {
       cuErrCheck(cuDeviceGetAttribute(
           &smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
