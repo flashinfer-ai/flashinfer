@@ -225,6 +225,10 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 `DeepSeek-V2 <https://arxiv.org/abs/2405.04434>`_, `DeepSeek-V3 <https://arxiv.org/abs/2412.19437>`_,
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
+See the `Batch MLA backend architecture <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/batch_mla_backend_architecture.md>`_
+for the internal ownership, planning, representation, selection, and hot-path
+contracts shared by the wrapper and functional APIs.
+
 .. currentmodule:: flashinfer.mla
 
 PageAttention for MLA
@@ -233,6 +237,7 @@ PageAttention for MLA
 .. autosummary::
     :toctree: ../generated
 
+    batch_mla_paged_attention
     trtllm_batch_decode_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
@@ -249,6 +254,9 @@ PageAttention for MLA
     with ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
     remain arbitrary absolute rows. Precompute that conversion before a CUDA
     Graph or a latency-sensitive loop.
+
+``xqa_batch_decode_with_kv_cache_mla`` is deprecated. Use
+``batch_mla_paged_attention(..., backend="xqa")`` instead.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

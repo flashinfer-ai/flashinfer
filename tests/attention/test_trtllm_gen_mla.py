@@ -3,10 +3,13 @@ import random
 
 import pytest
 import torch
-import torch.nn.functional as F
 
+from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_reference
 import flashinfer
+from flashinfer.mla._batch_mla._backends import trtllm_gen_backend
+from flashinfer.mla._batch_mla import _wrapper as mla_wrapper
 from flashinfer.mla import (
+    MLAPlanMetadata,
     MLALayerDimensions,
     deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
@@ -32,6 +35,39 @@ def test_grouped_mla_selection_is_not_a_public_option():
     ).parameters
 
     assert "selects_grouped_mla" not in parameters
+
+
+def test_trtllm_gen_mla_launcher_passes_default_fp8_transform_mode():
+    calls = []
+    launcher = trtllm_gen_backend._TrtllmGenMlaDecodeLauncher(
+        lambda *args: calls.append(args)
+    )
+    launcher._multi_ctas_kv_counter_buffer = torch.empty(1, dtype=torch.uint8)
+    launcher._counter_is_preplanned = True
+    query = torch.empty((1, 1, 1, 576))
+    kv_cache = torch.empty((1, 1, 32, 576))
+    workspace = torch.empty(1, dtype=torch.uint8)
+
+    launcher.run(
+        out=torch.empty((1, 1, 1, 512)),
+        query=query,
+        key_cache=kv_cache,
+        value_cache=kv_cache,
+        workspace_buffer=workspace,
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        max_q_len=1,
+        max_seq_len=32,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        batch_size=1,
+        num_qo_heads=1,
+        sparse_mla_top_k=0,
+        sm_count=1,
+        enable_pdl=False,
+    )
+
+    assert calls[0][-1] == 0
 
 
 def trtllm_gen_workspace_softmax_end_bytes_decode(
@@ -266,30 +302,32 @@ def torch_reference_mla(
     c_rope = kv_flat[:, kv_lora_rank:]
     q_nope = query[..., :kv_lora_rank]
     q_rope = query[..., kv_lora_rank:]
-
-    outputs = []
-    for b in range(B):
-        seq_len = seq_lens[b].item()
-        num_pages = (seq_len + page_size - 1) // page_size
-        pages = block_tables[b, :num_pages]
-        kv_indices = []
-        for p in pages:
-            start = p.item() * page_size
-            kv_indices.extend(range(start, start + page_size))
-        kv_indices = kv_indices[:seq_len]
-        kv_idx_t = torch.tensor(kv_indices, device=query.device)
-
-        k_lat = c_latent[kv_idx_t]  # [seq_len, kv_lora_rank]
-        k_rope = c_rope[kv_idx_t]  # [seq_len, rope_dim]
-
-        attn_lat = torch.einsum("qhd,kd->qhk", q_nope[b].float(), k_lat.float())
-        attn_rope = torch.einsum("qhd,kd->qhk", q_rope[b].float(), k_rope.float())
-        attn = (attn_lat + attn_rope) * softmax_scale
-        attn = F.softmax(attn, dim=-1)
-        out_b = torch.einsum("qhk,kd->qhd", attn, k_lat.float()) * output_scale
-        outputs.append(out_b)
-
-    return torch.stack(outputs, dim=0)  # [B, q_len, H, kv_lora_rank]
+    qo_indptr = torch.arange(
+        0,
+        (B + 1) * q_len,
+        q_len,
+        device=query.device,
+        dtype=torch.int32,
+    )
+    output, _ = mla_paged_attention_reference(
+        q_nope=q_nope.flatten(0, 1),
+        q_pe=q_rope.flatten(0, 1),
+        ckv_cache=c_latent.view(-1, page_size, kv_lora_rank),
+        kpe_cache=c_rope.view(-1, page_size, qk_rope_head_dim),
+        qo_indptr=qo_indptr,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        sm_scale=softmax_scale,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=output_scale,
+        contract=MLAReferenceContract(
+            kv_layout="independent-split",
+            output_dtype=torch.float32,
+            scale_mode="bmm-scalar",
+        ),
+    )
+    return output.view(B, q_len, H, kv_lora_rank)
 
 
 def trtllm_batch_decode_mla(
@@ -572,18 +610,22 @@ def trtllm_batch_decode_mla(
     kv_indices = all_block_ids.int()
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        seq_lens_tensor,
-        layer_dimensions.num_heads,
-        layer_dimensions.head_dimensions.kv_lora_rank,
-        layer_dimensions.head_dimensions.qk_rope_head_dim,
-        page_size,
-        True,
-        sm_scale,
-        q_ref.dtype,
-        kv_cache.dtype,
+        metadata=MLAPlanMetadata.csr(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_lens_tensor,
+        ),
+        num_heads=layer_dimensions.num_heads,
+        head_dim_ckv=layer_dimensions.head_dimensions.kv_lora_rank,
+        head_dim_kpe=layer_dimensions.head_dimensions.qk_rope_head_dim,
+        page_size=page_size,
+        causal=True,
+        sm_scale=sm_scale,
+        q_data_type=q_ref.dtype,
+        kv_data_type=kv_cache.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
     )
     q_nope = q_ref[..., : layer_dimensions.head_dimensions.kv_lora_rank].reshape(
         -1,
@@ -600,7 +642,11 @@ def trtllm_batch_decode_mla(
     ckv = kv_cache[..., : layer_dimensions.head_dimensions.kv_lora_rank]
     kpe = kv_cache[..., layer_dimensions.head_dimensions.kv_lora_rank :]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=False,
+    )
 
     # cute-dsl fp8 kernel outputs fp8; cast to bf16 to match trtllm-gen / reference
     if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:
@@ -1426,12 +1472,22 @@ def test_trtllm_batch_decode_mla_native_block_table_width(
 def test_trtllm_batch_decode_mla_preallocated_out(
     q_len_per_request: int,
     batch_size: int,
+    monkeypatch,
 ):
     """Issue #2856: pre-allocated out tensor rejected when q_len_per_req > 1.
     The shape check hardcoded 3D but query is 4D for multi-token generation."""
     cc = get_compute_capability(torch.device("cuda"))
     if cc[0] != 10:
         pytest.skip("trtllm-gen MLA requires SM100/SM103")
+
+    def forbid_wrapper_construction(*args, **kwargs):
+        raise AssertionError("functional TRTLLM-GEN constructed the planned wrapper")
+
+    monkeypatch.setitem(
+        mla_wrapper._BATCH_MLA_BACKENDS,
+        "trtllm-gen",
+        forbid_wrapper_construction,
+    )
 
     device = "cuda:0"
     layer_dim = supported_mla_layer_dimensions[0]

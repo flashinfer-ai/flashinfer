@@ -38,7 +38,7 @@ from tests.trace.reference_utils import (
 )
 def test_xqa_mla_reference_correctness(shape_kwargs):
     """XQA MLA kernel vs reference (latent-split page-gather SDPA)."""
-    from flashinfer import xqa_mla
+    from flashinfer.xqa import xqa_mla
     from flashinfer.trace.templates.page import xqa_mla_trace
 
     if _cc()[0] != 12:

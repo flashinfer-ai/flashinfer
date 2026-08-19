@@ -202,6 +202,61 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["sm_scale"] == 0.125
 
 
+def test_mla_stateful_adapter_preserves_old_and_new_module_paths():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    legacy = adapter_for("flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run")
+    current = adapter_for(
+        "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    )
+
+    assert legacy is current
+    assert current is not None
+    assert current.plan_attr == "plan"
+    assert current.plan_inputs == {
+        "qo_indptr": "qo_indptr",
+        "kv_indptr": "kv_indptr",
+        "kv_indices": "kv_indices",
+        "kv_len_arr": "kv_len_arr",
+        "sm_scale": "sm_scale",
+    }
+
+
+def test_mla_stateful_adapter_recovers_structured_plan_metadata():
+    from flashinfer.mla import MLAPlanMetadata
+    from flashinfer.trace_apply.plan_capture import (
+        adapter_for,
+        augment_namespace,
+        stash_plan_kwargs,
+    )
+
+    adapter = adapter_for(
+        "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    )
+    assert adapter is not None
+
+    class _W:
+        pass
+
+    wrapper = _W()
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, 1], dtype=torch.int32)
+    kv_indices = torch.tensor([0], dtype=torch.int32)
+    kv_len_arr = torch.tensor([1], dtype=torch.int32)
+    metadata = MLAPlanMetadata.csr(qo_indptr, kv_indptr, kv_indices, kv_len_arr)
+    stash_plan_kwargs(wrapper, {"metadata": metadata, "sm_scale": 0.125})
+
+    namespace = augment_namespace(adapter, None, {}, wrapper)
+
+    assert namespace == {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_indices": kv_indices,
+        "kv_len_arr": kv_len_arr,
+        "sm_scale": 0.125,
+    }
+
+
 def test_output_adapt_value_returning_returns_value():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)

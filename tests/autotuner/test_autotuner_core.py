@@ -1,4 +1,6 @@
+from dataclasses import replace
 import random
+import threading
 import tracemalloc
 from unittest.mock import MagicMock, patch
 
@@ -6,15 +8,23 @@ import pytest
 import torch
 
 import flashinfer.fused_moe.core as core_mod
+import flashinfer.autotuner.autotuner as autotuner_module
 from flashinfer import autotune
+from flashinfer.autotuner.autotuner import _get_autotune_context_mode
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
 from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
 )
-from flashinfer.mla._core import (
+from flashinfer.mla._batch_mla._auto_policy import (
+    _MLAAutotuneProfile,
+    build_wrapper_tuning_config,
+)
+from flashinfer.mla._batch_mla._backends._cute_dsl_functional_common import (
     CuteDslMlaDecodeRunner,
+)
+from flashinfer.mla._batch_mla._functional import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
@@ -999,6 +1009,119 @@ def test_autotune_context_restores_overrides():
     assert tuner._override_round_up is False
 
 
+def test_autotune_context_activity_is_thread_local_and_nestable():
+    assert _get_autotune_context_mode() is None
+    other_thread_activity = []
+
+    with autotune(False):
+        assert _get_autotune_context_mode() is False
+        thread = threading.Thread(
+            target=lambda: other_thread_activity.append(_get_autotune_context_mode())
+        )
+        thread.start()
+        thread.join()
+        with autotune(True):
+            assert _get_autotune_context_mode() is True
+        assert _get_autotune_context_mode() is False
+
+    assert _get_autotune_context_mode() is None
+    assert other_thread_activity == [None]
+
+
+def test_autotune_entry_failure_rolls_back_global_and_thread_local_state(monkeypatch):
+    tuner = reset_autotuner()
+
+    def fail_on_entry(_message):
+        raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(autotuner_module.logger, "info", fail_on_entry)
+
+    with (
+        pytest.raises(RuntimeError, match="logging failed"),
+        autotune(
+            True,
+            tuning_buckets=(1, 2),
+            round_up=True,
+            skip_ops={"example"},
+        ),
+    ):
+        pytest.fail("autotune context body should not run")
+
+    assert tuner._active_tuning_contexts == 0
+    assert tuner._global_tuning_mode is False
+    assert _get_autotune_context_mode() is None
+    assert tuner._override_tuning_buckets is None
+    assert tuner._override_round_up is False
+    assert tuner._effective_skip_ops == frozenset()
+
+
+def test_nested_cache_only_context_overrides_outer_tuning_mode(monkeypatch):
+    tuner = reset_autotuner()
+    profile_calls = []
+
+    def profile(*_args, **_kwargs):
+        profile_calls.append(True)
+        raise AssertionError("cache-only selection must not profile")
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    runner = DummyRunner(valid_tactics=(0,))
+    with autotune(True), autotune(False):
+        selected, tactic = tuner.choose_one(
+            "nested-cache-only", [runner], TuningConfig(), [torch.ones(1)]
+        )
+
+    assert selected is runner
+    assert tactic == -1
+    assert profile_calls == []
+
+
+def test_concurrent_cache_only_context_overrides_global_tuning_mode(monkeypatch):
+    tuner = reset_autotuner()
+    tuning_entered = threading.Event()
+    release_tuning = threading.Event()
+    profile_calls = []
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda *_args, **_kwargs: profile_calls.append(True),
+    )
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    bundled_lookups = []
+
+    def load_from_file(key):
+        bundled_lookups.append(key)
+        return True, None, 7, None
+
+    monkeypatch.setattr("flashinfer.autotuner.autotuner.load_from_file", load_from_file)
+
+    def tune_elsewhere():
+        with autotune(True):
+            tuning_entered.set()
+            assert release_tuning.wait(timeout=5)
+
+    thread = threading.Thread(target=tune_elsewhere)
+    thread.start()
+    assert tuning_entered.wait(timeout=5)
+    try:
+        with autotune(False):
+            selected, tactic = tuner.choose_one(
+                "concurrent-cache-only",
+                [DummyRunner(valid_tactics=(0,))],
+                TuningConfig(),
+                [torch.ones(1)],
+            )
+    finally:
+        release_tuning.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert tactic == 7
+    assert isinstance(selected, DummyRunner)
+    assert profile_calls == []
+    assert len(bundled_lookups) == 1
+
+
 def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
     """Full choose_one flow with custom buckets: profile, cache, retrieve."""
     tuner = reset_autotuner()
@@ -1923,9 +2046,90 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
     assert eq_calls == 0
 
 
-def _call_build_mla_decode_tuning_config(
-    enable_dcp: bool = False, has_sparse_mla_top_k_lens: bool = False
-):
+def _wrapper_mla_autotune_profile() -> _MLAAutotuneProfile:
+    return _MLAAutotuneProfile(
+        batch_size=2,
+        q_len=1,
+        max_q_len=1,
+        max_kv_len=7,
+        min_kv_len_bucket=4,
+        max_kv_len_bucket=8,
+        page_size=2,
+        table_width=4,
+        page_reuse=False,
+        num_heads=4,
+        head_dim_ckv=8,
+        head_dim_kpe=2,
+        query_dtype=torch.float16,
+        kv_dtype=torch.bfloat16,
+        kv_layout="combined",
+        lse_mode="none",
+        output_dtype=torch.float16,
+        output_scale="none",
+        scale_mode="default",
+        skip_softmax=False,
+        use_sinks=False,
+        causal=False,
+        sm_scale=0.5,
+        qk_nope_head_dim=None,
+        enable_pdl=None,
+        is_var_seq=None,
+        use_profiler=False,
+        use_cuda_graph=False,
+        workspace_page_capacity=128,
+    )
+
+
+def test_wrapper_mla_cache_extras_bucket_batch_and_track_plan_fields():
+    profile = _wrapper_mla_autotune_profile()
+    baseline = profile.cache_extras("fa2")
+    same_sequence_bucket = replace(profile, batch_size=8, max_kv_len=5)
+
+    assert same_sequence_bucket.cache_extras("fa2") == baseline
+    for field, value in (
+        ("causal", True),
+        ("sm_scale", 0.25),
+        ("qk_nope_head_dim", 4),
+        ("enable_pdl", True),
+        ("is_var_seq", True),
+        ("use_profiler", True),
+        ("use_cuda_graph", True),
+    ):
+        assert replace(profile, **{field: value}).cache_extras("fa2") != baseline
+
+
+def test_wrapper_mla_tuning_config_is_memoized_by_effective_inputs():
+    profile = _wrapper_mla_autotune_profile()
+    first = build_wrapper_tuning_config(profile, buckets=(1, 3, 7))
+
+    assert set(dict(first.tensor_initializers)) == {0, 1, 2, 3}
+
+    assert (
+        build_wrapper_tuning_config(
+            replace(profile, batch_size=8, causal=True), buckets=(7, 3, 1, 3)
+        )
+        is first
+    )
+    assert (
+        build_wrapper_tuning_config(
+            replace(profile, max_kv_len=profile.max_kv_len + 1),
+            buckets=(1, 3, 7),
+        )
+        is not first
+    )
+    assert (
+        build_wrapper_tuning_config(
+            replace(
+                profile,
+                workspace_page_capacity=profile.workspace_page_capacity + 1,
+            ),
+            buckets=(1, 3, 7),
+        )
+        is not first
+    )
+
+
+def _call_build_mla_decode_tuning_config(sparse_top_k_width: int = 0):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
     runner_names is restricted to trtllm-gen so bucket computation stays
@@ -1942,31 +2146,25 @@ def _call_build_mla_decode_tuning_config(
         kv_lora_rank=512,
         max_seq_len=1024,
         device=torch.device("cpu"),
-        has_sparse_mla_top_k_lens=has_sparse_mla_top_k_lens,
-        enable_dcp=enable_dcp,
-        cp_world=4,
-        cp_rank=1,
+        sparse_top_k_width=sparse_top_k_width,
     )
 
 
 @pytest.mark.parametrize(
     (
-        "enable_dcp",
-        "has_sparse_mla_top_k_lens",
+        "sparse_top_k_width",
         "expected_input_idx",
         "expected_initializer_indices",
         "expected_fifth_value",
     ),
     [
-        (False, False, (0, 1, 2, 3), {1, 2}, None),
-        (True, False, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
-        (False, True, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
+        (0, (0, 1, 2, 3), {1, 2}, None),
+        (64, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
     ],
-    ids=("default", "dcp", "sparse-top-k"),
+    ids=("default", "sparse-top-k"),
 )
 def test_mla_decode_tuning_config_is_memoized(
-    enable_dcp,
-    has_sparse_mla_top_k_lens,
+    sparse_top_k_width,
     expected_input_idx,
     expected_initializer_indices,
     expected_fifth_value,
@@ -1979,12 +2177,8 @@ def test_mla_decode_tuning_config_is_memoized(
     """
     _mla_decode_tuning_config.cache_clear()
     try:
-        config_a = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
-        )
-        config_b = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
-        )
+        config_a = _call_build_mla_decode_tuning_config(sparse_top_k_width)
+        config_b = _call_build_mla_decode_tuning_config(sparse_top_k_width)
 
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "
@@ -2070,11 +2264,10 @@ def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
     return runner.get_cache_key_extras([query, None, None, out])
 
 
-def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
-    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+def test_cute_dsl_runner_cache_buckets_sequence_and_tracks_workspace_geometry():
     key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
     key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
-    assert key_257 != key_385
+    assert key_257 == key_385
 
     key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
     assert key_257 != key_small_workspace

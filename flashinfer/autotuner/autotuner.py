@@ -779,6 +779,32 @@ class TunableRunner(ABC):
         return hash(tuple(hashable_vals))
 
 
+_autotune_context_local = threading.local()
+
+
+def _push_autotune_context(tune_mode: bool) -> None:
+    local = _autotune_context_local
+    stack = getattr(local, "mode_stack", None)
+    if stack is None:
+        stack = []
+        local.mode_stack = stack
+    stack.append(tune_mode)
+
+
+def _pop_autotune_context() -> None:
+    local = _autotune_context_local
+    stack = getattr(local, "mode_stack", None)
+    if not stack:
+        raise RuntimeError("autotune context stack underflow")
+    stack.pop()
+
+
+def _get_autotune_context_mode() -> bool | None:
+    """Return this thread's innermost explicit autotune mode, if any."""
+    stack = getattr(_autotune_context_local, "mode_stack", ())
+    return stack[-1] if stack else None
+
+
 @contextlib.contextmanager
 def autotune(
     tune_mode: bool = True,
@@ -875,8 +901,12 @@ def autotune(
 
     **Nested / sequential contexts** -- Overrides are managed on a per-thread
     stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
-    context's values are restored.  Sequential contexts are fully independent.
-    Different buckets produce different cache keys, so entries never collide.
+    context's values are restored. The innermost context's ``tune_mode`` wins;
+    in particular, ``autotune(False)`` remains cache-only inside an outer or
+    concurrently active ``autotune(True)``. Threads without an explicit context
+    continue to observe process-global tuning activity. Sequential contexts are
+    fully independent. Different buckets produce different cache keys, so
+    entries never collide.
 
     **Using both parameters together** is fully supported:
     ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
@@ -958,19 +988,25 @@ def autotune(
     if pushed:
         override_stack.append((new_buckets, new_round_up))
 
-    # Reference-counted tuning mode: is_tuning_mode stays True as long as
-    # at least one autotune(True) context is active, even if an
-    # autotune(False) context overlaps on another thread.
+    _push_autotune_context(tune_mode)
+    # Keep a process-wide reference count so threads without an explicit
+    # context can observe whether tuning is active elsewhere.  Reads through
+    # is_tuning_mode still honor the calling thread's innermost context.
     try:
         with tuner._lock:
+            old_mode = tuner._global_tuning_mode
             if tune_mode:
                 tuner._active_tuning_contexts += 1
-            old_mode = tuner.is_tuning_mode
-            tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+            tuner._global_tuning_mode = tuner._active_tuning_contexts > 0
             autotune_enabled = tune_mode and not old_mode
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
+        with tuner._lock:
+            if tune_mode:
+                tuner._active_tuning_contexts -= 1
+            tuner._global_tuning_mode = tuner._active_tuning_contexts > 0
+        _pop_autotune_context()
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -983,13 +1019,14 @@ def autotune(
         with tuner._lock:
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
-            tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+            tuner._global_tuning_mode = tuner._active_tuning_contexts > 0
 
         # Pop the overrides we pushed (thread-local, no lock needed).
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
             skip_ops_stack.pop()
+        _pop_autotune_context()
 
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
@@ -1006,9 +1043,9 @@ def autotune(
 # Thread-local "currently inside the per-tactic measurement window" flag.
 # Set/cleared by ``_profile_measurement_scope`` and queried by
 # ``is_in_profile_measurement``.  Distinct from
-# ``AutoTuner.is_tuning_mode``, which is True for the entire ``autotune(True)``
-# context (cache hits, prep calls, post-``choose_one`` runs, and concurrent
-# threads inclusive); ``is_in_profile_measurement`` is True only on the
+# ``AutoTuner.is_tuning_mode``, which is True for the calling thread's entire
+# ``autotune(True)`` context (cache hits, prep calls, and post-``choose_one``
+# runs); ``is_in_profile_measurement`` is True only on the
 # specific thread that is actively timing a tactic, and only during the
 # warmup + measurement window inside ``_profile_single_kernel``.
 _profile_measurement_thread_local = threading.local()
@@ -1035,9 +1072,9 @@ def is_in_profile_measurement() -> bool:
 
     This is *narrower* than ``AutoTuner.get().is_tuning_mode``:
 
-    - ``is_tuning_mode`` is True for the entire ``autotune(True)`` context,
-      including cache lookups, ``do_preparation`` calls, the final invocation
-      after ``choose_one`` returns, and any concurrent threads' work.
+    - ``is_tuning_mode`` is True for the calling thread's entire
+      ``autotune(True)`` context, including cache lookups, ``do_preparation``
+      calls, and the final invocation after ``choose_one`` returns.
     - ``is_in_profile_measurement`` is True only on the calling thread, and
       only during the actual measurement window of a single tactic.
 
@@ -1241,7 +1278,7 @@ class AutoTuner:
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate.
         self._ranked_tactics_cache: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
-        self.is_tuning_mode = False
+        self._global_tuning_mode = False
         self._active_tuning_contexts = 0
 
         # Reentrant lock protecting all mutable state on this instance.
@@ -1371,6 +1408,22 @@ class AutoTuner:
         if stack:
             return stack[-1][1]
         return False
+
+    @property
+    def is_tuning_mode(self) -> bool:
+        """Whether tuning is effective for the calling thread.
+
+        Threads without an explicit ``autotune()`` context inherit the
+        process-global, reference-counted state.  Within nested contexts, the
+        innermost explicit ``tune_mode`` wins.
+        """
+        context_mode = _get_autotune_context_mode()
+        return self._global_tuning_mode if context_mode is None else context_mode
+
+    @is_tuning_mode.setter
+    def is_tuning_mode(self, value: bool) -> None:
+        """Set the process-global fallback mode for backward compatibility."""
+        self._global_tuning_mode = bool(value)
 
     @classmethod
     def get(cls):

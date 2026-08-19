@@ -424,14 +424,13 @@ def test_batch_mla_varlen_page_attention(
         )
         * qo_len
     )
+    page_counts = pages_nums.repeat(batch_size).to(device)
     kv_indptr = torch.cat(
-        [
-            torch.arange(0, batch_size + 1).unsqueeze(-1).int() * pages_nums_sum
-            + pages_nums_indptr[i]
-            for i in range(num_different_kv_len)
-        ],
-        dim=-1,
-    ).flatten()
+        (
+            torch.zeros(1, device=device, dtype=torch.int32),
+            page_counts.cumsum(0, dtype=torch.int32),
+        )
+    )
     kv_indices = torch.arange(
         0, batch_size * pages_nums_sum, device=device, dtype=torch.int32
     )
@@ -449,6 +448,7 @@ def test_batch_mla_varlen_page_attention(
         sm_scale,
         q_nope.dtype,
         ckv.dtype,
+        lse_mode="base2",
     )
     o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
@@ -654,6 +654,7 @@ def test_batch_mla_page_attention(
             sm_scale,
             q_nope.dtype,
             ckv.dtype,
+            lse_mode="base2",
         )
 
         # warmup
@@ -682,6 +683,7 @@ def test_batch_mla_page_attention(
         sm_scale,
         q_nope.dtype,
         ckv.dtype,
+        lse_mode="base2",
     )
     if use_cuda_graph:
         o.fill_(0)
@@ -768,10 +770,10 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     )
     kv_indices = page_table.flatten()
 
-    q_nope = q_nope_pe[..., :head_dim_ckv]
-    q_pe = q_nope_pe[..., head_dim_ckv:]
-    ckv = ckv_kpe[..., :head_dim_ckv]
-    kpe = ckv_kpe[..., head_dim_ckv:]
+    q_nope = q_nope_pe[..., :head_dim_ckv].clone()
+    q_pe = q_nope_pe[..., head_dim_ckv:].clone()
+    ckv = ckv_kpe[..., :head_dim_ckv].clone()
+    kpe = ckv_kpe[..., head_dim_ckv:].clone()
 
     # use head dimension before matrix absorption
     sm_scale = 1.0 / ((128 + 64) ** 0.5)
@@ -797,6 +799,7 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         backend="cutlass",
     )
     o_ans = mla_ans.run(q_nope, q_pe, ckv, kpe, kv_len=kv_lens, page_table=page_table)
+    assert mla_ans.resolved_backend == "cutlass"
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
 
 
@@ -1404,6 +1407,8 @@ def test_fp8_kv_plan_rejects_fp16_q():
             sm_scale=1.0,
             q_data_type=torch.float16,
             kv_data_type=torch.float8_e4m3fn,
+            query_layout="split",
+            kv_cache_layout="split",
         )
 
 
@@ -1424,19 +1429,16 @@ def test_fp8_kv_scales_are_keyword_only():
 
 
 @pytest.mark.parametrize(
-    "wrong_tensor,wrong_dtype,exc_match",
+    "wrong_input,wrong_dtype,exc_match",
     [
-        ("q_nope", torch.float16, "q_nope.dtype"),
-        ("q_pe", torch.float16, "q_pe.dtype"),
-        ("ckv_cache", torch.bfloat16, "ckv_cache.dtype"),
-        ("kpe_cache", torch.bfloat16, "kpe_cache.dtype"),
+        ("query", torch.float16, "q_nope.dtype"),
+        ("kv_cache", torch.bfloat16, "ckv_cache.dtype"),
     ],
 )
-def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match):
+def test_fp8_kv_run_rejects_dtype_mismatch(wrong_input, wrong_dtype, exc_match):
     """The C++ launcher reinterprets tensor storage by the JIT-template type
-    chosen at plan(); a run-time dtype mismatch produces silent wrong output.
-    Each tensor (q_nope, q_pe, ckv_cache, kpe_cache) has an independent
-    check; this test exercises all four."""
+    chosen at plan(); a run-time query or KV dtype mismatch would otherwise
+    produce silent wrong output."""
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
     device = torch.device("cuda:0")
@@ -1473,15 +1475,14 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
         dtype=torch.float8_e4m3fn,
     )
 
-    # Replace the chosen tensor with a wrong-dtype variant.
-    tensors = {
-        "q_nope": q_nope,
-        "q_pe": q_pe,
-        "ckv_cache": ckv_cache,
-        "kpe_cache": kpe_cache,
-    }
-    orig = tensors[wrong_tensor]
-    tensors[wrong_tensor] = torch.zeros(orig.shape, dtype=wrong_dtype, device=device)
+    query = (q_nope, q_pe)
+    kv_cache = (ckv_cache, kpe_cache)
+    if wrong_input == "query":
+        query = tuple(torch.zeros_like(tensor, dtype=wrong_dtype) for tensor in query)
+    else:
+        kv_cache = tuple(
+            torch.zeros_like(tensor, dtype=wrong_dtype) for tensor in kv_cache
+        )
 
     qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
@@ -1502,13 +1503,13 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
         sm_scale=1.0,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.float8_e4m3fn,
+        query_layout="split",
+        kv_cache_layout="split",
     )
     with pytest.raises(ValueError, match=exc_match):
         wrapper.run(
-            tensors["q_nope"],
-            tensors["q_pe"],
-            tensors["ckv_cache"],
-            tensors["kpe_cache"],
+            query=query,
+            kv_cache=kv_cache,
             ckv_scale=1.0,
             kpe_scale=1.0,
         )
@@ -1570,18 +1571,18 @@ def test_fp8_kv_requires_scales():
         sm_scale=1.0,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.float8_e4m3fn,
+        query_layout="split",
+        kv_cache_layout="split",
     )
     with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
-        wrapper.run(q_nope, q_pe, ckv_fp8, kpe_fp8)
+        wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv_fp8, kpe_fp8))
     invalid_scales = torch.ones(
         1, page_size, HEAD_DIM_CKV // 128 - 1, dtype=torch.float32, device=device
     )
     with pytest.raises(ValueError, match="Invalid shape of ckv_scale_arr"):
         wrapper.run(
-            q_nope,
-            q_pe,
-            ckv_fp8,
-            kpe_fp8,
+            query=(q_nope, q_pe),
+            kv_cache=(ckv_fp8, kpe_fp8),
             ckv_scale_arr=invalid_scales,
             kpe_scale=1.0,
         )
@@ -1590,10 +1591,8 @@ def test_fp8_kv_requires_scales():
     )
     with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
         wrapper.run(
-            q_nope,
-            q_pe,
-            ckv_fp8,
-            kpe_fp8,
+            query=(q_nope, q_pe),
+            kv_cache=(ckv_fp8, kpe_fp8),
             ckv_scale=1.0,
             ckv_scale_arr=valid_scales,
             kpe_scale=1.0,

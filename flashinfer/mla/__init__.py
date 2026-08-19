@@ -12,7 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._core import *  # noqa: F401,F403
+from ._core import (
+    BatchMLAPagedAttentionWrapper,
+    DSV4HCAMetadata,
+    MLAAutoSelectionTrace,
+    MLAHeadDimensions,
+    MLALayerDimensions,
+    MLAPlanMetadata,
+    deepseek_mla_dimensions,
+    nope_mla_dimensions,
+    smaller_mla_dimensions,
+    supported_mla_head_dimensions,
+    supported_mla_layer_dimensions,
+    batch_decode_sparse_mla_dsv4,
+    convert_compressed_page_aligned_sparse_indices_to_hca_metadata,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
+from ._batch_mla._functional import (
+    batch_mla_paged_attention,
+    trtllm_batch_decode_with_kv_cache_mla,
+    xqa_batch_decode_with_kv_cache_mla,
+)
+
+__all__ = (
+    "BatchMLAPagedAttentionWrapper",
+    "DSV4HCAMetadata",
+    "MLAAutoSelectionTrace",
+    "MLAHeadDimensions",
+    "MLALayerDimensions",
+    "MLAPlanMetadata",
+    "batch_decode_sparse_mla_dsv4",
+    "batch_mla_paged_attention",
+    "convert_compressed_page_aligned_sparse_indices_to_hca_metadata",
+    "deepseek_mla_dimensions",
+    "get_prims_ts_batch_decode_mla_workspace_size",
+    "nope_mla_dimensions",
+    "prims_ts_batch_decode_with_kv_cache_mla",
+    "smaller_mla_dimensions",
+    "supported_mla_head_dimensions",
+    "supported_mla_layer_dimensions",
+    "trtllm_batch_decode_sparse_mla_dsv4",
+    "trtllm_batch_decode_with_kv_cache_mla",
+    "xqa_batch_decode_with_kv_cache_mla",
+)
 
 
 _PRIMS_TS_LAZY_EXPORTS = frozenset(

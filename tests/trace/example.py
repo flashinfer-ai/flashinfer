@@ -133,7 +133,7 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
     fmha_v2_prefill_sm120,
 )
-from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -721,18 +721,19 @@ for mla_ps, mla_np in ((64, 32), (1, 2048)):
     ws_mla = torch.empty(WORKSPACE, dtype=torch.uint8, device=device)
     mla = BatchMLAPagedAttentionWrapper(ws_mla)
     mla.plan(
-        mla_qo_indptr,
-        mla_kv_indptr,
-        mla_kv_indices,
-        mla_kv_len,
-        mla_h,
-        ckv,
-        kpe,
-        mla_ps,
+        metadata=MLAPlanMetadata.csr(
+            mla_qo_indptr, mla_kv_indptr, mla_kv_indices, mla_kv_len
+        ),
+        num_heads=mla_h,
+        head_dim_ckv=ckv,
+        head_dim_kpe=kpe,
+        page_size=mla_ps,
         causal=False,
         sm_scale=1.0 / (ckv**0.5),
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
+        query_layout="packed",
+        kv_cache_layout="packed",
     )
     q_nope = torch.randn(mla_b, mla_h, ckv, dtype=torch.bfloat16, device=device)
     q_pe = torch.randn(mla_b, mla_h, kpe, dtype=torch.bfloat16, device=device)

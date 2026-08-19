@@ -15,6 +15,9 @@ import torch
 from tests.test_helpers.test_helpers import clear_cuda_cache
 
 import flashinfer
+from flashinfer.mla._batch_mla._backends.fa2_backend import (
+    _BatchMLAPagedAttentionFa2Backend,
+)
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 
@@ -60,14 +63,14 @@ def _setup_mla_inputs(batch_size, max_seq_len, page_size, dtype, device):
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024])
 @pytest.mark.parametrize("page_size", [1, 16])
-@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn])
-def test_cutlass_mla_fp8_output(batch_size, max_seq_len, page_size, fp8_dtype):
+def test_cutlass_mla_fp8_output(batch_size, max_seq_len, page_size):
     """FP8 output should match bf16 output + manual quantization."""
     device = torch.device("cuda:0")
     clear_cuda_cache(device)
     _skip_if_unsupported(device)
 
     dtype = torch.bfloat16
+    fp8_dtype = torch.float8_e4m3fn
     q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table = _setup_mla_inputs(
         batch_size, max_seq_len, page_size, dtype, device
     )
@@ -228,31 +231,19 @@ def test_cutlass_mla_bf16_output_unchanged():
     torch.testing.assert_close(o1, o2, rtol=1e-3, atol=1e-3)
 
 
-def test_cutlass_mla_fp8_non_cutlass_backend_rejected():
-    """o_scale with non-cutlass backend should raise ValueError.
-
-    We directly set _backend to 'fa2' without calling plan() to avoid
-    JIT compilation dependencies. The o_scale check happens before any
-    module call.
-    """
+def test_cutlass_mla_fp8_output_scale_rejected_by_non_cutlass_backend():
+    """The public wrapper rejects CUTLASS-only output scaling on FA backends."""
     device = torch.device("cuda:0")
-
-    q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table = _setup_mla_inputs(
+    q_nope, q_pe, ckv_cache, kpe_cache, _, _ = _setup_mla_inputs(
         1, 128, 1, torch.float16, device
     )
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
-    # Force backend without plan() to avoid JIT compilation
-    wrapper._backend = "fa2"
+    wrapper._selected_backend = "fa2"
+    backend = object.__new__(_BatchMLAPagedAttentionFa2Backend)
+    backend._generated_fa_workspace = wrapper._generated_fa_workspace
+    wrapper._backend_impl = backend
+    out = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
 
-    out_fp8 = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
     with pytest.raises(ValueError, match="o_scale is only supported with the cutlass"):
-        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, out=out_fp8, o_scale=0.1)
-
-
-if __name__ == "__main__":
-    test_cutlass_mla_fp8_output(1, 128, 1, torch.float8_e4m3fn)
-    test_cutlass_mla_fp8_output(4, 1024, 16, torch.float8_e4m3fn)
-    test_cutlass_mla_fp8_output_validation_no_out()
-    test_cutlass_mla_fp8_output_validation_wrong_dtype()
-    test_cutlass_mla_bf16_output_unchanged()
+        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, out=out, o_scale=0.1)

@@ -39,6 +39,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 )
 from flashinfer.utils import is_sm12x_supported
 
+
 pytestmark = pytest.mark.skipif(
     not is_sm12x_supported(torch.device("cuda")),
     reason="Sparse-MLA SM120 requires SM12x.",
@@ -788,6 +789,73 @@ def test_sparse_mla_sm120_v32_prefill_public_api_accepts_hnd_view() -> None:
     )
 
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_v32_broadcasts_batch_topk_lengths() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size, q_len, num_heads, topk = 2, 2, 8, 128
+    d_qk, d_v, page_block_size, num_blocks = 576, 512, 64, 4
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+    query = (
+        torch.randn(
+            batch_size,
+            q_len,
+            num_heads,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0,
+        num_blocks * page_block_size,
+        (batch_size, q_len, topk),
+        device=device,
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([64, topk], dtype=torch.int32, device=device)
+    sm_scale = d_qk**-0.5
+    ref_out, _ = _ref_sparse_attn(
+        query.flatten(0, 1),
+        kv_dequant,
+        indices.flatten(0, 1),
+        sm_scale,
+        d_v,
+        topk_length=seq_lens.repeat_interleave(q_len),
+    )
+
+    out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_packed.transpose(1, 2),
+        workspace_buffer=torch.empty(8 << 20, dtype=torch.uint8, device=device),
+        qk_nope_head_dim=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=indices,
+        seq_lens=seq_lens,
+        max_seq_len=topk,
+        sparse_mla_top_k=topk,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        backend="sparse",
+    )
+
+    torch.testing.assert_close(out.flatten(0, 1), ref_out, atol=5e-2, rtol=5e-2)
 
 
 _DSV3_2_PREFILL_HEADS = [8, 16, 32, 64, 128]

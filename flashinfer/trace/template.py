@@ -728,6 +728,38 @@ class TraceTemplate:
             name: Optional[str] = None,
             **kwargs: Any,
         ) -> Dict[str, Any]:
+            if template.op_type == "mla_paged":
+                left_width = kwargs.get("head_dim_ckv")
+                right_width = kwargs.get("head_dim_kpe")
+
+                def _split_side(value: Any) -> Any:
+                    if isinstance(value, torch.Tensor):
+                        if not isinstance(left_width, int) or not isinstance(
+                            right_width, int
+                        ):
+                            return None
+                        return (
+                            value[..., :left_width],
+                            value[..., left_width : left_width + right_width],
+                        )
+                    if type(value) is not tuple or len(value) != 2:
+                        return None
+                    left, right = value
+                    if type(left) is tuple and len(left) == 2:
+                        return left
+                    if type(right) is tuple and len(right) == 2:
+                        return right
+                    return value
+
+                query_split = _split_side(kwargs.get("query"))
+                if query_split is not None:
+                    kwargs.setdefault("q_nope", query_split[0])
+                    kwargs.setdefault("q_pe", query_split[1])
+                kv_split = _split_side(kwargs.get("kv_cache"))
+                if kv_split is not None:
+                    kwargs.setdefault("ckv_cache", kv_split[0])
+                    kwargs.setdefault("kpe_cache", kv_split[1])
+
             # ── 1. Extract axis values ─────────────────────────────────────
             axis_values: Dict[str, int] = {}
             for axis_name, extractor in axis_extractors.items():

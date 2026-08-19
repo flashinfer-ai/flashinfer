@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from routines import attention as attention_routine
+from routines import mla as mla_routine
 from routines.flashinfer_benchmark_utils import routine_cc_to_supported_backends
 
 
@@ -39,9 +40,10 @@ def mocked_prims_ts_benchmark(monkeypatch):
     benchmark_outputs = []
     real_torch_empty = torch.empty
 
-    monkeypatch.setattr(
-        attention_routine, "get_device", lambda _args: torch.device("cpu")
-    )
+    for routine_module in (attention_routine, mla_routine):
+        monkeypatch.setattr(
+            routine_module, "get_device", lambda _args: torch.device("cpu")
+        )
     monkeypatch.setattr(
         attention_routine,
         "filter_backends_by_compute_capability",
@@ -61,6 +63,11 @@ def mocked_prims_ts_benchmark(monkeypatch):
         return np.array([1.0])
 
     monkeypatch.setattr(attention_routine, "bench_gpu_time", fake_bench_gpu_time)
+    monkeypatch.setattr(mla_routine, "bench_gpu_time", fake_bench_gpu_time)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
 
     def install_wrapper(wrapper_name):
         wrapper = _RecordingPrimsTSWrapper()
@@ -70,7 +77,10 @@ def mocked_prims_ts_benchmark(monkeypatch):
             return wrapper
 
         module = SimpleNamespace(**{wrapper_name: constructor})
-        monkeypatch.setattr(attention_routine, "_get_prims_ts_module", lambda: module)
+        target = (
+            mla_routine if wrapper_name.startswith("BatchMLA") else attention_routine
+        )
+        monkeypatch.setattr(target, "_get_prims_ts_module", lambda: module)
         return wrapper
 
     return install_wrapper, benchmark_outputs
@@ -537,10 +547,19 @@ def test_prims_ts_fmha_decode_sq_one_keeps_causal_plan(
     assert results[0]["causal"] is False
 
 
+@pytest.mark.parametrize(
+    ("scale_mode", "expected_bmm1_scale"),
+    [
+        ("default", 1.0 / math.sqrt(192)),
+        ("bmm-scalar", 1.0),
+    ],
+)
 def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     mocked_prims_ts_benchmark,
+    scale_mode,
+    expected_bmm1_scale,
 ):
-    install_wrapper, benchmark_outputs = mocked_prims_ts_benchmark
+    install_wrapper, _ = mocked_prims_ts_benchmark
     wrapper = install_wrapper("BatchMLADecodePagedTSWrapper")
     args = _parse_prims_ts_case(
         "BatchMLAPagedAttentionWrapper",
@@ -565,10 +584,21 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
             "bfloat16",
             "--kv_dtype",
             "bfloat16",
+            "--mla-kv-layout",
+            "combined",
+            "--mla-scale-mode",
+            scale_mode,
+            "--mla-softmax-scale-qk-nope-head-dim",
+            "128",
+            "--causal",
+            "--mla-q-lengths",
+            "2,3",
+            "--mla-kv-lengths",
+            "16,16",
         ],
     )
 
-    attention_routine.testBatchMLAPagedAttentionWrapper(args)
+    mla_routine.testBatchMLAPagedAttentionWrapper(args)
 
     assert wrapper.constructor_call == ((), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
@@ -576,8 +606,9 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     assert plan_args[0].shape == (2, 1)
     assert plan_args[1].tolist() == [16, 16]
     assert plan_args[2:] == (2, 512, 64, 16)
+    assert plan_kwargs.pop("qo_indptr").tolist() == [0, 2, 5]
     assert plan_kwargs == {
-        "seq_len_q": 3,
+        "max_seq_len_q": 3,
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
@@ -587,14 +618,13 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
 
     run_args, run_kwargs = wrapper.run_calls[0]
     runtime_q, runtime_kv_cache = run_args
-    assert runtime_q.shape == (2, 3, 2, 576)
+    assert runtime_q.shape == (5, 2, 576)
     assert runtime_kv_cache.shape == (2, 16, 576)
     assert runtime_kv_cache.is_contiguous()
-    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(192))
+    assert run_kwargs["bmm1_scale"] == pytest.approx(expected_bmm1_scale)
     assert run_kwargs["bmm2_scale"] == 1.0
-    assert run_kwargs["out"].shape == (2, 3, 2, 512)
+    assert run_kwargs["out"].shape == (5, 2, 512)
     assert run_kwargs["out"].dtype == torch.bfloat16
-    assert benchmark_outputs[0].shape == (6, 2, 512)
 
 
 @pytest.mark.parametrize("batch_size", [16, 32])
