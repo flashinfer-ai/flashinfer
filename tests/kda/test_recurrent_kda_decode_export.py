@@ -437,18 +437,44 @@ def test_cake_unbounded_softplus_t1_split_boundaries(work, sm_count, expected_sp
     )
 
 
+@pytest.mark.parametrize(
+    ("work", "sm_count", "expected_variant"),
+    [
+        (3 * 148 - 1, 148, "d128_t1_unbounded_softplus_direct_split16"),
+        (3 * 148, 148, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        (14 * 148, 148, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        (14 * 148 + 1, 148, "d128_t1_unbounded_softplus_direct_split4"),
+        (3 * 160 - 1, 160, "d128_t1_unbounded_softplus_direct_split16"),
+        (3 * 160, 160, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        (14 * 160, 160, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        (14 * 160 + 1, 160, "d128_t1_unbounded_softplus_direct_split4"),
+    ],
+)
+def test_cake_unbounded_softplus_t1_cta_grouping_boundaries(
+    work, sm_count, expected_variant
+):
+    assert (
+        recurrent_module._select_cake_kda_unbounded_softplus_t1_variant(work, sm_count)
+        == expected_variant
+    )
+
+
 def test_cake_unbounded_direct_variants_use_exact_warp_launch_geometry():
     expected = {
         "d128_t1_unbounded_softplus_direct_split4",
         "d128_t1_unbounded_softplus_direct_split8",
         "d128_t1_unbounded_softplus_direct_split16",
+        "d128_t1_unbounded_softplus_direct_split8_warp2",
     }
     assert set(cake_decode_jit_module.CAKE_KDA_DECODE_DIRECT_VARIANTS) == expected
     assert set(cake_decode_jit_module.CAKE_KDA_DECODE_VARIANTS) == expected
-    assert {
-        metadata.launch_threads
-        for metadata in cake_decode_jit_module.CAKE_KDA_DECODE_VARIANT_METADATA.values()
-    } == {32}
+    for (
+        variant,
+        metadata,
+    ) in cake_decode_jit_module.CAKE_KDA_DECODE_VARIANT_METADATA.items():
+        expected_warps = 2 if variant.endswith("_warp2") else 1
+        assert metadata.warps_per_cta == expected_warps
+        assert metadata.launch_threads == 32 * expected_warps
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -486,22 +512,26 @@ def test_precomputed_token_family_uses_tuned_export_dispatch(
 
 
 @pytest.mark.parametrize(
-    ("cc", "sm_count", "num_sequences", "expected_split"),
+    ("cc", "sm_count", "num_sequences", "expected_variant"),
     [
-        ((10, 0), 148, 8, 16),
-        ((10, 0), 148, 18, 16),
-        ((10, 0), 148, 19, 8),
-        ((10, 3), 160, 20, 16),
-        ((10, 3), 160, 21, 8),
+        ((10, 0), 148, 8, "d128_t1_unbounded_softplus_direct_split16"),
+        ((10, 0), 148, 14, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        ((10, 0), 148, 65, "d128_t1_unbounded_softplus_direct_split4"),
+        ((10, 3), 160, 14, "d128_t1_unbounded_softplus_direct_split16"),
+        ((10, 3), 160, 15, "d128_t1_unbounded_softplus_direct_split8_warp2"),
+        ((10, 3), 160, 71, "d128_t1_unbounded_softplus_direct_split4"),
     ],
 )
 def test_t1_unbounded_softplus_uses_native_direct_dispatch(
-    monkeypatch, cc, sm_count, num_sequences, expected_split
+    monkeypatch, cc, sm_count, num_sequences, expected_variant
 ):
     _patch_cpu_selector_environment(monkeypatch, sm_count=sm_count, cc=cc)
-    assert recurrent_module._select_flash_kda_decode_variant(
-        **_fake_t1_unbounded_selector_kwargs(num_sequences=num_sequences)
-    ) == (_T1_UNBOUNDED_VARIANT_PREFIX + str(expected_split))
+    assert (
+        recurrent_module._select_flash_kda_decode_variant(
+            **_fake_t1_unbounded_selector_kwargs(num_sequences=num_sequences)
+        )
+        == expected_variant
+    )
 
 
 @pytest.mark.parametrize("num_heads", [1, 2, 4, 8, 16, 32])
@@ -950,6 +980,12 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
             (10, 0),
             "12.9",
             "d128_t1_unbounded_softplus_direct_split8",
+            "sm100f",
+        ),
+        (
+            (10, 0),
+            "12.9",
+            "d128_t1_unbounded_softplus_direct_split8_warp2",
             "sm100f",
         ),
         (
@@ -1803,13 +1839,11 @@ def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inpu
         backend="auto",
     )
 
-    expected_split = (
-        recurrent_module._select_cake_kda_unbounded_softplus_t1_value_split(
-            num_sequences * num_heads,
-            torch.cuda.get_device_properties(flash_kda_device).multi_processor_count,
-        )
+    expected_variant = recurrent_module._select_cake_kda_unbounded_softplus_t1_variant(
+        num_sequences * num_heads,
+        torch.cuda.get_device_properties(flash_kda_device).multi_processor_count,
     )
-    assert frozen_calls == [_T1_UNBOUNDED_VARIANT_PREFIX + str(expected_split)]
+    assert frozen_calls == [expected_variant]
     assert actual_output.data_ptr() == actual_output_buffer.data_ptr()
     assert actual_state_result is actual_state
     assert actual_state_result.stride(0) > num_heads * _D * _D

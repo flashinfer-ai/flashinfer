@@ -33,6 +33,7 @@ CakeKDADecodeVariant = Literal[
     "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
+    "d128_t1_unbounded_softplus_direct_split8_warp2",
 ]
 CakeKDADecodeTarget = Literal["sm100a", "sm100f", "sm103a"]
 
@@ -55,12 +56,14 @@ CAKE_KDA_DECODE_VARIANTS: tuple[CakeKDADecodeVariant, ...] = (
     "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
+    "d128_t1_unbounded_softplus_direct_split8_warp2",
 )
 
 CAKE_KDA_DECODE_DIRECT_VARIANTS: tuple[CakeKDADecodeVariant, ...] = (
     "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
+    "d128_t1_unbounded_softplus_direct_split8_warp2",
 )
 
 
@@ -70,6 +73,7 @@ class CakeKDADecodeVariantMetadata(NamedTuple):
     gate_kind: int
     value_split: int
     launch_threads: int
+    warps_per_cta: int
     direct_impl: bool
 
 
@@ -79,6 +83,7 @@ def _variant_metadata(
     value_split: int,
     coefficient_gram: bool = False,
     direct_impl: bool = False,
+    warps_per_cta: int = 1,
 ) -> CakeKDADecodeVariantMetadata:
     """Derive the exact launch geometry used by the frozen Cake schedule."""
 
@@ -87,13 +92,18 @@ def _variant_metadata(
     value_warps = value_rows // 16
     rows_per_group = 2 if coefficient_gram and value_split == 8 else 8
     state_warps = (value_rows // rows_per_group + 1) // 2
-    launch_threads = 32 if direct_impl else max(tokens, value_warps, state_warps) * 32
+    launch_threads = (
+        32 * warps_per_cta
+        if direct_impl
+        else max(tokens, value_warps, state_warps) * 32
+    )
     return CakeKDADecodeVariantMetadata(
         head_dim,
         tokens,
         gate_kind,
         value_split,
         launch_threads,
+        warps_per_cta,
         direct_impl,
     )
 
@@ -109,6 +119,9 @@ CAKE_KDA_DECODE_VARIANT_METADATA: dict[
     ),
     "d128_t1_unbounded_softplus_direct_split8": _variant_metadata(
         1, 2, 8, direct_impl=True
+    ),
+    "d128_t1_unbounded_softplus_direct_split8_warp2": _variant_metadata(
+        1, 2, 8, direct_impl=True, warps_per_cta=2
     ),
 }
 
@@ -198,6 +211,7 @@ def _get_binding_cu(
 #define CAKE_KDA_DECODE_GATE_KIND {metadata.gate_kind}
 #define CAKE_KDA_DECODE_VALUE_SPLIT {metadata.value_split}
 #define CAKE_KDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}
+#define CAKE_KDA_DECODE_WARPS_PER_CTA {metadata.warps_per_cta}
 {direct_impl_define}
 
 #include "cake_kda_decode_binding.cuh"
@@ -212,7 +226,7 @@ def gen_cake_kda_decode_module(
 
     ``sm100f`` is the normal CUDA-12.9+ target for both CC 10.0 and CC 10.3.
     ``sm100a`` preserves CUDA-12.8 B200 support, while ``sm103a`` is limited to
-    the three direct T=1 bodies whose family-target code showed a measurable
+    the direct T=1 bodies whose family-target code showed a measurable
     GB300 latency regression.
     """
 
