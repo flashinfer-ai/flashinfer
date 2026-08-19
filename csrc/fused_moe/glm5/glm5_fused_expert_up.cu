@@ -36,6 +36,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <list>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -68,6 +69,7 @@ constexpr int kNumInterTopK = kNumExpertWarps * kTopK;
 
 constexpr int kHidden = 6144;
 constexpr int kCtaOutRows = 64;
+constexpr int kMaxCudaDevicesForSmemAttr = 64;
 
 // TP-dependent constants. The kernel is templated on kInterPerTpParam; the
 // host-side dispatcher selects {256, 512} based on input tensor shape.
@@ -1114,8 +1116,11 @@ static void glm5_fused_expert_up_impl(TensorView scores, TensorView hidden_in, T
     size_t const smem_bytes =
         fused_expert_up_smem_bytes<true, kPackedWeightStagesParam, kPackedWeightLoadModeParam>();
 
-    static bool smem_attribute_set = false;
-    if (!smem_attribute_set)
+    int const device_id = scores.device().device_id;
+    TVM_FFI_ICHECK(device_id >= 0 && device_id < kMaxCudaDevicesForSmemAttr)
+        << "unsupported CUDA device id " << device_id;
+    static std::once_flag smem_attribute_once[kMaxCudaDevicesForSmemAttr];
+    std::call_once(smem_attribute_once[device_id], [&]()
     {
         cudaError_t err = cudaFuncSetAttribute(
             dsv3_fused_expert_up_kernel<kInterPerTpParam, true, kPackedWeightStagesParam,
@@ -1124,8 +1129,7 @@ static void glm5_fused_expert_up_impl(TensorView scores, TensorView hidden_in, T
         TVM_FFI_ICHECK(err == cudaSuccess)
             << "cudaFuncSetAttribute for GLM5 fused expert-up failed: "
             << cudaGetErrorString(err);
-        smem_attribute_set = true;
-    }
+    });
 
     dsv3_fused_expert_up_kernel<kInterPerTpParam, true, kPackedWeightStagesParam,
         kPackedWeightLoadModeParam><<<grid, block, smem_bytes, stream>>>(

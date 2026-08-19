@@ -1,4 +1,20 @@
-"""Low-token block-FP8 fused MoE specialized for the GLM5 decode shape."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Low-token block-FP8 fused MoE specialized for the GLM5 decode shape.
+"""
 
 from __future__ import annotations
 
@@ -210,6 +226,10 @@ def pack_glm5_fused_moe_gate_up_weight(
     The result has shape ``[257, I/64, 8, 98304]``. Row zero is the shared
     expert and rows 1..256 are routed experts.
     """
+    if shared_gate_up_weight.device != routed_up_gate_weight.device:
+        raise ValueError(
+            "Shared and routed gate/up weights must be on the same device."
+        )
     if shared_gate_up_weight.ndim != 2 or shared_gate_up_weight.shape[0] % 2:
         raise ValueError(
             "shared_gate_up_weight must have shape [2 * I, 6144], got "
@@ -252,6 +272,8 @@ def pack_glm5_fused_moe_gate_up_scale(
     routed_up_gate_scale: torch.Tensor,
 ) -> torch.Tensor:
     """Combine shared ``[gate, up]`` and routed ``[up, gate]`` FP32 scales."""
+    if shared_gate_up_scale.device != routed_up_gate_scale.device:
+        raise ValueError("Shared and routed gate/up scales must be on the same device.")
     if shared_gate_up_scale.ndim != 2 or shared_gate_up_scale.shape[0] % 2:
         raise ValueError("shared_gate_up_scale must have shape [2 * I/128, 48].")
     if (
@@ -491,6 +513,47 @@ def glm5_fused_moe(
     expert, top-8 sigmoid routing, hidden size 6144, ``M <= 4``, and local
     intermediate size 256 (TP8) or 512 (TP4). Call
     :func:`prepare_glm5_fused_moe_weights` once when loading model weights.
+
+    The returned tensor is this TP rank's local contribution. Distributed
+    callers must all-reduce it across TP ranks before the residual connection.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        BF16 input with shape ``[M, 6144]``, where ``1 <= M <= 4``.
+    router_logits : torch.Tensor
+        FP32 routed-expert logits with shape ``[M, 256]``.
+    routing_bias : torch.Tensor
+        BF16 no-aux routing bias with shape ``[256]``. The bias affects expert
+        selection; normalized expert weights use the unbiased sigmoid scores.
+    expert_gate_up_weight : torch.Tensor
+        Packed FP8 gate/up weights from
+        :func:`pack_glm5_fused_moe_gate_up_weight`.
+    expert_gate_up_scale : torch.Tensor
+        Packed FP32 block scales from
+        :func:`pack_glm5_fused_moe_gate_up_scale`.
+    routed_down_weight, shared_down_weight : torch.Tensor
+        Raw row-major FP8 down-projection weights.
+    routed_down_scale, shared_down_scale : torch.Tensor
+        FP32 128x128 down-projection block scales.
+    routed_scaling_factor : float
+        Scale applied after normalizing the selected sigmoid scores.
+    out : Optional[torch.Tensor]
+        Optional BF16 output buffer with shape ``[M, 6144]``.
+    workspace : Optional[Glm5FusedMoeWorkspace]
+        Reusable temporaries allocated by
+        :func:`alloc_glm5_fused_moe_workspace`. Supplying this and ``out``
+        makes repeated decode calls allocation-free.
+    packed_weight_stages : int
+        Number of packed gate/up pipeline stages, either 1 or 2.
+    use_tma : bool
+        Use the TMA packed-weight loader. ``False`` selects the cp.async
+        fallback.
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 TP-local MoE contribution with shape ``[M, 6144]``.
     """
     num_tokens, inter_per_tp = _check_glm5_fused_moe_shapes(
         hidden_states,

@@ -3170,11 +3170,13 @@ glm5_fused_moe_trace = TraceTemplate(
     ),
     axes={
         "seq_len": Var(description="Decode token count (1..4)."),
-        "num_experts": Const(description="Number of routed experts (256)."),
+        "num_experts": Const(description="Number of routed experts (256).", abbrev=""),
         "num_experts_with_shared": Const(
             description="Packed routed plus shared experts (257).", abbrev=""
         ),
-        "top_k": Const(value=8, description="Experts selected per token."),
+        "top_k": Const(
+            value=8, description="Experts selected per token.", abbrev="topk"
+        ),
         "hidden_size": Const(description="Model hidden size (6144).", abbrev="h"),
         "local_intermediate_size": Const(
             description="TP-local MoE intermediate size (256 or 512).", abbrev="i"
@@ -3276,7 +3278,7 @@ glm5_fused_moe_trace = TraceTemplate(
         "hidden_size == 6144",
         "local_intermediate_size in {256, 512}",
     ],
-    tags=["status:experimental", "quantization:float8_e4m3fn", "arch:sm100"],
+    tags=["status:verified", "quantization:float8_e4m3fn", "arch:sm100-family"],
 )
 
 

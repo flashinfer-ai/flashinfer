@@ -32,6 +32,7 @@ from pathlib import Path
 import statistics
 
 import torch
+import torch.distributed as dist
 
 from flashinfer.fused_moe import (
     alloc_glm5_fused_moe_workspace,
@@ -81,11 +82,18 @@ def main() -> None:
     parser.add_argument("--packed-weight-stages", type=int, default=2, choices=(1, 2))
     parser.add_argument("--no-tma", action="store_true")
     args = parser.parse_args()
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
 
     rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    if world_size > 1:
+        dist.init_process_group("nccl")
     dump_dir = args.dump_dir.expanduser()
 
     router_path = _one(dump_dir, f"r{rank}_l*_router_weight.pt")
@@ -153,11 +161,32 @@ def main() -> None:
         )
 
     times_us = _profile(run, args.warmup, args.iterations)
+    mean_us = statistics.mean(times_us)
+    median_us = statistics.median(times_us)
+    min_us = min(times_us)
     print(
-        f"rank={rank} tokens={args.tokens} mean_us={statistics.mean(times_us):.3f} "
-        f"median_us={statistics.median(times_us):.3f} min_us={min(times_us):.3f} "
-        f"stages={args.packed_weight_stages} tma={int(not args.no_tma)}"
+        f"rank={rank} tokens={args.tokens} mean_us={mean_us:.3f} "
+        f"median_us={median_us:.3f} min_us={min_us:.3f} "
+        f"stages={args.packed_weight_stages} tma={int(not args.no_tma)}",
+        flush=True,
     )
+
+    if world_size > 1:
+        local_stats = torch.tensor(
+            [mean_us, median_us, min_us], dtype=torch.float64, device=device
+        )
+        gathered = [torch.empty_like(local_stats) for _ in range(world_size)]
+        dist.all_gather(gathered, local_stats)
+        if rank == 0:
+            all_stats = torch.stack(gathered).cpu()
+            print(
+                f"all_ranks={world_size} mean_us={all_stats[:, 0].mean().item():.3f} "
+                f"median_us={all_stats[:, 1].mean().item():.3f} "
+                f"rank_mean_range_us=[{all_stats[:, 0].min().item():.3f}, "
+                f"{all_stats[:, 0].max().item():.3f}]",
+                flush=True,
+            )
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

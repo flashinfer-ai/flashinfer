@@ -22,8 +22,8 @@
 // the caller-provided bf16 output tensor. It supports M in [1, 4] and the
 // DeepSeek-V3 TP layouts with K_local=512 (TP=4) or K_local=256 (TP=8).
 //
-// The deployed path uses packed down weights. The raw-weight path remains for
-// diagnostics and uses TMA staging from the original row-major tensors.
+// Both raw row-major and prepacked down weights are supported. FlashInfer's
+// public GLM5 wrapper uses raw row-major weights and TMA staging.
 
 #include <cooperative_groups.h>
 #include <cstdint>
