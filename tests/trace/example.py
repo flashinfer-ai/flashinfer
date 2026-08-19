@@ -818,8 +818,6 @@ flashinfer.fused_moe.glm5_low_latency_moe.fi_trace(
         _glm5_H_BLOCKS, _glm5_I // 128, dtype=torch.float32, device="meta"
     ),
     routed_scaling_factor=2.5,
-    packed_weight_stages=2,
-    use_tma=True,
 )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────

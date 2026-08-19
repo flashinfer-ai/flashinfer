@@ -79,8 +79,6 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=4, choices=(1, 2, 3, 4))
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--packed-weight-stages", type=int, default=2, choices=(1, 2))
-    parser.add_argument("--no-tma", action="store_true")
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
@@ -156,8 +154,6 @@ def main() -> None:
             **weights.as_kwargs(),
             out=output,
             workspace=workspace,
-            packed_weight_stages=args.packed_weight_stages,
-            use_tma=not args.no_tma,
         )
 
     times_us = _profile(run, args.warmup, args.iterations)
@@ -166,8 +162,7 @@ def main() -> None:
     min_us = min(times_us)
     print(
         f"rank={rank} tokens={args.tokens} mean_us={mean_us:.3f} "
-        f"median_us={median_us:.3f} min_us={min_us:.3f} "
-        f"stages={args.packed_weight_stages} tma={int(not args.no_tma)}",
+        f"median_us={median_us:.3f} min_us={min_us:.3f}",
         flush=True,
     )
 

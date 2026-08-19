@@ -3254,16 +3254,6 @@ glm5_low_latency_moe_trace = TraceTemplate(
             optional=True,
             description="Post-normalization routed-expert scale.",
         ),
-        "packed_weight_stages": Scalar(
-            "int32",
-            optional=True,
-            description="One or two packed-weight pipeline stages.",
-        ),
-        "use_tma": Scalar(
-            "bool",
-            optional=True,
-            description="Use TMA instead of the cp.async fallback.",
-        ),
     },
     outputs={
         "output": Tensor(

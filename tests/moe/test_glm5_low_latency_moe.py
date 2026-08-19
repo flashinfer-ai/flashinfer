@@ -230,28 +230,17 @@ def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
         hidden_states.shape[0], prepared.shared_down_weight.shape[1], device
     )
     output = torch.empty_like(hidden_states)
-    for packed_weight_stages, use_tma in (
-        (1, True),
-        (2, True),
-        (1, False),
-        (2, False),
-    ):
-        with torch.inference_mode():
-            actual = glm5_low_latency_moe(
-                hidden_states,
-                router_logits,
-                routing_bias,
-                **prepared.as_kwargs(),
-                out=output,
-                workspace=workspace,
-                packed_weight_stages=packed_weight_stages,
-                use_tma=use_tma,
-            )
-            torch.cuda.synchronize(device)
-
-        max_abs_error = (actual.float() - expected.float()).abs().max().item()
-        print(
-            f"rank={rank} stages={packed_weight_stages} tma={int(use_tma)} "
-            f"max_abs_error={max_abs_error:.6e} threshold={threshold:.6e}"
+    with torch.inference_mode():
+        actual = glm5_low_latency_moe(
+            hidden_states,
+            router_logits,
+            routing_bias,
+            **prepared.as_kwargs(),
+            out=output,
+            workspace=workspace,
         )
-        assert max_abs_error <= threshold
+        torch.cuda.synchronize(device)
+
+    max_abs_error = (actual.float() - expected.float()).abs().max().item()
+    print(f"rank={rank} max_abs_error={max_abs_error:.6e} threshold={threshold:.6e}")
+    assert max_abs_error <= threshold

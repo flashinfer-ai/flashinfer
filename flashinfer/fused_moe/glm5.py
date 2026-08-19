@@ -409,8 +409,6 @@ def _check_glm5_low_latency_moe_supported(
     routed_scaling_factor: float = 2.5,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[Glm5LowLatencyMoeWorkspace] = None,
-    packed_weight_stages: int = 2,
-    use_tma: bool = True,
 ) -> bool:
     num_tokens, inter_per_tp = _check_glm5_low_latency_moe_shapes(
         hidden_states,
@@ -485,8 +483,6 @@ def _check_glm5_low_latency_moe_supported(
             raise ValueError(
                 "workspace tensors have incompatible shapes, dtypes, or devices."
             )
-    if packed_weight_stages not in (1, 2):
-        raise ValueError("packed_weight_stages must be 1 or 2.")
     if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
         raise ValueError("routed_scaling_factor must be positive and finite.")
     return True
@@ -507,8 +503,6 @@ def glm5_low_latency_moe(
     routed_scaling_factor: float = 2.5,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[Glm5LowLatencyMoeWorkspace] = None,
-    packed_weight_stages: int = 2,
-    use_tma: bool = True,
 ) -> torch.Tensor:
     """Run the GLM5 low-latency block-FP8 MoE path on SM100/SM103.
 
@@ -547,12 +541,6 @@ def glm5_low_latency_moe(
         Reusable temporaries allocated by
         :func:`alloc_glm5_low_latency_moe_workspace`. Supplying this and ``out``
         makes repeated decode calls allocation-free.
-    packed_weight_stages : int
-        Number of packed gate/up pipeline stages, either 1 or 2.
-    use_tma : bool
-        Use the TMA packed-weight loader. ``False`` selects the cp.async
-        fallback.
-
     Returns
     -------
     torch.Tensor
@@ -591,8 +579,6 @@ def glm5_low_latency_moe(
         workspace.topk_indices,
         workspace.expert_slots,
         float(routed_scaling_factor),
-        int(packed_weight_stages),
-        bool(use_tma),
     )
     module.glm5_fused_expert_down(
         workspace.expert_slots,

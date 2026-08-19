@@ -58,21 +58,20 @@ FP16 SwiGLU slots per token: one shared slot followed by eight routed slots.
 
 The expert-down launch buckets repeated expert IDs, stages the selected down
 weights, computes all nine down projections, applies routing weights to the
-routed slots, and writes the BF16 local sum. The public wrapper supports one or
-two packed up-weight stages and either TMA or cp.async loading.
+routed slots, and writes the BF16 local sum. The expert-up kernel uses a fixed
+two-stage TMA pipeline for its packed gate/up weights.
 
 ## Validation and performance
 
 The dump replay test uses the eight rank-specific tensors and saved PyTorch
 reference outputs from a GLM5 TP8 serving run. On eight B200 GPUs, all ranks
-passed for both stage counts and both weight loaders. With the default
-two-stage TMA path, the observed per-rank maximum absolute error was
+passed with the two-stage TMA path. The observed per-rank maximum absolute error was
 `6.87e-05` through `4.08e-04`, within the established rank-specific FP8
 thresholds.
 
 For `M=4`, 20 warmups, and 100 timed iterations, the two-launch operator
-averaged `43.349 us` across eight B200 ranks; individual rank means ranged from
-`41.555 us` to `46.321 us`. This timing excludes the router GEMM and TP
+averaged `42.260 us` across eight B200 ranks; individual rank means ranged from
+`39.956 us` to `44.522 us`. This timing excludes the router GEMM and TP
 all-reduce, matching the operator boundary described above.
 
 Run the replay and benchmark with:

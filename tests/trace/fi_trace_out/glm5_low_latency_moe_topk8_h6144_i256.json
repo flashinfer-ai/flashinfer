@@ -157,18 +157,6 @@
       "dtype": "float32",
       "optional": true,
       "description": "Post-normalization routed-expert scale."
-    },
-    "packed_weight_stages": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true,
-      "description": "One or two packed-weight pipeline stages."
-    },
-    "use_tma": {
-      "shape": null,
-      "dtype": "bool",
-      "optional": true,
-      "description": "Use TMA instead of the cp.async fallback."
     }
   },
   "outputs": {
