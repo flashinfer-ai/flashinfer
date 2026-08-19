@@ -8622,24 +8622,63 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
         )
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         raise ValueError("Cake batch DeepGEMM FP8 requires float8_e4m3fn a and b")
-    if a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32:
-        raise ValueError("Cake batch DeepGEMM FP8 requires float32 scales")
+    packed_scales = a_scale.dtype == torch.int32 and b_scale.dtype == torch.int32
+    if not packed_scales and (
+        a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32
+    ):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires both scales to be float32 or "
+            "packed int32 UE8M0"
+        )
     if masked_m.dtype != torch.int32 or masked_m.shape != (batch,):
         raise ValueError(
             "Cake batch DeepGEMM FP8 requires int32 masked_m with shape [B]"
         )
-    if a_scale.shape != (batch, m, k // 128):
-        raise ValueError("Cake batch DeepGEMM FP8 requires a_scale shape [B,M,K/128]")
-    if b_scale.shape != (batch, n // 128, k // 128):
-        raise ValueError(
-            "Cake batch DeepGEMM FP8 requires b_scale shape [B,N/128,K/128]"
-        )
+    if packed_scales:
+        if batch != 64 or m not in {256, 512} or (n, k) not in {
+            (4096, 7168),
+            (7168, 2048),
+        }:
+            raise ValueError(
+                "Cake packed UE8M0 scales support the serving boundary "
+                "B=64, M in {256,512}, and N/K in {(4096,7168),(7168,2048)}"
+            )
+        packed_cols = k // 512
+        if a_scale.shape != (batch, m, packed_cols):
+            raise ValueError(
+                "Cake packed UE8M0 requires a_scale shape [B,M,K/512]"
+            )
+        if b_scale.shape != (batch, n, packed_cols):
+            raise ValueError(
+                "Cake packed UE8M0 requires b_scale shape [B,N,K/512]"
+            )
+        if a_scale.stride() != (m * packed_cols, 1, m):
+            raise ValueError(
+                "Cake packed UE8M0 requires MN-major a_scale stride "
+                "[M*K/512,1,M]"
+            )
+        if b_scale.stride() != (n * packed_cols, 1, n):
+            raise ValueError(
+                "Cake packed UE8M0 requires MN-major b_scale stride "
+                "[N*K/512,1,N]"
+            )
+    else:
+        if a_scale.shape != (batch, m, k // 128):
+            raise ValueError(
+                "Cake batch DeepGEMM FP8 requires a_scale shape [B,M,K/128]"
+            )
+        if b_scale.shape != (batch, n // 128, k // 128):
+            raise ValueError(
+                "Cake batch DeepGEMM FP8 requires b_scale shape [B,N/128,K/128]"
+            )
+        if not a_scale.is_contiguous() or not b_scale.is_contiguous():
+            raise ValueError("Cake float32 scales must be contiguous")
     if not all(
-        tensor.is_cuda and tensor.is_contiguous()
-        for tensor in (a, b, a_scale, b_scale, masked_m)
-    ):
+        tensor.is_cuda and tensor.is_contiguous() for tensor in (a, b, masked_m)
+    ) or not (a_scale.is_cuda and b_scale.is_cuda):
         raise ValueError(
-            "Cake batch DeepGEMM FP8 inputs must be contiguous CUDA tensors"
+            "Cake batch DeepGEMM FP8 data and mask must be contiguous CUDA "
+            "tensors, and scales must be CUDA tensors"
         )
     if not isinstance(expected_m, int) or not 0 <= expected_m <= m:
         raise ValueError(
@@ -8744,11 +8783,16 @@ def batch_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(batch_size, m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        With ``backend="cake"``, the SGLang serving boundary also accepts native
+        MN-major packed UE8M0 ``torch.int32`` scales of shape
+        ``(batch_size, m, k // 512)`` without conversion.
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
         of the original float32 tensor for each group.
+        With ``backend="cake"``, packed UE8M0 scales use shape
+        ``(batch_size, n, k // 512)`` and the same MN-major layout as DeepGEMM.
 
     masked_m : torch.Tensor
         Masking tensor of shape ``(batch_size,)`` with ``torch.int32`` dtype. Each element

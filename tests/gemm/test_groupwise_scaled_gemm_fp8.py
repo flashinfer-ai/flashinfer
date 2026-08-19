@@ -483,6 +483,77 @@ def test_fp8_groupwise_batch_deepgemm_cake_packed_m224_routes(
             )
 
 
+@pytest.mark.parametrize(
+    ("m", "nk", "expected_m"),
+    [
+        (256, (4096, 7168), 1),
+        (256, (4096, 7168), 8),
+        (256, (7168, 2048), 1),
+        (256, (7168, 2048), 8),
+        (512, (4096, 7168), 8),
+        (512, (7168, 2048), 8),
+    ],
+)
+def test_fp8_groupwise_batch_deepgemm_cake_native_packed_scales(
+    m,
+    nk,
+    expected_m,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
+
+    torch.random.manual_seed(0)
+    group_size = 64
+    n, k = nk
+    a_fp8 = torch.randint(
+        -2, 3, (group_size, m, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    b_fp8 = torch.randint(
+        -2, 3, (group_size, n, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    packed_cols = k // 512
+    packed_one = 0x7F7F7F7F
+    a_scale_storage = torch.full(
+        (group_size, packed_cols, m),
+        packed_one,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    b_scale_storage = torch.full(
+        (group_size, packed_cols, n),
+        packed_one,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    a_scale = a_scale_storage.as_strided(
+        (group_size, m, packed_cols), (m * packed_cols, 1, m)
+    )
+    b_scale = b_scale_storage.as_strided(
+        (group_size, n, packed_cols), (n * packed_cols, 1, n)
+    )
+    masked_m = torch.full(
+        (group_size,), expected_m, device="cuda", dtype=torch.int32
+    )
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=torch.bfloat16,
+        backend="cake",
+    )
+    for group in (0, 1, 31, 63):
+        for row in (0, expected_m - 1):
+            reference = torch.mv(b_fp8[group].float(), a_fp8[group, row].float())
+            torch.testing.assert_close(
+                out[group, row].float(), reference, atol=0.1, rtol=0.1
+            )
+
+
 @pytest.mark.parametrize("m", [128, 512])
 @pytest.mark.parametrize("n", [256, 4096])
 @pytest.mark.parametrize("k", [256, 2048])

@@ -94,6 +94,42 @@ _EXPECTED_METADATA = {
         smem_bytes=203776,
         use_fast_math=False,
     ),
+    "m32_n4096_k7168_s6e1_g1": cake_batch_deepgemm.CakeBatchDeepGemmMetadata(
+        n=4096,
+        k=7168,
+        variant=8,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m32",
+        source="cake_batch_deepgemm_fp8_m32_n4096_k7168_s6e1_g1.cu",
+        smem_bytes=232448,
+        use_fast_math=False,
+    ),
+    "m32_n4096_k7168_s5e2_g8": cake_batch_deepgemm.CakeBatchDeepGemmMetadata(
+        n=4096,
+        k=7168,
+        variant=9,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m32",
+        source="cake_batch_deepgemm_fp8_m32_n4096_k7168_s5e2_g8.cu",
+        smem_bytes=198656,
+        use_fast_math=False,
+    ),
+    "m32_n7168_k2048_s5e3_g8": cake_batch_deepgemm.CakeBatchDeepGemmMetadata(
+        n=7168,
+        k=2048,
+        variant=10,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m32",
+        source="cake_batch_deepgemm_fp8_m32_n7168_k2048_s5e3_g8.cu",
+        smem_bytes=202752,
+        use_fast_math=False,
+    ),
+    "m32_n7168_k2048_s5e2_g8": cake_batch_deepgemm.CakeBatchDeepGemmMetadata(
+        n=7168,
+        k=2048,
+        variant=11,
+        symbol="kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m32",
+        source="cake_batch_deepgemm_fp8_m32_n7168_k2048_s5e2_g8.cu",
+        smem_bytes=198656,
+        use_fast_math=False,
+    ),
 }
 
 _EXPORTED_SOURCE_SHA256 = {
@@ -105,6 +141,10 @@ _EXPORTED_SOURCE_SHA256 = {
     "pack_scales_m224": "50e2dc40262732417c3a7b20029292506230286f5be0549f0b5256985892969d",
     "swap_m224": "0507863accaaad850eaac6bf75f52eb6db623588f1c2d2889c14024cbfafe377",
     "tail128": "c9ee48e0cbaca969d2b07d73cdc174afd3911865fa20d419e52f04afa8f50d02",
+    "m32_n4096_k7168_s6e1_g1": "f9ef8ba595c4be275e184a23fb8c71f8fda5848fb353b8460246d4440f46340b",
+    "m32_n4096_k7168_s5e2_g8": "d74eada281597783c21f7e148fdf26ea048b759aaa0e4d21503ab8cc278ab94a",
+    "m32_n7168_k2048_s5e3_g8": "4c2043b3a513b921d15924f175a3427f202a258066bbb072d634080646eb196c",
+    "m32_n7168_k2048_s5e2_g8": "a4b5bdf3ad410ba1e7ab1383e3371ba0fac8c0663a3da33f995b5c383b927adc",
 }
 _FROZEN_BODY_BEGIN = "// BEGIN FROZEN CAKE EXPORT\n"
 _FROZEN_BODY_END = "// END FROZEN CAKE EXPORT\n"
@@ -238,6 +278,26 @@ def test_cake_batch_deepgemm_source_routes(batch, m, n, k, expected_m, route):
 
 
 @pytest.mark.parametrize(
+    ("m", "n", "k", "expected_m", "route", "cta_reserve"),
+    [
+        (256, 4096, 7168, 1, "m32_n4096_k7168_s6e1_g1", 0),
+        (256, 4096, 7168, 2, "m32_n4096_k7168_s5e2_g8", 16),
+        (256, 4096, 7168, 4, "m32_n4096_k7168_s5e2_g8", 24),
+        (256, 4096, 7168, 8, "m32_n4096_k7168_s5e2_g8", 24),
+        (512, 4096, 7168, 8, "m32_n4096_k7168_s5e2_g8", 16),
+        (256, 7168, 2048, 1, "m32_n7168_k2048_s5e3_g8", 0),
+        (256, 7168, 2048, 2, "m32_n7168_k2048_s5e2_g8", 20),
+        (256, 7168, 2048, 8, "m32_n7168_k2048_s5e2_g8", 24),
+    ],
+)
+def test_cake_batch_deepgemm_packed_m32_routes(
+    m, n, k, expected_m, route, cta_reserve
+):
+    assert cake_batch_deepgemm._select_packed_m32_route(n, k, expected_m) == route
+    assert cake_batch_deepgemm._packed_m32_cta_reserve(m, k, expected_m) == cta_reserve
+
+
+@pytest.mark.parametrize(
     ("route", "expected_a_rows", "expected_b_rows"),
     [
         ("large_nk", 128, 64),
@@ -273,6 +333,38 @@ def test_cake_batch_deepgemm_tensor_map_matches_route(
     assert calls[1][1]["box_dims"] == (128, expected_b_rows, 2, 1)
 
 
+def test_cake_batch_deepgemm_packed_m32_tensor_maps(monkeypatch):
+    calls = []
+
+    def fake_tensor_map_device(tensor, **kwargs):
+        calls.append((tensor, kwargs))
+        return len(calls)
+
+    monkeypatch.setattr(
+        cake_batch_deepgemm,
+        "_tensor_map_device",
+        fake_tensor_map_device,
+    )
+    a = SimpleNamespace(shape=(64, 256, 7168))
+    b = SimpleNamespace(shape=(64, 4096, 7168))
+    a_scale = object()
+    b_scale = object()
+    out = object()
+
+    assert cake_batch_deepgemm._packed_m32_tensor_maps(
+        a, b, a_scale, b_scale, out
+    ) == (1, 2, 3, 4, 5)
+    assert calls[0][1]["box_dims"] == (128, 16, 2, 1)
+    assert calls[1][1]["box_dims"] == (128, 128, 2, 1)
+    assert calls[2][1]["box_dims"] == (64, 16)
+    assert calls[3][1]["global_dims"] == (256, 64 * 14)
+    assert calls[3][1]["global_strides"] == (256 * 4,)
+    assert calls[3][1]["box_dims"] == (32, 1)
+    assert calls[4][1]["global_dims"] == (4096, 64 * 14)
+    assert calls[4][1]["global_strides"] == (4096 * 4,)
+    assert calls[4][1]["box_dims"] == (128, 1)
+
+
 def test_cake_batch_deepgemm_rejects_unknown_source_route():
     with pytest.raises(ValueError, match="unsupported Cake batch DeepGEMM shape"):
         cake_batch_deepgemm._select_route(1, 128, 256, 256, 64)
@@ -298,12 +390,16 @@ def test_cake_batch_deepgemm_binding_public_abi_and_boundary():
     assert "kVariantPackScalesM224 = 5" in binding
     assert "kVariantSwapM224 = 6" in binding
     assert "kVariantTail128 = 7" in binding
+    assert "kVariantM32N4096K7168S6E1 = 8" in binding
+    assert "kVariantM32N7168K2048S5E2 = 11" in binding
     assert "the tail128 route requires B64/M256/N7168/K2048" in binding
     assert "kMaxGenericPersistentCtas = 156" in binding
     assert "a_scale must have shape [B,M,K/128]" in binding
     assert "b_scale must have shape [B,N/128,K/128]" in binding
     assert "masked_m must have shape [B]" in binding
     assert "expected_m must be in [0,M]" in binding
+    assert "the packed-M32 route requires B64 and M256 or M512" in binding
+    assert "Cake packed-M32 GEMM launch" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
     assert "mask_values" not in binding
     assert "valid_rows" not in binding
