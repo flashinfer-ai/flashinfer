@@ -50,19 +50,19 @@ def _skip_if_not_sm100():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _build_fp8(context_lens, next_n, phys_block_kv, seed=0, num_heads=64, head_dim=128):
+def _build_fp8(context_lens, next_n, block_size, seed=0, num_heads=64, head_dim=128):
     torch.manual_seed(seed)
     B = context_lens.shape[0]
-    block_table, ntb = _make_paged_kv(B, phys_block_kv, context_lens, DEVICE)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, DEVICE)
     q = torch.randn(B, next_n, num_heads, head_dim, device=DEVICE).to(
         torch.float8_e4m3fn
     )
-    kv = torch.randn(ntb, phys_block_kv, head_dim, device=DEVICE)
+    kv = torch.randn(ntb, block_size, head_dim, device=DEVICE)
     amax = kv.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = _ceil_to_ue8m0_fp(amax / 448.0).squeeze(-1)
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     weights = torch.randn(B * next_n, num_heads, device=DEVICE)
-    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, phys_block_kv, head_dim)
+    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, head_dim)
     return q, kv_fp8, scale, weights, kv_fused, block_table
 
 
@@ -143,20 +143,20 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("phys_block_kv", [32, 64, 128])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize(
     "ctx",
     [1, 2, 3, 33, 64, 127, 128, 129, 255, 256, 257, 383, 384, 512, 640, 1024, 1025],
 )
-def test_adv_context_boundaries_fp8(phys_block_kv, next_n, ctx):
+def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
     """Boundary context lengths (block/128/256 multiples and ±1) must stay correct."""
     _skip_if_not_sm100()
     if ctx < next_n:
         pytest.skip("ctx must be >= next_n for a valid causal window")
     cl = torch.full((4,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, phys_block_kv, seed=ctx)
+    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, block_size, seed=ctx)
     diff, max_abs, _ = _cmp_fp8(q, kv_fp8, scale, w, kv_fused, cl, bt, max_ml, next_n)
     assert diff < 0.02, f"cosine diff {diff:.3e} (max_abs {max_abs:.3e}) ctx={ctx}"
 
@@ -170,12 +170,12 @@ def test_adv_context_boundaries_fp8(phys_block_kv, next_n, ctx):
 def test_adv_skewed_varlen_fp8(next_n):
     """One very long sequence + many short ones (schedule stress)."""
     _skip_if_not_sm100()
-    B, pbk = 16, 64
+    B, block_size = 16, 64
     cl = torch.full((B,), 128, dtype=torch.int32, device=DEVICE)
     cl[0] = 32768
     cl[1] = 16384
     max_ml = 32768 + 8
-    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, pbk, seed=7)
+    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, block_size, seed=7)
     diff, max_abs, _ = _cmp_fp8(q, kv_fp8, scale, w, kv_fused, cl, bt, max_ml, next_n)
     assert diff < 0.02, f"cosine diff {diff:.3e} max_abs {max_abs:.3e}"
 
@@ -194,14 +194,14 @@ def test_adv_degenerate_values_fp8(mode):
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(3)
-    B, next_n, pbk, H, D = 4, 2, 64, 64, 128
+    B, next_n, block_size, H, D = 4, 2, 64, 64, 128
     ctx = 2048
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = ctx + 8
-    block_table, ntb = _make_paged_kv(B, pbk, cl, DEVICE)
+    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
 
     q_f = torch.randn(B, next_n, H, D, device=DEVICE)
-    kv = torch.randn(ntb, pbk, D, device=DEVICE)
+    kv = torch.randn(ntb, block_size, D, device=DEVICE)
     weights = torch.randn(B * next_n, H, device=DEVICE)
 
     if mode == "zero_q":
@@ -219,10 +219,10 @@ def test_adv_degenerate_values_fp8(mode):
     amax = kv.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = _ceil_to_ue8m0_fp(amax / 448.0).squeeze(-1)
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, pbk, D)
+    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
 
     ref = _ref_fp8_paged_mqa_logits(
-        q, kv_fp8, scale, weights, cl, block_table, max_ml, pbk
+        q, kv_fp8, scale, weights, cl, block_table, max_ml, block_size
     )
     out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, block_table, max_ml)
 
@@ -260,29 +260,27 @@ def test_adv_determinism_fp8():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# F) FP4 correctness across phys_block_kv (flat SF vs online transpose)
+# F) FP4 correctness across block_size (flat SF vs online transpose)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("phys_block_kv", [32, 64, 128])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("ctx", [128, 129, 256, 257, 1024])
-def test_adv_fp4_boundaries(phys_block_kv, next_n, ctx):
-    """FP4: boundary contexts across all phys_block_kv (SF layout correctness)."""
+def test_adv_fp4_boundaries(block_size, next_n, ctx):
+    """FP4: boundary contexts across all block_size (SF layout correctness)."""
     _skip_if_not_sm100()
     from flashinfer import fp4_paged_mqa_logits
 
     if ctx < next_n:
         pytest.skip("ctx must be >= next_n")
-    torch.manual_seed(ctx + phys_block_kv)
+    torch.manual_seed(ctx + block_size)
     B, H, D = 4, 64, 128
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, phys_block_kv, cl, DEVICE)
+    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
-    kv_cache = torch.randn(
-        ntb, phys_block_kv, 1, D, device=DEVICE, dtype=torch.bfloat16
-    )
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
@@ -315,7 +313,7 @@ def test_adv_fp4_boundaries(phys_block_kv, next_n, ctx):
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
-    assert diff < 0.05, f"FP4 cosine diff {diff:.3e} ctx={ctx} pbk={phys_block_kv}"
+    assert diff < 0.05, f"FP4 cosine diff {diff:.3e} ctx={ctx} block_size={block_size}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,12 +328,12 @@ def test_adv_fp4_next_n4_small_ctx(ctx):
     from flashinfer import fp4_paged_mqa_logits
 
     torch.manual_seed(ctx)
-    B, next_n, H, D, pbk = 4, 4, 64, 128, 64
+    B, next_n, H, D, block_size = 4, 4, 64, 128, 64
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, pbk, cl, DEVICE)
+    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
-    kv_cache = torch.randn(ntb, pbk, 1, D, device=DEVICE, dtype=torch.bfloat16)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
@@ -379,22 +377,24 @@ def test_adv_shared_physical_blocks_fp8():
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(5)
-    B, next_n, pbk, H, D = 4, 2, 64, 64, 128
+    B, next_n, block_size, H, D = 4, 2, 64, 64, 128
     ctx = 1024
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = ctx + 8
-    n_blk = (ctx + pbk - 1) // pbk
-    kv = torch.randn(n_blk + 2, pbk, D, device=DEVICE)
+    n_blk = (ctx + block_size - 1) // block_size
+    kv = torch.randn(n_blk + 2, block_size, D, device=DEVICE)
     amax = kv.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = _ceil_to_ue8m0_fp(amax / 448.0).squeeze(-1)
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, pbk, D)
+    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
     # Every row uses the identical block table (shared KV).
     bt = torch.arange(n_blk, dtype=torch.int32, device=DEVICE).unsqueeze(0).repeat(B, 1)
     q = torch.randn(B, next_n, H, D, device=DEVICE).to(torch.float8_e4m3fn)
     weights = torch.randn(B * next_n, H, device=DEVICE)
 
-    ref = _ref_fp8_paged_mqa_logits(q, kv_fp8, scale, weights, cl, bt, max_ml, pbk)
+    ref = _ref_fp8_paged_mqa_logits(
+        q, kv_fp8, scale, weights, cl, bt, max_ml, block_size
+    )
     out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, bt, max_ml)
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     o = out.float().masked_fill(~valid, 0)
@@ -412,18 +412,18 @@ def test_adv_shared_physical_blocks_fp8():
 def test_adv_guards_raise():
     """Adversarial malformed inputs on the guarded paths must raise ValueError."""
     _skip_if_not_sm100()
-    from flashinfer import aligned_context_len, fp8_paged_mqa_logits
+    from flashinfer import padded_context_len, fp8_paged_mqa_logits
 
-    B, next_n, pbk = 2, 1, 64
+    B, next_n, block_size = 2, 1, 64
     ctx = 1024
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
-    max_ml = ctx + 300  # non-256-aligned -> aligned > max_ml
-    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, pbk, seed=1)
+    max_ml = ctx + 300  # not a multiple of 256 -> padded > max_ml
+    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, block_size, seed=1)
 
     # Undersized out= (would OOB-write) -> ValueError
     bad = torch.empty((B * next_n, max_ml), device=DEVICE, dtype=torch.float32)
-    assert aligned_context_len(max_ml) > max_ml
-    with pytest.raises(ValueError, match="aligned_context_len"):
+    assert padded_context_len(max_ml) > max_ml
+    with pytest.raises(ValueError, match="padded_context_len"):
         fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, out=bad)
 
     # FP8 bf16 output unsupported
@@ -448,11 +448,11 @@ def test_adv_new_guards_raise():
         fp8_paged_mqa_logits,
     )
 
-    B, next_n, pbk = 4, 2, 64
+    B, next_n, block_size = 4, 2, 64
     ctx = 2048
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = ctx + 8
-    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, pbk, seed=2)
+    q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, next_n, block_size, seed=2)
 
     # (#2) fp8 e5m2 q rejected
     with pytest.raises(ValueError, match="float8_e4m3fn"):
@@ -487,7 +487,7 @@ def test_adv_new_guards_raise():
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, 64, 64)
     sf_q = sf_qp.view(torch.int32).view(B, next_n, 64)
     kv_cache = torch.randn(
-        kv_fp8.shape[0], pbk, 1, 128, device=DEVICE, dtype=torch.bfloat16
+        kv_fp8.shape[0], block_size, 1, 128, device=DEVICE, dtype=torch.bfloat16
     )
     kv_fused4, _ = _kv_cache_cast_to_fp4(kv_cache)
     with pytest.raises(ValueError, match="uint8"):

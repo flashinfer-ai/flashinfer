@@ -39,6 +39,7 @@ from ..trace.templates.attn_scores import (
     fp8_paged_mqa_logits_trace,
 )
 from ..utils import (
+    backend_requirement,
     get_device_index,
     get_device_sm_count,
     supported_compute_capability,
@@ -49,6 +50,23 @@ from ..utils import (
 _FP8_DTYPES = (torch.float32, torch.float16)
 # FP4 kernel supports fp32/fp16/bf16 for epilogue and output.
 _FP4_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+# FP8 UMMA instruction K. The kernel derives mma_inst_tile_k = head_dim // this
+# via integer division, so head_dim must be an exact multiple (see the guard in
+# fp8_paged_mqa_logits).
+_FP8_MMA_INST_K = 32
+# FP4 hardcodes these in FP4MQALogitsKernel.__init__ (asserts on head_dim and
+# num_heads); mirrored at the API boundary for a clearer error.
+_FP4_REQUIRED_HEAD_DIM = 128
+_FP4_REQUIRED_NUM_HEADS = 64
+# Max TMA sub-copies per compute tile (kernel: `num_blocks_per_mma <= 4`).
+_MAX_BLOCKS_PER_MMA = 4
+# UMMA N-mode limits, reported by the DSL as
+# "expects the N-mode to satisfy 8 <= N <= 256 and N % 8 == 0".
+# N here is next_n * num_heads.
+_MMA_N_MIN, _MMA_N_MAX, _MMA_N_MULTIPLE = 8, 256, 8
+# FP4 natively supports next_n in {1,2,3}; next_n=4 is handled by this wrapper
+# via caller-side atom-split (2B x next_n=2), so 4 is supported at the API level.
+_FP4_MAX_NEXT_N = 4
 
 
 @functools.cache
@@ -69,9 +87,9 @@ def _validate_paged_inputs(
     pointer or misread storage) and have exactly ``batch_size`` rows.
 
     NOTE (caller invariant, not checked here — would need a device sync): the
-    kernel reads ceil(context_lens[b]/128) compute tiles * (128 // phys_block_kv)
+    kernel reads ceil(context_lens[b]/128) compute tiles * (128 // block_size)
     physical blocks per row, so ``block_table`` must have at least
-    ``max_b ceil(context_lens[b]/128) * (128 // phys_block_kv)`` columns. A
+    ``max_b ceil(context_lens[b]/128) * (128 // block_size)`` columns. A
     narrower block_table causes an out-of-bounds read. Verifying this cheaply is
     impossible without a D2H copy of context_lens (which would break CUDA-graph
     capture), so it is the caller's responsibility."""
@@ -115,15 +133,15 @@ def _validate_schedule_meta(schedule_meta: torch.Tensor, num_sms: int, device) -
 def _validate_out(
     out: torch.Tensor,
     rows: int,
-    aligned_ctx: int,
+    padded_ctx_len: int,
     device: torch.device,
     out_dtype: torch.dtype,
 ) -> None:
     """Validate a caller-provided ``out=`` buffer.
 
-    The kernel writes UNCONDITIONALLY into the SPLIT_KV-aligned trailing region,
-    so ``out`` must have at least ``aligned_ctx`` columns (use
-    :func:`aligned_context_len`) and ``rows`` rows — otherwise the store spills
+    The kernel writes UNCONDITIONALLY into the SPLIT_KV-padded trailing region,
+    so ``out`` must have at least ``padded_ctx_len`` columns (use
+    :func:`padded_context_len`) and ``rows`` rows — otherwise the store spills
     past each row / past the buffer (silent corruption or illegal address)."""
     if out.device != device:
         raise ValueError(f"out.device ({out.device}) must match q.device ({device})")
@@ -131,13 +149,73 @@ def _validate_out(
         raise ValueError(
             f"out.dtype ({out.dtype}) must match output_dtype ({out_dtype})"
         )
-    if out.dim() != 2 or out.shape[0] < rows or out.shape[1] < aligned_ctx:
+    if out.dim() != 2 or out.shape[0] < rows or out.shape[1] < padded_ctx_len:
         raise ValueError(
-            f"out must be at least ({rows}, {aligned_ctx}); the kernel writes into "
-            f"the SPLIT_KV=256-aligned trailing region. Use "
-            f"aligned_context_len(max_context_len) for the column count. "
+            f"out must be at least ({rows}, {padded_ctx_len}); the kernel writes into "
+            f"the SPLIT_KV=256-padded trailing region. Use "
+            f"padded_context_len(max_context_len) for the column count. "
             f"Got shape {tuple(out.shape)}."
         )
+
+
+def _validate_phys_block_kv(block_size: int, fn_name: str) -> None:
+    """Validate the physical KV page size, taken from ``kv_fused.shape[1]``.
+
+    Both kernels tile KV in a fixed ``_COMPUTE_BLOCK_KV``-token compute tile and
+    issue ``_COMPUTE_BLOCK_KV // block_size`` TMA sub-copies to fill it,
+    capped at ``_MAX_BLOCKS_PER_MMA``. So the page size must divide the compute
+    tile and not be too small. Measured on sm_100a: {32, 64, 128} work, while
+    16 (too many sub-copies) and 48 / 96 / 256 (not divisors) each trip a bare
+    assertion from inside kernel construction.
+    """
+    if (
+        block_size <= 0
+        or _COMPUTE_BLOCK_KV % block_size != 0
+        or _COMPUTE_BLOCK_KV // block_size > _MAX_BLOCKS_PER_MMA
+    ):
+        supported = [
+            b
+            for b in range(1, _COMPUTE_BLOCK_KV + 1)
+            if _COMPUTE_BLOCK_KV % b == 0
+            and _COMPUTE_BLOCK_KV // b <= _MAX_BLOCKS_PER_MMA
+        ]
+        raise ValueError(
+            f"{fn_name}: block_size (kv_fused.shape[1]) must divide the "
+            f"{_COMPUTE_BLOCK_KV}-token compute tile into at most "
+            f"{_MAX_BLOCKS_PER_MMA} sub-blocks; supported values are {supported}, "
+            f"got {block_size}."
+        )
+
+
+def _fp8_smem_bytes(block_kv: int, head_dim: int, n: int, epi_bytes: int) -> int:
+    """Predict the FP8 kernel's per-CTA shared-memory usage, in bytes.
+
+    Mirrors ``FP8MQALogitsKernel.__init__`` for the configuration this wrapper
+    always builds (``max_kv_pipeline=False`` -> 3 KV stages, 3 Q stages, both
+    math groups resident).  Verified against the driver: head_dim=256 with
+    block_kv=128, n=64, fp32 epilogue predicts 249856 B and the launch reports
+    "Allocated: 249856 bytes".
+    """
+    num_kv_stages = 3
+    num_q_stages = 3
+    # KV + per-token fp32 scales, ×2 math groups.
+    kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
+    # Weights are padded to a 128 B stage stride for TMA alignment.
+    w_stage_stride = ((n * epi_bytes + 127) // 128 * 128) // epi_bytes
+    qw_per_stage = n * head_dim + w_stage_stride * epi_bytes
+    barriers = 256
+    return barriers + kv_scale_per_stage * num_kv_stages + qw_per_stage * num_q_stages
+
+
+@functools.cache
+def _cached_max_smem_per_block(device_index: int) -> int:
+    """Opt-in per-CTA SMEM cap for the device (232448 B on sm_100a)."""
+    props = torch.cuda.get_device_properties(torch.device("cuda", device_index))
+    for attr in ("shared_memory_per_block_optin", "sharedMemPerBlockOptin"):
+        val = getattr(props, attr, None)
+        if val:
+            return int(val)
+    return 232448  # sm_100a fallback
 
 
 _CUTE_DSL_AVAILABLE = (
@@ -234,15 +312,15 @@ if _CUTE_DSL_AVAILABLE:
 
 
 @functools.cache
-def _fp8_source_files() -> Tuple[str, ...]:
+def _cached_fp8_source_files() -> Tuple[str, ...]:
     from .kernels import fp8_paged_mqa_logits as _m
 
     return (__file__, _m.__file__)
 
 
 @functools.cache
-def _compile_fp8_kernel(
-    phys_block_kv: int,
+def _cached_compile_fp8_kernel(
+    block_size: int,
     num_heads: int,
     head_dim: int,
     next_n: int,
@@ -256,7 +334,7 @@ def _compile_fp8_kernel(
     from .kernels import FP8MQALogitsKernel
 
     N = next_n * num_heads
-    block_bytes = phys_block_kv * (head_dim + 4)
+    block_bytes = block_size * (head_dim + 4)
 
     sym_npb = cute.sym_int()
     sym_B = cute.sym_int()
@@ -264,8 +342,18 @@ def _compile_fp8_kernel(
     max_blocks = cute.sym_int()
     num_ctas_sym = cute.sym_int()
 
-    kv_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (sym_npb, block_bytes), stride_order=(1, 0)
+    # KV may come from a K-cache pool view that is strided in dim 0 (pool
+    # layouts interleave layers, e.g. [num_blocks, num_layers, kvFactor,
+    # block_bytes]). Declare the outer stride as a symbol so the actual
+    # per-block stride is read at runtime; the innermost stride is fixed to 1
+    # (bytes are contiguous within one logical block). A compact-tensor
+    # declaration would bake block_bytes in as the outer stride and reject
+    # such a view at the FFI boundary. Matches TensorRT-LLM's production
+    # CuteDSLPagedMQALogitsRunner._compile.
+    kv_fake = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (sym_npb, block_bytes),
+        stride=(cute.sym_int64(), 1),
     )
     q_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (N, head_dim, sym_B), stride_order=(1, 0, 2)
@@ -292,7 +380,7 @@ def _compile_fp8_kernel(
 
     kernel = FP8MQALogitsKernel(
         block_kv=_COMPUTE_BLOCK_KV,
-        phys_block_kv=phys_block_kv,
+        phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
         num_heads=num_heads,
         head_dim=head_dim,
         next_n=next_n,
@@ -320,7 +408,7 @@ def _compile_fp8_kernel(
         )
 
     tag = (
-        f"fp8_pbk{phys_block_kv}_H{num_heads}_D{head_dim}_nn{next_n}"
+        f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
         f"_sub{num_epi_subtiles}"
     )
@@ -328,7 +416,7 @@ def _compile_fp8_kernel(
         "attn_scores_fp8",
         tag,
         _compile_fn,
-        extra_key_files=_fp8_source_files(),
+        extra_key_files=_cached_fp8_source_files(),
     )
 
 
@@ -338,15 +426,15 @@ def _compile_fp8_kernel(
 
 
 @functools.cache
-def _fp4_source_files() -> Tuple[str, ...]:
+def _cached_fp4_source_files() -> Tuple[str, ...]:
     from .kernels import fp4_paged_mqa_logits as _m
 
     return (__file__, _m.__file__)
 
 
 @functools.cache
-def _compile_fp4_kernel(
-    phys_block_kv: int,
+def _cached_compile_fp4_kernel(
+    block_size: int,
     num_heads: int,
     head_dim: int,
     next_n: int,
@@ -361,7 +449,7 @@ def _compile_fp4_kernel(
 
     N = next_n * num_heads
     half_D = head_dim // 2
-    block_bytes = phys_block_kv * (half_D + 4)
+    block_bytes = block_size * (half_D + 4)
 
     sym_npb = cute.sym_int()
     sym_B = cute.sym_int()
@@ -369,8 +457,12 @@ def _compile_fp4_kernel(
     max_blocks = cute.sym_int()
     num_ctas_sym = cute.sym_int()
 
-    kv_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (sym_npb, block_bytes), stride_order=(1, 0)
+    # Symbolic outer stride so a strided K-cache pool view works zero-copy;
+    # see the matching comment in _cached_compile_fp8_kernel.
+    kv_fake = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (sym_npb, block_bytes),
+        stride=(cute.sym_int64(), 1),
     )
     q_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (N, half_D, sym_B), stride_order=(1, 0, 2)
@@ -399,7 +491,7 @@ def _compile_fp4_kernel(
 
     kernel = FP4MQALogitsKernel(
         block_kv=_COMPUTE_BLOCK_KV,
-        phys_block_kv=phys_block_kv,
+        phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
         num_heads=num_heads,
         head_dim=head_dim,
         next_n=next_n,
@@ -428,7 +520,7 @@ def _compile_fp4_kernel(
         )
 
     tag = (
-        f"fp4_pbk{phys_block_kv}_H{num_heads}_D{head_dim}_nn{next_n}"
+        f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
         f"_sub{num_epi_subtiles}_sfT{int(remove_online_sf_transpose)}"
     )
@@ -436,7 +528,7 @@ def _compile_fp4_kernel(
         "attn_scores_fp4",
         tag,
         _compile_fn,
-        extra_key_files=_fp4_source_files(),
+        extra_key_files=_cached_fp4_source_files(),
     )
 
 
@@ -465,14 +557,14 @@ def _gpu_schedule(
     compiled(context_lens, schedule_meta, batch_size)
 
 
-def aligned_context_len(max_context_len: int) -> int:
+def padded_context_len(max_context_len: int) -> int:
     """Return the minimum allocated context dimension for paged MQA logits output.
 
-    The kernel may write unconditionally into SPLIT_KV-aligned trailing positions,
+    The kernel may write unconditionally into SPLIT_KV-padded trailing positions,
     so the output tensor must be allocated with at least this many columns.
 
     Use this to pre-allocate the ``out`` parameter:
-        out = torch.empty((B * next_n, aligned_context_len(max_ctx)), dtype=..., device="cuda")
+        out = torch.empty((B * next_n, padded_context_len(max_ctx)), dtype=..., device="cuda")
         logits = fp8_paged_mqa_logits(..., out=out)
     """
     return ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
@@ -525,6 +617,101 @@ def compute_paged_mqa_logits_schedule(
 
 
 @supported_compute_capability(_SM100_CCS)
+def _check_fp8_paged_mqa_logits_supported(
+    q: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_context_len: int,
+    output_dtype: torch.dtype = torch.float32,
+    epi_dtype: torch.dtype = torch.float32,
+    acc_dtype: torch.dtype = torch.float32,
+    num_epi_subtiles: int = 1,
+    schedule_meta: torch.Tensor = None,
+    out: torch.Tensor = None,
+) -> bool:
+    """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
+
+    Signature mirrors :func:`fp8_paged_mqa_logits` (``backend_requirement`` binds
+    the public arguments and forwards them all by keyword); ``schedule_meta`` and
+    ``out`` are accepted but validated in the API body instead — they describe
+    caller-supplied output storage rather than problem supportedness, and must
+    stay enforced even under ``skip_check=True`` because a too-small buffer is a
+    silent out-of-bounds write.
+    """
+    B, next_n, H, D = q.shape
+    N = next_n * H
+    block_size = kv_fused.shape[1]
+
+    if q.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"fp8_paged_mqa_logits requires q.dtype == float8_e4m3fn; got {q.dtype}. "
+            "(e5m2 has a different byte layout and would be silently misread as e4m3.)"
+        )
+    if num_epi_subtiles < 1:
+        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
+    if (
+        output_dtype not in _FP8_DTYPES
+        or epi_dtype not in _FP8_DTYPES
+        or acc_dtype not in _FP8_DTYPES
+    ):
+        raise ValueError(
+            "fp8_paged_mqa_logits supports output/epi/acc dtype in {float32, "
+            f"float16}}; got output_dtype={output_dtype}, epi_dtype={epi_dtype}, "
+            f"acc_dtype={acc_dtype}."
+        )
+    # --- head_dim supportedness -------------------------------------------
+    # The FP8 kernel is parametric over head_dim (unlike FP4, which hardcodes
+    # 128), but two conditions bound it. Both are checked here so the caller
+    # gets an actionable error instead of a silently-wrong result or a bare
+    # cudaErrorInvalidValue from the driver at launch.
+    #
+    # (1) Multiple of the MMA instruction K. The kernel computes
+    #     mma_inst_tile_k = head_dim // 32 with integer division, so a
+    #     non-multiple silently truncates the QK contraction (head_dim=100
+    #     would reduce over only 96 elements) and returns wrong logits.
+    if D % _FP8_MMA_INST_K != 0:
+        raise ValueError(
+            f"head_dim must be a multiple of {_FP8_MMA_INST_K} (FP8 MMA instruction K); "
+            f"got head_dim={D} from q.shape. A non-multiple would silently truncate the "
+            f"QK contraction to {D // _FP8_MMA_INST_K * _FP8_MMA_INST_K} elements."
+        )
+    # (2) SMEM budget. Tile sizing scales linearly with head_dim; an oversized
+    #     config fails at launch with an opaque driver error. Measured on
+    #     sm_100a: head_dim <= 192 fits, 256 does not (249856 B > 232448 B).
+    _smem_needed = _fp8_smem_bytes(
+        _COMPUTE_BLOCK_KV, D, N, 2 if epi_dtype == torch.float16 else 4
+    )
+    _smem_limit = _cached_max_smem_per_block(get_device_index(q.device))
+    if _smem_needed > _smem_limit:
+        raise ValueError(
+            f"head_dim={D} with num_heads={H}, next_n={next_n} needs {_smem_needed} B "
+            f"of shared memory per CTA but this device allows {_smem_limit} B. "
+            f"Reduce head_dim (<=192 fits at num_heads=64, next_n=1), num_heads, "
+            f"or next_n."
+        )
+    # UMMA N-mode: N = next_n * num_heads must be a multiple of 8 in [8, 256].
+    # Exceeding it fails inside the DSL with an opaque OpError (measured:
+    # next_n=5 at num_heads=64 gives N=320 -> "expects the N-mode to satisfy
+    # 8 <= N <= 256 and N % 8 == 0, but got 320").
+    if N < _MMA_N_MIN or N > _MMA_N_MAX or N % _MMA_N_MULTIPLE != 0:
+        raise ValueError(
+            f"next_n * num_heads must be a multiple of {_MMA_N_MULTIPLE} in "
+            f"[{_MMA_N_MIN}, {_MMA_N_MAX}] (UMMA N-mode); got next_n={next_n} * "
+            f"num_heads={H} = {N}."
+        )
+    _validate_phys_block_kv(block_size, "fp8_paged_mqa_logits")
+    if kv_fused.dim() != 4 or kv_fused.shape[2] != 1 or kv_fused.shape[-1] != D + 4:
+        raise ValueError(
+            f"kv_fused must be [num_blocks, block_size, 1, head_dim+4={D + 4}] "
+            f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(context_lens, block_table, B)
+    return True
+
+
+@backend_requirement({}, common_check=_check_fp8_paged_mqa_logits_supported)
 @flashinfer_api(trace=fp8_paged_mqa_logits_trace)
 def fp8_paged_mqa_logits(
     q: torch.Tensor,
@@ -544,13 +731,14 @@ def fp8_paged_mqa_logits(
     """FP8 paged MQA logits for Blackwell (SM100).
 
     Args:
-        q:               [B, next_n, H, D]  float8_e4m3fn
-        kv_fused:        [num_blocks, phys_block_kv, 1, D+4]  uint8
-                         Layout per block: [KV data (phys_block_kv*D bytes)]
-                                           [scales (phys_block_kv*4 bytes, float32)]
-        weights:         [B*next_n, H]  float32  per-head mixing weights
-        context_lens:    [B]  int32  (CUDA)
-        block_table:     [B, max_blocks]  int32  (CUDA)
+        q:               [batch_size, next_n, num_heads, head_dim]  float8_e4m3fn
+        kv_fused:        [num_blocks, block_size, 1, head_dim+4]  uint8
+                         Per block: [KV data (block_size*head_dim bytes)]
+                                    [scales (block_size*4 bytes, float32)]
+        weights:         [batch_size*next_n, num_heads]  float32  per-head weights
+        context_lens:    [batch_size]  int32  (CUDA)
+        block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
+                         Values are physical block indices into kv_fused's dim 0.
         max_context_len: int  maximum KV sequence length
         output_dtype:    output tensor dtype (float32 or float16)
         epi_dtype:       epilogue accumulation dtype (float32 or float16)
@@ -561,83 +749,52 @@ def fp8_paged_mqa_logits(
                          Pass a pre-computed tensor to avoid the CPU overhead when
                          the schedule is stable across calls (e.g. fixed batch).
                          Use compute_paged_mqa_logits_schedule() to generate it.
-        out:             optional pre-allocated output tensor [B*next_n, aligned_ctx]
-                         where aligned_ctx >= max_context_len and is a multiple of
-                         SPLIT_KV=256.  If None, allocated each call.
-                         Use flashinfer.attn_scores.attn_scores.aligned_context_len()
-                         to compute the required allocation size.
-                         Required for CUDA graph capture.
+        out:             optional pre-allocated output
+                         [batch_size*next_n, padded_ctx_len], where padded_ctx_len
+                         >= max_context_len and is a multiple of SPLIT_KV=256.
+                         If None, allocated each call.  Use padded_context_len()
+                         to size it.  Required for CUDA graph capture.
 
     Returns:
-        logits: [B*next_n, max_context_len]  output_dtype  (a view of ``out`` if provided)
+        logits: [batch_size*next_n, max_context_len]  output_dtype
+                (a view of ``out`` when provided)
     """
     if not _CUTE_DSL_AVAILABLE:
         raise RuntimeError("fp8_paged_mqa_logits requires nvidia-cutlass-dsl")
 
     B, next_n, H, D = q.shape
-    N = next_n * H
-    phys_block_kv = kv_fused.shape[1]
-    num_phys_blocks = kv_fused.shape[0]
+    block_size = kv_fused.shape[1]
+    num_blocks = kv_fused.shape[0]
     num_sms = _cached_num_sms(get_device_index(q.device))
-
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            f"fp8_paged_mqa_logits requires q.dtype == float8_e4m3fn; got {q.dtype}. "
-            "(e5m2 has a different byte layout and would be silently misread as e4m3.)"
-        )
-    if num_epi_subtiles < 1:
-        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
-    if (
-        output_dtype not in _FP8_DTYPES
-        or epi_dtype not in _FP8_DTYPES
-        or acc_dtype not in _FP8_DTYPES
-    ):
-        raise ValueError(
-            "fp8_paged_mqa_logits supports output/epi/acc dtype in {float32, "
-            f"float16}}; got output_dtype={output_dtype}, epi_dtype={epi_dtype}, "
-            f"acc_dtype={acc_dtype}."
-        )
-    if kv_fused.dim() != 4 or kv_fused.shape[2] != 1 or kv_fused.shape[-1] != D + 4:
-        raise ValueError(
-            f"kv_fused must be [num_blocks, phys_block_kv, 1, head_dim+4={D + 4}] "
-            f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
-        )
-    _validate_paged_inputs(context_lens, block_table, B)
-    if schedule_meta is not None:
-        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_acc = _to_cutlass(acc_dtype)
     cutlass_out = _to_cutlass(output_dtype)
 
-    # Reshape inputs to kernel convention (no .contiguous() — strides must stay
-    # B-independent so the compile cache stays hot across different batch sizes)
-    q_3d = q.reshape(B, N, D).permute(1, 2, 0)  # [N, D, B]
+    q_3d = q.reshape(B, next_n * H, D).permute(1, 2, 0)  # [next_n*H, D, B]
     if epi_dtype == torch.float16:
-        w_2d = weights.reshape(B, N).half().t()  # [N, B]
+        w_2d = weights.reshape(B, next_n * H).half().t()  # [next_n*H, B]
     else:
-        w_2d = weights.reshape(B, N).t()  # [N, B]
-    kv_flat = kv_fused.reshape(num_phys_blocks, -1)  # [num_blocks, block_bytes]
+        w_2d = weights.reshape(B, next_n * H).t()  # [next_n*H, B]
+    kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
 
-    # Output: aligned to SPLIT_KV so the kernel can store unconditionally.
-    # Use pre-allocated buffer if provided (avoids allocation, enables CUDA graphs).
-    aligned_ctx = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
-        _validate_out(out, B * next_n, aligned_ctx, q.device, output_dtype)
+        _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
         logits = out[:, :max_context_len]
     else:
         logits_full = torch.empty(
-            (B * next_n, aligned_ctx), device=q.device, dtype=output_dtype
+            (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
         )
         logits = logits_full[:, :max_context_len]
 
-    # Schedule metadata — use caller's precomputed tensor or compute it now.
-    # GPU kernel is used by default when context_lens is on CUDA (no D2H copy).
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
+    else:
+        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
-    compiled = _compile_fp8_kernel(
-        phys_block_kv,
+    compiled = _cached_compile_fp8_kernel(
+        block_size,
         H,
         D,
         next_n,
@@ -662,13 +819,98 @@ def fp8_paged_mqa_logits(
         block_table,
         context_lens,
         schedule_meta,
-        num_phys_blocks,
+        num_blocks,
         B,
     )
     return logits
 
 
 @supported_compute_capability(_SM100_CCS)
+def _check_fp4_paged_mqa_logits_supported(
+    q: torch.Tensor,
+    sf_q: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_context_len: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+    epi_dtype: torch.dtype = torch.float32,
+    num_epi_subtiles: int = 1,
+    remove_online_sf_transpose: bool = False,
+    schedule_meta: torch.Tensor = None,
+    out: torch.Tensor = None,
+) -> bool:
+    """Return True when the FP4 kernel supports this problem, else raise ``ValueError``.
+
+    Mirrors :func:`fp4_paged_mqa_logits`'s signature; see
+    :func:`_check_fp8_paged_mqa_logits_supported` for why ``schedule_meta`` and
+    ``out`` are validated in the API body rather than here.
+    """
+    B, next_n, H, half_D = q.shape
+    D = half_D * 2
+    block_size = kv_fused.shape[1]
+
+    if q.dtype != torch.uint8:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires q.dtype == uint8 (packed FP4 e2m1, two "
+            f"per byte); got {q.dtype}"
+        )
+    if sf_q.dtype != torch.int32 or tuple(sf_q.shape) != (B, next_n, H):
+        raise ValueError(
+            f"sf_q must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
+            f"got dtype={sf_q.dtype}, shape={tuple(sf_q.shape)}"
+        )
+    if num_epi_subtiles < 1:
+        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
+    if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
+        raise ValueError(
+            "fp4_paged_mqa_logits supports output/epi dtype in {float32, "
+            f"float16, bfloat16}}; got output_dtype={output_dtype}, "
+            f"epi_dtype={epi_dtype}."
+        )
+    # --- head_dim / num_heads supportedness --------------------------------
+    # Unlike FP8, the FP4 kernel hardcodes both (see FP4MQALogitsKernel.__init__:
+    # `assert head_dim == 128` / `assert num_heads == 64`). The scale-factor
+    # buffer-offset math bakes in head_dim // sf_vec_size == 128 // 32 == 4
+    # packed UE8M0 values per token, and the TMEM/SMEM budget is sized for
+    # num_heads=64. Check here so callers get a clear error at the API boundary
+    # rather than an assertion from inside JIT compilation.
+    if D != _FP4_REQUIRED_HEAD_DIM:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires head_dim == {_FP4_REQUIRED_HEAD_DIM}; got "
+            f"head_dim={D} (from q.shape[-1]*2). The FP4 kernel hardcodes this: its "
+            f"scale-factor layout assumes exactly {_FP4_REQUIRED_HEAD_DIM // 32} UE8M0 "
+            f"groups per token."
+        )
+    if H != _FP4_REQUIRED_NUM_HEADS:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires num_heads == {_FP4_REQUIRED_NUM_HEADS}; got "
+            f"num_heads={H}. The FP4 kernel hardcodes this for its TMEM/SMEM budget."
+        )
+    # The kernel natively supports next_n in {1,2,3} (TMEM cap); next_n=4 is
+    # decomposed in the API body into 2 atoms of 2. Anything larger has no
+    # decomposition and would trip a kernel assertion during JIT compilation.
+    if next_n < 1 or next_n > _FP4_MAX_NEXT_N:
+        raise ValueError(
+            f"fp4_paged_mqa_logits supports next_n in 1..{_FP4_MAX_NEXT_N} "
+            f"(1-3 natively, 4 via atom-split); got next_n={next_n}."
+        )
+    _validate_phys_block_kv(block_size, "fp4_paged_mqa_logits")
+    if (
+        kv_fused.dim() != 4
+        or kv_fused.shape[2] != 1
+        or kv_fused.shape[-1] != half_D + 4
+    ):
+        raise ValueError(
+            f"kv_fused must be [num_blocks, block_size, 1, head_dim//2+4="
+            f"{half_D + 4}] (head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(context_lens, block_table, B)
+    return True
+
+
+@backend_requirement({}, common_check=_check_fp4_paged_mqa_logits_supported)
 @flashinfer_api(trace=fp4_paged_mqa_logits_trace)
 def fp4_paged_mqa_logits(
     q: torch.Tensor,
@@ -689,75 +931,50 @@ def fp4_paged_mqa_logits(
     """FP4 (MXFP4) paged MQA logits for Blackwell (SM100).
 
     Args:
-        q:               [B, next_n, H, D//2]  uint8 (two FP4 per byte, E2M1)
-        sf_q:            [B, next_n, H]  int32 (4 UE8M0 scale factors packed per token)
-        kv_fused:        [num_blocks, phys_block_kv, 1, D//2+4]  uint8
-                         Layout per block: [KV data (phys_block_kv*D//2 bytes)]
-                                           [KV SF   (phys_block_kv*4 bytes, int32)]
-        weights:         [B*next_n, H]  float32  per-head mixing weights
-        context_lens:    [B]  int32  (CUDA)
-        block_table:     [B, max_blocks]  int32  (CUDA)
+        q:               [batch_size, next_n, num_heads, head_dim//2]  uint8
+                         (two FP4 per byte, E2M1)
+        sf_q:            [batch_size, next_n, num_heads]  int32
+                         (4 UE8M0 scale factors packed per token)
+        kv_fused:        [num_blocks, block_size, 1, head_dim//2+4]  uint8
+                         Per block: [KV data (block_size*head_dim//2 bytes)]
+                                    [KV SF   (block_size*4 bytes, int32)]
+        weights:         [batch_size*next_n, num_heads]  float32  per-head weights
+        context_lens:    [batch_size]  int32  (CUDA)
+        block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
+                         Values are physical block indices into kv_fused's dim 0.
         max_context_len: int  maximum KV sequence length
         output_dtype:    output tensor dtype (float32, float16, or bfloat16)
         epi_dtype:       epilogue dtype (float32, float16, or bfloat16)
         num_epi_subtiles: epilogue subtile count (perf knob, default 1)
         remove_online_sf_transpose: if True, skip in-kernel SF SMEM transpose
                          (requires KV SF pre-arranged in UTCCP chunk layout,
-                         phys_block_kv=128 only)
+                         block_size=128 only)
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on CUDA.  If None, computed from context_lens each call.
                          Pass a pre-computed tensor to avoid the CPU overhead when
                          the schedule is stable across calls.
                          Use compute_paged_mqa_logits_schedule() to generate it.
-        out:             optional pre-allocated output tensor [B*next_n, aligned_ctx].
-                         Required for CUDA graph capture.
+        out:             optional pre-allocated output
+                         [batch_size*next_n, padded_ctx_len].  Use
+                         padded_context_len() to size it.  Required for CUDA
+                         graph capture.
 
     Returns:
-        logits: [B*next_n, max_context_len]  output_dtype
+        logits: [batch_size*next_n, max_context_len]  output_dtype
 
     Note:
-        next_n=4 is handled internally via atom-split (2B × next_n=2) so callers
-        can pass next_n=4 directly. next_n ∈ {1,2,3} are natively supported.
+        next_n=4 is handled internally via atom-split (2*batch_size rows of
+        next_n=2) so callers can pass next_n=4 directly. next_n in {1,2,3}
+        are natively supported.
     """
     if not _CUTE_DSL_AVAILABLE:
         raise RuntimeError("fp4_paged_mqa_logits requires nvidia-cutlass-dsl")
 
     B, next_n, H, half_D = q.shape
     D = half_D * 2
-    phys_block_kv = kv_fused.shape[1]
-    num_phys_blocks = kv_fused.shape[0]
+    block_size = kv_fused.shape[1]
+    num_blocks = kv_fused.shape[0]
     num_sms = _cached_num_sms(get_device_index(q.device))
-
-    if q.dtype != torch.uint8:
-        raise ValueError(
-            f"fp4_paged_mqa_logits requires q.dtype == uint8 (packed FP4 e2m1, two "
-            f"per byte); got {q.dtype}"
-        )
-    if sf_q.dtype != torch.int32 or tuple(sf_q.shape) != (B, next_n, H):
-        raise ValueError(
-            f"sf_q must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
-            f"got dtype={sf_q.dtype}, shape={tuple(sf_q.shape)}"
-        )
-    if num_epi_subtiles < 1:
-        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
-    if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
-        raise ValueError(
-            "fp4_paged_mqa_logits supports output/epi dtype in {float32, "
-            f"float16, bfloat16}}; got output_dtype={output_dtype}, "
-            f"epi_dtype={epi_dtype}."
-        )
-    if (
-        kv_fused.dim() != 4
-        or kv_fused.shape[2] != 1
-        or kv_fused.shape[-1] != half_D + 4
-    ):
-        raise ValueError(
-            f"kv_fused must be [num_blocks, phys_block_kv, 1, head_dim//2+4="
-            f"{half_D + 4}] (head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
-        )
-    _validate_paged_inputs(context_lens, block_table, B)
-    if schedule_meta is not None:
-        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_out = _to_cutlass(output_dtype)
@@ -797,28 +1014,28 @@ def fp4_paged_mqa_logits(
         w_2d = weights.reshape(kernel_B, kernel_N).bfloat16().t()
     else:
         w_2d = weights.reshape(kernel_B, kernel_N).t()
-    kv_flat = kv_fused.reshape(num_phys_blocks, -1)
+    kv_flat = kv_fused.flatten(1)
 
-    aligned_ctx = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
-        _validate_out(out, B * next_n, aligned_ctx, q.device, output_dtype)
+        _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
         logits = out[:, :max_context_len]
     else:
         logits_full = torch.empty(
-            (B * next_n, aligned_ctx), device=q.device, dtype=output_dtype
+            (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
         )
         logits = logits_full[:, :max_context_len]
 
-    # Schedule metadata — route through the shared helper so the on-GPU schedule
-    # kernel is used when kernel_ctx_lens is on CUDA (no D2H copy; CUDA-graph
-    # capturable), matching fp8_paged_mqa_logits.
+    # Built from kernel_ctx_lens, so this must follow the next_n=4 atom-split.
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(
             kernel_ctx_lens, device=q.device
         )
+    else:
+        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
-    compiled = _compile_fp4_kernel(
-        phys_block_kv,
+    compiled = _cached_compile_fp4_kernel(
+        block_size,
         H,
         D,
         kernel_next_n,
@@ -837,7 +1054,7 @@ def fp4_paged_mqa_logits(
         kernel_block_table,
         kernel_ctx_lens,
         schedule_meta,
-        num_phys_blocks,
+        num_blocks,
         kernel_B,
     )
     return logits
@@ -848,7 +1065,10 @@ def fp4_paged_mqa_logits(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def precompile_paged_mqa_logits(device: torch.device = None) -> None:
+def precompile_paged_mqa_logits(
+    device: torch.device = None,
+    variants: Tuple[str, ...] = ("fp8", "fp4"),
+) -> None:
     """Pre-compile paged MQA logits kernels for common static configs.
 
     Populates the on-disk CuTe-DSL kernel cache so subsequent calls to
@@ -856,42 +1076,57 @@ def precompile_paged_mqa_logits(device: torch.device = None) -> None:
     compilation on first use.  Call once during deployment setup or as part
     of a package-build step.
 
+    Only the configs listed below are covered; anything else (fp16 epilogue,
+    other head_dim / num_heads, num_epi_subtiles != 1) still compiles on first
+    use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s for the 9 fp4.
+
     Args:
-        device: CUDA device to target.  Defaults to cuda:0.
+        device:   CUDA device to target.  Defaults to cuda:0.
+        variants: Which precisions to build.  A deployment normally runs one
+                  indexer precision, so pass e.g. ``("fp8",)`` to avoid
+                  compiling kernels that will never be called.
     """
     if not _CUTE_DSL_AVAILABLE:
         return
+    unknown = set(variants) - {"fp8", "fp4"}
+    if unknown:
+        raise ValueError(
+            f"precompile_paged_mqa_logits: unknown variants {sorted(unknown)}; "
+            f"supported values are 'fp8' and 'fp4'."
+        )
     if device is None:
         device = torch.device("cuda", 0)
     num_sms = _cached_num_sms(get_device_index(torch.device(device)))
     num_heads, head_dim = 64, 128
 
-    # FP8 common configs: phys_block_kv × next_n, fp32 acc/epi/out
-    fp8_cfgs = [(pbk, nn) for pbk in (64, 128) for nn in (1, 2, 3, 4)]
-    for pbk, nn in fp8_cfgs:
-        _compile_fp8_kernel(
-            pbk,
-            num_heads,
-            head_dim,
-            nn,
-            num_sms,
-            _to_cutlass(torch.float32),
-            _to_cutlass(torch.float32),
-            _to_cutlass(torch.float32),
-            1,
-        )
+    if "fp8" in variants:
+        # block_size × next_n, fp32 acc/epi/out
+        for block_size in (64, 128):
+            for nn in (1, 2, 3, 4):
+                _cached_compile_fp8_kernel(
+                    block_size,
+                    num_heads,
+                    head_dim,
+                    nn,
+                    num_sms,
+                    _to_cutlass(torch.float32),
+                    _to_cutlass(torch.float32),
+                    _to_cutlass(torch.float32),
+                    1,
+                )
 
-    # FP4 common configs: phys_block_kv × next_n, fp32 epi, bf16 out
-    fp4_cfgs = [(pbk, nn) for pbk in (32, 64, 128) for nn in (1, 2, 3)]
-    for pbk, nn in fp4_cfgs:
-        _compile_fp4_kernel(
-            pbk,
-            num_heads,
-            head_dim,
-            nn,
-            num_sms,
-            _to_cutlass(torch.float32),
-            _to_cutlass(torch.bfloat16),
-            1,
-            False,
-        )
+    if "fp4" in variants:
+        # block_size × next_n, fp32 epi, bf16 out
+        for block_size in (32, 64, 128):
+            for nn in (1, 2, 3):
+                _cached_compile_fp4_kernel(
+                    block_size,
+                    num_heads,
+                    head_dim,
+                    nn,
+                    num_sms,
+                    _to_cutlass(torch.float32),
+                    _to_cutlass(torch.bfloat16),
+                    1,
+                    False,
+                )

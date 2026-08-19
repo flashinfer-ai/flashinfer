@@ -85,7 +85,7 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
-from .attn_scores import aligned_context_len as aligned_context_len
+from .attn_scores import padded_context_len as padded_context_len
 from .attn_scores import (
     compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
 )

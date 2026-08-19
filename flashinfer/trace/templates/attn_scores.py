@@ -38,16 +38,16 @@ def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
-def _make_paged_block_table(context_lens, phys_block_kv, device):
+def _make_paged_block_table(context_lens, block_size, device):
     """Random paged block table + total block count for a batch of context lens.
 
     Sized for the kernel's access pattern: it reads ceil(ctx/128) compute tiles *
-    (128 // phys_block_kv) physical blocks per row, which exceeds ceil(ctx/pbk)
+    (128 // block_size) physical blocks per row, which exceeds ceil(ctx/block_size)
     when ctx is not a multiple of 128. The extra columns default to physical index
     0 (a valid pool block); those positions are beyond ctx (masked), so this avoids
     an out-of-bounds block_table / KV read."""
-    n_blk = (context_lens + phys_block_kv - 1) // phys_block_kv
-    kern_blk = ((context_lens + 127) // 128) * (128 // phys_block_kv)
+    n_blk = (context_lens + block_size - 1) // block_size
+    kern_blk = ((context_lens + 127) // 128) * (128 // block_size)
     total = int(n_blk.sum().item()) + context_lens.shape[0] * 2
     max_blk = int(kern_blk.max().item())
     block_table = torch.zeros(
@@ -61,14 +61,14 @@ def _make_paged_block_table(context_lens, phys_block_kv, device):
     return block_table, total
 
 
-def _pack_fused_kv_fp8(kv_fp8, kv_scales, phys_block_kv, head_dim):
+def _pack_fused_kv_fp8(kv_fp8, kv_scales, block_size, head_dim):
     """Pack fp8 KV + per-token fp32 scales into the fused layout used by the kernel:
-    per physical block = [all KV bytes (pbk*D)] [all scale bytes (pbk*4)]."""
+    per physical block = [all KV bytes (block_size*D)] [all scale bytes (block_size*4)]."""
     num_blocks = kv_fp8.shape[0]
-    scale_offset = phys_block_kv * head_dim
+    scale_offset = block_size * head_dim
     fused = torch.zeros(
         num_blocks,
-        phys_block_kv * (head_dim + 4),
+        block_size * (head_dim + 4),
         dtype=torch.uint8,
         device=kv_fp8.device,
     )
@@ -77,7 +77,7 @@ def _pack_fused_kv_fp8(kv_fp8, kv_scales, phys_block_kv, head_dim):
         fused[blk, scale_offset:] = (
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
-    return fused.view(num_blocks, phys_block_kv, 1, head_dim + 4)
+    return fused.view(num_blocks, block_size, 1, head_dim + 4)
 
 
 @torch.no_grad()
@@ -94,22 +94,22 @@ def _fp8_paged_mqa_logits_reference(
 
     Unpacks ``kv_fused`` (flat [all KV][all scales] per block) back into fp8 KV
     and fp32 per-token scales, then reproduces the kernel math."""
-    num_blocks, pbk, _one, row_bytes = kv_fused.shape
+    num_blocks, block_size, _one, row_bytes = kv_fused.shape
     head_dim = row_bytes - 4
     B, next_n, H, _D = q.shape
     device = q.device
 
-    flat = kv_fused.reshape(num_blocks, -1)  # [num_blocks, pbk*(D+4)]
+    flat = kv_fused.reshape(num_blocks, -1)  # [num_blocks, block_size*(D+4)]
     kv_fp8 = (
-        flat[:, : pbk * head_dim]
-        .reshape(num_blocks, pbk, head_dim)
+        flat[:, : block_size * head_dim]
+        .reshape(num_blocks, block_size, head_dim)
         .view(torch.float8_e4m3fn)
     )
     scales = (
-        flat[:, pbk * head_dim :]
+        flat[:, block_size * head_dim :]
         .contiguous()
         .view(torch.float32)
-        .reshape(num_blocks, pbk)
+        .reshape(num_blocks, block_size)
     )
 
     q_f32 = q.float()
@@ -120,17 +120,17 @@ def _fp8_paged_mqa_logits_reference(
         ctx = int(context_lens[b].item())
         q_pos = torch.arange(ctx - next_n, ctx, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].to(output_dtype)
-        for blk in range((ctx + pbk - 1) // pbk):
+        for blk in range((ctx + block_size - 1) // block_size):
             phys = int(block_table[b, blk].item())
             k = kv_fp8[phys].float()
             sc = scales[phys].to(output_dtype)
-            kpos = torch.arange(blk * pbk, (blk + 1) * pbk, device=device)
+            kpos = torch.arange(blk * block_size, (blk + 1) * block_size, device=device)
             mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
             qk = torch.matmul(q_f32[b].permute(1, 0, 2), k.T)
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
             qk = torch.relu(qk).to(output_dtype)
             weighted = (w.T[:, :, None] * qk).sum(dim=0) * sc[None, :]
-            s, e = blk * pbk, blk * pbk + pbk
+            s, e = blk * block_size, blk * block_size + block_size
             logits[b * next_n : (b + 1) * next_n, s:e] = torch.where(
                 mask,
                 weighted,
@@ -154,7 +154,7 @@ def _paged_mqa_logits_masked_check(
 ):
     """Compare kernel logits vs reference over the causal, in-context, finite region.
 
-    Positions beyond each row's causal limit (and the SPLIT_KV-aligned padding the
+    Positions beyond each row's causal limit (and the SPLIT_KV-padded padding the
     kernel may write) are excluded, as are positions where either side is non-finite
     (fp8/fp4 accumulation-order can differ at extremes).  Uses an element-wise
     tolerance plus a cosine-similarity floor."""
@@ -207,7 +207,7 @@ def _fp8_paged_mqa_logits_init(
     next_n: int = 1,
     num_heads: int = 64,
     head_dim: int = 128,
-    phys_block_kv: int = 64,
+    block_size: int = 64,
     max_context_len: int = 4096,
     device: str = "cuda",
     seed: int = 0,
@@ -217,21 +217,19 @@ def _fp8_paged_mqa_logits_init(
     context_lens = torch.full(
         (batch_size,), max_context_len, dtype=torch.int32, device=device
     )
-    block_table, num_blocks = _make_paged_block_table(
-        context_lens, phys_block_kv, device
-    )
+    block_table, num_blocks = _make_paged_block_table(context_lens, block_size, device)
 
     q = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
         torch.float8_e4m3fn
     )
-    kv_f32 = torch.randn(num_blocks, phys_block_kv, head_dim, device=device)
+    kv_f32 = torch.randn(num_blocks, block_size, head_dim, device=device)
     kv_amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
     kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
     kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     weights = torch.randn(
         batch_size * next_n, num_heads, device=device, dtype=torch.float32
     )
-    kv_fused = _pack_fused_kv_fp8(kv_fp8, kv_scale, phys_block_kv, head_dim)
+    kv_fused = _pack_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
     return {
         "q": q,
         "kv_fused": kv_fused,
@@ -266,9 +264,7 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             abbrev="D", description="Head dimension (FP8 elements per row)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "phys_block_kv": Const(
-            abbrev="pbk", description="Tokens per physical KV page."
-        ),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim + 4)."
         ),
@@ -281,7 +277,7 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             description="Query, FP8 e4m3.",
         ),
         "kv_fused": Tensor(
-            ["num_blocks", "phys_block_kv", "num_kv_heads", "block_row_bytes"],
+            ["num_blocks", "block_size", "num_kv_heads", "block_row_bytes"],
             dtype="uint8",
             description="Fused paged KV: [KV fp8 bytes][per-token fp32 scale bytes] per block.",
         ),
@@ -385,24 +381,24 @@ def _cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 32
 
 
 def _pack_kv_cache_fp4(kv_cache):
-    """bf16 KV cache [num_blocks, pbk, 1, D] -> (fused uint8 [num_blocks, pbk, 1, D//2+4], dequant bf16)."""
-    num_blocks, page_size, num_heads, head_dim = kv_cache.shape
+    """bf16 KV cache [num_blocks, block_size, 1, D] -> (fused uint8 [num_blocks, block_size, 1, D//2+4], dequant bf16)."""
+    num_blocks, block_size, num_heads, head_dim = kv_cache.shape
     x_scaled, sf = _per_token_cast_to_fp4(kv_cache.view(-1, head_dim), gran_k=32)
     x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(
-        num_blocks, page_size, 1, head_dim
+        num_blocks, block_size, 1, head_dim
     )
     x_fp4 = torch.empty(
-        (num_blocks, page_size * (head_dim // 2 + 4)),
+        (num_blocks, block_size * (head_dim // 2 + 4)),
         device=kv_cache.device,
         dtype=torch.uint8,
     )
-    x_fp4[:, : page_size * head_dim // 2] = x_scaled.view(
-        num_blocks, page_size * head_dim // 2
+    x_fp4[:, : block_size * head_dim // 2] = x_scaled.view(
+        num_blocks, block_size * head_dim // 2
     ).view(torch.uint8)
-    x_fp4[:, page_size * head_dim // 2 :] = sf.view(num_blocks, page_size).view(
+    x_fp4[:, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(
         torch.uint8
     )
-    return x_fp4.view(num_blocks, page_size, num_heads, head_dim // 2 + 4), x_back.to(
+    return x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4), x_back.to(
         kv_cache.dtype
     )
 
@@ -422,24 +418,24 @@ def _fp4_paged_mqa_logits_reference(
 
     Dequantizes q (fp4 codes + UE8M0 scales) and kv_fused (fp4 codes + flat UE8M0
     scales) back to float, then reproduces the kernel math."""
-    num_blocks, pbk, _one, row_bytes = kv_fused.shape
+    num_blocks, block_size, _one, row_bytes = kv_fused.shape
     half_D = row_bytes - 4
     head_dim = half_D * 2
     B, next_n, H, _hd = q.shape
     device = q.device
 
-    # Dequantize KV: flat [KV codes (pbk*half_D bytes)][SF int32 (pbk*4 bytes)] per block.
+    # Dequantize KV: flat [KV codes (block_size*half_D bytes)][SF int32 (block_size*4 bytes)] per block.
     flat = kv_fused.reshape(num_blocks, -1)
-    kv_codes = flat[:, : pbk * half_D].reshape(num_blocks * pbk, half_D)
+    kv_codes = flat[:, : block_size * half_D].reshape(num_blocks * block_size, half_D)
     kv_sf = (
-        flat[:, pbk * half_D :]
+        flat[:, block_size * half_D :]
         .contiguous()
         .view(torch.int32)
-        .reshape(num_blocks * pbk, 1)
+        .reshape(num_blocks * block_size, 1)
     )
     kv_deq = (
         _cast_back_from_fp4(kv_codes, kv_sf, gran_k=32)
-        .view(num_blocks, pbk, 1, head_dim)
+        .view(num_blocks, block_size, 1, head_dim)
         .float()
     )
 
@@ -459,12 +455,12 @@ def _fp4_paged_mqa_logits_reference(
         ctx = int(context_lens[b].item())
         q_pos = torch.arange(ctx - next_n, ctx, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].transpose(0, 1).contiguous()
-        n_blk = (ctx + pbk - 1) // pbk
+        n_blk = (ctx + block_size - 1) // block_size
         blocks = block_table[b, :n_blk]
         kx = kv_deq[blocks].permute(2, 3, 0, 1).reshape(1, head_dim, -1)
         qx = q_deq[b].transpose(0, 1)  # [H, next_n, D]
         s = torch.matmul(qx, kx).to(torch.float32)  # [H, next_n, total_len]
-        total_len = n_blk * pbk
+        total_len = n_blk * block_size
         kpos = torch.arange(0, total_len, device=device)
         mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
         s = torch.where(mask[None, :, :], s, float("-inf"))
@@ -493,7 +489,7 @@ def _fp4_paged_mqa_logits_init(
     next_n: int = 1,
     num_heads: int = 64,
     head_dim: int = 128,
-    phys_block_kv: int = 64,
+    block_size: int = 64,
     max_context_len: int = 4096,
     device: str = "cuda",
     seed: int = 0,
@@ -503,15 +499,13 @@ def _fp4_paged_mqa_logits_init(
     context_lens = torch.full(
         (batch_size,), max_context_len, dtype=torch.int32, device=device
     )
-    block_table, num_blocks = _make_paged_block_table(
-        context_lens, phys_block_kv, device
-    )
+    block_table, num_blocks = _make_paged_block_table(context_lens, block_size, device)
 
     q_bf = torch.randn(
         batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
     )
     kv_cache = torch.randn(
-        num_blocks, phys_block_kv, 1, head_dim, device=device, dtype=torch.bfloat16
+        num_blocks, block_size, 1, head_dim, device=device, dtype=torch.bfloat16
     )
     weights = torch.randn(
         batch_size * next_n, num_heads, device=device, dtype=torch.float32
@@ -565,9 +559,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             abbrev="Dp", description="Packed head bytes (head_dim // 2)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "phys_block_kv": Const(
-            abbrev="pbk", description="Tokens per physical KV page."
-        ),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim//2 + 4)."
         ),
@@ -585,7 +577,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             description="Query UE8M0 scale factors (4 packed per token).",
         ),
         "kv_fused": Tensor(
-            ["num_blocks", "phys_block_kv", "num_kv_heads", "block_row_bytes"],
+            ["num_blocks", "block_size", "num_kv_heads", "block_row_bytes"],
             dtype="uint8",
             description="Fused paged KV: [FP4 codes][UE8M0 SF int32] per block.",
         ),

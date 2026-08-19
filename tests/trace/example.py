@@ -2043,7 +2043,7 @@ with contextlib.suppress(Exception):
         next_n=2,
         num_heads=64,
         head_dim=128,
-        phys_block_kv=64,
+        block_size=64,
         max_context_len=4096,
         device=device,
     )
