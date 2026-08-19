@@ -232,7 +232,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     # Public sources describe the generator and immutable body, without
     # publishing private GitLab URLs, internal merge-request IDs, or commits.
     for private_provenance in (
-        "gitlab-master.nvidia.com",
+        "internal-source-redacted",
         "merge_requests/",
         "Cake commit",
         "CAKE commit",

@@ -119,7 +119,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     assert FROZEN_GENERATED_BODY_SHA256[variant] in before_body
     assert after_body.strip() == "// clang-format on"
     for private_provenance in (
-        "gitlab-master.nvidia.com",
+        "internal-source-redacted",
         "merge_requests/",
         "MR !",
     ):
