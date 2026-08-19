@@ -115,9 +115,9 @@ def main() -> None:
         seq_idx = chunk_indices = chunk_offsets = seq_chunk_cumsum = None
     else:
         batch = 1
-        sequence_lengths = args.sequence_lengths or [
-            args.chunks_per_seq * 128
-        ] * args.num_seqs
+        sequence_lengths = (
+            args.sequence_lengths or [args.chunks_per_seq * 128] * args.num_seqs
+        )
         num_sequences = len(sequence_lengths)
         nchunks = sum(sequence_lengths) // 128
         seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum = (
