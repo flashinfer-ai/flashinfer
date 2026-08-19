@@ -40,6 +40,12 @@ cudaError_t launch(ScoreT* scores, BiasT* bias, ScoreT* topk_values, int32_t* to
     float const scaling32 = static_cast<float>(routed_scaling_factor);                             \
     int32_t const has_replay = routing_replay_out != nullptr;                                      \
     if (n_group > 1) {                                                                             \
+      if (num_experts == 256 && n_group == 8 && topk_group == 4 && topk == 8) {                    \
+        return cudaLaunchKernelEx(                                                                 \
+            &config, kernel_cake_deepseek_routing_grouped_k8g4_##ScoreTag##_##BiasTag, scores,     \
+            bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32, groups32,  \
+            top_groups32, scaling32, has_replay);                                                  \
+      }                                                                                            \
       return cudaLaunchKernelEx(&config,                                                           \
                                 kernel_cake_deepseek_routing_grouped_##ScoreTag##_##BiasTag,       \
                                 scores, bias, topk_values, topk_indices, replay_bytes, tokens32,   \
