@@ -292,11 +292,21 @@ def _make_decode_scratch(
 
 _DSV4_DECODE_CONFIGS = [
     (8, 128),
+    (8, 192),
+    (8, 256),
     (8, 512),
     (8, 1024),
     (16, 128),
+    (16, 192),
+    (16, 256),
+    (32, 192),
+    (32, 256),
     (32, 512),
+    (64, 192),
+    (64, 256),
     (64, 1024),
+    (128, 192),
+    (128, 256),
     (128, 1024),
 ]
 
@@ -368,12 +378,15 @@ def test_sparse_mla_sm120_decode_dsv4(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
+@pytest.mark.parametrize("num_heads", [8, 32])
+@pytest.mark.parametrize("topk,topk_len", [(192, 133), (256, 133), (512, 128)])
+def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
+    num_heads: int, topk: int, topk_len: int
+) -> None:
     """DSv4 decode honors topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads, topk, num_tokens = 32, 512, 16
-    topk_len = 128
+    num_tokens = 16
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
@@ -425,10 +438,50 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_public_api() -> None:
+def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> None:
+    """An unsupported decode shape raises instead of entering prefill."""
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 1, 16, 384
+    d_qk = d_v = 512
+
+    q = torch.empty((num_tokens, num_heads, d_qk), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty((1, 64, 1, 584), dtype=torch.uint8, device=device)
+    indices = torch.zeros((num_tokens, topk), dtype=torch.int32, device=device)
+    output = torch.empty(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        ValueError,
+        match=r"no decode kernel.*num_tokens=1, num_heads=16, topk=384",
+    ):
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            d_v=d_v,
+        )
+
+
+@pytest.mark.parametrize(
+    "num_heads,topk,num_tokens,kv_layout",
+    [
+        (32, 128, 7, "NHD"),
+        (32, 192, 7, "HND"),
+        (32, 256, 7, "HND"),
+        (8, 192, 128, "HND"),
+        (8, 256, 128, "HND"),
+    ],
+)
+def test_sparse_mla_sm120_dsv4_public_api(
+    num_heads: int, topk: int, num_tokens: int, kv_layout: str
+) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_tokens, num_heads, topk = 16, 32, 128
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 32
@@ -452,30 +505,51 @@ def test_sparse_mla_sm120_decode_dsv4_public_api() -> None:
     )
     sm_scale = d_qk**-0.5
     ref_out, _ = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+    workspace_buffer = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+    swa_topk_lens = torch.full((num_tokens,), topk, device=device, dtype=torch.int32)
+    seq_lens = torch.full((num_tokens,), s_kv, device=device, dtype=torch.int32)
+    kv_cache = (
+        kv_packed if kv_layout == "NHD" else kv_packed.transpose(1, 2).contiguous()
+    )
 
     out = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
         query=q.unsqueeze(1),
-        swa_kv_cache=kv_packed,
-        workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
+        swa_kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
         sparse_indices=indices,
-        swa_topk_lens=torch.full((num_tokens,), topk, device=device, dtype=torch.int32),
+        seq_lens=seq_lens,
+        swa_topk_lens=swa_topk_lens,
         bmm1_scale=sm_scale,
-        kv_layout="NHD",
+        kv_layout=kv_layout,
     )
 
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
+    out_buffer = torch.empty_like(out)
+    returned = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+        query=q.unsqueeze(1),
+        swa_kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        sparse_indices=indices,
+        seq_lens=seq_lens,
+        out=out_buffer,
+        swa_topk_lens=swa_topk_lens,
+        bmm1_scale=sm_scale,
+        kv_layout=kv_layout,
+    )
+    assert returned.data_ptr() == out_buffer.data_ptr()
+    torch.testing.assert_close(out_buffer.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
+
     with pytest.raises(ValueError, match="only supports BF16 query"):
         flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             query=q.to(torch.float8_e4m3fn).unsqueeze(1),
-            swa_kv_cache=kv_packed,
-            workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
+            swa_kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
             sparse_indices=indices,
-            swa_topk_lens=torch.full(
-                (num_tokens,), topk, device=device, dtype=torch.int32
-            ),
+            seq_lens=seq_lens,
+            swa_topk_lens=swa_topk_lens,
             bmm1_scale=sm_scale,
-            kv_layout="NHD",
+            kv_layout=kv_layout,
         )
 
 
@@ -889,15 +963,29 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 
 _DSV4_PREFILL_CONFIGS = [
+    (8, 128),
+    (8, 192),
+    (8, 256),
+    (8, 512),
+    (8, 1024),
+    (8, 2048),
     (16, 128),
+    (16, 192),
+    (16, 256),
+    (32, 192),
+    (32, 256),
     (32, 512),
+    (64, 192),
+    (64, 256),
     (64, 1024),
+    (128, 192),
+    (128, 256),
     (128, 1024),
 ]
 
 
 @pytest.mark.parametrize("num_heads,topk", _DSV4_PREFILL_CONFIGS)
-@pytest.mark.parametrize("num_tokens", [128, 256])
+@pytest.mark.parametrize("num_tokens", [65, 128, 256])
 @pytest.mark.parametrize("with_sink", [False, True])
 def test_sparse_mla_sm120_prefill_dsv4(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
@@ -960,13 +1048,68 @@ def test_sparse_mla_sm120_prefill_dsv4(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("num_heads", [8, 32])
+@pytest.mark.parametrize("topk", [192, 256])
+def test_sparse_mla_sm120_prefill_dsv4_topk_length_truncation(
+    num_heads: int, topk: int
+) -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    topk_len, num_tokens = 133, 128
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    topk_length = torch.full((num_tokens,), topk_len, dtype=torch.int32, device=device)
+
+    sm_scale = d_qk**-0.5
+    ref_indices = indices.clone()
+    ref_indices[:, topk_len:] = -1
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, ref_indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        topk_length=topk_length,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (128, 64),
     (512, 64),
     (512, 2),
 ]
 
-_DSV4_PREFILL_DUAL_HEADS = [16, 32, 64, 128]
+_DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
 
 @pytest.mark.parametrize("num_heads", _DSV4_PREFILL_DUAL_HEADS)
@@ -1126,14 +1269,15 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> N
     torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("extra_topk_len", [0, 128, 768])
 def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
-    extra_topk_len: int,
+    num_heads: int, extra_topk_len: int
 ) -> None:
     """DSv4 dual-cache prefill honors extra_topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads, num_tokens = 64, 128
+    num_tokens = 128
     d_qk, d_v = 512, 512
     topk = 128
     main_pbs = 64

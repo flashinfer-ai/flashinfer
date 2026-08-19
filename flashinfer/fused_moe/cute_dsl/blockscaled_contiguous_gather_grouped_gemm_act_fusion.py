@@ -30,7 +30,7 @@ grouped GEMM kernel with fused gather and activation designed for MoE GEMM1 laye
 - Output C: activated outputs in permuted order
 
 Key features:
-- NVFP4 x NVFP4 grouped GEMM with FP8 scale factors
+- NVFP4 x NVFP4 and MXFP8 x MXFP4 grouped GEMM paths
 - Fused gather operation using LDGSTS instructions with token_id_mapping
 - Eliminates the need for a separate moe_permute kernel
 - Fused FC1 activation in the epilogue
@@ -44,7 +44,7 @@ Comparison with non-gather activation fusion:
 - Gather: Uses LDGSTS to gather A directly using token_id_mapping, no moe_permute needed
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -220,9 +220,11 @@ def _get_compiled_gather_kernel(
     stream,
     # Dtype parameters (compile-time - IN cache key)
     # cute.compile specializes on pointer types, so dtype must be in cache key
-    ab_dtype: str,
+    a_dtype: str,
+    b_dtype: str,
     sf_dtype: str,
     c_dtype: str,
+    quantize_output: bool,
     # Tactic parameters (compile-time - IN cache key)
     sf_vec_size: int,
     tile_size: int,
@@ -232,7 +234,7 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
-    activation_type: int = ActivationType.Swiglu.value,
+    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -269,9 +271,11 @@ def _get_compiled_gather_kernel(
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
-        ab_dtype,
+        a_dtype,
+        b_dtype,
         sf_dtype,
         c_dtype,
+        quantize_output,
         sf_vec_size,
         tile_size,
         topk,
@@ -348,7 +352,7 @@ def _get_compiled_gather_kernel(
     return _gather_kernel_cache[cache_key]
 
 
-def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -364,17 +368,19 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
     topk: int = 8,
-    ab_dtype: str = "float4_e2m1fn",
+    a_dtype: str = "float4_e2m1fn",
+    b_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
     c_dtype: str = "bfloat16",
     sf_vec_size: int = 16,
+    quantize_output: bool = False,
     mma_tiler_mn: Tuple[int, int] = (256, 128),
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     vectorized_f32: bool = True,
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
-    activation_type: int = ActivationType.Swiglu.value,
+    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -391,7 +397,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     - The kernel gathers input tokens using token_id_mapping during LDGSTS load
     - Gated activations use interleaved gate and up projection weights
     - The configured activation is fused into the GEMM epilogue
-    - Optional FP4 quantization of output
+    - Optional block-scaled quantization of output
 
     Args:
         a: Input tensor A (original unpermuted tokens), shape (seq_len, k) for FP4
@@ -411,21 +417,29 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         num_non_exiting_tiles: Number of valid tiles, shape (1,), int32
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
-        out_scale: Optional output scale factor tensor for FP4 quantized output.
-        global_scale: Global scale factor for FP4 quantization, shape (1,), float32.
+        out_scale: Optional output scale factor tensor for block-scaled
+            quantized output.
+        global_scale: Global scale factor for FP4 output quantization, shape
+            (1,), float32.
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
         topk: Number of experts per token. Default: 8
-        ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
+        a_dtype: Data type for the A matrix.
+        b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         c_dtype: Data type for output matrix. Default: "bfloat16"
         sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
+        quantize_output: If True, quantize the epilogue output to a
+            block-scaled format and generate out_scale. This is separate from
+            c_dtype because float8_e4m3fn may also be used as a plain output
+            dtype without MXFP8 scale generation.
         mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        enable_pdl: Enable Programmatic Dependent Launch. Default: True.
         activation_type: Activation type for the epilogue. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
@@ -445,7 +459,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         Tuple of:
         - out: Output tensor C, shape (permuted_m, intermediate_size) with dtype c_dtype
                For FP4 output: (permuted_m, intermediate_size//2) uint8
-        - out_scale: Output scale factors if c_dtype is FP4, else None
+        - out_scale: Output scale factors if quantize_output is True, else None
 
     Notes:
         - Unlike the non-gather kernel, this kernel does NOT require moe_permute!
@@ -499,8 +513,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     num_experts = b.shape[0]
     n = b.shape[1]
     k = a.shape[1]
-    if ab_dtype == "float4_e2m1fn":
+    if a_dtype == "float4_e2m1fn":
         k = k * 2  # FP4 is packed 2 elements per byte
+    b_k = b.shape[2] * (2 if b_dtype == "float4_e2m1fn" else 1)
+    if b_k != k:
+        raise ValueError(f"A and B logical K dimensions must match, got {k} and {b_k}")
 
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
@@ -522,15 +539,25 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
 
-    # Check if we're doing FP4 quantization
-    generate_sfc = c_dtype == "float4_e2m1fn"
+    # Output quantization is explicit because Float8E4M3FN can also be used as
+    # an ordinary (non-block-scaled) output by other internal configurations.
+    generate_sfc = quantize_output
     if generate_sfc:
-        if global_scale is None:
+        if c_dtype not in {"float4_e2m1fn", "float8_e4m3fn"}:
+            raise ValueError(
+                f"Output scale generation is unsupported for c_dtype={c_dtype}"
+            )
+        if c_dtype == "float4_e2m1fn" and global_scale is None:
             raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+        # The output scale-factor tensor is laid out in whole 128-row MMA atoms.
+        if permuted_m % 128 != 0:
+            raise ValueError(
+                f"permuted_m={permuted_m} must be padded to a multiple of 128 "
+                "when generating output scale factors"
+            )
     elif out_scale is not None or global_scale is not None:
         raise ValueError(
-            "out_scale and global_scale are only supported when "
-            "c_dtype is 'float4_e2m1fn'"
+            "out_scale and global_scale are only supported when quantize_output is True"
         )
 
     # Check compute capability
@@ -542,12 +569,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         )
 
     # Validate configuration
-    ab_dtype_cutlass = get_cutlass_dtype(ab_dtype)
+    a_dtype_cutlass = get_cutlass_dtype(a_dtype)
+    b_dtype_cutlass = get_cutlass_dtype(b_dtype)
     sf_dtype_cutlass = get_cutlass_dtype(sf_dtype)
     c_dtype_cutlass = get_cutlass_dtype(c_dtype)
 
     if not BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-        ab_dtype_cutlass,
+        a_dtype_cutlass,
+        b_dtype_cutlass,
         sf_dtype_cutlass,
         sf_vec_size,
         c_dtype_cutlass,
@@ -562,14 +591,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         c_major="n",
     ):
         raise ValueError(
-            f"Unsupported configuration: ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
+            f"Unsupported configuration: a_dtype={a_dtype}, b_dtype={b_dtype}, "
+            f"sf_dtype={sf_dtype}, "
             f"sf_vec_size={sf_vec_size}, c_dtype={c_dtype}, mma_tiler_mn={mma_tiler_mn}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
     # Create output tensor if not provided
     if out is None:
-        if generate_sfc:
+        if generate_sfc and c_dtype == "float4_e2m1fn":
             # FP4 output: 2 values per byte
             out = torch.empty(
                 (permuted_m, intermediate_size // 2),
@@ -586,11 +616,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     # Create output scale tensor if needed and not provided
     if generate_sfc and out_scale is None:
         # Scale factor layout for output
-        scale_intermediate_size = intermediate_size // sf_vec_size
+        scale_atom_n = sf_vec_size * 4
+        scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
         # MMA-compatible scale factor shape
         out_scale = torch.empty(
-            (32, 4, permuted_m // 128, 4, scale_intermediate_size // 4, 1),
-            dtype=torch.uint8,  # FP8 E4M3
+            (32, 4, permuted_m // 128, 4, scale_rest_n, 1),
+            dtype=torch.uint8,
             device=a.device,
         )
 
@@ -608,10 +639,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
 
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
-        ab_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        a_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     b_ptr = make_ptr(
-        ab_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        b_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     a_sf_ptr = make_ptr(
         sf_dtype_cutlass, a_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -624,14 +655,30 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     )
 
     if generate_sfc:
+        # CuTeDSL supports FP32 -> E8M0 conversion, but the MXFP8 epilogue
+        # deliberately emits the exact UE8M0 codes used by mxfp8_quantize and
+        # scalar-stores them as bytes. This also avoids the unsupported
+        # vector<2xE8M0> conversion/store lowering; GEMM2 reinterprets the same
+        # bytes as Float8E8M0FNU scale factors.
+        c_sf_storage_dtype = (
+            cutlass.Uint8
+            if c_dtype == "float8_e4m3fn" and sf_dtype == "float8_e8m0fnu"
+            else sf_dtype_cutlass
+        )
         c_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
+            c_sf_storage_dtype,
             out_scale.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        norm_const_ptr = make_ptr(
-            cutlass.Float32, global_scale.data_ptr(), cute.AddressSpace.gmem
+        norm_const_ptr = (
+            make_ptr(
+                cutlass.Float32,
+                global_scale.data_ptr(),
+                cute.AddressSpace.gmem,
+            )
+            if global_scale is not None
+            else None
         )
     else:
         c_sf_ptr = None
@@ -688,9 +735,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
-        ab_dtype=ab_dtype,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
+        quantize_output=quantize_output,
         # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
@@ -738,3 +787,199 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     )
 
     return out, out_scale if generate_sfc else None
+
+
+def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    token_id_mapping: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+    *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
+    topk: int = 8,
+    ab_dtype: str = "float4_e2m1fn",
+    sf_dtype: str = "float8_e4m3fn",
+    c_dtype: str = "bfloat16",
+    sf_vec_size: int = 16,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    vectorized_f32: bool = True,
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gated: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Run the existing NVFP4 gather GEMM1 path.
+
+    ``ab_dtype`` is retained for API compatibility and is applied to both MMA
+    operands.  FP4 output scale generation keeps the existing global-scale
+    behavior.
+    """
+    return _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        out,
+        out_scale,
+        global_scale,
+        a_per_token_scale=a_per_token_scale,
+        topk=topk,
+        a_dtype=ab_dtype,
+        b_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+        quantize_output=c_dtype == "float4_e2m1fn",
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vectorized_f32,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gated=gated,
+    )
+
+
+def blockscaled_contiguous_gather_grouped_gemm_act_fusion_mxfp8_mxfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    token_id_mapping: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    *,
+    topk: int = 8,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    vectorized_f32: bool = True,
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    gated: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run MXFP8 activation x MXFP4 weight GEMM1 and quantize FC1 to MXFP8.
+
+    A is an unpermuted ``torch.float8_e4m3fn`` tensor with linear per-token
+    E8M0 scale bytes.  B is packed E2M1 in ``torch.uint8`` with an
+    MMA-swizzled E8M0 scale tensor.  The returned activation is E4M3 and its
+    scale tensor uses the canonical 128x4 MMA layout with vector size 32.
+    """
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
+    if a.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"MXFP8 A must have dtype torch.float8_e4m3fn, got {a.dtype}")
+    if b.dtype != torch.uint8:
+        raise TypeError(f"Packed MXFP4 B must have dtype torch.uint8, got {b.dtype}")
+    if a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8:
+        raise TypeError("MXFP8/MXFP4 E8M0 scale tensors must have dtype torch.uint8")
+    if alpha.dtype != torch.float32:
+        raise TypeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+    int32_tensors = {
+        "tile_idx_to_expert_idx": tile_idx_to_expert_idx,
+        "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+        "token_id_mapping": token_id_mapping,
+        "num_non_exiting_tiles": num_non_exiting_tiles,
+    }
+    for name, tensor in int32_tensors.items():
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+    tensors = {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "alpha": alpha,
+        **int32_tensors,
+    }
+    for name, tensor in tensors.items():
+        if tensor.device != a.device:
+            raise ValueError(f"{name} must be on {a.device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    # convert_sf_to_mma_layout intentionally returns a non-contiguous logical
+    # 6D view over canonical contiguous scale-factor storage.  Only data_ptr()
+    # is consumed below, so requiring PyTorch logical contiguity would reject
+    # the standard weight-scale representation used by the existing MoE path.
+    if b_scale.device != a.device:
+        raise ValueError(f"b_scale must be on {a.device}, got {b_scale.device}")
+    if out is not None and out.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"MXFP8 GEMM1 output must have dtype torch.float8_e4m3fn, got {out.dtype}"
+        )
+    if out_scale is not None and out_scale.dtype != torch.uint8:
+        raise TypeError("MXFP8 output scale tensor must have dtype torch.uint8")
+    for name, tensor in (("out", out), ("out_scale", out_scale)):
+        if tensor is not None:
+            if tensor.device != a.device:
+                raise ValueError(f"{name} must be on {a.device}, got {tensor.device}")
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+
+    result, result_scale = _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        out,
+        out_scale,
+        None,
+        topk=topk,
+        a_dtype="float8_e4m3fn",
+        b_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype="float8_e4m3fn",
+        sf_vec_size=32,
+        quantize_output=True,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vectorized_f32,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        gated=gated,
+    )
+    assert result_scale is not None
+    return result, result_scale

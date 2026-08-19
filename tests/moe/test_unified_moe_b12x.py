@@ -43,6 +43,7 @@ from flashinfer.fused_moe.api import (
     ActivationType,
     BackendOptions,
     ExecutionConfig,
+    MoEFinalizeConfig,
     ExpertConfig,
     MoEConfig,
     QuantConfig,
@@ -114,6 +115,7 @@ class TestB12xUnifiedValidation:
         activation=ActivationConfig.swiglu,
         experts=None,
         execution=None,
+        finalize=None,
     ):
         return MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
@@ -122,6 +124,7 @@ class TestB12xUnifiedValidation:
             activation=activation,
             backend=BackendOptions((backend,)),
             execution=execution or ExecutionConfig(),
+            finalize=finalize or MoEFinalizeConfig(),
         )
 
     @pytest.mark.parametrize("runner_type", (B12xNvfp4Runner, B12xW4A16Runner))
@@ -129,6 +132,27 @@ class TestB12xUnifiedValidation:
         assert runner_type.supported_routing_modes == (
             RoutingInputMode.PackedPrecomputed,
         )
+
+    def test_b12x_constructor_defers_idempotent_wrapper_build(self, monkeypatch):
+        import flashinfer.fused_moe.cute_dsl as cute_dsl
+
+        config = self._config(B12xNvfp4Config(), QuantVariant.NVFP4)
+
+        class Wrapper:
+            pass
+
+        monkeypatch.setattr(cute_dsl, "B12xMoEWrapper", Wrapper)
+        runner = B12xNvfp4Runner(config, torch.device("cuda:0"))
+        runner._check_support = lambda: None
+
+        assert runner._wrapper_cls is None
+
+        runner.check_support()
+        runner.build()
+        runner.build()
+
+        assert runner._wrapper_cls is Wrapper
+        assert runner._built
 
     @pytest.mark.parametrize(
         "runner_type,expected",
@@ -216,7 +240,7 @@ class TestB12xUnifiedValidation:
         config = self._config(
             B12xNvfp4Config(),
             QuantVariant.NVFP4,
-            execution=ExecutionConfig(do_finalize=False),
+            finalize=MoEFinalizeConfig(do_finalize=False),
         )
         self._mock_environment(monkeypatch)
         runner = self._runner(config)
@@ -325,6 +349,7 @@ class TestB12xUnifiedValidation:
             prepared["fc2_input_scale"] = weight
 
         runner = object.__new__(runner_type)
+        runner._built = True
         runner._prepared_weights = prepared
         runner._inner = Wrapper()
         hidden = torch.empty(1, 16)

@@ -46,6 +46,10 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
+from flashinfer.quantization.quantization_cute_dsl_utils import (
+    float_to_ue8m0_fast,
+    ue8m0_to_inv_scale_fast,
+)
 
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -53,6 +57,7 @@ from ..moe_utils import (
 )
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
+    f32_reciprocal,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
@@ -69,7 +74,7 @@ and FC1 activation fusion for the NVIDIA Blackwell architecture using CUTE DSL.
 This kernel performs FC1 layer computation with activation fusion:
 1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
 2. Activation: SwiGLU, SiTU, tanh-approximate GeGLU, or ReLU^2
-3. Optional Quant: When c_dtype is Float4E2M1FN, generates scale factor C and quantizes output
+3. Optional Quant: Generates scale factor C and quantizes output to NVFP4 or MXFP8
 
 - Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
 - Matrix B is NxKxL, B can be column-major("K"), L is grouped dimension (number of experts)
@@ -330,7 +335,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
     2. Activation: SwiGLU, SiTU, tanh-approximate GeGLU, or ReLU^2
-    3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
+    3. Optional Quant: Generates SFC and quantizes output to NVFP4 or MXFP8
 
     Note: Output C has N/2 columns for gated activations and N columns otherwise.
 
@@ -339,7 +344,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     - Uses TMA (Tensor Memory Access) for loading B and SFB matrices with multicast
     - Token ID mapping enables efficient gather operation during A/SFA load
     - FC1 activation fusion in the epilogue
-    - Optional quantization fusion for Float4E2M1FN output with scale factor generation
+    - Optional NVFP4 or MXFP8 output quantization with scale factor generation
     - Warp specialization: Scheduler (warp 10), A Sync Transform (warp 11, only used when
       use_2cta_instrs is True), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9), MMA (warp 8),
       Epilogue (warps 0-3)
@@ -355,8 +360,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     :param vectorized_f32: Whether to use vectorized f32x2 operations for better performance.
     :type vectorized_f32: bool
 
-    :note: In current version, A and B tensor must have the same data type
-        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
+    :note: In addition to the existing same-dtype paths, the FC1 kernel supports
+        Float8E4M3FN A with Float4E2M1FN B for the MXFP8 x MXFP4 backend.
 
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
@@ -612,6 +617,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Configure tiled mma
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -622,6 +628,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -712,8 +719,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ) = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
-            self.a_dtype,
-            self.b_dtype,
+            self.smem_alloc_a_dtype,
+            self.smem_alloc_b_dtype,
             self.epi_tile,
             self.c_dtype,
             self.c_layout,
@@ -727,13 +734,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
-            self.a_dtype,
+            self.smem_alloc_a_dtype,
             self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
             self.mma_tiler,
-            self.b_dtype,
+            self.smem_alloc_b_dtype,
             self.num_ab_stage,
         )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
@@ -780,6 +787,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.num_sf_tmem_cols // self.epi_tile_n_required
         )
 
+        # Each LDGSTS instruction transfers 128 bits.  The mixed path has an
+        # FP8 A operand and therefore loads 16 elements per instruction instead
+        # of the 32 elements used by NVFP4.  The MMA K tile changes from 256 to
+        # 128 at the same time, so the number of A copies per thread stays 8.
+        self.a_elements_per_ldgsts = 128 // self.a_dtype.width
+        self.sfa_copies_per_thread = self.mma_tiler[2] // (self.sf_vec_size * 4)
+
     @cute.jit
     def __call__(
         self,
@@ -805,7 +819,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         This method performs FC1 layer computation:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
         2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
-        3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
+        3. Optional Quant: Generates SFC and quantizes output to NVFP4 or MXFP8
 
         Data loading:
         - A and SFA are loaded using LDGSTS instructions with token-based gather
@@ -871,13 +885,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        self.unpack_tma = self.needs_unpack_tma(self.a_dtype, self.b_dtype)
+        self.smem_alloc_a_dtype = (
+            cutlass.Int8 if self.unpack_tma and self.a_dtype.width < 8 else self.a_dtype
+        )
+        self.smem_alloc_b_dtype = (
+            cutlass.Int8 if self.unpack_tma and self.b_dtype.width < 8 else self.b_dtype
+        )
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        # Check if input data types are compatible with MMA instruction
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+        self.is_mxfp8_output = (
+            self.c_dtype is cutlass.Float8E4M3FN
+            and self.sf_dtype is cutlass.Float8E8M0FNU
+            and self.sf_vec_size == 32
+        )
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -888,7 +911,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
-        self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
+        self.generate_sfc = sfc_tensor is not None
+        if cutlass.const_expr(
+            self.generate_sfc and not self.is_mxfp8_output and norm_const_tensor is None
+        ):
+            raise ValueError("norm_const_tensor is required for NVFP4 output")
         if cutlass.const_expr(self.generate_sfc):
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(
                 c.shape, self.sf_vec_size
@@ -897,6 +924,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -908,6 +936,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -929,6 +958,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=(
+                self.smem_alloc_b_dtype
+                if self.unpack_tma and self.b_dtype.width < 8
+                else None
+            ),
         )
 
         # Setup TMA load for SFB
@@ -971,6 +1005,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout
             )
 
+        # TMA mbarrier transaction bytes describe the packed GMEM transfer;
+        # UNPACK_U8 expands into the Int8 SMEM container after that transfer.
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (b_copy_size + sfb_copy_size) * atom_thr_size
@@ -1025,14 +1061,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.smem_alloc_a_dtype,
+                    cute.cosize(self.a_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.smem_alloc_b_dtype,
+                    cute.cosize(self.b_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1081,14 +1119,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.smem_alloc_a_dtype,
+                    cute.cosize(self.a_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.smem_alloc_b_dtype,
+                    cute.cosize(self.b_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1658,8 +1698,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             #
             # Setup LDGSTS copy atoms for A and SFA
-            # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix (32 elements per thread)
-            # SFA: 4x LDGSTS.32 per thread with 512-element block swizzling for scale factor A (4 elements per thread)
+            # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix.
+            # Each copy contains 32 FP4 or 16 FP8 elements.
+            # SFA: one LDGSTS.32 per scale-factor atom in the MMA K tile
+            # (4 atoms for NVFP4, 1 atom for MXFP8 x MXFP4).
             #
             a_atom_copy = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1667,7 +1709,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 num_bits_per_copy=128,
             )
             a_thread_layout = cute.make_layout((16, 8), stride=(8, 1))
-            a_value_layout = cute.make_layout((1, 32), stride=(32, 1))
+            a_value_layout = cute.make_layout(
+                (1, self.a_elements_per_ldgsts),
+                stride=(self.a_elements_per_ldgsts, 1),
+            )
             a_tiled_copy = cute.make_tiled_copy_tv(
                 a_atom_copy,
                 a_thread_layout,
@@ -1749,7 +1794,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             while is_valid_tile:
                 # Load token IDs for gather operation
                 # For A matrix: each thread loads 8 token offsets (for 8 LDGSTS.128 operations)
-                # For SFA matrix: each thread loads 1 token offset (for 4 LDGSTS.32 operations)
+                # For SFA matrix: each thread loads 1 token offset.
                 gToken_ml_tile = gToken_ml[(None, tile_info[0])]
                 for i in range(8):
                     token_ml_tile_offset = (tidx_in_warpgroup // 8) + i * 16
@@ -1787,7 +1832,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 tAgA = gA_mkl[(None, None, 0, None, 0)]
                 A_gmem_thread_offset = cute.assume(
-                    (tidx_in_warpgroup % 8) * 32, divby=32
+                    (tidx_in_warpgroup % 8) * self.a_elements_per_ldgsts,
+                    divby=self.a_elements_per_ldgsts,
                 )
                 tAgSFA = gSFA_mkl[(relative_sfa_token_offset, None, 0, None, 0)]
 
@@ -1844,23 +1890,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     for i in range(8):
                         #
                         # Load A matrix: 8x LDGSTS.128 per thread with swizzle_128B
-                        # Each LDGSTS.128 loads 32 elements (128 bits) from GMEM to SMEM
+                        # Each LDGSTS.128 loads a_elements_per_ldgsts values.
                         # Global memory address is computed using token offset for gather operation
                         # Predicate mask guards against invalid token IDs (padding tokens marked as -1)
                         #
                         A_gmem_slice_offset = A_gmem_thread_offset + cute.assume(
                             a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
-                            divby=32,
+                            divby=self.a_elements_per_ldgsts,
                         )
-                        A_gmem_slice_offset = cute.assume(A_gmem_slice_offset, divby=32)
+                        A_gmem_slice_offset = cute.assume(
+                            A_gmem_slice_offset,
+                            divby=self.a_elements_per_ldgsts,
+                        )
                         tAgA_slice_ptr = tAgA_ktile.iterator + A_gmem_slice_offset
                         tAgA_slice = cute.make_tensor(
-                            tAgA_slice_ptr, layout=cute.make_layout((32,))
+                            tAgA_slice_ptr,
+                            layout=cute.make_layout((self.a_elements_per_ldgsts,)),
                         )
 
                         tAsA_slice = cute.make_tensor(
                             tAsA_ktile[(None, i, None)].iterator,
-                            layout=cute.make_layout((32,)),
+                            layout=cute.make_layout((self.a_elements_per_ldgsts,)),
                         )
                         a_predicate_slice = cute.make_rmem_tensor(
                             cute.make_layout((1,)), cutlass.Boolean
@@ -1871,13 +1921,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
                         )
 
-                    for i in range(4):
+                    for i in range(self.sfa_copies_per_thread):
                         #
                         # Load SFA: 4x LDGSTS.32 per thread with 512-element block swizzling
                         # Each LDGSTS.32 loads 4 scale factor elements (32 bits) from GMEM to SMEM
                         # Uses same token offset as A matrix for consistent gather operation
                         #
-                        swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
+                        if cutlass.const_expr(self.sfa_copies_per_thread == 1):
+                            # The mixed MMA K tile contains exactly one 512-byte
+                            # scale-factor atom, so there is no atom swizzle.
+                            swizzled_iterator = 0
+                        else:
+                            # Preserve the existing four-atom NVFP4 swizzle.
+                            swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
                         tAgSFA_slice_ptr = tAgSFA_ktile.iterator + 4 * swizzled_iterator
                         tAgSFA_slice = cute.make_tensor(
                             tAgSFA_slice_ptr, layout=cute.make_layout((4,))
@@ -2511,7 +2567,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             if cutlass.const_expr(self.generate_sfc):
-                norm_const = norm_const_tensor[0]
+                # MXFP8 uses a pure per-vector E8M0 scale.  NVFP4 retains its
+                # existing global normalization factor.
+                norm_const = (
+                    cutlass.Float32(1.0)
+                    if cutlass.const_expr(self.is_mxfp8_output)
+                    else norm_const_tensor[0]
+                )
                 # (EPI_TILE_M, EPI_TILE_N, RestM, RestN, RestL)
                 gSFC_mnl = cute.local_tile(mSFC_mnl, epi_tile, (None, None, None))
 
@@ -2520,8 +2582,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tCgSFC_mnl = thr_copy_t2r.partition_D(gSFC_mnl)
                 tCgSFC_mnl = cute.filter_zeros(tCgSFC_mnl)
                 # (T2R, T2R_M, T2R_N)
+                # Keep MXFP8 scale codes as raw bytes from registers through
+                # GMEM; the scalar store below avoids a 2-element E8M0 vector.
+                sfc_rmem_dtype = (
+                    cutlass.Uint8
+                    if cutlass.const_expr(self.is_mxfp8_output)
+                    else self.sf_dtype
+                )
                 tCrSFC = cute.make_rmem_tensor(
-                    tCgSFC_mnl[(None, None, None, 0, 0, 0)].layout, self.sf_dtype
+                    tCgSFC_mnl[(None, None, None, 0, 0, 0)].layout,
+                    sfc_rmem_dtype,
                 )
                 tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
@@ -2733,7 +2803,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         swiglu_limit = cutlass.Float32(self.swiglu_limit)
                         LOG2_E = cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.situ_beta is not None):
-                            situ_beta = cutlass.Float32(self.situ_beta)
+                            # Keep the Python float so situ_f32 can fold 1/beta.
+                            situ_beta = self.situ_beta
+                            if cutlass.const_expr(self.situ_linear_beta is not None):
+                                linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                inv_linear_beta = cutlass.Float32(
+                                    f32_reciprocal(self.situ_linear_beta)
+                                )
                             if cutlass.const_expr(self.vectorized_f32):
                                 for i in cutlass.range_constexpr(
                                     0, cute.size(tTR_rAcc_up), 2
@@ -2767,18 +2843,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     if cutlass.const_expr(
                                         self.situ_linear_beta is not None
                                     ):
-                                        linear_beta = cutlass.Float32(
-                                            self.situ_linear_beta
-                                        )
                                         acc_vec_up_alpha = (
                                             linear_beta
                                             * tanh_f32(
-                                                acc_vec_up_alpha[0] / linear_beta,
+                                                acc_vec_up_alpha[0] * inv_linear_beta,
                                                 fastmath=True,
                                             ),
                                             linear_beta
                                             * tanh_f32(
-                                                acc_vec_up_alpha[1] / linear_beta,
+                                                acc_vec_up_alpha[1] * inv_linear_beta,
                                                 fastmath=True,
                                             ),
                                         )
@@ -2806,11 +2879,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     if cutlass.const_expr(
                                         self.situ_linear_beta is not None
                                     ):
-                                        linear_beta = cutlass.Float32(
-                                            self.situ_linear_beta
-                                        )
                                         acc_vec_up_alpha = linear_beta * tanh_f32(
-                                            acc_vec_up_alpha / linear_beta,
+                                            acc_vec_up_alpha * inv_linear_beta,
                                             fastmath=True,
                                         )
                                     tCompute[i] = acc_vec_up_alpha * situ_gate_value
@@ -2978,7 +3048,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
-                        # Quantization path for Float4E2M1FN output:
+                        # Quantization path for Float4E2M1FN or MXFP8 output:
                         # 1. Compute per-vector absolute max from SwiGLU result
                         # 2. Generate scale factor C (SFC) based on max values
                         # 3. Store SFC to global memory
@@ -3050,23 +3120,52 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     * norm_const
                                 )
 
-                        # TODO: need to add f32x2 -> f8x2 conversion
-                        tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+                        if cutlass.const_expr(self.is_mxfp8_output):
+                            # Direct FP32 -> E8M0 exists, but converting this
+                            # two-element fragment produces an unsupported
+                            # vector<2xE8M0> lowering. Generate the same exact
+                            # raw codes as mxfp8_quantize instead: saturating
+                            # round-toward +infinity, with byte 0 for a zero block.
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                scale_ue8m0 = float_to_ue8m0_fast(tCrSFC_pvscale[vi])
+                                tCrSFC[vi] = scale_ue8m0.to(cutlass.Uint8)
+                        else:
+                            tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
                         # Store SFC to global memory
                         #
                         # TODO: Need to think about predicate on it
                         # if cute.elem_less():
-                        cute.autovec_copy(tCrSFC, tCgSFC)
+                        if cutlass.const_expr(self.is_mxfp8_output):
+                            # Preserve those raw codes with scalar byte stores;
+                            # the generic auto-vectorizer requires at least 32 bits.
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                tCgSFC[vi] = tCrSFC[vi]
+                        else:
+                            cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
                         #
-                        # TODO: need to add f8x2 -> f32x2 conversion
-                        tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
-                        if cutlass.const_expr(self.vectorized_f32):
+                        if cutlass.const_expr(self.is_mxfp8_output):
+                            for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
+                                acc_scale0 = ue8m0_to_inv_scale_fast(
+                                    tCrSFC[vi].to(cutlass.Uint32)
+                                )
+                                acc_scale1 = ue8m0_to_inv_scale_fast(
+                                    tCrSFC[vi + 1].to(cutlass.Uint32)
+                                )
+                                vec0 = tTR_rAcc_frg[None, vi]
+                                vec1 = tTR_rAcc_frg[None, vi + 1]
+                                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                    vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
+                                        (vec0[ei], vec1[ei]),
+                                        (acc_scale0, acc_scale1),
+                                    )
+                        elif cutlass.const_expr(self.vectorized_f32):
+                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
                                 acc_scale = cute.arch.mul_packed_f32x2(
                                     (
@@ -3088,6 +3187,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         (acc_scale_min0, acc_scale_min1),
                                     )
                         else:
+                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                             for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
                                 # TODO:Need to add E8M0 rcp approximation
                                 acc_scale = norm_const * cute.arch.rcp_approx(
@@ -3520,6 +3620,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         raise ValueError(f"Invalid atom_sm_cnt: {atom_sm_cnt} and {mcast}")
 
     @staticmethod
+    def needs_unpack_tma(
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+    ) -> bool:
+        """Return whether a narrow mixed operand needs TMA UNPACK_U8."""
+        return a_dtype.width != b_dtype.width
+
+    @staticmethod
     def get_dtype_rcp_limits(dtype: Type[cutlass.Numeric]) -> float:
         """
         Calculates the reciprocal of the maximum absolute value for a given data type.
@@ -3540,7 +3648,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
@@ -3548,8 +3657,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         Check if the dtypes are valid
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param sf_dtype: The data type of the scale factor
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
@@ -3560,13 +3671,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :return: True if the dtypes are valid, False otherwise
         :rtype: bool
         """
-        is_valid = True
-        if ab_dtype not in {
+        supported_ab_dtypes = {
             cutlass.Float4E2M1FN,
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
+        }
+        if a_dtype not in supported_ab_dtypes or b_dtype not in supported_ab_dtypes:
+            return False
+
+        # Preserve all existing same-dtype configurations and add only the
+        # operand order used by MoE FC1: MXFP8 activation x MXFP4 weight.
+        is_mixed_mxfp8_mxfp4 = (
+            a_dtype is cutlass.Float8E4M3FN and b_dtype is cutlass.Float4E2M1FN
+        )
+        if a_dtype is not b_dtype and not is_mixed_mxfp8_mxfp4:
+            return False
+
+        if is_mixed_mxfp8_mxfp4:
+            return (
+                sf_dtype is cutlass.Float8E8M0FNU
+                and sf_vec_size == 32
+                and c_dtype is cutlass.Float8E4M3FN
+            )
+
+        is_valid = True
 
         # Check valid sf_vec_size
         if sf_vec_size not in {16, 32}:
@@ -3579,7 +3707,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Check valid sf_dtype and sf_vec_size combinations
         if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
             is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
+        if a_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
             is_valid = False
 
         # Check valid c_dtype
@@ -3597,7 +3725,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     @staticmethod
     def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
@@ -3606,8 +3735,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         Check if layouts and dtypes are valid combinations
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
         :param a_major: The major dimension of the A tensor
@@ -3622,7 +3753,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         is_valid = True
 
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
+        if a_dtype is cutlass.Float4E2M1FN and a_major != "k":
+            is_valid = False
+        if b_dtype is cutlass.Float4E2M1FN and b_major != "k":
             is_valid = False
         if c_dtype is cutlass.Float4E2M1FN and c_major == "m":
             is_valid = False
@@ -3686,7 +3819,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
@@ -3703,8 +3837,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
         :type l: cutlass.Int64
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
         :param a_major: The major axis of the A tensor
@@ -3725,10 +3861,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_contiguous_elements = 16 * 8 // dtype.width
             return num_major_elements % num_contiguous_elements == 0
 
+        def check_contiguous_128_elements(dtype, is_mode0_major, tensor_shape):
+            if dtype.width >= 8:
+                return True
+            major_mode_idx = 0 if is_mode0_major else 1
+            return tensor_shape[major_mode_idx] % 128 == 0
+
         if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
+            not check_contigous_16B_alignment(a_dtype, a_major == "m", (m, k, l))
+            or not check_contigous_16B_alignment(b_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
+        ):
+            is_valid = False
+
+        # UNPACK_U8 requires the contiguous dimension of a sub-byte operand to
+        # be a multiple of 128 elements.  In this gather kernel B is the only
+        # unpacked operand, but keep the check symmetric for clarity.
+        if BlockScaledContiguousGatherGroupedGemmKernel.needs_unpack_tma(
+            a_dtype, b_dtype
+        ) and (
+            not check_contiguous_128_elements(a_dtype, a_major == "m", (m, k, l))
+            or not check_contiguous_128_elements(b_dtype, b_major == "n", (n, k, l))
         ):
             is_valid = False
         return is_valid
@@ -3736,7 +3889,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     @classmethod
     def can_implement(
         cls,
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
@@ -3753,8 +3907,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         Check if the gemm can be implemented
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param sf_dtype: The data type of the scale factor
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
@@ -3786,12 +3942,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         can_implement = True
         # Skip unsupported types
         if not cls.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, c_dtype
+            a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
+        if not cls.is_valid_layouts(
+            a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
+        ):
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
@@ -3799,7 +3957,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not cls.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
+            m,
+            n,
+            k,
+            l,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            a_major,
+            b_major,
+            c_major,
         ):
             can_implement = False
         # Skip unsupported A/B layout
@@ -3870,11 +4037,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cute.make_tensor(
                 c_sf_ptr,
                 layout=cute.make_ordered_layout(
-                    (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
+                    (
+                        32,
+                        4,
+                        m // 128,
+                        4,
+                        cute.ceil_div(interm_size, scaling_vector_size * 4),
+                        l,
+                    ),
                     order=(2, 1, 4, 0, 3, 5),
                 ),
             )
-            if cutlass.const_expr(c.element_type is cutlass.Float4E2M1FN)
+            if cutlass.const_expr(c_sf_ptr is not None)
             else None
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
@@ -3898,7 +4072,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         global_sf = (
             cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
-            if cutlass.const_expr(c.element_type is cutlass.Float4E2M1FN)
+            if cutlass.const_expr(global_sf_ptr is not None)
             else None
         )
 
