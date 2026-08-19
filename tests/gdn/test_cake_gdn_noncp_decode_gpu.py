@@ -704,6 +704,9 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
         (8, 3, 16, 64, True, True, 3, True),
         (8, 4, 16, 64, True, True, 4, True),
         (8, 4, 16, 32, True, True, 4, False),
+        (2, 4, 4, 8, True, True, 4, False),
+        (3, 4, 4, 8, True, True, 4, False),
+        (5, 4, 4, 8, True, True, 4, False),
         (8, 4, 4, 8, True, True, 4, False),
         (8, 2, 16, 64, True, False, 0, True),
         (8, 4, 16, 64, True, False, 5, True),
@@ -784,13 +787,23 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
 
 
 @pytest.mark.parametrize(
-    ("num_q_heads", "num_v_heads", "pack_gates"),
-    [(16, 64, True), (16, 32, False), (4, 8, False)],
+    ("batch_size", "num_q_heads", "num_v_heads", "pack_gates"),
+    [
+        (8, 16, 64, True),
+        (8, 16, 32, False),
+        (2, 4, 8, False),
+        (3, 4, 8, False),
+        (5, 4, 8, False),
+        (8, 4, 8, False),
+    ],
 )
 def test_exported_bf16_verify_is_cuda_graph_safe(
-    num_q_heads: int, num_v_heads: int, pack_gates: bool
+    batch_size: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    pack_gates: bool,
 ) -> None:
-    batch_size, seq_len, cache_steps = 8, 4, 4
+    seq_len, cache_steps = 4, 4
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,

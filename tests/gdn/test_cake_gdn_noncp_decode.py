@@ -58,10 +58,10 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("264cbfe05a0aaad5c5fd630c7eeeecb43b9e4723")
-    assert manifest["contract_row_count"] == 1764
-    assert manifest["architecture_row_count"] == 3528
-    assert manifest["admitted_architecture_rows"] == 3468
+    assert manifest["generator_commit"] == ("22df7a1f42f913a96a3bae126c67e711269be7ca")
+    assert manifest["contract_row_count"] == 1767
+    assert manifest["architecture_row_count"] == 3534
+    assert manifest["admitted_architecture_rows"] == 3474
     assert manifest["fail_closed_architecture_rows"] == 60
     assert manifest["variant_count"] == len(manifest["variants"]) == 80
     assert manifest["source_only"] is True
@@ -257,16 +257,19 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
             "indexed_bf16_t1.tile16_fullwarp",
             "t1_bf16state_tile16",
         ),
-        (
-            dict(
-                batch_size=8,
-                seq_len=4,
-                disable_state_update=True,
-                cache_intermediate_states=True,
-                cache_steps=4,
-            ),
-            "indexed_bf16_verify_t4.tile16_fullwarp",
-            "t4_bf16state_tile16",
+        *(
+            (
+                dict(
+                    batch_size=batch_size,
+                    seq_len=4,
+                    disable_state_update=True,
+                    cache_intermediate_states=True,
+                    cache_steps=4,
+                ),
+                "indexed_bf16_verify_t4.tile16_fullwarp",
+                "t4_bf16state_tile16",
+            )
+            for batch_size in (2, 3, 5, 8)
         ),
     )
     for overrides, route_suffix, variant_fragment in tp4_rows:
@@ -286,7 +289,7 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
 def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="nine exact promoted",
+        match="twelve exact promoted",
     ):
         _decode(
             state_dtype="bfloat16",
@@ -295,6 +298,24 @@ def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
             num_v_heads=32,
             seq_len=1,
             strided_inputs=True,
+        )
+
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError,
+        match="twelve exact promoted",
+    ):
+        _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            batch_size=4,
+            num_k_heads=4,
+            num_q_heads=4,
+            num_v_heads=8,
+            seq_len=4,
+            strided_inputs=True,
+            disable_state_update=True,
+            cache_intermediate_states=True,
+            cache_steps=4,
         )
 
 
