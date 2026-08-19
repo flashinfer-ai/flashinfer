@@ -14,7 +14,7 @@ kernel-component model).
   Perf Improvment" — the mixed-CGA preferred/fallback cluster launch,
   reworked FC12 scheduler, and the token-in size-copy reorder around the
   metadata-ready wait). Previous snapshot: `882c83e2` (2026-08-08). The
-  `rubin/inference/mega` files at `92dd334` are identical to perf-report
+  `rubin/inference/mega` files at `92dd334` are identical to upstream
   commit `47881ad2` (2026-08-15).
 - Copied subtree: `next/sources/` → `src/sources/`
 - DSL requirement: the kernels need `cutlass.utils.rubin_helpers`, which is
@@ -75,8 +75,8 @@ verbatim upstream copies or recorded whole-file inlines (see the local-diffs
 section above). All adaptation lives in `shim/` and the backends.
 
 1. **Fetch + pick the upstream commit.** In the mirror repo, `git fetch`,
-   then choose the sync point (normally `origin/main`; if a perf report
-   quotes a dev-branch commit, check whether the `rubin/inference` files at
+   then choose the sync point (normally `origin/main`; if a reference
+   result quotes a dev-branch commit, check whether the `rubin/inference` files at
    that commit are identical to main — `git diff <main> <dev> -- '**/rubin/inference/**'`
    — before preferring one over the other).
 2. **Diff the vendored closure file-by-file.** For every `.py` under

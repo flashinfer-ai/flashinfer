@@ -1,150 +1,81 @@
 # SM107 (Rubin) block-scaled mega kernel — tuning notes
 
-Perf tracking for the `sm107_nvfp4_nvfp4_bf16_cutedsl` / `sm107_mxfp8_mxfp8_bf16_cutedsl`
-mega backends against the upstream kernel team's Rubin perf report.
+Tuning surface, selected-best knob profiles, and benchmark methodology for
+the `sm107_nvfp4_nvfp4_bf16_cutedsl` / `sm107_mxfp8_mxfp8_bf16_cutedsl` mega
+backends. Concrete latency numbers are intentionally not recorded here —
+they are hardware/driver/DSL-build specific; reproduce them with the
+harness below on your own nodes.
 
-## Upstream reference (kernel team)
+## Reference tuning (upstream kernel team)
 
-Measured by the upstream kernel tester at upstream commit `47881ad2`
-(2026-08-15; its `rubin/inference/mega` files are identical to the vendored
-`92dd334`), driver 615.31, four-GPU Rubin node. 384 autotune candidates per problem, 5 warmup + 20 measured
-iterations; latency is the arithmetic mean of the four rank averages.
-
-Problem: **DSv4 Pro, EP4** — hidden 7168, MoE intermediate 3072, 384 total
+The upstream kernel tester swept 384 candidates per problem at upstream
+commit `47881ad2` (2026-08-15; its `rubin/inference/mega` files are
+identical to the vendored `92dd334`) on a four-GPU Rubin node, for the
+**DSv4 Pro, EP4** problem — hidden 7168, MoE intermediate 3072, 384 total
 experts, top-k 6, NVFP4, BF16 combine.
 
 Every selected winner uses **mixed CGA (preferred 4x1, fallback 2x1),
 phase-interleave scheduling, atomic work IDs, FC2 bulk TMA stage 2,
-epi-warp token back, and separate top-k reduction**.
+epi-warp token back, and separate top-k reduction**; only the tile,
+phase-interleave hint, epi flag batches, and token-in flag batch vary:
 
-### Balanced routing (upstream)
+| Routing | Tokens/rank | Tile (MxNxK) | Hint | Epi flags (FC1xFC2) | Token-in flag batch |
+|---|---|---|---|---|---|
+| balanced | 1K | 256x128x256 | 4 | 1x4 | 1 |
+| balanced | 2K-4K | 256x256x256 | 3 | 2x4 | 1 |
+| balanced | 8K-32K | 256x256x256 | 3 | 1x4 | 1 |
+| power-law(0.8) | 1K | 256x128x256 | 3 | 1x4 | 1 |
+| power-law(0.8) | 2K | 256x256x256 | 3 | 1x4 | 1 |
+| power-law(0.8) | 4K | 256x256x256 | 4 | 1x4 | 1 |
+| power-law(0.8) | 8K | 256x256x256 | 3 | 1x4 | 1 |
+| power-law(0.8) | 16K-32K | 256x256x256 | 3 | 1x4 | 4 |
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | TFLOP/s | Selected-best detail |
-|---|---|---|---|---|
-| 1K | 372.22 | 366.18-394.78 | 2,180.8 | tile 256x128x256; hint 4; epi 1x4; tif 1 |
-| 2K | 410.48 | 404.45-455.39 | 3,955.1 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 4K | 529.56 | 521.12-541.73 | 6,131.5 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 8K | 800.48 | 791.97-820.00 | 8,112.7 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 1,484.16 | 1,470.72-1,582.53 | 8,751.1 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 32K | 2,960.92 | 2,909.25-3,012.99 | 8,772.9 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
+(NVFP4 tile K 256 = its 2x-mode instruction depth; for mxfp8 the analogous
+tile K is 128.) These profiles are baked into `default_knobs()` in the
+shim's `knob_cache.py` (two token buckets: tile N 128 below 2048
+tokens/rank, 256 at or above) and into the benchmark harness's per-size
+`WINNERS` table.
 
-### Power-law routing, alpha=0.8 (upstream)
+## Benchmark harness / methodology
 
-| Tokens/rank | Avg latency (us) | Min-max (us) | Selected-best detail |
-|---|---|---|---|
-| 1K | 399.75 | 388.54-456.80 | tile 256x128x256; hint 3; epi 1x4; tif 1 |
-| 2K | 474.56 | 466.14-535.26 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 4K | 621.76 | 610.02-704.99 | tile 256x256x256; hint 4; epi 1x4; tif 1 |
-| 8K | 1,053.01 | 1,035.65-1,178.27 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 2,081.84 | 2,041.95-2,131.55 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-| 32K | 4,023.79 | 3,990.11-4,152.51 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-
-## flashinfer moe_ep measurements
-
-Harness: `benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` under
-`torchrun --nproc_per_node=4`. The upstream selected-best knobs
-are replayed verbatim through `Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`
-(no autotune sweep — one config per problem). Timing spans ONLY the fused
-mega kernel launch (dispatch + FC1 + SwiGLU + FC2 + combine) via
+`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` under
+`torchrun --nproc_per_node=4`. The selected-best knobs above are replayed
+verbatim (no autotune sweep — one config per problem). Timing spans ONLY
+the fused mega kernel launch (dispatch + FC1 + SwiGLU + FC2 + combine) via
 `sm107_block_scaled_mega_launch_thunk` over pre-staged inputs; the torch
 staging fallback is excluded, matching the upstream tester's span.
-The timed loop replicates upstream ``tester/solver.py::perf_run`` exactly:
-5 warmup + 20 measured iterations, per-iteration CUDA event pairs, and the
-upstream per-iteration L2 flush (a 300MB throwaway ``randn`` enqueued
-outside the event window); "avg" is the mean of the four rank averages,
-"min-max" spans every rank sample. TFLOP/s = tokens x topk x 6 x hidden x intermediate / latency
-(balanced only — the balanced cost model is not meaningful for the
-imbalanced cases; matches the upstream convention).
+
+The timed loop replicates the upstream tester's perf run exactly: 5 warmup
++ 20 measured iterations, per-iteration CUDA event pairs, and a
+per-iteration L2 flush (a 300MB throwaway ``randn`` enqueued outside the
+event window; ``--no-l2-flush`` disables it). Reported latency is the mean
+of the rank averages; min-max spans every rank sample; TFLOP/s =
+tokens x topk x 6 x hidden x intermediate / latency (balanced routing
+only — the balanced cost model is not meaningful for imbalanced cases).
+Raw per-rank samples are written as JSONL (``--output``).
 
 Routing generators are ports of the upstream tester's block-balanced and
-Zipf/Gumbel power-law samplers. Bracketed `X.XXx` values are LATENCY ratios
-against the row's reference column — values above 1.00x are slower, below
-are faster (not speedups).
+Zipf/Gumbel power-law samplers.
 
-### NVFP4, measured 2026-08-18 (4x SM107 node)
+## Measured results (qualitative summary)
 
-Vendored kernel drop `92dd334`, NVIDIA-internal CuTe DSL nightly build
-(2026-08-03, git `d88cc85`), upstream L2-flush timing protocol. Raw per-rank
-samples are written by the harness (`--output` JSONL).
+Measured 2026-08-18 on a 4x SM107 node (vendored drop `92dd334`,
+NVIDIA-internal CuTe DSL nightly of 2026-08-03, git `d88cc85`):
 
-#### NVFP4, balanced routing
-
-| Tokens/rank | Upstream (us) | Ours (us, xupstream latency) | Min-max (us) | TFLOP/s | Knobs |
-|---|---|---|---|---|---|
-| 1K | 372.22 | 218.83 (0.59x) | 215.62-226.11 | 3,709.5 | tile 256x128x256; hint 4; epi 1x4; tif 1 |
-| 2K | 410.48 | 290.53 (0.71x) | 286.02-300.00 | 5,588.0 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 4K | 529.56 | 454.13 (0.86x) | 445.09-461.06 | 7,149.9 | tile 256x256x256; hint 3; epi 2x4; tif 1 |
-| 8K | 800.48 | 802.92 (1.00x) | 798.46-807.23 | 8,087.9 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 1,484.16 | 1,504.68 (1.01x) | 1,496.13-1,510.98 | 8,631.7 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 32K | 2,960.92 | 3,014.84 (1.02x) | 3,003.90-3,026.98 | 8,616.0 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-
-#### NVFP4, power-law routing (alpha=0.8)
-
-| Tokens/rank | Upstream (us) | Ours (us, xupstream latency) | Min-max (us) | Knobs |
-|---|---|---|---|---|
-| 1K | 399.75 | 315.28 (0.79x) | 311.68-321.89 | tile 256x128x256; hint 3; epi 1x4; tif 1 |
-| 2K | 474.56 | 378.97 (0.80x) | 373.79-387.55 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 4K | 621.76 | 532.55 (0.86x) | 525.98-537.28 | tile 256x256x256; hint 4; epi 1x4; tif 1 |
-| 8K | 1,053.01 | 1,255.96 (1.19x) | 1,247.71-1,265.28 | tile 256x256x256; hint 3; epi 1x4; tif 1 |
-| 16K | 2,081.84 | 2,040.66 (0.98x) | 2,019.62-2,056.86 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-| 32K | 4,023.79 | 4,497.98 (1.12x) | 4,466.43-4,606.08 | tile 256x256x256; hint 3; epi 1x4; tif 4 |
-
-### MXFP8 (e4m3), measured 2026-08-18 (4x SM107 node, same run)
-
-Same harness, same shape, same replayed winner knobs with tile K 128 (the
-mxfp8 2x-mode instruction-K depth) instead of 256.  **The upstream report is
-NVFP4-only, so MXFP8 has no upstream baseline** — the reference column is our
-own NVFP4 measurement (same job); the ratio is the cost of doubling the
-wire width (fp8 data + per-32 e8m0 scales vs fp4 + per-16 e4m3).
-
-#### MXFP8, balanced routing
-
-| Tokens/rank | NVFP4 ref (us) | MXFP8 (us, xNVFP4 latency) | Min-max (us) | TFLOP/s | Knobs |
-|---|---|---|---|---|---|
-| 1K | 218.83 | 319.07 (1.46x) | 315.04-339.01 | 2,544.1 | tile 256x128x128; hint 4; epi 1x4; tif 1 |
-| 2K | 290.53 | 427.75 (1.47x) | 422.21-434.43 | 3,795.4 | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 4K | 454.13 | 643.82 (1.42x) | 637.25-649.63 | 5,043.3 | tile 256x256x128; hint 3; epi 2x4; tif 1 |
-| 8K | 802.92 | 1,111.37 (1.38x) | 1,092.93-1,128.13 | 5,843.2 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 1,504.68 | 2,062.29 (1.37x) | 2,030.08-2,111.58 | 6,297.8 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 32K | 3,014.84 | 4,061.55 (1.35x) | 3,981.86-4,130.53 | 6,395.6 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-
-#### MXFP8, power-law routing (alpha=0.8)
-
-| Tokens/rank | NVFP4 ref (us) | MXFP8 (us, xNVFP4 latency) | Min-max (us) | Knobs |
-|---|---|---|---|---|
-| 1K | 315.28 | 437.27 (1.39x) | 429.60-445.12 | tile 256x128x128; hint 3; epi 1x4; tif 1 |
-| 2K | 378.97 | 546.01 (1.44x) | 539.36-556.67 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 4K | 532.55 | 698.71 (1.31x) | 692.74-707.39 | tile 256x256x128; hint 4; epi 1x4; tif 1 |
-| 8K | 1,255.96 | 1,596.46 (1.27x) | 1,589.02-1,603.71 | tile 256x256x128; hint 3; epi 1x4; tif 1 |
-| 16K | 2,040.66 | 2,588.31 (1.27x) | 2,562.85-2,655.49 | tile 256x256x128; hint 3; epi 1x4; tif 4 |
-| 32K | 4,497.98 | 5,851.03 (1.30x) | 5,782.66-5,913.06 | tile 256x256x128; hint 3; epi 1x4; tif 4 |
-
-MXFP8 lands at a steady ~1.3-1.5x the NVFP4 latency and plateaus at
-~6.3 PFLOP/s (vs 8.6 for NVFP4) — consistent with the doubled operand bytes
-through both GEMMs; the knobs were NOT re-tuned for mxfp8 (they replay the
-nvfp4 winners), so a dedicated sweep may claw some of this back.
-
-#### Reading the deltas
-
-- **Balanced >= 8K matches upstream within ~2%** (+0.3% / +1.4% / +1.8%)
-  at 8.1-8.6 PFLOP/s — the compute-bound regime, where a like-for-like
-  comparison is meaningful. This validates the port end to end.
-- **Small sizes measure faster than the upstream report (-14% to -41%)
-  under the identical protocol** (same knobs, same warmup/iteration
-  counts, same per-iteration L2 flush, same event span). The gap shrinks
-  from ~150 us at 1K to ~0 at 8K, the profile of a fixed
-  latency/bandwidth term: small sizes are dispatch/NVLink latency-bound,
-  so this is an environment difference between the upstream measurement
-  node (driver 615.31) and ours, not a kernel or harness difference.
-- **Power-law rows carry routing-draw noise (+/-10-20%).** The Zipf
-  popularity permutation is seed-dependent; a different draw puts a
-  different load on the hottest expert/rank, which gates the whole
-  collective (visible at 8K +19.3% vs 16K -2.0% with identical knobs
-  scaled). Comparisons against upstream's imbalanced rows are directional
-  only.
-- Balanced-vs-power-law penalty on our numbers: +44% at 1K, +56% at 8K,
-  +49% at 32K — same qualitative growth-with-size trend as upstream's
-  +7% -> +40%, amplified by the different routing draw.
+- **NVFP4 matches the upstream reference within ~2% in the compute-bound
+  regime** (>= 8K tokens/rank), validating the port end to end. At smaller
+  token counts our node measured faster than the reference under the
+  identical protocol; the gap decays to ~0 by 8K — the profile of a fixed
+  latency/bandwidth term (small sizes are dispatch/NVLink latency-bound),
+  i.e. a measurement-environment difference, not a kernel difference.
+- **MXFP8 runs at roughly 1.3-1.5x the NVFP4 latency** at equal token
+  counts — consistent with the doubled operand bytes through both GEMMs —
+  and its knobs simply replay the NVFP4 winners (tile K 128); a dedicated
+  mxfp8 tuner sweep may claw some of this back.
+- **Power-law comparisons carry +/-10-20% routing-draw noise**: the Zipf
+  popularity permutation is seed-dependent, and the hottest expert/rank
+  gates the whole collective. Treat imbalanced-routing comparisons as
+  directional only.
 
 ## Tuner
 
@@ -173,7 +104,7 @@ torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
   dtype + geometry + token bucket, so SM107 never collides with SM100).
 - Engine-side resolution via the config's `knobs` field: `None` (default)
   keeps the explicit config fields; `"cache"` resolves the recorded winner
-  (falling back to the built-in heuristic = the upstream selected-best
+  (falling back to the built-in heuristic = the reference selected-best
   profile in `default_knobs()`); a dict overrides explicitly. The
   SM100-style online `"auto"` sweep is deliberately NOT supported on the
   engine path (rebuild-per-candidate inside a serving engine is worse than
@@ -188,5 +119,5 @@ torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
   recipe.
 - The backends stage activations with the torch quantization fallback; a
   fused staging kernel is a known follow-up. End-to-end forward latency is
-  therefore staging-dominated for now — the numbers above isolate the mega
-  kernel to be comparable with the upstream report.
+  therefore staging-dominated for now — the benchmark isolates the mega
+  kernel to keep results comparable with the upstream tester.
