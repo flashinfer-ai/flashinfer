@@ -272,15 +272,9 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state():
         **arguments,
         # Expose sequence 1's checkpoint inside physical chunk 1 as a logical
         # segment boundary. This is the packed shape used by SGLang.
-        "chunk_indices": torch.tensor(
-            [0, 0, 1, 1], dtype=torch.int32, device="cuda"
-        ),
-        "chunk_offsets": torch.tensor(
-            [0, 96, 0, 96], dtype=torch.int32, device="cuda"
-        ),
-        "seq_chunk_cumsum": torch.tensor(
-            [0, 1, 4], dtype=torch.int32, device="cuda"
-        ),
+        "chunk_indices": torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda"),
+        "chunk_offsets": torch.tensor([0, 96, 0, 96], dtype=torch.int32, device="cuda"),
+        "seq_chunk_cumsum": torch.tensor([0, 1, 4], dtype=torch.int32, device="cuda"),
         "checkpoint_token_indices": torch.tensor(
             [-1, checkpoint_token], dtype=torch.int32, device="cuda"
         ),
