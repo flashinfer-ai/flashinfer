@@ -298,6 +298,14 @@ class NCCLLocalAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise RuntimeError("nccl_local requires an initialized process group")
         if dist.get_backend(group) != "nccl":
             raise ValueError("nccl_local requires a ProcessGroupNCCL group")
+        group_world_size = dist.get_world_size(group)
+        group_rank = dist.get_rank(group)
+        if (world_size, rank) != (group_world_size, group_rank):
+            raise ValueError(
+                "nccl_local world_size/rank must match the provided process "
+                f"group: got ({world_size}, {rank}), expected "
+                f"({group_world_size}, {group_rank})"
+            )
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("nccl_local supports torch.float16 and torch.bfloat16")
 
@@ -828,7 +836,7 @@ def allreduce_fusion(
             workspace.world_size, input.shape[0], input.shape[1], input.dtype
         ):
             raise ValueError("nccl_local workspace is insufficient for the input")
-        if weight_bias != 0.0:
+        if pattern == AllReduceFusionPattern.kARResidualRMSNorm and weight_bias != 0.0:
             raise ValueError("nccl_local does not yet support RMSNorm weight_bias")
 
         if output is None:
