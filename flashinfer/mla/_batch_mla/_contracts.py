@@ -2,17 +2,260 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union, overload
 
 import torch
 
 from flashinfer.autotuner import TunableRunner
 
 
+MLAInputAvailability = Literal["packed", "split", "redundant"]
+MLAChosenRepresentation = Literal["packed", "split"]
+MLAStructuralInputKind = Literal[
+    "packed", "adjacent-split", "independent-split", "dual"
+]
+
+
+def _as_tensor_leaf(value: object, *, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} structural MLA input leaves must be torch.Tensor.")
+    return value
+
+
+def _as_split_structural_pair(
+    value: object, *, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if type(value) is not tuple:
+        raise TypeError(
+            f"{name} structural MLA input must be a tensor or exact 2-tuple."
+        )
+    if len(value) != 2:
+        raise ValueError(f"{name} structural MLA input tuples must have length 2.")
+    left, right = value
+    if type(left) is tuple or type(right) is tuple:
+        raise ValueError(f"{name} structural MLA input has malformed nesting.")
+    return (
+        _as_tensor_leaf(left, name=name),
+        _as_tensor_leaf(right, name=name),
+    )
+
+
+def _parse_structural_mla_input(
+    value: object, *, name: str
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[tuple[torch.Tensor, torch.Tensor]],
+]:
+    if isinstance(value, torch.Tensor):
+        return value, None
+    if type(value) is not tuple:
+        raise TypeError(
+            f"{name} structural MLA input must be a tensor or exact 2-tuple."
+        )
+    if len(value) != 2:
+        raise ValueError(f"{name} structural MLA input tuples must have length 2.")
+    left, right = value
+    left_is_tuple = type(left) is tuple
+    right_is_tuple = type(right) is tuple
+    if left_is_tuple and right_is_tuple:
+        raise ValueError(f"{name} structural MLA input has malformed nesting.")
+    if left_is_tuple:
+        return (
+            _as_tensor_leaf(right, name=name),
+            _as_split_structural_pair(left, name=name),
+        )
+    if right_is_tuple:
+        return (
+            _as_tensor_leaf(left, name=name),
+            _as_split_structural_pair(right, name=name),
+        )
+    return None, (
+        _as_tensor_leaf(left, name=name),
+        _as_tensor_leaf(right, name=name),
+    )
+
+
+def _structural_mla_input_facts(
+    value: object,
+    *,
+    widths: tuple[int, int],
+    name: str,
+) -> tuple[MLAStructuralInputKind, torch.dtype, tuple[int, ...]]:
+    """Validate and describe an input while trusting an unselected dual member."""
+    packed, split = _parse_structural_mla_input(value, name=name)
+    packed_width = sum(widths)
+    if packed is not None:
+        kind: MLAStructuralInputKind = "dual" if split is not None else "packed"
+        tensor = packed
+        if tensor.ndim != 3:
+            raise ValueError(f"packed {name} must have rank 3.")
+        if tensor.shape[-1] != packed_width:
+            raise ValueError(
+                f"packed {name} last dimension does not match explicit split widths."
+            )
+        return kind, tensor.dtype, tuple(tensor.shape)
+
+    assert split is not None
+    left, right = split
+    if left.ndim != 3 or right.ndim != 3:
+        raise ValueError(f"split {name} tensors must have rank 3.")
+    if left.shape[:-1] != right.shape[:-1]:
+        raise ValueError(f"split {name} tensor shapes must match before the last axis.")
+    if left.dtype != right.dtype:
+        raise ValueError(f"split {name} tensor dtypes must match.")
+    if left.device != right.device:
+        raise ValueError(f"split {name} tensor devices must match.")
+    if (left.shape[-1], right.shape[-1]) != widths:
+        raise ValueError(f"split {name} last dimensions do not match explicit widths.")
+    kind = (
+        "adjacent-split"
+        if _are_adjacent_last_dim_views(left, right)
+        else "independent-split"
+    )
+    canonical_shape = tuple(left.shape[:-1]) + (packed_width,)
+    return kind, left.dtype, canonical_shape
+
+
+@overload
+def _resolve_structural_mla_input(
+    value: object,
+    *,
+    desired: Literal["packed"],
+    widths: Optional[tuple[int, int]],
+    name: str,
+) -> torch.Tensor: ...
+
+
+@overload
+def _resolve_structural_mla_input(
+    value: object,
+    *,
+    desired: Literal["split"],
+    widths: Optional[tuple[int, int]],
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def _resolve_structural_mla_input(
+    value: object,
+    *,
+    desired: MLAChosenRepresentation,
+    widths: Optional[tuple[int, int]],
+    name: str,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    if type(value) is tuple:
+        if len(value) != 2:
+            raise ValueError(f"{name} structural MLA input tuples must have length 2.")
+        left, right = value
+        left_is_tuple = type(left) is tuple
+        right_is_tuple = type(right) is tuple
+        if left_is_tuple != right_is_tuple:
+            if desired == "packed":
+                return _as_tensor_leaf(right if left_is_tuple else left, name=name)
+            return _as_split_structural_pair(
+                left if left_is_tuple else right, name=name
+            )
+    packed, split = _parse_structural_mla_input(value, name=name)
+    if desired == "split":
+        if split is not None:
+            return split
+        return _split_mla_tensor_references(
+            packed=packed,
+            left=None,
+            right=None,
+            representation="packed",
+            widths=widths,
+            name=name,
+        )
+    if packed is not None:
+        return packed
+    assert split is not None
+    left, right = split
+    return _packed_mla_tensor_reference(
+        packed=None,
+        left=left,
+        right=right,
+        representation="split",
+        widths=widths,
+        name=name,
+    )
+
+
+def _validate_mla_reference_presence(
+    *, packed: object, split_1: object, split_2: object, name: str
+) -> None:
+    """Validate MLA representation availability using identity checks only."""
+    has_packed = packed is not None
+    has_split_1 = split_1 is not None
+    has_split_2 = split_2 is not None
+    if has_split_1 != has_split_2 or not (has_packed or has_split_1):
+        raise ValueError(
+            f"{name} requires packed, complete split, or trusted redundant tensors."
+        )
+
+
+def _classify_mla_references(
+    *,
+    packed: object,
+    split_1: object,
+    split_2: object,
+    name: str,
+) -> MLAInputAvailability:
+    """Classify complete MLA representations using presence checks only."""
+    _validate_mla_reference_presence(
+        packed=packed,
+        split_1=split_1,
+        split_2=split_2,
+        name=name,
+    )
+    has_packed = packed is not None
+    has_split_1 = split_1 is not None
+    if has_packed and has_split_1:
+        return "redundant"
+    return "packed" if has_packed else "split"
+
+
+def _choose_mla_representation(
+    availability: MLAInputAvailability, preferred: MLAChosenRepresentation
+) -> MLAChosenRepresentation:
+    """Resolve trusted redundant references to one backend-native form."""
+    return preferred if availability == "redundant" else availability
+
+
+def _choose_mla_references(
+    *,
+    packed: Optional[torch.Tensor],
+    split_1: Optional[torch.Tensor],
+    split_2: Optional[torch.Tensor],
+    availability: MLAInputAvailability,
+    preferred: MLAChosenRepresentation,
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    MLAChosenRepresentation,
+]:
+    """Keep only the complete form selected for a backend."""
+    representation = _choose_mla_representation(availability, preferred)
+    if representation == "packed":
+        assert packed is not None
+        return packed, None, None, representation
+    assert split_1 is not None and split_2 is not None
+    return None, split_1, split_2, representation
+
+
 def _adjacent_last_dim_view(
     left: torch.Tensor, right: torch.Tensor
 ) -> Optional[torch.Tensor]:
     """Return one in-bounds contiguous view when split tensors are adjacent."""
+    if not _are_adjacent_last_dim_views(left, right):
+        return None
+    shape = left.shape[:-1] + (left.shape[-1] + right.shape[-1],)
+    return left.as_strided(shape, left.stride(), left.storage_offset())
+
+
+def _are_adjacent_last_dim_views(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether split tensors form one in-bounds contiguous tensor."""
     if (
         left.ndim == 0
         or left.ndim != right.ndim
@@ -23,283 +266,101 @@ def _adjacent_last_dim_view(
         or left.shape[-1] == 0
         or right.shape[-1] == 0
     ):
-        return None
+        return False
     storage = left.untyped_storage()
     if storage.data_ptr() != right.untyped_storage().data_ptr():
-        return None
+        return False
     stride = left.stride()
     storage_offset = left.storage_offset()
     if right.storage_offset() != storage_offset + left.shape[-1] * stride[-1]:
-        return None
+        return False
     shape = left.shape[:-1] + (left.shape[-1] + right.shape[-1],)
     storage_numel, remainder = divmod(storage.nbytes(), left.element_size())
     if remainder:
-        return None
+        return False
     if any(size == 0 for size in shape):
         if storage_offset > storage_numel:
-            return None
+            return False
+        return True
     else:
         last_offset = storage_offset + sum(
             (size - 1) * step for size, step in zip(shape, stride, strict=True)
         )
         if last_offset >= storage_numel:
-            return None
-    combined = left.as_strided(shape, stride, storage_offset)
-    return combined if combined.is_contiguous() else None
+            return False
+    expected_stride = 1
+    for size, step in zip(reversed(shape), reversed(stride), strict=True):
+        if size != 1:
+            if step != expected_stride:
+                return False
+            expected_stride *= size
+    return True
 
 
-def _concat_adjacent_views_or_cat(
-    left: torch.Tensor, right: torch.Tensor
+def _split_mla_tensor_references(
+    *,
+    packed: Optional[torch.Tensor],
+    left: Optional[torch.Tensor],
+    right: Optional[torch.Tensor],
+    representation: MLAChosenRepresentation,
+    widths: Optional[tuple[int, int]],
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a backend-native split pair from validated raw references."""
+    if representation == "split":
+        assert left is not None and right is not None
+        return left, right
+    assert packed is not None
+    if widths is None:
+        raise ValueError(f"packed {name} requires planned split widths.")
+    left_width, right_width = widths
+    if packed.ndim == 0:
+        raise ValueError(f"packed {name} must have at least one dimension.")
+    if left_width <= 0 or right_width <= 0:
+        raise ValueError("split widths must be positive.")
+    if packed.shape[-1] != left_width + right_width:
+        raise ValueError(
+            f"packed {name} last dimension does not match planned split widths."
+        )
+    return packed[..., :left_width], packed[..., left_width:]
+
+
+def _packed_mla_tensor_reference(
+    *,
+    packed: Optional[torch.Tensor],
+    left: Optional[torch.Tensor],
+    right: Optional[torch.Tensor],
+    representation: MLAChosenRepresentation,
+    widths: Optional[tuple[int, int]],
+    name: str,
 ) -> torch.Tensor:
-    """Join adjacent split views without a copy, otherwise preserve cat fallback."""
-    combined = _adjacent_last_dim_view(left, right)
-    return torch.cat((left, right), dim=-1) if combined is None else combined
+    """Return a backend-native packed tensor without representation copies."""
+    if representation == "packed":
+        assert packed is not None
+        return packed
+    assert left is not None and right is not None
+    adjacent = _adjacent_last_dim_view(left, right)
+    if adjacent is not None:
+        return adjacent
+    raise ValueError(
+        f"{name} cannot provide the planned packed representation zero-copy; "
+        "re-plan for split input."
+    )
 
 
 @dataclass(frozen=True)
 class MLAInputContract:
-    """Tensor-free plan facts that a run-time MLA input must satisfy."""
+    """Run options that must remain compatible with an MLA plan."""
 
-    query_split_widths: tuple[int, int]
-    kv_split_widths: tuple[int, int]
-    q_data_type: torch.dtype
-    kv_data_type: torch.dtype
-    kv_layout: str
     lse_mode: str
     output_dtype: torch.dtype
     output_scale: str
     scale_mode: str
     skip_softmax: bool
-
-    def validate(self, query: "MLAQuery", kv: "MLAKVCache") -> None:
-        """Reject value objects that are incompatible with this plan."""
-        q_nope, q_pe = query.split_views(self.query_split_widths)
-        ckv_cache, kpe_cache = kv.split_views(self.kv_split_widths)
-        if kv.layout != self.kv_layout:
-            raise ValueError(
-                "MLA planned input contract mismatch: KV layout "
-                f"planned {self.kv_layout!r}, got {kv.layout!r}; re-plan with "
-                "the needed arguments."
-            )
-        for name, tensor in (("q_nope", q_nope), ("q_pe", q_pe)):
-            if tensor.dtype != self.q_data_type:
-                raise ValueError(
-                    "MLA planned input contract mismatch: "
-                    f"{name} dtype planned {self.q_data_type!r}, got "
-                    f"{tensor.dtype!r}; re-plan with the needed arguments."
-                )
-        for name, tensor, dtype in (
-            ("ckv_cache", ckv_cache, self.kv_data_type),
-            ("kpe_cache", kpe_cache, self.kv_data_type),
-        ):
-            if tensor.dtype != dtype:
-                raise ValueError(
-                    "MLA planned input contract mismatch: "
-                    f"{name} dtype planned {dtype!r}, got {tensor.dtype!r}; "
-                    "re-plan with the needed arguments."
-                )
-        for name, tensor, width in (
-            ("q_nope", q_nope, self.query_split_widths[0]),
-            ("q_pe", q_pe, self.query_split_widths[1]),
-            ("ckv_cache", ckv_cache, self.kv_split_widths[0]),
-            ("kpe_cache", kpe_cache, self.kv_split_widths[1]),
-        ):
-            if tensor.shape[-1] != width:
-                raise ValueError(
-                    "MLA planned input contract mismatch: "
-                    f"{name} last dimension planned {width}, got "
-                    f"{tensor.shape[-1]}; re-plan with the needed arguments."
-                )
-
-
-@dataclass(frozen=True)
-class MLAQuery:
-    """One packed or split MLA query representation."""
-
-    q: Optional[torch.Tensor] = None
-    q_nope: Optional[torch.Tensor] = None
-    q_pe: Optional[torch.Tensor] = None
-
-    def __post_init__(self) -> None:
-        has_packed = self.q is not None
-        has_split = self.q_nope is not None or self.q_pe is not None
-        if has_packed == has_split or (
-            has_split and (self.q_nope is None or self.q_pe is None)
-        ):
-            raise ValueError(
-                "MLAQuery requires exactly one packed or complete split representation."
-            )
-        if any(
-            value is not None and not isinstance(value, torch.Tensor)
-            for value in (self.q, self.q_nope, self.q_pe)
-        ):
-            raise TypeError(
-                "MLAQuery representation values must be torch.Tensor instances."
-            )
-
-    @classmethod
-    def packed(cls, q: torch.Tensor) -> "MLAQuery":
-        return cls(q=q)
-
-    @classmethod
-    def split(cls, q_nope: torch.Tensor, q_pe: torch.Tensor) -> "MLAQuery":
-        return cls(q_nope=q_nope, q_pe=q_pe)
-
-    def split_views(
-        self, widths: Optional[tuple[int, int]]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return split query tensors, deriving zero-copy views when packed."""
-        if self.q is None:
-            if self.q_nope is None or self.q_pe is None:
-                raise ValueError("provide MLAQuery.packed or MLAQuery.split inputs.")
-            return self.q_nope, self.q_pe
-        if widths is None:
-            raise ValueError("MLAQuery.packed requires plan() before run().")
-        q_nope_width, q_pe_width = widths
-        if self.q.ndim == 0:
-            raise ValueError("packed query must have at least one dimension.")
-        if q_nope_width <= 0 or q_pe_width <= 0:
-            raise ValueError("split widths must be positive.")
-        if self.q.shape[-1] != q_nope_width + q_pe_width:
-            raise ValueError(
-                "packed query last dimension does not match planned split widths."
-            )
-        return self.q[..., :q_nope_width], self.q[..., q_nope_width:]
-
-    def packed_or_adjacent(self) -> Optional[torch.Tensor]:
-        """Return the packed query or a zero-copy view of adjacent splits."""
-        if self.q is not None:
-            return self.q
-        if not isinstance(self.q_nope, torch.Tensor) or not isinstance(
-            self.q_pe, torch.Tensor
-        ):
-            return None
-        return _adjacent_last_dim_view(self.q_nope, self.q_pe)
-
-    def packed_or_cat(self) -> torch.Tensor:
-        """Return a packed query, copying only non-adjacent split inputs."""
-        packed = self.packed_or_adjacent()
-        if packed is not None:
-            return packed
-        if not isinstance(self.q_nope, torch.Tensor) or not isinstance(
-            self.q_pe, torch.Tensor
-        ):
-            raise ValueError("provide MLAQuery.packed or MLAQuery.split inputs.")
-        return torch.cat((self.q_nope, self.q_pe), dim=-1)
-
-    def require_packed(self) -> torch.Tensor:
-        """Return the packed query, copying non-adjacent split inputs if needed."""
-        return self.packed_or_cat()
-
-
-@dataclass(frozen=True)
-class MLAKVCache:
-    """One packed or split paged MLA KV-cache representation."""
-
-    kv_cache: Optional[torch.Tensor] = None
-    ckv_cache: Optional[torch.Tensor] = None
-    kpe_cache: Optional[torch.Tensor] = None
-
-    def __post_init__(self) -> None:
-        has_packed = self.kv_cache is not None
-        has_split = self.ckv_cache is not None or self.kpe_cache is not None
-        if has_packed == has_split or (
-            has_split and (self.ckv_cache is None or self.kpe_cache is None)
-        ):
-            raise ValueError(
-                "MLAKVCache requires exactly one packed or complete split representation."
-            )
-        if any(
-            value is not None and not isinstance(value, torch.Tensor)
-            for value in (self.kv_cache, self.ckv_cache, self.kpe_cache)
-        ):
-            raise TypeError(
-                "MLAKVCache representation values must be torch.Tensor instances."
-            )
-
-    @classmethod
-    def packed(cls, kv_cache: torch.Tensor) -> "MLAKVCache":
-        return cls(kv_cache=kv_cache)
-
-    @classmethod
-    def split(cls, ckv_cache: torch.Tensor, kpe_cache: torch.Tensor) -> "MLAKVCache":
-        return cls(ckv_cache=ckv_cache, kpe_cache=kpe_cache)
-
-    def split_views(
-        self, widths: Optional[tuple[int, int]]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return split KV tensors, deriving zero-copy views when packed."""
-        if self.kv_cache is None:
-            if self.ckv_cache is None or self.kpe_cache is None:
-                raise ValueError(
-                    "provide MLAKVCache.packed or MLAKVCache.split inputs."
-                )
-            return self.ckv_cache, self.kpe_cache
-        if widths is None:
-            raise ValueError("MLAKVCache.packed requires planned split widths.")
-        ckv_width, kpe_width = widths
-        if self.kv_cache.ndim == 0:
-            raise ValueError("packed KV-cache must have at least one dimension.")
-        if ckv_width <= 0 or kpe_width <= 0:
-            raise ValueError("split widths must be positive.")
-        if self.kv_cache.shape[-1] != ckv_width + kpe_width:
-            raise ValueError(
-                "packed KV-cache last dimension does not match planned split widths."
-            )
-        return self.kv_cache[..., :ckv_width], self.kv_cache[..., ckv_width:]
-
-    def packed_or_adjacent(self) -> Optional[torch.Tensor]:
-        """Return the packed cache or a zero-copy packed view of adjacent splits."""
-        if self.kv_cache is not None:
-            return self.kv_cache
-        if not isinstance(self.ckv_cache, torch.Tensor) or not isinstance(
-            self.kpe_cache, torch.Tensor
-        ):
-            return None
-        return _adjacent_last_dim_view(self.ckv_cache, self.kpe_cache)
-
-    def require_packed_view(self) -> torch.Tensor:
-        """Return a zero-copy packed cache view or reject independent splits."""
-        packed = self.packed_or_adjacent()
-        if packed is None:
-            raise ValueError(
-                "MLA KV cache must be packed or use adjacent split tensor views."
-            )
-        return packed
-
-    @property
-    def layout(self) -> str:
-        if self.kv_cache is not None:
-            return "combined"
-        return (
-            "adjacent-split"
-            if self.packed_or_adjacent() is not None
-            else "independent-split"
-        )
-
-
-def _split_mla_value_objects(
-    query: MLAQuery,
-    kv: MLAKVCache,
-    contract: Optional[MLAInputContract],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return backend-native split views from raw wrapper value objects."""
-    query_widths = None if contract is None else contract.query_split_widths
-    if (
-        query_widths is None
-        and query.q is not None
-        and kv.ckv_cache is not None
-        and kv.kpe_cache is not None
-    ):
-        query_widths = (kv.ckv_cache.shape[-1], kv.kpe_cache.shape[-1])
-    q_nope, q_pe = query.split_views(query_widths)
-    kv_widths = (
-        (q_nope.shape[-1], q_pe.shape[-1])
-        if contract is None
-        else contract.kv_split_widths
-    )
-    ckv_cache, kpe_cache = kv.split_views(kv_widths)
-    return q_nope, q_pe, ckv_cache, kpe_cache
+    query_layout: MLAChosenRepresentation = "packed"
+    kv_cache_layout: MLAChosenRepresentation = "packed"
+    head_dim_ckv: Optional[int] = None
+    head_dim_kpe: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -379,8 +440,14 @@ class MLAPlanMetadata:
 
 @dataclass(frozen=True)
 class _FunctionalMLARequest:
-    query: torch.Tensor
-    kv_cache: torch.Tensor
+    query: Optional[torch.Tensor]
+    q_nope: Optional[torch.Tensor]
+    q_pe: Optional[torch.Tensor]
+    kv_cache: Optional[torch.Tensor]
+    ckv_cache: Optional[torch.Tensor]
+    kpe_cache: Optional[torch.Tensor]
+    query_availability: MLAInputAvailability
+    kv_availability: MLAInputAvailability
     workspace_buffer: torch.Tensor
     qk_nope_head_dim: int
     kv_lora_rank: int
@@ -412,6 +479,9 @@ class _FunctionalMLARequest:
 
 
 class _FunctionalMLARunner(TunableRunner):
+    native_query_representation: MLAChosenRepresentation
+    native_kv_representation: MLAChosenRepresentation
+
     def __init__(self, request: _FunctionalMLARequest) -> None:
         self.request = request
 

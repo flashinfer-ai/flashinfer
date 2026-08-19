@@ -17,15 +17,17 @@ from flashinfer.utils import (
 )
 from flashinfer.xqa import get_xqa_module_mla
 
-from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
+from ._capabilities import (
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import (
     _MLAPlanArguments,
 )
 from .._contracts import (
     _FunctionalMLARequest,
     _FunctionalMLARunner,
-    MLAKVCache,
-    MLAQuery,
+    _resolve_structural_mla_input,
 )
 
 
@@ -100,6 +102,8 @@ class _BatchMLAPagedAttentionXqaBackend:
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "bmm-scalar"}),
         supports_enable_pdl=True,
+        requires_packed_query=True,
+        requires_packed_kv_cache=True,
     )
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
@@ -562,8 +566,8 @@ class _BatchMLAPagedAttentionXqaBackend:
     def run_from_wrapper(
         self,
         *,
-        query: MLAQuery,
-        kv: MLAKVCache,
+        query: object,
+        kv_cache: object,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -579,8 +583,18 @@ class _BatchMLAPagedAttentionXqaBackend:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        packed_query = query.require_packed()
-        kv_cache = kv.require_packed_view()
+        packed_query = _resolve_structural_mla_input(
+            query,
+            desired="packed",
+            widths=(self._kv_lora_rank, self._qk_rope_head_dim),
+            name="query",
+        )
+        kv_cache = _resolve_structural_mla_input(
+            kv_cache,
+            desired="packed",
+            widths=(self._kv_lora_rank, self._qk_rope_head_dim),
+            name="KV cache",
+        )
         if return_lse or lse is not None:
             raise ValueError("XQA MLA wrapper does not support LSE output.")
         if profiler_buffer is not None:
@@ -720,6 +734,8 @@ class XqaMlaDecodeRunner(_FunctionalMLARunner):
     """Tunable-runner compatibility adapter for functional XQA dispatch."""
 
     name = "xqa"
+    native_query_representation = "packed"
+    native_kv_representation = "packed"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
         super().__init__(request)

@@ -26,7 +26,6 @@ pytestmark = pytest.mark.skipif(
     reason="installed CuTe DSL does not support this GPU architecture",
 )
 from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_reference
-from flashinfer.mla import MLAKVCache, MLAQuery
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 from flashinfer.cute_dsl import is_cute_dsl_available
 
@@ -1289,51 +1288,6 @@ def test_h96_sq8_split_workspace_drops_empty_partition():
     assert workspace_size == 1 * 128 * 6 * 8 * (512 + 1) * 4
 
 
-def test_cute_dsl_workspace_sizer_follows_selected_impl():
-    """Autotuning must size workspace with the implementation it will launch."""
-    if not is_cute_dsl_available():
-        pytest.skip("CuTe DSL not available")
-
-    from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
-        _get_split_kv_and_workspace_size as monolithic_sizer,
-    )
-    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
-        _get_split_kv_and_workspace_size as modular_sizer,
-    )
-    from flashinfer.mla._core import _get_cute_dsl_workspace_sizer
-
-    assert _get_cute_dsl_workspace_sizer("monolithic", None) is monolithic_sizer
-    assert _get_cute_dsl_workspace_sizer("modular", None) is modular_sizer
-    assert _get_cute_dsl_workspace_sizer("auto", None) is monolithic_sizer
-    assert _get_cute_dsl_workspace_sizer("auto", torch.empty(0)) is modular_sizer
-
-
-def test_monolithic_workspace_cap_drops_empty_partitions():
-    """Autotuning must use the launcher's max-sequence split normalization."""
-    if not is_cute_dsl_available():
-        pytest.skip("CuTe DSL not available")
-
-    from flashinfer.mla._core import _cute_dsl_max_supported_batch
-
-    # One K tile needs no split workspace for any candidate batch. Without
-    # max_seq_len propagation this is conservatively sized as 32 splits and
-    # the zero-byte workspace incorrectly caps the autotune sweep at B=1.
-    assert (
-        _cute_dsl_max_supported_batch(
-            workspace_bytes=0,
-            q_len=1,
-            num_heads=128,
-            kv_lora_rank=512,
-            max_active_blocks=148,
-            max_seq_len=128,
-            candidate_max=8,
-            cute_dsl_impl="monolithic",
-            sinks=None,
-        )
-        == 8
-    )
-
-
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [32, 128])
@@ -2584,8 +2538,8 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_im
 def _run_batch_mla_wrapper_cute_dsl_case(case):
     query = case["query"]
     return case["wrapper"].run(
-        query=MLAQuery.packed(query.flatten(0, 1)),
-        kv=MLAKVCache.packed(case["kv_cache"]),
+        query=query.flatten(0, 1),
+        kv_cache=case["kv_cache"],
         out=case["wrapper_out"],
         lse=case["wrapper_lse"] if case["return_lse"] else None,
         return_lse=case["return_lse"],

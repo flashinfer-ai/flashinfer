@@ -22,10 +22,7 @@ from .._planning import (
 from .._contracts import (
     _FunctionalBackendUnsupportedError,
     _FunctionalMLARequest,
-    MLAKVCache,
-    MLAInputContract,
-    MLAQuery,
-    _split_mla_value_objects,
+    _resolve_structural_mla_input,
 )
 from ._fa_common import (
     _BatchMLAGeneratedFaMechanics,
@@ -56,7 +53,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
-        input_contract: Optional[MLAInputContract] = None,
+        query_split_widths: Optional[tuple[int, int]] = None,
+        kv_split_widths: Optional[tuple[int, int]] = None,
     ) -> None:
         self._backend = "fa2"
         super().__init__(
@@ -67,7 +65,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             kv_indptr,
             kv_indices,
             kv_len_arr,
-            input_contract,
+            query_split_widths,
+            kv_split_widths,
         )
 
     @classmethod
@@ -91,7 +90,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             args._kv_indptr_buf,
             args._kv_indices_buf,
             args._kv_len_arr_buf,
-            args.input_contract,
+            (args.head_dim_ckv, args.head_dim_kpe),
+            (args.head_dim_ckv, args.head_dim_kpe),
         )
         backend.plan(
             qo_indptr=csr.qo_indptr,
@@ -197,8 +197,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
     def run_from_wrapper(
         self,
         *,
-        query: MLAQuery,
-        kv: MLAKVCache,
+        query: object,
+        kv_cache: object,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -215,8 +215,17 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         self._generated_fa_workspace.raise_if_invalid()
-        q_nope, q_pe, ckv_cache, kpe_cache = _split_mla_value_objects(
-            query, kv, getattr(self, "_input_contract", None)
+        q_nope, q_pe = _resolve_structural_mla_input(
+            query,
+            desired="split",
+            widths=self._query_split_widths,
+            name="query",
+        )
+        ckv_cache, kpe_cache = _resolve_structural_mla_input(
+            kv_cache,
+            desired="split",
+            widths=self._kv_split_widths,
+            name="KV-cache",
         )
         if sinks is not None:
             raise ValueError("sinks are not supported by the fa2 wrapper backend.")
@@ -259,13 +268,16 @@ class Fa2MlaRunner(_GeneratedFaMlaRunner):
     """Direct functional generated-FA2 MLA runner."""
 
     backend_name = "fa2"
+    native_query_representation = "split"
+    native_kv_representation = "split"
 
     def _load_functional_module(self, module_args: Sequence[Any]) -> Any:
         return get_batch_mla_module("fa2", *module_args)
 
     def _validate_backend_capability(self, request: _FunctionalMLARequest) -> None:
-        if request.kv_cache.dtype not in (torch.float16, torch.bfloat16):
+        assert request.ckv_cache is not None
+        if request.ckv_cache.dtype not in (torch.float16, torch.bfloat16):
             raise _FunctionalBackendUnsupportedError(
-                f"MLA kv_data_type {request.kv_cache.dtype} is not supported by the fa2 "
+                f"MLA kv_data_type {request.ckv_cache.dtype} is not supported by the fa2 "
                 f"backend. Supported dtypes: {[torch.float16, torch.bfloat16]}."
             )

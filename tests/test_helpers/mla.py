@@ -169,7 +169,10 @@ def wrapper_plan_kwargs(case: MLATestCase, inputs: MLATestInputs) -> dict:
         "kv_data_type": case.kv_dtype,
         "qk_nope_head_dim": case.qk_nope_head_dim,
         "lse_mode": case.lse_mode,
-        "kv_layout": case.kv_layout,
+        "query_layout": "packed",
+        "kv_cache_layout": (
+            "packed" if case.kv_layout != "independent-split" else "split"
+        ),
         "output_dtype": case.output_dtype,
         "output_scale": case.output_scale,
         "scale_mode": case.scale_mode,
@@ -254,7 +257,7 @@ def functional_kwargs(case: MLATestCase, inputs: MLATestInputs) -> dict:
 
 
 def reference_result(
-    case: MLATestCase, inputs: MLATestInputs
+    case: MLATestCase, inputs: MLATestInputs, *, causal: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     contract = MLAReferenceContract(
         lse_mode=case.lse_mode,
@@ -282,7 +285,7 @@ def reference_result(
         ckv_cache=inputs.ckv_cache,
         kpe_cache=inputs.kpe_cache,
         sm_scale=case.sm_scale,
-        causal=False,
+        causal=causal,
         **reference_kwargs,
     )
 

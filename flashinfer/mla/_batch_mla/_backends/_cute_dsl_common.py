@@ -12,13 +12,15 @@ from flashinfer.utils import (
     get_compute_capability,
 )
 
-from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
+from ._capabilities import (
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import (
     _MLAPlanArguments,
 )
 from .._contracts import (
-    MLAKVCache,
-    MLAQuery,
+    _resolve_structural_mla_input,
 )
 
 
@@ -485,8 +487,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
     def run_from_wrapper(
         self,
         *,
-        query: MLAQuery,
-        kv: MLAKVCache,
+        query: object,
+        kv_cache: object,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -502,8 +504,19 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        packed_query = query.require_packed()
-        kv_cache = kv.require_packed_view()
+        state = self._execution_state
+        packed_query = _resolve_structural_mla_input(
+            query,
+            desired="packed",
+            widths=(state.kv_lora_rank, state.qk_rope_head_dim),
+            name="query",
+        )
+        kv_cache = _resolve_structural_mla_input(
+            kv_cache,
+            desired="packed",
+            widths=(state.kv_lora_rank, state.qk_rope_head_dim),
+            name="KV cache",
+        )
         if profiler_buffer is not None:
             raise ValueError("profiler_buffer is not supported with cute-dsl backend.")
         if kv_len is not None or page_table is not None:

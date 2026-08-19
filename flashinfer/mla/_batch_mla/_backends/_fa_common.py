@@ -29,7 +29,6 @@ from flashinfer.jit import gen_batch_mla_module
 
 from ....utils import MaskMode, check_shape_dtype_device
 from .._contracts import _FunctionalMLARequest, _FunctionalMLARunner
-from .._contracts import MLAInputContract
 from .._planning import (
     _CSRPlanMetadata,
     _MLAGeneratedFaWorkspace,
@@ -125,6 +124,9 @@ class _BatchMLAGeneratedFaWorkspace:
 
 
 class _BatchMLAGeneratedFaMechanics:
+    native_query_representation = "split"
+    native_kv_representation = "split"
+
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -134,7 +136,8 @@ class _BatchMLAGeneratedFaMechanics:
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
-        input_contract: Optional[MLAInputContract] = None,
+        query_split_widths: Optional[tuple[int, int]] = None,
+        kv_split_widths: Optional[tuple[int, int]] = None,
     ) -> None:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -149,7 +152,8 @@ class _BatchMLAGeneratedFaMechanics:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
-        self._input_contract = input_contract
+        self._query_split_widths = query_split_widths
+        self._kv_split_widths = kv_split_widths
 
     def _validate_metadata_tensor(self, name: str, tensor: torch.Tensor) -> None:
         if not isinstance(tensor, torch.Tensor):
@@ -560,41 +564,51 @@ def _require_functional_scalar_scale(
 def _prepare_functional_fa_request(
     request: _FunctionalMLARequest,
 ) -> _PreparedFunctionalFaRequest:
-    """Normalize packed functional tensors to the generated-FA launch contract."""
-    query = request.query
-    kv_cache = request.kv_cache
+    """Validate native split references for the generated-FA launch contract."""
+    q_nope = request.q_nope
+    q_pe = request.q_pe
+    ckv_cache = request.ckv_cache
+    kpe_cache = request.kpe_cache
     kv_lora_rank = request.kv_lora_rank
     qk_rope_head_dim = request.qk_rope_head_dim
-    if not isinstance(query, torch.Tensor) or query.ndim not in (3, 4):
-        raise ValueError("query must be rank 4 (dense) or rank 3 (ragged).")
-    if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 3:
-        raise ValueError("generated FA MLA requires a rank-3 packed kv_cache.")
-    if query.device != kv_cache.device:
-        raise ValueError("query and kv_cache must be on the same device.")
-    if query.dtype != kv_cache.dtype:
-        raise ValueError("query and kv_cache must have the same dtype.")
-    if query.shape[-1] != kv_lora_rank + qk_rope_head_dim:
+    if not isinstance(q_nope, torch.Tensor) or q_nope.ndim not in (3, 4):
+        raise ValueError("q_nope must be rank 4 (dense) or rank 3 (ragged).")
+    if not isinstance(q_pe, torch.Tensor) or q_pe.shape[:-1] != q_nope.shape[:-1]:
+        raise ValueError("q_pe must match q_nope except for its last dimension.")
+    if not isinstance(ckv_cache, torch.Tensor) or ckv_cache.ndim != 3:
+        raise ValueError("generated FA MLA requires a rank-3 ckv_cache.")
+    if (
+        not isinstance(kpe_cache, torch.Tensor)
+        or kpe_cache.shape[:-1] != ckv_cache.shape[:-1]
+    ):
         raise ValueError(
-            "query head dimension must equal kv_lora_rank + qk_rope_head_dim."
+            "kpe_cache must match ckv_cache except for its last dimension."
         )
-    if kv_cache.shape[-1] != kv_lora_rank + qk_rope_head_dim:
-        raise ValueError(
-            "kv_cache head dimension must equal kv_lora_rank + qk_rope_head_dim."
-        )
+    if not all(
+        tensor.device == q_nope.device for tensor in (q_pe, ckv_cache, kpe_cache)
+    ):
+        raise ValueError("query and KV split references must be on the same device.")
+    if not all(tensor.dtype == q_nope.dtype for tensor in (q_pe, ckv_cache, kpe_cache)):
+        raise ValueError("query and KV split references must have the same dtype.")
+    if q_nope.shape[-1] != kv_lora_rank or ckv_cache.shape[-1] != kv_lora_rank:
+        raise ValueError("q_nope and ckv_cache must match kv_lora_rank.")
+    if q_pe.shape[-1] != qk_rope_head_dim or kpe_cache.shape[-1] != qk_rope_head_dim:
+        raise ValueError("q_pe and kpe_cache must match qk_rope_head_dim.")
     if kv_lora_rank <= 0 or qk_rope_head_dim <= 0:
         raise ValueError("kv_lora_rank and qk_rope_head_dim must be positive.")
     if request.seq_lens is None:
         raise ValueError("seq_lens is required for generated FA MLA backends.")
 
-    page_size = kv_cache.shape[1]
+    page_size = ckv_cache.shape[1]
     if page_size <= 0:
         raise ValueError("kv_cache page_size must be positive.")
-    if query.ndim == 4:
+    if q_nope.ndim == 4:
         if request.cum_seq_lens_q is not None:
             raise ValueError("cum_seq_lens_q requires a rank-3 ragged query.")
-        batch_size, q_len, _, _ = query.shape
+        batch_size, q_len, _, _ = q_nope.shape
         cumulative_q = (
-            torch.arange(batch_size + 1, dtype=torch.int32, device=query.device) * q_len
+            torch.arange(batch_size + 1, dtype=torch.int32, device=q_nope.device)
+            * q_len
         )
         dense = _validate_dense_metadata(
             cum_seq_lens_q=cumulative_q,
@@ -602,9 +616,10 @@ def _prepare_functional_fa_request(
             seq_lens=request.seq_lens,
             max_q_len=q_len,
             page_size=page_size,
-            device=query.device,
+            device=q_nope.device,
         )
-        flat_query = query.flatten(0, 1)
+        flat_q_nope = q_nope.flatten(0, 1)
+        flat_q_pe = q_pe.flatten(0, 1)
     else:
         if request.cum_seq_lens_q is None:
             raise ValueError("rank-3 query requires cum_seq_lens_q.")
@@ -614,45 +629,46 @@ def _prepare_functional_fa_request(
             seq_lens=request.seq_lens,
             max_q_len=request.max_q_len,
             page_size=page_size,
-            device=query.device,
+            device=q_nope.device,
         )
-        if int(dense.cum_seq_lens_q[-1].item()) != query.shape[0]:
+        if int(dense.cum_seq_lens_q[-1].item()) != q_nope.shape[0]:
             raise ValueError("cum_seq_lens_q[-1] must equal the ragged query length.")
-        flat_query = query
+        flat_q_nope = q_nope
+        flat_q_pe = q_pe
 
-    expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
+    expected_out_shape = q_nope.shape
     out = request.out
     if out is not None:
         if (
             out.shape != expected_out_shape
-            or out.dtype != query.dtype
-            or out.device != query.device
+            or out.dtype != q_nope.dtype
+            or out.device != q_nope.device
         ):
             raise ValueError(
                 f"out must have shape {tuple(expected_out_shape)}, query dtype, and query device."
             )
-        flat_out = out.flatten(0, 1) if query.ndim == 4 else out
+        flat_out = out.flatten(0, 1) if q_nope.ndim == 4 else out
     else:
         flat_out = None
 
     user_lse = request.lse
     flat_lse = None
     if request.return_lse:
-        flat_lse_shape = (flat_query.shape[0], flat_query.shape[1])
-        nested_lse_shape = query.shape[:-1]
+        flat_lse_shape = (flat_q_nope.shape[0], flat_q_nope.shape[1])
+        nested_lse_shape = q_nope.shape[:-1]
         if request.lse is None:
             flat_lse = None
         elif (
             request.lse.shape == flat_lse_shape
             and request.lse.dtype == torch.float32
-            and request.lse.device == query.device
+            and request.lse.device == q_nope.device
         ):
             flat_lse = request.lse
         elif (
-            query.ndim == 4
+            q_nope.ndim == 4
             and request.lse.shape == nested_lse_shape
             and request.lse.dtype == torch.float32
-            and request.lse.device == query.device
+            and request.lse.device == q_nope.device
         ):
             flat_lse = request.lse.flatten(0, 1)
         else:
@@ -663,10 +679,10 @@ def _prepare_functional_fa_request(
         raise ValueError("lse requires return_lse=True for generated FA MLA.")
 
     return _PreparedFunctionalFaRequest(
-        q_nope=flat_query[..., :kv_lora_rank],
-        q_pe=flat_query[..., kv_lora_rank:],
-        ckv_cache=kv_cache[..., :kv_lora_rank],
-        kpe_cache=kv_cache[..., kv_lora_rank:],
+        q_nope=flat_q_nope,
+        q_pe=flat_q_pe,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
         csr=_derive_csr_from_dense(dense, page_size=page_size),
         out=flat_out,
         lse=flat_lse,
@@ -678,15 +694,18 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
     """One-shot functional runner shared by the generated FA backends."""
 
     backend_name: str
+    native_query_representation = "split"
+    native_kv_representation = "split"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
         _FunctionalMLARunner.__init__(self, request)
         self._validate_functional_options(request)
         self._validate_backend_capability(request)
+        assert request.q_nope is not None and request.ckv_cache is not None
         _BatchMLAGeneratedFaMechanics.__init__(
             self,
             request.workspace_buffer,
-            _BatchMLAGeneratedFaWorkspace(request.query.device),
+            _BatchMLAGeneratedFaWorkspace(request.q_nope.device),
             False,
             None,
             None,
@@ -695,14 +714,14 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
         )
         if request.out is None:
             self._out = torch.empty(
-                request.query.shape[:-1] + (request.kv_lora_rank,),
-                dtype=request.query.dtype,
-                device=request.query.device,
+                request.q_nope.shape,
+                dtype=request.q_nope.dtype,
+                device=request.q_nope.device,
             )
         else:
             self._out = request.out
         self._inputs = [
-            request.query,
+            request.q_nope,
             request.block_tables,
             request.seq_lens,
             self._out,
@@ -757,9 +776,9 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
         if prepared is None:
             prepared = _prepare_functional_fa_request(request)
         module_args = (
-            request.query.dtype,
-            request.kv_cache.dtype,
-            request.query.dtype,
+            prepared.q_nope.dtype,
+            prepared.ckv_cache.dtype,
+            prepared.q_nope.dtype,
             prepared.csr.qo_indptr.dtype,
             request.kv_lora_rank,
             request.qk_rope_head_dim,
@@ -773,11 +792,11 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
             kv_len_arr=prepared.csr.kv_len_arr,
             num_heads=prepared.q_nope.shape[1],
             head_dim_ckv=request.kv_lora_rank,
-            page_size=request.kv_cache.shape[1],
+            page_size=prepared.ckv_cache.shape[1],
             causal=False,
             sm_scale=_require_functional_scalar_scale("bmm1_scale", request.bmm1_scale),
-            q_data_type=request.query.dtype,
-            kv_data_type=request.kv_cache.dtype,
+            q_data_type=prepared.q_nope.dtype,
+            kv_data_type=prepared.ckv_cache.dtype,
             use_profiler=False,
         )
         result = self._run_generated_fa_after_input_validation(
@@ -793,7 +812,8 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
             ckv_scale=1.0,
             kpe_scale=1.0,
         )
-        output_shape = request.query.shape[:-1] + (request.kv_lora_rank,)
+        assert request.q_nope is not None
+        output_shape = request.q_nope.shape
         if not request.return_lse:
             if isinstance(result, tuple):
                 raise RuntimeError("generated FA MLA unexpectedly returned LSE output.")
@@ -822,10 +842,10 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
             )
         if len(inputs) != 4:
             raise ValueError("generated FA MLA runner expects four dynamic inputs.")
-        query, block_tables, seq_lens, out = inputs
+        q_nope, block_tables, seq_lens, out = inputs
         dynamic_request = replace(
             self.request,
-            query=query,
+            q_nope=q_nope,
             block_tables=block_tables,
             seq_lens=seq_lens,
             out=out,

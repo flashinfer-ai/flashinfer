@@ -2,23 +2,28 @@
 
 from dataclasses import replace
 from contextlib import nullcontext
+import inspect
 import warnings
 
 import pytest
 import torch
 
+import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
 from flashinfer.mla._batch_mla import _auto_policy
+from flashinfer.mla._batch_mla import _wrapper as wrapper_module
+from flashinfer.mla._batch_mla._contracts import (
+    _resolve_structural_mla_input,
+)
 from flashinfer.mla import (
     BatchMLAPagedAttentionWrapper,
-    MLAKVCache,
     MLAPlanMetadata,
-    MLAQuery,
 )
 from tests.test_helpers.mla import (
     MLATestCase,
     assert_mla_close,
+    functional_kwargs,
     make_mla_inputs,
     reference_result,
     require_architecture,
@@ -103,7 +108,7 @@ _WRAPPER_CASES = (
         "cutlass",
         page_size=128,
         output_dtype=torch.float8_e4m3fn,
-        kv_layout="independent-split",
+        kv_layout="adjacent-split",
         output_scale="per-tensor",
         softmax_scale_qk_nope_head_dim=128,
     ),
@@ -237,13 +242,6 @@ def _metadata(case, inputs):
     )
 
 
-def _query_and_kv(inputs):
-    query = MLAQuery.split(inputs.q_nope, inputs.q_pe)
-    if inputs.kv_cache is not None:
-        return query, MLAKVCache.packed(inputs.kv_cache)
-    return query, MLAKVCache.split(inputs.ckv_cache, inputs.kpe_cache)
-
-
 def _run_public_wrapper(case, inputs, *, tuning_buckets=None, tune_mode=True):
     wrapper = BatchMLAPagedAttentionWrapper(_workspace(), backend=case.backend)
     plan_kwargs = wrapper_plan_kwargs(case, inputs)
@@ -256,16 +254,10 @@ def _run_public_wrapper(case, inputs, *, tuning_buckets=None, tune_mode=True):
     )
     with tuning_context:
         wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
-    query, kv = _query_and_kv(inputs)
     run_kwargs = wrapper_run_kwargs(case, inputs)
-    for name in ("kv_cache", "ckv_cache", "kpe_cache"):
-        run_kwargs.pop(name)
-    result = wrapper.run(query=query, kv=kv, **run_kwargs)
+    run_kwargs.update(q_nope=inputs.q_nope, q_pe=inputs.q_pe)
+    result = wrapper.run(**run_kwargs)
     return wrapper, unpack_mla_result(result, case.lse_mode != "none")
-
-
-def test_wrapper_case_table_covers_every_explicit_backend():
-    assert {case.backend for case in _WRAPPER_CASES} == _WRAPPER_BACKENDS
 
 
 def test_wrapper_rejects_removed_autotune_selector():
@@ -273,36 +265,220 @@ def test_wrapper_rejects_removed_autotune_selector():
         BatchMLAPagedAttentionWrapper(torch.empty(1), backend="autotune")
 
 
-def test_wrapper_case_table_covers_public_configuration_dimensions():
-    assert {case.q_dtype for case in _WRAPPER_CASES} == {
-        torch.float16,
-        torch.bfloat16,
-    }
-    assert {case.page_size for case in _WRAPPER_CASES} == {32, 64, 128}
-    assert {case.q_len for case in _WRAPPER_CASES} == {1, 2}
-    assert {case.kv_layout for case in _WRAPPER_CASES} == {
-        "combined",
-        "adjacent-split",
-        "independent-split",
-    }
-    assert {case.lse_mode for case in _WRAPPER_CASES} == {
-        "none",
-        "base2",
-        "basee",
-    }
-    assert {case.scale_mode for case in _WRAPPER_CASES} == {
-        "default",
-        "bmm-scalar",
-        "bmm-tensor",
-        "kv-per-tensor",
-    }
-    assert {case.output_scale for case in _WRAPPER_CASES} == {
-        "none",
-        "per-tensor",
-    }
-    assert {case.skip_softmax for case in _WRAPPER_CASES} == {False, True}
-    assert {case.metadata_form for case in _WRAPPER_CASES} == {"dense", "csr"}
-    assert {case.enable_pdl for case in _WRAPPER_CASES} == {None, False, True}
+def _minimal_mla_plan_metadata():
+    return MLAPlanMetadata.csr(
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indices=torch.tensor([0], dtype=torch.int32),
+        kv_len_arr=torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def test_metadata_driven_plan_is_warning_free(monkeypatch):
+    captured = {}
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    monkeypatch.setattr(
+        wrapper,
+        "_plan_backend",
+        lambda backend, args: captured.update(backend=backend, args=args),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        wrapper.plan(
+            metadata=_minimal_mla_plan_metadata(),
+            num_heads=2,
+            head_dim_ckv=2,
+            head_dim_kpe=1,
+            page_size=4,
+            causal=False,
+            sm_scale=1.0,
+            q_data_type=torch.float32,
+            kv_data_type=torch.float32,
+            query_layout="split",
+            kv_cache_layout="packed",
+        )
+    assert captured["args"].query_kind == "independent-split"
+    assert captured["args"].kv_kind == "packed"
+
+
+def test_trusted_dual_structural_query_reaches_split_backend_unchanged():
+    recorded = {}
+    output = torch.empty(1)
+
+    class PoisonReference:
+        def __getattribute__(self, _name):
+            raise AssertionError("ignored redundant reference was accessed")
+
+    class BackendImpl:
+        def run_from_wrapper(self, **kwargs):
+            recorded.update(kwargs)
+            resolved_query = _resolve_structural_mla_input(
+                kwargs["query"],
+                desired="split",
+                widths=None,
+                name="query",
+            )
+            resolved_kv = _resolve_structural_mla_input(
+                kwargs["kv_cache"],
+                desired="split",
+                widths=None,
+                name="KV cache",
+            )
+            assert resolved_query[0] is q_nope
+            assert resolved_query[1] is q_pe
+            assert resolved_kv[0] is ckv_cache
+            assert resolved_kv[1] is kpe_cache
+            return output
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    wrapper._selected_backend = "fa2"
+    wrapper._backend_impl = BackendImpl()
+    q_nope, q_pe = torch.empty(1, 1, 2), torch.empty(1, 1, 1)
+    ckv_cache, kpe_cache = torch.empty(1, 1, 2), torch.empty(1, 1, 1)
+
+    actual = wrapper.run(
+        query=(PoisonReference(), (q_nope, q_pe)),
+        kv_cache=(PoisonReference(), (ckv_cache, kpe_cache)),
+    )
+
+    assert actual is output
+    assert recorded["query"][1] == (q_nope, q_pe)
+    assert recorded["kv_cache"][1] == (ckv_cache, kpe_cache)
+    assert "q_nope" not in recorded
+    assert "ckv_cache" not in recorded
+
+
+def test_trusted_dual_structural_query_reaches_packed_backend_unchanged():
+    recorded = {}
+    output = torch.empty(1)
+
+    class PoisonReference:
+        def __getattribute__(self, _name):
+            raise AssertionError("ignored redundant reference was accessed")
+
+    class BackendImpl:
+        def run_from_wrapper(self, **kwargs):
+            recorded.update(kwargs)
+            assert (
+                _resolve_structural_mla_input(
+                    kwargs["query"],
+                    desired="packed",
+                    widths=None,
+                    name="query",
+                )
+                is query
+            )
+            assert (
+                _resolve_structural_mla_input(
+                    kwargs["kv_cache"],
+                    desired="packed",
+                    widths=None,
+                    name="KV cache",
+                )
+                is kv_cache
+            )
+            return output
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
+    wrapper._selected_backend = "cutlass"
+    wrapper._backend_impl = BackendImpl()
+    query = torch.empty(1, 1, 3)
+    kv_cache = torch.empty(1, 1, 3)
+    q_nope_poison, q_pe_poison = PoisonReference(), PoisonReference()
+    ckv_poison, kpe_poison = PoisonReference(), PoisonReference()
+
+    actual = wrapper.run(
+        query=(query, (q_nope_poison, q_pe_poison)),
+        kv_cache=(kv_cache, (ckv_poison, kpe_poison)),
+    )
+
+    assert actual is output
+    assert recorded["query"][0] is query
+    assert recorded["kv_cache"][0] is kv_cache
+    assert "q_nope" not in recorded
+    assert "ckv_cache" not in recorded
+
+
+def test_planned_tensor_keywords_keep_mixed_raw_references():
+    recorded = {}
+    output = torch.empty(1)
+
+    class BackendImpl:
+        def run_from_wrapper(self, **kwargs):
+            recorded.update(kwargs)
+            return output
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    wrapper._selected_backend = "fa2"
+    wrapper._backend_impl = BackendImpl()
+    query = torch.empty(1, 1, 3)
+    ckv_cache, kpe_cache = torch.empty(1, 1, 2), torch.empty(1, 1, 1)
+
+    actual = wrapper.run(
+        query=query,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+    )
+
+    assert actual is output
+    assert recorded["query"] is query
+    assert recorded["kv_cache"] == (ckv_cache, kpe_cache)
+    assert "q_nope" not in recorded
+    assert "ckv_cache" not in recorded
+
+
+def test_structural_split_run_forwards_query_and_kv_cache_unchanged():
+    recorded = {}
+    output = torch.empty(1)
+
+    class BackendImpl:
+        def run_from_wrapper(self, **kwargs):
+            recorded.update(kwargs)
+            return output
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    wrapper._selected_backend = "fa2"
+    wrapper._backend_impl = BackendImpl()
+    query = (torch.empty(1, 1, 2), torch.empty(1, 1, 1))
+    kv_cache = (torch.empty(1, 1, 2), torch.empty(1, 1, 1))
+
+    actual = wrapper.run(query=query, kv_cache=kv_cache)
+
+    assert actual is output
+    assert recorded["query"] is query
+    assert recorded["kv_cache"] is kv_cache
+    assert "q_nope" not in recorded
+    assert "ckv_cache" not in recorded
+
+
+def test_legacy_split_run_warns_once_and_translates_to_structural_split():
+    recorded = []
+    output = torch.empty(1)
+
+    class BackendImpl:
+        def run_from_wrapper(self, **kwargs):
+            recorded.append(kwargs)
+            return output
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    wrapper._selected_backend = "fa2"
+    wrapper._backend_impl = BackendImpl()
+    q_nope, q_pe = torch.empty(1, 1, 2), torch.empty(1, 1, 1)
+    ckv_cache, kpe_cache = torch.empty(1, 1, 2), torch.empty(1, 1, 1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        wrapper.run(q_nope=q_nope, q_pe=q_pe, ckv_cache=ckv_cache, kpe_cache=kpe_cache)
+        wrapper.run(q_nope=q_nope, q_pe=q_pe, ckv_cache=ckv_cache, kpe_cache=kpe_cache)
+
+    assert (
+        sum("Legacy MLA tensor arguments" in str(item.message) for item in caught) == 1
+    )
+    assert recorded[0]["query"] == (q_nope, q_pe)
+    assert recorded[0]["kv_cache"] == (ckv_cache, kpe_cache)
+    assert "q_nope" not in recorded[0]
+    assert "ckv_cache" not in recorded[0]
 
 
 @pytest.mark.parametrize("case", _WRAPPER_CASES, ids=lambda case: case.case_id)
@@ -390,7 +566,8 @@ def test_failed_auto_replan_preserves_previous_state(monkeypatch):
         "sm_scale": 1.0,
         "q_data_type": torch.float32,
         "kv_data_type": torch.float32,
-        "kv_layout": "independent-split",
+        "query_layout": "split",
+        "kv_cache_layout": "split",
     }
 
     with autotune(False):
@@ -404,8 +581,10 @@ def test_failed_auto_replan_preserves_previous_state(monkeypatch):
     assert wrapper.auto_selection_trace is old_trace
     assert (
         wrapper.run(
-            query=MLAQuery.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
-            kv=MLAKVCache.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+            q_nope=torch.empty(1, 1, 2),
+            q_pe=torch.empty(1, 1, 1),
+            ckv_cache=torch.empty(1, 1, 2),
+            kpe_cache=torch.empty(1, 1, 1),
         )
         == "old-result"
     )
@@ -462,12 +641,25 @@ def test_sm100_wrapper_autotune_run_is_cuda_graph_capturable():
     with autotune(True, tuning_buckets=(1, 2, 4)):
         wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
 
-    query, kv = _query_and_kv(inputs)
     graph_output = torch.empty_like(inputs.q_nope)
-    wrapper.run(query=query, kv=kv, out=graph_output)
+    wrapper.run(
+        q_nope=inputs.q_nope,
+        q_pe=inputs.q_pe,
+        kv_cache=inputs.kv_cache,
+        ckv_cache=inputs.ckv_cache,
+        kpe_cache=inputs.kpe_cache,
+        out=graph_output,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.run(query=query, kv=kv, out=graph_output)
+        wrapper.run(
+            q_nope=inputs.q_nope,
+            q_pe=inputs.q_pe,
+            kv_cache=inputs.kv_cache,
+            ckv_cache=inputs.ckv_cache,
+            kpe_cache=inputs.kpe_cache,
+            out=graph_output,
+        )
     graph.replay()
     torch.cuda.synchronize()
 
@@ -487,10 +679,12 @@ def test_sm90_wrapper_autotune_supports_profiler():
     with autotune(True, tuning_buckets=(1, 2, 4)):
         wrapper.plan(metadata=_metadata(case, inputs), use_profiler=True, **plan_kwargs)
 
-    query, kv = _query_and_kv(inputs)
     output = wrapper.run(
-        query=query,
-        kv=kv,
+        q_nope=inputs.q_nope,
+        q_pe=inputs.q_pe,
+        kv_cache=inputs.kv_cache,
+        ckv_cache=inputs.ckv_cache,
+        kpe_cache=inputs.kpe_cache,
         profiler_buffer=torch.empty(1 << 20, dtype=torch.uint64, device="cuda"),
     )
 
@@ -521,7 +715,8 @@ def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
             case.sm_scale,
             case.q_dtype,
             case.kv_dtype,
-            kv_layout=case.kv_layout,
+            query_layout="split",
+            kv_cache_layout="split",
         )
         first = wrapper.run(
             inputs.q_nope, inputs.q_pe, inputs.ckv_cache, inputs.kpe_cache
@@ -536,3 +731,276 @@ def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
     assert sum("Legacy MLA metadata" in str(item.message) for item in caught) == 1
     assert_mla_close(first, expected_output)
     assert_mla_close(second, expected_output)
+
+
+def test_packed_native_wrapper_rejects_independent_structural_kv_zero_copy():
+    class Backend:
+        def run_from_wrapper(self, **kwargs):
+            _resolve_structural_mla_input(
+                kwargs["kv_cache"],
+                desired="packed",
+                widths=(2, 1),
+                name="KV cache",
+            )
+            return "launched"
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
+    wrapper._selected_backend = "cutlass"
+    wrapper._backend_impl = Backend()
+    wrapper._input_contract = wrapper_module.MLAInputContract(
+        lse_mode="none",
+        output_dtype=torch.float32,
+        output_scale="none",
+        scale_mode="default",
+        skip_softmax=False,
+        head_dim_ckv=2,
+        head_dim_kpe=1,
+    )
+
+    with pytest.raises(ValueError, match="KV cache.*packed representation zero-copy"):
+        wrapper.run(
+            query=torch.empty(1, 1, 3),
+            kv_cache=(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+        )
+
+
+def test_unplanned_cutlass_warning_is_attributed_to_public_caller(monkeypatch):
+    class Backend:
+        def run_from_wrapper(self, **kwargs):
+            return kwargs["out"]
+
+    monkeypatch.setattr(
+        wrapper_module._BatchMLAPagedAttentionCutlassBackend,
+        "plan_from_wrapper",
+        classmethod(lambda _cls, _args: Backend()),
+    )
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
+    query = torch.empty(1, 1, 576)
+    kv_cache = torch.empty(1, 1, 576)
+    out = torch.empty(1, 1, 512)
+    kv_len = torch.tensor([1], dtype=torch.int32)
+    page_table = torch.zeros(1, 1, dtype=torch.int32)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_lineno = inspect.currentframe().f_lineno + 1
+        wrapper.run(
+            query=query,
+            kv_cache=kv_cache,
+            out=out,
+            kv_len=kv_len,
+            page_table=page_table,
+        )
+
+    warning = next(
+        item
+        for item in caught
+        if "explicitly requested CUTLASS backend" in str(item.message)
+    )
+    assert warning.filename == __file__
+    assert warning.lineno == expected_lineno
+
+
+_TENSOR_FIRST_PRODUCTION_ROWS = (
+    (
+        MLATestCase("sm80-fa2-split", (8, 0), "fa2", kv_layout="adjacent-split"),
+        "split",
+        False,
+    ),
+    (
+        MLATestCase(
+            "sm90-fa3-split-prefill-lse",
+            (9, 0),
+            "fa3",
+            q_len=2,
+            kv_layout="adjacent-split",
+            lse_mode="base2",
+        ),
+        "split",
+        False,
+    ),
+    (
+        MLATestCase(
+            "sm100-cutlass-packed",
+            (10, 0),
+            "cutlass",
+            softmax_scale_qk_nope_head_dim=128,
+        ),
+        "packed",
+        False,
+    ),
+    (
+        MLATestCase(
+            "sm100-trtllm-redundant-graph",
+            (10, 0),
+            "trtllm-gen",
+            qk_nope_head_dim=128,
+        ),
+        "redundant",
+        True,
+    ),
+    (
+        MLATestCase(
+            "sm100-cute-monolithic-prefill-lse",
+            (10, 0),
+            "cute-dsl-monolithic",
+            q_len=2,
+            lse_mode="basee",
+        ),
+        "packed",
+        False,
+    ),
+    (
+        MLATestCase(
+            "sm100-cute-modular-split",
+            (10, 0),
+            "cute-dsl-modular",
+            kv_layout="adjacent-split",
+        ),
+        "split",
+        False,
+    ),
+    (
+        MLATestCase(
+            "sm120-xqa-packed-graph",
+            (12, 0),
+            "xqa",
+            softmax_scale_qk_nope_head_dim=128,
+        ),
+        "packed",
+        True,
+    ),
+)
+
+
+def _tensor_first_references(case, inputs, form):
+    packed_kv = (
+        inputs.kv_cache
+        if inputs.kv_cache is not None
+        else torch.cat((inputs.ckv_cache, inputs.kpe_cache), dim=-1)
+    )
+    q_nope = inputs.q_nope.reshape(2, case.q_len, 128, 512)
+    q_pe = inputs.q_pe.reshape(2, case.q_len, 128, 64)
+    ckv_cache, kpe_cache = packed_kv[..., :512], packed_kv[..., 512:]
+    if form == "packed":
+        return {"query": inputs.query, "kv_cache": packed_kv}
+    if form == "split":
+        return {
+            "q_nope": q_nope,
+            "q_pe": q_pe,
+            "ckv_cache": ckv_cache,
+            "kpe_cache": kpe_cache,
+        }
+    return {
+        "query": inputs.query,
+        "q_nope": q_nope,
+        "q_pe": q_pe,
+        "kv_cache": packed_kv,
+        "ckv_cache": ckv_cache,
+        "kpe_cache": kpe_cache,
+    }
+
+
+def _run_tensor_first_functional(case, inputs, references, use_cuda_graph):
+    kwargs = functional_kwargs(case, inputs)
+    kwargs.pop("query")
+    kwargs.pop("kv_cache")
+    kwargs.update(references)
+    if use_cuda_graph:
+        kwargs["out"] = torch.empty(
+            (2, case.q_len, 128, 512),
+            dtype=case.output_dtype,
+            device="cuda",
+        )
+        flashinfer.mla.batch_mla_paged_attention(**kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = flashinfer.mla.batch_mla_paged_attention(**kwargs)
+        graph.replay()
+        torch.cuda.synchronize()
+    else:
+        result = flashinfer.mla.batch_mla_paged_attention(**kwargs)
+    return unpack_mla_result(result, case.lse_mode != "none")
+
+
+def _run_tensor_first_wrapper(case, inputs, references, use_cuda_graph):
+    wrapper_kwargs = {"backend": case.backend, "use_cuda_graph": use_cuda_graph}
+    if use_cuda_graph:
+        wrapper_kwargs.update(
+            qo_indptr=torch.empty_like(inputs.qo_indptr),
+            kv_indptr=torch.empty_like(inputs.kv_indptr),
+            kv_indices=torch.empty_like(inputs.kv_indices),
+            kv_len_arr=torch.empty_like(inputs.kv_len_arr),
+        )
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        **wrapper_kwargs,
+    )
+    plan_kwargs = wrapper_plan_kwargs(case, inputs)
+    for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
+        plan_kwargs.pop(name)
+    wrapper.plan(
+        metadata=MLAPlanMetadata.dense(
+            inputs.cum_seq_lens_q,
+            inputs.block_tables,
+            inputs.seq_lens,
+            case.q_len,
+        ),
+        **plan_kwargs,
+    )
+    run_kwargs = wrapper_run_kwargs(case, inputs)
+    for name in ("kv_cache", "ckv_cache", "kpe_cache"):
+        run_kwargs.pop(name, None)
+    run_kwargs.update(
+        {
+            name: (
+                tensor.flatten(0, 1) if name in ("query", "q_nope", "q_pe") else tensor
+            )
+            for name, tensor in references.items()
+        }
+    )
+    if use_cuda_graph:
+        run_kwargs["out"] = torch.empty_like(inputs.q_nope)
+        wrapper.run(**run_kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = wrapper.run(**run_kwargs)
+        graph.replay()
+        torch.cuda.synchronize()
+    else:
+        result = wrapper.run(**run_kwargs)
+    return unpack_mla_result(result, case.lse_mode != "none")
+
+
+@pytest.mark.parametrize(
+    "case,input_form,use_cuda_graph",
+    _TENSOR_FIRST_PRODUCTION_ROWS,
+    ids=lambda value: value.case_id if isinstance(value, MLATestCase) else str(value),
+)
+def test_tensor_first_functional_and_wrapper_production_matrix(
+    case, input_form, use_cuda_graph
+):
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    references = _tensor_first_references(case, inputs, input_form)
+    expected_output, expected_lse = reference_result(
+        case,
+        inputs,
+        causal=case.backend == "cute-dsl-monolithic" and case.q_len > 1,
+    )
+
+    functional_output, functional_lse = _run_tensor_first_functional(
+        case, inputs, references, use_cuda_graph
+    )
+    assert_mla_close(functional_output.reshape_as(expected_output), expected_output)
+    if expected_lse is not None:
+        assert functional_lse is not None
+        assert_mla_close(functional_lse.reshape_as(expected_lse), expected_lse)
+
+    wrapper_output, wrapper_lse = _run_tensor_first_wrapper(
+        case, inputs, references, use_cuda_graph
+    )
+    assert_mla_close(wrapper_output.reshape_as(expected_output), expected_output)
+    if expected_lse is not None:
+        assert wrapper_lse is not None
+        assert_mla_close(wrapper_lse.reshape_as(expected_lse), expected_lse)

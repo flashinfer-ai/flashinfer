@@ -18,15 +18,15 @@ import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.jit.mla import gen_mla_module
-from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
+from ._capabilities import (
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import _MLAPlanArguments
 from .._contracts import (
-    MLAKVCache,
-    MLAQuery,
     _FunctionalMLARequest,
     _FunctionalMLARunner,
-    _concat_adjacent_views_or_cat,
-    _split_mla_value_objects,
+    _resolve_structural_mla_input,
 )
 from flashinfer.utils import check_shape_dtype_device, get_compute_capability
 
@@ -136,18 +136,22 @@ def get_mla_module():
 class _BatchMLAPagedAttentionCutlassBackend:
     """CUTLASS MLA backend with plan-preferred launch metadata.
 
-    The public query and cache inputs remain split into NoPE/PE tensors and are
-    concatenated internally for the launcher. ``kv_len`` and ``page_table`` may
-    be captured by :meth:`plan`; :meth:`run` then uses those planned tensors
-    unless callers provide cheap-verified aliases of the same tensor views.
+    The wrapper passes six raw packed/split query and cache references. This
+    backend resolves packed launcher inputs itself, permits a bounded copy for
+    an independent split query, and retains the deprecated compatibility copy
+    for independent split KV. ``kv_len`` and ``page_table`` may be captured by
+    :meth:`plan`; :meth:`run` then uses those planned tensors unless callers
+    provide cheap-verified aliases of the same tensor views.
     """
 
     _plan_capabilities = MLAPlanCapabilities(
         backend_name="cutlass",
         lse_modes=frozenset({"none"}),
-        kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
+        kv_layouts=frozenset({"combined", "adjacent-split"}),
         output_scales=frozenset({"none", "per-tensor"}),
         scale_modes=frozenset({"default"}),
+        requires_packed_query=True,
+        requires_packed_kv_cache=True,
     )
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
@@ -284,6 +288,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
         self._batch_size = batch_size
         self._page_size = page_size
         self._head_dim_ckv = head_dim_ckv
+        self._head_dim_kpe = head_dim_kpe
         self._kv_len = kv_len
         self._page_table = page_table
         self._cached_module = get_mla_module()
@@ -378,8 +383,8 @@ class _BatchMLAPagedAttentionCutlassBackend:
     def run_from_wrapper(
         self,
         *,
-        query: MLAQuery,
-        kv: MLAKVCache,
+        query: object,
+        kv_cache: object,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -395,6 +400,18 @@ class _BatchMLAPagedAttentionCutlassBackend:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        packed_query = _resolve_structural_mla_input(
+            query,
+            desired="packed",
+            widths=(self._head_dim_ckv, self._head_dim_kpe),
+            name="query",
+        )
+        kv_cache = _resolve_structural_mla_input(
+            kv_cache,
+            desired="packed",
+            widths=(self._head_dim_ckv, self._head_dim_kpe),
+            name="KV cache",
+        )
         self._validate_wrapper_run_options(
             lse=lse,
             return_lse=return_lse,
@@ -407,80 +424,9 @@ class _BatchMLAPagedAttentionCutlassBackend:
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
         )
-        packed_query = query.require_packed()
-        kv_cache = kv.packed_or_adjacent()
-        if kv_cache is None:
-            ckv_cache, kpe_cache = kv.split_views(None)
-            kv_cache = _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
         return self.run(
             query=packed_query,
             kv_cache=kv_cache,
-            out=out,
-            kv_len=kv_len,
-            page_table=page_table,
-            o_scale=o_scale,
-        )
-
-    @classmethod
-    def run_unplanned_from_wrapper(
-        cls,
-        float_workspace_buffer: torch.Tensor,
-        *,
-        query: MLAQuery,
-        kv: MLAKVCache,
-        out: Optional[torch.Tensor],
-        lse: Optional[torch.Tensor],
-        return_lse: bool,
-        profiler_buffer: Optional[torch.Tensor],
-        kv_len: Optional[torch.Tensor],
-        page_table: Optional[torch.Tensor],
-        return_lse_base_on_e: bool,
-        o_scale: Optional[float],
-        ckv_scale: Optional[float],
-        kpe_scale: Optional[float],
-        sinks: Optional[torch.Tensor],
-        skip_softmax_threshold_scale_factor: Optional[float],
-        bmm1_scale: Optional[Union[float, torch.Tensor]],
-        bmm2_scale: Optional[Union[float, torch.Tensor]],
-    ) -> torch.Tensor:
-        """Run the deprecated explicit-CUTLASS compatibility path without plan()."""
-        cls._validate_wrapper_run_options(
-            lse=lse,
-            return_lse=return_lse,
-            profiler_buffer=profiler_buffer,
-            return_lse_base_on_e=return_lse_base_on_e,
-            ckv_scale=ckv_scale,
-            kpe_scale=kpe_scale,
-            sinks=sinks,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-        )
-        q_nope, q_pe, ckv_cache, kpe_cache = _split_mla_value_objects(query, kv, None)
-        packed_query = query.require_packed()
-        kv_cache = kv.packed_or_adjacent()
-        backend = cls(float_workspace_buffer)
-        backend.plan(
-            num_heads=q_nope.shape[1],
-            head_dim_ckv=q_nope.shape[2],
-            head_dim_kpe=q_pe.shape[2],
-            page_size=ckv_cache.shape[1],
-            causal=False,
-            sm_scale=1.0 / math.sqrt(128 + q_pe.shape[2]),
-            q_data_type=q_nope.dtype,
-            kv_data_type=ckv_cache.dtype,
-            use_profiler=False,
-            batch_size=q_nope.shape[0],
-            kv_len=None,
-            page_table=None,
-        )
-        return backend.run(
-            query=packed_query,
-            kv_cache=(
-                _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
-                if kv_cache is None
-                else kv_cache
-            ),
             out=out,
             kv_len=kv_len,
             page_table=page_table,
@@ -564,12 +510,15 @@ class CutlassMlaRunner(_FunctionalMLARunner):
     """Direct functional runner for the fixed-shape CUTLASS MLA kernel."""
 
     name = "cutlass"
+    native_query_representation = "packed"
+    native_kv_representation = "packed"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
         super().__init__(request)
         self._validate_functional_options(request)
         initial_out = request.out
         if initial_out is None:
+            assert request.query is not None
             initial_out = torch.empty(
                 request.query.shape[:-1] + (request.kv_lora_rank,),
                 dtype=request.query.dtype,

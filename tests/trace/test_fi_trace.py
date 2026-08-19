@@ -746,6 +746,58 @@ def test_mla_paged_fi_trace():
     assert ckv_scale_arr_defn["optional"] is True
 
 
+def test_mla_paged_fi_trace_accepts_structural_split_and_dual_inputs():
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    q_nope = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    q_pe = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+    ckv_cache = torch.randn(5, 7, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.randn(5, 7, 3, dtype=torch.bfloat16)
+    packed_query = torch.empty(2, 4, 11, dtype=torch.bfloat16)
+    packed_kv = torch.empty(5, 7, 11, dtype=torch.bfloat16)
+
+    split = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        query=(q_nope, q_pe), kv_cache=(ckv_cache, kpe_cache)
+    )
+    dual_packed_first = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        query=(packed_query, (q_nope, q_pe)),
+        kv_cache=(packed_kv, (ckv_cache, kpe_cache)),
+    )
+    dual_split_first = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        query=((q_nope, q_pe), object()),
+        kv_cache=((ckv_cache, kpe_cache), object()),
+    )
+
+    for defn in (split, dual_packed_first, dual_split_first):
+        _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
+        axes = defn["axes"]
+        assert axes["num_qo_heads"]["value"] == 4
+        assert axes["head_dim_ckv"]["value"] == 8
+        assert axes["head_dim_kpe"]["value"] == 3
+        assert axes["page_size"]["value"] == 7
+
+
+def test_mla_paged_fi_trace_splits_packed_structural_inputs_from_explicit_widths():
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    packed_query = torch.randn(2, 4, 11, dtype=torch.bfloat16)
+    packed_kv = torch.randn(5, 7, 11, dtype=torch.bfloat16)
+
+    defn = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        query=packed_query,
+        kv_cache=packed_kv,
+        head_dim_ckv=8,
+        head_dim_kpe=3,
+    )
+
+    _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
+    axes = defn["axes"]
+    assert axes["num_qo_heads"]["value"] == 4
+    assert axes["head_dim_ckv"]["value"] == 8
+    assert axes["head_dim_kpe"]["value"] == 3
+    assert axes["page_size"]["value"] == 7
+
+
 # ---------------------------------------------------------------------------
 # GDN decode
 # ---------------------------------------------------------------------------
@@ -991,7 +1043,7 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     _check_defn(
         dense,
         "mla_paged",
-        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+        "flashinfer.mla._batch_mla._functional.trtllm_batch_decode_with_kv_cache_mla",
     )
     assert dense["name"].startswith("trtllm_batch_decode_mla_dense")
     assert dense["inputs"]["query"]["shape"] == [
@@ -1016,7 +1068,7 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     _check_defn(
         ragged,
         "mla_paged",
-        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+        "flashinfer.mla._batch_mla._functional.trtllm_batch_decode_with_kv_cache_mla",
     )
     assert ragged["name"].startswith("trtllm_batch_decode_mla_ragged")
     assert ragged["inputs"]["query"]["shape"] == [
@@ -1037,19 +1089,28 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     (
         (
             "trtllm_batch_decode_with_kv_cache_mla",
-            "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+            "flashinfer.mla._batch_mla._functional.trtllm_batch_decode_with_kv_cache_mla",
         ),
         (
             "batch_mla_paged_attention",
-            "flashinfer.mla._core.batch_mla_paged_attention",
+            "flashinfer.mla._batch_mla._functional.batch_mla_paged_attention",
         ),
     ),
 )
 def test_neutral_mla_public_apis_have_independent_single_trace_identity(
-    api_name, fi_api
+    api_name, fi_api, monkeypatch
 ):
     """A facade must retain one public trace node rather than nesting another API."""
     import flashinfer.mla
+
+    if api_name == "trtllm_batch_decode_with_kv_cache_mla":
+        import flashinfer.mla._batch_mla._functional as mla_functional
+
+        monkeypatch.setattr(
+            mla_functional,
+            "_trtllm_batch_decode_with_kv_cache_mla_warning_emitted",
+            False,
+        )
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

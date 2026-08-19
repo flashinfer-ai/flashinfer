@@ -153,6 +153,9 @@ def _cute_dsl_incompatibility_reason(
 class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
     """Wrapper-free functional CuTe runner mechanics for concrete bindings."""
 
+    native_query_representation = "packed"
+    native_kv_representation = "packed"
+
     def __init__(
         self,
         request: _FunctionalMLARequest,

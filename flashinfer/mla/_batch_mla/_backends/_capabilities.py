@@ -21,6 +21,8 @@ class MLAPlanCapabilities:
     supports_is_var_seq: bool = False
     supports_sinks: bool = False
     supports_qk_nope_head_dim: bool = False
+    requires_packed_query: bool = False
+    requires_packed_kv_cache: bool = False
 
 
 class _CapabilityPlanArguments(Protocol):
@@ -51,6 +53,12 @@ class _CapabilityPlanArguments(Protocol):
     @property
     def qk_nope_head_dim(self) -> Optional[int]: ...
 
+    @property
+    def query_kind(self) -> Optional[str]: ...
+
+    @property
+    def kv_kind(self) -> Optional[str]: ...
+
 
 def validate_plan_capabilities(
     args: _CapabilityPlanArguments,
@@ -59,6 +67,10 @@ def validate_plan_capabilities(
     """Reject unsupported cross-backend options before backend construction."""
 
     backend_name = capabilities.backend_name
+    if (
+        reason := structural_eligibility_rejection_reason(args, capabilities)
+    ) is not None:
+        raise _BackendPlanUnsupportedError(reason)
     if args.lse_mode not in capabilities.lse_modes:
         raise _BackendPlanUnsupportedError(
             f"{backend_name} backend does not support this LSE contract."
@@ -121,3 +133,22 @@ def validate_plan_capabilities(
         raise _BackendPlanUnsupportedError(
             f"qk_nope_head_dim is not supported by the {backend_name} backend contract."
         )
+
+
+def structural_eligibility_rejection_reason(
+    args: _CapabilityPlanArguments,
+    capabilities: MLAPlanCapabilities,
+) -> str | None:
+    """Return why representative inputs cannot meet native layout requirements."""
+
+    if capabilities.requires_packed_query and args.query_kind == "independent-split":
+        return (
+            f"{capabilities.backend_name} backend requires a packed query view; "
+            "representative query is independent split-only."
+        )
+    if capabilities.requires_packed_kv_cache and args.kv_kind == "independent-split":
+        return (
+            f"{capabilities.backend_name} backend requires a packed KV-cache view; "
+            "representative kv_cache is independent split-only."
+        )
+    return None

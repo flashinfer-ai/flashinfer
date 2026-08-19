@@ -590,7 +590,10 @@ def testBatchMLAPagedAttentionWrapper(args):
         enable_pdl=args.enable_pdl,
         use_sinks=args.mla_use_sinks,
         lse_mode=args.mla_lse_mode,
-        kv_layout=args.mla_kv_layout,
+        query_layout="packed",
+        kv_cache_layout=(
+            "packed" if args.mla_kv_layout != "independent-split" else "split"
+        ),
         output_dtype=out_dtype,
         output_scale=args.mla_output_scale,
         scale_mode=args.mla_scale_mode,

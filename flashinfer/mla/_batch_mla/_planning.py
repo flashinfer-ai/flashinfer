@@ -10,7 +10,7 @@ from typing import Literal, Optional, Protocol, Tuple
 
 import torch
 
-from ._contracts import MLAInputContract, MLAPlanMetadata
+from ._contracts import MLAInputContract, MLAPlanMetadata, MLAStructuralInputKind
 
 
 _MLALSEMode = Literal["none", "base2", "basee"]
@@ -587,6 +587,10 @@ class _MLAPlanArguments:
     sm_scale: float
     q_data_type: torch.dtype
     kv_data_type: torch.dtype
+    query_kind: Optional[MLAStructuralInputKind] = None
+    kv_kind: Optional[MLAStructuralInputKind] = None
+    query_layout: Literal["packed", "split"] = "packed"
+    kv_cache_layout: Literal["packed", "split"] = "packed"
     lse_mode: _MLALSEMode = "none"
     kv_layout: _MLAKVLayout = "independent-split"
     output_dtype: torch.dtype = torch.float16
@@ -616,6 +620,10 @@ class _MLAPlanArguments:
             raise ValueError(f"unsupported LSE mode {self.lse_mode!r}")
         if self.kv_layout not in ("combined", "adjacent-split", "independent-split"):
             raise ValueError(f"unsupported KV layout {self.kv_layout!r}")
+        if self.query_layout not in ("packed", "split"):
+            raise ValueError(f"unsupported query layout {self.query_layout!r}")
+        if self.kv_cache_layout not in ("packed", "split"):
+            raise ValueError(f"unsupported KV-cache layout {self.kv_cache_layout!r}")
         if not isinstance(self.output_dtype, torch.dtype):
             raise ValueError(
                 f"output_dtype must be a torch.dtype, got {self.output_dtype!r}"
@@ -663,16 +671,15 @@ class _MLAPlanArguments:
     def input_contract(self) -> MLAInputContract:
         """Return the run-time value-object contract for this plan."""
         return MLAInputContract(
-            query_split_widths=(self.head_dim_ckv, self.head_dim_kpe),
-            kv_split_widths=(self.head_dim_ckv, self.head_dim_kpe),
-            q_data_type=self.q_data_type,
-            kv_data_type=self.kv_data_type,
-            kv_layout=self.kv_layout,
             lse_mode=self.lse_mode,
             output_dtype=self.output_dtype,
             output_scale=self.output_scale,
             scale_mode=self.scale_mode,
             skip_softmax=self.skip_softmax,
+            query_layout=self.query_layout,
+            kv_cache_layout=self.kv_cache_layout,
+            head_dim_ckv=self.head_dim_ckv,
+            head_dim_kpe=self.head_dim_kpe,
         )
 
     @property

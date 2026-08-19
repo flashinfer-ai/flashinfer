@@ -25,8 +25,19 @@ from flashinfer.autotuner.initializers import (
 )
 
 from ._backends._fa_common import _BatchMLAGeneratedFaWorkspace
-from ._contracts import MLAKVCache, MLAPlanMetadata, MLAQuery
+from ._backends._capabilities import structural_eligibility_rejection_reason
+from ._contracts import (
+    MLAPlanMetadata,
+)
 from ._planning import _MLAPlanArguments
+
+
+def _structural_rejection_reason(
+    args: _MLAPlanArguments, candidate: str, backend_types: Mapping[str, Any]
+) -> str | None:
+    return structural_eligibility_rejection_reason(
+        args, backend_types[candidate]._plan_capabilities
+    )
 
 
 SM80_PREFERRED_BACKENDS = (
@@ -175,11 +186,11 @@ class _MLAAutotuneProfile:
 
 @dataclass(slots=True)
 class _SyntheticMLAPlan:
-    """Temporary value objects and plan arguments for one tuning bucket."""
+    """Temporary raw references and plan arguments for one tuning bucket."""
 
     args: _MLAPlanArguments
-    query: MLAQuery
-    kv: MLAKVCache
+    query: torch.Tensor
+    kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     output: torch.Tensor
     lse: torch.Tensor | None
     profiler_buffer: torch.Tensor | None
@@ -421,19 +432,19 @@ def build_synthetic_plan(
         template.head_dim_ckv + template.head_dim_kpe,
     )
     if template.kv_layout == "combined":
-        kv = MLAKVCache.packed(
-            torch.zeros(kv_shape, dtype=template.kv_data_type, device=query_4d.device)
+        kv_cache = torch.zeros(
+            kv_shape, dtype=template.kv_data_type, device=query_4d.device
         )
     elif template.kv_layout == "adjacent-split":
         storage = torch.zeros(
             kv_shape, dtype=template.kv_data_type, device=query_4d.device
         )
-        kv = MLAKVCache.split(
+        kv_cache = (
             storage[..., : template.head_dim_ckv],
             storage[..., template.head_dim_ckv :],
         )
     else:
-        kv = MLAKVCache.split(
+        kv_cache = (
             torch.zeros(
                 (num_pages, template.page_size, template.head_dim_ckv),
                 dtype=template.kv_data_type,
@@ -449,8 +460,8 @@ def build_synthetic_plan(
     output = output_4d.reshape(-1, *output_4d.shape[2:])
     return _SyntheticMLAPlan(
         args=synthetic_args,
-        query=MLAQuery.packed(query_4d.reshape(-1, *query_4d.shape[2:])),
-        kv=kv,
+        query=query_4d.reshape(-1, *query_4d.shape[2:]),
+        kv_cache=kv_cache,
         output=output,
         lse=(
             torch.empty(
@@ -482,7 +493,7 @@ def _synthetic_run_kwargs(
     args = synthetic.args
     return {
         "query": synthetic.query,
-        "kv": synthetic.kv,
+        "kv_cache": synthetic.kv_cache,
         "out": synthetic.output,
         "lse": synthetic.lse,
         "return_lse": args.lse_mode != "none",
@@ -636,6 +647,10 @@ def _plan_ranked_fallback(
     for candidate in candidates:
         if candidate in skip:
             continue
+        rejection_reason = _structural_rejection_reason(args, candidate, backend_types)
+        if rejection_reason is not None:
+            rejections.append((candidate, rejection_reason))
+            continue
         try:
             implementation = backend_types[candidate].plan_from_wrapper(args)
         except _BackendPlanUnsupportedError as error:
@@ -659,6 +674,7 @@ def plan_auto_backend(
     buckets: tuple[int, ...] | None = None,
 ) -> _MLAAutoPlanResult:
     """Resolve and plan one backend through the unified automatic policy."""
+    original_candidates = candidates
     bypass_reason = autotune_bypass_reason(args) if autotune_mode is not None else None
     if autotune_mode is None or bypass_reason is not None:
         name, implementation, rejections = _plan_ranked_fallback(
@@ -676,6 +692,25 @@ def plan_auto_backend(
             ),
         )
 
+    structural_rejections = tuple(
+        (candidate, reason)
+        for candidate in candidates
+        if (reason := _structural_rejection_reason(args, candidate, backend_types))
+        is not None
+    )
+    candidates = tuple(
+        candidate
+        for candidate in candidates
+        if _structural_rejection_reason(args, candidate, backend_types) is None
+    )
+    if not candidates:
+        summary = "; ".join(
+            f"{candidate}: {reason}" for candidate, reason in structural_rejections
+        )
+        raise _BackendPlanUnsupportedError(
+            f"backend='auto' rejected all candidates [{', '.join(original_candidates)}]: "
+            f"{summary}"
+        )
     profile = summarize_for_autotune(args)
     profile = replace(
         profile,
@@ -712,16 +747,17 @@ def plan_auto_backend(
             args,
             candidates,
             backend_types,
-            initial_rejections=[(selected_name, reason)],
+            initial_rejections=[*structural_rejections, (selected_name, reason)],
             skip=frozenset((selected_name,)),
         )
     else:
         name = selected_name
-        rejections = [
+        rejections = list(structural_rejections)
+        rejections.extend(
             (runner.backend_name, runner.rejection)
             for runner in runners
             if runner.rejection is not None
-        ]
+        )
 
     profile_rejections = tuple(
         rejection for runner in runners for rejection in runner.profile_rejections
@@ -730,7 +766,7 @@ def plan_auto_backend(
         name,
         implementation,
         MLAAutoSelectionTrace(
-            candidates,
+            original_candidates,
             tuple((candidate, str(reason)) for candidate, reason in rejections),
             "tuning" if autotune_mode else "cache-only",
             None,

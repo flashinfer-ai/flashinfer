@@ -119,6 +119,8 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "bmm-scalar"}),
         supports_is_var_seq=True,
+        requires_packed_query=True,
+        requires_packed_kv_cache=True,
     )
 
     def _compile_kernel(
@@ -166,6 +168,8 @@ class CuteDslMonolithicMlaDecodeRunner(CuteDslMlaDecodeRunner):
     """Strict functional runner for the monolithic CuTe DSL implementation."""
 
     name = "cute-dsl"
+    native_query_representation = "packed"
+    native_kv_representation = "packed"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
         super().__init__(

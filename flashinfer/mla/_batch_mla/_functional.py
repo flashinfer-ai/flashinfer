@@ -17,7 +17,7 @@ limitations under the License.
 from dataclasses import replace
 import functools
 import threading
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import cast, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import torch
@@ -29,7 +29,11 @@ from flashinfer.autotuner import (
     TuningConfig,
     make_bucket_mapper,
 )
-from flashinfer.trace.templates.attention import xqa_batch_decode_mla_trace
+from flashinfer.trace.templates.attention import (
+    trtllm_batch_decode_mla_trace_dispatch,
+    xqa_batch_decode_mla_trace,
+)
+from flashinfer.utils import check_shape_dtype_device, get_compute_capability
 
 from ._backends._cute_dsl_functional_common import (
     _cute_dsl_max_supported_batch,
@@ -51,11 +55,53 @@ from ._contracts import (
     _FunctionalBackendUnsupportedError,
     _FunctionalMLARequest,
     _FunctionalMLARunner,
+    MLAChosenRepresentation,
+    _adjacent_last_dim_view,
+    _choose_mla_references,
+    _classify_mla_references,
+    _split_mla_tensor_references,
 )
 
 
 _xqa_batch_decode_with_kv_cache_mla_warning_emitted = False
 _xqa_batch_decode_with_kv_cache_mla_warning_lock = threading.Lock()
+_trtllm_batch_decode_with_kv_cache_mla_warning_emitted = False
+_trtllm_batch_decode_with_kv_cache_mla_warning_lock = threading.Lock()
+_functional_split_materialization_warning_emitted = False
+_functional_split_materialization_warning_lock = threading.Lock()
+
+
+def _warn_functional_split_materialization_once() -> None:
+    global _functional_split_materialization_warning_emitted
+    if _functional_split_materialization_warning_emitted:
+        return
+    with _functional_split_materialization_warning_lock:
+        if _functional_split_materialization_warning_emitted:
+            return
+        warnings.warn(
+            "Independent split MLA inputs require materialization for a "
+            "packed-native backend. Pass packed, adjacent-split, or trusted "
+            "redundant inputs to avoid a per-call allocation.",
+            UserWarning,
+            stacklevel=4,
+        )
+        _functional_split_materialization_warning_emitted = True
+
+
+def _warn_trtllm_batch_decode_with_kv_cache_mla_once() -> None:
+    global _trtllm_batch_decode_with_kv_cache_mla_warning_emitted
+    if _trtllm_batch_decode_with_kv_cache_mla_warning_emitted:
+        return
+    with _trtllm_batch_decode_with_kv_cache_mla_warning_lock:
+        if _trtllm_batch_decode_with_kv_cache_mla_warning_emitted:
+            return
+        warnings.warn(
+            "trtllm_batch_decode_with_kv_cache_mla is deprecated; "
+            "use batch_mla_paged_attention instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        _trtllm_batch_decode_with_kv_cache_mla_warning_emitted = True
 
 
 def _warn_xqa_batch_decode_with_kv_cache_mla_once() -> None:
@@ -74,11 +120,9 @@ def _warn_xqa_batch_decode_with_kv_cache_mla_once() -> None:
         _xqa_batch_decode_with_kv_cache_mla_warning_emitted = True
 
 
-_FUNCTIONAL_MLA_RUNNERS: dict[
-    str, Callable[[_FunctionalMLARequest], _FunctionalMLARunner]
-] = {
-    "fa2": Fa2MlaRunner,
-    "fa3": Fa3MlaRunner,
+_FUNCTIONAL_MLA_RUNNERS: dict[str, type[_FunctionalMLARunner]] = {
+    "fa2": cast(type[_FunctionalMLARunner], Fa2MlaRunner),
+    "fa3": cast(type[_FunctionalMLARunner], Fa3MlaRunner),
     "cutlass": CutlassMlaRunner,
     "trtllm-gen": TrtllmGenMlaDecodeRunner,
     "cute-dsl-monolithic": CuteDslMonolithicMlaDecodeRunner,
@@ -204,6 +248,108 @@ def _build_mla_decode_tuning_config(
     )
 
 
+def _materialize_functional_packed_reference(
+    *,
+    packed: Optional[torch.Tensor],
+    left: Optional[torch.Tensor],
+    right: Optional[torch.Tensor],
+    representation: MLAChosenRepresentation,
+    name: str,
+) -> torch.Tensor:
+    """Return a packed functional reference, materializing only when required."""
+    if representation == "packed":
+        assert packed is not None
+        return packed
+    assert left is not None and right is not None
+    adjacent = _adjacent_last_dim_view(left, right)
+    if adjacent is not None:
+        return adjacent
+    _warn_functional_split_materialization_once()
+    return torch.cat((left, right), dim=-1)
+
+
+def _select_functional_request(
+    request: _FunctionalMLARequest,
+    runner_factory: type[_FunctionalMLARunner],
+) -> _FunctionalMLARequest:
+    """Reduce raw references to one complete native form for one runner."""
+    query, q_nope, q_pe, query_representation = _choose_mla_references(
+        packed=request.query,
+        split_1=request.q_nope,
+        split_2=request.q_pe,
+        availability=request.query_availability,
+        preferred=runner_factory.native_query_representation,
+    )
+    kv_cache, ckv_cache, kpe_cache, kv_representation = _choose_mla_references(
+        packed=request.kv_cache,
+        split_1=request.ckv_cache,
+        split_2=request.kpe_cache,
+        availability=request.kv_availability,
+        preferred=runner_factory.native_kv_representation,
+    )
+    if query_representation != runner_factory.native_query_representation:
+        if runner_factory.native_query_representation == "packed":
+            query = _materialize_functional_packed_reference(
+                packed=query,
+                left=q_nope,
+                right=q_pe,
+                representation=query_representation,
+                name="query",
+            )
+            q_nope = q_pe = None
+        else:
+            q_nope, q_pe = _split_mla_tensor_references(
+                packed=query,
+                left=q_nope,
+                right=q_pe,
+                representation=query_representation,
+                widths=(request.kv_lora_rank, request.qk_rope_head_dim),
+                name="query",
+            )
+            query = None
+        query_representation = runner_factory.native_query_representation
+    if kv_representation != runner_factory.native_kv_representation:
+        if runner_factory.native_kv_representation == "packed":
+            kv_cache = _materialize_functional_packed_reference(
+                packed=kv_cache,
+                left=ckv_cache,
+                right=kpe_cache,
+                representation=kv_representation,
+                name="KV cache",
+            )
+            ckv_cache = kpe_cache = None
+        else:
+            ckv_cache, kpe_cache = _split_mla_tensor_references(
+                packed=kv_cache,
+                left=ckv_cache,
+                right=kpe_cache,
+                representation=kv_representation,
+                widths=(request.kv_lora_rank, request.qk_rope_head_dim),
+                name="KV cache",
+            )
+            kv_cache = None
+        kv_representation = runner_factory.native_kv_representation
+    return replace(
+        request,
+        query=query,
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_cache=kv_cache,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        query_availability=query_representation,
+        kv_availability=kv_representation,
+    )
+
+
+def _make_functional_runner(
+    runner_factory: type[_FunctionalMLARunner],
+    request: _FunctionalMLARequest,
+) -> _FunctionalMLARunner:
+    selected = _select_functional_request(request, runner_factory)
+    return runner_factory(selected)
+
+
 def _run_functional_mla(
     request: _FunctionalMLARequest,
     backend: str,
@@ -226,6 +372,15 @@ def _run_functional_mla(
         direct_request: _FunctionalMLARequest,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Run CuTe features whose dynamic metadata is owned by its public adapter."""
+        runner_name = (
+            "cute-dsl-modular"
+            if direct_request.cute_dsl_impl == "modular"
+            else "cute-dsl-monolithic"
+        )
+        direct_request = _select_functional_request(
+            direct_request, _FUNCTIONAL_MLA_RUNNERS[runner_name]
+        )
+        assert direct_request.query is not None and direct_request.kv_cache is not None
         if direct_request.seq_lens is None:
             raise ValueError("seq_lens is required for cute-dsl MLA")
         if direct_request.multi_ctas_kv_counter_buffer is not None:
@@ -275,10 +430,12 @@ def _run_functional_mla(
             replace(cute_request, cute_dsl_impl="auto") if for_auto else cute_request
         )
         if implementation == "monolithic":
-            runner = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-monolithic"](candidate_request)
+            runner_factory = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-monolithic"]
+            runner = _make_functional_runner(runner_factory, candidate_request)
             return prepare_candidate(runner) if for_auto else runner
         if implementation == "modular":
-            runner = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"](candidate_request)
+            runner_factory = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"]
+            runner = _make_functional_runner(runner_factory, candidate_request)
             return prepare_candidate(runner) if for_auto else runner
         modular_request = (
             candidate_request
@@ -286,15 +443,20 @@ def _run_functional_mla(
             else replace(cute_request, cute_dsl_impl="modular")
         )
         if cute_request.sinks is not None:
-            runner = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"](modular_request)
+            runner_factory = _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"]
+            runner = _make_functional_runner(runner_factory, modular_request)
             return prepare_candidate(runner) if for_auto else runner
         try:
             return prepare_candidate(
-                _FUNCTIONAL_MLA_RUNNERS["cute-dsl-monolithic"](candidate_request)
+                _make_functional_runner(
+                    _FUNCTIONAL_MLA_RUNNERS["cute-dsl-monolithic"], candidate_request
+                )
             )
         except _FunctionalBackendUnsupportedError:
             return prepare_candidate(
-                _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"](modular_request)
+                _make_functional_runner(
+                    _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"], modular_request
+                )
             )
 
     if request.enable_dcp:
@@ -304,13 +466,23 @@ def _run_functional_mla(
         if backend in ("cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"):
             return run_cute_direct(request)
         if backend == "trtllm-gen":
-            return run_explicit(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request))
+            return run_explicit(
+                _make_functional_runner(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"], request)
+            )
         if backend == "auto":
-            num_heads = request.query.size(-2)
+            trt_request = _select_functional_request(
+                request, _FUNCTIONAL_MLA_RUNNERS["trtllm-gen"]
+            )
+            assert trt_request.query is not None
+            num_heads = trt_request.query.size(-2)
             trt_gap = 64 < num_heads < 128
             needs_cute = trt_gap or request.return_lse or request.lse is not None
             if not needs_cute:
-                return run_explicit(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request))
+                return run_explicit(
+                    _make_functional_runner(
+                        _FUNCTIONAL_MLA_RUNNERS["trtllm-gen"], request
+                    )
+                )
             if request.sparse_mla_top_k > 0:
                 reason = "head-count gap" if trt_gap else "LSE with cum_seq_lens_q"
                 raise ValueError(
@@ -322,17 +494,23 @@ def _run_functional_mla(
     if backend == "cute-dsl":
         return run_explicit(make_cute_runner(request, for_auto=False))
     if backend != "auto":
-        return run_explicit(_FUNCTIONAL_MLA_RUNNERS[backend](request))
+        return run_explicit(
+            _make_functional_runner(_FUNCTIONAL_MLA_RUNNERS[backend], request)
+        )
 
     runners: List[_FunctionalMLARunner] = []
     runner_names: List[str] = []
-    trtllm_reason = _trtllm_gen_mla_incompatibility_reason(request.kv_cache)
-    if 64 < request.query.size(-2) < 128:
+    trt_request = _select_functional_request(
+        request, _FUNCTIONAL_MLA_RUNNERS["trtllm-gen"]
+    )
+    assert trt_request.query is not None and trt_request.kv_cache is not None
+    trtllm_reason = _trtllm_gen_mla_incompatibility_reason(trt_request.kv_cache)
+    if 64 < trt_request.query.size(-2) < 128:
         trtllm_reason = "trtllm-gen MLA decode does not support 64 < num_heads_q < 128"
     if trtllm_reason is None:
         try:
             trtllm_runner = prepare_candidate(
-                _FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request)
+                _make_functional_runner(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"], request)
             )
         except _FunctionalBackendUnsupportedError as error:
             trtllm_reason = str(error)
@@ -366,8 +544,10 @@ def _run_functional_mla(
             f"(trtllm-gen: {trtllm_reason}; cute-dsl: {cute_reason})"
         )
 
-    tuning_kv_cache = request.kv_cache
-    _, q_len, num_heads, _ = request.query.shape
+    tuning_request = runners[0].request
+    assert tuning_request.query is not None and tuning_request.kv_cache is not None
+    tuning_kv_cache = tuning_request.kv_cache
+    _, q_len, num_heads, _ = tuning_request.query.shape
     tuning_config = _build_mla_decode_tuning_config(
         kv_cache=tuning_kv_cache,
         block_tables=request.block_tables,
@@ -377,7 +557,7 @@ def _run_functional_mla(
         num_heads=num_heads,
         kv_lora_rank=request.kv_lora_rank,
         max_seq_len=request.max_seq_len,
-        device=request.query.device,
+        device=tuning_request.query.device,
         sparse_top_k_width=(
             request.block_tables.shape[-1]
             if request.sparse_mla_top_k_lens is not None
@@ -385,7 +565,7 @@ def _run_functional_mla(
         ),
     )
     inputs = [
-        request.query,
+        tuning_request.query,
         request.block_tables,
         request.seq_lens,
         runners[0].inputs[3],
@@ -403,6 +583,640 @@ def _run_functional_mla(
         tactic=tactic,
         multi_ctas_kv_counter_buffer=request.multi_ctas_kv_counter_buffer,
     )
+
+
+def _batch_mla_paged_attention_impl(
+    *,
+    query: Optional[torch.Tensor] = None,
+    q_nope: Optional[torch.Tensor] = None,
+    q_pe: Optional[torch.Tensor] = None,
+    kv_cache: Optional[torch.Tensor] = None,
+    ckv_cache: Optional[torch.Tensor] = None,
+    kpe_cache: Optional[torch.Tensor] = None,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    max_seq_len: int,
+    sparse_mla_top_k: int = 0,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool | None = None,
+    backend: str = "auto",
+    is_var_seq: bool = True,
+    uses_shared_paged_kv_idx: bool = True,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    cute_dsl_impl: str = "auto",
+    kv_scale_format: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Validate public options and dispatch raw tensor references."""
+    query_availability = _classify_mla_references(
+        packed=query, split_1=q_nope, split_2=q_pe, name="query"
+    )
+    kv_availability = _classify_mla_references(
+        packed=kv_cache, split_1=ckv_cache, split_2=kpe_cache, name="KV cache"
+    )
+    if backend not in (
+        "auto",
+        "xqa",
+        "trtllm-gen",
+        "cute-dsl",
+        "cute-dsl-monolithic",
+        "cute-dsl-modular",
+        "sparse",
+        "fa2",
+        "fa3",
+        "cutlass",
+    ):
+        raise ValueError(f"Backend {backend} not supported")
+
+    preference_backend = backend
+    if preference_backend == "auto":
+        preference_backend = "trtllm-gen"
+    elif preference_backend == "cute-dsl":
+        preference_backend = (
+            "cute-dsl-modular" if cute_dsl_impl == "modular" else "cute-dsl-monolithic"
+        )
+    elif preference_backend == "sparse":
+        preference_backend = "xqa"
+    runner_factory = _FUNCTIONAL_MLA_RUNNERS[preference_backend]
+    metadata_query, metadata_q_nope, _, _ = _choose_mla_references(
+        packed=query,
+        split_1=q_nope,
+        split_2=q_pe,
+        availability=query_availability,
+        preferred=runner_factory.native_query_representation,
+    )
+    query_reference = metadata_query if metadata_query is not None else metadata_q_nope
+    assert query_reference is not None
+
+    if isinstance(bmm1_scale, torch.Tensor) and bmm1_scale.dtype != torch.float32:
+        raise TypeError("bmm1_scale tensor must have dtype torch.float32")
+    if isinstance(bmm2_scale, torch.Tensor) and bmm2_scale.dtype != torch.float32:
+        raise TypeError("bmm2_scale tensor must have dtype torch.float32")
+    if max_q_len is not None and cum_seq_lens_q is None:
+        raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+    is_nope_mla = kv_lora_rank == 512 and qk_rope_head_dim == 0
+    if is_nope_mla and sparse_mla_top_k <= 0:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+        )
+    if is_nope_mla and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query_reference.size(0) * query_reference.size(1)
+            if query_reference.ndim == 4
+            else query_reference.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query_reference.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
+
+    if not isinstance(enable_dcp, bool):
+        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
+    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
+        raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
+    if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
+        raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+    if not enable_dcp:
+        nondefault_dcp_args = []
+        if cp_world != 1:
+            nondefault_dcp_args.append(f"cp_world={cp_world}")
+        if cp_rank != 0:
+            nondefault_dcp_args.append(f"cp_rank={cp_rank}")
+        if causal_seqlens_kv_global is not None:
+            nondefault_dcp_args.append("causal_seqlens_kv_global")
+        if nondefault_dcp_args:
+            raise ValueError(
+                "DCP arguments require enable_dcp=True; got "
+                + ", ".join(nondefault_dcp_args)
+            )
+    else:
+        if query_reference.ndim != 4:
+            raise ValueError(
+                "DCP requires a dense query with shape "
+                "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
+            )
+        if not 0 <= cp_rank < cp_world:
+            raise ValueError(
+                "cp_rank must satisfy 0 <= cp_rank < cp_world, got "
+                f"cp_rank={cp_rank}, cp_world={cp_world}"
+            )
+        if backend not in ("auto", "cute-dsl", "cute-dsl-monolithic"):
+            raise ValueError(
+                "enable_dcp=True is only supported by backend='cute-dsl', got "
+                f"backend={backend!r}"
+            )
+        if not return_lse:
+            raise ValueError(
+                "enable_dcp=True requires return_lse=True so rank-local "
+                "attention states can be merged"
+            )
+        if sinks is not None:
+            raise ValueError("DCP cannot be combined with sinks")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
+        if not isinstance(causal_seqlens_kv_global, torch.Tensor):
+            raise TypeError(
+                "causal_seqlens_kv_global must be a torch.Tensor, got "
+                f"{type(causal_seqlens_kv_global).__name__}"
+            )
+        check_shape_dtype_device(
+            causal_seqlens_kv_global,
+            (query_reference.shape[0],),
+            torch.int32,
+            query_reference.device,
+            "causal_seqlens_kv_global",
+        )
+        if not causal_seqlens_kv_global.is_contiguous():
+            raise ValueError("causal_seqlens_kv_global must be contiguous")
+        backend = "cute-dsl"
+
+    if backend in ("cute-dsl-monolithic", "cute-dsl-modular"):
+        cute_dsl_impl = backend.removeprefix("cute-dsl-")
+    if backend == "auto":
+        cc = get_compute_capability(query_reference.device)
+        if cc[0] == 12 and sparse_mla_top_k > 0:
+            backend = "sparse"
+        elif cc[0] != 10:
+            backend = "xqa"
+
+    request = _FunctionalMLARequest(
+        query=query,
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_cache=kv_cache,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        query_availability=query_availability,
+        kv_availability=kv_availability,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=sparse_mla_top_k,
+        out=out,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        enable_pdl=enable_pdl,
+        is_var_seq=is_var_seq,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=lse,
+        return_lse=return_lse,
+        cute_dsl_impl=cute_dsl_impl,
+        kv_scale_format=kv_scale_format,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+    )
+    if backend == "sparse":
+        packed_request = _select_functional_request(
+            request, _FUNCTIONAL_MLA_RUNNERS["xqa"]
+        )
+        assert packed_request.query is not None and packed_request.kv_cache is not None
+        from flashinfer.mla._core import _run_mla_decode_sparse
+
+        return _run_mla_decode_sparse(
+            query=packed_request.query,
+            kv_cache=packed_request.kv_cache,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
+            backend=backend,
+            is_var_seq=is_var_seq,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            lse=lse,
+            return_lse=return_lse,
+            cute_dsl_impl=cute_dsl_impl,
+            kv_scale_format=kv_scale_format,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+    return _run_functional_mla(request, backend)
+
+
+@flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
+def batch_mla_paged_attention(
+    *,
+    query: Optional[torch.Tensor] = None,
+    q_nope: Optional[torch.Tensor] = None,
+    q_pe: Optional[torch.Tensor] = None,
+    kv_cache: Optional[torch.Tensor] = None,
+    ckv_cache: Optional[torch.Tensor] = None,
+    kpe_cache: Optional[torch.Tensor] = None,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    max_seq_len: int,
+    sparse_mla_top_k: int = 0,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool | None = None,
+    backend: str = "auto",
+    is_var_seq: bool = True,
+    uses_shared_paged_kv_idx: bool = True,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    cute_dsl_impl: str = "auto",
+    kv_scale_format: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Decode MLA with tensor-first packed, split, or trusted redundant inputs.
+
+    This one-shot API accepts only raw tensor references. Query tensors may be
+    provided as packed ``query`` or complete split ``q_nope`` / ``q_pe``
+    tensors. KV cache tensors may be provided as packed ``kv_cache`` or
+    complete split ``ckv_cache`` / ``kpe_cache`` tensors. Supplying both packed
+    and complete split tensors for either group is a trusted redundant form:
+    only the backend-native form is selected, and the redundant references are
+    not inspected or validated. Partial split pairs are rejected.
+
+    Packed query and KV tensors concatenate the no-position and RoPE parts on
+    the last dimension. Split pairs must have widths ``kv_lora_rank`` and
+    ``qk_rope_head_dim`` respectively. Backends whose native form differs from
+    the provided query form may use a view when the split tensors are adjacent,
+    or a copy for non-adjacent query splits. Independent split KV tensors are
+    not copied into a packed cache; a packed-native backend rejects them unless
+    the split tensors are adjacent views of one packed allocation.
+
+    With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
+    when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
+    backend for ``sparse_mla_top_k > 0`` and XQA for dense decode. Dense
+    backend selection uses the backend-native tensor representation for each
+    candidate.
+
+    Parameters
+    ----------
+    query : Optional[torch.Tensor]
+        Packed query tensor with shape
+        ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` or, when
+        ``cum_seq_lens_q`` is provided, ``[total_q, num_heads, head_dim_qk]``.
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. For the SM120/SM121
+        v32/GLM sparse backend, this must be BF16 with ``head_dim_qk == 576``.
+    q_nope : Optional[torch.Tensor]
+        Split query tensor containing the non-RoPE channels. Its last dimension
+        must be ``kv_lora_rank``.
+    q_pe : Optional[torch.Tensor]
+        Split query tensor containing the RoPE channels. Its last dimension
+        must be ``qk_rope_head_dim``.
+    kv_cache : Optional[torch.Tensor]
+        Packed paged KV cache. For dense backends, the accepted shapes are
+        ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` and
+        ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]``. The
+        tensor uses the query-compatible dense dtype. For the SM120/SM121
+        v32/GLM sparse backend, this is a packed uint8 cache with 656 bytes per
+        token, shaped ``[num_pages, page_size, 656]`` or
+        ``[num_pages, 1, page_size, 656]``.
+    ckv_cache : Optional[torch.Tensor]
+        Split paged KV cache containing compressed latent KV channels. Its
+        last dimension must be ``kv_lora_rank``.
+    kpe_cache : Optional[torch.Tensor]
+        Split paged KV cache containing RoPE channels. Its last dimension must
+        be ``qk_rope_head_dim``.
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer. Must be zero-initialized on first use
+        by kernels that use semaphore state.
+    qk_nope_head_dim : int
+        Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
+        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        ignores this value and validates ``query.shape[-1] == 576`` instead.
+    kv_lora_rank : int
+        Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
+    qk_rope_head_dim : int
+        RoPE head dimension. Sparse MLA paths use ``64``.
+    block_tables : torch.Tensor
+        Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
+        SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
+        When ``cum_seq_lens_q`` is provided with sparse MLA, pass compact
+        sparse rows in flattened query-token order with shape
+        ``[total_q, sparse_mla_top_k]``. For SM120/SM121 sparse v32/GLM, it is
+        the sparse index matrix and must have shape
+        ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with int32
+        physical token indices.
+    seq_lens : Optional[torch.Tensor]
+        Per-request KV sequence lengths for dense and TRTLLM-GEN paths. For
+        SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
+        flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
+        ``None``, every column in ``block_tables`` is active.
+    max_seq_len : int
+        Maximum KV sequence length used for dense/TRTLLM-GEN scheduling.
+        Ignored by the SM120/SM121 sparse v32/GLM backend.
+    sparse_mla_top_k : int
+        Enables sparse MLA when greater than zero. On SM100/SM103 this selects
+        the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
+        ``backend="auto"`` or ``backend="sparse"``, this is the width of the
+        packed v32/GLM sparse index matrix. The TRTLLM-GEN backend supports
+        dense query input or flattened query input plus ``cum_seq_lens_q``.
+    out : Optional[torch.Tensor]
+        Output tensor. If not provided, it is allocated internally.
+    bmm1_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
+        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+    bmm2_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
+        CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires
+        ``1.0``.
+    sinks : Optional[List[torch.Tensor]]
+        Additional value per head in the denominator of the softmax.
+        Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``. On
+        ``cute-dsl`` this requires the modular implementation;
+        ``cute_dsl_impl="auto"`` (the default) promotes to modular
+        automatically, and ``cute_dsl_impl="monolithic"`` with sinks set raises
+        :class:`ValueError`.
+    skip_softmax_threshold_scale_factor : Optional[float]
+        Threshold scale factor for skipping softmax operations. Providing a
+        value enables skip-softmax sparsity. The actual threshold equals the
+        provided scale factor divided by the context length.
+    enable_pdl : Optional[bool]
+        Programmatic Dependent Launch toggle. When ``None`` (default), support
+        is auto-detected from the query device. Honored by the ``trtllm-gen``,
+        ``cute-dsl``, and ``xqa`` functional backends.
+    backend : str = "auto"
+        Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
+        ``"trtllm-gen"``, ``"cute-dsl"``, ``"cute-dsl-monolithic"``,
+        ``"cute-dsl-modular"``, ``"sparse"``, ``"fa2"``, ``"fa3"``, and
+        ``"cutlass"``. ``"auto"`` chooses ``"trtllm-gen"`` for SM100/SM103
+        sparse MLA and chooses ``"sparse"`` for SM120/SM121 when
+        ``sparse_mla_top_k > 0``; otherwise SM120/SM121 dense decode uses
+        ``"xqa"``. ``"cute-dsl"`` preserves family-local selection. The
+        concrete CuTe names require the selected implementation and do not fall
+        back to its sibling. ``"fa2"`` and ``"fa3"`` are one-shot generated-FA
+        paths. ``"cutlass"`` is limited to its SM100/SM110 single-query,
+        128-head DeepSeek MLA launch envelope.
+    is_var_seq : bool
+        Whether the sequence length is variable.
+    uses_shared_paged_kv_idx : bool = True
+        Whether K and V page indices are shared as a unified index. ``False``
+        uses TRT-LLM layout with a 3D page table
+        ``[batch_size, 2, max_num_pages_per_seq]`` and is supported only by
+        TRTLLM-GEN.
+    lse : Optional[torch.Tensor] = None
+        Optional pre-allocated Log-Sum-Exp buffer. Supported by
+        ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends and required to
+        have dtype ``torch.float32``. Accepted shapes are
+        ``[batch_size * q_len_per_request, num_qo_heads]`` and
+        ``[batch_size, q_len_per_request, num_qo_heads]``.
+    return_lse : bool = False
+        Whether to return LSE values. When true, returns ``(out, lse)``.
+    cute_dsl_impl : str = "auto"
+        Which CuTe DSL implementation to use for the ``cute-dsl`` family and
+        its auto candidate. ``"auto"`` picks monolithic by default and promotes
+        to modular for modular-only features such as sinks. ``"modular"`` and
+        ``"monolithic"`` are strict.
+    kv_scale_format : str = "auto"
+        Scale semantics for the SM120/SM121 packed v32/GLM sparse backend.
+        ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
+        scales; ``"arbitrary_fp32"`` selects arbitrary FP32 inline scales.
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query sequence lengths for variable-length query support,
+        shape ``[batch_size + 1]`` and dtype ``torch.int32``. TRTLLM-GEN owns
+        the native variable-Q path; CuTe DSL handles configurations that require
+        its compact variable-Q fallback, including LSE and unsupported TRTLLM-GEN
+        head counts. When provided, packed ``query`` must have shape
+        ``[total_q, num_heads, head_dim_qk]`` and split ``q_nope`` / ``q_pe``
+        must have matching flattened leading dimensions.
+    max_q_len : Optional[int] = None
+        Maximum query sequence length represented by ``cum_seq_lens_q``.
+        Providing it avoids host-side metadata validation.
+    multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
+        Optional caller-owned counter buffer for TRTLLM-GEN. It must remain
+        alive for every launch or CUDA graph replay that uses it and be
+        zero-initialized once. Autotune profiling uses runner-owned storage;
+        this buffer is used only for the selected TRTLLM-GEN final request.
+    sparse_mla_top_k_lens : Optional[torch.Tensor] = None
+        Flattened active sparse top-k lengths, one INT32 value per query token.
+        Required by native ``kv_lora_rank=512, qk_rope_head_dim=0``
+        TRTLLM-GEN MLA.
+    enable_dcp : bool = False
+        Enable cyclic decode context parallelism in monolithic CuTe DSL MLA.
+        Requires ``return_lse=True`` so callers can merge rank-local states.
+    cp_world : int = 1
+        Context-parallel world size.
+    cp_rank : int = 0
+        Context-parallel rank for this launch.
+    causal_seqlens_kv_global : Optional[torch.Tensor] = None
+        Contiguous CUDA int32 tensor ``[batch_size]`` containing each request's
+        global exclusive causal KV bound. Required when DCP is enabled.
+
+    Returns
+    -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        The MLA output tensor, or ``(out, lse)`` when ``return_lse=True``.
+
+    Note
+    ----
+    In MLA, the actual BMM1 and BMM2 scales applied are fused as::
+
+        bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
+        bmm2_scale = v_scale * o_scale
+
+    The two scale factors should be static constants for CUDA graph capture.
+    On-device fused scale tensors may be used for dynamically changing FP8
+    scale factors.
+
+    Autotune
+    --------
+    On SM100/SM103 dense MLA, calling under ``flashinfer.autotune(True)`` with
+    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` across a
+    bucketed batch sweep and caches the winning runner per shape signature.
+    Subsequent calls under ``autotune(False)`` dispatch to the cached choice.
+    The autotune bucket range and cache key do not depend on
+    ``kv_cache.shape[0]``; however, the page-aliasing ratio during profiling
+    does depend on the pool size, so profile with a representative KV pool.
+
+    Warning
+    -------
+    ``trtllm_batch_decode_with_kv_cache_mla`` remains as a deprecated alias for
+    packed tensor callers. New code should call this function directly with the
+    tensor form that matches its source buffers.
+    """
+    return _batch_mla_paged_attention_impl(
+        query=query,
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_cache=kv_cache,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=sparse_mla_top_k,
+        out=out,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        enable_pdl=enable_pdl,
+        backend=backend,
+        is_var_seq=is_var_seq,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=lse,
+        return_lse=return_lse,
+        cute_dsl_impl=cute_dsl_impl,
+        kv_scale_format=kv_scale_format,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+    )
+
+
+@flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
+def trtllm_batch_decode_with_kv_cache_mla(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    max_seq_len: int,
+    sparse_mla_top_k: int = 0,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool | None = None,
+    backend: str = "auto",
+    is_var_seq: bool = True,
+    uses_shared_paged_kv_idx: bool = True,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    cute_dsl_impl: str = "auto",
+    kv_scale_format: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    _warn_trtllm_batch_decode_with_kv_cache_mla_once()
+    return _batch_mla_paged_attention_impl(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=sparse_mla_top_k,
+        out=out,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        enable_pdl=enable_pdl,
+        backend=backend,
+        is_var_seq=is_var_seq,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=lse,
+        return_lse=return_lse,
+        cute_dsl_impl=cute_dsl_impl,
+        kv_scale_format=kv_scale_format,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+    )
+
+
+trtllm_batch_decode_with_kv_cache_mla.__doc__ = batch_mla_paged_attention.__doc__
+
+_trtllm_batch_decode_with_kv_cache_mla_fi_trace = (
+    trtllm_batch_decode_with_kv_cache_mla.fi_trace
+)
+
+
+@functools.wraps(_trtllm_batch_decode_with_kv_cache_mla_fi_trace)
+def _warn_once_trtllm_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs):
+    _warn_trtllm_batch_decode_with_kv_cache_mla_once()
+    return _trtllm_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs)
+
+
+trtllm_batch_decode_with_kv_cache_mla.fi_trace = (  # type: ignore[attr-defined]
+    _warn_once_trtllm_batch_decode_with_kv_cache_mla_fi_trace
+)
 
 
 @flashinfer_api(trace=xqa_batch_decode_mla_trace)
@@ -495,7 +1309,13 @@ def xqa_batch_decode_with_kv_cache_mla(
     _warn_xqa_batch_decode_with_kv_cache_mla_once()
     request = _FunctionalMLARequest(
         query=query,
+        q_nope=None,
+        q_pe=None,
         kv_cache=kv_cache,
+        ckv_cache=None,
+        kpe_cache=None,
+        query_availability="packed",
+        kv_availability="packed",
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,

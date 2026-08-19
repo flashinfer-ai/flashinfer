@@ -31,7 +31,10 @@ from flashinfer.utils import (
     next_positive_power_of_2,
 )
 
-from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
+from ._capabilities import (
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import (
     _MLAPlanArguments,
 )
@@ -39,8 +42,7 @@ from .._contracts import (
     _FunctionalBackendUnsupportedError,
     _FunctionalMLARequest,
     _FunctionalMLARunner,
-    MLAKVCache,
-    MLAQuery,
+    _resolve_structural_mla_input,
 )
 
 
@@ -393,6 +395,8 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         supports_is_var_seq=True,
         supports_sinks=True,
         supports_qk_nope_head_dim=True,
+        requires_packed_query=True,
+        requires_packed_kv_cache=True,
     )
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
@@ -635,8 +639,8 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
     def run_from_wrapper(
         self,
         *,
-        query: MLAQuery,
-        kv: MLAKVCache,
+        query: object,
+        kv_cache: object,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -652,8 +656,18 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        packed_query = query.require_packed()
-        kv_cache = kv.require_packed_view()
+        packed_query = _resolve_structural_mla_input(
+            query,
+            desired="packed",
+            widths=(self._kv_lora_rank, self._qk_rope_head_dim),
+            name="query",
+        )
+        kv_cache = _resolve_structural_mla_input(
+            kv_cache,
+            desired="packed",
+            widths=(self._kv_lora_rank, self._qk_rope_head_dim),
+            name="KV cache",
+        )
         if profiler_buffer is not None:
             raise ValueError(
                 "profiler_buffer is not supported with trtllm-gen backend."
@@ -896,6 +910,8 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
     """Direct functional TRTLLM-GEN runner with one native tactic."""
 
     name = "trtllm-gen"
+    native_query_representation = "packed"
+    native_kv_representation = "packed"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
         _FunctionalMLARunner.__init__(self, request)

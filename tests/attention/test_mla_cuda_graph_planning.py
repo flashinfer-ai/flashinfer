@@ -8,7 +8,7 @@ import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.mla import _core as mla_core
-from flashinfer.mla import MLAKVCache, MLAPlanMetadata, MLAQuery
+from flashinfer.mla import MLAPlanMetadata
 from flashinfer.mla._batch_mla import _wrapper as batch_mla_core
 from flashinfer.mla._batch_mla import _planning
 from flashinfer.mla._batch_mla._backends import _fa_common
@@ -70,17 +70,20 @@ def _dense_plan_args(backend_name):
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
         output_dtype=torch.bfloat16,
-        kv_layout="combined",
+        query_layout="packed",
+        kv_cache_layout="packed",
         qk_nope_head_dim=128 if backend_name == "trtllm-gen" else None,
     )
 
 
 def _csr_plan_args():
     return dict(
-        qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
-        kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
-        kv_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
-        kv_len_arr=torch.tensor([64, 96], dtype=torch.int32),
+        metadata=MLAPlanMetadata.csr(
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+            torch.tensor([0, 1, 3], dtype=torch.int32),
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+            torch.tensor([64, 96], dtype=torch.int32),
+        ),
         num_heads=128,
         head_dim_ckv=512,
         head_dim_kpe=64,
@@ -95,14 +98,7 @@ def _csr_plan_args():
 
 def _make_generated_fa_plan_request(workspace):
     plan_args = _csr_plan_args()
-    metadata = MLAPlanMetadata.csr(
-        plan_args.pop("qo_indptr"),
-        plan_args.pop("kv_indptr"),
-        plan_args.pop("kv_indices"),
-        plan_args.pop("kv_len_arr"),
-    )
     return _planning._MLAPlanArguments(
-        metadata=metadata,
         **plan_args,
         _float_workspace_buffer=torch.empty(1),
         _generated_fa_workspace=workspace,
@@ -116,8 +112,8 @@ def _make_generated_fa_plan_request(workspace):
 
 def _generated_fa_run_args():
     return dict(
-        query=MLAQuery.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
-        kv=MLAKVCache.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+        query=(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+        kv_cache=(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
         out=None,
         lse=None,
         return_lse=False,

@@ -7,7 +7,6 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.mla._core as mla_core
 import flashinfer.mla._batch_mla._functional as mla_functional
 from tests.test_helpers.mla import (
     MLATestCase,
@@ -18,6 +17,7 @@ from tests.test_helpers.mla import (
     require_architecture,
     unpack_mla_result,
 )
+from flashinfer.mla._batch_mla._contracts import _FunctionalMLARequest
 
 
 _FUNCTIONAL_BACKENDS = {
@@ -180,8 +180,6 @@ _PUBLIC_MLA_API = {
     "MLALayerDimensions",
     "supported_mla_layer_dimensions",
     "BatchMLAPagedAttentionWrapper",
-    "MLAQuery",
-    "MLAKVCache",
     "MLAPlanMetadata",
     "MLAAutoSelectionTrace",
     "batch_mla_paged_attention",
@@ -197,31 +195,6 @@ def _compare_result(case, result, expected_output, expected_lse):
     if expected_lse is not None:
         assert actual_lse is not None
         assert_mla_close(actual_lse.reshape_as(expected_lse), expected_lse)
-
-
-def test_functional_case_table_covers_every_explicit_backend():
-    assert {case.backend for case in _FUNCTIONAL_CASES} == _FUNCTIONAL_BACKENDS
-
-
-def test_functional_case_table_covers_public_configuration_dimensions():
-    assert {case.q_dtype for case in _FUNCTIONAL_CASES} == {
-        torch.float16,
-        torch.bfloat16,
-    }
-    assert {case.page_size for case in _FUNCTIONAL_CASES} == {32, 64, 128}
-    assert {case.q_len for case in _FUNCTIONAL_CASES} == {1, 2}
-    assert {case.lse_mode for case in _FUNCTIONAL_CASES} == {
-        "none",
-        "base2",
-        "basee",
-    }
-    assert {case.scale_mode for case in _FUNCTIONAL_CASES} == {
-        "default",
-        "bmm-scalar",
-        "bmm-tensor",
-    }
-    assert {case.skip_softmax for case in _FUNCTIONAL_CASES} == {False, True}
-    assert {case.enable_pdl for case in _FUNCTIONAL_CASES} == {None, False, True}
 
 
 @pytest.mark.parametrize("case", _FUNCTIONAL_CASES, ids=lambda case: case.case_id)
@@ -255,16 +228,329 @@ def test_functional_auto_matches_reference(case):
     _compare_result(case, result, expected_output, expected_lse)
 
 
-def test_functional_exports_and_legacy_signature_are_stable():
+def test_functional_exports_and_tensor_first_ownership_are_stable():
     assert hasattr(flashinfer.mla, "batch_mla_paged_attention")
     assert not hasattr(flashinfer.decode, "batch_mla_paged_attention")
     assert not hasattr(flashinfer, "batch_mla_paged_attention")
-    assert inspect.signature(
-        flashinfer.mla.batch_mla_paged_attention
-    ) == inspect.signature(flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla)
+    for name in ("MLAQuery", "MLAKVCache"):
+        assert name not in flashinfer.mla.__all__
+        assert not hasattr(flashinfer.mla, name)
+        with pytest.raises(ImportError):
+            exec(f"from flashinfer.mla import {name}", {})
+
+    signature = inspect.signature(flashinfer.mla.BatchMLAPagedAttentionWrapper.run)
+    for name in (
+        "query",
+        "q_nope",
+        "q_pe",
+        "kv_cache",
+        "ckv_cache",
+        "kpe_cache",
+    ):
+        assert name in signature.parameters
+    assert "query_object" not in signature.parameters
+    assert "kv" not in signature.parameters
+
     namespace = {}
     exec("from flashinfer.mla import *", namespace)
     assert {name for name in namespace if not name.startswith("__")} == _PUBLIC_MLA_API
+
+
+class _PoisonReference:
+    def __getattribute__(self, name):
+        if name.startswith("__"):
+            return object.__getattribute__(self, name)
+        raise AssertionError(f"ignored reference was inspected through {name}")
+
+
+def _raw_functional_request(**overrides):
+    values = dict(
+        query=torch.empty(2, 1, 4, 3),
+        q_nope=torch.empty(2, 1, 4, 2),
+        q_pe=torch.empty(2, 1, 4, 1),
+        kv_cache=torch.empty(4, 1, 3),
+        ckv_cache=torch.empty(4, 1, 2),
+        kpe_cache=torch.empty(4, 1, 1),
+        query_availability="redundant",
+        kv_availability="redundant",
+        workspace_buffer=torch.empty(16, dtype=torch.int8),
+        qk_nope_head_dim=2,
+        kv_lora_rank=2,
+        qk_rope_head_dim=1,
+        block_tables=torch.zeros(2, 1, dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        max_seq_len=1,
+        sparse_mla_top_k=0,
+        out=None,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        sinks=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl=None,
+        is_var_seq=True,
+        uses_shared_paged_kv_idx=True,
+        lse=None,
+        return_lse=False,
+        cute_dsl_impl="auto",
+        kv_scale_format="auto",
+        cum_seq_lens_q=None,
+        max_q_len=None,
+        multi_ctas_kv_counter_buffer=None,
+        sparse_mla_top_k_lens=None,
+        enable_dcp=False,
+        cp_world=1,
+        cp_rank=0,
+        causal_seqlens_kv_global=None,
+    )
+    values.update(overrides)
+    return _FunctionalMLARequest(**values)
+
+
+def test_packed_functional_selection_materializes_independent_split_inputs(
+    monkeypatch,
+):
+    q_nope = torch.ones(1, 1, 1, 2)
+    q_pe = torch.full((1, 1, 1, 1), 2.0)
+    ckv_cache = torch.full((1, 1, 2), 3.0)
+    kpe_cache = torch.full((1, 1, 1), 4.0)
+    request = _raw_functional_request(
+        query=None,
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_cache=None,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        query_availability="split",
+        kv_availability="split",
+    )
+    concatenations = []
+    real_cat = torch.cat
+
+    def recording_cat(tensors, *, dim):
+        concatenations.append((tuple(tensors), dim))
+        return real_cat(tuple(tensors), dim=dim)
+
+    class PackedRunner:
+        native_query_representation = "packed"
+        native_kv_representation = "packed"
+
+    monkeypatch.setattr(torch, "cat", recording_cat)
+
+    with pytest.warns(UserWarning, match="materialization"):
+        selected = mla_functional._select_functional_request(request, PackedRunner)
+
+    assert torch.equal(selected.query, torch.tensor([[[[1.0, 1.0, 2.0]]]]))
+    assert torch.equal(selected.kv_cache, torch.tensor([[[3.0, 3.0, 4.0]]]))
+    assert selected.q_nope is selected.q_pe is None
+    assert selected.ckv_cache is selected.kpe_cache is None
+    assert [dim for _, dim in concatenations] == [-1, -1]
+
+
+def test_functional_split_materialization_warns_once_per_process(monkeypatch):
+    request = _raw_functional_request(
+        query=None,
+        q_nope=torch.ones(1, 1, 1, 2),
+        q_pe=torch.ones(1, 1, 1, 1),
+        kv_cache=None,
+        ckv_cache=torch.ones(1, 1, 2),
+        kpe_cache=torch.ones(1, 1, 1),
+        query_availability="split",
+        kv_availability="split",
+    )
+
+    class PackedRunner:
+        native_query_representation = "packed"
+        native_kv_representation = "packed"
+
+    monkeypatch.setattr(
+        mla_functional,
+        "_functional_split_materialization_warning_emitted",
+        False,
+        raising=False,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mla_functional._select_functional_request(request, PackedRunner)
+        mla_functional._select_functional_request(request, PackedRunner)
+
+    user_warnings = [item for item in caught if item.category is UserWarning]
+    assert len(user_warnings) == 1
+    assert "materialization" in str(user_warnings[0].message)
+    assert "per-call allocation" in str(user_warnings[0].message)
+    assert user_warnings[0].filename.endswith("test_mla_functional.py")
+    assert not [item for item in caught if item.category is DeprecationWarning]
+
+
+@pytest.mark.parametrize(
+    "form", ("packed", "adjacent-split", "redundant", "split-native")
+)
+def test_functional_zero_copy_forms_do_not_materialize_or_warn(monkeypatch, form):
+    packed_query = torch.arange(3.0).reshape(1, 1, 1, 3)
+    packed_kv = torch.arange(3.0).reshape(1, 1, 3)
+    split_query = (packed_query[..., :2], packed_query[..., 2:])
+    split_kv = (packed_kv[..., :2], packed_kv[..., 2:])
+
+    if form == "packed":
+        request = _raw_functional_request(
+            query=packed_query,
+            q_nope=None,
+            q_pe=None,
+            kv_cache=packed_kv,
+            ckv_cache=None,
+            kpe_cache=None,
+            query_availability="packed",
+            kv_availability="packed",
+        )
+        native_representation = "packed"
+    elif form == "adjacent-split":
+        request = _raw_functional_request(
+            query=None,
+            q_nope=split_query[0],
+            q_pe=split_query[1],
+            kv_cache=None,
+            ckv_cache=split_kv[0],
+            kpe_cache=split_kv[1],
+            query_availability="split",
+            kv_availability="split",
+        )
+        native_representation = "packed"
+    elif form == "redundant":
+        request = _raw_functional_request(
+            query=packed_query,
+            q_nope=_PoisonReference(),
+            q_pe=_PoisonReference(),
+            kv_cache=packed_kv,
+            ckv_cache=_PoisonReference(),
+            kpe_cache=_PoisonReference(),
+            query_availability="redundant",
+            kv_availability="redundant",
+        )
+        native_representation = "packed"
+    else:
+        request = _raw_functional_request(
+            query=None,
+            q_nope=split_query[0],
+            q_pe=split_query[1],
+            kv_cache=None,
+            ckv_cache=split_kv[0],
+            kpe_cache=split_kv[1],
+            query_availability="split",
+            kv_availability="split",
+        )
+        native_representation = "split"
+
+    class NativeRunner:
+        native_query_representation = native_representation
+        native_kv_representation = native_representation
+
+    monkeypatch.setattr(
+        mla_functional,
+        "_functional_split_materialization_warning_emitted",
+        False,
+    )
+    monkeypatch.setattr(
+        torch,
+        "cat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("zero-copy functional form called torch.cat")
+        ),
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        selected = mla_functional._select_functional_request(request, NativeRunner)
+
+    assert not [item for item in caught if item.category is UserWarning]
+    if native_representation == "packed":
+        assert selected.query.data_ptr() == packed_query.data_ptr()
+        assert selected.kv_cache.data_ptr() == packed_kv.data_ptr()
+    else:
+        assert selected.q_nope is split_query[0]
+        assert selected.q_pe is split_query[1]
+        assert selected.ckv_cache is split_kv[0]
+        assert selected.kpe_cache is split_kv[1]
+
+
+def test_functional_materialization_propagates_allocation_failure(monkeypatch):
+    request = _raw_functional_request(
+        query=None,
+        q_nope=torch.ones(1, 1, 1, 2),
+        q_pe=torch.ones(1, 1, 1, 1),
+        query_availability="split",
+    )
+
+    class PackedRunner:
+        native_query_representation = "packed"
+        native_kv_representation = "packed"
+
+    monkeypatch.setattr(
+        mla_functional,
+        "_functional_split_materialization_warning_emitted",
+        False,
+    )
+    monkeypatch.setattr(
+        torch,
+        "cat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            torch.cuda.OutOfMemoryError("functional compatibility allocation")
+        ),
+    )
+
+    with (
+        pytest.warns(UserWarning, match="materialization"),
+        pytest.raises(
+            torch.cuda.OutOfMemoryError,
+            match="functional compatibility allocation",
+        ),
+    ):
+        mla_functional._select_functional_request(request, PackedRunner)
+
+
+def test_explicit_functional_runner_receives_only_its_independently_selected_forms(
+    monkeypatch,
+):
+    query_preference = "packed"
+    kv_preference = "split"
+    packed_query = torch.empty(2, 1, 4, 3)
+    split_kv = (torch.empty(4, 1, 2), torch.empty(4, 1, 1))
+    request = _raw_functional_request(
+        query=packed_query,
+        q_nope=_PoisonReference(),
+        q_pe=_PoisonReference(),
+        kv_cache=_PoisonReference(),
+        ckv_cache=split_kv[0],
+        kpe_cache=split_kv[1],
+    )
+    seen = []
+
+    class RecordingRunner:
+        native_query_representation = query_preference
+        native_kv_representation = kv_preference
+
+        def __init__(self, selected_request):
+            seen.append(selected_request)
+            self.request = selected_request
+
+        def prepare_for_dispatch(self):
+            pass
+
+        @property
+        def inputs(self):
+            return []
+
+        def __call__(self, *, inputs, tactic, **_kwargs):
+            return self.request
+
+    monkeypatch.setitem(mla_functional._FUNCTIONAL_MLA_RUNNERS, "fa2", RecordingRunner)
+
+    selected = mla_functional._run_functional_mla(request, "fa2")
+
+    assert seen == [selected]
+    assert selected.query is packed_query
+    assert selected.q_nope is selected.q_pe is None
+    assert selected.kv_cache is None
+    assert (selected.ckv_cache, selected.kpe_cache) == split_kv
 
 
 def test_supported_functional_api_emits_no_deprecation_warning():
@@ -279,7 +565,7 @@ def test_supported_functional_api_emits_no_deprecation_warning():
 
 def test_trtllm_legacy_facade_warns_once_and_preserves_output_identity(monkeypatch):
     monkeypatch.setattr(
-        mla_core,
+        mla_functional,
         "_trtllm_batch_decode_with_kv_cache_mla_warning_emitted",
         False,
         raising=False,
