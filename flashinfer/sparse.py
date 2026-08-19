@@ -350,19 +350,34 @@ class BlockSparseAttentionWrapper:
         self._workspace_size = (
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
-        self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-        )
-
-        self._kv_lens_buffer = torch.empty(
-            (32768,), dtype=torch.int32, device=self.device
-        )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=torch.uint8,
-            pin_memory=True,
-            device="cpu",
-        )
+        self._backend = _BACKEND_ALIASES.get(backend, backend)
+        if self._backend == "cake":
+            # Cake consumes the caller's direct VSA metadata and never invokes
+            # the generic sparse planner. Avoid allocating its per-wrapper 8 MiB
+            # device/host workspaces: video diffusion creates one wrapper per
+            # transformer layer.
+            self._int_workspace_buffer = torch.empty(
+                (0,), dtype=torch.uint8, device=self.device
+            )
+            self._kv_lens_buffer = torch.empty(
+                (0,), dtype=torch.int32, device=self.device
+            )
+            self._pin_memory_int_workspace_buffer = torch.empty(
+                (0,), dtype=torch.uint8, device="cpu"
+            )
+        else:
+            self._int_workspace_buffer = torch.empty(
+                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+            )
+            self._kv_lens_buffer = torch.empty(
+                (32768,), dtype=torch.int32, device=self.device
+            )
+            self._pin_memory_int_workspace_buffer = torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=torch.uint8,
+                pin_memory=True,
+                device="cpu",
+            )
         self._use_cuda_graph = False
         self._kv_layout = "NHD"
         self._qo_indptr: Optional[torch.Tensor] = None
@@ -375,7 +390,6 @@ class BlockSparseAttentionWrapper:
         self.C: Optional[int] = None
         self.M: Optional[int] = None
         self.N: Optional[int] = None
-        self._backend = _BACKEND_ALIASES.get(backend, backend)
         self._cake_vsa_plan: Optional[dict] = None
 
     def reset_workspace_buffer(

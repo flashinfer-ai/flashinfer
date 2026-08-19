@@ -17,11 +17,21 @@ limitations under the License.
 import torch
 
 from flashinfer import cake_vsa
+from flashinfer.sparse import BlockSparseAttentionWrapper
 
 
 class _NoRuntimeReduction:
     def max(self):
         raise AssertionError("static mask reductions must not run in run_cake_vsa")
+
+
+def test_cake_wrapper_skips_generic_sparse_workspaces():
+    workspace = torch.empty((1,), dtype=torch.uint8)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+
+    assert wrapper._int_workspace_buffer.numel() == 0
+    assert wrapper._kv_lens_buffer.numel() == 0
+    assert wrapper._pin_memory_int_workspace_buffer.numel() == 0
 
 
 def test_run_cake_vsa_uses_planned_mask_reductions(monkeypatch):
