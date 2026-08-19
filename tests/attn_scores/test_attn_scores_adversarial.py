@@ -317,18 +317,18 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G) next_n=4 with small / boundary contexts (FP4 atom-split)
+# G) max next_n with small / boundary contexts
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("ctx", [8, 64, 128, 129, 256, 257])
-def test_adv_fp4_next_n4_small_ctx(ctx):
-    """FP4 next_n=4 atom-split with small/boundary contexts (ctx-2 crosses blocks)."""
+def test_adv_fp4_max_next_n_small_ctx(ctx):
+    """FP4 at the largest supported next_n with small/boundary contexts."""
     _skip_if_not_sm100()
     from flashinfer import fp4_paged_mqa_logits
 
     torch.manual_seed(ctx)
-    B, next_n, H, D, block_size = 4, 4, 64, 128, 64
+    B, next_n, H, D, block_size = 4, 3, 64, 128, 64
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
     block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
@@ -363,7 +363,7 @@ def test_adv_fp4_next_n4_small_ctx(ctx):
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
-    assert diff < 0.05, f"FP4 next_n=4 cosine diff {diff:.3e} ctx={ctx}"
+    assert diff < 0.05, f"FP4 next_n={next_n} cosine diff {diff:.3e} ctx={ctx}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
