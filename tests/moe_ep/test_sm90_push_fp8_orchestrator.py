@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 
+_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
 _PACKAGE_ROOT = (
     Path(__file__).resolve().parents[2]
     / "flashinfer"
@@ -17,6 +19,17 @@ _PACKAGE_ROOT = (
     / "sm90"
     / "push_style_megamoe"
 )
+
+
+def _package_text(*parts: str) -> str:
+    source_tree = _PACKAGE_ROOT.joinpath(*parts)
+    if source_tree.is_file():
+        return source_tree.read_text(encoding="utf-8")
+
+    resource = resources.files(_PACKAGE_NAME)
+    for part in parts:
+        resource = resource / part
+    return resource.read_text(encoding="utf-8")
 
 
 class _Viewable:
@@ -627,13 +640,9 @@ def test_pipe_abort_keeps_local_poison_when_cuda_is_sticky(monkeypatch):
 
 
 def test_abort_cuda_contract_is_wired_through_waits_and_traps():
-    header = (_PACKAGE_ROOT / "src" / "a2a" / "sm90_push_a2a.cuh").read_text(
-        encoding="utf-8"
-    )
-    ops = (_PACKAGE_ROOT / "src" / "a2a" / "sm90_push_a2a_ops.cu").read_text(
-        encoding="utf-8"
-    )
-    protocol = (_PACKAGE_ROOT / "shim" / "protocol.py").read_text(encoding="utf-8")
+    header = _package_text("src", "a2a", "sm90_push_a2a.cuh")
+    ops = _package_text("src", "a2a", "sm90_push_a2a_ops.cu")
+    protocol = _package_text("shim", "protocol.py")
 
     assert "pool_head_offset + kPoolHeadStorageBytes" in header
     assert "kPoolHeadStorageBytes + kAbortCellStorageBytes <= 128" in header

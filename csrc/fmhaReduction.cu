@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,6 +66,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
   // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
+  // Fixed-Q batches are packed by mMaxSeqLenQ; grouped CTA coverage can include padded rows.
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
                                                             : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
@@ -94,8 +95,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   } else {
     seqLenKv = params.ptrSeqLensKv[batchIdx];
   }
-  // Consider the causal-mask speculative decoding.
-  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - lastTokenIdxQ);
+  // Consider the causal-mask speculative decoding. Use the per-batch seqLenQ (not mMaxSeqLenQ)
+  // so variable-length batches get the correct KV extent; these agree when seqLenQ ==
+  // mMaxSeqLenQ.
+  seqLenKv = max(seqLenKv - seqLenQ + lastTokenIdxQ + 1, 0);
   // Consider sparseAttnTopK and variable sparse MLA topK lengths.
   if (supportsVarSparseMlaTopKLens) {
     seqLenKv = params.ptrSparseMlaTopKLens[seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ];

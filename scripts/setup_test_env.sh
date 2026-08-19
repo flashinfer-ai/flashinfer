@@ -31,6 +31,39 @@ if [ -z "${PIP_CONSTRAINT:-}" ]; then
   unset _torch_pin
 fi
 
+# Install only what this branch moved past the image. Installing the full file
+# instead lets one drifted floor re-resolve every other requirement, which is how
+# torch has twice been swapped for a build that does not match the image.
+_reqs_output=$(python "${SCRIPT_DIR}/check_requirements.py" \
+  "${REPO_ROOT}/requirements.txt") && _reqs_status=0 || _reqs_status=$?
+case "${_reqs_status}" in
+  0)
+    echo "Requirements are satisfied by the image; nothing to install."
+    ;;
+  1)
+    echo "Installing requirements this branch changed: ${_reqs_output//$'\n'/ }"
+    _reqs_list=()
+    while IFS= read -r _req; do
+      [ -n "${_req}" ] && _reqs_list+=("${_req}")
+    done <<< "${_reqs_output}"
+    pip install "${_reqs_list[@]}"
+    unset _reqs_list _req
+    ;;
+  *)
+    echo "WARNING: requirement check failed; syncing the full requirements" >&2
+    pip install -r "${REPO_ROOT}/requirements.txt"
+    ;;
+esac
+unset _reqs_output _reqs_status
+
+# Install using only what the image carries; the check above covered the rest.
+# FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
+# hooks' own downloads, which isolation has always swallowed here.
+install_flashinfer_editable() {
+  FLASHINFER_BUILD_NO_PIP=1 \
+    pip install --no-build-isolation --no-deps -e "${1:-.}" -v
+}
+
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
   source "${REPO_ROOT}/ci/setup_python.env"
