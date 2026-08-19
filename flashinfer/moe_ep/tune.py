@@ -4,11 +4,14 @@ This module is only the command-line frontend: it parses arguments and
 dispatches to the tuner that lives NEXT TO the backend being tuned
 (``backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/tuner.py`` for
 ``--dtype nvfp4``, ``.../mxfp8_mxfp8_bf16_cutedsl/tuner.py`` for the mxfp8
-kinds).  Shared sweep machinery lives in ``backends/mega/kernel/tuning.py``.
+kinds; the ``backends/mega/kernel/sm107/`` twins when ``--arch sm107`` or a
+Rubin device is auto-detected).  Shared sweep machinery lives in
+``backends/mega/kernel/tuning.py`` (+ ``sm107/tuning.py`` for the SM107
+core-runtime dist lifecycle).
 
 The sweep runs the collective autotune OUTSIDE any serving engine and
 persists the winners in the knob cache (see
-``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
+``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
 that constructs the mega layer with ``knobs=None`` (the default) resolves the
 recorded winner with a pure dict lookup — no compiles, no collectives, no
 timing on the hot path.
@@ -48,6 +51,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
+    )
+    parser.add_argument(
+        "--arch",
+        choices=("auto", "sm100", "sm107"),
+        default="auto",
+        help="which mega backend family to tune; 'auto' picks sm107 on a "
+        "Rubin (compute capability 10.7) device, else sm100",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -126,21 +136,36 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_arch(arch: str) -> str:
+    if arch != "auto":
+        return arch
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7):
+        return "sm107"
+    return "sm100"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
         return 2
 
-    if args.dtype == "nvfp4":
-        from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    else:
-        from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    return run_tuning(args)
+    # The tuner lives next to the backend being tuned; SM107's pair are thin
+    # quant-kind bindings over one shared driver (sm107/tuning.py).
+    import importlib
+
+    family = _resolve_arch(args.arch)
+    backend = (
+        "nvfp4_nvfp4_bf16_cutedsl"
+        if args.dtype == "nvfp4"
+        else "mxfp8_mxfp8_bf16_cutedsl"
+    )
+    tuner = importlib.import_module(
+        f".backends.mega.kernel.{family}.{backend}.tuner", __package__
+    )
+    return tuner.run_tuning(args)
 
 
 if __name__ == "__main__":

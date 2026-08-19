@@ -15,7 +15,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         COMBINE_FORMAT_NAMES,
         autotune_nvfp4_mega_moe,
         create_dummy_nvfp4_inputs,

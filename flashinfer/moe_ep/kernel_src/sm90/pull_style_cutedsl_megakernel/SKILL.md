@@ -3,7 +3,7 @@
 ## Provenance
 
 This tree vendors the kernel team's **SM90 FP8 MegaMoE** drop — a fork of the
-same kernel repo that `kernel_src/cutedsl_megamoe` vendors (Bangyu's
+same kernel repo that `kernel_src/sm100/cutedsl_megamoe` vendors (Bangyu's
 SM100 tree). The SM90 work (Vincent's `hopper_megamoe` branch) moved the
 shared runtime forward, so this tree duplicates `common/`, `src/`, and
 `moe_nvfp4_swapab/` at its own revision instead of sharing the SM100 copies.
@@ -51,7 +51,7 @@ for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
 
 ## When the kernel team drops a new version of src/
 
-Same workflow as `kernel_src/cutedsl_megamoe/SKILL.md`, with this tree's
+Same workflow as `kernel_src/sm100/cutedsl_megamoe/SKILL.md`, with this tree's
 package set:
 
 ```bash

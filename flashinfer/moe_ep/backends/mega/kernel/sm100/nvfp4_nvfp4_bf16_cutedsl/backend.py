@@ -119,7 +119,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
 
         k = self._kernel_config
         fp = fleet_params
@@ -180,7 +180,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from ......kernel_src.cutedsl_megamoe import (
+            from ......kernel_src.sm100.cutedsl_megamoe import (
                 Nvfp4BlockSize,
                 ceil_div,
                 round_up,
@@ -205,7 +205,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
-            from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+            from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
@@ -223,7 +223,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -245,7 +245,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from ......kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_nvfp4_mega_moe
 
             autotune_nvfp4_mega_moe(
                 output,
@@ -283,7 +283,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         state = self._thunk_state
         if state is None or state[0] != key or key[2] is None:
-            from ......kernel_src.cutedsl_megamoe import (
+            from ......kernel_src.sm100.cutedsl_megamoe import (
                 MegaMoENvfp4Inputs,
             )
 
@@ -358,7 +358,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

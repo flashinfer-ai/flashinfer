@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-kernel_src/cutedsl_megamoe/
+kernel_src/sm100/cutedsl_megamoe/
 ├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
@@ -62,9 +62,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 1. **Replace `src/` verbatim** with the drop's four kernel packages — no injected
    files, no edits (the drop is a full repo; copy only these four dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
+   rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
-       flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
+       flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).

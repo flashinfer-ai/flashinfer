@@ -248,6 +248,26 @@ def validate_mega_arch_sm90() -> None:
         )
 
 
+def validate_mega_arch_sm107() -> None:
+    """Arch gate for the SM107 (Rubin) mega kernels.
+
+    The Rubin block-scaled CuTeDSL mega kernels target sm_107a exactly (they
+    need ``cutlass.utils.rubin_helpers`` codegen and compile with
+    ``CUTE_DSL_ARCH=sm_107a``); Blackwell hosts use the sm_100 tree's kernels
+    instead.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc != (10, 7):
+        raise MoEEpArchError(
+            f"the SM107 block-scaled mega kernels require sm_107 "
+            f"(Rubin); host has sm_{cc[0]}{cc[1]}"
+        )
+
+
 def validate_fleet_weights(
     weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:

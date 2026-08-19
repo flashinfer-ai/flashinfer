@@ -77,6 +77,14 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
 )
+from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
+    Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm107_mxfp8_mega_weights,
+)
+from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
+    Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm107_nvfp4_mega_weights,
+)
 
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
@@ -203,6 +211,8 @@ __all__ = [
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
@@ -222,6 +232,8 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm107_mxfp8_mega_weights",
+    "preprocess_sm107_nvfp4_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
     "run_split_kernel",

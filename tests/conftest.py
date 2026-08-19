@@ -164,6 +164,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
     config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
+    config.addinivalue_line("markers", "arch_rubin: requires sm_107 (Rubin)")
     config.addinivalue_line(
         "markers",
         "long_running: front-load this test file at the start of the parallel CI queue",
@@ -214,8 +215,14 @@ def pytest_collection_modifyitems(config, items):
                         reason="requires torchrun launch (WORLD_SIZE unset)"
                     )
                 )
-        if "arch_blackwell" in item.keywords and cc < (10, 0):
-            item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
+        # Blackwell band only: SM107 (Rubin, cc 10.7) is NOT a superset of the
+        # sm_100 kernel targets — Blackwell-marked tests fail there (ptxas /
+        # DSL target mismatch), so they skip gracefully instead.
+        if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
+        # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
+        if "arch_rubin" in item.keywords and cc != (10, 7):
+            item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):
