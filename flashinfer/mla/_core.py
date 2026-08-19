@@ -3525,7 +3525,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
+    r"""Decode MLA with Cake, TRTLLM-GEN, CuteDSL, XQA, or sparse kernels.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
     when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
@@ -3615,7 +3615,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         backends; ignored by ``cute-dsl``.
     backend : str = "auto"
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
-        ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``. ``"auto"``
+        ``"cake"``, ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``.
+        ``"cake"`` explicitly selects the source-level SM103a BF16 schedule
+        for its verified low-batch, page-size-32, 1024-token envelope and is
+        never selected automatically. ``"auto"``
         chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
         ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
         SM120/SM121 dense decode uses ``"xqa"``.
@@ -3810,6 +3813,36 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cp_rank=cp_rank,
         causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
+
+    if backend == "cake":
+        from .cake_trtllm_mla import cake_trtllm_mla_decode
+
+        return cake_trtllm_mla_decode(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            lse=lse,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            enable_dcp=enable_dcp,
+            backend="cake",
+        )
 
     if backend == "auto":
         cc = get_compute_capability(query.device)

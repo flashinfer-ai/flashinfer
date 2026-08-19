@@ -48,7 +48,11 @@ repos:
       - id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
+          (?x)^(
+            3rdparty/.*|
+            flashinfer/jit/aot_config\.py|
+            csrc/mla/cake_trtllm_mla_bf16_low_batch_single_launch\.cu
+          )$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
