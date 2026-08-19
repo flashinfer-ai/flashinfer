@@ -259,6 +259,8 @@ def select_cake_fmha_decode_route(
         return None
     if block_tables.dtype not in (torch.int32, torch.uint32):
         return None
+    if not block_tables.is_contiguous():
+        return None
     if uses_shared_paged_kv_idx:
         if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
             return None
@@ -273,6 +275,13 @@ def select_cake_fmha_decode_route(
         or sinks.dtype != torch.float32
         or sinks.numel() != num_q_heads
         or not sinks.is_contiguous()
+    ):
+        return None
+    if lse is not None and (
+        lse.dtype != torch.float32
+        or lse.shape != (query.shape[0], num_q_heads)
+        or not lse.is_contiguous()
+        or lse.stride() != (num_q_heads, 1)
     ):
         return None
 

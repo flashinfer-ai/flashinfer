@@ -312,6 +312,30 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         )
         is None
     )
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            query.device,
+            **{
+                **kwargs,
+                "block_tables": torch.zeros((2, 4), dtype=torch.int32)[:, ::2],
+            },
+        )
+        is None
+    )
+    valid_lse = torch.empty((2, 4), dtype=torch.float32)
+    assert cake_api.select_cake_fmha_decode_route(
+        query.device, **{**kwargs, "lse": valid_lse}
+    ) == route
+    for invalid_lse in (
+        torch.empty((2, 4), dtype=torch.float16),
+        torch.empty((2, 5), dtype=torch.float32)[:, :4],
+    ):
+        assert (
+            cake_api.select_cake_fmha_decode_route(
+                query.device, **{**kwargs, "lse": invalid_lse}
+            )
+            is None
+        )
     misaligned_key = torch.empty((4, 2, 16, 129), dtype=torch.bfloat16)[..., :128]
     assert misaligned_key.stride() == (4128, 2064, 129, 1)
     assert (
@@ -378,6 +402,34 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
     assert fp16_route is not None
     assert fp16_route.component == "decode_native_fp16_nhd"
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            fp16_q.device,
+            query=fp16_q,
+            key_cache=normalized_nhd,
+            value_cache=torch.empty_like(normalized_nhd),
+            out=torch.empty_like(fp16_q),
+            block_tables=torch.zeros((2, 2, 4), dtype=torch.int32)[:, :, ::2],
+            seq_lens=torch.tensor([32, 32], dtype=torch.int32),
+            batch_size=2,
+            q_len=1,
+            max_seq_len=32,
+            window_left=-1,
+            bmm1_scale=0.125,
+            bmm2_scale=1.0,
+            o_scale=1.0,
+            sinks=None,
+            kv_layout="NHD",
+            uses_shared_paged_kv_idx=False,
+            cum_seq_lens_q=None,
+            key_block_scales=None,
+            value_block_scales=None,
+            skip_softmax_threshold_scale_factor=None,
+            enable_block_sparse_attention=False,
+            lse=None,
+        )
+        is None
+    )
     misaligned_nhd = torch.empty((4, 32, 2, 129), dtype=torch.float16)[
         ..., :128
     ].transpose(-3, -2)
