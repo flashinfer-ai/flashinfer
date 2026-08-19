@@ -173,13 +173,15 @@ def recurrent_kda(
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
-            permutation of shape ``[N]``. CuTe DSL uses the original sequence
-            order when this is omitted; callers that want length-prioritized
-            scheduling can prepare it outside the launch with
+            permutation of shape ``[N]``. For eager CuTe DSL packed engine
+            calls, omitting it builds and caches a longest-sequence-first order;
+            CuTe DSL decomp keeps the original order because its CTA grid fits
+            in one wave. CUDA Graph capture of a packed CuTe DSL engine call
+            requires an explicit plan prepared with
             :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order keeps the
-            direct schedule so caller-owned ordering is not replaced by
-            persistent task bins.
+            own eager host metadata. On Cake, supplying an order keeps the direct
+            schedule so caller-owned ordering is not replaced by persistent task
+            bins.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family prefill backends.

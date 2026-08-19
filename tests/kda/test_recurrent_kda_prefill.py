@@ -368,7 +368,10 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
     }
 
 
-def test_cute_dsl_prefill_adapter_forwards_explicit_sequence_order(monkeypatch):
+@pytest.mark.parametrize("explicit_order", [False, True])
+def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
+    monkeypatch, explicit_order
+):
     calls = []
 
     class Compiled:
@@ -394,7 +397,7 @@ def test_cute_dsl_prefill_adapter_forwards_explicit_sequence_order(monkeypatch):
     inputs = _cpu_route_tensors()
     output = torch.empty_like(inputs["q"])
     cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
-    seq_order = torch.tensor([1, 0], dtype=torch.int32)
+    seq_order = torch.tensor([1, 0], dtype=torch.int32) if explicit_order else None
     result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
         q=inputs["q"],
         k=inputs["k"],
@@ -430,6 +433,66 @@ def test_cute_dsl_prefill_adapter_forwards_explicit_sequence_order(monkeypatch):
     assert kwargs["state_indices"] is None
     assert kwargs["planned_cu_chunks"] is None
     assert kwargs["planned_chunk_to_seq"] is None
+
+
+def test_cute_dsl_lpt_sequence_order_is_content_cached():
+    kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
+    kernel_module._CU_CONTENTS_MEMO.clear()
+    kernel_module._LPT_SEQUENCE_ORDER_CACHE.clear()
+    cu_seqlens = torch.tensor(
+        [0, 1300, 1847, 3895, 4858, 5129, 8192], dtype=torch.int64
+    )
+
+    first = kernel_module._lpt_sequence_order(cu_seqlens)
+    second = kernel_module._lpt_sequence_order(cu_seqlens.clone())
+
+    assert first.tolist() == [5, 2, 0, 3, 1, 4]
+    assert second.data_ptr() == first.data_ptr()
+
+
+def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
+    kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(kernel_module, "_device_sm_count", lambda device: 148)
+    monkeypatch.setattr(
+        kernel_module,
+        "_route_for_workspace",
+        lambda n_seq, heads, device, mode: "engine",
+    )
+    compiled = kernel_module._make_call(
+        lambda *args, **kwargs: None,
+        {
+            "mode": None,
+            "dtype": object(),
+            "state_dtype": object(),
+            "gate_dtype": object(),
+            "safe_gate": True,
+            "gate_lower_bound": -5.0,
+            "has_state_in": False,
+            "has_state_out": False,
+            "has_state_ckpt": False,
+            "has_state_indices": False,
+        },
+    )
+    inputs = _cpu_route_tensors()
+    cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match=r"Wrapper\.plan\(\)"):
+        compiled(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            inputs["beta"],
+            cu_seqlens,
+            None,
+            torch.empty_like(inputs["q"]),
+            None,
+            torch.empty(0, dtype=torch.uint8),
+            0,
+        )
 
 
 def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatch):

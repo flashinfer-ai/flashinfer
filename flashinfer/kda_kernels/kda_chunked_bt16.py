@@ -6792,6 +6792,26 @@ def host_prep(
 
 
 _PLAN_CACHE: dict = {}
+_LPT_SEQUENCE_ORDER_CACHE: dict = {}
+
+
+def _lpt_sequence_order(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Cached longest-processing-time-first order for packed engine calls."""
+
+    cu_list = _cu_seqlens_contents(cu_seqlens)
+    key = (cu_list, str(cu_seqlens.device))
+    order = _LPT_SEQUENCE_ORDER_CACHE.get(key)
+    if order is None:
+        lengths = [
+            cu_list[index + 1] - cu_list[index] for index in range(len(cu_list) - 1)
+        ]
+        order = torch.tensor(
+            sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True),
+            dtype=torch.int32,
+            device=cu_seqlens.device,
+        )
+        _LPT_SEQUENCE_ORDER_CACHE[key] = order
+    return order
 
 
 def _plan(cu_seqlens: torch.Tensor) -> dict:
@@ -9702,8 +9722,10 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
 
     Runtime ABI: (q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens,
     initial_state, out, final_state, workspace, stream_a, scale, ..., seq_order)
-    — ``seq_order=None`` uses the original sequence order; an explicit packed
-    CUDA int32 permutation overrides it. The remaining positional ABI is
+    — for packed engine calls, ``seq_order=None`` builds and caches an eager LPT
+    order; fixed and decomp calls retain the original sequence order. An explicit
+    packed CUDA int32 permutation overrides either default. The remaining
+    positional ABI is
     the reference host ABI (stream_a == the reference `stream`, scale in the same
     position) plus the `workspace` operand.  Decomp always runs prep-first on
     overlap.  `.workspace_size(cu_seqlens, heads)` is attached.  There is NO
@@ -9804,7 +9826,8 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         # feed the kernels directly in token-major memory order: the hosts
         # build every TMA descriptor from explicit (shape, stride) tuples, so
         # no logical permute is needed anywhere.
-        if cu_seqlens is None:
+        packed_layout = cu_seqlens is not None
+        if not packed_layout:
             bsz = int(q.shape[0])
             tlen = int(q.shape[1])
             cu_seqlens = _uniform_cu_seqlens(bsz, tlen, q.device)
@@ -9820,19 +9843,6 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         device = q.device
         sm_count = _device_sm_count(device)
         n_seq = cu_seqlens.numel() - 1
-        if seq_order is None:
-            seq_order = _identity_sequence_order(n_seq, device)
-        elif (
-            seq_order.device != device
-            or seq_order.dtype != torch.int32
-            or seq_order.ndim != 1
-            or not seq_order.is_contiguous()
-            or seq_order.numel() != n_seq
-        ):
-            raise ValueError(
-                "seq_order must be a contiguous CUDA int32 tensor with one "
-                "entry per sequence"
-            )
         if state_indices is not None and (
             initial_state is None
             or state_indices.device != device
@@ -9850,6 +9860,28 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         if kind is None:
             kind = _route_for_workspace(n_seq, heads, device, compile_mode or "auto")
             decisions[key] = kind
+        if seq_order is None:
+            if packed_layout and kind == "engine":
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "packed CuTe DSL engine CUDA Graph capture requires "
+                        "an explicit sequence plan; use "
+                        "RecurrentKDAPrefillWrapper.plan() before capture"
+                    )
+                seq_order = _lpt_sequence_order(cu_seqlens)
+            else:
+                seq_order = _identity_sequence_order(n_seq, device)
+        elif (
+            seq_order.device != device
+            or seq_order.dtype != torch.int32
+            or seq_order.ndim != 1
+            or not seq_order.is_contiguous()
+            or seq_order.numel() != n_seq
+        ):
+            raise ValueError(
+                "seq_order must be a contiguous CUDA int32 tensor with one "
+                "entry per sequence"
+            )
         has_planned_chunks = (
             planned_cu_chunks is not None and planned_chunk_to_seq is not None
         )

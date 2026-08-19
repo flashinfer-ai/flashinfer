@@ -301,7 +301,7 @@ def _run_cute_dsl_kda_prefill(
         raise ValueError(f"scale must be finite, got {scale_value}")
 
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
-    if seq_order is None:
+    if seq_order is None and cu_seqlens is None:
         seq_order = _identity_seq_order(
             device=q.device,
             num_sequences=num_sequences,
