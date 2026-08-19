@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from dataclasses import replace
 from typing import Any
 
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
@@ -1826,54 +1827,9 @@ def _batched_gemm_kernel_bf16_body(
         name="GmemC",
     )
 
-    # WorkQueue — CLC persistent or static (non-persistent)
-    if cutlass.const_expr(cfg.is_persistent):
-        if cutlass.const_expr(
-            cfg.use_early_exit
-            and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
-        ):
-            num_non_exiting_ctas_view = cutlass.make_array_view(
-                num_non_exiting_ctas_tensor
-            )
-            num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
-                idx=Int32(0), vector_size=1
-            )[0]
-        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
-        tile_sched_cfg = (
-            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
-                tile_scheduler_params=tile_sched_params,
-                response_ptr=clc_response_ptr,
-            )
-        )
-        work_queue = BatchedGemmWorkQueue(
-            tile_scheduler_config=tile_sched_cfg,
-            cfg=cfg,
-            num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
-            num_non_exiting_ctas_value=num_non_exiting_ctas_value,
-            pipeline_config=pcfgs["workid"],
-            name="WorkQueue",
-        )
-    else:
-        tile_sched_cfg = (
-            TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
-                tile_scheduler_params=tile_sched_params,
-            )
-        )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
-
-    work_throttle = None
-    if cutlass.const_expr(cfg.use_work_throttle_barrier):
-        work_throttle = WorkThrottleBarrierResource(
-            pipeline_config=pcfgs["work_throttle"],
-            name="WorkThrottle",
-        )
-
-    # ProxyCluster is constructed with the tasks below. Initialize the local
-    # before building the allocator, then register its pipeline barriers once
-    # the resource exists.
-    proxy_cluster = None
-
-    # SMEM allocator
+    # Keep all persistent scheduler storage in the unified dynamic-SMEM block.
+    # A standalone alloc_smem object reserves an additional 1 KiB of static
+    # SMEM and reduces the maximum opt-in dynamic-SMEM capacity.
     smem_allocator = SmemAllocator()
     smem_resources: tuple[Any, ...] = (smem_a, smem_b)
     if cutlass.const_expr(cfg.has_cast_a):
@@ -1882,8 +1838,6 @@ def _batched_gemm_kernel_bf16_body(
         smem_resources = smem_resources + (smem_sfa, smem_sfb)
     if cutlass.const_expr(cfg.has_deepseek_fp8):
         smem_resources = smem_resources + (smem_dsfp8_sfab,)
-    if cutlass.const_expr(cfg.is_persistent):
-        smem_resources = smem_resources + (work_queue,)
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
@@ -1894,7 +1848,6 @@ def _batched_gemm_kernel_bf16_body(
         tmem_sfa,
         tmem_sfb,
         tmem_sfab,
-        work_throttle,
     )
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
@@ -1913,7 +1866,122 @@ def _batched_gemm_kernel_bf16_body(
         tmem_dealloc_mbar_alloc = smem_allocator.add(
             SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
         )
+
+    clc_response_alloc = None
+    workid_barrier_alloc = None
+    work_throttle_barrier_alloc = None
+    proxy_barrier_alloc = None
+    fast_drain_response_alloc = None
+    fast_drain_mbar_alloc = None
+    if cutlass.const_expr(cfg.is_persistent):
+        clc_response_alloc = smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=cfg.num_stages_workid,
+                alignment=16,
+            )
+        )
+        workid_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "workid_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * cfg.num_stages_workid,
+                alignment=8,
+            )
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_throttle_mbarriers",
+                    dtype=cutlass.Int64,
+                    count=2 * cfg.num_stages_workid,
+                    alignment=8,
+                )
+            )
+        if cutlass.const_expr(
+            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+        ):
+            proxy_barrier_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "proxy_cluster_mbarriers",
+                    dtype=cutlass.Int64,
+                    count=2 * pcfgs["proxy"].num_stages,
+                    alignment=8,
+                )
+            )
+        if cutlass.const_expr(
+            cfg.use_early_exit and cfg.use_clc_fast_drain
+        ):
+            fast_drain_response_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_queue_fast_drain_response",
+                    dtype=cutlass.Int128,
+                    count=BatchedGemmWorkQueue.fast_drain_rate,
+                    alignment=16,
+                )
+            )
+            fast_drain_mbar_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_queue_fast_drain_mbar",
+                    dtype=cutlass.Int64,
+                    alignment=8,
+                )
+            )
     smem_allocator.compute_layout()
+
+    clc_response_ptr = None
+    fast_drain_response_ptr = None
+    fast_drain_mbar_ptr = None
+    if cutlass.const_expr(cfg.is_persistent):
+        smem_allocator.allocate()
+        smem_base = smem_allocator.smem_base.data_ptr()
+        clc_response_ptr = cute.make_ptr(
+            cutlass.Int128,
+            smem_base + clc_response_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        workid_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_base + workid_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["workid"] = replace(
+            pcfgs["workid"], barrier_ptr=workid_barrier_ptr
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + work_throttle_barrier_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            pcfgs["work_throttle"] = replace(
+                pcfgs["work_throttle"], barrier_ptr=work_throttle_barrier_ptr
+            )
+        if cutlass.const_expr(
+            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+        ):
+            proxy_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + proxy_barrier_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            pcfgs["proxy"] = replace(
+                pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr
+            )
+        if cutlass.const_expr(
+            cfg.use_early_exit and cfg.use_clc_fast_drain
+        ):
+            fast_drain_response_ptr = cute.make_ptr(
+                cutlass.Int128,
+                smem_base + fast_drain_response_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            fast_drain_mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + fast_drain_mbar_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
 
     # TMEM allocator
     tmem_allocator = TmemAllocator()
@@ -1928,6 +1996,51 @@ def _batched_gemm_kernel_bf16_body(
             tmem_allocator.add_resource(tmem_sfa)
             tmem_allocator.add_resource(tmem_sfb)
     tmem_allocator.compute_layout()
+
+    # WorkQueue — CLC persistent or static (non-persistent)
+    if cutlass.const_expr(cfg.is_persistent):
+        if cutlass.const_expr(
+            cfg.use_early_exit
+            and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
+        ):
+            num_non_exiting_ctas_view = cutlass.make_array_view(
+                num_non_exiting_ctas_tensor
+            )
+            num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
+                idx=Int32(0), vector_size=1
+            )[0]
+        tile_sched_cfg = (
+            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+                response_ptr=clc_response_ptr,
+            )
+        )
+        work_queue = BatchedGemmWorkQueue(
+            tile_scheduler_config=tile_sched_cfg,
+            cfg=cfg,
+            num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
+            num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+            fast_drain_response_ptr=fast_drain_response_ptr,
+            fast_drain_mbar_ptr=fast_drain_mbar_ptr,
+            pipeline_config=pcfgs["workid"],
+            name="WorkQueue",
+        )
+    else:
+        tile_sched_cfg = (
+            TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+            )
+        )
+        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+
+    work_throttle = None
+    if cutlass.const_expr(cfg.use_work_throttle_barrier):
+        work_throttle = WorkThrottleBarrierResource(
+            pipeline_config=pcfgs["work_throttle"],
+            name="WorkThrottle",
+        )
+
+    proxy_cluster = None
 
     pdl_wait_completed_before_tasks = cutlass.const_expr(
         _pdl_wait_completed_before_tasks(cfg)
@@ -2016,8 +2129,6 @@ def _batched_gemm_kernel_bf16_body(
                 pipeline_config=pcfgs.get("proxy"),
                 name="ProxyCluster",
             )
-            smem_allocator.add_resource(proxy_cluster)
-            smem_allocator.compute_layout()
             sync = create_sync_task(
                 cfg,
                 proxy_cluster,
