@@ -44,6 +44,7 @@ from .pcie_ipc_tuning import (
     pcie_ipc_tuning_config,
     resolve_tuned_config,
     tuned_batches_for,
+    warn_no_tune_group,
 )
 
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
@@ -585,8 +586,14 @@ class PcieIpcAllReduceWorkspace:
             # distributed tune group, profiling this collective is unsafe.
             # Restore the workspace's explicit tune cache and perform a lookup
             # with its own bucket policy instead of retaining the seed tactic.
-            if tuner.is_tuning_mode and self._tune_cache_exists:
-                tuner.load_configs(self._tune_cache)
+            if tuner.is_tuning_mode:
+                # The runner would have said this had it been asked for
+                # candidates; short-circuiting before ``choose_one`` is what
+                # would otherwise swallow it. It is the actionable half of the
+                # diagnosis -- the caller is tuning, so "go tune" is not.
+                warn_no_tune_group(stacklevel=4)
+                if self._tune_cache_exists:
+                    tuner.load_configs(self._tune_cache)
             _, _, tactic, _ = tuner.search_cache(
                 PCIE_IPC_CUSTOM_OP,
                 [self._runner],
@@ -615,7 +622,7 @@ class PcieIpcAllReduceWorkspace:
                 stacklevel=3,
             )
             return seed
-        if not can_profile:
+        if not tuner.is_tuning_mode:
             self._warn_if_untuned()
         return config
 

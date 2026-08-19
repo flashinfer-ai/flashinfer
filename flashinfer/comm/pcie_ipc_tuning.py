@@ -334,6 +334,25 @@ def tuned_batches_for(
     return tuple(b for b in batches if b * hidden <= max_numel)
 
 
+def warn_no_tune_group(stacklevel: int = 2) -> None:
+    """Say why a tuning session left this collective untuned.
+
+    Raised from two places that reach the same dead end -- the runner, when the
+    autotuner does ask it for candidates, and the workspace, when it declines
+    to ask at all. The generic "nothing is tuned" advice does not fit here: the
+    caller *is* tuning, so telling them to tune is a dead end. What they are
+    missing is the reduction group, and that is what this names.
+    """
+    warnings.warn(
+        "PCIe IPC all-reduce skipped autotuning: no matching "
+        "autotune process group is installed on every rank. Call "
+        "PcieIpcAllReduceWorkspace.tune(), or install one with "
+        "set_autotune_process_group() before entering autotune().",
+        RuntimeWarning,
+        stacklevel=stacklevel,
+    )
+
+
 class PcieIpcAllReduceRunner(TunableRunner):
     """Adapts the all-reduce to the autotuner, and screens candidates first.
 
@@ -431,14 +450,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
             # over the candidate timings the ranks would argmin independently
             # and pick different kernels, which this protocol does not survive.
             # Offering only the seed degrades that into a no-op.
-            warnings.warn(
-                "PCIe IPC all-reduce skipped autotuning: no matching "
-                "autotune process group is installed on every rank. Call "
-                "PcieIpcAllReduceWorkspace.tune(), or install one with "
-                "set_autotune_process_group() before entering autotune().",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            warn_no_tune_group(stacklevel=3)
             return [TABLE_TACTIC]
 
         tactics = candidate_tactics(ws.world_size, ws.max_blocks)
