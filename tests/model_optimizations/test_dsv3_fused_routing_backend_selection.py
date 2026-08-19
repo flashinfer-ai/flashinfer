@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import flashinfer.fused_moe.fused_routing_dsv3 as fused_routing
 from flashinfer.fused_moe.fused_routing_dsv3 import (
     _is_cake_dsv3_fused_routing_supported,
 )
@@ -69,3 +72,52 @@ def test_cake_backend_rejects_single_group_above_boundary():
 
 def test_cake_backend_preserves_source_single_group_topk_constraint():
     assert not _supported(num_experts=256, n_group=1, topk_group=1, topk=8)
+
+
+def _selected_backend(monkeypatch, backend=None):
+    selected = []
+
+    def fake_get_module(backend="default"):
+        selected.append(backend)
+        return SimpleNamespace(NoAuxTc=lambda *_args, **_kwargs: None)
+
+    monkeypatch.setattr(fused_routing, "get_dsv3_fused_routing_module", fake_get_module)
+
+    scores = torch.empty((1, 256), dtype=torch.bfloat16)
+    bias = torch.empty((256,), dtype=torch.bfloat16)
+    kwargs = {}
+    if backend is not None:
+        kwargs["backend"] = backend
+    fused_routing.fused_topk_deepseek(
+        scores,
+        bias,
+        n_group=8,
+        topk_group=4,
+        topk=8,
+        routed_scaling_factor=1.0,
+        topk_values=torch.empty((1, 8), dtype=torch.bfloat16),
+        topk_indices=torch.empty((1, 8), dtype=torch.int32),
+        skip_check=True,
+        **kwargs,
+    )
+    return selected
+
+
+def test_fused_topk_deepseek_preserves_default_backend(monkeypatch):
+    def fail_on_capability_query(*_args, **_kwargs):
+        raise AssertionError("default backend must not query Cake capability")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fail_on_capability_query)
+    assert _selected_backend(monkeypatch) == ["default"]
+
+
+def test_fused_topk_deepseek_allows_explicit_cake_backend(monkeypatch):
+    assert _selected_backend(monkeypatch, backend="cake") == ["cake"]
+
+
+def test_fused_topk_deepseek_backend_capability_metadata():
+    assert fused_routing.fused_topk_deepseek.is_backend_supported("default", 90)
+    assert fused_routing.fused_topk_deepseek.is_backend_supported("default", 100)
+    assert not fused_routing.fused_topk_deepseek.is_backend_supported("cake", 90)
+    assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 100)
+    assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 103)

@@ -1,6 +1,6 @@
 import functools
 from types import SimpleNamespace
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -57,6 +57,41 @@ def _is_cake_dsv3_fused_routing_supported(
 
 
 @supported_compute_capability([89, 90, 100, 103, 107, 120, 121])
+def _check_default_dsv3_fused_routing_backend_supported(**_kwargs) -> bool:
+    """Return whether the existing fused-routing backend is available."""
+
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _check_cake_dsv3_fused_routing_backend_supported(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    topk: int,
+    **_kwargs,
+) -> bool:
+    """Validate the explicit Cake backend's executable contract."""
+
+    capability = torch.cuda.get_device_capability(scores.device)
+    if not _is_cake_dsv3_fused_routing_supported(
+        capability=capability,
+        num_tokens=scores.shape[0],
+        num_experts=scores.shape[1],
+        n_group=n_group,
+        topk_group=topk_group,
+        topk=topk,
+        score_dtype=scores.dtype,
+        bias_dtype=bias.dtype,
+    ):
+        raise ValueError(
+            "backend='cake' does not support this fused-routing configuration"
+        )
+    return True
+
+
+@supported_compute_capability([89, 90, 100, 103, 107, 120, 121])
 def _check_dsv3_fused_routing_supported(
     scores,
     bias,
@@ -68,6 +103,7 @@ def _check_dsv3_fused_routing_supported(
     topk_indices,
     launch_with_pdl,
     routing_replay_out=None,
+    backend="default",
 ):
     """Validate configuration parameters for DSv3 fused routing kernel.
 
@@ -81,6 +117,8 @@ def _check_dsv3_fused_routing_supported(
         topk_values: Output tensor for normalized expert weights
         topk_indices: Output tensor for selected expert indices
         launch_with_pdl: Whether to use Persistent Device-side Launch
+        routing_replay_out: Optional tensor for recording selected expert IDs
+        backend: Fused-routing implementation selected by the public API
 
     Raises:
         ValueError: If configuration is invalid or exceeds kernel limits
@@ -180,7 +218,13 @@ def get_dsv3_fused_routing_module(backend: str = "default"):
     )
 
 
-@backend_requirement({}, common_check=_check_dsv3_fused_routing_supported)
+@backend_requirement(
+    {
+        "default": _check_default_dsv3_fused_routing_backend_supported,
+        "cake": _check_cake_dsv3_fused_routing_backend_supported,
+    },
+    common_check=_check_dsv3_fused_routing_supported,
+)
 @flashinfer_api(trace=fused_topk_deepseek_trace)
 def fused_topk_deepseek(
     scores: torch.Tensor,
@@ -193,6 +237,8 @@ def fused_topk_deepseek(
     topk_indices: torch.Tensor,
     launch_with_pdl: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["default", "cake"] = "default",
 ) -> None:
     r"""Fused expert routing with top-k selection for DeepSeek-V3.
 
@@ -258,6 +304,11 @@ def fused_topk_deepseek(
         steps with smaller ``num_tokens`` under CUDA graphs (the kernel only
         writes indices ``[0, num_tokens)``).  When ``None`` (default) the
         kernel skips this write (zero overhead).
+    backend : Literal["default", "cake"]
+        Implementation backend. ``"default"`` preserves the existing
+        FlashInfer implementation. ``"cake"`` explicitly selects the Cake
+        kernel and raises when the call is outside its supported contract.
+        Defaults to ``"default"``.
 
     Returns
     -------
@@ -274,22 +325,7 @@ def fused_topk_deepseek(
     load-balancing losses and the ``Tc`` suffix indicates Tensor-Core
     utilization.
     """
-    capability = torch.cuda.get_device_capability(scores.device)
-    use_cake = _is_cake_dsv3_fused_routing_supported(
-        capability=capability,
-        num_tokens=scores.shape[0],
-        num_experts=scores.shape[1],
-        n_group=n_group,
-        topk_group=topk_group,
-        topk=topk,
-        score_dtype=scores.dtype,
-        bias_dtype=bias.dtype,
-    )
-    module = (
-        get_dsv3_fused_routing_module(backend="cake")
-        if use_cake
-        else get_dsv3_fused_routing_module(backend="default")
-    )
+    module = get_dsv3_fused_routing_module(backend=backend)
     module.NoAuxTc(
         scores,
         bias,
