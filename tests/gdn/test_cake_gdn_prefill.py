@@ -299,7 +299,7 @@ def test_indexed_state_rows_must_not_overlap() -> None:
         )
 
 
-def test_public_cake_cache_rebinds_rotating_tensor_addresses(
+def test_public_cake_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     preparations: list[dict[str, object]] = []
@@ -323,8 +323,9 @@ def test_public_cake_cache_rebinds_rotating_tensor_addresses(
         "current_stream",
         lambda _device: SimpleNamespace(cuda_stream=7),
     )
+    monkeypatch.setattr(cake.torch.cuda, "is_current_stream_capturing", lambda: False)
     cake._public_key = None
-    cake._public_metadata_bindings = None
+    cake._public_metadata_binding = None
     cake._public_prepared = None
 
     cu_seqlens = torch.tensor([0, 2], dtype=torch.int64)
@@ -351,9 +352,6 @@ def test_public_cake_cache_rebinds_rotating_tensor_addresses(
         )
 
     assert len(preparations) == 1
-    assert cake._public_metadata_bindings is not None
-    assert cake._public_metadata_bindings[0] is cu_seqlens
-    assert cake._public_metadata_bindings[1] is None
     assert preparations[0]["_capture_graph"] is False
     assert len(dynamic_launches) == 1
     assert dynamic_launches[0]["output"] is output
@@ -373,11 +371,11 @@ def test_public_cake_cache_rebinds_rotating_tensor_addresses(
         state_indices=None,
         output_final_state=True,
     )
-    assert len(preparations) == 2
+    assert len(preparations) == 1
 
     cake._reset_cake_gdn_cp_prefill_cache()
     assert cake._public_key is None
-    assert cake._public_metadata_bindings is None
+    assert cake._public_metadata_binding is None
     assert cake._public_prepared is None
 
     cake.chunk_gated_delta_rule_cake_sm100(
@@ -395,6 +393,165 @@ def test_public_cake_cache_rebinds_rotating_tensor_addresses(
         output_final_state=True,
     )
     assert replays == ["replay"]
+
+
+def test_public_cake_cache_detects_metadata_writes_without_version_bump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparations: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    class FakePrepared:
+        def launch_with_bindings(self, **_kwargs) -> None:
+            pass
+
+        def replay(self) -> None:
+            pass
+
+    def fake_prepare(
+        _q,
+        _k,
+        _v,
+        _alpha,
+        _beta,
+        cu_seqlens,
+        _initial_state,
+        *,
+        state_indices,
+        checkpoint_cu_starts,
+        **_kwargs,
+    ):
+        preparations.append(
+            (
+                tuple(int(value) for value in cu_seqlens.tolist()),
+                tuple(int(value) for value in state_indices.tolist()),
+                tuple(int(value) for value in checkpoint_cu_starts.tolist()),
+            )
+        )
+        return FakePrepared()
+
+    monkeypatch.setattr(cake, "prepare_cake_gdn_cp_prefill", fake_prepare)
+    monkeypatch.setattr(
+        cake.torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=7),
+    )
+    monkeypatch.setattr(cake.torch.cuda, "is_current_stream_capturing", lambda: False)
+    cake._reset_cake_gdn_cp_prefill_cache()
+
+    q = torch.zeros((4, 1, 128), dtype=torch.float16)
+    output = torch.empty_like(q)
+    alpha = torch.ones((4, 1), dtype=torch.float32)
+    beta = torch.ones((4, 1), dtype=torch.float32)
+    state = torch.zeros((2, 1, 128, 128), dtype=torch.float32)
+    output_state = torch.empty_like(state)
+    state_checkpoints = torch.empty((2, 1, 128, 128), dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 1, 4], dtype=torch.int64)
+    state_indices = torch.tensor([0, 1], dtype=torch.int32)
+    checkpoint_cu_starts = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+    def invoke() -> None:
+        cake.chunk_gated_delta_rule_cake_sm100(
+            output,
+            output_state,
+            q,
+            q,
+            q,
+            alpha,
+            beta,
+            cu_seqlens,
+            0.125,
+            initial_state=state,
+            state_indices=state_indices,
+            output_final_state=True,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=64,
+        )
+
+    invoke()
+    cu_version = int(cu_seqlens._version)
+    indices_version = int(state_indices._version)
+    checkpoint_version = int(checkpoint_cu_starts._version)
+    cu_seqlens.numpy()[1] = 2
+    state_indices.numpy()[:] = (1, 0)
+    checkpoint_cu_starts.numpy()[1] = 0
+    assert int(cu_seqlens._version) == cu_version
+    assert int(state_indices._version) == indices_version
+    assert int(checkpoint_cu_starts._version) == checkpoint_version
+    invoke()
+
+    assert preparations == [
+        ((0, 1, 4), (0, 1), (0, 1, 2)),
+        ((0, 2, 4), (1, 0), (0, 0, 2)),
+    ]
+
+
+def test_public_cake_cache_requires_warmed_metadata_during_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparations: list[str] = []
+    dynamic_launches: list[str] = []
+    capturing = False
+
+    class FakePrepared:
+        def launch_with_bindings(self, **_kwargs) -> None:
+            dynamic_launches.append("launch")
+
+        def replay(self) -> None:
+            pass
+
+    def fake_prepare(*_args, **_kwargs):
+        preparations.append("prepare")
+        return FakePrepared()
+
+    monkeypatch.setattr(cake, "prepare_cake_gdn_cp_prefill", fake_prepare)
+    monkeypatch.setattr(
+        cake.torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=7),
+    )
+    monkeypatch.setattr(
+        cake.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+    cake._reset_cake_gdn_cp_prefill_cache()
+
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    output = torch.empty_like(q)
+    alpha = torch.ones((2, 1), dtype=torch.float32)
+    beta = torch.ones((2, 1), dtype=torch.float32)
+    state = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+    output_state = torch.empty_like(state)
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int64)
+
+    def invoke(metadata: torch.Tensor) -> None:
+        cake.chunk_gated_delta_rule_cake_sm100(
+            output,
+            output_state,
+            q,
+            q,
+            q,
+            alpha,
+            beta,
+            metadata,
+            0.125,
+            initial_state=state,
+            state_indices=None,
+            output_final_state=True,
+        )
+
+    invoke(cu_seqlens)
+    capturing = True
+    invoke(cu_seqlens)
+    assert preparations == ["prepare"]
+    assert dynamic_launches == ["launch"]
+
+    with pytest.raises(RuntimeError, match="same unchanged tensors"):
+        invoke(cu_seqlens.clone())
+    cu_seqlens.add_(0)
+    with pytest.raises(RuntimeError, match="same unchanged tensors"):
+        invoke(cu_seqlens)
 
 
 @pytest.mark.parametrize(
