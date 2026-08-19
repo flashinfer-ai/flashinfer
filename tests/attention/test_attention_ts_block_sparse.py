@@ -424,6 +424,22 @@ _CASES = (
 
 _GQA_CASES = (
     _Case(
+        "gqa16_bf16_causal_token_routes_persistent_q16_kv128",
+        1,
+        16,
+        8,
+        1024,
+        1,
+        128,
+        torch.bfloat16,
+        "causal",
+        "none",
+        "persistent",
+        num_kv_heads=1,
+        expected_q_tile=16,
+        expected_kv_tile=128,
+    ),
+    _Case(
         "gqa4_fp16_dense_holey_static_q32_kv128",
         1,
         8,
@@ -982,6 +998,11 @@ def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None
 @pytest.mark.parametrize(
     ("q_block_size", "heads_q_per_kv", "kv_block_size", "expected_q_tile"),
     (
+        pytest.param(1, 8, 128, 8, id="q1-gqa8-coarse-kv"),
+        pytest.param(1, 16, 128, 16, id="q1-gqa16-coarse-kv"),
+        pytest.param(1, 32, 128, 32, id="q1-gqa32-coarse-kv"),
+        pytest.param(2, 4, 128, 8, id="q2-gqa4-coarse-kv"),
+        pytest.param(4, 2, 128, 8, id="q4-gqa2-coarse-kv"),
         pytest.param(8, 4, 64, 32, id="q8-gqa4-coarse-kv"),
         pytest.param(8, 8, 64, 64, id="q8-gqa8-coarse-kv"),
         pytest.param(8, 8, 8, 32, id="q8-gqa8-fine-kv"),
@@ -991,6 +1012,7 @@ def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None
         pytest.param(16, 1, 64, 16, id="mha-q16"),
         pytest.param(32, 1, 64, 32, id="mha-q32"),
         pytest.param(64, 1, 64, 64, id="mha-q64"),
+        pytest.param(96, 1, 64, 32, id="mha-q96"),
         pytest.param(128, 1, 64, 128, id="mha-q128"),
         pytest.param(192, 1, 64, 64, id="mha-q192"),
         pytest.param(256, 1, 64, 128, id="mha-q256"),
@@ -1049,6 +1071,71 @@ def test_block_sparse_static_profile_accepts_supported_gqa_groups(
     profile = _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
 
     assert profile.q_tile_size == expected_q_tile
+
+
+def test_paged_block_sparse_static_profile_accepts_token_q_blocks() -> None:
+    """A token-level route maps one GQA16 token to one physical Q16 tile."""
+
+    profile = block_sparse_module._validate_block_sparse_static_profile(
+        batch_size=1,
+        seq_len_q=4,
+        seq_len_kv=512,
+        num_qo_heads=16,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        q_block_size=1,
+        kv_block_size=128,
+        use_kv_valid_bits=False,
+        mask_type="dense",
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        max_blocks_per_row=2,
+        page_size=128,
+    )
+
+    assert profile.q_tile_size == 16
+    assert profile.kv_route_size == 128
+
+
+@pytest.mark.parametrize(
+    ("q_block_size", "heads_q_per_kv"),
+    (
+        pytest.param(1, 4, id="q1-gqa4"),
+        pytest.param(2, 2, id="q2-gqa2"),
+        pytest.param(4, 1, id="q4-mha"),
+    ),
+)
+def test_block_sparse_rejects_q_geometry_that_crosses_route_rows(
+    q_block_size: int,
+    heads_q_per_kv: int,
+) -> None:
+    with pytest.raises(ValueError, match="no row-pure Q tile"):
+        block_sparse_config._select_block_sparse_q_tile_size(
+            q_block_size=q_block_size,
+            heads_q_per_kv=heads_q_per_kv,
+            kv_block_size=128,
+        )
+
+
+@pytest.mark.parametrize(
+    ("q_block_size", "error_type", "message"),
+    (
+        pytest.param(True, TypeError, "Python integer", id="bool"),
+        pytest.param(1 << 31, OverflowError, "signed int32", id="int32-overflow"),
+    ),
+)
+def test_block_sparse_rejects_unrepresentable_q_block_sizes(
+    q_block_size: object,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error_type, match=message):
+        block_sparse_config._select_block_sparse_q_tile_size(
+            q_block_size=q_block_size,
+            heads_q_per_kv=8,
+            kv_block_size=128,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2319,7 +2406,7 @@ def test_runtime_output_must_not_alias_plan_owned_route_workspace() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     (
-        pytest.param({"q_block_size": 96}, "8, 16, 32", id="block-size"),
+        pytest.param({"q_block_size": 0}, "positive", id="q-block-size"),
         pytest.param(
             {"num_qo_heads": 3},
             "power of two",
@@ -3689,6 +3776,152 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("q_block_size", "num_qo_heads", "expected_q_tile"),
+    (
+        pytest.param(1, 16, 16, id="q1-gqa16"),
+        pytest.param(2, 4, 8, id="q2-gqa4"),
+        pytest.param(4, 2, 8, id="q4-gqa2"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@torch.no_grad()
+def test_public_paged_gqa_small_q_blocks_match_reference(
+    q_block_size: int,
+    num_qo_heads: int,
+    expected_q_tile: int,
+) -> None:
+    """Small semantic Q blocks keep independent routes after page remapping."""
+
+    torch.manual_seed(20260819 + q_block_size)
+    case = _Case(
+        f"paged_gqa_small_q_block_{q_block_size}",
+        1,
+        num_qo_heads,
+        8,
+        1024,
+        q_block_size,
+        128,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        num_kv_heads=1,
+        expected_q_tile=expected_q_tile,
+        expected_kv_tile=128,
+    )
+    page_size = 128
+    route_rows = (
+        (0, 2, 7),
+        (1, 3, 6),
+        (2, 4, 5),
+        (0, 5, 6),
+        (1, 4, 7),
+        (0, 3, 4),
+        (2, 3, 7),
+        (1, 5, 6),
+    )
+    num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
+    patterns: _Patterns = ((tuple(route_rows[:num_q_rows]),),)
+    assert all(route == tuple(sorted(route)) for route in patterns[0][0])
+    block_indptr, block_indices = _make_bsr(patterns)
+
+    paged_kv_indptr = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.tensor(
+        [8, 1, 6, 3, 9, 0, 7, 2],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q = (
+        torch.randn(
+            (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+            device="cuda",
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
+    k_pages = (
+        torch.randn(
+            (10, case.effective_num_kv_heads, page_size, _HEAD_DIM),
+            device="cuda",
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
+    v_pages = torch.randn_like(k_pages)
+    paged_kv_cache = (k_pages, v_pages)
+    logical_k = torch.cat(
+        [k_pages[page_id].transpose(0, 1) for page_id in paged_kv_indices.tolist()],
+        dim=0,
+    ).unsqueeze(0)
+    logical_v = torch.cat(
+        [v_pages[page_id].transpose(0, 1) for page_id in paged_kv_indices.tolist()],
+        dim=0,
+    ).unsqueeze(0)
+    sm_scale = _HEAD_DIM**-0.5
+    expected = _reference(
+        case,
+        q,
+        logical_k,
+        logical_v,
+        patterns,
+        (frozenset(range(case.seq_len_kv)),),
+        sm_scale,
+    )
+
+    wrapper = prims_ts.BlockSparsePagedTSWrapper()
+    wrapper.plan(
+        paged_kv_indptr,
+        case.seq_len_q,
+        case.seq_len_kv,
+        case.num_heads,
+        case.effective_num_kv_heads,
+        _HEAD_DIM,
+        case.q_block_size,
+        case.kv_block_size,
+        page_size,
+        max_blocks_per_row=3,
+        use_kv_valid_bits=False,
+        mask_type="dense",
+        q_data_type=case.dtype,
+    )
+    policy = dict(wrapper._policy)
+    assert policy["tile_size_q"] == case.expected_q_tile
+    assert policy["tile_size_kv"] == case.expected_kv_tile
+    assert policy["use_persistent_scheduler"] is False
+
+    actual = wrapper.run(
+        q,
+        paged_kv_cache,
+        paged_kv_indices,
+        block_indptr,
+        block_indices,
+        sm_scale=sm_scale,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    graph_out = torch.empty_like(q)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(
+            q,
+            paged_kv_cache,
+            paged_kv_indices,
+            block_indptr,
+            block_indices,
+            sm_scale=sm_scale,
+            out=graph_out,
+        )
+    assert captured is graph_out
+    torch.cuda.synchronize()
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, expected, rtol=2e-2, atol=2e-2)
 
 
 @_REQUIRES_PRIMTS_GPU

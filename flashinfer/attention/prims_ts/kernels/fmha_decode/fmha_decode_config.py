@@ -29,7 +29,7 @@ from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _select_block_sparse_q_tile_size,
-    _validate_sparse_block_size,
+    _validate_sparse_kv_block_size,
 )
 from ...split_kv_mode_policy import select_split_kv_modes
 from .fmha_decode_constants import (
@@ -500,9 +500,10 @@ class FmhaDecodeConfig:
     # K/V tokens per tile along the K-sequence dimension; also the MMA "M"
     # dimension for BMM1 under SwapsMmaAb.
     tile_size_kv: int = 128
-    # Select a block-sparse launch. Q and KV block sizes are independently
-    # chosen from 8/16/32 or positive multiples of 64. Semantic KV blocks are
-    # assembled into a profile-selected fixed KV128 or KV256 route.
+    # Select a block-sparse launch. A positive semantic Q block is legal when
+    # the selected physical Q tile stays within one route row. KV blocks remain
+    # restricted to 8/16/32 or positive multiples of 64 and are assembled into
+    # a profile-selected fixed KV128 or KV256 route.
     use_block_sparse: bool = False
     q_block_size: int = 0
     kv_block_size: int = 0
@@ -1259,7 +1260,7 @@ class FmhaDecodeConfig:
                 "block-sparse supports only matching Float16 or BFloat16 IO"
             )
 
-        kv_block_size = _validate_sparse_block_size(self.kv_block_size, "kv_block_size")
+        kv_block_size = _validate_sparse_kv_block_size(self.kv_block_size)
         selected_q_tile = _select_block_sparse_q_tile_size(
             q_block_size=self.q_block_size,
             heads_q_per_kv=heads_q_per_kv,

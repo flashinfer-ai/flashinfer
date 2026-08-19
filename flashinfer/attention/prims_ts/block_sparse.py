@@ -158,10 +158,14 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``torch.float16`` or ``torch.bfloat16`` dtype. Runtime tensor shapes
         are documented by :meth:`run`.
 
-        Each block size may be 8, 16, 32, or a positive multiple of 64; Q and
-        KV block sizes may differ. The Q tile groups complete Q-head groups and
-        as many Q tokens as fit without crossing a semantic Q-block row, up to
-        Q128; fine KV blocks cap this at a SWAPAB Q32 tile. Every run prepares
+        ``q_block_size`` may be any positive signed-Int32 value for which a
+        physical Q tile stays within one BSR row. Equivalently,
+        ``q_block_size * (Hq / Hkv)`` must be divisible by 8; therefore Q block
+        sizes 1, 2, and 4 require GQA ratios of at least 8, 4, and 2,
+        respectively. ``kv_block_size`` may be 8, 16, 32, or a positive
+        multiple of 64. The Q tile groups complete Q-head groups and as many Q
+        tokens as fit without crossing a semantic Q-block row, up to Q128;
+        fine KV blocks cap this at a SWAPAB Q32 tile. Every run prepares
         per-KV-head canonical BSR into compact, profile-selected fixed-width
         route metadata, and the attention core consumes only that metadata.
         This remains true when every KV block is selected;
@@ -368,9 +372,12 @@ def block_sparse_attention(
     block_indices : torch.Tensor
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
     q_block_size : int
-        Number of logical query tokens represented by one BSR row.
+        Positive number of logical query tokens represented by one BSR row.
+        The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
+        tile does not cross row boundaries.
     kv_block_size : int
-        Number of logical KV tokens represented by one BSR block ID.
+        Number of logical KV tokens represented by one BSR block ID; it must
+        be 8, 16, 32, or a positive multiple of 64.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
     mask_type : {"dense", "causal"}, optional
@@ -518,6 +525,12 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         live entries; extra entries are spare capacity and are not read. Physical
         page IDs and block-sparse routes remain runtime inputs, so graph replays
         may remap them in place between completed replays.
+
+        ``q_block_size`` may be any positive signed-Int32 value satisfying
+        ``q_block_size * (Hq / Hkv) % 8 == 0``. This row-purity condition keeps
+        every physical Q tile within exactly one logical BSR row.
+        ``kv_block_size`` remains restricted to 8, 16, 32, or a positive
+        multiple of 64.
         """
 
         source_device, batch_size = _validate_paged_kv_indptr_tensor(paged_kv_indptr)
@@ -698,9 +711,12 @@ def block_sparse_attention_with_paged_kv_cache(
     block_indices : torch.Tensor
         Contiguous Int32 logical KV-block IDs referenced by ``block_indptr``.
     q_block_size : int
-        Number of logical query tokens represented by one BSR row.
+        Positive number of logical query tokens represented by one BSR row.
+        The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
+        tile does not cross row boundaries.
     kv_block_size : int
-        Number of logical KV tokens represented by one BSR block ID.
+        Number of logical KV tokens represented by one BSR block ID; it must
+        be 8, 16, 32, or a positive multiple of 64.
     seq_len_kv : int
         Exact shared logical KV length, or the maximum logical length when
         ``seq_lens_kv`` is provided.

@@ -318,10 +318,8 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
             "num_qo_heads % num_kv_heads == 0",
             "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
             "head_dim == 128",
-            (
-                "q_block_size in (8, 16, 32) or "
-                "(q_block_size > 0 and q_block_size % 64 == 0)"
-            ),
+            "q_block_size > 0",
+            "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
             (
                 "kv_block_size in (8, 16, 32) or "
                 "(kv_block_size > 0 and kv_block_size % 64 == 0)"

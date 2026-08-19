@@ -483,6 +483,8 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     assert "num_qo_heads % num_kv_heads == 0" in constraints
     assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
     assert "num_qo_heads == num_kv_heads" not in constraints
+    assert "q_block_size > 0" in constraints
+    assert "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0" in constraints
     assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
     assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
     assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
