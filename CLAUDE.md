@@ -618,6 +618,14 @@ users should normally leave the batch-size policy at its defaults.
 
 ## Development Workflow
 
+### Pull Requests
+
+Before creating or updating a pull request, read
+`.github/pull_request_template.md` and use it as the PR body structure. Preserve
+all template headings and checklist items. Fill each section with task-specific
+details, mark only checks that were actually completed, and leave unverified
+items unchecked. Add relevant context for unchecked items under Reviewer Notes.
+
 ### Typical Development Loop
 
 1. Edit kernel code in `include/flashinfer/some_kernel.cuh`
