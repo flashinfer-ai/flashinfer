@@ -264,7 +264,9 @@ def _validate_variable_window_bounds(
     ):
         _validate_tensor(tensor, name)
         if tensor.device != geometry.device:
-            raise ValueError(f"{name} must be on {geometry.device}, got {tensor.device}")
+            raise ValueError(
+                f"{name} must be on {geometry.device}, got {tensor.device}"
+            )
         if tensor.dtype != torch.int32:
             raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
         if tuple(tensor.shape) != expected_shape:
@@ -1230,12 +1232,8 @@ def _get_compiled_context(
     variable_window_shape = (
         (batch_size * max_seq_len_q,) if has_variable_window else (1,)
     )
-    variable_window_starts_fake = fake_compact(
-        cutlass.Int32, variable_window_shape, 4
-    )
-    variable_window_ends_fake = fake_compact(
-        cutlass.Int32, variable_window_shape, 4
-    )
+    variable_window_starts_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_ends_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so

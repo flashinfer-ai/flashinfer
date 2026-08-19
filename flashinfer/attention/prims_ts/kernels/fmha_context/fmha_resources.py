@@ -979,8 +979,7 @@ class GmemQKVResource(MemoryResource):
             )
             packed_q = batch_coord * self.variable_window_q_stride + first_local_q
             kv_tile_start = (
-                Int32(self.variable_window_token_starts[packed_q])
-                // self.cfg.kv_tile_n
+                Int32(self.variable_window_token_starts[packed_q]) // self.cfg.kv_tile_n
             )
         return (
             seq_coord,
@@ -1955,8 +1954,12 @@ class TmemSPResource(MemoryResource):
     p_chunk: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     q_offset: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    variable_window_start: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    variable_window_end: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    variable_window_start: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    variable_window_end: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
 
     def __init__(
         self,
@@ -2435,9 +2438,7 @@ class TmemSPResource(MemoryResource):
             + row_in_tile
         )
         packed_q = batch_coord * self.variable_window_q_stride + local_q
-        first_local_q = (
-            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
-        )
+        first_local_q = seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
         first_packed_q = batch_coord * self.variable_window_q_stride + first_local_q
         window_tile_start = Int32(0)
         if cute.arch.lane_idx() == 0:

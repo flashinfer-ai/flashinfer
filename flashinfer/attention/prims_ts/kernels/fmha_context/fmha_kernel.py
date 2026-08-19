@@ -557,9 +557,7 @@ class VariableWindowDomainTask(Task):
         first_k = Int32(
             self._variable_window_token_starts[packed_q_base + first_local_q]
         )
-        last_k = Int32(
-            self._variable_window_token_ends[packed_q_base + last_local_q]
-        )
+        last_k = Int32(self._variable_window_token_ends[packed_q_base + last_local_q])
         first_k_tile = first_k // self._kv_n
         last_k_tile = (last_k + self._kv_n) // self._kv_n
         return last_k_tile - first_k_tile - self._offset
