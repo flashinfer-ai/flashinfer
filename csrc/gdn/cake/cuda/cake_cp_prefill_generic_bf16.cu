@@ -1157,8 +1157,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
             }
             unsigned int _phase_load_k_empty = 1;
             unsigned int _phase_load_q_empty = 1;
-            unsigned int _phase_load_v_empty = 1;
             unsigned int _phase_load_t_empty = 1;
+            unsigned int _phase_load_v_empty = 1;
             if (blockIdx.x / num_sab_heads < ((int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y] + cp_chunk_len - 1) / cp_chunk_len) {
                 int q_head = sab_head_3 * num_q_heads / num_sab_heads;
                 int k_head = sab_head_3 * num_k_heads / num_sab_heads;
@@ -1187,14 +1187,6 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                         tma_4d_gmem2smem(smem_q_addr + q_stage * 16384, tensormap_workspace + cta_slot_base_tma, 0, block_offset, 0, q_head, load_q_full_addr + (q_stage) * 8);
                         q_stage += 1;
                         if (q_stage == 2) { q_stage = 0; _phase_load_q_empty ^= 1; }
-                        mbarrier_wait(load_v_empty_addr + (v_stage) * 8, _phase_load_v_empty);
-                        if (block_idx == 0) {
-                            asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"((uint64_t)(tensormap_workspace + (cta_slot_base_tma + 256))) : "memory");
-                        }
-                        mbarrier_arrive_expect_tx(load_v_full_addr + (v_stage) * 8, 16384);
-                        tma_4d_gmem2smem(smem_v_addr + v_stage * 16384, tensormap_workspace + (cta_slot_base_tma + 256), 0, block_offset, 0, v_head, load_v_full_addr + (v_stage) * 8);
-                        v_stage += 1;
-                        if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
                         int t_block = block_idx;
                         {
                             if (num_valid_blocks_3 <= block_idx) {
@@ -1206,6 +1198,14 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                         tma_4d_gmem2smem(smem_t_addr + t_stage * 8192, (&T), 0, 0, sab_head_3, t_block_start_3 + t_block, load_t_full_addr + (t_stage) * 8);
                         t_stage += 1;
                         if (t_stage == 2) { t_stage = 0; _phase_load_t_empty ^= 1; }
+                        mbarrier_wait(load_v_empty_addr + (v_stage) * 8, _phase_load_v_empty);
+                        if (block_idx == 0) {
+                            asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"((uint64_t)(tensormap_workspace + (cta_slot_base_tma + 256))) : "memory");
+                        }
+                        mbarrier_arrive_expect_tx(load_v_full_addr + (v_stage) * 8, 16384);
+                        tma_4d_gmem2smem(smem_v_addr + v_stage * 16384, tensormap_workspace + (cta_slot_base_tma + 256), 0, block_offset, 0, v_head, load_v_full_addr + (v_stage) * 8);
+                        v_stage += 1;
+                        if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
                     }
                     #pragma unroll
                     for (int __5 = 0; __5 < 2; __5++) {
