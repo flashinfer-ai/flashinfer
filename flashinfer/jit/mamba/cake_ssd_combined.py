@@ -52,26 +52,26 @@ _PROGRAMS = {
     "bf16_batched": (
         "cake_mamba_ssd_bf16_batched_device.cu",
         "cake_mamba_ssd_bf16_batched_host.cpp",
-        "mamba_ssd_q_tmem_alias_bf16_batched_3b1a5f3bdc",
+        "mamba_ssd_q_tmem_alias_bf16_batched_591ed736f5",
         True,
     ),
     "bf16_varlen": (
         "cake_mamba_ssd_bf16_varlen_device.cu",
         "cake_mamba_ssd_bf16_varlen_host.cpp",
-        "mamba_ssd_q_tmem_alias_bf16_varlen_ea4e025f1f",
+        "mamba_ssd_q_tmem_alias_bf16_varlen_b3467d0b30",
         True,
     ),
     "f16_batched": (
         "cake_mamba_ssd_f16_batched_device.cu",
         "cake_mamba_ssd_f16_batched_host.cpp",
-        "mamba_ssd_q_tmem_alias_f16_batched_68ac74aee6",
+        "mamba_ssd_q_tmem_alias_f16_batched_1f3eea15ba",
         True,
     ),
     "f16_varlen": (
         "cake_mamba_ssd_f16_varlen_device.cu",
         "cake_mamba_ssd_f16_varlen_host.cpp",
-        "mamba_ssd_q_tmem_alias_f16_varlen_6d15bfd533",
-        False,
+        "mamba_ssd_q_tmem_alias_f16_varlen_f8de0d30e2",
+        True,
     ),
 }
 
@@ -389,6 +389,9 @@ class CakeSSDCombined:
         chunk_offsets: Optional[torch.Tensor] = None,
         seq_chunk_cumsum: Optional[torch.Tensor] = None,
         update_seq_chunk_cumsum: bool = False,
+        checkpoint_token_indices: Optional[torch.Tensor] = None,
+        checkpoint_state_slots: Optional[torch.Tensor] = None,
+        checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
     ):
@@ -435,6 +438,52 @@ class CakeSSDCombined:
         nchunks = seqlen // _CHUNK_SIZE
         num_sequences = initial_states.shape[0] if mode_varlen else batch
         num_segments = len(chunk_indices) if mode_varlen else batch * nchunks
+        checkpoint_args = (
+            checkpoint_token_indices,
+            checkpoint_state_slots,
+            checkpoint_states,
+        )
+        if any(value is not None for value in checkpoint_args) and not all(
+            value is not None for value in checkpoint_args
+        ):
+            raise ValueError(
+                "checkpoint_token_indices, checkpoint_state_slots, and "
+                "checkpoint_states must be provided together"
+            )
+        write_checkpoint_states = checkpoint_states is not None
+        if write_checkpoint_states:
+            assert checkpoint_token_indices is not None
+            assert checkpoint_state_slots is not None
+            assert checkpoint_states is not None
+            if (
+                tuple(checkpoint_token_indices.shape) != (num_sequences,)
+                or checkpoint_token_indices.dtype != torch.int32
+                or not checkpoint_token_indices.is_contiguous()
+            ):
+                raise ValueError(
+                    "checkpoint_token_indices must be a contiguous int32 vector "
+                    "with one entry per sequence"
+                )
+            if (
+                tuple(checkpoint_state_slots.shape) != (num_sequences,)
+                or checkpoint_state_slots.dtype != torch.int32
+                or not checkpoint_state_slots.is_contiguous()
+            ):
+                raise ValueError(
+                    "checkpoint_state_slots must be a contiguous int32 vector "
+                    "with one entry per sequence"
+                )
+            if (
+                checkpoint_states.ndim != 4
+                or tuple(checkpoint_states.shape[1:])
+                != (self.nheads, _HEADDIM, _DSTATE)
+                or checkpoint_states.dtype != self.state_dtype
+                or not checkpoint_states.is_contiguous()
+            ):
+                raise ValueError(
+                    "checkpoint_states must be contiguous [num_checkpoints, "
+                    f"{self.nheads}, 64, 128] with state dtype"
+                )
         if D is not None:
             valid_d_shapes = ((self.nheads,), (self.nheads, _HEADDIM))
             if tuple(D.shape) not in valid_d_shapes or D.dtype != torch.bfloat16:
@@ -523,6 +572,12 @@ class CakeSSDCombined:
         )
         chunk_offsets = self._contiguous_input(
             workspace, "chunk_offsets", chunk_offsets
+        )
+        checkpoint_token_indices = self._contiguous_input(
+            workspace, "checkpoint_token_indices", checkpoint_token_indices
+        )
+        checkpoint_state_slots = self._contiguous_input(
+            workspace, "checkpoint_state_slots", checkpoint_state_slots
         )
         assert x is not None and dt is not None and A is not None
         assert B is not None and C is not None
@@ -630,6 +685,21 @@ class CakeSSDCombined:
             if initial_states is not None
             else self._dummy(x.device, self.state_dtype)
         )
+        checkpoint_states_arg = (
+            checkpoint_states
+            if checkpoint_states is not None
+            else self._dummy(x.device, self.state_dtype)
+        )
+        checkpoint_token_indices_arg = (
+            checkpoint_token_indices
+            if checkpoint_token_indices is not None
+            else self._dummy(x.device, torch.int32)
+        )
+        checkpoint_state_slots_arg = (
+            checkpoint_state_slots
+            if checkpoint_state_slots is not None
+            else self._dummy(x.device, torch.int32)
+        )
         cumsum_arg = (
             seq_chunk_cumsum
             if seq_chunk_cumsum is not None
@@ -665,6 +735,9 @@ class CakeSSDCombined:
                 dt_bias_float,
                 initial_arg,
                 workspace["final"],
+                checkpoint_states_arg,
+                checkpoint_token_indices_arg,
+                checkpoint_state_slots_arg,
                 seq_i32,
                 seq_i64,
                 chunk_indices_arg,
@@ -688,6 +761,7 @@ class CakeSSDCombined:
                 dt_min,
                 dt_max,
                 int(return_final_states),
+                int(write_checkpoint_states),
                 grid,
                 1,
                 1,
