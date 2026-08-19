@@ -54,6 +54,7 @@ class Variant:
     raw_bytes: int
     module_ident: str
     frozen_filename: str
+    kernel_symbol: str = "kernel_flashinfer_recurrent_kda_t1_unbounded_softplus"
 
 
 VARIANTS = {
@@ -80,6 +81,15 @@ VARIANTS = {
         raw_bytes=13298,
         module_ident="flashinfer_recurrent_kda_t1_unbounded_softplus_8365fd9a5f",
         frozen_filename="cake_kda_decode_d128_t1_unbounded_softplus_direct_split16.cu",
+    ),
+    "split8_warp2": Variant(
+        split=8,
+        raw_sha256="9408feb2f856279f21fb283dbe369d81b1e8c16c3874f6f12bf2e1615ce56ff4",
+        normalized_sha256="df684b2afe66f118688e219382132b8781e70d6bfb80545c10d9fc49c9859462",
+        raw_bytes=13314,
+        module_ident="flashinfer_recurrent_kda_t1_unbounded_softplus_warp2_78450abdcb",
+        frozen_filename="cake_kda_decode_d128_t1_unbounded_softplus_direct_split8_warp2.cu",
+        kernel_symbol="kernel_flashinfer_recurrent_kda_t1_unbounded_softplus_warp2",
     ),
 }
 
@@ -126,6 +136,22 @@ PROFILES = {
         "profile_sha256": "8d634512b0c23d61e33b453493956655178127d8edacde5a55bd33ce71263800",
         "variant": "split16",
     },
+    "sm100_split8_warp2": {
+        "arch": "sm_100a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-warp2-sm100",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_warp2_sm100.json",
+        "profile_sha256": "fc07fc4f6f054d962ec0ebc63060a185fcce515a1d8bed7504d7797f25723411",
+        "source_suffix": "split8_warp2",
+        "variant": "split8_warp2",
+    },
+    "sm103_split8_warp2": {
+        "arch": "sm_103a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-warp2-sm103",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_warp2_sm103.json",
+        "profile_sha256": "629957e53ab36b77ba03f1fc3c94c3a32f6be339aa217a4d98a8a39b0e2609d1",
+        "source_suffix": "split8_warp2",
+        "variant": "split8_warp2",
+    },
 }
 
 
@@ -166,6 +192,20 @@ def _read_verified(path: Path, variant: Variant, arch: str) -> bytes:
     data = path.read_bytes()
     actual_sha256 = _sha256(data)
     if len(data) != variant.raw_bytes or actual_sha256 != variant.raw_sha256:
+        text = data.decode("utf-8")
+        restored = (
+            text.replace("CakeTensorMapPack", "LoomTensorMapPack")
+            .replace("CakeTensorMap", "LoomTensorMap")
+            .replace("CAKE_INF", "LOOM_INF")
+            .encode("utf-8")
+        )
+        if (
+            len(restored) == variant.raw_bytes
+            and _sha256(restored) == variant.raw_sha256
+        ):
+            data = restored
+            actual_sha256 = variant.raw_sha256
+    if len(data) != variant.raw_bytes or actual_sha256 != variant.raw_sha256:
         raise ValueError(
             f"{arch} split{variant.split} export identity mismatch: "
             f"bytes={len(data)} sha256={actual_sha256}; expected "
@@ -197,7 +237,7 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     text = raw.decode("utf-8")
     if not text.endswith("\n"):
         raise ValueError("raw source must end with a newline")
-    if text.count("kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(") != 1:
+    if text.count(f"{variant.kernel_symbol}(") != 1:
         raise ValueError("raw source has an unexpected kernel signature")
     for required in (
         "float* __restrict__ A_log",
@@ -278,6 +318,8 @@ def _parse_args() -> argparse.Namespace:
             parser.add_argument(
                 f"--{arch}-split{split}-profile", type=Path, required=True
             )
+        parser.add_argument(f"--{arch}-split8-warp2-source", type=Path, required=True)
+        parser.add_argument(f"--{arch}-split8-warp2-profile", type=Path, required=True)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -293,16 +335,17 @@ def main() -> int:
     for profile_key, profile in PROFILES.items():
         arch_key = "sm100" if profile["arch"] == "sm_100a" else "sm103"
         variant = VARIANTS[profile["variant"]]
-        source_path = getattr(args, f"{arch_key}_split{variant.split}_source")
-        profile_path = getattr(args, f"{arch_key}_split{variant.split}_profile")
+        source_suffix = profile.get("source_suffix", f"split{variant.split}")
+        source_path = getattr(args, f"{arch_key}_{source_suffix}_source")
+        profile_path = getattr(args, f"{arch_key}_{source_suffix}_profile")
         _verify_profile(profile_path, profile, variant)
         raw[profile_key] = _read_verified(source_path, variant, profile["arch"])
-    for split in (4, 8, 16):
-        if raw[f"sm100_split{split}"] != raw[f"sm103_split{split}"]:
-            raise ValueError(f"split{split} SM100 and SM103 source text differs")
+    for variant_key in ("split4", "split8", "split16", "split8_warp2"):
+        if raw[f"sm100_{variant_key}"] != raw[f"sm103_{variant_key}"]:
+            raise ValueError(f"{variant_key} SM100 and SM103 source text differs")
     frozen = {
-        f"split{split}": _freeze(raw[f"sm100_split{split}"], VARIANTS[f"split{split}"])
-        for split in (4, 8, 16)
+        variant_key: _freeze(raw[f"sm100_{variant_key}"], VARIANTS[variant_key])
+        for variant_key in ("split4", "split8", "split16", "split8_warp2")
     }
     outputs = {
         args.output_dir / variant.frozen_filename: frozen[key]

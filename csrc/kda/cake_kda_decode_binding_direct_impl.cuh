@@ -31,6 +31,9 @@
 #ifndef CAKE_KDA_DECODE_LAUNCH_THREADS
 #error "CAKE_KDA_DECODE_LAUNCH_THREADS must be defined by the binding translation unit"
 #endif
+#ifndef CAKE_KDA_DECODE_WARPS_PER_CTA
+#error "CAKE_KDA_DECODE_WARPS_PER_CTA must be defined by the binding translation unit"
+#endif
 
 namespace flashinfer {
 namespace cake_kda_decode {
@@ -38,13 +41,14 @@ namespace cake_kda_decode {
 using ActiveVariant = VariantTraits<CAKE_KDA_DECODE_HEAD_DIM, CAKE_KDA_DECODE_TOKENS,
                                     CAKE_KDA_DECODE_GATE_KIND, CAKE_KDA_DECODE_VALUE_SPLIT>;
 
-static_assert(THREADS == 32);
 static_assert(CAKE_KDA_DECODE_HEAD_DIM == 128);
 static_assert(CAKE_KDA_DECODE_TOKENS == 1);
 static_assert(CAKE_KDA_DECODE_GATE_KIND == 0 || CAKE_KDA_DECODE_GATE_KIND == 2);
 static_assert(CAKE_KDA_DECODE_VALUE_SPLIT == 4 || CAKE_KDA_DECODE_VALUE_SPLIT == 8 ||
               CAKE_KDA_DECODE_VALUE_SPLIT == 16);
+static_assert(CAKE_KDA_DECODE_WARPS_PER_CTA == 1 || CAKE_KDA_DECODE_WARPS_PER_CTA == 2);
 static_assert(CAKE_KDA_DECODE_LAUNCH_THREADS == THREADS);
+static_assert(CAKE_KDA_DECODE_LAUNCH_THREADS == 32 * CAKE_KDA_DECODE_WARPS_PER_CTA);
 
 void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta, TensorView A_log,
          TensorView dt_bias, TensorView state, TensorView out, TensorView cu_seqlens,
@@ -55,10 +59,17 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
       num_accepted_tokens, scale, lower_bound, beta_is_logit, cuda_stream);
   ffi::CUDADeviceGuard device_guard(ctx.device_id);
 
-  const dim3 grid(ctx.num_value_heads * CAKE_KDA_DECODE_VALUE_SPLIT, ctx.num_sequences, 1);
+  const int64_t work = ctx.num_value_heads * CAKE_KDA_DECODE_VALUE_SPLIT;
+  const dim3 grid((work + CAKE_KDA_DECODE_WARPS_PER_CTA - 1) /
+                      CAKE_KDA_DECODE_WARPS_PER_CTA,
+                  ctx.num_sequences, 1);
   const dim3 block(CAKE_KDA_DECODE_LAUNCH_THREADS, 1, 1);
 #if CAKE_KDA_DECODE_GATE_KIND == 2
+#if CAKE_KDA_DECODE_WARPS_PER_CTA == 2
+  kernel_flashinfer_recurrent_kda_t1_unbounded_softplus_warp2<<<grid, block, 0, ctx.stream>>>(
+#else
   kernel_flashinfer_recurrent_kda_t1_unbounded_softplus<<<grid, block, 0, ctx.stream>>>(
+#endif
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
@@ -77,6 +88,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
       static_cast<int64_t>(ctx.state_slot_stride), ctx.beta_is_logit, 0, ctx.num_heads,
       ctx.num_value_heads, ctx.head_ratio);
 #else
+  static_assert(CAKE_KDA_DECODE_WARPS_PER_CTA == 1);
   kernel_flashinfer_recurrent_kda_t1_direct<<<grid, block, 0, ctx.stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),

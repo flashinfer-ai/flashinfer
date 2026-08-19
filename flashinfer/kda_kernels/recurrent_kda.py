@@ -1374,6 +1374,24 @@ def _select_cake_kda_unbounded_softplus_t1_value_split(work: int, sm_count: int)
     return 8
 
 
+def _select_cake_kda_unbounded_softplus_t1_variant(
+    work: int, sm_count: int
+) -> CakeKDADecodeVariant:
+    """Select the measured value split and CTA grouping for unbounded T1."""
+
+    # Paired cold-L2 CUPTI screening on B200 and GB300 finds that grouping two
+    # split-8 value tiles per CTA wins every measured row from three through
+    # fourteen SM-equivalents. Smaller grids lose parallelism; work=4096 loses
+    # to the one-warp split-4 route on both architectures.
+    if 3 * sm_count <= work <= 14 * sm_count:
+        return "d128_t1_unbounded_softplus_direct_split8_warp2"
+    value_split = _select_cake_kda_unbounded_softplus_t1_value_split(work, sm_count)
+    return cast(
+        CakeKDADecodeVariant,
+        f"d128_t1_unbounded_softplus_direct_split{value_split}",
+    )
+
+
 _FLASH_KDA_DECODE_VALUE_SPLIT_SELECTOR_BY_ARCH: dict[
     FlashKDADecodeDeviceArch, Callable[[int, int, int], int]
 ] = {
@@ -1636,11 +1654,7 @@ def _select_flash_kda_decode_variant(
     work = num_sequences * num_value_heads
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     if is_t1_unbounded_softplus:
-        value_split = _select_cake_kda_unbounded_softplus_t1_value_split(work, sm_count)
-        return cast(
-            CakeKDADecodeVariant,
-            f"d128_t1_unbounded_softplus_direct_split{value_split}",
-        )
+        return _select_cake_kda_unbounded_softplus_t1_variant(work, sm_count)
     value_split = _select_flash_kda_decode_value_split(num_tokens, work, sm_count, arch)
     if num_tokens == 1:
         return cast(

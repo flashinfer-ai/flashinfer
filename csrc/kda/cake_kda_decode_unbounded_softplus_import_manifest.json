@@ -23,6 +23,14 @@
       "profile_sha256": "1bfa62c0e038ae87ef92c5d46fad31592665dc9fae2f3110f25d94cb0e3e349b",
       "variant": "split8"
     },
+    "sm100_split8_warp2": {
+      "arch": "sm_100a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-warp2-sm100",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_warp2_sm100.json",
+      "profile_sha256": "fc07fc4f6f054d962ec0ebc63060a185fcce515a1d8bed7504d7797f25723411",
+      "source_suffix": "split8_warp2",
+      "variant": "split8_warp2"
+    },
     "sm103_split16": {
       "arch": "sm_103a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm103",
@@ -43,6 +51,14 @@
       "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
       "profile_sha256": "9428d8e139a9792a84944a6f04593729f45a37fb6614361f7d80596d60f9f45e",
       "variant": "split8"
+    },
+    "sm103_split8_warp2": {
+      "arch": "sm_103a",
+      "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-warp2-sm103",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_warp2_sm103.json",
+      "profile_sha256": "629957e53ab36b77ba03f1fc3c94c3a32f6be339aa217a4d98a8a39b0e2609d1",
+      "source_suffix": "split8_warp2",
+      "variant": "split8_warp2"
     }
   },
   "schema_version": 1,
@@ -72,6 +88,15 @@
       "normalized_sha256": "5212fdda593d60f3ef2897f44ac3a81fd15d87fd3fa39c5463635a4bb4378718",
       "raw_bytes": 13297,
       "raw_sha256": "0cd542dd0e6327d89d00a2fd835cbdf657bf2c2d67caf9d58df5bcc8f194c6e8",
+      "value_split": 8
+    },
+    "split8_warp2": {
+      "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split8_warp2.cu",
+      "frozen_sha256": "119b690dc6c2b1df01cdea9291aa7e7cbcc9f0c2c00733c6cac92a442ae5c8d6",
+      "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_warp2_78450abdcb",
+      "normalized_sha256": "df684b2afe66f118688e219382132b8781e70d6bfb80545c10d9fc49c9859462",
+      "raw_bytes": 13314,
+      "raw_sha256": "9408feb2f856279f21fb283dbe369d81b1e8c16c3874f6f12bf2e1615ce56ff4",
       "value_split": 8
     }
   }
