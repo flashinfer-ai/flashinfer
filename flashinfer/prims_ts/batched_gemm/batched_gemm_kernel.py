@@ -3149,12 +3149,11 @@ def gemm(
     cluster_shape = (cfg.cluster_m, 1, 1)
 
     if cutlass.const_expr(cfg.is_persistent):
-        clc_raster_along_m = True
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
             1,
-            clc_raster_along_m,
+            cfg.raster_along_m,
         )
         grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
     else:

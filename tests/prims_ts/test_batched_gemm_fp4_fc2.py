@@ -32,6 +32,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     uniform_pipeline_stage_overrides,
     BatchMode,
     BiasType,
+    CtaRasterOrder,
     DType,
     SfLayout,
 )
@@ -674,3 +675,54 @@ class TestFp4Fc2HT:
             f"epi_tile_n={epi_tile_n}, "
             f"tmem_ldst_max_num_regs={tmem_ldst_max_num_regs}"
         )
+
+    @pytest.mark.timeout(240)
+    def test_ht_tile256_k256_no_swap_along_n(self):
+        """Numerically validate multi-tile non-swap Along-N rasterization."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            SfLayout,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=512,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_m=128,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            cluster_m=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            sf_bits=8,
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=1,
+            cta_raster_order=int(CtaRasterOrder.ALONG_N),
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "FP4 FC2 non-swap HT256 Along-N overlap failed"

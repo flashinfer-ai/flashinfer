@@ -54,6 +54,11 @@ class TileScheduler(IntEnum):
     PERSISTENT = 1
 
 
+class CtaRasterOrder(IntEnum):
+    ALONG_M = 0
+    ALONG_N = 1
+
+
 class ActKind(IntEnum):
     NONE = 0
     SWIGLU = 1
@@ -629,6 +634,14 @@ class BatchedGemmConfig:
 
     ``STATIC`` (fixed hardware grid) or ``PERSISTENT`` (dynamic CLC work queue).
     See :attr:`is_persistent`.
+    """
+
+    cta_raster_order: int = int(CtaRasterOrder.ALONG_M)
+    """Persistent CTA rasterization order, as a :class:`CtaRasterOrder` value.
+
+    ``ALONG_M`` visits M tiles first; ``ALONG_N`` visits N tiles first. TRTLLM-gen
+    exposes these as ``ctaSwizzleType=rasterizeAlongM/rasterizeAlongN``, but no
+    additional CTA swizzle is applied here.
     """
 
     transpose_mma_output: int = 1
@@ -1749,6 +1762,11 @@ class BatchedGemmConfig:
         return self.tile_scheduler == int(TileScheduler.PERSISTENT)
 
     @property
+    def raster_along_m(self) -> bool:
+        """Whether the persistent CLC scheduler rasterizes along M."""
+        return self.cta_raster_order == int(CtaRasterOrder.ALONG_M)
+
+    @property
     def use_work_throttle_barrier(self) -> bool:
         """True when the persistent work-throttle barrier is active.
 
@@ -2644,6 +2662,20 @@ def validate_config(
         raise ValueError(
             f"tile_scheduler must be STATIC or PERSISTENT, got {cfg.tile_scheduler}"
         )
+
+    if cfg.cta_raster_order not in (
+        int(CtaRasterOrder.ALONG_M),
+        int(CtaRasterOrder.ALONG_N),
+    ):
+        raise ValueError(
+            "cta_raster_order must be ALONG_M or "
+            f"ALONG_N, got {cfg.cta_raster_order}"
+        )
+    if (
+        cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
+        and not cfg.is_persistent
+    ):
+        raise ValueError("cta_raster_order=ALONG_N requires persistent scheduling")
 
     if cfg.cluster_m not in (1, 2):
         raise ValueError(

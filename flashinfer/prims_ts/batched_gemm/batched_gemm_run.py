@@ -54,6 +54,7 @@ from .batched_gemm_kernel import (
 )
 from .batched_gemm_config import (
     BatchMode,
+    CtaRasterOrder,
     RouteImpl,
     TileScheduler,
     ActKind,
@@ -1428,6 +1429,12 @@ def _parse_overrides(args):
                 "static": TileScheduler.STATIC,
                 "persistent": TileScheduler.PERSISTENT,
             }[args.tile_scheduler]
+        ),
+        "cta_raster_order": int(
+            {
+                "rasterizeAlongM": CtaRasterOrder.ALONG_M,
+                "rasterizeAlongN": CtaRasterOrder.ALONG_N,
+            }[args.cta_swizzle_type]
         ),
         "transpose_mma_output": args.transpose_mma_output,
         "act_kind": int(
@@ -3809,6 +3816,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tile-scheduler",
         choices=["static", "persistent"],
         default="static",
+    )
+    parser.add_argument(
+        "--cta-swizzle-type",
+        choices=["rasterizeAlongM", "rasterizeAlongN"],
+        default="rasterizeAlongM",
+        help=(
+            "Persistent CLC CTA rasterization order; the option name and values "
+            "match TRTLLM-gen, but do not enable an additional CTA swizzle."
+        ),
     )
     parser.add_argument(
         "--transpose-mma-output",

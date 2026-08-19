@@ -64,6 +64,49 @@ def _fused_operand_sf_config(**overrides):
     return cfg
 
 
+def test_persistent_cta_swizzle_config_and_cli_mapping():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--tile-scheduler",
+            "persistent",
+            "--cta-swizzle-type",
+            "rasterizeAlongN",
+        ]
+    )
+    overrides = _parse_overrides(args)
+    cfg = make_config(**overrides)
+
+    validate_config(cfg)
+    assert cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
+    assert cfg.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert not cfg.raster_along_m
+
+
+def test_along_n_cta_swizzle_rejects_non_persistent_scheduler():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(cta_raster_order=int(CtaRasterOrder.ALONG_N))
+
+    with pytest.raises(ValueError, match="requires persistent scheduling"):
+        validate_config(cfg)
+
+
 @pytest.mark.parametrize(
     ("max_regs", "epi_tile_n", "expected_overlap_loads"),
     ((32, 64, 2), (64, 64, 1), (64, 128, 2)),
