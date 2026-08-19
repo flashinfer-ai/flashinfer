@@ -60,6 +60,11 @@ flashinfer/gdn_kernels/experimental/README.md):
 - the CuTe-DSL impl staying inside the DSL surface its DEPLOYED version
   offers, not the one a dev box happens to have, and that documented floor
   staying consistent with the nvidia-cutlass-dsl version the repo pins;
+- the PDL contract of any impl that launches with programmatic stream
+  serialization: every such kernel must reach a griddepcontrol wait on every
+  path before it can read predecessor-produced data, and must not release its
+  dependents before that wait.  Asserted structurally (AST), because the race
+  it prevents is not reproducible by timing;
 - multi-device dispatch: a call whose tensors live on a device other than
   the ambient one must still reach the kernel (TP > 1 serving does exactly
   that) and must leave the caller's ambient device alone, and no impl may
@@ -1459,6 +1464,173 @@ def test_impl_modules_name_the_device_they_take_a_stream_from():
         f"impl modules call current_stream() with no device: {offenders}. "
         "Pass the tensors' device explicitly, e.g. "
         "torch.cuda.current_stream(hidden_states.device)."
+    )
+
+
+_PDL_WAIT = "griddepcontrol_wait"
+_PDL_TRIGGER = "griddepcontrol_launch_dependents"
+
+
+def _pdl_launched_kernels(tree: ast.AST) -> dict:
+    """Kernel functions the module launches with ``use_pdl=True``.
+
+    Matches the ``<kernel>(...).launch(..., use_pdl=True)`` shape the CuTe-DSL
+    impls use and resolves the kernel name back to its ``FunctionDef``.
+    """
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    launched = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "launch":
+            continue
+        if not any(
+            kw.arg == "use_pdl"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value is True
+            for kw in node.keywords
+        ):
+            continue
+        inner = node.func.value
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+            if inner.func.id in functions:
+                launched[inner.func.id] = functions[inner.func.id]
+    return launched
+
+
+def _griddepcontrol_lines(node: ast.AST, primitive: str) -> list:
+    """Line numbers of every ``...<primitive>()`` call inside ``node``."""
+    return sorted(
+        call.lineno
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == primitive
+    )
+
+
+def _every_path_calls(body: list, primitive: str) -> bool:
+    """True when every control-flow path through ``body`` runs ``primitive``.
+
+    A statement-level call counts; an ``if`` counts only when BOTH arms do.
+    Deliberately conservative: loops and ``try`` bodies are not credited,
+    because neither is guaranteed to execute.  Conservative in the safe
+    direction -- it can refuse a kernel that is in fact fine (say the wait
+    with a real ``else``-less guard), never accept one that is not.
+    """
+    for stmt in body:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            func = stmt.value.func
+            if isinstance(func, ast.Attribute) and func.attr == primitive:
+                return True
+        if isinstance(stmt, ast.If) and stmt.orelse:
+            if _every_path_calls(stmt.body, primitive) and _every_path_calls(
+                stmt.orelse, primitive
+            ):
+                return True
+    return False
+
+
+def _impl_module_pdl_kernels() -> list:
+    """``(module_name, kernel_name, FunctionDef)`` for every PDL-launched
+    kernel across the shipped impl modules."""
+    kernel_dir = pathlib.Path(specialized_gdn.__file__).parent / "kernel"
+    found = []
+    for impl_name in SHIPPED_IMPLS:
+        path = kernel_dir / f"gdn_fused_decode_{impl_name}.py"
+        assert path.is_file(), f"impl module not found at {path}"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for kernel_name, node in sorted(_pdl_launched_kernels(tree).items()):
+            found.append((path.name, kernel_name, node))
+    return found
+
+
+def test_every_pdl_kernel_waits_on_all_paths():
+    """A kernel launched with PDL must call ``griddepcontrol_wait()`` on every
+    path before it can read anything, and every block must reach it.
+
+    ``use_pdl=True`` sets CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+    which (CUDA programming guide, *Programmatic Dependent Launch*) tells the
+    driver it "is safe to launch the secondary kernel early and not wait on the
+    completion and memory flush of the primary before launching the secondary",
+    and that consequently "secondary thread blocks might launch before data
+    written by the primary kernel is visible".  Every input of this op is
+    produced by a stream predecessor -- the layer's projections, the caller's
+    metadata prep, an earlier decode step's pool update, and the workspace the
+    host memsets immediately before the launch -- so a PDL kernel with no wait
+    is reading them unordered.
+
+    This is a STATIC guarantee, not a runtime race test, and that is on
+    purpose.  The window is short and the data usually already there, so a
+    timing test would pass on broken code nearly always and fail nowhere
+    reproducibly; whether the race fires also depends on whether some
+    *upstream* kernel fires a PDL trigger, which is outside this repo.  What
+    can be proved here is the structural property the contract actually asks
+    for: the barrier exists and is unconditionally reached.  Needs neither a
+    GPU nor cutlass.
+    """
+    kernels = _impl_module_pdl_kernels()
+    assert kernels, (
+        "no use_pdl=True launch found in any shipped impl module -- either the "
+        "PDL impl was removed (then delete this test) or _pdl_launched_kernels "
+        "no longer matches how impls launch (then fix the matcher)"
+    )
+    offenders = []
+    for module_name, kernel_name, node in kernels:
+        if not _every_path_calls(node.body, _PDL_WAIT):
+            offenders.append(f"{module_name}::{kernel_name}")
+    assert not offenders, (
+        f"PDL-launched kernels with no unconditional {_PDL_WAIT}(): "
+        f"{offenders}. Add the wait above the kernel's first global load and "
+        "above any block-role split so every block runs it (or drop use_pdl "
+        "from that launch, which also costs the overlap it buys)."
+    )
+
+
+def test_pdl_kernels_wait_before_their_first_launch_dependents():
+    """A PDL kernel that releases its dependents must be ordered itself first.
+
+    ``griddepcontrol_launch_dependents()`` is a SCHEDULING gate -- PTX: the
+    designated dependents "can be scheduled as soon as all other CTAs in the
+    grid issue the same instruction or have completed" -- so a kernel that
+    triggers before its own ``griddepcontrol_wait()`` puts the dependent's CTAs
+    on the SMs while it is itself still unordered against its predecessors.
+    Any load the dependent issues *before* its own wait (this op's
+    ``delta_kernel`` deliberately prefetches ``ssm_state`` and reads
+    ``state_indices`` there) then has no ordering either.  Waiting first is
+    what hands the dependent an already-ordered state.
+
+    Note what this does NOT assert: that the trigger sits after the kernel's
+    stores.  It need not.  A dependent's wait blocks until every prerequisite
+    grid "in flight has completed and all the memory operations from the
+    prerequisite grids are performed and made visible to the current grid"
+    (PTX), so the trigger publishes nothing and cannot release a dependent
+    early onto unwritten data.  Where the trigger sits between the wait and
+    the end of the kernel is a performance choice -- earlier means more
+    overlap and more SM competition -- and pinning it would forbid the
+    entry-fire pattern this impl and ``gdn_decode_bf16_wy_ucache_flush.py``
+    both rely on.  Static check, no GPU or cutlass needed.
+    """
+    kernels = _impl_module_pdl_kernels()
+    assert kernels, "no use_pdl=True launch found in any shipped impl module"
+    offenders = {}
+    for module_name, kernel_name, node in kernels:
+        triggers = _griddepcontrol_lines(node, _PDL_TRIGGER)
+        if not triggers:
+            continue
+        waits = _griddepcontrol_lines(node, _PDL_WAIT)
+        if not waits or waits[0] > triggers[0]:
+            offenders[f"{module_name}::{kernel_name}"] = {
+                "first_wait_line": waits[0] if waits else None,
+                "first_trigger_line": triggers[0],
+            }
+    assert not offenders, (
+        f"PDL kernels that call {_PDL_TRIGGER}() before their own "
+        f"{_PDL_WAIT}(): {offenders}. Move the wait above the trigger."
     )
 
 

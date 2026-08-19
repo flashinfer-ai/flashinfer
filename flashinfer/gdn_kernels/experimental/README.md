@@ -317,6 +317,26 @@ dispatch, kernel or consumer code has to move.
    mark those pointers `__restrict__`: they alias by construction, and the
    promise would let the compiler hoist a pool load across a pool store.
 
+   **If an impl launches with PDL** (`use_pdl=True` /
+   `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`), every kernel it
+   launches that way must issue `griddepcontrol_wait()` on *every* path before
+   its first read of anything a stream predecessor produced — the op's inputs
+   are all predecessor-produced, including a workspace the host memsets just
+   before the launch.  The attribute frees the driver from waiting on the
+   predecessor's completion *and* its memory flush, so the wait is the only
+   thing that orders those reads, and omitting it makes correctness depend on
+   whether some unrelated upstream kernel happens to fire a trigger.  A kernel
+   that also calls `griddepcontrol_launch_dependents()` must do so *after* its
+   own wait: the trigger is a scheduling gate that places the dependent's CTAs
+   on the SMs, and a dependent released by an unordered kernel inherits that
+   disorder for any load it issues before its own wait.  The trigger is *not*
+   what publishes data — a dependent's wait blocks until the whole prerequisite
+   grid has completed and flushed — so where the trigger sits is a performance
+   decision (earlier = more overlap, more SM competition) rather than a
+   correctness one.  Two AST tests in `tests/gdn/test_fused_decode.py` pin both
+   rules; the worked example is the contract block at the top of
+   `kernel/gdn_fused_decode_cutedsl_sm120_pdl.py`.
+
    Any per-device state an impl keeps across calls (scratch buffers, a
    persistent grid barrier) is shared by every call on that device, so
    `execute` must order a call that arrives on a different stream after the

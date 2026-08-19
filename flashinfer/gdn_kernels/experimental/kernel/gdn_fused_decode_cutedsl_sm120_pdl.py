@@ -25,10 +25,9 @@ DS-dense pool; indexing is stride-generic, so the layouts differ only in
 which mode carries the static unit stride. The first launch
 fuses the depthwise conv1d update with a heavily K-split b/a GEMV (fp32
 partials accumulated with device-scope atomics); the second applies the gated
-delta rule. Both launches use programmatic dependent launch (PDL): the first
-kernel signals its dependents immediately so the second kernel's fp32
-state-row loads overlap the whole first-kernel body, then waits before
-consuming the conv/GEMV results.
+delta rule. Both launches use programmatic dependent launch (PDL); the
+wait/trigger contract that makes that safe is stated in full above
+:func:`pre_kernel` and pinned by ``tests/gdn/test_fused_decode.py``.
 
 Implements the impl-module interface documented in ../README.md.
 Compilation is lazy: the first eager :func:`execute` of a (batch, scale,
@@ -68,6 +67,70 @@ KCHUNK = HIDDEN // KS  # 10
 NCONV = QKV_DIM // 256  # conv tiles per batch = 40
 
 
+# ---------------------------------------------------------------------------
+# PDL contract for this op -- read this before moving either griddepcontrol.
+# ---------------------------------------------------------------------------
+# Both launches carry ``use_pdl=True``
+# (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION), which tells the
+# driver it "is safe to launch the secondary kernel early and not wait on the
+# completion and memory flush of the primary before launching the secondary"
+# (CUDA programming guide, Programmatic Dependent Launch).  Two DIFFERENT
+# hardware events then keep that safe, and conflating them is the way this
+# code goes wrong:
+#
+#   griddepcontrol.launch_dependents -- a SCHEDULING gate only.  PTX: the
+#       designated dependents "can be scheduled as soon as all other CTAs in
+#       the grid issue the same instruction or have completed".  It publishes
+#       nothing, orders nothing, and is not what a dependent's wait observes.
+#   griddepcontrol.wait -- the VISIBILITY barrier.  PTX: the thread waits
+#       "until all prerequisite grids in flight have completed and all the
+#       memory operations from the prerequisite grids are performed and made
+#       visible to the current grid", i.e. until the predecessor grid's
+#       grid-ending membar has drained.  This, and only this, makes a read of
+#       a predecessor's output legal.
+#
+# Who waits, who triggers, and what each ordering protects:
+#
+#   pre_kernel WAITS FIRST, unconditionally, before its first global load and
+#       before the conv/GEMV block split so that every block reaches it.
+#       Everything it loads is produced by a stream predecessor -- mixed_qkv
+#       and hidden by this layer's projections, state_indices by the caller's
+#       metadata prep, conv_state by an earlier decode step, and ``part`` by
+#       the cuMemsetD32Async this launch is queued behind.  The launch
+#       attribute above explicitly releases the driver from waiting on those,
+#       so without this wait the op's correctness would rest on whether some
+#       unrelated upstream kernel happens to fire a trigger -- a property this
+#       op cannot see and must not depend on.
+#   pre_kernel THEN TRIGGERS, in the same unconditional prologue.  Order
+#       matters and is not cosmetic: the trigger is what places delta_kernel's
+#       CTAs on the SMs, and delta_kernel reads ssm_state BEFORE its own wait.
+#       Triggering ahead of pre_kernel's wait would schedule delta while
+#       pre_kernel is itself still unordered against its predecessors, and
+#       delta's pre-wait prefetch would inherit exactly that -- no ordering
+#       against whoever last wrote ssm_state/state_indices.  Waiting first is
+#       what hands the dependent an already-ordered state.
+#   pre_kernel triggers HERE rather than after its stores on purpose.  The
+#       trigger does not publish qkv_act/part and is not what releases
+#       delta_kernel's wait; delta's wait does not return until pre_kernel's
+#       whole grid has completed and flushed, which covers every store in this
+#       kernel wherever it sits.  Firing at entry is what buys the overlap the
+#       impl exists for (upstream's gdn_decode_bf16_wy_ucache_flush.py fires at
+#       entry for the same reason).  What it does cost is SM competition:
+#       delta's CTAs are resident and parked on their wait while pre_kernel
+#       runs.  That trade is measured, not assumed -- see ../README.md.
+#   delta_kernel WAITS in both arms of its padded-row branch, after the
+#       ssm_state prefetch and before the first read of qkv_act/part.  That
+#       wait is the ordering that protects the conv output and the GEMV
+#       partials.
+#   delta_kernel does NOT trigger, so nothing downstream is scheduled early on
+#       its account and its ssm_state/output stores need no further signal
+#       here: a successor is scheduled at this grid's completion.  Adding a
+#       trigger to delta_kernel would be a performance change that also
+#       obliges every PDL successor to wait -- do not add one without the
+#       matching wait on the other side.
+#
+# Pinned by ``test_pdl_kernels_wait_before_their_first_launch_dependents`` and
+# ``test_every_pdl_kernel_waits_on_all_paths`` in tests/gdn/test_fused_decode.py.
 @cute.kernel
 def pre_kernel(
     mixed_qkv: cute.Tensor,  # [B, QKV_DIM] bf16
@@ -88,13 +151,26 @@ def pre_kernel(
     the silu-activated conv output to ``qkv_act``; the remaining blocks
     accumulate K-split partials of ``hidden @ w_ba`` into ``part`` with
     gpu-scope atomics (hence the memset of ``part`` before the launch).  It
-    signals PDL launch dependents up front so ``delta_kernel``'s ``ssm_state``
-    prefetch overlaps this entire body.
+    waits on its own stream predecessors and then signals PDL launch
+    dependents up front, so ``delta_kernel``'s ``ssm_state`` prefetch overlaps
+    this entire body -- see the PDL contract block above.
     """
     # Combined conv + K-split GEMV in one launch. Blocks [0, B*NCONV) do conv;
     # blocks [B*NCONV, ...) accumulate GEMV partials with gpu-scope atomics.
-    # Early PDL signal so delta_kernel's ssm_state prefetch overlaps the FULL
-    # pre_kernel body (delta only consumes qkv_act/part after its wait).
+    #
+    # PDL prologue, above the block split so EVERY block runs both halves.
+    # (1) Wait: this grid is launched with programmatic stream serialization,
+    # so it may already be running while its predecessors are still draining.
+    # Every global load below -- state_indices, conv_state, mixed_qkv, hidden,
+    # the weights, and the atomics into the freshly memset `part` -- reads what
+    # those predecessors produced, so this is the barrier that makes them
+    # legal, not an optimization.
+    cute.arch.griddepcontrol_wait()
+    # (2) Only then release delta_kernel onto the SMs, so its long-latency
+    # ssm_state prefetch overlaps this whole body.  Never before the wait:
+    # delta reads global memory before its own wait and would inherit this
+    # grid's unordered state.  This does not publish anything -- delta's wait
+    # covers pre_kernel's stores wherever they sit.
     cute.arch.griddepcontrol_launch_dependents()
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -179,6 +255,10 @@ def delta_kernel(
     lane = tidx % 32
     v = rb * RPB + warp  # ssm row index this warp owns
 
+    # Second global read issued before this kernel's PDL wait (with the
+    # ssm_state prefetch below).  pre_kernel does not write state_indices;
+    # ordering against whoever did is inherited from pre_kernel waiting before
+    # it triggers -- see the PDL contract block at the top of this file.
     pp = cutlass.Int32(state_indices[b_idx])
 
     # A negative slot index (vLLM's PAD_SLOT_ID = -1) marks a padded batch
@@ -192,7 +272,11 @@ def delta_kernel(
     # uniform across blocks keeps the launch's dependency semantics simple.
     if pp >= 0:
         # fp32 state loads issued before the PDL wait: pre_kernel never writes
-        # ssm_state, so these long-latency loads overlap its whole body.
+        # ssm_state, so these long-latency loads overlap its whole body.  What
+        # orders them against the PREVIOUS step's writer of ssm_state is
+        # pre_kernel waiting before it triggers: this grid cannot be scheduled
+        # until pre_kernel has released it, and pre_kernel only releases after
+        # its own wait has drained the predecessors.  Keep that order there.
         k0 = lane
         k1 = lane + 32
         k2 = lane + 64
@@ -354,6 +438,12 @@ def fused_launch(
 
     Compiled once per (batch size, scale, conv-state stride mode); ``B`` and
     ``scale`` are constexpr because both shape the generated code.
+
+    ``use_pdl=True`` on BOTH launches is a promise about the kernels, not just
+    a scheduling hint: each of them may start before its stream predecessor has
+    completed and flushed, so each must issue ``griddepcontrol_wait()`` before
+    reading what a predecessor produced.  Do not add a third PDL launch here
+    without reading the contract block above ``pre_kernel``.
     """
     pre_kernel(
         mixed_qkv,
