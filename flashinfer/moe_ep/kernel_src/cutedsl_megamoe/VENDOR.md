@@ -6,8 +6,8 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Repo**: <https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe>
-  (NVIDIA-internal GitLab; see `ACKNOWLEDGEMENT.md` for authors/contacts).
+- **Repo**: NVIDIA-internal source (URL redacted; see `ACKNOWLEDGEMENT.md`
+  for authors/contacts).
 - **Vendored commit**: not recorded — the current `src/` drop was taken
   2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
   PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
@@ -33,7 +33,7 @@ replace, what to audit) lives in `SKILL.md`.
 
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
-  (<https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/blob/50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab/src/inputs_process.py>),
+  (NVIDIA-internal source; URL redacted),
   taken 2026-08-10: the kernel team's fix for the fused activation-quant
   staging breaking on CuTe-DSL 4.7 (mxfp8 path reworked so each lane owns one
   contiguous 16-byte fp8 store, lane pairs reduce the 32-element block amax
