@@ -1635,9 +1635,12 @@ def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
         )
 
 
-@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
+@pytest.mark.parametrize(
+    ("num_heads", "forced_split"),
+    [(4, None), (8, None), (16, None), (32, None), (4, 4)],
+)
 def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inputs(
-    flash_kda_device, monkeypatch, num_heads
+    flash_kda_device, monkeypatch, num_heads, forced_split
 ):
     generator = torch.Generator(device=flash_kda_device).manual_seed(2248 + num_heads)
     num_sequences = 7
@@ -1786,6 +1789,12 @@ def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inpu
         frozen_call_kwargs.append(kwargs)
         return run_frozen(variant, **kwargs)
 
+    if forced_split is not None:
+        monkeypatch.setattr(
+            recurrent_module,
+            "_select_cake_kda_unbounded_softplus_t1_value_split",
+            lambda work, sm_count: forced_split,
+        )
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
     actual_output, actual_state_result = recurrent_kda(
         **_call_kwargs(
