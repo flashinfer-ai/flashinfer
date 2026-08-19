@@ -1134,6 +1134,7 @@ def test_frozen_route_and_ffi_abi(
         **_strict_prefill_kwargs(inputs),
         output=output,
         seq_order=seq_order,
+        backend="cake",
     )
     assert actual.data_ptr() == output.data_ptr()
     assert state is None
@@ -1218,6 +1219,7 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     output, state = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
     assert output.shape == inputs["q"].shape
     assert state is None
@@ -1269,6 +1271,7 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
     recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
     assert routes == [("m128", "sm100f")]
     (args,) = module.calls
@@ -1399,6 +1402,7 @@ def test_direct_packed_prefill_automatically_sorts_sequences(cuda_device, monkey
     recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
     (args,) = module.calls
     assert args[9].tolist() == [1, 2, 0]
@@ -1553,6 +1557,7 @@ def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
         recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             output=torch.empty_like(inputs["q"]),
+            backend="cake",
         )
     (args,) = module.calls
     assert args[27] == int(stream.cuda_stream)
@@ -1593,6 +1598,7 @@ def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
         output_final_state=True,
+        backend="cake",
     )
     assert actual.shape == inputs["q"].shape
     assert returned_state is original_state
@@ -1644,6 +1650,7 @@ def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
         recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             output=torch.empty_like(inputs["q"]),
+            backend="cake",
         )
 
     assert len(kda_prefill_api._flash_kda_stream_workspaces) == 1
@@ -1695,6 +1702,7 @@ def test_graph_capture_requires_packed_int64_offsets(cuda_device, monkeypatch):
         recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             prefill_workspace=workspace,
+            backend="cake",
         )
 
 
@@ -1732,6 +1740,7 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
             **_strict_prefill_kwargs(inputs),
             output=output,
             prefill_workspace=workspace,
+            backend="cake",
         )
     assert [args[17] for args in module.calls] == [1, 0]
     assert (
@@ -1745,6 +1754,7 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
         **_strict_prefill_kwargs(inputs),
         output=changed_output,
         prefill_workspace=workspace,
+        backend="cake",
     )
     assert module.calls[-1][17] == 1
 
@@ -1768,6 +1778,7 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
         **_strict_prefill_kwargs(inputs),
         output=output,
         prefill_workspace=workspace,
+        backend="cake",
     )
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -1776,12 +1787,14 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
             **_strict_prefill_kwargs(inputs),
             output=torch.empty_like(output),
             prefill_workspace=workspace,
+            backend="cake",
         )
 
     recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         output=output,
         prefill_workspace=workspace,
+        backend="cake",
     )
     assert module.calls[-1][17] == 0
     assert workspace._captured
@@ -1791,6 +1804,7 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
             **_strict_prefill_kwargs(inputs),
             output=output,
             prefill_workspace=workspace,
+            backend="cake",
         )
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -1799,6 +1813,7 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
             **_strict_prefill_kwargs(inputs),
             output=output,
             prefill_workspace=workspace,
+            backend="cake",
         )
 
 
@@ -2470,6 +2485,7 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
         "output_final_state": True,
         "seq_order": seq_order,
         "prefill_workspace": workspace,
+        "backend": "cake",
     }
     with torch.cuda.stream(capture_stream):
         recurrent_kda(**call_kwargs)

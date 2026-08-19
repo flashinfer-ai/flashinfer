@@ -81,10 +81,11 @@ Fixed input omits ``cu_seqlens``. Packed input has ``B=1`` and accepts a
 contiguous CUDA int32 or int64 ``cu_seqlens``. The frozen binding consumes
 int64 offsets; pass int64 directly for CUDA graph capture to avoid an
 in-capture conversion allocation. Offset values are a caller contract:
-``cu_seqlens[0] == 0``, entries are strictly increasing (every sequence is
-non-empty), and ``cu_seqlens[-1] == total_tokens``. FlashInfer does not
-synchronize the device to inspect these values; invalid offsets may cause
-out-of-bounds device access.
+``cu_seqlens[0] == 0``, entries are non-decreasing, and
+``cu_seqlens[-1] == total_tokens``. CuTe DSL accepts equal adjacent offsets for
+zero-length sequences; Cake requires every sequence to be non-empty.
+FlashInfer does not synchronize the device to inspect these values; invalid
+offsets may cause out-of-bounds device access.
 
 Packed scheduling
 -----------------
@@ -95,17 +96,19 @@ is a permutation of ``[0, N)``. Ordering sequences by decreasing length
 reduces the final partial wave. FlashInfer validates dtype, device, rank, and
 size without synchronizing the device to inspect permutation values.
 
-When ``seq_order=None``, a cached identity order is used. H12 selects the
-dedicated M128 schedule with a 16-token recurrence chunk for both fixed and
-packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64 value-split kernel;
-the fixed small-BH region described above selects its eight-CTA owner/helper
-schedule; all remaining eligible inputs select the general 32-token M128
-schedule.
+For Cake, omitting ``seq_order`` uses its cached eager scheduling metadata. H12
+selects the dedicated M128 schedule with a 16-token recurrence chunk for both
+fixed and packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64
+value-split kernel; the fixed small-BH region described above selects its
+eight-CTA owner/helper schedule; all remaining eligible inputs select the
+general 32-token M128 schedule.
 
-CuTe DSL no-plan execution also uses the original sequence order and launches
-no sorting kernel. ``flashinfer.RecurrentKDAPrefillWrapper`` provides an
-optional host-planned path: ``plan`` builds a stable decreasing-length order
-and the decomp ``cu_chunks`` / ``chunk_to_seq`` metadata, then ``run`` consumes
+For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
+caches a stable decreasing-length order on the host. CuTe DSL decomp retains
+the original sequence order because its CTA grid fits in one wave.
+``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
+needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
+decomp ``cu_chunks`` / ``chunk_to_seq`` metadata, then ``run`` consumes
 fixed-address buffers. The number of sequences, total tokens, and total BT=16
 chunks are fixed by the first plan so the metadata and launch geometry remain
 valid across CUDA Graph replays.

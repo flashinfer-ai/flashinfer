@@ -139,9 +139,11 @@ def recurrent_kda(
             contract is not normally host-validated. Eager calls without an
             explicit workspace or ``seq_order`` read these values once per
             unchanged offsets tensor to schedule longer sequences first on
-            Cake. CuTe DSL uses the original sequence order unless the caller
-            supplies ``seq_order``; eligible 148-SM B200 and 152-SM GB200 Cake
-            calls also cache persistent worker task bins.
+            Cake. Eager packed CuTe DSL engine calls also cache a
+            longest-sequence-first order; CuTe DSL decomp calls retain the
+            original order because their CTA grid fits in one wave. Eligible
+            148-SM B200 and 152-SM GB200 Cake calls additionally cache
+            persistent worker task bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
