@@ -166,23 +166,25 @@ def test_long_row_dispatch_is_exact(
 
 
 @pytest.mark.parametrize(
-    ("seq_lens", "dtype", "heads", "expected_prefill"),
+    ("arch", "seq_lens", "dtype", "heads", "expected_prefill"),
     [
-        ((128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
-        ((128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
-        ((128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
-        ((65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
-        ((128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
+        ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
+        ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
+        ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
+        ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
+        ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
+        ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
 )
 def test_generic_plan_selects_head_dtype_and_tail_routes(
     monkeypatch: pytest.MonkeyPatch,
+    arch: str,
     seq_lens: tuple[int, ...],
     dtype: torch.dtype,
     heads: tuple[int, int, int],
     expected_prefill: str,
 ) -> None:
-    monkeypatch.setattr(cake, "_arch_for", lambda _device: "sm_100a")
+    monkeypatch.setattr(cake, "_arch_for", lambda _device: arch)
     monkeypatch.setattr(
         cake.torch.cuda,
         "get_device_properties",
