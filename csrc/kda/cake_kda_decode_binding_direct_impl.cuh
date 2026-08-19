@@ -60,8 +60,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
   ffi::CUDADeviceGuard device_guard(ctx.device_id);
 
   const int64_t work = ctx.num_value_heads * CAKE_KDA_DECODE_VALUE_SPLIT;
-  const dim3 grid((work + CAKE_KDA_DECODE_WARPS_PER_CTA - 1) /
-                      CAKE_KDA_DECODE_WARPS_PER_CTA,
+  const dim3 grid((work + CAKE_KDA_DECODE_WARPS_PER_CTA - 1) / CAKE_KDA_DECODE_WARPS_PER_CTA,
                   ctx.num_sequences, 1);
   const dim3 block(CAKE_KDA_DECODE_LAUNCH_THREADS, 1, 1);
 #if CAKE_KDA_DECODE_GATE_KIND == 2
