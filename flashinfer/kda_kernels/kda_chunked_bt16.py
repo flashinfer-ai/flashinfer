@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: BSD-3-Clause
 
 """KDA chunked BT=16 forward kernel using direct CUTLASS primitives.
 
@@ -1980,7 +1980,7 @@ def ptx_mma_m16n8k16_b16_f32(
     if cutlass.const_expr(
         input_dtype != cutlass.Float16 and input_dtype != cutlass.BFloat16
     ):
-        raise TypeError(f"Invalid super-MMA input dtype: {input_dtype}")
+        raise TypeError(f"Invalid auxiliary-MMA input dtype: {input_dtype}")
     input_tag = "f16" if cutlass.const_expr(input_dtype == cutlass.Float16) else "bf16"
 
     return cute.arch.inline_ptx(

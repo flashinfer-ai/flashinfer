@@ -864,21 +864,21 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     _, mixed_ids, mixed_offsets = mixed
     assert sorted(mixed_ids) == list(range(6 * 96))
     assert len(mixed_offsets) == 149
-    gb200_uniform = kda_prefill_api._persistent_task_plan(
+    large_sm_count_uniform = kda_prefill_api._persistent_task_plan(
         (8192,) * 8,
         num_heads=96,
         sm_count=152,
     )
-    assert gb200_uniform is not None
-    assert len(gb200_uniform[2]) == 129
+    assert large_sm_count_uniform is not None
+    assert len(large_sm_count_uniform[2]) == 129
 
-    gb200_mixed = kda_prefill_api._persistent_task_plan(
+    large_sm_count_mixed = kda_prefill_api._persistent_task_plan(
         (3063, 2048, 1300, 963, 547, 271),
         num_heads=96,
         sm_count=152,
     )
-    assert gb200_mixed is not None
-    assert len(gb200_mixed[2]) == 153
+    assert large_sm_count_mixed is not None
+    assert len(large_sm_count_mixed[2]) == 153
     assert (
         kda_prefill_api._persistent_task_plan(
             (3063, 2048, 1300, 963, 547, 271),
