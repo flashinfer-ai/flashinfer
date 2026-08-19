@@ -968,7 +968,7 @@ def _layout_key(tensor: torch.Tensor | None) -> tuple[object, ...]:
 
 _public_prepared: CakeGDNCPPrefill | None = None
 _public_key: tuple[object, ...] | None = None
-_public_metadata_bindings: (
+_public_metadata_binding: (
     tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -976,17 +976,47 @@ _public_metadata_bindings: (
         int,
         int | None,
         int | None,
+        tuple[
+            tuple[int, ...],
+            tuple[int, ...] | None,
+            tuple[int, ...] | None,
+        ],
     ]
     | None
 ) = None
 
 
+def _metadata_signature(
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    checkpoint_cu_starts: torch.Tensor | None,
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+]:
+    """Read the address maps whose payload determines the prepared plan."""
+
+    cu_values = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    state_values = (
+        tuple(int(value) for value in state_indices.detach().cpu().tolist())
+        if state_indices is not None
+        else None
+    )
+    checkpoint_values = (
+        tuple(int(value) for value in checkpoint_cu_starts.detach().cpu().tolist())
+        if checkpoint_cu_starts is not None
+        else None
+    )
+    return cu_values, state_values, checkpoint_values
+
+
 def _reset_cake_gdn_cp_prefill_cache() -> None:
     """Release the internal public-dispatch plan and its owned workspaces."""
 
-    global _public_key, _public_metadata_bindings, _public_prepared
+    global _public_key, _public_metadata_binding, _public_prepared
     _public_key = None
-    _public_metadata_bindings = None
+    _public_metadata_binding = None
     _public_prepared = None
 
 
@@ -1010,7 +1040,7 @@ def chunk_gated_delta_rule_cake_sm100(
 ) -> None:
     """Public dispatcher target; every accepted SM100/SM103 route uses Cake."""
 
-    global _public_key, _public_metadata_bindings, _public_prepared
+    global _public_key, _public_metadata_binding, _public_prepared
     stream = torch.cuda.current_stream(q.device)
     state_indices_version = (
         int(state_indices._version) if state_indices is not None else None
@@ -1018,15 +1048,28 @@ def chunk_gated_delta_rule_cake_sm100(
     checkpoint_cu_starts_version = (
         int(checkpoint_cu_starts._version) if checkpoint_cu_starts is not None else None
     )
-    metadata_matches = bool(
-        _public_metadata_bindings is not None
-        and _public_metadata_bindings[0] is cu_seqlens
-        and _public_metadata_bindings[1] is state_indices
-        and _public_metadata_bindings[2] is checkpoint_cu_starts
-        and _public_metadata_bindings[3] == int(cu_seqlens._version)
-        and _public_metadata_bindings[4] == state_indices_version
-        and _public_metadata_bindings[5] == checkpoint_cu_starts_version
-    )
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        if not (
+            _public_metadata_binding is not None
+            and _public_metadata_binding[0] is cu_seqlens
+            and _public_metadata_binding[1] is state_indices
+            and _public_metadata_binding[2] is checkpoint_cu_starts
+            and _public_metadata_binding[3] == int(cu_seqlens._version)
+            and _public_metadata_binding[4] == state_indices_version
+            and _public_metadata_binding[5] == checkpoint_cu_starts_version
+        ):
+            raise RuntimeError(
+                "Cake GDN CP-prefill metadata must be warmed with the same "
+                "unchanged tensors before CUDA graph capture"
+            )
+        metadata_signature = _public_metadata_binding[6]
+    else:
+        metadata_signature = _metadata_signature(
+            cu_seqlens,
+            state_indices,
+            checkpoint_cu_starts,
+        )
     key: tuple[object, ...] = (
         *(
             _layout_key(tensor)
@@ -1045,13 +1088,18 @@ def chunk_gated_delta_rule_cake_sm100(
         _layout_key(cu_seqlens),
         _layout_key(state_indices),
         _layout_key(checkpoint_cu_starts),
+        metadata_signature,
         output_state is initial_state and initial_state is not None,
         float(scale),
         bool(output_final_state),
         int(checkpoint_every_n_tokens),
         int(stream.cuda_stream),
     )
-    if _public_prepared is None or _public_key != key or not metadata_matches:
+    if _public_prepared is None or _public_key != key:
+        if capturing:
+            raise RuntimeError(
+                "Cake GDN CP-prefill plan must be warmed before CUDA graph capture"
+            )
         _public_prepared = prepare_cake_gdn_cp_prefill(
             q,
             k,
@@ -1071,21 +1119,28 @@ def chunk_gated_delta_rule_cake_sm100(
             _capture_graph=False,
         )
         _public_key = key
-        # Keep the caller's small address-map tensors alive for as long as the
-        # prepared plan is cached. Python object ids and CUDA allocator
-        # addresses can otherwise both be recycled, making a different
-        # cu_seqlens/state_indices payload look identical to the old binding.
-        _public_metadata_bindings = (
+        _public_metadata_binding = (
             cu_seqlens,
             state_indices,
             checkpoint_cu_starts,
             int(cu_seqlens._version),
             state_indices_version,
             checkpoint_cu_starts_version,
+            metadata_signature,
         )
         if initial_state is not None and output_state is initial_state:
             _public_prepared.replay()
         return
+    if not capturing:
+        _public_metadata_binding = (
+            cu_seqlens,
+            state_indices,
+            checkpoint_cu_starts,
+            int(cu_seqlens._version),
+            state_indices_version,
+            checkpoint_cu_starts_version,
+            metadata_signature,
+        )
     _public_prepared.launch_with_bindings(
         q=q,
         k=k,
