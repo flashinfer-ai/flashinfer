@@ -8,25 +8,22 @@ kernel-component model).
 
 ## Provenance
 
-- Upstream repo: `cutedsl_megamoe` (kernel team), local mirror
-  `/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/cutedsl_megamoe`
-- Upstream commit: `92dd334` (2026-08-15, "Merge branch 'ag_dev/perf_details'
-  into 'main'"; brings in `a5b4d33` "Rubin MegaMoE Perf Improvment" — the
-  mixed-CGA preferred/fallback cluster launch, reworked FC12 scheduler, and
-  the token-in size-copy reorder around the metadata-ready wait). Previous
-  snapshot: `882c83e2` (2026-08-08). The `rubin/inference/mega` files at
-  `92dd334` are identical to perf-report commit `47881ad2`
-  (`ag_dev/investigate_blackwell`).
+- Upstream repo: the NVIDIA kernel team's `cutedsl_megamoe` repository
+  (internal; see `ACKNOWLEDGEMENT.md` for authors/contacts).
+- Upstream commit: `92dd334` (2026-08-15; brings in `a5b4d33` "Rubin MegaMoE
+  Perf Improvment" — the mixed-CGA preferred/fallback cluster launch,
+  reworked FC12 scheduler, and the token-in size-copy reorder around the
+  metadata-ready wait). Previous snapshot: `882c83e2` (2026-08-08). The
+  `rubin/inference/mega` files at `92dd334` are identical to perf-report
+  commit `47881ad2` (2026-08-15).
 - Copied subtree: `next/sources/` → `src/sources/`
 - DSL requirement: the kernels need `cutlass.utils.rubin_helpers`, which is
   in NO public `nvidia-cutlass-dsl` release (<= 4.7.0; the 4.7.0 wheel
-  contains zero rubin files, and 4.8 had not shipped on public PyPI or the
-  internal index as of 2026-08-18) — only the internal nightly
-  `nvidia-cutlass-dsl-internal` (urm.nvidia.com). Validated here on
-  `0.3.0+20260803235612.d88cc85` (installed by the sbatch scripts in
-  `.sqsh_build_logs/`). When a public 4.8 ships, validate it with
-  `sbatch --export=ALL,SM107_DSL_SPEC="nvidia-cutlass-dsl==4.8.0"
-  .sqsh_build_logs/run_sm107_tests.sbatch`.
+  contains no Rubin files, and 4.8 had not shipped as of 2026-08-18).
+  Validated on an NVIDIA-internal CuTe DSL nightly build (2026-08-03, git
+  `d88cc85`); Rubin support in the public wheels is expected in the 4.8
+  line. When a Rubin-capable public release ships, re-run the
+  `oracle_sm107` / `mega_sm107` test targets against it.
 
 ## Scope of this drop (inference only)
 
@@ -116,10 +113,11 @@ section above). All adaptation lives in `shim/` and the backends.
    (`tests/moe_ep/test_sm107_block_scaled_*.py`: config defaults, shim
    validation cases, an oracle case exercising the new path).
 8. **Update this file** (provenance commit, scope notes, local diffs) and
-   validate on hecate via `.sqsh_build_logs/run_sm107_tests.sbatch`
-   (config + oracle + 4-rank multirank must be green; `92dd334` ran as job
-   435039). Perf tracking lives in `TUNING.md`
-   (`.sqsh_build_logs/run_sm107_bench.sbatch`).
+   validate on a Rubin node: the sm107 config tests plus the
+   `oracle_sm107` and `mega_sm107` targets of `tests/moe_ep/run_tests.sh`
+   must be green (the `92dd334` refresh was validated 2026-08-17). Perf
+   tracking lives in `TUNING.md`
+   (`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py`).
 
 ## Layout
 

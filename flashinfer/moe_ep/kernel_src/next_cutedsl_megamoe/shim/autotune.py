@@ -74,7 +74,7 @@ def sm107_candidates(
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
     16 candidates (32 with the ikr axis), spanning the axes the upstream
-    Rubin TS4B report showed to matter (see TUNING.md):
+    Rubin perf report showed to matter (see TUNING.md):
 
     - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)

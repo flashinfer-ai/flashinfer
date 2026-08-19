@@ -217,7 +217,7 @@ def record_knobs(
 
 
 def default_knobs(max_tokens: int, *, quant_kind: str = "nvfp4") -> Dict[str, Any]:
-    """Built-in SM107 heuristic: the upstream Rubin TS4B selected-best profile.
+    """Built-in SM107 heuristic: the upstream Rubin perf-report selected-best profile.
 
     Two token profiles (see TUNING.md): <2048 tokens/rank keeps the 128-wide
     N tile, >=2048 the 256-wide.  Both use mixed CGA (4x1 preferred, 2x1

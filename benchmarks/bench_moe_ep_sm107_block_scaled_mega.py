@@ -1,6 +1,6 @@
 """4-GPU SM107 (Rubin) block-scaled mega kernel latency benchmark.
 
-Reproduces the upstream cutedsl_megamoe Rubin TS4B perf-report protocol
+Reproduces the upstream cutedsl_megamoe Rubin perf-report protocol
 (tested upstream at 47881ad2 / vendored 92dd334) on the flashinfer moe_ep
 backends: DSv4-Pro EP4 shape (hidden 7168, MoE intermediate 3072, 384 total
 experts, top-k 6, BF16 combine), NVFP4 and/or MXFP8 (--quant-kind; the
@@ -67,7 +67,7 @@ WINNERS = {
     ("power_law", 32768): dict(tile=(256, 256, 256), hint=3, epi=(1, 4), tif=4),
 }
 
-# Upstream reference latencies (us) for the reference column, Rubin TS4B @ 47881ad2.
+# Upstream reference latencies (us) for the reference column, upstream commit 47881ad2 (2026-08-15).
 UPSTREAM_US = {
     ("balanced", 1024): 372.22,
     ("balanced", 2048): 410.48,
