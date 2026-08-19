@@ -4094,7 +4094,7 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
                    "Internal error: missing FP8 per-channel MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
-  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
+  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
 Array<Tensor> trtllm_fp8_block_scale_moe(
