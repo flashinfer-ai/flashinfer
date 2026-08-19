@@ -2,7 +2,7 @@
 
 Rubin (SM107) MegaMoE kernels from the kernel team's `cutedsl_megamoe` repo,
 **`next/` greenfield tree** (a different codebase generation from the
-`kernel_src/cutedsl_megamoe` SM100 drop and the `kernel_src/sm90` fork — the
+`kernel_src/sm100/cutedsl_megamoe` SM100 drop and the `kernel_src/sm90` fork — the
 `next/` tree uses fully relative imports and a composable `api.py`
 kernel-component model).
 

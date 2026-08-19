@@ -30,7 +30,7 @@ QUANT_KINDS = ("mxfp8_e4m3", "nvfp4")
 def _sm107_tree():
     """Import the drop package, skipping if something shadows ``sources``."""
     try:
-        import flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe as pkg
+        import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
     except RuntimeError as exc:
         pytest.skip(f"next_cutedsl_megamoe tree unavailable in this process: {exc}")
     return pkg

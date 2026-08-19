@@ -1,8 +1,11 @@
 # kernel_src — vendored kernel snapshots
 
-Every directory here is one snapshot of one upstream kernel repo (see each
-drop's `VENDOR.md` for provenance, `SKILL.md` for the drop-update workflow).
-Layout is by **provenance**, not taxonomy: the user-facing
+Every leaf directory here is one snapshot of one upstream kernel repo (see
+each drop's `VENDOR.md` for provenance, `SKILL.md` for the drop-update
+workflow). Drops are grouped by target architecture —
+`kernel_src/sm<arch>/<tree_name>/` (e.g. `sm100/cutedsl_megamoe`,
+`sm107/next_cutedsl_megamoe`, `sm90/pull_style_cutedsl_megakernel`) — while
+each tree keeps its upstream name for provenance. The user-facing
 `sm<arch>/<dtype-style>` organization lives in `backends/mega/kernel/`, which
 wraps these drops.
 

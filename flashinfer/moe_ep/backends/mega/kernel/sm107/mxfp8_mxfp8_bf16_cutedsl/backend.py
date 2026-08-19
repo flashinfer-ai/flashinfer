@@ -1,6 +1,6 @@
 """SM107 (Rubin) mxfp8 block-scaled mega-MoE kernel backend.
 
-Wraps the vendored ``kernel_src/next_cutedsl_megamoe`` drop's fused
+Wraps the vendored ``kernel_src/sm107/next_cutedsl_megamoe`` drop's fused
 dispatch + FC1 + SwiGLU + FC2 + combine inference kernel
 (``BlockScaledSwapAbMegaMoeKernel`` at quant kind mxfp8) behind the
 ``MegaKernelBackend`` contract.  The backend talks only to the drop's package
@@ -103,7 +103,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the next_cutedsl_megamoe shim (never src/
         # directly).
-        from ......kernel_src.next_cutedsl_megamoe import (
+        from ......kernel_src.sm107.next_cutedsl_megamoe import (
             get_symm_buffer_for_sm107_block_scaled_mega_moe,
         )
 
@@ -158,7 +158,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         supported on the engine path — the SM107 session bakes knobs at
         construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
         """
-        from ......kernel_src.next_cutedsl_megamoe import KNOB_KEYS, resolve_knobs
+        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS, resolve_knobs
 
         k = self._kernel_config
         if k.knobs is None:
@@ -255,7 +255,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> torch.Tensor:
         # Backend talks only to the next_cutedsl_megamoe shim (never src/
         # directly).
-        from ......kernel_src.next_cutedsl_megamoe import sm107_block_scaled_mega_moe
+        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+            sm107_block_scaled_mega_moe,
+        )
 
         if output is not None:
             num_tokens = int(output.shape[0])

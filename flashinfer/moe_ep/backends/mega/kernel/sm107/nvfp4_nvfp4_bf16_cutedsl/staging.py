@@ -23,7 +23,7 @@ def stage_mega_moe_inputs(
     Returns the staged token count.
     """
     # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.next_cutedsl_megamoe import (
+    from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
         quantize_nvfp4_block16,
@@ -82,7 +82,7 @@ def validate_sm107_nvfp4_forward_inputs(
         )
         return
 
-    from ......kernel_src.next_cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from ......kernel_src.sm107.next_cutedsl_megamoe import Nvfp4BlockSize, ceil_div
 
     num_tokens = hidden_states.shape[0]
     hidden = fleet_params.token_hidden_size

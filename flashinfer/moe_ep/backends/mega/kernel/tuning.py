@@ -126,7 +126,7 @@ def run_tuning(args, tune_one: Callable[[Any, int, int, int], dict]) -> int:
     """Dist lifecycle + per-bucket sweep loop shared by the cutedsl tuners."""
     import torch
 
-    from ....kernel_src.cutedsl_megamoe import (
+    from ....kernel_src.sm100.cutedsl_megamoe import (
         finalize_dist,
         init_dist,
         knob_cache_path,

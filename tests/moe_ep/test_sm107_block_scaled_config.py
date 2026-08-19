@@ -4,7 +4,7 @@ No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing
 for BOTH sm107 backends (mxfp8 and nvfp4).
 
-Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe``
+Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe``
 internals that pull cutlass: the ``unit`` run_tests.sh target collects this
 file in one shared pytest process.  Shim/kernel validation coverage lives in
 ``test_sm107_block_scaled_kernel_vs_reference.py`` (own process, Rubin only).

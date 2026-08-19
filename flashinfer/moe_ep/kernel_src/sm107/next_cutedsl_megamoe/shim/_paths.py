@@ -1,4 +1,4 @@
-"""Put ``kernel_src/next_cutedsl_megamoe/src`` on ``sys.path`` so ``sources`` resolves.
+"""Put ``kernel_src/sm107/next_cutedsl_megamoe/src`` on ``sys.path`` so ``sources`` resolves.
 
 This is shim glue, not kernel-team code, so it lives in ``shim/`` (never inside
 ``src/`` — that directory is a *verbatim* drop from the kernel team).  It adds

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Symmetric-heap + graph-capture utilities for the SM107 GLU mega frontend.
 
-Mirrors ``kernel_src/cutedsl_megamoe/shim/comm.py`` (the SM100 tree) with the
+Mirrors ``kernel_src/sm100/cutedsl_megamoe/shim/comm.py`` (the SM100 tree) with the
 drop-specific ``src.bootstrap`` pieces removed: torch.distributed / NVSHMEM
 runtime bring-up for this tree is owned by ``flashinfer.moe_ep.core.runtime``
 (the backend declares the requirement); the shim only allocates on whatever

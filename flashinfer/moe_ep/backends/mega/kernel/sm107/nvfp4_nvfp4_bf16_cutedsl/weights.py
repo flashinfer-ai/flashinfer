@@ -69,7 +69,7 @@ def preprocess_mega_weights(
         )
 
     # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.next_cutedsl_megamoe import (
+    from ......kernel_src.sm107.next_cutedsl_megamoe import (
         interleave_gate_up_16,
         quantize_nvfp4_block16,
         to_blocked,
@@ -124,7 +124,7 @@ def validate_transformed_mega_weights(
     """Structure/shape/dtype checks for user-supplied transformed weights."""
     import torch
 
-    from ......kernel_src.next_cutedsl_megamoe import (
+    from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Nvfp4BlockSize,
         swizzled_flat_sf_size,
     )

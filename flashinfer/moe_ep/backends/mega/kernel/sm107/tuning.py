@@ -3,7 +3,7 @@
 SM100 counterpart: the per-backend ``sm100/<name>/tuner.py`` pair over
 ``backends/mega/kernel/tuning.py``.  The SM107 backends share one driver
 because both talk to the same quant-kind-generic shim
-(``kernel_src/next_cutedsl_megamoe``); the per-backend ``tuner.py`` modules
+(``kernel_src/sm107/next_cutedsl_megamoe``); the per-backend ``tuner.py`` modules
 are thin quant-kind bindings invoked through the
 :mod:`flashinfer.moe_ep.tune` CLI (``--arch sm107``).
 
@@ -13,15 +13,29 @@ Differences from the SM100 driver:
   shim has no ``init_dist``; NVSHMEM + torch.distributed come from
   ``bootstrap_moe_ep_runtime``), with ``MEGA_NO_DIST=1`` single-rank support;
 - each candidate rebuilds the kernel session (SM107 bakes knobs at
-  construction — see ``kernel_src/next_cutedsl_megamoe/shim/autotune.py``).
+  construction — see ``kernel_src/sm107/next_cutedsl_megamoe/shim/autotune.py``).
 """
 
 from __future__ import annotations
 
+import importlib
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ..tuning import finish_sweep
+
+if TYPE_CHECKING:
+    from .....kernel_src.sm107.next_cutedsl_megamoe import Sm107QuantKind
+
+
+def _backend_module(quant_kind: str, name: str):
+    backend = (
+        "nvfp4_nvfp4_bf16_cutedsl"
+        if quant_kind == "nvfp4"
+        else "mxfp8_mxfp8_bf16_cutedsl"
+    )
+    return importlib.import_module(f".{backend}.{name}", __package__)
+
 
 _WEIGHT_CHUNK_EXPERTS = 8  # bf16 generation + quantize peak-memory bound
 
@@ -32,14 +46,8 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
 
     from .....weights import MoEWeightPack
 
-    if quant_kind == "nvfp4":
-        from .nvfp4_nvfp4_bf16_cutedsl import weights as weights_mod
-
-        extra = {}
-    else:
-        from .mxfp8_mxfp8_bf16_cutedsl import weights as weights_mod
-
-        extra = {"kind": quant_kind}
+    weights_mod = _backend_module(quant_kind, "weights")
+    extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
@@ -90,14 +98,8 @@ def _stage_dummy_inputs(args, rank, symm_buffer, live_tokens: int, quant_kind: s
     """Random activations + near-uniform distinct top-k routing, staged."""
     import torch
 
-    if quant_kind == "nvfp4":
-        from .nvfp4_nvfp4_bf16_cutedsl import staging as staging_mod
-
-        extra = {}
-    else:
-        from .mxfp8_mxfp8_bf16_cutedsl import staging as staging_mod
-
-        extra = {"kind": quant_kind}
+    staging_mod = _backend_module(quant_kind, "staging")
+    extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 13 * rank)
     x = torch.randn(
@@ -134,7 +136,7 @@ def tune_one(
 
     import torch
 
-    from .....kernel_src.next_cutedsl_megamoe import (
+    from .....kernel_src.sm107.next_cutedsl_megamoe import (
         autotune_sm107_block_scaled_mega_moe,
         get_symm_buffer_for_sm107_block_scaled_mega_moe,
         resolve_knobs,
@@ -160,7 +162,7 @@ def tune_one(
             args.intermediate,
             rank,
             world_size,
-            quant_kind=quant_kind,
+            quant_kind=cast("Sm107QuantKind", quant_kind),
             gate_up_clamp=args.gate_up_clamp,
         )
         _stage_dummy_inputs(args, rank, symm_buffer, live_tokens, quant_kind)
@@ -245,7 +247,7 @@ def run_tuning(args, quant_kind: str) -> int:
 
             finalize_moe_ep_runtime(runtime)
     if rank == 0:
-        from .....kernel_src.next_cutedsl_megamoe import knob_cache_path
+        from .....kernel_src.sm107.next_cutedsl_megamoe import knob_cache_path
 
         print(
             f"[moe_ep-tune] done; cache: {knob_cache_path() or 'DISABLED'}", flush=True

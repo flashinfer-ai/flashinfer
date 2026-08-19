@@ -10,7 +10,7 @@ Sm107Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 @dataclass
 class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
+    """Kernel params for ``kernel_src.sm107.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
 
     The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
     FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
@@ -42,7 +42,7 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # Tuning-knob resolution: None -> the explicit fields above stand;
-    # a dict (shim knob keys, see kernel_src.next_cutedsl_megamoe.KNOB_KEYS)
+    # a dict (shim knob keys, see kernel_src.sm107.next_cutedsl_megamoe.KNOB_KEYS)
     # -> explicit overrides; "cache" -> knob-cache lookup (populated by
     # `python -m flashinfer.moe_ep.tune`) with the built-in heuristic
     # fallback. The SM100-style online "auto" sweep is NOT supported on the

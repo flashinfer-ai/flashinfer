@@ -27,7 +27,7 @@ Run (whole node, 4 Rubin GPUs)::
 
 Results are appended as JSON lines to ``--output`` (rank 0 only) and printed
 as a markdown table row per problem size. See
-``flashinfer/moe_ep/kernel_src/next_cutedsl_megamoe/TUNING.md``.
+``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md``.
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ def _bench_one(
     l2_flush: bool = True,
     knobs_override: Optional[dict] = None,
 ) -> Tuple[dict, list]:
-    import flashinfer.moe_ep.kernel_src.next_cutedsl_megamoe as pkg
+    import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,

@@ -28,7 +28,7 @@ def stage_mega_moe_inputs(
     yet). Returns the staged token count.
     """
     # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.next_cutedsl_megamoe import (
+    from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
         quantize_mxfp8_block32,
@@ -88,7 +88,7 @@ def validate_sm107_forward_inputs(
         )
         return
 
-    from ......kernel_src.next_cutedsl_megamoe import Mxfp8BlockSize, ceil_div
+    from ......kernel_src.sm107.next_cutedsl_megamoe import Mxfp8BlockSize, ceil_div
 
     num_tokens = hidden_states.shape[0]
     hidden = fleet_params.token_hidden_size
