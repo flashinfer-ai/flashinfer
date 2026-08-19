@@ -87,9 +87,7 @@ def _variant_metadata(
     value_warps = value_rows // 16
     rows_per_group = 2 if coefficient_gram and value_split == 8 else 8
     state_warps = (value_rows // rows_per_group + 1) // 2
-    launch_threads = (
-        32 if direct_impl else max(tokens, value_warps, state_warps) * 32
-    )
+    launch_threads = 32 if direct_impl else max(tokens, value_warps, state_warps) * 32
     return CakeKDADecodeVariantMetadata(
         head_dim,
         tokens,

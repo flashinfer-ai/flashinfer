@@ -428,9 +428,7 @@ def test_sm103a_split_policy_has_an_independent_retuning_hook(monkeypatch):
         (8 * 152, 152, 4),
     ],
 )
-def test_cake_unbounded_softplus_t1_split_boundaries(
-    work, sm_count, expected_split
-):
+def test_cake_unbounded_softplus_t1_split_boundaries(work, sm_count, expected_split):
     assert (
         recurrent_module._select_cake_kda_unbounded_softplus_t1_value_split(
             work, sm_count
