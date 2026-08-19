@@ -1516,7 +1516,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
 
     with pytest.raises(
         NotImplementedError,
-        match="variable-window masking.*not supported for paged context",
+        match=r"variable-window masking.*not supported for paged context",
     ):
         FmhaTs(has_variable_window=True, use_paged_kv=True)
 
@@ -1527,7 +1527,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
     wrapper = BatchPrefillPagedTSWrapper()
     with pytest.raises(
         NotImplementedError,
-        match="variable_window.*not supported for paged context",
+        match=r"variable_window.*not supported for paged context",
     ):
         wrapper.plan(
             None,

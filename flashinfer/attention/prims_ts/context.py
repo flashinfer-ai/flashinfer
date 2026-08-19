@@ -1701,10 +1701,15 @@ class BatchPrefillTSWrapper:
             Fixed or packed query, key, and value tensors.
         qo_indptr, kv_indptr : torch.Tensor, optional
             Cumulative query and K/V offsets for packed-ragged input.
-        mask_type : {"dense", "causal"}
-            Attention mask mode.
+        mask_type : {"dense", "causal", "variable_window"}
+            Attention mask mode. ``variable_window`` is supported only for
+            fixed-shape inputs.
         window_left : int
             Left sliding-window extent, or ``-1`` to disable the window.
+        variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+            Inclusive per-query K bounds required for ``variable_window``.
+            Both must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+            ``0 <= starts[b, q] <= ends[b, q] < Sk``.
         sm_scale : float, optional
             Softmax scale; defaults to the inverse square root of head size.
         output_scale : float
@@ -2107,10 +2112,15 @@ def batch_prefill(
         Fixed or packed query, key, and value tensors.
     qo_indptr, kv_indptr : torch.Tensor, optional
         Cumulative query and K/V offsets for packed-ragged input.
-    mask_type : {"dense", "causal"}
-        Attention mask mode.
+    mask_type : {"dense", "causal", "variable_window"}
+        Attention mask mode. ``variable_window`` is supported only for
+        fixed-shape inputs.
     window_left : int
         Left sliding-window extent, or ``-1`` to disable the window.
+    variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+        Inclusive per-query K bounds required for ``variable_window``. Both
+        must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+        ``0 <= starts[b, q] <= ends[b, q] < Sk``.
     sm_scale : float, optional
         Softmax scale; defaults to the inverse square root of head size.
     output_scale : float
