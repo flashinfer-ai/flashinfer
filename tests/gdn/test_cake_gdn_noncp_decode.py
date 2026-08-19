@@ -58,7 +58,7 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("78e460e9d92759bb568c75aae4e6601ea4f425d4")
+    assert manifest["generator_commit"] == ("264cbfe05a0aaad5c5fd630c7eeeecb43b9e4723")
     assert manifest["contract_row_count"] == 1764
     assert manifest["architecture_row_count"] == 3528
     assert manifest["admitted_architecture_rows"] == 3468
@@ -100,6 +100,33 @@ def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
     assert "single_chunk" in single.variant_name
 
 
+def test_prefill_resolver_selects_frozen_dynamic_head_specializations() -> None:
+    dynamic_heads = _prefill(
+        num_seqs=1,
+        total_seq_len=64,
+        max_seq_len=64,
+        num_q_heads=3,
+        num_k_heads=3,
+        num_v_heads=3,
+        use_initial_state=False,
+        store_final_state=True,
+    )
+    dynamic_group = _prefill(
+        num_q_heads=6,
+        num_k_heads=2,
+        num_v_heads=2,
+    )
+
+    assert dynamic_heads.route_id == "cake.gdn_prefill.noncp.dvsplit"
+    assert dynamic_group.route_id == "cake.gdn_prefill.noncp.dvsplit"
+    heads_record = cake_gdn._kernel_record(dynamic_heads.variant_name)
+    group_record = cake_gdn._kernel_record(dynamic_group.variant_name)
+    assert heads_record["specializations"]["NUM_O_HEADS_LOG2"] == -1
+    assert heads_record["specializations"]["HEAD_GROUP_LOG2"] == 0
+    assert group_record["specializations"]["NUM_O_HEADS_LOG2"] == -1
+    assert group_record["specializations"]["HEAD_GROUP_LOG2"] == -1
+
+
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -116,6 +143,14 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
         match="low-precision state requires BF16 I/O",
     ):
         _prefill(state_dtype="float16")
+
+
+def test_kernel_loader_fails_closed_for_unsupported_architecture() -> None:
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError,
+        match="unsupported Cake GDN architecture",
+    ):
+        cake_gdn.load_cake_gdn_kernel("unused", "sm_90a")  # type: ignore[arg-type]
 
 
 def test_decode_resolver_selects_all_promoted_physical_routes() -> None:

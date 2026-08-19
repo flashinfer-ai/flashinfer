@@ -90,6 +90,44 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
   }
 }
 
+template <int Rank>
+struct TmaDescriptorCache {
+  std::mutex mu;
+  bool valid = false;
+  void* data = nullptr;
+  uint64_t global_dim[Rank] = {};
+  uint64_t global_strides[Rank - 1] = {};
+  CUtensorMap descriptor{};
+
+  bool Lookup(
+      void* candidate_data,
+      const uint64_t (&candidate_dim)[Rank],
+      const uint64_t (&candidate_strides)[Rank - 1],
+      CUtensorMap* result) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!valid || data != candidate_data ||
+        std::memcmp(global_dim, candidate_dim, sizeof(global_dim)) != 0 ||
+        std::memcmp(global_strides, candidate_strides, sizeof(global_strides)) != 0) {
+      return false;
+    }
+    *result = descriptor;
+    return true;
+  }
+
+  void Store(
+      void* candidate_data,
+      const uint64_t (&candidate_dim)[Rank],
+      const uint64_t (&candidate_strides)[Rank - 1],
+      const CUtensorMap& candidate_descriptor) {
+    std::lock_guard<std::mutex> lock(mu);
+    data = candidate_data;
+    std::memcpy(global_dim, candidate_dim, sizeof(global_dim));
+    std::memcpy(global_strides, candidate_strides, sizeof(global_strides));
+    descriptor = candidate_descriptor;
+    valid = true;
+  }
+};
+
 struct TmaDeviceArena {
   static constexpr size_t kSlotsPerChunk = 256;
   static constexpr size_t kMaxSlots = 4096;
@@ -97,7 +135,36 @@ struct TmaDeviceArena {
   size_t used = 0;
 };
 
-// Immutable, process-lifetime device tensor-map slots for the pointer ABI.
+struct TmaSlotKey {
+  unsigned long long context_id;
+  CUtensorMap descriptor;
+
+  bool operator==(const TmaSlotKey& other) const {
+    return context_id == other.context_id &&
+           std::memcmp(&descriptor, &other.descriptor, sizeof(CUtensorMap)) == 0;
+  }
+};
+
+struct TmaSlotKeyHash {
+  size_t operator()(const TmaSlotKey& key) const {
+    // FNV-1a over initialized fields only (never struct padding): warm
+    // lookups allocate nothing and identical descriptors hash identically.
+    size_t hash = static_cast<size_t>(1469598103934665603ULL);
+    auto mix = [&hash](const void* data, size_t size) {
+      const unsigned char* bytes =
+          reinterpret_cast<const unsigned char*>(data);
+      for (size_t index = 0; index < size; ++index) {
+        hash ^= static_cast<size_t>(bytes[index]);
+        hash *= static_cast<size_t>(1099511628211ULL);
+      }
+    };
+    mix(&key.context_id, sizeof(key.context_id));
+    mix(&key.descriptor, sizeof(key.descriptor));
+    return hash;
+  }
+};
+
+// Immutable, loaded-module-lifetime device tensor-map slots for the pointer ABI.
 // A slot is never rewritten: different descriptor bytes always get a new
 // address, so concurrent streams cannot observe a partially updated map. The
 // chunked arena caps storage at 512 KiB per CUDA context in this host module.
@@ -106,8 +173,10 @@ static inline void* TmaDeviceSlot(
     int device_id,
     cudaStream_t stream) {
   static std::mutex mu;
-  static auto* slots = new std::unordered_map<std::string, void*>();
-  static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
+  static auto* slots =
+      new std::unordered_map<TmaSlotKey, void*, TmaSlotKeyHash>();
+  static auto* arenas =
+      new std::unordered_map<unsigned long long, TmaDeviceArena>();
 
   // Device allocations are context-owned. Resolve and validate the active
   // context before cache lookup so a warm entry can never bypass the same
@@ -122,11 +191,13 @@ static inline void* TmaDeviceSlot(
   TVM_FFI_CHECK(result == CUDA_SUCCESS && current_device == device_id, RuntimeError)
       << "TMA descriptor device mismatch: current=" << current_device
       << ", tensor=" << device_id;
+  unsigned long long current_context_id = 0;
+  result = cuCtxGetId(current_context, &current_context_id);
+  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
+      << "cuCtxGetId for TMA descriptor slot failed: CUresult="
+      << static_cast<int>(result);
 
-  std::string key =
-      std::to_string(reinterpret_cast<uintptr_t>(current_context));
-  key.push_back(':');
-  key.append(reinterpret_cast<const char*>(&tm), sizeof(CUtensorMap));
+  TmaSlotKey key{current_context_id, tm};
   std::lock_guard<std::mutex> lock(mu);
   auto it = slots->find(key);
   if (it != slots->end()) return it->second;
@@ -142,7 +213,7 @@ static inline void* TmaDeviceSlot(
          "CUDA Graph capture; prewarm this exact tensor/layout binding or "
          "compile with tma_abi='grid_constant'";
 
-  TmaDeviceArena& arena = (*arenas)[current_context];
+  TmaDeviceArena& arena = (*arenas)[current_context_id];
   TVM_FFI_CHECK(arena.used < TmaDeviceArena::kMaxSlots, RuntimeError)
       << "pointer TMA ABI exhausted its immutable descriptor arena in CUDA "
          "context " << current_context << " on device " << device_id
@@ -199,15 +270,18 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
       (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
   };
+  static TmaDescriptorCache<3> cache;
+  CUtensorMap tm{};
+  if (cache.Lookup(t.data_ptr(), global_dim, global_strides, &tm)) return tm;
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
+  cache.Store(t.data_ptr(), global_dim, global_strides, tm);
   return tm;
 }
 
@@ -238,15 +312,18 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
       (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
   };
+  static TmaDescriptorCache<3> cache;
+  CUtensorMap tm{};
+  if (cache.Lookup(t.data_ptr(), global_dim, global_strides, &tm)) return tm;
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'K') failed: CUresult=" << (int)r;
+  cache.Store(t.data_ptr(), global_dim, global_strides, tm);
   return tm;
 }
 
@@ -277,15 +354,18 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
       (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
   };
+  static TmaDescriptorCache<3> cache;
+  CUtensorMap tm{};
+  if (cache.Lookup(t.data_ptr(), global_dim, global_strides, &tm)) return tm;
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'V') failed: CUresult=" << (int)r;
+  cache.Store(t.data_ptr(), global_dim, global_strides, tm);
   return tm;
 }
 
@@ -316,15 +396,18 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
       (uint64_t)((s3 * 16) / 8),
       (uint64_t)((s2 * 16) / 8),
   };
+  static TmaDescriptorCache<3> cache;
+  CUtensorMap tm{};
+  if (cache.Lookup(t.data_ptr(), global_dim, global_strides, &tm)) return tm;
   uint32_t box_dim[3] = {64u, 64u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'O') failed: CUresult=" << (int)r;
+  cache.Store(t.data_ptr(), global_dim, global_strides, tm);
   return tm;
 }
 
@@ -351,10 +434,8 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   CheckContiguous(arg_state_indices, "state_indices");
   CheckCudaTensor(arg_initial_state, "initial_state");
   CheckDtype(arg_initial_state, "initial_state", 2, 32, 1);
-  CheckContiguous(arg_initial_state, "initial_state");
   CheckCudaTensor(arg_output_state, "output_state");
   CheckDtype(arg_output_state, "output_state", 2, 32, 1);
-  CheckContiguous(arg_output_state, "output_state");
   CheckCudaTensor(arg_checkpoint_state, "checkpoint_state");
   CheckDtype(arg_checkpoint_state, "checkpoint_state", 2, 32, 1);
   CheckContiguous(arg_checkpoint_state, "checkpoint_state");
@@ -364,12 +445,6 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   CheckCudaTensor(arg_tensormap_workspace, "tensormap_workspace");
   CheckDtype(arg_tensormap_workspace, "tensormap_workspace", 1, 8, 1);
   CheckContiguous(arg_tensormap_workspace, "tensormap_workspace");
-  TVM_FFI_CHECK(arg_initial_state_stride_slot >= -9223372036854775808LL && arg_initial_state_stride_slot <= 9223372036854775807LL, ValueError)
-      << "scalar 'initial_state_stride_slot' value " << arg_initial_state_stride_slot
-      << " is outside i64 range [-9223372036854775808, 9223372036854775807]";
-  TVM_FFI_CHECK(arg_output_state_stride_slot >= -9223372036854775808LL && arg_output_state_stride_slot <= 9223372036854775807LL, ValueError)
-      << "scalar 'output_state_stride_slot' value " << arg_output_state_stride_slot
-      << " is outside i64 range [-9223372036854775808, 9223372036854775807]";
   TVM_FFI_CHECK(arg_checkpoint_every_n_tokens >= -2147483648LL && arg_checkpoint_every_n_tokens <= 2147483647LL, ValueError)
       << "scalar 'checkpoint_every_n_tokens' value " << arg_checkpoint_every_n_tokens
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -385,6 +460,40 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   TVM_FFI_CHECK(arg_total_tiles >= -2147483648LL && arg_total_tiles <= 2147483647LL, ValueError)
       << "scalar 'total_tiles' value " << arg_total_tiles
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_num_seqs > 0 && arg_num_q_heads == 2LL && arg_num_v_heads == 4LL, ValueError)
+      << "prefill sequence/head counts do not match the selected Cake variant";
+  TVM_FFI_CHECK(arg_total_tiles == arg_num_seqs * 8LL, ValueError)
+      << "prefill total_tiles does not match num_seqs and the selected physical route";
+  TVM_FFI_CHECK(grid_y == 1 && grid_z == 1 && grid_x <= arg_total_tiles, ValueError)
+      << "prefill launch grid does not match the selected persistent route";
+  TVM_FFI_CHECK(arg_Q.ndim() == 3 && arg_Q.size(0) > 0 && arg_Q.size(1) == 2 && arg_Q.size(2) == 128LL, ValueError)
+      << "Q shape does not match [tokens,Hq,128]";
+  TVM_FFI_CHECK(arg_K.ndim() == 3 && arg_K.size(0) == arg_Q.size(0) && arg_K.size(1) == 2 && arg_K.size(2) == 128LL, ValueError)
+      << "K shape does not match [tokens,min(Hq,Hv),128]";
+  TVM_FFI_CHECK(arg_V.ndim() == 3 && arg_V.size(0) == arg_Q.size(0) && arg_V.size(1) == 4 && arg_V.size(2) == 128LL, ValueError)
+      << "V shape does not match [tokens,Hv,128]";
+  TVM_FFI_CHECK(arg_O.ndim() == 3 && arg_O.size(0) == arg_Q.size(0) && arg_O.size(1) == 4 && arg_O.size(2) == 128LL, ValueError)
+      << "O shape does not match [tokens,max(Hq,Hv),128]";
+  TVM_FFI_CHECK(arg_gate.ndim() == 2 && arg_gate.size(0) == arg_Q.size(0) && arg_gate.size(1) == 4, ValueError)
+      << "gate shape does not match [tokens,max(Hq,Hv)]";
+  TVM_FFI_CHECK(arg_beta.ndim() == 2 && arg_beta.size(0) == arg_Q.size(0) && arg_beta.size(1) == 4, ValueError)
+      << "beta shape does not match [tokens,max(Hq,Hv)]";
+  TVM_FFI_CHECK(arg_cu_seqlens.ndim() == 1 && arg_cu_seqlens.size(0) == arg_num_seqs + 1, ValueError)
+      << "cu_seqlens must contain num_seqs+1 entries";
+  TVM_FFI_CHECK(arg_tensormap_workspace.ndim() == 1 && arg_tensormap_workspace.numel() >= grid_x * 512LL, ValueError)
+      << "tensormap_workspace is too small for the launch grid";
+  TVM_FFI_CHECK(arg_state_indices.numel() >= 1, ValueError)
+      << "state_indices dummy buffer is empty";
+  TVM_FFI_CHECK(arg_initial_state.numel() >= 1, ValueError)
+      << "initial_state dummy buffer is empty";
+  TVM_FFI_CHECK(arg_output_state.ndim() == 4 && arg_output_state.size(0) == arg_num_seqs && arg_output_state.size(1) == 4 && arg_output_state.size(2) == 128LL && arg_output_state.size(3) == 128LL, ValueError)
+      << "output_state shape does not match the selected state-pool contract";
+  TVM_FFI_CHECK(arg_output_state.stride(3) == 1 && arg_output_state.stride(2) == 128LL && arg_output_state.stride(1) == 16384LL && arg_output_state_stride_slot == arg_output_state.stride(0) && arg_output_state_stride_slot >= 65536LL, ValueError)
+      << "output_state inner layout or slot stride is invalid";
+  TVM_FFI_CHECK(arg_checkpoint_every_n_tokens == 0, ValueError)
+      << "checkpoint interval must be zero for a non-checkpoint variant";
+  TVM_FFI_CHECK(arg_checkpoint_state.numel() >= 1 && arg_cu_checkpoints.numel() >= 1, ValueError)
+      << "checkpoint dummy buffers must be nonempty";
   CheckSameCudaDevice(arg_K, arg_Q, "K", "Q");
   CheckSameCudaDevice(arg_V, arg_Q, "V", "Q");
   CheckSameCudaDevice(arg_O, arg_Q, "O", "Q");
@@ -399,6 +508,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   CheckSameCudaDevice(arg_tensormap_workspace, arg_Q, "tensormap_workspace", "Q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+  TVM_FFI_CHECK(grid_x <= 4294967295LL && grid_y <= 4294967295LL && grid_z <= 4294967295LL, ValueError)
+      << "launch grid dimensions exceed uint32 range: (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
 
   DLDevice dev = arg_Q.device();

@@ -90,6 +90,44 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
   }
 }
 
+template <int Rank>
+struct TmaDescriptorCache {
+  std::mutex mu;
+  bool valid = false;
+  void* data = nullptr;
+  uint64_t global_dim[Rank] = {};
+  uint64_t global_strides[Rank - 1] = {};
+  CUtensorMap descriptor{};
+
+  bool Lookup(
+      void* candidate_data,
+      const uint64_t (&candidate_dim)[Rank],
+      const uint64_t (&candidate_strides)[Rank - 1],
+      CUtensorMap* result) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!valid || data != candidate_data ||
+        std::memcmp(global_dim, candidate_dim, sizeof(global_dim)) != 0 ||
+        std::memcmp(global_strides, candidate_strides, sizeof(global_strides)) != 0) {
+      return false;
+    }
+    *result = descriptor;
+    return true;
+  }
+
+  void Store(
+      void* candidate_data,
+      const uint64_t (&candidate_dim)[Rank],
+      const uint64_t (&candidate_strides)[Rank - 1],
+      const CUtensorMap& candidate_descriptor) {
+    std::lock_guard<std::mutex> lock(mu);
+    data = candidate_data;
+    std::memcpy(global_dim, candidate_dim, sizeof(global_dim));
+    std::memcpy(global_strides, candidate_strides, sizeof(global_strides));
+    descriptor = candidate_descriptor;
+    valid = true;
+  }
+};
+
 void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_state, TensorView arg_A_log, TensorView arg_a, TensorView arg_dt_bias, TensorView arg_b, TensorView arg_out, TensorView arg_intermediate_state, TensorView arg_initial_state_indices, TensorView arg_output_state_indices, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_q, "q");
   CheckDtype(arg_q, "q", 4, 16, 1);
@@ -145,6 +183,26 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_st
   CheckCudaTensor(arg_output_state_indices, "output_state_indices");
   CheckDtype(arg_output_state_indices, "output_state_indices", 0, 32, 1);
   CheckContiguous(arg_output_state_indices, "output_state_indices");
+  TVM_FFI_CHECK(arg_q.ndim() == 4 && arg_q.size(0) == arg_q.size(0) && arg_q.size(1) == 1LL && arg_q.size(2) == 4LL && arg_q.size(3) == 128LL, ValueError)
+      << "q shape does not match the frozen Cake GDN launch contract";
+  TVM_FFI_CHECK(arg_k.ndim() == 4 && arg_k.size(0) == arg_q.size(0) && arg_k.size(1) == 1LL && arg_k.size(2) == 4LL && arg_k.size(3) == 128LL, ValueError)
+      << "k shape does not match the frozen Cake GDN launch contract";
+  TVM_FFI_CHECK(arg_v.ndim() == 4 && arg_v.size(0) == arg_q.size(0) && arg_v.size(1) == 1LL && arg_v.size(2) == 8LL && arg_v.size(3) == 128LL, ValueError)
+      << "v shape does not match the frozen Cake GDN launch contract";
+  TVM_FFI_CHECK(arg_out.ndim() == 4 && arg_out.size(0) == arg_q.size(0) && arg_out.size(1) == 1LL && arg_out.size(2) == 8LL && arg_out.size(3) == 128LL, ValueError)
+      << "out shape does not match the frozen Cake GDN launch contract";
+  TVM_FFI_CHECK(arg_state.ndim() == 4 && arg_state.size(0) > 0 && arg_state.size(1) == 8LL && arg_state.size(2) == 128LL && arg_state.size(3) == 128LL && arg_state.stride(3) == 1 && arg_state.stride(2) == 128LL && arg_state.stride(1) == 16384LL && arg_state.stride(0) >= 131072LL, ValueError)
+      << "BF16 state pool shape or slot stride is invalid";
+  TVM_FFI_CHECK(arg_initial_state_indices.ndim() == 1 && arg_initial_state_indices.size(0) == arg_q.size(0) && arg_output_state_indices.ndim() == 1 && arg_output_state_indices.size(0) == arg_q.size(0), ValueError)
+      << "BF16 decode requires one input/output slot per batch row";
+  TVM_FFI_CHECK(arg_q.size(0) > 0 && grid_y == 1 && grid_z == 1 && grid_x == arg_q.size(0) * 64LL, ValueError)
+      << "BF16 decode grid does not match batch, heads, and tile_v";
+  TVM_FFI_CHECK(arg_intermediate_state.numel() >= 1, ValueError)
+      << "intermediate_state dummy buffer is empty";
+  TVM_FFI_CHECK(arg_A_log.ndim() == 1 && arg_A_log.size(0) == 8LL && arg_dt_bias.ndim() == 1 && arg_dt_bias.size(0) == 8LL, ValueError)
+      << "A_log/dt_bias shapes do not match num_v_heads";
+  TVM_FFI_CHECK(arg_a.ndim() >= 1 && arg_a.numel() >= arg_q.size(0) * 8LL && arg_b.ndim() >= 1 && arg_b.numel() >= arg_q.size(0) * 8LL, ValueError)
+      << "decode gate buffers are too small for the batch and value heads";
   CheckSameCudaDevice(arg_k, arg_q, "k", "q");
   CheckSameCudaDevice(arg_v, arg_q, "v", "q");
   CheckSameCudaDevice(arg_state, arg_q, "state", "q");
@@ -158,6 +216,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_st
   CheckSameCudaDevice(arg_output_state_indices, arg_q, "output_state_indices", "q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+  TVM_FFI_CHECK(grid_x <= 4294967295LL && grid_y <= 4294967295LL && grid_z <= 4294967295LL, ValueError)
+      << "launch grid dimensions exceed uint32 range: (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
 
   DLDevice dev = arg_q.device();

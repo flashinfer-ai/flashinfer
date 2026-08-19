@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "77e1417829203006c2c19a93a5c5917281058f69fa3b325ddd29bca3ea99d62e"
-_GENERATOR_COMMIT = "78e460e9d92759bb568c75aae4e6601ea4f425d4"
+_MANIFEST_SHA256 = "07ea3de3d67ab86e42813e087ed85b2cf91cf2143fd46c783a40c3c0e7f26b49"
+_GENERATOR_COMMIT = "264cbfe05a0aaad5c5fd630c7eeeecb43b9e4723"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -198,7 +198,9 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     """Compile and load one checksum-verified Cake GDN host entrypoint."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
-        raise ValueError(f"unsupported Cake GDN architecture: {arch!r}")
+        raise CakeGDNUnsupportedError(
+            f"unsupported Cake GDN architecture: {arch!r}"
+        )
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
     host = record["host_binding"]
@@ -358,8 +360,6 @@ def select_cake_gdn_prefill_variant(
         min_heads <= 0
         or num_k_heads != min_heads
         or num_o_heads % min_heads
-        or _power_of_two_log2(num_o_heads // min_heads) < 0
-        or _power_of_two_log2(num_o_heads) < 0
     ):
         raise CakeGDNUnsupportedError("unsupported GDN head mapping")
     if (

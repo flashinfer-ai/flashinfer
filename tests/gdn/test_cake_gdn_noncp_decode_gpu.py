@@ -244,9 +244,41 @@ def _load_prefill():
     return route, cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
 
 
-def _launch_prefill(entry, tensors: dict[str, torch.Tensor]) -> None:
+def test_exported_dynamic_non_power_of_two_prefill_host_contract_compiles() -> None:
+    route = cake_gdn.select_cake_gdn_prefill_variant(
+        arch=_arch(),
+        io_dtype="float16",
+        state_dtype="float32",
+        num_seqs=1,
+        total_seq_len=64,
+        max_seq_len=64,
+        num_q_heads=3,
+        num_k_heads=3,
+        num_v_heads=3,
+        use_initial_state=False,
+        store_final_state=True,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+    )
+
+    assert route.route_id == "cake.gdn_prefill.noncp.dvsplit"
+    cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
+
+
+def _launch_prefill(
+    entry,
+    tensors: dict[str, torch.Tensor],
+    *,
+    num_v_heads: int = 8,
+    tensormap_workspace: torch.Tensor | None = None,
+) -> None:
     total_tiles = 4 * 8 * 2
     grid_x = total_tiles
+    workspace = (
+        tensors["tensormap_workspace"]
+        if tensormap_workspace is None
+        else tensormap_workspace
+    )
     entry(
         tensors["q"],
         tensors["k"],
@@ -260,14 +292,14 @@ def _launch_prefill(entry, tensors: dict[str, torch.Tensor]) -> None:
         tensors["empty_state"],
         tensors["empty_state"],
         tensors["empty_i32"],
-        tensors["tensormap_workspace"],
+        workspace,
         8 * _HEAD_SIZE * _HEAD_SIZE,
         8 * _HEAD_SIZE * _HEAD_SIZE,
         0,
         _SCALE,
         4,
         4,
-        8,
+        num_v_heads,
         total_tiles,
         grid_x,
         1,
@@ -275,22 +307,54 @@ def _launch_prefill(entry, tensors: dict[str, torch.Tensor]) -> None:
     )
 
 
-def _launch(entry, tensors: dict[str, torch.Tensor], batch_size: int) -> None:
+def _launch(
+    entry,
+    tensors: dict[str, torch.Tensor],
+    batch_size: int,
+    *,
+    state: torch.Tensor | None = None,
+    grid_x: int | None = None,
+) -> None:
     blocks_per_state = 8 if batch_size < 32 else 1
     entry(
         tensors["q"],
         tensors["k"],
         tensors["v"],
-        tensors["state"],
+        state if state is not None else tensors["state"],
         tensors["A_log"],
         tensors["a"],
         tensors["dt_bias"],
         tensors["b"],
         tensors["out"],
-        batch_size * 32 * blocks_per_state,
+        grid_x if grid_x is not None else batch_size * 32 * blocks_per_state,
         1,
         1,
     )
+
+
+def test_exported_prefill_raw_abi_rejects_metadata_mismatch() -> None:
+    tensors = _make_prefill_inputs()
+    _, entry = _load_prefill()
+
+    with pytest.raises(ValueError, match="sequence/head counts"):
+        _launch_prefill(entry, tensors, num_v_heads=4)
+    with pytest.raises(ValueError, match="tensormap_workspace is too small"):
+        _launch_prefill(
+            entry,
+            tensors,
+            tensormap_workspace=tensors["tensormap_workspace"][:1],
+        )
+
+
+def test_exported_decode_raw_abi_rejects_shape_and_grid_mismatch() -> None:
+    batch_size = 1
+    tensors = _make_inputs(batch_size)
+    _, entry = _load(batch_size)
+
+    with pytest.raises(ValueError, match="state shape"):
+        _launch(entry, tensors, batch_size, state=tensors["state"][:0])
+    with pytest.raises(ValueError, match="decode grid"):
+        _launch(entry, tensors, batch_size, grid_x=255)
 
 
 def _make_bf16_serving_inputs(
