@@ -26,6 +26,7 @@ from flashinfer.kda_decode import recurrent_kda
 
 kda_decode_module = importlib.import_module("flashinfer.kda_decode")
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
+cake_decode_jit_module = importlib.import_module("flashinfer.jit.cake_kda_decode")
 
 _D = 128
 _T = 5
@@ -408,6 +409,48 @@ def test_sm103a_split_policy_has_an_independent_retuning_hook(monkeypatch):
         recurrent_module._select_flash_kda_decode_value_split(5, 256, 160, "sm100a")
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("work", "sm_count", "expected_split"),
+    [
+        (1, 148, 16),
+        (4 * 148, 148, 16),
+        (4 * 148 + 1, 148, 8),
+        (8 * 148 - 1, 148, 8),
+        (8 * 148, 148, 4),
+        (32 * 128, 148, 4),
+        (4 * 128, 148, 16),
+        (4 * 136, 148, 16),
+        (4 * 152, 152, 16),
+        (4 * 152 + 1, 152, 8),
+        (8 * 152 - 1, 152, 8),
+        (8 * 152, 152, 4),
+    ],
+)
+def test_cake_unbounded_softplus_t1_split_boundaries(
+    work, sm_count, expected_split
+):
+    assert (
+        recurrent_module._select_cake_kda_unbounded_softplus_t1_value_split(
+            work, sm_count
+        )
+        == expected_split
+    )
+
+
+def test_cake_unbounded_direct_variants_use_exact_warp_launch_geometry():
+    expected = {
+        "d128_t1_unbounded_softplus_direct_split4",
+        "d128_t1_unbounded_softplus_direct_split8",
+        "d128_t1_unbounded_softplus_direct_split16",
+    }
+    assert set(cake_decode_jit_module.CAKE_KDA_DECODE_DIRECT_VARIANTS) == expected
+    assert set(cake_decode_jit_module.CAKE_KDA_DECODE_VARIANTS) == expected
+    assert {
+        metadata.launch_threads
+        for metadata in cake_decode_jit_module.CAKE_KDA_DECODE_VARIANT_METADATA.values()
+    } == {32}
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -893,6 +936,12 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
 @pytest.mark.parametrize(
     ("cc", "cuda_version", "variant", "expected_target"),
     [
+        (
+            (10, 0),
+            "12.8",
+            "d128_t1_unbounded_softplus_direct_split4",
+            "sm100a",
+        ),
         (
             (10, 0),
             "12.8",

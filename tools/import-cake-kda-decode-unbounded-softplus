@@ -57,6 +57,14 @@ class Variant:
 
 
 VARIANTS = {
+    "split4": Variant(
+        split=4,
+        raw_sha256="f69246cbfd204a8d89cfea30c91594ed4734fdcee1f8127a3b6cc8f06d858a16",
+        normalized_sha256="651d702e191a00b2bb12306e533212d560cb72551b7a8cf34b48d67259335579",
+        raw_bytes=13297,
+        module_ident="flashinfer_recurrent_kda_t1_unbounded_softplus_f8e5172021",
+        frozen_filename="cake_kda_decode_d128_t1_unbounded_softplus_direct_split4.cu",
+    ),
     "split8": Variant(
         split=8,
         raw_sha256="0cd542dd0e6327d89d00a2fd835cbdf657bf2c2d67caf9d58df5bcc8f194c6e8",
@@ -76,6 +84,20 @@ VARIANTS = {
 }
 
 PROFILES = {
+    "sm100_split4": {
+        "arch": "sm_100a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm100",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm100.json",
+        "profile_sha256": "66ca59276b49c9be6aed6ed4cec436353292d718304e31395a2689a7a3e93b32",
+        "variant": "split4",
+    },
+    "sm103_split4": {
+        "arch": "sm_103a",
+        "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm103",
+        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm103.json",
+        "profile_sha256": "a17799b9cb65ebfff23f453414e5770ceac2451d4e63b2478dccc32f2434c8bb",
+        "variant": "split4",
+    },
     "sm100_split8": {
         "arch": "sm_100a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm100",
@@ -233,7 +255,7 @@ def _write_or_check(path: Path, expected: bytes, check: bool) -> bool:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for arch in ("sm100", "sm103"):
-        for split in (8, 16):
+        for split in (4, 8, 16):
             parser.add_argument(
                 f"--{arch}-split{split}-source", type=Path, required=True
             )
@@ -259,12 +281,12 @@ def main() -> int:
         profile_path = getattr(args, f"{arch_key}_split{variant.split}_profile")
         _verify_profile(profile_path, profile, variant)
         raw[profile_key] = _read_verified(source_path, variant, profile["arch"])
-    for split in (8, 16):
+    for split in (4, 8, 16):
         if raw[f"sm100_split{split}"] != raw[f"sm103_split{split}"]:
             raise ValueError(f"split{split} SM100 and SM103 source text differs")
     frozen = {
         f"split{split}": _freeze(raw[f"sm100_split{split}"], VARIANTS[f"split{split}"])
-        for split in (8, 16)
+        for split in (4, 8, 16)
     }
     outputs = {
         args.output_dir / variant.frozen_filename: frozen[key]

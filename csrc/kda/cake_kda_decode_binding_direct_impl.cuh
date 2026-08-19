@@ -42,7 +42,8 @@ static_assert(THREADS == 32);
 static_assert(CAKE_KDA_DECODE_HEAD_DIM == 128);
 static_assert(CAKE_KDA_DECODE_TOKENS == 1);
 static_assert(CAKE_KDA_DECODE_GATE_KIND == 0 || CAKE_KDA_DECODE_GATE_KIND == 2);
-static_assert(CAKE_KDA_DECODE_VALUE_SPLIT == 8 || CAKE_KDA_DECODE_VALUE_SPLIT == 16);
+static_assert(CAKE_KDA_DECODE_VALUE_SPLIT == 4 || CAKE_KDA_DECODE_VALUE_SPLIT == 8 ||
+              CAKE_KDA_DECODE_VALUE_SPLIT == 16);
 static_assert(CAKE_KDA_DECODE_LAUNCH_THREADS == THREADS);
 
 void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta, TensorView A_log,
