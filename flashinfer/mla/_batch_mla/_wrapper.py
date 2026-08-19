@@ -702,6 +702,67 @@ class BatchMLAPagedAttentionWrapper:
         resolves to FA2 or FA3 restricts later graph-mode replans to that same
         concrete backend and does not fall through to another backend.
 
+        Parameters
+        ----------
+        qo_indptr : Optional[torch.Tensor]
+            Deprecated flat CSR query indptr.
+        kv_indptr : Optional[torch.Tensor]
+            Deprecated flat CSR KV indptr.
+        kv_indices : Optional[torch.Tensor]
+            Deprecated flat CSR page indices.
+        kv_len_arr : Optional[torch.Tensor]
+            Deprecated flat CSR per-request KV lengths.
+        num_heads : Optional[int]
+            Number of query heads.
+        head_dim_ckv : Optional[int]
+            Compressed-KV feature width.
+        head_dim_kpe : Optional[int]
+            RoPE feature width.
+        page_size : Optional[int]
+            Number of KV tokens in each cache page.
+        causal : Optional[bool]
+            Whether the planned attention is causal.
+        sm_scale : Optional[float]
+            Softmax scale captured by the plan.
+        q_data_type : Optional[torch.dtype]
+            Query dtype supported by the planned backend.
+        kv_data_type : Optional[torch.dtype]
+            KV-cache dtype supported by the planned backend.
+        use_profiler : bool
+            Whether to enable backend profiler support.
+        metadata : Optional[MLAPlanMetadata]
+            Preferred canonical CSR, dense, or dual planning metadata.
+        cum_seq_lens_q : Optional[torch.Tensor]
+            Deprecated flat dense query offsets.
+        block_tables : Optional[torch.Tensor]
+            Deprecated flat dense page table.
+        seq_lens : Optional[torch.Tensor]
+            Deprecated flat dense per-request KV lengths.
+        max_q_len : Optional[int]
+            Maximum query length for dense metadata; inferred when omitted.
+        qk_nope_head_dim : Optional[int]
+            Optional non-RoPE query-key width required by TRTLLM-GEN.
+        enable_pdl : Optional[bool]
+            Whether supported backends enable programmatic dependent launch.
+        is_var_seq : Optional[bool]
+            Whether planned KV sequence lengths vary across requests.
+        use_sinks : bool
+            Whether the plan must support attention sinks.
+        lse_mode : {"none", "base2", "basee"}
+            Required log-sum-exp output mode.
+        query_layout : Optional[{"packed", "split"}]
+            Query representation accepted by subsequent ``run()`` calls.
+        kv_cache_layout : Optional[{"packed", "split"}]
+            KV-cache representation accepted by subsequent ``run()`` calls.
+        output_dtype : Optional[torch.dtype]
+            Required output dtype; defaults to the query dtype.
+        output_scale : {"none", "per-tensor"}
+            Required output scaling mode.
+        scale_mode : {"default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"}
+            Required runtime scaling contract.
+        skip_softmax : bool
+            Whether the plan must support the skip-softmax threshold feature.
+
         Deprecated
         ----------
         Flat CSR and dense metadata arguments are deprecated. New code should
@@ -884,7 +945,7 @@ class BatchMLAPagedAttentionWrapper:
         # completed successfully. A failed replan leaves prior state live.
         self._publish_auto_plan(plan_args, result)
 
-    # Output-only form –– ``return_lse=False`` returns the output tensor.
+    # Output-only form -- ``return_lse=False`` returns the output tensor.
     # Preferred form.
     @overload
     def run(
@@ -1088,6 +1149,12 @@ class BatchMLAPagedAttentionWrapper:
 
         Parameters
         ----------
+        query : Optional[torch.Tensor or tuple[torch.Tensor, torch.Tensor]]
+            Packed query tensor or split no-PE/PE query tensor pair, matching
+            the representation declared by ``plan()``.
+        kv_cache : Optional[torch.Tensor or tuple[torch.Tensor, torch.Tensor]]
+            Packed KV cache or split compressed-KV/RoPE cache tensor pair,
+            matching the representation declared by ``plan()``.
         q_nope : Optional[torch.Tensor]
             The query tensor without rope, shape:
             ``[batch_size, num_heads, head_dim_ckv]``.
@@ -1146,6 +1213,9 @@ class BatchMLAPagedAttentionWrapper:
             Per-head float32 attention sinks. For the CuTe DSL family, sinks
             must be planned with ``use_sinks=True`` and use
             ``backend="cute-dsl"`` or ``backend="cute-dsl-modular"``.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            Runtime threshold scale for plans created with
+            ``skip_softmax=True``. Unsupported backends reject the option.
         bmm1_scale : Optional[float]
             Finite run-time attention-logit scale override for CuTe DSL or
             XQA. If omitted, the ``sm_scale`` captured by ``plan()`` is used.

@@ -271,7 +271,7 @@ def test_cuda_graph_dense_backend_supports_first_plan_but_rejects_replan(
     wrapper.plan(**args)
     assert wrapper._backend_impl is backend
 
-    with pytest.raises(ValueError, match="CUDA graph.*replan"):
+    with pytest.raises(ValueError, match=r"CUDA graph.*replan"):
         # The guard must run before argument validation or metadata conversion.
         wrapper.plan(cum_seq_lens_q=object())
 

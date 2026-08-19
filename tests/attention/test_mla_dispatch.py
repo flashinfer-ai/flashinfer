@@ -23,6 +23,7 @@ from flashinfer.mla._batch_mla._contracts import (
     _packed_mla_tensor_reference,
 )
 from flashinfer.mla._batch_mla._planning import _MLAPlanArguments
+from flashinfer.mla import _sparse_mla_sm120
 
 
 def _plan_kwargs():
@@ -142,6 +143,88 @@ def test_fa3_cpu_plan_is_typed_unsupported():
             q_data_type=torch.float16,
             kv_data_type=torch.float16,
             use_profiler=False,
+        )
+
+
+def test_trtllm_gen_query_offsets_must_start_at_zero():
+    with pytest.raises(_BackendPlanUnsupportedError, match="start at zero"):
+        trtllm_gen_backend._get_q_layout(torch.tensor([1, 2], dtype=torch.int32))
+
+
+def test_xqa_cpu_architecture_probe_is_unsupported():
+    assert not xqa_backend._is_xqa_wrapper_arch_supported(torch.device("cpu"))
+
+
+def _plan_xqa_backend(workspace: torch.Tensor, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        xqa_backend, "_is_xqa_wrapper_arch_supported", lambda _device: True
+    )
+    backend = xqa_backend._BatchMLAPagedAttentionXqaBackend(workspace)
+    backend.plan(
+        cum_seq_lens_q=None,
+        block_tables=torch.zeros((1, 8), dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        max_q_len=1,
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=16,
+        causal=False,
+        sm_scale=1.0,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        use_profiler=False,
+        enable_pdl=False,
+        initialize_semaphore=False,
+    )
+
+
+def test_xqa_plan_rejects_noncontiguous_workspace_before_byte_view(monkeypatch):
+    workspace = torch.empty((4, 4), dtype=torch.float32).t()
+    assert not workspace.is_contiguous()
+
+    with pytest.raises(ValueError, match="workspace buffer must be contiguous"):
+        _plan_xqa_backend(workspace, monkeypatch)
+
+
+def test_xqa_plan_always_validates_workspace_capacity(monkeypatch):
+    with pytest.raises(_BackendPlanUnsupportedError, match="at least 128 MiB"):
+        _plan_xqa_backend(torch.empty(1, dtype=torch.float32), monkeypatch)
+
+
+def test_sparse_sm120_rejects_noncontiguous_out_before_launch(monkeypatch):
+    monkeypatch.setattr(_sparse_mla_sm120, "is_sm12x_supported", lambda _device: True)
+    monkeypatch.setattr(
+        _sparse_mla_sm120,
+        "_SparseMLAPagedAttentionRunner",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sparse runner constructed before out validation")
+        ),
+    )
+    out = torch.empty((1, 1, 1, 1024), dtype=torch.bfloat16)[..., ::2]
+    assert tuple(out.shape) == (1, 1, 1, 512)
+    assert not out.is_contiguous()
+
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        _sparse_mla_sm120._run_mla_decode_sparse_sm120(
+            query=torch.empty((1, 1, 1, 576), dtype=torch.bfloat16),
+            kv_cache=torch.empty((1, 1, 656), dtype=torch.uint8),
+            workspace_buffer=torch.empty(1, dtype=torch.uint8),
+            qk_nope_head_dim=512,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=torch.zeros((1, 1, 1), dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            sparse_mla_top_k=1,
+            out=out,
+            bmm1_scale=1.0,
+            bmm2_scale=1.0,
+            sinks=None,
+            skip_softmax_threshold_scale_factor=None,
+            uses_shared_paged_kv_idx=True,
+            lse=None,
+            return_lse=False,
+            kv_scale_format="auto",
         )
 
 
@@ -445,7 +528,7 @@ def test_unplanned_cutlass_requires_runtime_metadata():
 def test_independent_split_to_packed_is_rejected_without_copy():
     left, right = torch.empty(1, 1, 2), torch.empty(1, 1, 3)
 
-    with pytest.raises(ValueError, match="query.*packed representation zero-copy"):
+    with pytest.raises(ValueError, match=r"query.*packed representation zero-copy"):
         _packed_mla_tensor_reference(
             packed=None,
             left=left,
@@ -466,7 +549,7 @@ def test_cutlass_wrapper_rejects_independent_split_kv_without_copy():
     ckv_cache = torch.empty(1, 1, 2)
     kpe_cache = torch.empty(1, 1, 1)
 
-    with pytest.raises(ValueError, match="KV cache.*packed representation zero-copy"):
+    with pytest.raises(ValueError, match=r"KV cache.*packed representation zero-copy"):
         backend.run_from_wrapper(
             query=torch.empty(1, 1, 3),
             kv_cache=(ckv_cache, kpe_cache),

@@ -343,6 +343,8 @@ def _run_mla_decode_sparse_sm120(
         check_shape_dtype_device(
             out, expected_out_shape, torch.bfloat16, query.device, "out"
         )
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous for SM120 sparse MLA")
     out_flat = out.view(query_flat.shape[0], num_heads, _D_V)
 
     flat_lse_shape = (query_flat.shape[0], num_heads)

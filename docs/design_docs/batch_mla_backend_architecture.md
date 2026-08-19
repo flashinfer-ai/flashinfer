@@ -1,5 +1,8 @@
 # Attention Backend Architecture: Batch MLA
 
+**Scope**: Batch MLA public orchestration, planning contracts, backend ownership,
+and the relationship between planned and functional execution paths.
+
 ## Summary
 
 The Batch MLA implementation is the reference architecture for FlashInfer

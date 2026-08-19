@@ -1084,6 +1084,24 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     assert ragged["inputs"]["max_q_len"]["shape"] is None
 
 
+def test_cutlass_mla_trace_rejects_ragged_query():
+    with pytest.raises(NotImplementedError, match="CUTLASS.*ragged"):
+        flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+            query=torch.empty(2, 128, 576, dtype=torch.bfloat16),
+            kv_cache=torch.empty(4, 64, 576, dtype=torch.bfloat16),
+            workspace_buffer=torch.empty(1024, dtype=torch.int8),
+            qk_nope_head_dim=512,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens=torch.full((2,), 64, dtype=torch.int32),
+            max_seq_len=64,
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            max_q_len=1,
+            backend="cutlass",
+        )
+
+
 @pytest.mark.parametrize(
     ("api_name", "fi_api"),
     (

@@ -1165,6 +1165,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Deprecated compatibility alias for Batch MLA attention.
+
+    See :func:`batch_mla_paged_attention` for the parameter and return-value
+    contract.
+    """
     _warn_trtllm_batch_decode_with_kv_cache_mla_once()
     return _batch_mla_paged_attention_impl(
         query=query,
@@ -1200,8 +1205,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
 
-
-trtllm_batch_decode_with_kv_cache_mla.__doc__ = batch_mla_paged_attention.__doc__
 
 _trtllm_batch_decode_with_kv_cache_mla_fi_trace = (
     trtllm_batch_decode_with_kv_cache_mla.fi_trace

@@ -3649,6 +3649,10 @@ def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
             else fa3_batch_decode_mla_trace
         )
     if backend == "cutlass":
+        if has_ragged_query:
+            raise NotImplementedError(
+                "CUTLASS MLA tracing does not support ragged queries"
+            )
         return cutlass_batch_decode_mla_trace
     if sparse_mla_top_k > 0 and has_ragged_query:
         return trtllm_batch_decode_mla_ragged_sparse_trace

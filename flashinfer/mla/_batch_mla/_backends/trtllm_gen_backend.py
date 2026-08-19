@@ -76,6 +76,10 @@ def _get_q_layout(qo_indptr: torch.Tensor) -> tuple[int, int, int, bool, int]:
         )
 
     qo_indptr_host = qo_indptr.to(device="cpu", dtype=torch.int64)
+    if int(qo_indptr_host[0].item()) != 0:
+        raise _BackendPlanUnsupportedError(
+            "trtllm-gen backend expects qo_indptr to start at zero."
+        )
     q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
     if torch.any(q_lens < 0).item():
         raise _BackendPlanUnsupportedError(

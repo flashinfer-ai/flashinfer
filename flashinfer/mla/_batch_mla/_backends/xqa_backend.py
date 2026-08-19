@@ -38,6 +38,8 @@ _XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 
 def _is_xqa_wrapper_arch_supported(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     if not is_sm12x_supported(device):
         return False
     return get_compute_capability(device) in ((12, 0), (12, 1))
@@ -521,10 +523,10 @@ class _BatchMLAPagedAttentionXqaBackend:
                 "XQA MLA wrapper expects enable_pdl to be bool or None, got "
                 f"{enable_pdl!r}."
             )
-        workspace_u8 = self._float_workspace_buffer.view(torch.uint8).flatten()
-        if initialize_semaphore and not self._float_workspace_buffer.is_contiguous():
+        if not self._float_workspace_buffer.is_contiguous():
             raise ValueError("workspace buffer must be contiguous for XQA MLA wrapper.")
-        if initialize_semaphore and workspace_u8.numel() < _XQA_MIN_WORKSPACE_BYTES:
+        workspace_u8 = self._float_workspace_buffer.view(torch.uint8).flatten()
+        if workspace_u8.numel() < _XQA_MIN_WORKSPACE_BYTES:
             raise _BackendPlanUnsupportedError(
                 "XQA MLA wrapper workspace must contain at least 128 MiB, got "
                 f"{workspace_u8.numel()} bytes."

@@ -762,7 +762,7 @@ def test_packed_native_wrapper_rejects_independent_structural_kv_zero_copy():
         head_dim_kpe=1,
     )
 
-    with pytest.raises(ValueError, match="KV cache.*packed representation zero-copy"):
+    with pytest.raises(ValueError, match=r"KV cache.*packed representation zero-copy"):
         wrapper.run(
             query=torch.empty(1, 1, 3),
             kv_cache=(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),

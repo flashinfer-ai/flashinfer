@@ -7,6 +7,7 @@ import torch
 from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_reference
 import flashinfer
 from flashinfer.mla._batch_mla._backends import trtllm_gen_backend
+from flashinfer.mla._batch_mla import _wrapper as mla_wrapper
 from flashinfer.mla import (
     MLAPlanMetadata,
     MLALayerDimensions,
@@ -1482,9 +1483,9 @@ def test_trtllm_batch_decode_mla_preallocated_out(
     def forbid_wrapper_construction(*args, **kwargs):
         raise AssertionError("functional TRTLLM-GEN constructed the planned wrapper")
 
-    monkeypatch.setattr(
-        trtllm_gen_backend,
-        "_BatchMLAPagedAttentionTrtllmGenBackend",
+    monkeypatch.setitem(
+        mla_wrapper._BATCH_MLA_BACKENDS,
+        "trtllm-gen",
         forbid_wrapper_construction,
     )
 
