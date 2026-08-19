@@ -137,7 +137,6 @@ def test_fp8_per_channel_renormalize(
     activation_type,
     cache_permute_indices,
 ):
-    """Dedicated per-channel FP8 coverage for gated and non-gated activations."""
     run_moe_test(
         num_tokens,
         hidden_size,

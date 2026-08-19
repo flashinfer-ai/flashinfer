@@ -83,6 +83,7 @@ from ..tllm_enums import (
     RoutingMethodType,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
+    is_gated_activation,
     trtllm_gen_dtype_has_scale,
 )
 from ..utils import (
@@ -414,34 +415,19 @@ def is_trtllm_moe_supported(
     return True
 
 
-_GATED_ACTIVATION_TYPES = (
-    ActivationType.Swiglu,
-    ActivationType.Geglu,
-    ActivationType.SwigluBias,
-)
-
-
 def _prepare_gemm1_per_channel_scales(
     weight_scale: torch.Tensor,
     gate_weight_scale: torch.Tensor,
     activation_type: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split row-wise dequantization from the scalar FC1 output scale.
-
-    The MetaFP8 cubins apply the two FP32 row-scale operands before the activation, while
-    ``ScaleC`` applies the output quantization factor and ``ScaleGate``/``ScaleAct`` supplies any
-    remaining pre-activation factor.  The public API keeps the same scale tensors as the
-    per-tensor path: ``weight_scale`` carries ``c_global_sf`` and ``gate_weight_scale`` carries
-    weight dequantization.  Recover the scalar output factor here and pass neutral gate/activation
-    scales so the row-wise factors are applied exactly once.
-    """
-    if ActivationType(activation_type) in _GATED_ACTIVATION_TYPES:
+    """Separate row-wise dequantization from the expert-level output scale."""
+    if is_gated_activation(activation_type):
         output_scale = weight_scale[:, 0] / gate_weight_scale[:, 0]
     else:
         output_scale = weight_scale[:, 0]
     output_scale = output_scale.contiguous()
-    gate_scale = torch.ones_like(output_scale)
-    return gate_weight_scale, output_scale, gate_scale
+    unit_scale = torch.ones_like(output_scale)
+    return gate_weight_scale, output_scale, unit_scale
 
 
 def _maybe_get_cached_w3_w1_permute_indices(
@@ -2148,7 +2134,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     )
                 elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                     # FP8 per-token activation and per-channel weight scales.
-                    gemm1_scale, output1_scale, output1_gate_scale = (
+                    gemm1_scale, output1_scale, unit_scale = (
                         _prepare_gemm1_per_channel_scales(
                             kwargs["gemm1_per_channel_weight_scale"],
                             kwargs["gemm1_per_channel_gate_weight_scale"],
@@ -2165,10 +2151,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         kwargs["gemm1_weights"],
                         gemm1_scale,
                         output1_scale,
-                        output1_gate_scale,
+                        unit_scale,
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_per_channel_weight_scale"],
-                        output1_gate_scale,
+                        unit_scale,
                         output,
                         kwargs["num_experts"],
                         self.top_k,
@@ -3463,12 +3449,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
-        gemm1_scale, output1_scale, output1_gate_scale = (
-            _prepare_gemm1_per_channel_scales(
-                gemm1_per_channel_weight_scale,
-                gemm1_per_channel_gate_weight_scale,
-                activation_type,
-            )
+        gemm1_scale, output1_scale, unit_scale = _prepare_gemm1_per_channel_scales(
+            gemm1_per_channel_weight_scale,
+            gemm1_per_channel_gate_weight_scale,
+            activation_type,
         )
         intermediate_output = moe_op.trtllm_fp8_per_channel_scale_moe(
             routing_logits,
@@ -3480,10 +3464,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             gemm1_weights,
             gemm1_scale,
             output1_scale,
-            output1_gate_scale,
+            unit_scale,
             gemm2_weights,
             gemm2_per_channel_weight_scale,
-            output1_gate_scale,
+            unit_scale,
             output,
             num_experts,
             top_k,

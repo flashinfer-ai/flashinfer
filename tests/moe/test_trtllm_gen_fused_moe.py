@@ -31,7 +31,6 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     BF16Moe,
     FP4Moe,
     FP8BlockScaleMoe,
-    FP8PerChannelMoe,
     FP8PerTensorMoe,
     Fp8QuantizationType,
     MxInt4BlockScaleMoe,
@@ -239,12 +238,7 @@ def test_sigmoid_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [
-                    BF16Moe,
-                    FP8PerTensorMoe,
-                    FP8PerChannelMoe,
-                    FP4Moe,
-                ],
+                "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP4Moe],
                 "compatible_intermediate_size": [2688],
                 "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
@@ -415,11 +409,7 @@ def test_sigmoid_routing(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                ],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
             },
             id="Shuffled_MajorK",
         ),
@@ -652,11 +642,7 @@ def test_topk_routing(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                ],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
             },
             id="Shuffled_MajorK",
         ),
