@@ -432,6 +432,7 @@ class BlockSparseAttentionWrapper:
         o_data_type: Union[str, torch.dtype] = "float16",
         non_blocking: bool = True,
         block_mask: Optional[torch.Tensor] = None,
+        kv_block_lens: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -512,6 +513,10 @@ class BlockSparseAttentionWrapper:
             Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
             and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
+        kv_block_lens : torch.Tensor, optional
+            Number of valid tokens in every KV block, shape ``(NB,)``. Entries
+            must be in ``[1, C]``. Supported by the ``cake`` block-64 route;
+            when omitted, every block is treated as having ``C`` valid tokens.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -554,6 +559,7 @@ class BlockSparseAttentionWrapper:
                 indptr,
                 indices,
                 block_mask,
+                kv_block_lens,
                 M=M,
                 N=N,
                 R=R,

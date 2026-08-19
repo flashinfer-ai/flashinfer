@@ -213,6 +213,7 @@ def plan_cake_vsa(
     indptr: Optional[torch.Tensor],
     indices: Optional[torch.Tensor],
     block_mask: Optional[torch.Tensor],
+    kv_block_lens: Optional[torch.Tensor],
     *,
     M: int,
     N: int,
@@ -230,6 +231,8 @@ def plan_cake_vsa(
     _arch_for_device(device)
     if R != C or R not in (64, 128):
         raise ValueError("Cake VSA supports square 64- or 128-token blocks")
+    if kv_block_lens is not None and R != 64:
+        raise ValueError("kv_block_lens is supported only by Cake blk64")
     if M % R or N % C:
         raise ValueError("M and N must be divisible by the Cake VSA block size")
     if head_dim not in (64, 96, 128):
@@ -269,8 +272,31 @@ def plan_cake_vsa(
     uniform_selected_blocks = bool(torch.all(row_counts == max_selected_blocks).item())
     if min_selected_blocks <= 0:
         raise ValueError("every Cake VSA block row must select at least one block")
+    q2k_indices = q2k_num = planned_kv_block_lens = None
+    if R == 64:
+        q2k_num = row_counts.contiguous()
+        q2k_indices = torch.argsort(
+            dense.to(torch.int8),
+            dim=-1,
+            descending=True,
+            stable=True,
+        ).to(torch.int32).contiguous()
+        if kv_block_lens is None:
+            planned_kv_block_lens = torch.full(
+                (nb,), C, dtype=torch.int32, device=device
+            )
+        else:
+            if tuple(kv_block_lens.shape) != (nb,):
+                raise ValueError("kv_block_lens must have shape [NB]")
+            planned_kv_block_lens = kv_block_lens.to(
+                device=device, dtype=torch.int32
+            ).contiguous()
+            min_block_len = int(planned_kv_block_lens.min().item())
+            max_block_len = int(planned_kv_block_lens.max().item())
+            if min_block_len <= 0 or max_block_len > C:
+                raise ValueError("kv_block_lens entries must be in [1, C]")
     shared_indptr = shared_indices = None
-    if R == 64 or torch.equal(dense, dense[:1].expand_as(dense)):
+    if R != 64 and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(dense, indptr, indices)
     return {
         "M": M,
@@ -290,6 +316,9 @@ def plan_cake_vsa(
         "uniform_selected_blocks": uniform_selected_blocks,
         "indptr": shared_indptr,
         "indices": shared_indices,
+        "q2k_indices": q2k_indices,
+        "q2k_num": q2k_num,
+        "kv_block_lens": planned_kv_block_lens,
         "workspace": {},
     }
 
@@ -454,8 +483,10 @@ def _run_blk64(
             v,
             out,
             stats,
-            plan["indptr"],
-            plan["indices"],
+            plan["q2k_indices"],
+            plan["q2k_num"],
+            plan["kv_block_lens"],
+            plan["q2k_indices"].shape[-1],
             plan["M"],
             plan["mb"],
             total_tiles,
