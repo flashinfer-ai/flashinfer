@@ -20,6 +20,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_context_fp8_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_module,
+    load_cake_fmha_decode_native_fp16_nhd_module,
 )
 from .utils import get_compute_capability
 
@@ -108,7 +109,13 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
 # export remain fail-closed to compat_v1 until that export and binding digest
 # are updated together.
 _AUTHENTICATED_JIT_COMPONENTS = frozenset(
-    {"compat_v1", "context_bf16", "context_fp8", "decode_native_bf16"}
+    {
+        "compat_v1",
+        "context_bf16",
+        "context_fp8",
+        "decode_native_bf16",
+        "decode_native_fp16_nhd",
+    }
 )
 
 
@@ -388,7 +395,15 @@ def get_cake_fmha_decode_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
-    return load_cake_fmha_decode_native_bf16_module(
+    loader = {
+        "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
+        "decode_native_fp16_nhd": load_cake_fmha_decode_native_fp16_nhd_module,
+    }.get(route.component)
+    if loader is None:
+        raise RuntimeError(
+            f"Cake FMHA decode route has no authenticated loader: {route.component}"
+        )
+    return loader(
         route.target,
         route.batch_size,
         route.q_len,
