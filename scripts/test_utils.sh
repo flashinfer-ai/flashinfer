@@ -297,8 +297,10 @@ install_and_verify() {
             pip install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
         fi
 
-        # Install local python sources
-        pip install -e . -v --no-deps
+        # Install local python sources. The env var keeps --no-build-isolation
+        # from activating the build hooks' own downloads (see setup_test_env.sh).
+        FLASHINFER_BUILD_NO_PIP=1 \
+            pip install -e . -v --no-deps --no-build-isolation
         echo ""
 
         # Verify installation

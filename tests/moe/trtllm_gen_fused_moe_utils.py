@@ -2518,6 +2518,25 @@ def routing_reference_sigmoid_renorm(
     return permute_info, scores
 
 
+def routing_reference_topk_sigmoid(expert_logits, top_k, num_experts, padding):
+    """TopK -> Sigmoid routing reference.
+
+    Selection ranks the raw logits; sigmoid is applied only to the survivors.
+    Sigmoid is monotonic, so this picks the same experts as
+    ``routing_reference_sigmoid_renorm(norm_topk_prob=False)`` unless the
+    logits are large enough for sigmoid to saturate to exactly 1.0.
+    """
+    topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
+    topk_values = torch.sigmoid(topk_values.float()).to(expert_logits.dtype)
+
+    scores = torch.zeros_like(expert_logits)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
 def routing_reference_minimax2(
     expert_logits, routing_bias, top_k, num_experts, padding, routed_scaling_factor
 ):
@@ -3793,6 +3812,10 @@ def run_moe_test(
     elif routing_method_type == RoutingMethodType.Sigmoid:
         permute_info, scores = routing_reference_sigmoid_renorm(
             expert_logits, top_k, num_experts, padding, norm_topk_prob=False
+        )
+    elif routing_method_type == RoutingMethodType.TopKSigmoid:
+        permute_info, scores = routing_reference_topk_sigmoid(
+            expert_logits, top_k, num_experts, padding
         )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(

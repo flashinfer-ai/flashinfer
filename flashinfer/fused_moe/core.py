@@ -4207,7 +4207,8 @@ def trtllm_bf16_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -4417,7 +4418,8 @@ def trtllm_bf16_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -4630,7 +4632,8 @@ def trtllm_fp8_per_tensor_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -5182,7 +5185,8 @@ def trtllm_fp8_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``False``).
     weight_layout : int
@@ -5430,7 +5434,8 @@ def trtllm_fp4_block_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -5661,7 +5666,8 @@ def trtllm_fp4_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -5862,7 +5868,8 @@ def trtllm_mxint4_block_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6012,7 +6019,8 @@ def trtllm_mxint4_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to run the finalize stage (default ``True``).
     enable_pdl : Optional[bool]
