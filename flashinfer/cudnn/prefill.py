@@ -80,14 +80,13 @@ def _check_fp8_scale_args(
     k_scale: Optional[torch.Tensor],
     v_scale: Optional[torch.Tensor],
     o_scale: Optional[torch.Tensor],
-    amax_s: Optional[torch.Tensor],
     amax_o: Optional[torch.Tensor],
 ) -> None:
     """Validate the fp8-only scale/amax arguments against the query dtype.
 
     With a non-fp8 query, raises ValueError for an fp8 ``o_data_type`` (a
     non-fp8 graph cannot quantize its output: it produces NaN garbage) and for
-    the fp8-output-only arguments ``o_scale``/``amax_s``/``amax_o``.  The
+    the fp8-output-only arguments ``o_scale``/``amax_o``.  The
     long-standing ``q_scale``/``k_scale``/``v_scale`` arguments only warn:
     they were always silently ignored on non-fp8 graphs and callers pass them
     unconditionally.  With an fp8 query, warns when an fp8 output is requested
@@ -105,7 +104,6 @@ def _check_fp8_scale_args(
             name
             for name, t in (
                 ("o_scale", o_scale),
-                ("amax_s", amax_s),
                 ("amax_o", amax_o),
             )
             if t is not None
@@ -207,7 +205,6 @@ def _sdpa_prefill_key_fn(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
-    return_amax_s: bool = False,
     return_amax_o: bool = False,
 ):
     if actual_seq_lens_q is not None:
@@ -298,11 +295,10 @@ def _sdpa_prefill_key_fn(
         # stale-scale graph for any same-shape call with a different scale.
         scale,
         # o_data_type is baked into the built graph via set_data_type on O,
-        # and return_amax_s/return_amax_o change which amax tensors are graph
-        # outputs; all three must key the cache or a same-shape call would
+        # and return_amax_o changes whether the amax tensor is a graph
+        # output; both must key the cache or a same-shape call would
         # replay a structurally different graph.
         o_data_type if o_data_type is not None else q.dtype,
-        return_amax_s,
         return_amax_o,
     )
     return key
@@ -335,7 +331,6 @@ if CUDNN_AVAILABLE:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         o_data_type: Optional[torch.dtype] = None,
-        return_amax_s: bool = False,
         return_amax_o: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
@@ -682,7 +677,7 @@ if CUDNN_AVAILABLE:
                     ),
                 )
 
-                amax_s.set_uid(UIDs.S_AMAX_UID.value).set_output(return_amax_s).set_dim(
+                amax_s.set_uid(UIDs.S_AMAX_UID.value).set_output(False).set_dim(
                     (1, 1, 1, 1)
                 ).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
                 amax_o.set_uid(UIDs.O_AMAX_UID.value).set_output(return_amax_o).set_dim(
@@ -758,7 +753,6 @@ def _batch_prefill_with_kv_cache(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     o_scale: Optional[torch.Tensor] = None,
-    amax_s: Optional[torch.Tensor] = None,
     amax_o: Optional[torch.Tensor] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
@@ -794,7 +788,6 @@ def _batch_prefill_with_kv_cache(
         out=out,
         lse=lse,
         o_data_type=o_data_type,
-        return_amax_s=amax_s is not None,
         return_amax_o=amax_o is not None,
     )
 
@@ -839,8 +832,8 @@ def _batch_prefill_with_kv_cache(
     # fp8 graphs contain all six scale tensors unconditionally (built from
     # q.dtype in _build_prefill_graph), so binding is keyed on the dtype, not
     # on which scales the caller passed: user tensors when given, the dummy
-    # 1.0 otherwise. The amax UIDs are graph outputs only when requested
-    # (return_amax_s/return_amax_o above).
+    # 1.0 otherwise. The amax_o UID is a graph output only when requested
+    # (return_amax_o above).
     if q.dtype in _FP8_DTYPES:
         dummy_scale_tensor = _get_dummy_scale_tensor(q.device)
         var_map[UIDs.Q_SCALE_UID.value] = (
@@ -857,8 +850,6 @@ def _batch_prefill_with_kv_cache(
         var_map[UIDs.O_SCALE_UID.value] = (
             o_scale if o_scale is not None else dummy_scale_tensor
         )
-        if amax_s is not None:
-            var_map[UIDs.S_AMAX_UID.value] = amax_s
         if amax_o is not None:
             var_map[UIDs.O_AMAX_UID.value] = amax_o
 
@@ -890,7 +881,6 @@ def cudnn_batch_prefill_with_kv_cache(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     o_scale: Optional[torch.Tensor] = None,
-    amax_s: Optional[torch.Tensor] = None,
     amax_o: Optional[torch.Tensor] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
@@ -964,12 +954,6 @@ def cudnn_batch_prefill_with_kv_cache(
         ``o_data_type``; defaults to 1.0 (unit scale, which saturates e4m3 at
         448).  Only valid with an fp8 ``q`` on the cuDNN graph backend (the
         cubin fallback raises ``NotImplementedError``).
-    amax_s : Optional[torch.Tensor]
-        Optional pre-allocated fp32 output buffer, shape ``(1, 1, 1, 1)`` on
-        GPU, written in place with the absolute maximum of the post-softmax
-        matrix (for delayed-scaling recipes).  Only valid with an fp8 ``q`` on
-        the cuDNN graph backend (the cubin fallback raises
-        ``NotImplementedError``).
     amax_o : Optional[torch.Tensor]
         Optional pre-allocated fp32 output buffer, shape ``(1, 1, 1, 1)`` on
         GPU, written in place with the absolute maximum of the output before
@@ -1062,7 +1046,6 @@ def cudnn_batch_prefill_with_kv_cache(
         k_scale,
         v_scale,
         o_scale,
-        amax_s,
         amax_o,
     )
 
@@ -1165,7 +1148,6 @@ def cudnn_batch_prefill_with_kv_cache(
             k_scale=k_scale,
             v_scale=v_scale,
             o_scale=o_scale,
-            amax_s=amax_s,
             amax_o=amax_o,
             out=out,
             lse=lse,
@@ -1235,9 +1217,9 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_stats=batch_offsets_stats,
         )
     else:
-        if o_scale is not None or amax_s is not None or amax_o is not None:
+        if o_scale is not None or amax_o is not None:
             raise NotImplementedError(
-                "o_scale/amax_s/amax_o require the cuDNN graph backend; they "
+                "o_scale/amax_o require the cuDNN graph backend; they "
                 "are not supported by the fallback cubin prefill path"
             )
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:

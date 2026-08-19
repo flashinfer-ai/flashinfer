@@ -523,7 +523,7 @@ def _make_fp8_prefill_inputs(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("paged", [True, False])
 def test_cudnn_prefill_fp8_output_scaling(o_scale_value, causal, paged):
-    """FP8 output path: o_scale quantizes O and amax_s/amax_o are written."""
+    """FP8 output path: o_scale quantizes O and amax_o is written."""
     device = "cuda:0"
     _skip_unless_fp8_prefill_supported(device)
 
@@ -548,14 +548,12 @@ def test_cudnn_prefill_fp8_output_scaling(o_scale_value, causal, paged):
     o_scale = torch.tensor(o_scale_value, device=device, dtype=torch.float32).reshape(
         1, 1, 1, 1
     )
-    amax_s = torch.full((1, 1, 1, 1), -1.0, device=device, dtype=torch.float32)
     amax_o = torch.full((1, 1, 1, 1), -1.0, device=device, dtype=torch.float32)
     out_fp8, _ = cudnn_batch_prefill_with_kv_cache(
         **run_kwargs,
         causal=causal,
         o_data_type=torch.float8_e4m3fn,
         o_scale=o_scale,
-        amax_s=amax_s,
         amax_o=amax_o,
     )
     assert out_fp8.dtype == torch.float8_e4m3fn
@@ -576,8 +574,6 @@ def test_cudnn_prefill_fp8_output_scaling(o_scale_value, causal, paged):
         atol=1e-3,
         rtol=5e-2,
     )
-    # amax_s is the absolute maximum of the post-softmax matrix, in (0, 1].
-    assert 0.0 < amax_s.item() <= 1.0 + 1e-3
 
 
 def test_cudnn_prefill_fp8_output_scale_prevents_saturation():
@@ -644,7 +640,7 @@ def test_cudnn_prefill_fp8_output_scale_prevents_saturation():
 def test_cudnn_prefill_fp8_args_rejected_on_non_fp8():
     """fp8-output arguments raise for non-fp8 q; q/k/v_scale only warn.
 
-    ``o_scale``/``amax_s``/``amax_o`` (and an fp8 ``o_data_type``) are new and
+    ``o_scale``/``amax_o`` (and an fp8 ``o_data_type``) are new and
     meaningless on a non-fp8 graph, so they hard-fail.  The long-standing
     ``q_scale``/``k_scale``/``v_scale`` arguments were always silently ignored
     on non-fp8 graphs and callers pass them unconditionally, so they must keep
@@ -672,7 +668,7 @@ def test_cudnn_prefill_fp8_args_rejected_on_non_fp8():
         return_lse=False,
     )
 
-    for name in ("o_scale", "amax_s", "amax_o"):
+    for name in ("o_scale", "amax_o"):
         with pytest.raises(ValueError, match="fp8 query dtype"):
             cudnn_batch_prefill_with_kv_cache(
                 q, k_cache, v_cache, **run_kwargs, **{name: scale_tensor}
@@ -790,7 +786,7 @@ def test_sdpa_prefill_key_fn_discriminates_baked_attributes():
 
 
 def test_cudnn_prefill_fp8_out_args_require_graph_backend():
-    """The cubin fallback cannot honor o_scale/amax_s/amax_o: it must raise
+    """The cubin fallback cannot honor o_scale/amax_o: it must raise
     NotImplementedError instead of silently ignoring them."""
     device = "cuda:0"
     s = 8
