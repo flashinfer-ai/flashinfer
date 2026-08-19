@@ -68,31 +68,25 @@ def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
 
 
 def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> None:
-    manifest_route_counts = cake_api.cake_fmha_manifest()["capability"]["route_counts"]
+    manifest = cake_api.cake_fmha_manifest()
+    manifest_route_counts = manifest["capability"]["route_counts"]
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
     assert cake_api._manifest_optimized_route_accounting() == (1_798, 1_798)
+    for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
+        manifest_components = tuple(
+            dict.fromkeys(
+                item["component"]
+                for item in manifest["routes"][route_name]["components"]
+            )
+        )
+        assert components == manifest_components
     routed_components = {
         component
         for components in cake_api._PRODUCT_ROUTE_COMPONENTS.values()
         for component in components
     }
-    assert routed_components | {"compat_v1"} == {
-        "compat_v1",
-        "context_bf16",
-        "context_fp16_hd256",
-        "context_fp8",
-        "context_fp8_hd256",
-        "context_hd256_support",
-        "context_nvfp4",
-        "decode_native_bf16",
-        "decode_native_fp16_hd512",
-        "decode_native_fp16_nhd",
-        "decode_quant_bf16q",
-        "decode_quant_fp8",
-        "decode_quant_fp8_reduce",
-        "decode_quant_nvfp4",
-    }
+    assert routed_components | {"compat_v1"} == set(manifest["components"])
 
 
 def test_cake_fmha_jit_spec_uses_versioned_standalone_sources(monkeypatch) -> None:

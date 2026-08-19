@@ -85,7 +85,10 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
         "context_fp8_hd256",
     ),
     "ctx_fp8_hnd_hd128_hgpack_48b5_v1": ("context_fp8",),
-    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": ("context_nvfp4",),
+    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": (
+        "context_nvfp4_dequant",
+        "context_fp8",
+    ),
     "decode_native_bf16_v1_bece": ("decode_native_bf16",),
     "decode_native_fp16_hd512_v1_66b1": ("decode_native_fp16_hd512",),
     "decode_native_fp16_nhd_v1_f32d": ("decode_native_fp16_nhd",),
