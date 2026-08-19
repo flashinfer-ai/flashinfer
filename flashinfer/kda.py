@@ -402,9 +402,9 @@ class RecurrentKDAPrefillWrapper:
     """Plan-and-run wrapper for packed recurrent-KDA prefill.
 
     ``plan`` runs outside CUDA Graph capture.  It reads ``cu_seqlens`` on the
-    host, builds a stable descending-length sequence order, and copies both
-    arrays into fixed-address device buffers.  ``run`` consumes those buffers
-    through :func:`recurrent_kda` as an explicit host-planned order.
+    host, builds a stable descending-length sequence order and cumulative chunk
+    prefix, and copies them into fixed-address device buffers.  ``run`` consumes
+    those buffers through :func:`recurrent_kda` as an explicit host plan.
 
     The number of sequences, total token count, and total BT=16 chunk count are
     fixed by the first ``plan`` call so device buffer addresses, workspace
@@ -429,7 +429,6 @@ class RecurrentKDAPrefillWrapper:
         self._cu_seqlens_buf: Optional[torch.Tensor] = None
         self._seq_order_buf: Optional[torch.Tensor] = None
         self._cu_chunks_buf: Optional[torch.Tensor] = None
-        self._chunk_to_seq_buf: Optional[torch.Tensor] = None
         self._num_sequences: Optional[int] = None
         self._total_tokens: Optional[int] = None
         self._total_chunks: Optional[int] = None
@@ -488,10 +487,8 @@ class RecurrentKDAPrefillWrapper:
             for index in range(num_sequences)
         ]
         cu_chunks = [0]
-        chunk_to_seq = []
-        for index, count in enumerate(chunk_counts):
+        for count in chunk_counts:
             cu_chunks.append(cu_chunks[-1] + count)
-            chunk_to_seq.extend([index] * count)
         total_chunks = cu_chunks[-1]
 
         with self._lock:
@@ -505,9 +502,6 @@ class RecurrentKDAPrefillWrapper:
                 )
                 self._cu_chunks_buf = torch.empty(
                     num_sequences + 1, dtype=torch.int32, device=self.device
-                )
-                self._chunk_to_seq_buf = torch.empty(
-                    total_chunks, dtype=torch.int32, device=self.device
                 )
                 self._total_chunks = total_chunks
             elif num_sequences != self._num_sequences:
@@ -529,7 +523,6 @@ class RecurrentKDAPrefillWrapper:
             assert self._cu_seqlens_buf is not None
             assert self._seq_order_buf is not None
             assert self._cu_chunks_buf is not None
-            assert self._chunk_to_seq_buf is not None
             self._cu_seqlens_buf.copy_(cu_seqlens, non_blocking=non_blocking)
             self._seq_order_buf.copy_(
                 torch.tensor(sequence_order, dtype=torch.int32),
@@ -539,12 +532,8 @@ class RecurrentKDAPrefillWrapper:
                 torch.tensor(cu_chunks, dtype=torch.int32),
                 non_blocking=non_blocking,
             )
-            self._chunk_to_seq_buf.copy_(
-                torch.tensor(chunk_to_seq, dtype=torch.int32),
-                non_blocking=non_blocking,
-            )
             self._workspace.__dict__["_cute_dsl_cu_chunks"] = self._cu_chunks_buf
-            self._workspace.__dict__["_cute_dsl_chunk_to_seq"] = self._chunk_to_seq_buf
+            self._workspace.__dict__["_cute_dsl_total_chunks"] = total_chunks
             self._total_tokens = offsets[-1]
 
     def run(

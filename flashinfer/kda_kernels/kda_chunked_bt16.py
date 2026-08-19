@@ -6578,10 +6578,20 @@ def super_mma_stage_qk_prime(
 
 
 @cute.jit
-def chunk_coords(cu_seqlens, cu_chunks, chunk_to_seq, gchunk):
-    """Return (sequence_start, seqlen, chunk_start_tok) for one global chunk."""
+def chunk_coords(cu_seqlens, cu_chunks, gchunk):
+    """Return coordinates for a global chunk using the cumulative chunk prefix."""
 
-    seq = cutlass.Int32(chunk_to_seq[gchunk])
+    # Binary-search the compact [num_sequences + 1] prefix instead of carrying
+    # a redundant dense chunk_to_seq[total_chunks] inverse map.
+    lo = cutlass.Int32(0)
+    hi = cutlass.Int32(cu_chunks.shape[0] - 1)
+    while lo + cutlass.Int32(1) < hi:
+        mid = (lo + hi) // cutlass.Int32(2)
+        if cutlass.Int32(cu_chunks[mid]) <= gchunk:
+            lo = mid
+        else:
+            hi = mid
+    seq = lo
     sequence_start = cutlass.Int32(cu_seqlens[seq])
     seqlen = cutlass.Int32(cu_seqlens[seq + 1]) - sequence_start
     chunk_start_tok = (gchunk - cutlass.Int32(cu_chunks[seq])) * cutlass.Int32(BT)
@@ -6679,7 +6689,6 @@ def host_prep(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
-    chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
     ws_qd: cute.Tensor,
     ws_w: cute.Tensor,
@@ -6724,9 +6733,15 @@ def host_prep(
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     ws_rows = ws_kd.shape[2]
+    # Canonicalize the unused head stride for H=1.  Leaving it proportional to
+    # ws_rows reaches the grid-constant TensorMap launch boundary at 1M tokens,
+    # even though a singleton mode never contributes to an address.
+    ws_head_stride = DK
+    if heads != cutlass.Int32(1):
+        ws_head_stride = DK * ws_rows
     ws_tile_layout = cute.make_layout(
         (DK, ws_rows, heads, 1),
-        stride=(1, DK, DK * ws_rows, DK * ws_rows * heads),
+        stride=(1, DK, ws_head_stride, DK),
     )
     tma_desc_ws_kd = cuda.create_tensor_map_tiled_from_view(
         cute.make_tensor(ws_kd.iterator, ws_tile_layout),
@@ -6764,7 +6779,6 @@ def host_prep(
         beta,
         cu_seqlens,
         cu_chunks,
-        chunk_to_seq,
         ws_kd,
         ws_qd,
         ws_w,
@@ -6812,7 +6826,7 @@ def _lpt_sequence_order(cu_seqlens: torch.Tensor) -> torch.Tensor:
 
 
 def _plan(cu_seqlens: torch.Tensor) -> dict:
-    """Cached chunk plan (cu_chunks / chunk_to_seq device tensors).
+    """Cached cumulative chunk-prefix tensor and host metadata.
 
     Keyed by the cu_seqlens CONTENTS (data_ptr identity is unsafe under
     allocator block reuse — the s27 stale-plan hazard; the read is
@@ -6831,16 +6845,11 @@ def _plan(cu_seqlens: torch.Tensor) -> dict:
         for c in chunks:
             cu_chunks.append(cu_chunks[-1] + c)
         total_chunks = cu_chunks[-1]
-        chunk_to_seq = torch.repeat_interleave(
-            torch.arange(len(chunks), dtype=torch.int32),
-            torch.tensor(chunks, dtype=torch.int64),
-        ).to(device=cu_seqlens.device)
         plan = {
             "total_chunks": total_chunks,
             "cu_chunks": torch.tensor(
                 cu_chunks, dtype=torch.int32, device=cu_seqlens.device
             ),
-            "chunk_to_seq": chunk_to_seq,
             "cu_list": cu_list,
         }
         _PLAN_CACHE[key] = plan
@@ -7032,7 +7041,6 @@ def prefetch_next_chunk(
     raw_beta_smem,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
-    chunk_to_seq: cute.Tensor,
     local_chunk,
     my_chunks,
     gchunk,
@@ -7064,7 +7072,6 @@ def prefetch_next_chunk(
         ) = chunk_coords(
             cu_seqlens,
             cu_chunks,
-            chunk_to_seq,
             next_gchunk,
         )
         tma_prep_stage_load_inputs(
@@ -7634,7 +7641,6 @@ def kernel_prep(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
-    chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
     ws_qd: cute.Tensor,
     ws_w: cute.Tensor,
@@ -7659,7 +7665,7 @@ def kernel_prep(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % THREADS_PER_WARP
 
-    total_chunks = cutlass.Int32(chunk_to_seq.shape[0])
+    total_chunks = cutlass.Int32(ws_qk.shape[2])
     gchunk_stride = cutlass.Int32(1)
     chunk_lo = bidx * chunks_per_cta
     my_chunks = total_chunks - chunk_lo
@@ -7823,7 +7829,6 @@ def kernel_prep(
         sequence_start, seqlen, chunk_start_tok = chunk_coords(
             cu_seqlens,
             cu_chunks,
-            chunk_to_seq,
             gchunk,
         )
         phase = local_chunk % 2
@@ -7929,7 +7934,6 @@ def kernel_prep(
                     raw_beta_smem,
                     cu_seqlens,
                     cu_chunks,
-                    chunk_to_seq,
                     local_chunk,
                     my_chunks,
                     gchunk,
@@ -7983,7 +7987,6 @@ def kernel_prep(
                     raw_beta_smem,
                     cu_seqlens,
                     cu_chunks,
-                    chunk_to_seq,
                     local_chunk,
                     my_chunks,
                     gchunk,
@@ -9288,9 +9291,17 @@ def host_chain_dv2(
     heads = v.shape[2]
     ws_rows = ws_kd.shape[2]
     num_chunks_total = ws_qk.shape[2]
+    # Keep singleton TensorMap modes canonical for the same reason as K1.
+    tile_head_stride = DK
+    diag_head_stride = DIAG_REC_ELEMS
+    qk_head_stride = QK_REC_ELEMS
+    if heads != cutlass.Int32(1):
+        tile_head_stride = DK * ws_rows
+        diag_head_stride = DIAG_REC_ELEMS * num_chunks_total
+        qk_head_stride = QK_REC_ELEMS * num_chunks_total
     tile_layout = cute.make_layout(
         (DK, ws_rows, heads, 1),
-        stride=(1, DK, DK * ws_rows, DK * ws_rows * heads),
+        stride=(1, DK, tile_head_stride, DK),
     )
     v_layout = cute.make_layout(
         (DV, seqlen, heads, 1),
@@ -9301,8 +9312,8 @@ def host_chain_dv2(
         stride=(
             1,
             DIAG_REC_ELEMS,
-            DIAG_REC_ELEMS * num_chunks_total,
-            DIAG_REC_ELEMS * num_chunks_total * heads,
+            diag_head_stride,
+            DIAG_REC_ELEMS,
         ),
     )
     qk_layout = cute.make_layout(
@@ -9310,8 +9321,8 @@ def host_chain_dv2(
         stride=(
             1,
             QK_REC_ELEMS,
-            QK_REC_ELEMS * num_chunks_total,
-            QK_REC_ELEMS * num_chunks_total * heads,
+            qk_head_stride,
+            QK_REC_ELEMS,
         ),
     )
     f16_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
@@ -9414,7 +9425,6 @@ def host_unified(
     seq_order: cute.Tensor,
     state_indices: cute.Tensor | None,
     cu_chunks: cute.Tensor,
-    chunk_to_seq: cute.Tensor,
     ws_kd: cute.Tensor,
     ws_qd: cute.Tensor,
     ws_w: cute.Tensor,
@@ -9475,7 +9485,6 @@ def host_unified(
             beta,
             cu_seqlens,
             cu_chunks,
-            chunk_to_seq,
             ws_kd,
             ws_qd,
             ws_w,
@@ -9554,7 +9563,7 @@ def _unified_fakes(
 
     Independent symbols where lengths are unrelated: cu_chunks (`scu2`) is NOT
     tied to cu_seqlens (`scu`), so the engine route can pass a length-1 dummy;
-    chunk_to_seq / ws_qk / ws_diag share `sc` (chunk count), ws_kd/qd/w use the
+    ws_qk / ws_diag share `sc` (chunk count), while ws_kd/qd/w use the
     16-divisible `sc16` (chunk*BT rows).
     """
     F = make_fake_compact_tensor
@@ -9581,7 +9590,6 @@ def _unified_fakes(
         else None
     )
     fcuc = F(cutlass.Int32, (scu2,), stride_order=(0,), assumed_align=8)
-    fcts = F(cutlass.Int32, (sc,), stride_order=(0,), assumed_align=8)
 
     def ws_tile():
         return F(dtype, (1, sh, sc16, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
@@ -9637,7 +9645,6 @@ def _unified_fakes(
             forder,
             fstate_indices,
             fcuc,
-            fcts,
             fkd,
             fqd,
             fw,
@@ -9672,8 +9679,7 @@ def _engine_dummies(heads: int, device, dtype: type):
             1, heads, 1, DIAG_REC_ELEMS, dtype=torch.float32, device=device
         )
         cuc = torch.zeros(1, dtype=torch.int32, device=device)
-        cts = torch.zeros(1, dtype=torch.int32, device=device)
-        d = (kd, kd, kd, qk, diag, cuc, cts)
+        d = (kd, kd, kd, qk, diag, cuc)
         _ENGINE_DUMMIES[key] = d
     return d
 
@@ -9764,7 +9770,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         ckpt_interval=0,
         seq_order=None,
         planned_cu_chunks=None,
-        planned_chunk_to_seq=None,
+        planned_total_chunks=None,
         state_indices=None,
     ):
         # The state specialization is DERIVED from which state tensors the call
@@ -9811,7 +9817,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 ckpt_interval=ckpt_interval,
                 seq_order=seq_order,
                 planned_cu_chunks=planned_cu_chunks,
-                planned_chunk_to_seq=planned_chunk_to_seq,
+                planned_total_chunks=planned_total_chunks,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -9881,11 +9887,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 "entry per sequence"
             )
         has_planned_chunks = (
-            planned_cu_chunks is not None and planned_chunk_to_seq is not None
+            planned_cu_chunks is not None and planned_total_chunks is not None
         )
-        if (planned_cu_chunks is None) != (planned_chunk_to_seq is None):
+        if (planned_cu_chunks is None) != (planned_total_chunks is None):
             raise ValueError(
-                "planned_cu_chunks and planned_chunk_to_seq must be provided together"
+                "planned_cu_chunks and planned_total_chunks must be provided together"
             )
         cu_list = None
         if (kind == "decomp" and not has_planned_chunks) or (
@@ -9952,7 +9958,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                     f"heads={heads}: the pair-packed beta tile exceeds the SMEM "
                     "stage; supported are heads % 8 == 0 or heads <= 14"
                 )
-            kd, qd, wt, qk, diag, cuc, cts = _engine_dummies(heads, device, dtype)
+            kd, qd, wt, qk, diag, cuc = _engine_dummies(heads, device, dtype)
             unified(
                 q,
                 k,
@@ -9965,7 +9971,6 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 seq_order,
                 state_indices,
                 cuc,
-                cts,
                 kd,
                 qd,
                 wt,
@@ -9998,19 +10003,16 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 or planned_cu_chunks.ndim != 1
                 or not planned_cu_chunks.is_contiguous()
                 or planned_cu_chunks.numel() != n_seq + 1
-                or planned_chunk_to_seq.device != device
-                or planned_chunk_to_seq.dtype != torch.int32
-                or planned_chunk_to_seq.ndim != 1
-                or not planned_chunk_to_seq.is_contiguous()
+                or not isinstance(planned_total_chunks, int)
+                or planned_total_chunks <= 0
             ):
                 raise ValueError(
-                    "planned chunk metadata must be contiguous CUDA int32 "
-                    "cu_chunks[N+1] and chunk_to_seq[total_chunks] tensors"
+                    "planned chunk metadata must be a contiguous CUDA int32 "
+                    "cu_chunks[N+1] tensor and a positive host total_chunks"
                 )
             plan = {
-                "total_chunks": planned_chunk_to_seq.numel(),
+                "total_chunks": planned_total_chunks,
                 "cu_chunks": planned_cu_chunks,
-                "chunk_to_seq": planned_chunk_to_seq,
             }
         else:
             plan = _plan(cu_seqlens)
@@ -10039,7 +10041,6 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             seq_order,
             state_indices,
             plan["cu_chunks"],
-            plan["chunk_to_seq"],
             ws["kd"],
             ws["qd"],
             ws["w"],

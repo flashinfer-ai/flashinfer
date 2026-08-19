@@ -155,30 +155,6 @@ SMALL_BH_CASES = (
     Case("h1_fixed_131072", 1, (131072,), False, 11002),
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
 )
-POLICY_CASES = (
-    tuple(
-        Case(f"h{heads}_fixed8192", heads, (8192,), False, 20000 + heads)
-        for heads in (24, 32, 48)
-    )
-    + tuple(
-        case
-        for heads in (24, 32, 48)
-        for case in (
-            Case(
-                f"h{heads}_mixed",
-                heads,
-                (1300, 547, 2048, 963, 271, 3063),
-                True,
-                21000 + heads,
-            ),
-            Case(f"h{heads}_uniform", heads, (1024,) * 8, True, 22000 + heads),
-        )
-    )
-    + (
-        Case("h64_packed_single", 64, (8192,), True, 23064),
-        Case("h96_packed_single", 96, (8192,), True, 23096),
-    )
-)
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
 
@@ -618,11 +594,11 @@ def main() -> None:
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh", "policy", "sweep"),
+        choices=("all", "legacy", "h12", "small_bh"),
         default="all",
         help=(
-            "Run all standard cases, the original H64/H96 cases, Kimi-K3 TP8 "
-            "H12 cases, fixed-layout small-BH cases, or backend-policy cases."
+            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
+            "cases, or the fixed-layout small-BH cases."
         ),
     )
     parser.add_argument(
@@ -724,8 +700,6 @@ def main() -> None:
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
-        "policy": POLICY_CASES,
-        "sweep": CASES + POLICY_CASES,
     }[args.case_set]
     results = []
     for case in selected_cases:

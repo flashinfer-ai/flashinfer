@@ -48,18 +48,16 @@ def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
     cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
     seq_order_ptr = wrapper._seq_order_buf.data_ptr()
     cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
-    chunk_to_seq_ptr = wrapper._chunk_to_seq_buf.data_ptr()
     assert wrapper._cu_seqlens_buf.dtype == torch.int64
     assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
     assert wrapper._seq_order_buf.tolist() == [1, 3, 0, 2]
     assert wrapper._cu_chunks_buf.tolist() == [0, 0, 1, 1, 2]
-    assert wrapper._chunk_to_seq_buf.tolist() == [1, 3]
+    assert wrapper._workspace._cute_dsl_total_chunks == 2
 
     wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
     assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
     assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
     assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
-    assert wrapper._chunk_to_seq_buf.data_ptr() == chunk_to_seq_ptr
     assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
 
     with pytest.raises(ValueError, match="total token count is fixed"):
@@ -93,7 +91,7 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     assert calls[0]["prefill_workspace"] is wrapper._workspace
     assert calls[0]["backend"] == "cute-dsl"
     assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
-    assert wrapper._workspace._cute_dsl_chunk_to_seq is wrapper._chunk_to_seq_buf
+    assert wrapper._workspace._cute_dsl_total_chunks == 2
 
 
 def _cpu_route_tensors(token_count=2):
@@ -369,7 +367,7 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
         "seq_order": identity_order,
         "state_indices": state_indices,
         "planned_cu_chunks": None,
-        "planned_chunk_to_seq": None,
+        "planned_total_chunks": None,
     }
 
 
@@ -432,12 +430,12 @@ def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
         "state_indices",
         "seq_order",
         "planned_cu_chunks",
-        "planned_chunk_to_seq",
+        "planned_total_chunks",
     )
     assert kwargs["seq_order"] is seq_order
     assert kwargs["state_indices"] is None
     assert kwargs["planned_cu_chunks"] is None
-    assert kwargs["planned_chunk_to_seq"] is None
+    assert kwargs["planned_total_chunks"] is None
 
 
 def test_cute_dsl_lpt_sequence_order_is_content_cached():
@@ -1321,6 +1319,7 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(inputs["q"]),
         output_final_state=True,
+        backend="cake",
     )
 
     assert output.shape == inputs["q"].shape
@@ -1896,6 +1895,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
                 **_strict_prefill_kwargs(inputs),
                 output=small_output,
                 output_final_state=True,
+                backend="cake",
             )
         stream.synchronize()
     else:
@@ -1903,6 +1903,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
             **_strict_prefill_kwargs(inputs),
             output=small_output,
             output_final_state=True,
+            backend="cake",
         )
 
     monkeypatch.setattr(
@@ -1914,6 +1915,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
         **_strict_prefill_kwargs(direct_inputs),
         output=direct_output,
         output_final_state=True,
+        backend="cake",
     )
 
     expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
@@ -1959,6 +1961,7 @@ def test_frozen_small_bh_prefill_cuda_graph_replay_matches_direct_control(
         "output": output,
         "output_final_state": True,
         "prefill_workspace": workspace,
+        "backend": "cake",
     }
 
     with torch.cuda.stream(capture_stream):
@@ -1988,6 +1991,7 @@ def test_frozen_small_bh_prefill_cuda_graph_replay_matches_direct_control(
         **_strict_prefill_kwargs(inputs),
         output=torch.empty_like(output),
         output_final_state=True,
+        backend="cake",
     )
 
     assert workspace._captured

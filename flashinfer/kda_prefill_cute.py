@@ -349,16 +349,18 @@ def _run_cute_dsl_kda_prefill(
         if prefill_workspace is not None
         else None
     )
-    planned_chunk_to_seq = (
-        getattr(prefill_workspace, "_cute_dsl_chunk_to_seq", None)
+    planned_total_chunks = (
+        getattr(prefill_workspace, "_cute_dsl_total_chunks", None)
         if prefill_workspace is not None
         else None
     )
-    if planned_cu_chunks is not None and planned_chunk_to_seq is not None:
+    if (planned_cu_chunks is None) != (planned_total_chunks is None):
+        raise RuntimeError("incomplete CuTe DSL chunk plan on prefill workspace")
+    if planned_cu_chunks is not None:
         workspace_bytes = compiled.workspace_size_from_total_chunks(
             num_sequences,
             q.shape[2],
-            planned_chunk_to_seq.numel(),
+            planned_total_chunks,
             q.device,
         )
     elif cu_seqlens is None:
@@ -409,7 +411,7 @@ def _run_cute_dsl_kda_prefill(
             state_indices=state_indices,
             seq_order=seq_order,
             planned_cu_chunks=planned_cu_chunks,
-            planned_chunk_to_seq=planned_chunk_to_seq,
+            planned_total_chunks=planned_total_chunks,
             **checkpoint_kwargs,
         )
 
