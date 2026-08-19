@@ -23,6 +23,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    _chunk_gated_delta_rule_cake_sm100,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
@@ -44,9 +45,48 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float8_e5m2,
 )
 
+_CAKE_STATE_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+)
+
 
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
+
+
+def _use_cake_cp_sm100(
+    *,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
+) -> bool:
+    """Select Cake for the ratified PR4078 domain and FP32 checkpoints."""
+
+    checkpoint_enabled = checkpoint_every_n_tokens > 0
+    if checkpoint_enabled:
+        if (
+            state_checkpoints is None
+            or state_checkpoints.dtype != torch.float32
+            or checkpoint_cu_starts is None
+            or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or cp_chunk_len not in (None, checkpoint_every_n_tokens)
+        ):
+            return False
+    elif (
+        state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+        or cp_chunk_len is not None
+    ):
+        return False
+    return all(
+        tensor is None or tensor.dtype in _CAKE_STATE_DTYPES
+        for tensor in (initial_state, output_state)
+    )
 
 
 def _cp_delta_rule_rejection_reason(
@@ -60,10 +100,12 @@ def _cp_delta_rule_rejection_reason(
     beta: Optional[torch.Tensor],
     output: torch.Tensor,
     initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
 ) -> Optional[str]:
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
@@ -71,19 +113,23 @@ def _cp_delta_rule_rejection_reason(
     elif arch_major == 10:
         if cuda_major < 13:
             return "CP delta rule SM100 requires CUDA 13 or newer"
-        if cp_delta_rule_dsl_sm100 is None:
+        use_cake = _use_cake_cp_sm100(
+            initial_state=initial_state,
+            output_state=output_state,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            cp_chunk_len=cp_chunk_len,
+        )
+        if use_cake and _chunk_gated_delta_rule_cake_sm100 is None:
+            return "Cake-only CP delta rule SM100 kernel is unavailable"
+        if not use_cake and cp_delta_rule_dsl_sm100 is None:
             return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
-    if (
-        checkpoint_every_n_tokens > 0
-        or state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ) and arch_major not in (9, 10, 12):
-        return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -212,10 +258,13 @@ def chunk_gated_delta_rule(
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use the SM90/SM120 context-parallel DSL implementation when
-        low-parallelism heuristics match. ``"auto"`` enables conservative
-        routing, ``True`` requires CP support, and ``False`` disables CP.
-        Default: ``"auto"``.
+        Whether to use context parallelism when low-parallelism heuristics
+        match. SM100/SM103 uses the Cake-only four-stage implementation for
+        the original CP feature domain and FP32 boundary checkpoints. FP8
+        state/checkpoints and an unrelated explicit private CP chunk length
+        retain the CuTe-DSL implementation.
+        ``"auto"`` enables conservative routing, ``True`` requires CP support,
+        and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
@@ -399,10 +448,12 @@ def chunk_gated_delta_rule(
             beta=beta,
             output=output,
             initial_state=initial_state,
+            output_state=output_state,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             state_indices=state_indices,
+            cp_chunk_len=_cp_chunk_len,
         )
         if cp_rejection_reason is not None:
             if use_cp is True:
@@ -414,12 +465,42 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
+            use_cake_cp = _arch_major == 10 and _use_cake_cp_sm100(
+                initial_state=initial_state,
+                output_state=output_state,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                cp_chunk_len=_cp_chunk_len,
+            )
             if output_final_state and output_state is None:
                 output_state = torch.empty(
                     (num_seqs, num_sab_heads, head_size, head_size),
                     dtype=torch.float32,
                     device=device,
                 )
+            if use_cake_cp:
+                cake_cp = cast(Callable[..., None], _chunk_gated_delta_rule_cake_sm100)
+                cake_cp(
+                    output,
+                    output_state,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu_seqlens,
+                    _scale,
+                    initial_state=initial_state,
+                    state_indices=state_indices,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    output_final_state=output_final_state,
+                )
+                if output_final_state:
+                    return output, output_state
+                return output
             _g = (
                 g
                 if g is not None
