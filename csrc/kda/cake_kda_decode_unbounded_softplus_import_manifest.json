@@ -5,42 +5,42 @@
     "sm100_split16": {
       "arch": "sm_100a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm100",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
       "profile_sha256": "e6db65c328e4718f0600a09fc3d2a20d3bd0fe4efe5360d8e9d93b21566ea0a0",
       "variant": "split16"
     },
     "sm100_split4": {
       "arch": "sm_100a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm100",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm100.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm100.json",
       "profile_sha256": "66ca59276b49c9be6aed6ed4cec436353292d718304e31395a2689a7a3e93b32",
       "variant": "split4"
     },
     "sm100_split8": {
       "arch": "sm_100a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm100",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
       "profile_sha256": "1bfa62c0e038ae87ef92c5d46fad31592665dc9fae2f3110f25d94cb0e3e349b",
       "variant": "split8"
     },
     "sm103_split16": {
       "arch": "sm_103a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm103",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
       "profile_sha256": "8d634512b0c23d61e33b453493956655178127d8edacde5a55bd33ce71263800",
       "variant": "split16"
     },
     "sm103_split4": {
       "arch": "sm_103a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm103",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm103.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm103.json",
       "profile_sha256": "a17799b9cb65ebfff23f453414e5770ceac2451d4e63b2478dccc32f2434c8bb",
       "variant": "split4"
     },
     "sm103_split8": {
       "arch": "sm_103a",
       "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm103",
-      "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
+      "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
       "profile_sha256": "9428d8e139a9792a84944a6f04593729f45a37fb6614361f7d80596d60f9f45e",
       "variant": "split8"
     }
@@ -49,7 +49,7 @@
   "variants": {
     "split16": {
       "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split16.cu",
-      "frozen_sha256": "17d40cfcceb7cdf8cf6519bc718aad9b96c4e57cc872de13f2967aab8e191a01",
+      "frozen_sha256": "bf4c10d3e7e0ddfa8debb4e199d204091988f48419324d0423c40a1b6bf5e45c",
       "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_8365fd9a5f",
       "normalized_sha256": "0cb65b0ed4cbd63dbaaa06711318b191e0759ef7b515cf79e4df5b71b8f4bda7",
       "raw_bytes": 13298,
@@ -58,7 +58,7 @@
     },
     "split4": {
       "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split4.cu",
-      "frozen_sha256": "10a8268d47f21166cc118b4ce9090405ff37cfadd9a790f4f5778a7e038952f9",
+      "frozen_sha256": "c3a44266fc3c81aa837b501b90b2154720bdeb50d473172efe108f7c0701610e",
       "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_f8e5172021",
       "normalized_sha256": "651d702e191a00b2bb12306e533212d560cb72551b7a8cf34b48d67259335579",
       "raw_bytes": 13297,
@@ -67,7 +67,7 @@
     },
     "split8": {
       "frozen_path": "csrc/kda/cake_kda_decode_d128_t1_unbounded_softplus_direct_split8.cu",
-      "frozen_sha256": "c1bcf927764b43421c14a9dda7ad1444266c3df691174ee1ed437fea113c7386",
+      "frozen_sha256": "2e2c8164e4f60081a5f5b5e5919abf92c148724358eb160d110f8d65ee75cc24",
       "module_ident": "flashinfer_recurrent_kda_t1_unbounded_softplus_f0fda85f01",
       "normalized_sha256": "5212fdda593d60f3ef2897f44ac3a81fd15d87fd3fa39c5463635a4bb4378718",
       "raw_bytes": 13297,

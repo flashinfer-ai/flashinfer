@@ -22,7 +22,7 @@
 
 #include "cake_kda_decode_binding_common.cuh"
 
-// Frozen Loom bodies provide private fixed-width aliases. Rename them while
+// Frozen Cake bodies provide private fixed-width aliases. Rename them while
 // including the body so CUDA's standard integer typedefs remain unambiguous in
 // the TVM-FFI binding.
 #define uint8_t cake_kda_generated_uint8_t
@@ -31,8 +31,8 @@
 #define uint64_t cake_kda_generated_uint64_t
 #define int32_t cake_kda_generated_int32_t
 #define int16_t cake_kda_generated_int16_t
-#define LoomTensorMap cake_kda_generated_LoomTensorMap
-#define LoomTensorMapPack cake_kda_generated_LoomTensorMapPack
+#define CakeKDATensorMap cake_kda_generated_CakeKDATensorMap
+#define CakeKDATensorMapPack cake_kda_generated_CakeKDATensorMapPack
 #define CUtensorMap cake_kda_generated_CUtensorMap
 #include CAKE_KDA_DECODE_BODY_FILE
 #undef uint8_t
@@ -41,8 +41,8 @@
 #undef uint64_t
 #undef int32_t
 #undef int16_t
-#undef LoomTensorMap
-#undef LoomTensorMapPack
+#undef CakeKDATensorMap
+#undef CakeKDATensorMapPack
 #undef CUtensorMap
 
 #ifdef CAKE_KDA_DECODE_DIRECT_IMPL

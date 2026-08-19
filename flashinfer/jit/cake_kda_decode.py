@@ -80,7 +80,7 @@ def _variant_metadata(
     coefficient_gram: bool = False,
     direct_impl: bool = False,
 ) -> CakeKDADecodeVariantMetadata:
-    """Derive the exact launch geometry used by the frozen Loom schedule."""
+    """Derive the exact launch geometry used by the frozen Cake schedule."""
 
     head_dim = 128
     value_rows = head_dim // value_split

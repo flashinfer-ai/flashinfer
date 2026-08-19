@@ -87,42 +87,42 @@ PROFILES = {
     "sm100_split4": {
         "arch": "sm_100a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm100",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm100.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm100.json",
         "profile_sha256": "66ca59276b49c9be6aed6ed4cec436353292d718304e31395a2689a7a3e93b32",
         "variant": "split4",
     },
     "sm103_split4": {
         "arch": "sm_103a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split4-sm103",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm103.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split4_sm103.json",
         "profile_sha256": "a17799b9cb65ebfff23f453414e5770ceac2451d4e63b2478dccc32f2434c8bb",
         "variant": "split4",
     },
     "sm100_split8": {
         "arch": "sm_100a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm100",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm100.json",
         "profile_sha256": "1bfa62c0e038ae87ef92c5d46fad31592665dc9fae2f3110f25d94cb0e3e349b",
         "variant": "split8",
     },
     "sm103_split8": {
         "arch": "sm_103a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split8-sm103",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split8_sm103.json",
         "profile_sha256": "9428d8e139a9792a84944a6f04593729f45a37fb6614361f7d80596d60f9f45e",
         "variant": "split8",
     },
     "sm100_split16": {
         "arch": "sm_100a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm100",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm100.json",
         "profile_sha256": "e6db65c328e4718f0600a09fc3d2a20d3bd0fe4efe5360d8e9d93b21566ea0a0",
         "variant": "split16",
     },
     "sm103_split16": {
         "arch": "sm_103a",
         "profile": "flashinfer-recurrent-kda-t1-unbounded-softplus-split16-sm103",
-        "profile_path": "loom/export/profiles/flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
+        "profile_path": "flashinfer_recurrent_kda_t1_unbounded_softplus_split16_sm103.json",
         "profile_sha256": "8d634512b0c23d61e33b453493956655178127d8edacde5a55bd33ce71263800",
         "variant": "split16",
     },
@@ -145,6 +145,21 @@ def _normalize_generated_body(source: str) -> str:
     source = _VOLATILE_TEMP.sub(replace_volatile_temp, source)
     source = "\n".join(line.rstrip() for line in source.splitlines())
     return source.rstrip() + "\n"
+
+
+def _publicize_generated_names(source: str) -> str:
+    replacements = (
+        (r"\b[A-Z][A-Za-z0-9]*TensorMapPack\b", "CakeKDATensorMapPack"),
+        (r"\b[A-Z][A-Za-z0-9]*TensorMap\b", "CakeKDATensorMap"),
+    )
+    for pattern, replacement in replacements:
+        source, count = re.subn(pattern, replacement, source)
+        if count == 0:
+            raise ValueError(f"generated source is missing {pattern!r}")
+    inf_match = re.search(r"#define ([A-Z][A-Z0-9_]*_INF) CUDART_INF_F", source)
+    if inf_match is None:
+        raise ValueError("generated source is missing its infinity macro")
+    return source.replace(inf_match.group(1), "CAKE_KDA_INF")
 
 
 def _read_verified(path: Path, variant: Variant, arch: str) -> bytes:
@@ -201,8 +216,9 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
     normalized = _normalize_generated_body(text)
     if _sha256(normalized.encode("utf-8")) != variant.normalized_sha256:
         raise ValueError("normalized generated source identity mismatch")
+    public_text = _publicize_generated_names(text)
     metadata = (
-        "// Generated from a recurrent-KDA Loom schedule.\n"
+        "// Frozen Cake recurrent-KDA export; do not edit by hand.\n"
         f"// Raw generated body SHA256: {variant.raw_sha256}\n"
         f"// Normalized generated SHA256: {variant.normalized_sha256}\n"
         "// BEGIN FROZEN GENERATED BODY\n"
@@ -211,7 +227,7 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
         LICENSE_HEADER
         + "\n// clang-format off\n"
         + metadata
-        + text
+        + public_text
         + "// END FROZEN GENERATED BODY\n"
         + "// clang-format on\n"
     ).encode("utf-8")

@@ -27,14 +27,14 @@
     "sm100_unbounded_softplus": {
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-unbounded-softplus-sm100",
-      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_unbounded_softplus_sm100.json",
+      "profile_path": "flashkda_bf16_fused_m128_unbounded_softplus_sm100.json",
       "profile_sha256": "2902deb070cdf84ad277ac2c35ac921f11c75f34e50f4f9ae9405d2e9288c2b8",
       "variant": "unbounded_softplus"
     },
     "sm103_unbounded_softplus": {
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-unbounded-softplus-sm103",
-      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_unbounded_softplus_sm103.json",
+      "profile_path": "flashkda_bf16_fused_m128_unbounded_softplus_sm103.json",
       "profile_sha256": "2f186bdd334aced41d8b1fc531567e0477d5919914126a4a8357d3c08f1728c9",
       "variant": "unbounded_softplus"
     }
@@ -44,7 +44,7 @@
     "unbounded_softplus": {
       "binding_path": "csrc/kda/cake_kda_bf16_fused_m128_unbounded_softplus_binding.cu",
       "frozen_path": "csrc/kda/cake_kda_bf16_fused_m128_unbounded_softplus.cu",
-      "frozen_sha256": "fca1b2608e51aa839a527d7a5a0f2d0d46c310beaf93f2feeddba5b09fe70561",
+      "frozen_sha256": "a207895766071dc5259771e19a6857d0ddbf5e8bd983274e76c74f08ec65625a",
       "module_ident": "cake_kda_bf16_fused_m128_73277a98ca",
       "raw_bytes": 177223,
       "raw_sha256": "2e482de1d19e8a583ee11812e0f53bafc00ac5222a762069b2082beb465baf9a",
