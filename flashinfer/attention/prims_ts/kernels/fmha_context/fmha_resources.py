@@ -88,6 +88,7 @@ from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
     freeze_smem_descriptor,
+    variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
 
@@ -787,6 +788,7 @@ class GmemQKVResource(MemoryResource):
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
     variable_window_token_starts: cute.Tensor | None = field(init=False, default=None)
+    variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
     q_offset_default: int | Int32 = field(init=False, default=0)
     seqlens_kv: cute.Pointer | None = field(init=False, default=None)
@@ -817,6 +819,7 @@ class GmemQKVResource(MemoryResource):
         seqlens_kv: cute.Pointer | None = None,
         max_seq_len_kv: Int32 | int | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
         variable_window_q_stride: int | Int32 = 0,
         **kwargs: Any,
     ) -> None:
@@ -831,6 +834,7 @@ class GmemQKVResource(MemoryResource):
         self.seqlens_kv = seqlens_kv
         self.max_seq_len_kv = max_seq_len_kv
         self.variable_window_token_starts = variable_window_token_starts
+        self.variable_window_cta_starts = variable_window_cta_starts
         self.variable_window_q_stride = variable_window_q_stride
         self.cfg = cfg
         self.seq_coord = TaskLocalVariable(
@@ -974,13 +978,14 @@ class GmemQKVResource(MemoryResource):
                     // self.cfg.seq_tile_n,
                 )
         if cutlass.const_expr(self.cfg.has_variable_window):
-            first_local_q = (
-                seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+            min_window_start = variable_window_cta_min_start(
+                self.variable_window_cta_starts,
+                batch_coord=batch_coord,
+                seq_coord=seq_coord,
+                q_stride=self.variable_window_q_stride,
+                cta_m=self.cfg.cta_tiler[0],
             )
-            packed_q = batch_coord * self.variable_window_q_stride + first_local_q
-            kv_tile_start = (
-                Int32(self.variable_window_token_starts[packed_q]) // self.cfg.kv_tile_n
-            )
+            kv_tile_start = min_window_start // self.cfg.kv_tile_n
         return (
             seq_coord,
             head_coord,
@@ -1936,6 +1941,7 @@ class TmemSPResource(MemoryResource):
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
     variable_window_token_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_token_ends: cute.Tensor | None = field(init=False, default=None)
+    variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
     scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
@@ -1973,6 +1979,7 @@ class TmemSPResource(MemoryResource):
         cum_seqlen_k: cute.Tensor | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
         variable_window_q_stride: int | Int32 = 0,
         scale_softmax_log2: cute.Tensor | None = None,
         **kwargs: Any,
@@ -1989,6 +1996,7 @@ class TmemSPResource(MemoryResource):
         self.cum_seqlen_k = cum_seqlen_k
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_token_ends = variable_window_token_ends
+        self.variable_window_cta_starts = variable_window_cta_starts
         self.variable_window_q_stride = variable_window_q_stride
         self.scale_softmax_log2 = scale_softmax_log2
         self._alloc = TmemAllocation(
@@ -2438,23 +2446,14 @@ class TmemSPResource(MemoryResource):
             + row_in_tile
         )
         packed_q = batch_coord * self.variable_window_q_stride + local_q
-        first_local_q = seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
-        first_packed_q = batch_coord * self.variable_window_q_stride + first_local_q
-        window_tile_start = Int32(0)
-        if cute.arch.lane_idx() == 0:
-            window_tile_start = (
-                Int32(self.variable_window_token_starts[first_packed_q])
-                // self.cfg.kv_tile_n
-            )
-        window_tile_start = prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=window_tile_start,
-            offset=0,
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.IDX,
-            return_value_and_is_valid=False,
+        min_window_start = variable_window_cta_min_start(
+            self.variable_window_cta_starts,
+            batch_coord=batch_coord,
+            seq_coord=seq_coord,
+            q_stride=self.variable_window_q_stride,
+            cta_m=self.cfg.cta_tiler[0],
         )
-        kv_base = window_tile_start * self.cfg.kv_tile_n
+        kv_base = (min_window_start // self.cfg.kv_tile_n) * self.cfg.kv_tile_n
         return (
             Int32(self.variable_window_token_starts[packed_q]) - kv_base,
             Int32(self.variable_window_token_ends[packed_q]) - kv_base,

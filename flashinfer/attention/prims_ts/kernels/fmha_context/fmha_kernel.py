@@ -192,6 +192,7 @@ from .fmha_tasks import (
 from .helpers import (
     bottom_right_window_max_tiles,
     bottom_right_window_tile_start,
+    variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
 
@@ -522,6 +523,7 @@ class VariableWindowDomainTask(Task):
         self,
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
+        variable_window_cta_starts: cute.Tensor,
         num_kv_tiles: int | Int32,
         q_stride: int | Int32,
         cta_m: int,
@@ -536,6 +538,7 @@ class VariableWindowDomainTask(Task):
         super().__init__(**kwargs)
         self._variable_window_token_starts = variable_window_token_starts
         self._variable_window_token_ends = variable_window_token_ends
+        self._variable_window_cta_starts = variable_window_cta_starts
         self._num_kv_tiles = num_kv_tiles
         self._q_stride = q_stride
         self._cta_m = cta_m
@@ -554,8 +557,12 @@ class VariableWindowDomainTask(Task):
             self._q_stride - Int32(1),
         )
         packed_q_base = batch_coord * self._q_stride
-        first_k = Int32(
-            self._variable_window_token_starts[packed_q_base + first_local_q]
+        first_k = variable_window_cta_min_start(
+            self._variable_window_cta_starts,
+            batch_coord=batch_coord,
+            seq_coord=seq_coord,
+            q_stride=self._q_stride,
+            cta_m=self._cta_m,
         )
         last_k = Int32(self._variable_window_token_ends[packed_q_base + last_local_q])
         first_k_tile = first_k // self._kv_n
@@ -628,6 +635,7 @@ def build_context_task_manager(
     cum_seqlen_k: cute.Tensor | None,
     variable_window_token_starts: cute.Tensor | None = None,
     variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
@@ -926,6 +934,7 @@ def build_context_task_manager(
         seqlens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
         variable_window_token_starts=variable_window_token_starts,
+        variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         name="gmem_qkv",
     )
@@ -1052,6 +1061,7 @@ def build_context_task_manager(
         cum_seqlen_k=cum_seqlen_k,
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         name="tmem_sp0",
@@ -1113,6 +1123,7 @@ def build_context_task_manager(
             cum_seqlen_k=cum_seqlen_k,
             variable_window_token_starts=variable_window_token_starts,
             variable_window_token_ends=variable_window_token_ends,
+            variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             name="tmem_sp1",
@@ -1982,6 +1993,7 @@ def _select_fmha_domain_policy(
     cum_seqlen_k: cute.Tensor | None,
     variable_window_token_starts: cute.Tensor | None = None,
     variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
 ) -> FmhaDomainPolicy:
     """Select loop domains and softmax masks for the configured FMHA mode."""
@@ -1993,12 +2005,17 @@ def _select_fmha_domain_policy(
         else None
     )
     if cfg.has_variable_window:
-        if variable_window_token_starts is None or variable_window_token_ends is None:
+        if (
+            variable_window_token_starts is None
+            or variable_window_token_ends is None
+            or variable_window_cta_starts is None
+        ):
             raise ValueError("VariableWindow domain requires start and end tensors")
         base_kwargs: DomainKwargs = {
             "task_class": VariableWindowDomainTask,
             "variable_window_token_starts": variable_window_token_starts,
             "variable_window_token_ends": variable_window_token_ends,
+            "variable_window_cta_starts": variable_window_cta_starts,
             "num_kv_tiles": num_kv_tiles,
             "q_stride": variable_window_q_stride,
             "cta_m": cfg.cta_tiler[0],
@@ -2173,6 +2190,7 @@ def build_fmha_task_manager(
     num_kv_tiles: int | Int32,
     variable_window_token_starts: cute.Tensor | None = None,
     variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
@@ -2247,6 +2265,7 @@ def build_fmha_task_manager(
         ),
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
     )
 
@@ -2261,6 +2280,7 @@ def build_fmha_task_manager(
         cum_seqlen_k=cum_seqlen_k,
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
@@ -2375,6 +2395,10 @@ class FmhaTs:
         if has_variable_window and (is_causal or window_size_left > 0):
             raise ValueError(
                 "VariableWindow bounds replace causal and sliding-window masks"
+            )
+        if has_variable_window and use_paged_kv:
+            raise NotImplementedError(
+                "variable-window masking is not supported for paged context"
             )
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
         if use_paged_kv:
@@ -2555,6 +2579,7 @@ class FmhaTs:
         seq_lens_kv: cute.Tensor | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -2569,6 +2594,7 @@ class FmhaTs:
             if cutlass.const_expr(
                 variable_window_token_starts is None
                 or variable_window_token_ends is None
+                or variable_window_cta_starts is None
             ):
                 raise ValueError("VariableWindow requires start and end tensors")
 
@@ -2817,6 +2843,7 @@ class FmhaTs:
             Int32(s_k),
             variable_window_token_starts,
             variable_window_token_ends,
+            variable_window_cta_starts,
             Int32(s_q),
             self.is_persistent,
             self.is_clc_dynamic,
@@ -2855,6 +2882,7 @@ class FmhaTs:
         max_seq_len_kv: Int32 | None,
         variable_window_token_starts: cute.Tensor | None,
         variable_window_token_ends: cute.Tensor | None,
+        variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
@@ -2914,6 +2942,7 @@ class FmhaTs:
             num_kv_tiles=num_kv_tiles,
             variable_window_token_starts=variable_window_token_starts,
             variable_window_token_ends=variable_window_token_ends,
+            variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,

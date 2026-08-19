@@ -524,6 +524,7 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
         "output_scale",
         "variable_window_token_starts",
         "variable_window_token_ends",
+        "variable_window_cta_starts",
     )
 
     for aliased_name in (*argument_names, *retained_names):
@@ -1508,6 +1509,39 @@ def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key()
     )
 
 
+def test_attention_ts_context_paged_rejects_variable_window_before_compile(
+    monkeypatch,
+):
+    """Paged context must not silently dispatch variable windows as dense."""
+
+    with pytest.raises(
+        NotImplementedError,
+        match="variable-window masking.*not supported for paged context",
+    ):
+        FmhaTs(has_variable_window=True, use_paged_kv=True)
+
+    def fail_compile(*args, **kwargs):
+        pytest.fail("paged variable-window validation reached kernel compilation")
+
+    monkeypatch.setattr(context_module, "_get_compiled_paged_context", fail_compile)
+    wrapper = BatchPrefillPagedTSWrapper()
+    with pytest.raises(
+        NotImplementedError,
+        match="variable_window.*not supported for paged context",
+    ):
+        wrapper.plan(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            mask_type="variable_window",
+            out_dtype=torch.float16,
+        )
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_rejects_int32_page_table_offset_overflow(monkeypatch):
@@ -1849,6 +1883,49 @@ def test_attention_ts_context_variable_window_t1_i1_t2_i2(
         2559,
         2559,
     ]
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type="variable_window",
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+    )
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(actual, case, expected=expected)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: int):
+    """A later Q row may extend into a K tile earlier than the CTA's first row."""
+
+    seq_len_q = 256
+    seq_len_k = 256
+    case = _make_context_case(
+        q_lengths=(seq_len_q,),
+        k_lengths=(seq_len_k,),
+        num_qo_heads=2,
+        num_kv_heads=1,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=head_dim,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026081901 + head_dim,
+    )
+    starts = torch.full((1, seq_len_q), 128, dtype=torch.int32, device="cuda")
+    starts[0, 160] = 0
+    ends = torch.full((1, seq_len_q), seq_len_k - 1, dtype=torch.int32, device="cuda")
 
     wrapper = BatchPrefillTSWrapper()
     wrapper.plan(

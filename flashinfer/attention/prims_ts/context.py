@@ -65,6 +65,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
+_CONTEXT_Q_TILE_M = 128
 # Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
 # coordinates include the padded tail of that 256-row span and, for masking,
 # its exclusive right boundary.  Reserve the maximum 255-row tail padding in
@@ -275,6 +276,32 @@ def _validate_variable_window_bounds(
             )
         _validate_compact(tensor, name, "[B, Sq]")
     return starts.flatten(), ends.flatten()
+
+
+def _build_variable_window_cta_starts(
+    starts: torch.Tensor, *, geometry: _ContextGeometry
+) -> torch.Tensor:
+    """Reduce fixed per-row starts into one minimum for each kernel Q CTA."""
+    cta_m = (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if geometry.head_dim == _CONTEXT_Q_TILE_M
+        else _CONTEXT_Q_TILE_M
+    )
+    num_seq_tiles = (geometry.max_seq_len_q + cta_m - 1) // cta_m
+    padded_rows = num_seq_tiles * cta_m
+    starts_2d = starts.view(geometry.batch_size, geometry.max_seq_len_q)
+    if padded_rows != geometry.max_seq_len_q:
+        padded = torch.full(
+            (geometry.batch_size, padded_rows),
+            _INT32_MAX,
+            dtype=torch.int32,
+            device=geometry.device,
+        )
+        padded[:, : geometry.max_seq_len_q] = starts_2d
+        starts_2d = padded
+    return (
+        starts_2d.view(geometry.batch_size, num_seq_tiles, cta_m).amin(dim=-1).flatten()
+    )
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -782,9 +809,13 @@ def _resolve_paged_geometry(
 ) -> tuple[_PagedContextGeometry, _PagedContextMetadata]:
     """Validate packed-Q paged-KV inputs and materialize their static ABI."""
 
+    _validate_mask(mask_type)
+    if mask_type == "variable_window":
+        raise NotImplementedError(
+            "mask_type='variable_window' is not supported for paged context"
+        )
     _validate_base_tensors(q, k_cache, v_cache)
     _validate_output_dtype(output_dtype)
-    _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     page_size = _validate_page_size(page_size)
     device_index = _validate_device(q.device)
@@ -1159,6 +1190,7 @@ def _get_compiled_context(
         kv_indptr: cute.Tensor,
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
+        variable_window_cta_starts: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1183,6 +1215,7 @@ def _get_compiled_context(
                 cutlass.Int32(static_max_seq_len_k),
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
         else:
             fmha(
@@ -1196,6 +1229,7 @@ def _get_compiled_context(
                 stream,
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1234,6 +1268,19 @@ def _get_compiled_context(
     )
     variable_window_starts_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
     variable_window_ends_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_cta_m = (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if head_dim == _CONTEXT_Q_TILE_M
+        else _CONTEXT_Q_TILE_M
+    )
+    variable_window_cta_shape = (
+        (batch_size * cute.ceil_div(max_seq_len_q, variable_window_cta_m),)
+        if has_variable_window
+        else (1,)
+    )
+    variable_window_cta_starts_fake = fake_compact(
+        cutlass.Int32, variable_window_cta_shape, 4
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1251,6 +1298,7 @@ def _get_compiled_context(
             kv_indptr_fake,
             variable_window_starts_fake,
             variable_window_ends_fake,
+            variable_window_cta_starts_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -1682,12 +1730,20 @@ class BatchPrefillTSWrapper:
             output_dtype=resolved_out_dtype,
         )
         if mask_type == "variable_window":
-            planned_window_starts, planned_window_ends = (
+            validated_window_starts, validated_window_ends = (
                 _validate_variable_window_bounds(
                     variable_window_token_starts,
                     variable_window_token_ends,
                     geometry=geometry,
                 )
+            )
+            # Variable-window bounds are plan metadata. Keep one internal
+            # snapshot so row masks and the reduced CTA origins cannot diverge
+            # if the caller later modifies its tensors.
+            planned_window_starts = validated_window_starts.clone()
+            planned_window_ends = validated_window_ends.clone()
+            planned_window_cta_starts = _build_variable_window_cta_starts(
+                planned_window_starts, geometry=geometry
             )
         else:
             if (
@@ -1701,6 +1757,9 @@ class BatchPrefillTSWrapper:
                 1, dtype=torch.int32, device=geometry.device
             )
             planned_window_ends = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_cta_starts = torch.empty(
                 1, dtype=torch.int32, device=geometry.device
             )
         if sm_scale is None:
@@ -1743,6 +1802,7 @@ class BatchPrefillTSWrapper:
         self._output_scale = output_scale_tensor
         self._variable_window_token_starts = planned_window_starts
         self._variable_window_token_ends = planned_window_ends
+        self._variable_window_cta_starts = planned_window_cta_starts
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -1783,6 +1843,7 @@ class BatchPrefillTSWrapper:
                 ("output_scale", self._output_scale),
                 ("variable_window_token_starts", self._variable_window_token_starts),
                 ("variable_window_token_ends", self._variable_window_token_ends),
+                ("variable_window_cta_starts", self._variable_window_cta_starts),
             )
         self._compiled(
             q,
@@ -1795,6 +1856,7 @@ class BatchPrefillTSWrapper:
             self._kv_indptr,
             self._variable_window_token_starts,
             self._variable_window_token_ends,
+            self._variable_window_cta_starts,
         )
         return out
 
