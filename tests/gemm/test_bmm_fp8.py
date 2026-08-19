@@ -84,6 +84,20 @@ _SMOKE_CASES = [
         "auto",
         False,
     ),
+    # cute-dsl (SM107 only).  Every entry in SM107_AUTOTUNE_CONFIGS is 2-CTA with
+    # mma_tiler M=256, so the CTA tile is 256x128 and the problem must have
+    # m >= 256 and n >= 128 to fill one; smaller shapes have no valid config.
+    (
+        1,
+        256,
+        10304,
+        2688,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        "cute-dsl",
+        False,
+    ),
 ]
 
 
@@ -96,14 +110,33 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
         pytest.skip(
             "bmm_fp8 with cutlass backend is only supported on SM100, SM110, and SM120/121 GPUs."
         )
+    if backend == "cute-dsl":
+        if compute_capability != (10, 7):
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend is only supported on SM107 GPUs."
+            )
+        if m % 16 != 0 or n % 16 != 0 or k % 16 != 0:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires m, n, k to be multiples of 16."
+            )
+        if input_dtype != mat2_dtype:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires A and B to have the same dtype."
+            )
+        if m < 256 or n < 128:
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires m >= 256 and n >= 128 "
+                "(2-CTA tile); smaller problems have no valid SM107 config."
+            )
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
     if input_dtype == torch.float8_e5m2 or mat2_dtype == torch.float8_e5m2:
         if backend == "cutlass":
             pytest.skip("Invalid combination: cutlass does not support e5m2")
-    if auto_tuning and backend not in ["cutlass", "cudnn", "cublas"]:
+    if auto_tuning and backend not in ["cutlass", "cudnn", "cublas", "cute-dsl"]:
         pytest.skip(
-            "Invalid combination: auto_tuning only supported for cutlass, cudnn, and cublas"
+            "Invalid combination: auto_tuning only supported for cutlass, cudnn, "
+            "cublas, and cute-dsl"
         )
     if compute_capability[0] == 11 and (
         input_dtype == torch.float8_e5m2 or mat2_dtype == torch.float8_e5m2
