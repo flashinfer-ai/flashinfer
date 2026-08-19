@@ -42,6 +42,7 @@ from ..utils import (
     MaskMode,
     _check_block_tables_shape,
     check_shape_dtype_device,
+    check_trtllm_gen_sm107_only_feature,
     determine_mla_backend,
     device_support_pdl,
     get_compute_capability,
@@ -3823,6 +3824,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cp_world=cp_world,
         cp_rank=cp_rank,
         causal_seqlens_kv_global=causal_seqlens_kv_global,
+    )
+
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
     )
 
     if backend == "auto":

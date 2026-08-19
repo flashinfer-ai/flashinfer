@@ -84,6 +84,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     round_up,
+    check_trtllm_gen_sm107_only_feature,
 )
 
 
@@ -2869,6 +2870,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 lse=lse,
             )
 
+        check_trtllm_gen_sm107_only_feature(
+            use_fp16_softmax, "use_fp16_softmax", q.device
+        )
+        check_trtllm_gen_sm107_only_feature(
+            uses_spcompress, "uses_spcompress", q.device
+        )
+
         if (
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
         ) and kv_cache_sf is None:
@@ -4834,6 +4842,12 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
+    )
+    check_trtllm_gen_sm107_only_feature(
+        uses_spcompress, "uses_spcompress", query.device
+    )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
@@ -5435,6 +5449,12 @@ def trtllm_batch_context_with_kv_cache(
         ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``.
     """
 
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
+    )
+    check_trtllm_gen_sm107_only_feature(
+        uses_spcompress, "uses_spcompress", query.device
+    )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if not causal and window_left >= 0:

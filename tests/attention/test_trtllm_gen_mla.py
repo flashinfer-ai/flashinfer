@@ -347,6 +347,9 @@ def trtllm_batch_decode_mla(
 
     if use_fp16_softmax and backend != "trtllm-gen":
         pytest.skip("use_fp16_softmax=True is only supported for trtllm-gen backend")
+    if use_fp16_softmax and get_compute_capability(torch.device("cuda:0")) != (10, 7):
+        # trtllm-gen only exports the Fp16Softmax cubin variants for sm107a.
+        pytest.skip("use_fp16_softmax=True is only supported on SM107 (Rubin)")
 
     torch.manual_seed(42)
     device = "cuda:0"
