@@ -777,7 +777,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                    flat_idx = (
+                        cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                    )
                     ita = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
@@ -1310,7 +1312,7 @@ def gdn_wide_vec_kernel(
             o1 = cutlass.Float32(0.0)
             o2 = cutlass.Float32(0.0)
             o3 = cutlass.Float32(0.0)
-            flat_idx = cutlass.Int32(0)
+            flat_idx = cutlass.Int64(0)
             # FLA-flat predeclaration: Int64 so the Phase B loop's
             # reassignment via Int64(pool_slot)*HV+i_hv keeps a consistent
             # type. cute-DSL rejects type changes inside a dynamic for.
@@ -1559,7 +1561,9 @@ def gdn_wide_vec_kernel(
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                    flat_idx = (
+                        cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                    )
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -1873,7 +1877,9 @@ def gdn_wide_vec_kernel(
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                    flat_idx = (
+                        cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                    )
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -2377,7 +2383,9 @@ def gdn_wide_vec_kernel_t1(
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145. Int64 widening per PR #3230.
-                    flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                    flat_idx = (
+                        cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                    )
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),

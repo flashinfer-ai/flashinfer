@@ -3620,6 +3620,71 @@ def test_gdn_decode_mtp_cache_steps_stride(
     )
 
 
+def test_gdn_decode_bf16_dense_cache_int64_boundary():
+    """Dense BF16 cache addressing must remain 64-bit beyond 2**31 elements."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = 257, 1, 8
+    H, HV, K, V = 1, 64, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(1, HV, V, K, dtype=torch.bfloat16, device=device)
+    state_indices = torch.zeros(B, dtype=torch.int32, device=device)
+
+    # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
+    # state pool compact and leave the 4.02 GiB cache uninitialized so the test
+    # exercises the boundary without unnecessary initialization traffic.
+    cache = torch.empty(
+        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=state,
+        initial_state_indices=state_indices,
+        intermediate_states_buffer=cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+
+    ref_cache = torch.empty(1, T, HV, V, K, dtype=torch.bfloat16, device=device)
+    ref_output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a[-1:],
+        dt_bias=dt_bias,
+        q=q[-1:],
+        k=k[-1:],
+        v=v[-1:],
+        b=b[-1:],
+        initial_state_source=state,
+        initial_state_indices=state_indices[:1],
+        intermediate_states_buffer=ref_cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output[-1:], ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache[-1:, :T], ref_cache, atol=1e-2, rtol=1e-2)
+
+
 # ==============================================================================
 # BF16 state FLA-style per-token pool scatter (ssm_state_indices)
 # ==============================================================================
