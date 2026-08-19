@@ -651,6 +651,11 @@ class BatchMLAPagedAttentionWrapper:
         Pass ``metadata=MLAPlanMetadata.csr(...)``, ``.dense(...)``, or
         ``.dual(...)``.
 
+        Metadata tensors may be on CPU or on the wrapper's device, including
+        mixed placement within one form. Planning uses CPU values directly
+        where possible and stages metadata onto the wrapper device for backend
+        launch contracts. Tensors on another accelerator device are rejected.
+
         **CSR form**
 
         Prefer ``metadata=MLAPlanMetadata.csr(qo_indptr, kv_indptr,

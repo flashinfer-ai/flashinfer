@@ -499,6 +499,52 @@ def test_explicit_wrapper_matches_reference(case):
         assert_mla_close(actual_lse, expected_lse)
 
 
+def test_sm90_fa3_cuda_graph_plan_accepts_host_control_metadata():
+    case = MLATestCase(
+        "sm90-fa3-host-control-metadata",
+        (9, 0),
+        "fa3",
+        metadata_form="csr",
+        kv_layout="independent-split",
+    )
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, _ = reference_result(case, inputs)
+    wrapper = BatchMLAPagedAttentionWrapper(
+        _workspace(),
+        use_cuda_graph=True,
+        qo_indptr=torch.empty_like(inputs.qo_indptr),
+        kv_indptr=torch.empty_like(inputs.kv_indptr),
+        kv_indices=torch.empty_like(inputs.kv_indices),
+        kv_len_arr=torch.empty_like(inputs.kv_len_arr),
+        backend=case.backend,
+    )
+    plan_kwargs = wrapper_plan_kwargs(case, inputs)
+    for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
+        plan_kwargs.pop(name)
+    plan_kwargs["query_layout"] = "split"
+    wrapper.plan(
+        metadata=MLAPlanMetadata.csr(
+            inputs.qo_indptr.cpu(),
+            inputs.kv_indptr.cpu(),
+            inputs.kv_indices,
+            inputs.kv_len_arr.cpu(),
+        ),
+        **plan_kwargs,
+    )
+
+    actual_output, _ = unpack_mla_result(
+        wrapper.run(
+            query=(inputs.q_nope, inputs.q_pe),
+            kv_cache=(inputs.ckv_cache, inputs.kpe_cache),
+        ),
+        False,
+    )
+
+    assert wrapper.resolved_backend == "fa3"
+    assert_mla_close(actual_output, expected_output)
+
+
 @pytest.mark.parametrize("case", _AUTO_CASES, ids=lambda case: case.case_id)
 def test_wrapper_auto_matches_selected_backend_and_reference(case):
     require_architecture(case.architecture)

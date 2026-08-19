@@ -81,9 +81,10 @@ def _validate_metadata_tensor(
         raise ValueError(
             f"{name} metadata must have dtype torch.int32, got {tensor.dtype}."
         )
-    if tensor.device != device:
+    if tensor.device.type != "cpu" and tensor.device != device:
         raise ValueError(
-            f"{name} metadata must be on wrapper device {device}, got {tensor.device}."
+            f"{name} metadata must be on CPU or wrapper device {device}, "
+            f"got {tensor.device}."
         )
     if not tensor.is_contiguous():
         raise ValueError(f"{name} metadata must be contiguous.")
@@ -230,6 +231,9 @@ def _validate_csr_metadata(
     kv_lens_values = validated_kv_len_arr.to(dtype=torch.int64)
     if bool(torch.any(kv_lens_values < 0).item()):
         raise ValueError("kv_len_arr metadata must be nonnegative.")
+    if kv_lens_values.device != kv_values.device:
+        kv_lens_values = kv_lens_values.to(device="cpu")
+        kv_values = kv_values.to(device="cpu")
     expected_pages = torch.div(
         kv_lens_values + page_size - 1, page_size, rounding_mode="floor"
     )
@@ -260,13 +264,13 @@ def _derive_csr_from_dense(
     ).to(dtype=torch.int32)
     kv_indptr = torch.cat(
         (
-            torch.zeros((1,), dtype=torch.int32, device=dense.cum_seq_lens_q.device),
+            torch.zeros((1,), dtype=torch.int32, device=dense.seq_lens.device),
             torch.cumsum(live_pages, dim=0, dtype=torch.int32),
         )
     )
-    live_pages_host = live_pages.to(device="cpu").tolist()
+    live_page_counts = live_pages.to(device="cpu").tolist()
     rows = [
-        dense.block_tables[row, : int(live_pages_host[row])]
+        dense.block_tables[row, : int(live_page_counts[row])]
         for row in range(dense.block_tables.shape[0])
     ]
     kv_indices = (
@@ -358,6 +362,8 @@ class _MLAPlanMetadataResolver:
         self._derived_csr: Optional[_CSRPlanMetadata] = None
         self._derived_dense_by_alignment: dict[int, _DensePlanMetadata] = {}
         self._derived_native_dense: Optional[_DensePlanMetadata] = None
+        self._device_dense_by_alignment: dict[int, _DensePlanMetadata] = {}
+        self._device_native_dense: Optional[_DensePlanMetadata] = None
         self._equivalence_checked = False
 
     def _check_forms(self) -> None:
@@ -494,11 +500,17 @@ class _MLAPlanMetadataResolver:
 
         dense_as_csr = self._derive_csr(dense)
         csr_live_end = int(csr.kv_indptr[-1].item())
+
+        def equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+            if left.device == right.device:
+                return torch.equal(left, right)
+            return torch.equal(left.to(device="cpu"), right.to(device="cpu"))
+
         equivalent = (
-            torch.equal(csr.qo_indptr, dense_as_csr.qo_indptr)
-            and torch.equal(csr.kv_indptr, dense_as_csr.kv_indptr)
-            and torch.equal(csr.kv_indices[:csr_live_end], dense_as_csr.kv_indices)
-            and torch.equal(csr.kv_len_arr, dense_as_csr.kv_len_arr)
+            equal(csr.qo_indptr, dense_as_csr.qo_indptr)
+            and equal(csr.kv_indptr, dense_as_csr.kv_indptr)
+            and equal(csr.kv_indices[:csr_live_end], dense_as_csr.kv_indices)
+            and equal(csr.kv_len_arr, dense_as_csr.kv_len_arr)
         )
         if not equivalent:
             raise ValueError(
@@ -555,6 +567,41 @@ class _MLAPlanMetadataResolver:
             )
         return self._derived_dense_by_alignment[table_width_alignment]
 
+    def _dense_on_device(self, dense: _DensePlanMetadata) -> _DensePlanMetadata:
+        if all(
+            tensor.device == self.device
+            for tensor in (
+                dense.cum_seq_lens_q,
+                dense.block_tables,
+                dense.seq_lens,
+            )
+        ):
+            return dense
+        return _DensePlanMetadata(
+            cum_seq_lens_q=dense.cum_seq_lens_q.to(
+                device=self.device, non_blocking=True
+            ),
+            block_tables=dense.block_tables.to(device=self.device, non_blocking=True),
+            seq_lens=dense.seq_lens.to(device=self.device, non_blocking=True),
+            max_q_len=dense.max_q_len,
+        )
+
+    def resolve_device_dense(
+        self,
+        *,
+        table_width_alignment: int,
+    ) -> _DensePlanMetadata:
+        """Return dense metadata materialized on the wrapper device."""
+        if table_width_alignment not in self._device_dense_by_alignment:
+            self._device_dense_by_alignment[table_width_alignment] = (
+                self._dense_on_device(
+                    self.resolve_dense(
+                        table_width_alignment=table_width_alignment,
+                    )
+                )
+            )
+        return self._device_dense_by_alignment[table_width_alignment]
+
     def resolve_native_dense(self) -> _DensePlanMetadata:
         """Return validated or derived dense metadata without width padding."""
         self._check_forms()
@@ -569,6 +616,14 @@ class _MLAPlanMetadataResolver:
                 table_width_alignment=None,
             )
         return self._derived_native_dense
+
+    def resolve_native_device_dense(self) -> _DensePlanMetadata:
+        """Return native-width dense metadata on the wrapper device."""
+        if self._device_native_dense is None:
+            self._device_native_dense = self._dense_on_device(
+                self.resolve_native_dense()
+            )
+        return self._device_native_dense
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, eq=False)
@@ -692,10 +747,14 @@ class _MLAPlanArguments:
         return self._metadata_resolver.resolve_csr()
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
-        return self._metadata_resolver.resolve_dense(
+        return self._metadata_resolver.resolve_device_dense(
             table_width_alignment=table_width_alignment
         )
 
     @property
     def native_dense(self) -> _DensePlanMetadata:
         return self._metadata_resolver.resolve_native_dense()
+
+    @property
+    def native_device_dense(self) -> _DensePlanMetadata:
+        return self._metadata_resolver.resolve_native_device_dense()

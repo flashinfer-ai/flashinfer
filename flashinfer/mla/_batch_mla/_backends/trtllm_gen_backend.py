@@ -436,7 +436,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 "trtllm-gen dense metadata requires page_size to divide 128, "
                 f"got {args.page_size}."
             )
-        dense = args.native_dense
+        dense = args.native_device_dense
         backend = cls(args._float_workspace_buffer)
         backend.plan(
             cum_seq_lens_q=dense.cum_seq_lens_q,

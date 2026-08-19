@@ -25,12 +25,13 @@ class _RecordingBackend:
 
 
 class _MetadataBuffer:
-    def __init__(self, name, start, size, events, *, fail=False):
+    def __init__(self, name, start, size, events, *, fail=False, device=None):
         self.name = name
         self._start = start
         self._size = size
         self._events = events
         self._fail = fail
+        self.device = device
 
     def data_ptr(self):
         return self._start
@@ -53,6 +54,21 @@ def _generated_fa_mechanics(workspace, *, use_cuda_graph=True):
     mechanics._generated_fa_workspace = workspace
     mechanics._use_cuda_graph = use_cuda_graph
     return mechanics
+
+
+def test_cpu_source_is_not_a_cuda_metadata_alias():
+    events = []
+    destination = _MetadataBuffer(
+        "destination", 100, 16, events, device=torch.device("cuda")
+    )
+    source = _MetadataBuffer("source", 100, 16, events, device=torch.device("cpu"))
+
+    assert not _fa_common._BatchMLAGeneratedFaMechanics._metadata_copy_is_exact_alias(
+        destination, source
+    )
+    _fa_common._BatchMLAGeneratedFaMechanics._preflight_cuda_graph_metadata_copies(
+        (("qo_indptr", destination, source),)
+    )
 
 
 def _dense_plan_args(backend_name):
@@ -96,6 +112,146 @@ def _csr_plan_args():
     )
 
 
+def test_cuda_wrapper_accepts_cpu_csr_plan_metadata():
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=_csr_plan_args()["metadata"],
+        page_size=64,
+        device=torch.device("cuda"),
+    )
+
+    csr = resolver.resolve_csr()
+
+    assert csr.qo_indptr.device.type == "cpu"
+    assert csr.kv_indptr.device.type == "cpu"
+    assert csr.kv_indices.device.type == "cpu"
+    assert csr.kv_len_arr.device.type == "cpu"
+
+
+def test_generated_fa_accepts_cpu_metadata_for_cuda_execution():
+    mechanics = object.__new__(_fa_common._BatchMLAGeneratedFaMechanics)
+    mechanics.device = torch.device("cuda")
+    mechanics._use_cuda_graph = False
+    metadata = _csr_plan_args()["metadata"]
+
+    mechanics._validate_plan_metadata(
+        qo_indptr=metadata.qo_indptr,
+        kv_indptr=metadata.kv_indptr,
+        kv_indices=metadata.kv_indices,
+        kv_len_arr=metadata.kv_len_arr,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA staging")
+def test_cpu_dense_metadata_materializes_on_wrapper_device():
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            block_tables=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+            seq_lens=torch.tensor([64, 96], dtype=torch.int32),
+        ),
+        page_size=64,
+        device=torch.device("cuda"),
+    )
+
+    dense = resolver.resolve_device_dense(table_width_alignment=2)
+
+    assert dense.cum_seq_lens_q.device.type == "cuda"
+    assert dense.block_tables.device.type == "cuda"
+    assert dense.seq_lens.device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA metadata")
+def test_cuda_dense_metadata_keeps_its_validated_zero_copy_form():
+    device = torch.device("cuda", torch.cuda.current_device())
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            block_tables=torch.tensor(
+                [[0, 1], [2, 3]], dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor([64, 96], dtype=torch.int32, device=device),
+        ),
+        page_size=64,
+        device=device,
+    )
+
+    validated = resolver.resolve_dense(table_width_alignment=2)
+    device_dense = resolver.resolve_device_dense(table_width_alignment=2)
+
+    assert device_dense is validated
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires mixed devices")
+def test_csr_metadata_fields_may_mix_cpu_and_wrapper_device():
+    device = torch.device("cuda", torch.cuda.current_device())
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=MLAPlanMetadata.csr(
+            qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+            kv_indices=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            kv_len_arr=torch.tensor([64, 96], dtype=torch.int32, device=device),
+        ),
+        page_size=64,
+        device=device,
+    )
+
+    csr = resolver.resolve_csr()
+
+    assert csr.qo_indptr.device.type == "cuda"
+    assert csr.kv_indptr.device.type == "cpu"
+    assert csr.kv_indices.device.type == "cuda"
+    assert csr.kv_len_arr.device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires mixed devices")
+def test_mixed_dense_metadata_derives_csr_without_cross_device_arithmetic():
+    device = torch.device("cuda", torch.cuda.current_device())
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            block_tables=torch.tensor(
+                [[0, 1], [2, 3]], dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor([64, 96], dtype=torch.int32, device=device),
+        ),
+        page_size=64,
+        device=device,
+    )
+
+    csr = resolver.resolve_csr()
+
+    assert csr.qo_indptr.device.type == "cpu"
+    assert csr.kv_indptr.device.type == "cuda"
+    assert csr.kv_indices.device.type == "cuda"
+    assert csr.kv_len_arr.device.type == "cuda"
+    assert csr.kv_indptr.cpu().tolist() == [0, 1, 3]
+    assert csr.kv_indices.cpu().tolist() == [0, 2, 3]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires mixed devices")
+def test_dual_metadata_equivalence_is_device_independent():
+    device = torch.device("cuda", torch.cuda.current_device())
+    resolver = _planning._MLAPlanMetadataResolver(
+        metadata=MLAPlanMetadata.dual(
+            qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+            kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+            kv_indices=torch.tensor([0, 2, 3], dtype=torch.int32),
+            kv_len_arr=torch.tensor([64, 96], dtype=torch.int32),
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            block_tables=torch.tensor(
+                [[0, 1], [2, 3]], dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor([64, 96], dtype=torch.int32, device=device),
+        ),
+        page_size=64,
+        device=device,
+    )
+
+    csr = resolver.resolve_csr()
+
+    assert csr.qo_indptr.device.type == "cpu"
+
+
 def _make_generated_fa_plan_request(workspace):
     plan_args = _csr_plan_args()
     return _planning._MLAPlanArguments(
@@ -108,6 +264,31 @@ def _make_generated_fa_plan_request(workspace):
         _kv_indices_buf=None,
         _kv_len_arr_buf=None,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA staging")
+def test_native_dense_stages_only_for_device_consumers():
+    device = torch.device("cuda", torch.cuda.current_device())
+    request = _planning._MLAPlanArguments(
+        **_csr_plan_args(),
+        _float_workspace_buffer=torch.empty(1, device=device),
+        _generated_fa_workspace=_fa_common._BatchMLAGeneratedFaWorkspace(device),
+        _use_cuda_graph=False,
+        _qo_indptr_buf=None,
+        _kv_indptr_buf=None,
+        _kv_indices_buf=None,
+        _kv_len_arr_buf=None,
+    )
+
+    native = request.native_dense
+    device_native = request.native_device_dense
+
+    assert native.cum_seq_lens_q.device.type == "cpu"
+    assert native.block_tables.device.type == "cpu"
+    assert native.seq_lens.device.type == "cpu"
+    assert device_native.cum_seq_lens_q.device == device
+    assert device_native.block_tables.device == device
+    assert device_native.seq_lens.device == device
 
 
 def _generated_fa_run_args():

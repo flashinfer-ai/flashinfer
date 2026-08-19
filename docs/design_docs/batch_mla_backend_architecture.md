@@ -239,6 +239,14 @@ forms:
 `MLAPlanMetadata.csr()`, `.dense()`, and `.dual()` construct these forms. If
 both forms are supplied, they must describe the same requests and page mapping.
 
+Each metadata tensor may be on CPU or the wrapper's device, and one form may
+mix those locations. The resolver co-locates values only when a logical check
+spans devices, while backend adapters receive device-resident launch metadata.
+Generated FA planning can therefore consume host indptr and length tensors
+without first copying them from CUDA; dense and run-time metadata is staged on
+the wrapper device when its backend requires it. Metadata on another
+accelerator device is rejected.
+
 The planner preserves the supplied representation and derives the selected
 backend's alternate form only when needed. Derived metadata is scoped to the
 planning request and is never reconstructed during a normal planned `run()`.

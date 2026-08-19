@@ -155,7 +155,13 @@ class _BatchMLAGeneratedFaMechanics:
         self._query_split_widths = query_split_widths
         self._kv_split_widths = kv_split_widths
 
-    def _validate_metadata_tensor(self, name: str, tensor: torch.Tensor) -> None:
+    def _validate_metadata_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        allow_cpu: bool = False,
+    ) -> None:
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"{name} must be a torch.Tensor.")
         if tensor.ndim != 1:
@@ -164,10 +170,15 @@ class _BatchMLAGeneratedFaMechanics:
             )
         if tensor.dtype != torch.int32:
             raise ValueError(f"{name} must have dtype int32, got {tensor.dtype}.")
-        if tensor.device != self.device:
-            raise ValueError(
-                f"{name} must be on wrapper device {self.device}, got {tensor.device}."
+        if tensor.device != self.device and not (
+            allow_cpu and tensor.device.type == "cpu"
+        ):
+            expected = (
+                f"CPU or wrapper device {self.device}"
+                if allow_cpu
+                else str(self.device)
             )
+            raise ValueError(f"{name} must be on {expected}, got {tensor.device}.")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous.")
 
@@ -186,7 +197,7 @@ class _BatchMLAGeneratedFaMechanics:
             ("kv_len_arr", kv_len_arr),
         )
         for name, tensor in metadata:
-            self._validate_metadata_tensor(name, tensor)
+            self._validate_metadata_tensor(name, tensor, allow_cpu=True)
 
         if qo_indptr.shape[0] == 0:
             raise ValueError("qo_indptr must contain at least one element.")
@@ -272,7 +283,9 @@ class _BatchMLAGeneratedFaMechanics:
     def _metadata_copy_is_exact_alias(
         cls, destination: torch.Tensor, source: torch.Tensor
     ) -> bool:
-        return cls._metadata_byte_range(destination) == cls._metadata_byte_range(source)
+        return getattr(destination, "device", None) == getattr(
+            source, "device", None
+        ) and cls._metadata_byte_range(destination) == cls._metadata_byte_range(source)
 
     @classmethod
     def _preflight_cuda_graph_metadata_copies(
@@ -304,6 +317,10 @@ class _BatchMLAGeneratedFaMechanics:
             left_pair, left_name, left_role, left_tensor, left_range = left
             for right in regions[left_index + 1 :]:
                 right_pair, right_name, right_role, right_tensor, right_range = right
+                if getattr(left_tensor, "device", None) != getattr(
+                    right_tensor, "device", None
+                ):
+                    continue
                 overlaps = max(left_range[0], right_range[0]) < min(
                     left_range[1], right_range[1]
                 )

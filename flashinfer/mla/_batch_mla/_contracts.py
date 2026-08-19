@@ -372,6 +372,10 @@ class MLAPlanMetadata:
     CUTLASS, TRTLLM-GEN, CuTe DSL, and XQA. :meth:`dual` is useful when both
     forms already exist and asserts that they describe the same requests.
 
+    Each tensor may be on CPU or on the wrapper's device, and fields may use
+    mixed placement. Planning retains host tensors for host-side planning and
+    stages backend launch metadata onto the wrapper device when required.
+
     The object only retains the supplied references. ``plan()`` lazily derives
     the selected backend's other form only when that backend needs it.
     """
