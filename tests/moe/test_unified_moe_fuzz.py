@@ -191,6 +191,7 @@ from flashinfer.fused_moe.api import (
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
+    MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
@@ -1038,6 +1039,7 @@ class Cfg:
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+    do_finalize: bool = True
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1075,8 +1077,9 @@ class Cfg:
             if self.num_fused_shared_experts
             else ""
         )
+        finalize = "" if self.do_finalize else "unfinalized_"
         return (
-            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{sh}{mode}{finalize}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1531,6 +1534,34 @@ _CURATED = [
             ("nvfp4", 1, 900_045),
             ("mxfp4", 2, 900_046),
             ("w4a16", 1, 900_044),
+        )
+    ],
+    # Issue #3926: every unified TRTLLM operator that exposes unfinalized
+    # intermediates must return BF16 expert weights for either logits dtype.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.Default,
+            routing_input_mode="fromlogits",
+            logits_dtype=logits_dtype,
+            do_finalize=False,
+        )
+        for variant, seed_base in (
+            ("bf16", 900_050),
+            ("fp8pertensor", 900_052),
+            ("deepseekfp8", 900_054),
+            ("mxint4", 900_056),
+        )
+        for logits_dtype, seed in (
+            ("bf16", seed_base),
+            ("fp32", seed_base + 1),
         )
     ],
 ]
@@ -1998,6 +2029,7 @@ def test_unified_moe_fuzz(cfg):
                 else max(cfg.num_tokens, 8192)
             )
         ),
+        finalize=MoEFinalizeConfig(do_finalize=cfg.do_finalize),
     )
 
     try:
@@ -2006,6 +2038,24 @@ def test_unified_moe_fuzz(cfg):
         if _is_unsupported(e):
             pytest.skip(f"MoELayer rejected {cfg.label}: {e}")
         raise
+
+    if not cfg.do_finalize:
+        result = layer(act_pack, weight_pack)
+        assert isinstance(result, list) and len(result) == 3, (
+            "do_finalize=False must return "
+            "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx], got "
+            f"{type(result).__name__} of length "
+            f"{len(result) if isinstance(result, list) else 'n/a'}"
+        )
+        gemm2_output, expert_weights, expanded_idx_to_permuted_idx = result
+        assert gemm2_output.shape[-1] == cfg.hidden
+        assert expert_weights.dtype == torch.bfloat16, (
+            "do_finalize=False expert_weights must be bfloat16, got "
+            f"{expert_weights.dtype} for routing_logits dtype {cfg.logits_dtype}"
+        )
+        assert tuple(expert_weights.shape) == (cfg.num_tokens, cfg.top_k)
+        assert expanded_idx_to_permuted_idx.numel() == cfg.num_tokens * cfg.top_k
+        return
 
     out_shape = (cfg.num_tokens, cfg.hidden)
 

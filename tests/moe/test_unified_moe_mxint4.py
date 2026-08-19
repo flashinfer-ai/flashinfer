@@ -389,26 +389,27 @@ def test_mxint4_explicit_autotune_matches_reference():
 
 
 @mxint4_required
-def test_mxint4_from_logits_rejects_fp32_until_validated():
-    act, weights, config, _, _ = _make_case(
+def test_mxint4_from_logits_supports_fp32():
+    act, weights, config, reference, _ = _make_case(
         routing_input_mode=RoutingInputMode.FromLogits
     )
     act.routing_logits = act.routing_logits.float()
     runner = _build_mxint4_runner(config)
-    with pytest.raises(TypeError, match="requires bfloat16 routing_logits"):
-        runner.pack_inputs(act, weights)
+    output = runner.forward(runner.pack_inputs(act, weights))
+    _assert_mxint4_close(output, reference)
 
 
 @mxint4_required
-def test_mxint4_from_logits_rejects_fp32_bias():
-    act, weights, config, _, _ = _make_case(
+def test_mxint4_from_logits_supports_fp32_bias():
+    act, weights, config, reference, _ = _make_case(
         routing_input_mode=RoutingInputMode.FromLogits,
         routing_method=RoutingMethodType.DeepSeekV3,
     )
+    act.routing_logits = act.routing_logits.float()
     act.routing_bias = act.routing_bias.float()
     runner = _build_mxint4_runner(config)
-    with pytest.raises(TypeError, match="routing_bias must be bfloat16"):
-        runner.pack_inputs(act, weights)
+    output = runner.forward(runner.pack_inputs(act, weights))
+    _assert_mxint4_close(output, reference)
 
 
 @mxint4_required

@@ -228,8 +228,11 @@ class MoEFinalizeConfig:
     do_finalize : bool
         Whether to apply routing-weight scaling and accumulate the per-expert
         partial results into the output.  ``False`` returns the unreduced
-        per-expert partials, leaving the combine to the caller — only the
-        backends that advertise it support this.
+        TRTLLM intermediates as ``[gemm2_output, expert_weights,
+        expanded_idx_to_permuted_idx]``, leaving the combine to the caller.
+        The routing kernel emits ``expert_weights`` in bfloat16 regardless of
+        the routing-logits dtype. Only backends that advertise unfinalized
+        output support this mode.
     use_fused_finalize : bool
         Whether supported backends reduce routed outputs in the GEMM2 epilogue
         (atomic accumulation) instead of running a separate reduction kernel.

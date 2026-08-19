@@ -694,15 +694,18 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="Swiglu"):
             runner.check_support()
 
-    def test_fp8_block_unfinalized_not_supported(self):
+    def test_fp8_block_unfinalized_supported(self, monkeypatch):
+        import flashinfer.utils as utils
+
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
         runner.config = cfg
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        runner.check_support()
 
     @pytest.mark.parametrize(
         ("runner_type", "variant"),
@@ -733,7 +736,7 @@ class TestMoERunnerSupport:
             with pytest.raises(NotImplementedError, match="SM100/SM103"):
                 runner.check_support()
 
-    def test_bf16_unfinalized_not_supported(self, monkeypatch):
+    def test_bf16_unfinalized_supported(self, monkeypatch):
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(
@@ -744,8 +747,7 @@ class TestMoERunnerSupport:
         runner.config = cfg
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.check_support()
 
     def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
         import flashinfer.utils as utils

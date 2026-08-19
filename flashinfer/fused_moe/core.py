@@ -2178,6 +2178,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         list(da_body_workspace),
                         prepare_da_body,
                     )
+                    # Unlike the routed per-tensor entry point, the FromLogits
+                    # ABI does not accept the caller's expert_weights buffer;
+                    # the launcher owns and returns that tensor.
+                    expert_weights = None
                 if prepare_da_body or da_routing_metadata:
                     return list(result)
             elif (
@@ -2265,6 +2269,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 )
                 if prepare_da_body or da_routing_metadata:
                     return list(result)
+
+            return _unpack_trtllm_moe_output(
+                result,
+                output,
+                kwargs["do_finalize"],
+                moe_inputs.gemm1_lora_delta,
+                expert_weights,
+            )
 
     class DABodyRunner:
         """Compose one ordinary MoERunner with prepared-metadata body execution."""
@@ -2566,7 +2578,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
             expert_weights = torch.empty(
-                0, dtype=routing_logits.dtype, device=hidden_states.device
+                0, dtype=torch.bfloat16, device=hidden_states.device
             )
         else:
             # When routing_logits is provided, we either have topk_ids/expert_weights,
@@ -2838,7 +2850,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
         topk_weights = torch.empty(
-            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+            num_tokens, top_k, dtype=torch.bfloat16, device=hidden_states.device
         )
 
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
@@ -3319,9 +3331,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 "either topk_ids or routing_logits must be provided."
             )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
-            routing_dtype = torch.bfloat16
-        else:
-            routing_dtype = routing_logits.dtype
+        routing_dtype = torch.bfloat16
 
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -3992,7 +4002,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
             expert_weights = torch.empty(
-                0, dtype=routing_logits.dtype, device=hidden_states.device
+                0, dtype=torch.bfloat16, device=hidden_states.device
             )
         else:
             # When routing_logits is provided, we either have topk_ids/expert_weights,
