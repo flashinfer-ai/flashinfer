@@ -203,6 +203,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
         assert fc1_w.shape == (2, HIDDEN // 2, 2 * INTERMEDIATE)
         assert fc2_w.shape == (2, INTERMEDIATE // 2, HIDDEN)
         assert fc1_sf.dtype == torch.float8_e4m3fn
+        assert fc2_sf.dtype == torch.float8_e4m3fn
     else:
         (fc1_w, fc1_sf), (fc2_w, fc2_sf) = preprocess_sm107_mxfp8_mega_weights(
             pack, intermediate_size=INTERMEDIATE, hidden_size=HIDDEN
@@ -210,7 +211,9 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
         assert fc1_w.shape == (2, HIDDEN, 2 * INTERMEDIATE)
         assert fc2_w.shape == (2, INTERMEDIATE, HIDDEN)
         assert fc1_w.dtype == torch.float8_e4m3fn
+        assert fc2_w.dtype == torch.float8_e4m3fn
         assert fc1_sf.dtype == torch.float8_e8m0fnu
+        assert fc2_sf.dtype == torch.float8_e8m0fnu
 
 
 @pytest.mark.gpu_4

@@ -1,10 +1,16 @@
 # moe_ep Design
 
+**Scope**: architecture of the `flashinfer.moe_ep` expert-parallel MoE
+subsystem — layers, backends, vendored kernel trees, and their contracts.
+
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md)
+> (SM100) and
+> [kernel_src/sm107/next_cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+> (SM107).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -40,8 +46,8 @@ moe_ep/
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
     shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
   kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin (SM107) "next" greenfield tree, inference-only so far
-    src/                       ← drop subtree (sources/), see VENDOR.md for the recorded fprop-scope diffs
-    shim/, __init__.py, VENDOR.md  ← same layering; relative-import drop, no module-name collision with the other trees
+    src/                       ← drop subtree (sources/), see VENDOR.md for the recorded inline diffs
+    shim/, __init__.py, VENDOR.md, TUNING.md  ← same layering; TUNING.md carries the SM107 knob/perf notes
   modes/{split_layer,mega_layer,config}.py
 ```
 

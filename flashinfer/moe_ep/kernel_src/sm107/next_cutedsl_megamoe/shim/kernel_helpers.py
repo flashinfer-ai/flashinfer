@@ -102,15 +102,24 @@ def pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
 
     Even trailing element -> low nibble, odd -> high (the layout
     ``cvt.rn.satfinite.e2m1x2.f32`` produces and :func:`unpack_fp4_to_f32`
-    decodes). Distance-min against the 8-value magnitude table; midpoints
-    round toward the LARGER magnitude where the HW rounds to even — a
-    tolerance-band (never bitwise) emulation, like the mxfp8 reciprocal above.
+    decodes). Distance-min against the 8-value magnitude table; exact
+    midpoints resolve to the EVEN code, matching the instruction's
+    round-to-nearest-even (e.g. 0.75 -> 1.0, 1.25 -> 1.0, 2.5 -> 2.0).
     """
     if fp32.shape[-1] % 2 != 0:
         raise ValueError(f"FP4 pack needs an even trailing dim, got {fp32.shape[-1]}.")
     values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=fp32.device)
     magnitude = torch.nan_to_num(fp32, nan=0.0).abs().clamp(max=_E2M1_MAX)
-    code = (magnitude.unsqueeze(-1) - values).abs().argmin(dim=-1).to(torch.uint8)
+    distance = (magnitude.unsqueeze(-1) - values).abs()
+    # Ties-to-even: among the (at most two, adjacent) codes at the minimum
+    # distance, rank even codes first; non-minimal codes rank last.
+    parity = torch.arange(len(_E2M1_VALUES), device=fp32.device) % 2
+    tie_rank = torch.where(
+        distance == distance.amin(dim=-1, keepdim=True),
+        parity.to(distance.dtype).expand_as(distance),
+        torch.full_like(distance, len(_E2M1_VALUES)),
+    )
+    code = tie_rank.argmin(dim=-1).to(torch.uint8)
     sign = (torch.signbit(fp32) & (code != 0)).to(torch.uint8) << 3
     nibble = code | sign
     pairs = nibble.reshape(*nibble.shape[:-1], -1, 2)

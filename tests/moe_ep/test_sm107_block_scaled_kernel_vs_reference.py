@@ -222,11 +222,13 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
     monkeypatch, quant_kind, apply_topk_at_fc1
 ):
     """Fused kernel vs pure-torch oracle over identical staged payloads."""
+    # monkeypatch (not os.environ): restored after the test, so it cannot
+    # silently downgrade later nvshmem-path tests in the same process. Set
+    # BEFORE the drop import so no module in the import chain can read the
+    # variable unset.
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
     pkg = _sm107_tree()
     _require_cuda()
-    # monkeypatch (not os.environ): restored after the test, so it cannot
-    # silently downgrade later nvshmem-path tests in the same process.
-    monkeypatch.setenv("MEGA_NO_DIST", "1")
 
     staging_mod, weights_mod = _backend_modules(quant_kind)
     from flashinfer.moe_ep.weights import MoEWeightPack
@@ -393,9 +395,10 @@ def test_sm107_block_scaled_kernel_perf_winner_config(monkeypatch, quant_kind):
     """Oracle check for the upstream perf-report winner knobs (a5b4d33):
     mixed CGA (preferred 4x1, fallback 2x1), phase-interleave scheduling,
     atomic work IDs, FC2 bulk TMA with 2 stages, epi-warp token back."""
+    # Set BEFORE the drop import (see the reference test above).
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
     pkg = _sm107_tree()
     _require_cuda()
-    monkeypatch.setenv("MEGA_NO_DIST", "1")
 
     staging_mod, weights_mod = _backend_modules(quant_kind)
     from flashinfer.moe_ep.weights import MoEWeightPack

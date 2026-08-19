@@ -151,7 +151,7 @@ nvfp4 winners), so a dedicated sweep may claw some of this back.
 The SM107 backends are wired into the moe_ep offline knob tuner (same shape
 as the SM100 one):
 
-```
+```bash
 torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
     --arch sm107 --dtype nvfp4 --hidden 7168 --intermediate 3072 \
     --num-experts 384 --topk 6 --max-tokens 1024 8192 32768

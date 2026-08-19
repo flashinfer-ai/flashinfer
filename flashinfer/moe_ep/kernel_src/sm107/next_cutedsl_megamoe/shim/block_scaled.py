@@ -544,6 +544,10 @@ class Sm107BlockScaledSymmBuffer:
             return
         self._destroyed = True
         comm.ensure_not_capturing("SM107 mega workspace free")
+        # nvshmem free is collective and does not wait for in-flight work;
+        # drain this rank's device before releasing symmetric memory that a
+        # still-running launch (ours or a peer's dispatch pull) may touch.
+        torch.cuda.synchronize()
         self._compiled = None
         self._launch_kwargs = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):

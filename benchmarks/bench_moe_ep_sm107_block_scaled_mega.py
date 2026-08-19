@@ -231,6 +231,12 @@ def _bench_one(
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
+    if (routing, tokens) not in WINNERS:
+        raise SystemExit(
+            f"no tuned knobs for routing={routing} tokens={tokens}; "
+            f"available token counts: "
+            f"{sorted({t for r, t in WINNERS if r == routing})}"
+        )
     knobs = dict(WINNERS[(routing, tokens)])
     if knobs_override:
         knobs.update(knobs_override)
