@@ -279,6 +279,8 @@ void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, Ten
   cudaLaunchConfig_t config{};
 #if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 5
   config.blockDim = dim3(512, 1, 1);
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  config.blockDim = dim3(256, 1, 1);
 #else
   config.blockDim = dim3(192, 1, 1);
 #endif

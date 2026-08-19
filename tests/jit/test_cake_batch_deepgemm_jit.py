@@ -399,6 +399,8 @@ def test_cake_batch_deepgemm_binding_public_abi_and_boundary():
     assert "masked_m must have shape [B]" in binding
     assert "expected_m must be in [0,M]" in binding
     assert "the packed-M32 route requires B64 and M256 or M512" in binding
+    assert "FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8" in binding
+    assert "config.blockDim = dim3(256, 1, 1);" in binding
     assert "Cake packed-M32 GEMM launch" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
     assert "mask_values" not in binding
