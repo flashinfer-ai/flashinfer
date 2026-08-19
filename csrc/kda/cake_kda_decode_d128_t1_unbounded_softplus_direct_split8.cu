@@ -16,8 +16,8 @@
 
 // clang-format off
 // Generated from a recurrent-KDA Loom schedule.
-// Raw generated body SHA256: 9f26543ff5ef868becb8b098919f0e3a2a375075fca1385fb73bffde0b5ee337
-// Normalized generated SHA256: 92fd02b9de1f34745843976a2d68d95fefd525c68f0634e29df714efa318dcff
+// Raw generated body SHA256: 0cd542dd0e6327d89d00a2fd835cbdf657bf2c2d67caf9d58df5bcc8f194c6e8
+// Normalized generated SHA256: 5212fdda593d60f3ef2897f44ac3a81fd15d87fd3fa39c5463635a4bb4378718
 // BEGIN FROZEN GENERATED BODY
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -49,7 +49,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, float lower_bound, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, int beta_is_logit, int H, int HV, int head_ratio)
+kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -68,12 +68,16 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     int lane_0 = lane;
     int k_lane = lane_0 % 16;
     int v_lane = lane_0 / 16;
-    int token_pos_raw = cu_seqlens[n];
-    int seq_len = cu_seqlens[n + 1] - token_pos_raw;
-    bool has_token = seq_len > 0;
-    int token_pos = token_pos_raw;
-    if (!has_token) {
-        token_pos = 0;
+    int token_pos = n;
+    bool has_token = 1;
+    {
+        int token_pos_raw = cu_seqlens[n];
+        int seq_len = cu_seqlens[n + 1] - token_pos_raw;
+        has_token = seq_len > 0;
+        token_pos = token_pos_raw;
+        if (!has_token) {
+            token_pos = 0;
+        }
     }
     int raw_slot = ssm_state_indices[n];
     int initial_slot = raw_slot;
@@ -83,10 +87,10 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     bool active = raw_slot >= 0 && has_token;
     int tile_row_base = value_tile * 16;
     int elem_start = lane_0 * 4;
-    int q_base = token_pos * q_stride_token + query_head * 128 + elem_start;
-    int k_base = token_pos * k_stride_token + query_head * 128 + elem_start;
-    int v_base = token_pos * v_stride_token + hv * 128;
-    int gate_base = token_pos * g_stride_token + hv * 128 + elem_start;
+    int q_base_narrow = token_pos * q_stride_token + query_head * 128 + elem_start;
+    int k_base_narrow = token_pos * k_stride_token + query_head * 128 + elem_start;
+    int v_base_narrow = token_pos * v_stride_token + hv * 128;
+    int gate_base_narrow = token_pos * g_stride_token + hv * 128 + elem_start;
     float q_src[4];
     float k_src[4];
     float gate_src[4];
@@ -100,47 +104,49 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
         k_src[source_value] = 0.0f;
         gate_src[source_value] = 0.0f;
     }
-    if (has_token) {
-        {
-            uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + q_base);
-            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
-            #pragma unroll
-            for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_src[0 + _pair * 2])[0]), "=f"((&q_src[0 + _pair * 2])[1])
-                    : "r"(_vpairs_0[_pair]));
+    {
+        if (has_token) {
+            {
+                uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + q_base_narrow);
+                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&q_src[0 + _pair * 2])[0]), "=f"((&q_src[0 + _pair * 2])[1])
+                        : "r"(_vpairs_0[_pair]));
+                }
             }
-        }
-        {
-            uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + k_base);
-            uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
-            #pragma unroll
-            for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_src[0 + _pair * 2])[0]), "=f"((&k_src[0 + _pair * 2])[1])
-                    : "r"(_vpairs_1[_pair]));
+            {
+                uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + k_base_narrow);
+                uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&k_src[0 + _pair * 2])[0]), "=f"((&k_src[0 + _pair * 2])[1])
+                        : "r"(_vpairs_1[_pair]));
+                }
             }
-        }
-        {
-            uint2 _vld_2 = *reinterpret_cast<const uint2*>(g + gate_base);
-            uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
-            #pragma unroll
-            for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&gate_src[0 + _pair * 2])[0]), "=f"((&gate_src[0 + _pair * 2])[1])
-                    : "r"(_vpairs_2[_pair]));
+            {
+                uint2 _vld_2 = *reinterpret_cast<const uint2*>(g + gate_base_narrow);
+                uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&gate_src[0 + _pair * 2])[0]), "=f"((&gate_src[0 + _pair * 2])[1])
+                        : "r"(_vpairs_2[_pair]));
+                }
             }
         }
     }
@@ -166,14 +172,16 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     for (int source_value_1 = 0; source_value_1 < 4; source_value_1++) {
         int k_idx = elem_start + source_value_1;
         float biased_gate = gate_src[source_value_1] + dt_bias[query_head * 128 + k_idx];
-        float softplus = biased_gate;
-        if (biased_gate <= 20.0f) {
-            float _expf_1 = __expf(biased_gate);
-            float _log1p_0 = log1pf(_expf_1);
-            softplus = _log1p_0;
+        {
+            float softplus = biased_gate;
+            if (biased_gate <= 20.0f) {
+                float _expf_3 = __expf(biased_gate);
+                float _log1p_0 = log1pf(_expf_3);
+                softplus = _log1p_0;
+            }
+            float _expf_4 = __expf((-gate_a) * softplus);
+            gate_src[source_value_1] = _expf_4;
         }
-        float _expf_2 = __expf((-gate_a) * softplus);
-        gate_src[source_value_1] = _expf_2;
     }
     #pragma unroll
     for (int i = 0; i < 8; i++) {
@@ -199,45 +207,50 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, k_dot_q, 1);
     k_dot_q += _shfl_xor_3;
     float beta_value = 0.0f;
-    if (has_token) {
-        beta_value = (float)beta[token_pos * beta_stride_token + hv];
-        if (beta_is_logit != 0) {
-            if (beta_value >= 0.0f) {
-                float _expf_3 = __expf(-beta_value);
-                beta_value = 1.0f / (1.0f + _expf_3);
-            } else {
-                float _expf_4 = __expf(beta_value);
-                float beta_exp = _expf_4;
-                beta_value = beta_exp / (1.0f + beta_exp);
+    {
+        if (has_token) {
+            beta_value = (float)beta[token_pos * beta_stride_token + hv];
+            if (beta_is_logit != 0) {
+                if (beta_value >= 0.0f) {
+                    float _expf_7 = __expf(-beta_value);
+                    beta_value = 1.0f / (1.0f + _expf_7);
+                } else {
+                    float _expf_8 = __expf(beta_value);
+                    float beta_exp = _expf_8;
+                    beta_value = beta_exp / (1.0f + beta_exp);
+                }
             }
         }
     }
-    int initial_head_base = initial_slot * state_stride_slot + hv * 128 * 128;
+    int initial_head_base_narrow = initial_slot * state_stride_slot + hv * 128 * 128;
     int output_head_base = (token_pos * HV + hv) * 128;
+    bool state_aligned = 1;
     #pragma unroll 1
     for (int row_block = 0; row_block < 2; row_block++) {
         #pragma unroll
         for (int row_local = 0; row_local < 4; row_local++) {
             int value_row = tile_row_base + v_lane + 2 * (row_block * 4 + row_local);
-            int state_base = initial_head_base + value_row * 128 + k_lane * 8;
             {
-                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_base);
-                uint4 _vld_3[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(_vld_3[_blk].x), "=r"(_vld_3[_blk].y), "=r"(_vld_3[_blk].z), "=r"(_vld_3[_blk].w)
-                        : "l"(_vptr_3 + _blk) : "memory");
-                    uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
+                int state_base_narrow = initial_head_base_narrow + value_row * 128 + k_lane * 8;
+                {
+                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_base_narrow);
+                    uint4 _vld_3[1];
                     #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&state_rows[row_local * 8 + _blk * 8 + _pair * 2])[0]), "=f"((&state_rows[row_local * 8 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_3[_pair]));
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_vld_3[_blk].x), "=r"(_vld_3[_blk].y), "=r"(_vld_3[_blk].z), "=r"(_vld_3[_blk].w)
+                            : "l"(_vptr_3 + _blk) : "memory");
+                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&state_rows[row_local * 8 + _blk * 8 + _pair * 2])[0]), "=f"((&state_rows[row_local * 8 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_3[_pair]));
+                        }
                     }
                 }
             }
@@ -270,8 +283,10 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
             float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, base, 1);
             base += _shfl_xor_11;
             float v_value = 0.0f;
-            if (k_lane == 0) {
-                v_value = (float)v[v_base + value_row_1];
+            {
+                if (k_lane == 0) {
+                    v_value = (float)v[v_base_narrow + value_row_1];
+                }
             }
             float _shfl_3 = __shfl_sync(0xFFFFFFFF, v_value, v_lane * 16);
             v_value = _shfl_3;
@@ -281,14 +296,16 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
                 state_rows[row_local_1 * 8 + i_3] = state_rows[row_local_1 * 8 + i_3] * decay_reg[i_3] + delta * k_reg[i_3];
             }
             if (active) {
-                int state_base_1 = initial_head_base + value_row_1 * 128 + k_lane * 8;
                 {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 0], state_rows[row_local_1 * 8 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 2], state_rows[row_local_1 * 8 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 4], state_rows[row_local_1 * 8 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 6], state_rows[row_local_1 * 8 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_base_1 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    int state_base_narrow_1 = initial_slot * state_stride_slot + hv * 128 * 128 + value_row_1 * 128 + k_lane * 8;
+                    {
+                        __nv_bfloat162 _pk[4];
+                        _pk[0] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 0], state_rows[row_local_1 * 8 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 2], state_rows[row_local_1 * 8 + 3]);
+                        _pk[2] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 4], state_rows[row_local_1 * 8 + 5]);
+                        _pk[3] = __floats2bfloat162_rn(state_rows[row_local_1 * 8 + 6], state_rows[row_local_1 * 8 + 7]);
+                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_base_narrow_1 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    }
                 }
                 if (k_lane == 0) {
                     out[output_head_base + value_row_1] = base + delta * k_dot_q;

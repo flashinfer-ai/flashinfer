@@ -68,9 +68,12 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
       reinterpret_cast<int*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(ssm_state_indices.data_ptr()),
-      reinterpret_cast<int*>(num_accepted_tokens.data_ptr()), static_cast<float>(scale), 0.0f,
+      reinterpret_cast<int*>(num_accepted_tokens.data_ptr()), static_cast<float>(scale),
       ctx.q_token_stride, ctx.k_token_stride, ctx.v_token_stride, ctx.gate_token_stride,
-      ctx.beta_token_stride, ctx.state_slot_stride, ctx.beta_is_logit, ctx.num_heads,
+      ctx.beta_token_stride, ctx.state_slot_stride, static_cast<int64_t>(ctx.q_token_stride),
+      static_cast<int64_t>(ctx.k_token_stride), static_cast<int64_t>(ctx.v_token_stride),
+      static_cast<int64_t>(ctx.gate_token_stride), static_cast<int64_t>(ctx.beta_token_stride),
+      static_cast<int64_t>(ctx.state_slot_stride), ctx.beta_is_logit, 0, ctx.num_heads,
       ctx.num_value_heads, ctx.head_ratio);
 #else
   kernel_flashinfer_recurrent_kda_t1_direct<<<grid, block, 0, ctx.stream>>>(
