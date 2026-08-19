@@ -359,14 +359,9 @@ struct MoERunnerArgs {
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
 
-  // FP8 per-token/per-channel scales. The weight scales are passed to
-  // TrtllmGenBatchedGemmRunner as perTokensSfB (which maps to kernel mPtrPerTokenSfA due to
-  // transposeMmaOutput=true). hidden_states_scale is passed as perTokensSfA for GEMM1 (mapping to
-  // kernel mPtrPerTokenSfB), and GEMM1's output scale is passed the same way for GEMM2.
-  // For gated activations, GEMM1 channel scales must be pre-interleaved by the caller: even indices
-  // carry the activation-channel scale, odd indices carry the gate-channel scale.
-  float* gemm1_per_channel_weight_scale = nullptr;  // [2*intermediate_size] for gated acts
-  float* gemm2_per_channel_weight_scale = nullptr;  // [hidden_size]
+  // Gated GEMM1 scales follow the shuffled, interleaved weight rows.
+  float* gemm1_per_channel_weight_scale = nullptr;  // [local_num_experts, M]
+  float* gemm2_per_channel_weight_scale = nullptr;  // [local_num_experts, hidden_size]
 
   // Output:
   void* output = nullptr;

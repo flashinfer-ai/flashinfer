@@ -32,6 +32,19 @@ namespace trtllmgen_moe {
 
 namespace btg = batchedGemm::trtllm::gen;
 
+namespace {
+btg::Dtype getPerTokenScaleDtype(btg::Dtype dtypeAct, bool usePerTokenScaling,
+                                 bool usePerChannelScaling) {
+  if (usePerChannelScaling) {
+    return btg::Dtype::Fp32;
+  }
+  if (!usePerTokenScaling) {
+    return btg::Dtype::Void;
+  }
+  return dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+}
+}  // namespace
+
 namespace PermuteGemm1 {
 
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
@@ -118,11 +131,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
         .perTokenSfDtype =
-            usePerChannelScaling
-                ? btg::Dtype::Fp32
-                : (usePerTokenScaling
-                       ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
-                       : btg::Dtype::Void),
+            getPerTokenScaleDtype(dtypeAct, usePerTokenScaling, usePerChannelScaling),
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -148,11 +157,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
         .perTokenSfDtype =
-            usePerChannelScaling
-                ? btg::Dtype::Fp32
-                : (usePerTokenScaling
-                       ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
-                       : btg::Dtype::Void),
+            getPerTokenScaleDtype(dtypeAct, usePerTokenScaling, usePerChannelScaling),
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -264,12 +269,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
-      .perTokenSfDtype =
-          usePerChannelScaling
-              ? btg::Dtype::Fp32
-              : (usePerTokenScaling
-                     ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
-                     : btg::Dtype::Void),
+      .perTokenSfDtype = getPerTokenScaleDtype(dtypeAct, usePerTokenScaling, usePerChannelScaling),
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }

@@ -1889,10 +1889,10 @@ class FP8PerChannelMoe(Moe):
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with one scale per output channel."""
         del hidden_states_sample
-        gemm1_weights_quant, gemm1_per_channel_scales = quant_fp8_per_channel_batches(
+        gemm1_weights_quant, gemm1_per_channel_scales = quant_fp8_per_channel(
             gemm1_weights
         )
-        gemm2_weights_quant, gemm2_per_channel_scales = quant_fp8_per_channel_batches(
+        gemm2_weights_quant, gemm2_per_channel_scales = quant_fp8_per_channel(
             gemm2_weights
         )
 
@@ -1929,76 +1929,53 @@ class FP8PerChannelMoe(Moe):
         weight_processing,
     ):
         """Prepare quantized and shuffled weights for the kernel."""
-        del gemm1_weights_orig, gemm2_weights_orig, weight_processing
+        del gemm1_weights_orig, gemm2_weights_orig, hidden_size, weight_processing
         epilogue_tile_m = 128
+        gated = is_gated_activation(args.activation_type)
 
-        gemm1_weights_fp8_interleaved = []
-        for i in range(num_experts):
-            if is_gated_activation(args.activation_type):
-                weights = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
-            else:
-                weights = args.gemm1_weights[i].clone()
-            gemm1_weights_fp8_interleaved.append(weights)
-
-        gemm1_weights_fp8_interleaved = torch.stack(
-            gemm1_weights_fp8_interleaved
-        ).reshape(
-            num_experts,
-            (2 if is_gated_activation(args.activation_type) else 1) * intermediate_size,
-            hidden_size,
+        gemm1_weights_interleaved = (
+            torch.stack(
+                [
+                    reorder_rows_for_gated_act_gemm(weight)
+                    for weight in args.gemm1_weights
+                ]
+            )
+            if gated
+            else args.gemm1_weights
         )
 
-        gemm1_weights_fp8_shuffled = []
-        gemm2_weights_fp8_shuffled = []
-        for i in range(num_experts):
-            gemm1_weights_fp8_shuffled.append(
-                shuffle_matrix_a(
-                    gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
-                )
-            )
-            gemm2_weights_fp8_shuffled.append(
-                shuffle_matrix_a(
-                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
-                )
+        def shuffle_rows(tensors):
+            return torch.stack(
+                [shuffle_matrix_a(tensor, epilogue_tile_m) for tensor in tensors]
             )
 
-        gemm1_weights_fp8_shuffled = torch.stack(gemm1_weights_fp8_shuffled).view(
-            torch.float8_e4m3fn
-        )
-        gemm2_weights_fp8_shuffled = torch.stack(gemm2_weights_fp8_shuffled).view(
-            torch.float8_e4m3fn
-        )
+        gemm1_weights_shuffled = shuffle_rows(
+            gemm1_weights_interleaved.view(torch.uint8)
+        ).view(torch.float8_e4m3fn)
+        gemm2_weights_shuffled = shuffle_rows(
+            args.gemm2_weights.view(torch.uint8)
+        ).view(torch.float8_e4m3fn)
 
         gemm1_per_channel_scales = args.gemm1_per_channel_scales
         gemm2_per_channel_scales = args.gemm2_per_channel_scales
 
-        if is_gated_activation(args.activation_type):
-            gemm1_per_channel_scales_reordered = []
-            for i in range(num_experts):
-                scales_2d = gemm1_per_channel_scales[i].reshape(2, intermediate_size)
-                reordered = torch.empty_like(scales_2d.reshape(-1))
-                reordered[0::2] = scales_2d[0]
-                reordered[1::2] = scales_2d[1]
-                gemm1_per_channel_scales_reordered.append(reordered)
-            gemm1_per_channel_scales = torch.stack(gemm1_per_channel_scales_reordered)
+        if gated:
+            scales = gemm1_per_channel_scales.reshape(num_experts, 2, intermediate_size)
+            gemm1_per_channel_scales = torch.stack(
+                (scales[:, 0], scales[:, 1]), dim=-1
+            ).reshape(num_experts, -1)
 
         # The MetaFP8 row scales index the physically shuffled weight rows.
         # Apply the same permutation used by shuffle_matrix_a so each scale
         # remains paired with its output channel.
-        gemm1_per_channel_scales = torch.stack(
-            [
-                shuffle_matrix_a(scale.unsqueeze(-1), epilogue_tile_m).squeeze(-1)
-                for scale in gemm1_per_channel_scales
-            ]
-        )
-        gemm2_per_channel_scales = torch.stack(
-            [
-                shuffle_matrix_a(scale.unsqueeze(-1), epilogue_tile_m).squeeze(-1)
-                for scale in gemm2_per_channel_scales
-            ]
-        )
+        gemm1_per_channel_scales = shuffle_rows(
+            gemm1_per_channel_scales.unsqueeze(-1)
+        ).squeeze(-1)
+        gemm2_per_channel_scales = shuffle_rows(
+            gemm2_per_channel_scales.unsqueeze(-1)
+        ).squeeze(-1)
 
-        if is_gated_activation(args.activation_type):
+        if gated:
             scale_c_fc1 = args_dequant.c_global_sf / gemm1_per_channel_scales
         else:
             scale_c_fc1 = torch.full_like(
@@ -2008,8 +1985,8 @@ class FP8PerChannelMoe(Moe):
         scale_c_fc2 = 1.0 / (args_dequant.c_global_sf * gemm2_per_channel_scales)
 
         return {
-            "gemm1_weights": gemm1_weights_fp8_shuffled,
-            "gemm2_weights": gemm2_weights_fp8_shuffled,
+            "gemm1_weights": gemm1_weights_shuffled,
+            "gemm2_weights": gemm2_weights_shuffled,
             "scale_c_fc1": scale_c_fc1,
             "scale_gate_fc1": scale_gate_fc1,
             "scale_c_fc2": scale_c_fc2,
@@ -2886,17 +2863,6 @@ def quant_fp8_per_channel(a):
     return a_fp8, per_channel_scales
 
 
-def quant_fp8_per_channel_batches(a):
-    """Apply per-channel FP8 weight quantization to every expert."""
-    quantized = []
-    scales = []
-    for batch in a:
-        batch_quantized, batch_scales = quant_fp8_per_channel(batch)
-        quantized.append(batch_quantized)
-        scales.append(batch_scales)
-    return torch.stack(quantized), torch.stack(scales)
-
-
 def quant_dequant_per_tensor_fp8(a):
     """FP8 per-tensor quantize-dequantize roundtrip function with centralized global scale factor calculation."""
     # Use centralized global scale factor calculation
@@ -3432,17 +3398,12 @@ def run_moe_reference_per_channel_scale_fp8(args):
         args.hidden_states.to(torch.float) * args.hidden_states_scale
     )
 
-    gemm1_weights_dequant = {}
-    for i in range(args.num_experts):
-        gemm1_weights_dequant[i] = args.gemm1_weights[i].to(
-            torch.float
-        ) / args.gemm1_per_channel_scales[i].unsqueeze(-1)
-
-    gemm2_weights_dequant = {}
-    for i in range(args.num_experts):
-        gemm2_weights_dequant[i] = args.gemm2_weights[i].to(
-            torch.float
-        ) / args.gemm2_per_channel_scales[i].unsqueeze(-1)
+    gemm1_weights_dequant = (
+        args.gemm1_weights.float() / args.gemm1_per_channel_scales.unsqueeze(-1)
+    )
+    gemm2_weights_dequant = (
+        args.gemm2_weights.float() / args.gemm2_per_channel_scales.unsqueeze(-1)
+    )
 
     args_dequant = moe_args_dequant(
         args.num_tokens,
