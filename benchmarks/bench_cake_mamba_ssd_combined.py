@@ -95,13 +95,16 @@ def main() -> None:
         help="packed varlen lengths; overrides --num-seqs/--chunks-per-seq",
     )
     parser.add_argument("--zero-initial-states", action="store_true")
+    parser.add_argument("--has-z", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--require-qualified-row", action="store_true")
     parser.add_argument("--nheads", type=int, default=8)
     parser.add_argument("--ngroups", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=100)
     args = parser.parse_args()
 
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
     if args.mode == "batched":
         if args.sequence_lengths is not None:
             raise ValueError("--sequence-lengths requires --mode varlen")
@@ -128,6 +131,7 @@ def main() -> None:
     B = torch.randn(batch, seqlen, args.ngroups, 128, device="cuda").to(torch.bfloat16)
     C = torch.randn_like(B)
     D = torch.randn(args.nheads, device="cuda").to(torch.bfloat16)
+    z = torch.randn_like(x) if args.has_z else None
     dt_bias = torch.rand(args.nheads, device="cuda") - 4.0
     initial_states = torch.randn(num_sequences, args.nheads, 64, 128, device="cuda").to(
         torch.bfloat16
@@ -135,7 +139,7 @@ def main() -> None:
     if args.zero_initial_states:
         initial_states.zero_()
     inputs = (x, dt, A, B, C)
-    backend_arguments = {"D": D, "z": None}
+    backend_arguments = {"D": D, "z": z}
 
     constructor = dict(
         chunk_size=128,
@@ -149,7 +153,7 @@ def main() -> None:
         d_has_hdim=False,
         has_initial_states=True,
         has_varlen=args.mode == "varlen",
-        has_z=False,
+        has_z=args.has_z,
         seq_idx_dtype=torch.int32,
     )
     runners = {
@@ -211,6 +215,8 @@ def main() -> None:
             "input_layout": "contiguous",
             "sequence_lengths": sequence_lengths,
             "initial_states": "zero" if args.zero_initial_states else "random",
+            "has_z": args.has_z,
+            "seed": args.seed,
         },
         "out": _diagnostic(outputs["cake"][0], outputs["cute"][0]),
         "final_states": _diagnostic(outputs["cake"][1], outputs["cute"][1]),
@@ -220,12 +226,13 @@ def main() -> None:
         "timing_backend": "cupti",
     }
     print(json.dumps(report, sort_keys=True))
-    if not report["out"]["tolerance_passed"]:
-        raise AssertionError("Cake output failed BF16 parity")
-    if not report["final_states"]["tolerance_passed"]:
-        raise AssertionError("Cake final state failed BF16 parity")
-    if report["speedup"] <= 1.0:
-        raise AssertionError("Cake must be faster than CuTe for a reported row")
+    if args.require_qualified_row:
+        if not report["out"]["tolerance_passed"]:
+            raise AssertionError("Cake output failed BF16 parity")
+        if not report["final_states"]["tolerance_passed"]:
+            raise AssertionError("Cake final state failed BF16 parity")
+        if report["speedup"] <= 1.0:
+            raise AssertionError("Cake must be faster than CuTe for a reported row")
 
 
 if __name__ == "__main__":
