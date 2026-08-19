@@ -441,6 +441,7 @@ class _BatchMLAGeneratedFaMechanics:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        self._head_dim_ckv = head_dim_ckv
         self._q_data_type = q_data_type
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
@@ -489,6 +490,7 @@ class _BatchMLAGeneratedFaMechanics:
         return_lse_base_on_e: bool,
         ckv_scale: float,
         kpe_scale: float,
+        ckv_scale_arr: Optional[torch.Tensor],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if profiler_buffer is None and self._use_profiler:
             raise ValueError("Profiler is enabled, profiler_buffer must be provided")
@@ -530,6 +532,7 @@ class _BatchMLAGeneratedFaMechanics:
             return_lse_base_on_e,
             ckv_scale,
             kpe_scale,
+            ckv_scale_arr,
             *profiler_args,
         )
         return (out, lse) if return_lse else out
@@ -813,6 +816,7 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
             return_lse_base_on_e=False,
             ckv_scale=1.0,
             kpe_scale=1.0,
+            ckv_scale_arr=None,
         )
         assert request.q_nope is not None
         output_shape = request.q_nope.shape

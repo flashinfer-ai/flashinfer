@@ -2102,6 +2102,8 @@ def test_wrapper_mla_tuning_config_is_memoized_by_effective_inputs():
     profile = _wrapper_mla_autotune_profile()
     first = build_wrapper_tuning_config(profile, buckets=(1, 3, 7))
 
+    assert set(dict(first.tensor_initializers)) == {0, 1, 2, 3}
+
     assert (
         build_wrapper_tuning_config(
             replace(profile, batch_size=8, causal=True), buckets=(7, 3, 1, 3)
@@ -2127,9 +2129,7 @@ def test_wrapper_mla_tuning_config_is_memoized_by_effective_inputs():
     )
 
 
-def _call_build_mla_decode_tuning_config(
-    enable_dcp: bool = False, has_sparse_mla_top_k_lens: bool = False
-):
+def _call_build_mla_decode_tuning_config(sparse_top_k_width: int = 0):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
     runner_names is restricted to trtllm-gen so bucket computation stays
@@ -2146,31 +2146,25 @@ def _call_build_mla_decode_tuning_config(
         kv_lora_rank=512,
         max_seq_len=1024,
         device=torch.device("cpu"),
-        has_sparse_mla_top_k_lens=has_sparse_mla_top_k_lens,
-        enable_dcp=enable_dcp,
-        cp_world=4,
-        cp_rank=1,
+        sparse_top_k_width=sparse_top_k_width,
     )
 
 
 @pytest.mark.parametrize(
     (
-        "enable_dcp",
-        "has_sparse_mla_top_k_lens",
+        "sparse_top_k_width",
         "expected_input_idx",
         "expected_initializer_indices",
         "expected_fifth_value",
     ),
     [
-        (False, False, (0, 1, 2, 3), {1, 2}, None),
-        (True, False, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
-        (False, True, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
+        (0, (0, 1, 2, 3), {1, 2}, None),
+        (64, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
     ],
-    ids=("default", "dcp", "sparse-top-k"),
+    ids=("default", "sparse-top-k"),
 )
 def test_mla_decode_tuning_config_is_memoized(
-    enable_dcp,
-    has_sparse_mla_top_k_lens,
+    sparse_top_k_width,
     expected_input_idx,
     expected_initializer_indices,
     expected_fifth_value,
@@ -2183,12 +2177,8 @@ def test_mla_decode_tuning_config_is_memoized(
     """
     _mla_decode_tuning_config.cache_clear()
     try:
-        config_a = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
-        )
-        config_b = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
-        )
+        config_a = _call_build_mla_decode_tuning_config(sparse_top_k_width)
+        config_b = _call_build_mla_decode_tuning_config(sparse_top_k_width)
 
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "

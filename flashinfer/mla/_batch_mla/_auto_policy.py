@@ -323,13 +323,13 @@ def _build_wrapper_tuning_config(
                 dim_idx=(0, 0, 0, 0),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(
-                    autotuner_initializer_zeros,
-                    _block_table_initializer(workspace_page_capacity),
-                    _seq_len_initializer(max_kv_len),
-                    autotuner_initializer_empty,
-                ),
             ),
+        ),
+        tensor_initializers=(
+            (0, autotuner_initializer_zeros),
+            (1, _block_table_initializer(workspace_page_capacity)),
+            (2, _seq_len_initializer(max_kv_len)),
+            (3, autotuner_initializer_empty),
         ),
         use_cuda_graph=True,
         use_cold_l2_cache=False,
@@ -497,8 +497,14 @@ def build_synthetic_plan(
 
 def _synthetic_run_kwargs(
     synthetic: _SyntheticMLAPlan,
+    *,
+    backend_name: str,
 ) -> dict[str, object]:
     args = synthetic.args
+    needs_generated_fa_fp8_scales = (
+        backend_name in ("fa2", "fa3") and args.kv_data_type == torch.float8_e4m3fn
+    )
+    uses_kv_scales = args.scale_mode == "kv-per-tensor" or needs_generated_fa_fp8_scales
     return {
         "query": synthetic.query,
         "kv_cache": synthetic.kv_cache,
@@ -510,8 +516,8 @@ def _synthetic_run_kwargs(
         "page_table": None,
         "return_lse_base_on_e": args.lse_mode == "basee",
         "o_scale": 1.0 if args.output_scale == "per-tensor" else None,
-        "ckv_scale": 1.0 if args.scale_mode == "kv-per-tensor" else None,
-        "kpe_scale": 1.0 if args.scale_mode == "kv-per-tensor" else None,
+        "ckv_scale": 1.0 if uses_kv_scales else None,
+        "kpe_scale": 1.0 if uses_kv_scales else None,
         "sinks": synthetic.sinks,
         "skip_softmax_threshold_scale_factor": (1.0 if args.skip_softmax else None),
         "bmm1_scale": (
@@ -584,7 +590,9 @@ class _PlannedMLABackendRunner(TunableRunner):
         try:
             backend_impl = self.backend_type.plan_from_wrapper(synthetic.args)
             planned_backend = cast(_PlannedBackend, backend_impl)
-            planned_backend.run_from_wrapper(**_synthetic_run_kwargs(synthetic))
+            planned_backend.run_from_wrapper(
+                **_synthetic_run_kwargs(synthetic, backend_name=self.backend_name)
+            )
             if synthetic.output.device.type == "cuda":
                 torch.cuda.synchronize(synthetic.output.device)
         except _BackendPlanUnsupportedError as error:
@@ -614,7 +622,9 @@ class _PlannedMLABackendRunner(TunableRunner):
         assert self._prepared_cache is not None
         synthetic, backend_impl = self._prepared_cache
         planned_backend = cast(_PlannedBackend, backend_impl)
-        return planned_backend.run_from_wrapper(**_synthetic_run_kwargs(synthetic))
+        return planned_backend.run_from_wrapper(
+            **_synthetic_run_kwargs(synthetic, backend_name=self.backend_name)
+        )
 
 
 def _default_tuning_buckets(

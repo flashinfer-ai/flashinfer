@@ -548,6 +548,7 @@ routine_cc_to_supported_backends = {
             "cute-dsl-monolithic",
             "cute-dsl-modular",
             "auto",
+            "prims-ts",
         ],
         "10.3": [
             "fa2",
@@ -556,6 +557,7 @@ routine_cc_to_supported_backends = {
             "cute-dsl-monolithic",
             "cute-dsl-modular",
             "auto",
+            "prims-ts",
         ],
         "10.7": ["fa2", "cutlass", "trtllm-gen", "auto"],
         "12.0": ["fa2", "xqa", "auto"],

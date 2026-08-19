@@ -35,7 +35,15 @@ _MLA_WRAPPER_BACKENDS = (
     "cute-dsl-modular",
     "xqa",
     "auto",
+    "prims-ts",
 )
+
+
+def _get_prims_ts_module():
+    """Load PrimTS only when its benchmark backend is selected."""
+    from flashinfer.attention import prims_ts
+
+    return prims_ts
 
 
 def parse_mla_args(line, parser, routine):
@@ -536,6 +544,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         device=device,
         generator=input_generator,
     ).to(kv_dtype)
+    combined_q = None
+    if "prims-ts" in requested:
+        combined_q = torch.cat((q_nope, q_pe), dim=-1)
     ckv_view, kpe_view = combined_kv.split(
         (args.head_dim_ckv, args.head_dim_kpe), dim=-1
     )
@@ -666,7 +677,11 @@ def testBatchMLAPagedAttentionWrapper(args):
         backend_run_kwargs = {**run_kwargs, "q_nope": q_nope}
         torch.cuda.reset_peak_memory_stats(device)
         capture_baseline = torch.cuda.memory_allocated(device)
-        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+        workspace = torch.empty(
+            0 if backend == "prims-ts" else 128 * 1024 * 1024,
+            dtype=torch.int8,
+            device=device,
+        )
         constructor_kwargs = {
             "float_workspace_buffer": workspace,
             "use_cuda_graph": not args.no_cuda_graph,
@@ -679,8 +694,97 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_indices=kv_indices,
                 kv_len_arr=kv_lens,
             )
+        wrapper_factory = flashinfer.mla.BatchMLAPagedAttentionWrapper
+        if backend == "prims-ts":
+            prims_ts = _get_prims_ts_module()
+
+            class PrimsTSMLAAdapter:
+                resolved_backend = "prims-ts"
+                auto_selection_trace = None
+
+                def __init__(self, **_kwargs):
+                    self._wrapper = prims_ts.BatchMLADecodePagedTSWrapper()
+                    self._out = torch.empty(
+                        total_q,
+                        args.num_qo_heads,
+                        args.head_dim_ckv,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
+
+                def plan(self, **_kwargs):
+                    if q_dtype != kv_dtype:
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts requires matching query and cache dtypes"
+                        )
+                    if q_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA supports bfloat16 and float8_e4m3fn inputs"
+                        )
+                    if (args.head_dim_ckv, args.head_dim_kpe) != (512, 64):
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts requires head_dim_ckv=512 and head_dim_kpe=64"
+                        )
+                    if args.page_size not in (16, 32, 64, 128):
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts requires page_size in {16, 32, 64, 128}"
+                        )
+                    if out_dtype != torch.bfloat16:
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA produces bfloat16 output"
+                        )
+                    if args.mla_kv_layout != "combined":
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA benchmark requires --mla-kv-layout combined"
+                        )
+                    if args.mla_lse_mode != "none":
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA does not expose LSE"
+                        )
+                    if args.mla_use_sinks or args.mla_skip_softmax:
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA does not support sinks or skip-softmax"
+                        )
+                    if args.enable_pdl:
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA does not expose PDL"
+                        )
+                    if args.mla_output_scale != "none" or args.mla_scale_mode not in (
+                        "default",
+                        "bmm-scalar",
+                    ):
+                        raise _BackendPlanUnsupportedError(
+                            "prims-ts MLA supports unscaled BF16 output and scalar BMM scales"
+                        )
+                    self._wrapper.plan(
+                        block_tables,
+                        kv_lens,
+                        args.num_qo_heads,
+                        args.head_dim_ckv,
+                        args.head_dim_kpe,
+                        args.page_size,
+                        qo_indptr=qo_indptr,
+                        max_seq_len_q=int(q_lens.max().item()),
+                        q_data_type=q_dtype,
+                        kv_data_type=kv_dtype,
+                        o_data_type=out_dtype,
+                        mask_type="causal" if args.causal else "dense",
+                        max_kv_len=args.s_kv,
+                    )
+
+                def run(self, **run_kwargs):
+                    return self._wrapper.run(
+                        combined_q,
+                        combined_kv,
+                        bmm1_scale=run_kwargs.get("bmm1_scale", sm_scale),
+                        bmm2_scale=run_kwargs.get("bmm2_scale", 1.0),
+                        out=self._out,
+                    )
+
+            wrapper_factory = PrimsTSMLAAdapter
+
         outcome = _capture_mla_backend(
-            wrapper_factory=flashinfer.mla.BatchMLAPagedAttentionWrapper,
+            wrapper_factory=wrapper_factory,
             backend=backend,
             constructor_kwargs=constructor_kwargs,
             plan_kwargs=backend_plan_kwargs,

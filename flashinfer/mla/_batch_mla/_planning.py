@@ -617,6 +617,10 @@ class _MLAPlanArguments:
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, MLAPlanMetadata):
             raise TypeError("metadata must be an MLAPlanMetadata instance.")
+        if self.head_dim_ckv <= 0:
+            raise ValueError(f"head_dim_ckv must be > 0, got {self.head_dim_ckv}.")
+        if self.head_dim_kpe < 0:
+            raise ValueError(f"head_dim_kpe must be >= 0, got {self.head_dim_kpe}.")
         if self.lse_mode not in ("none", "base2", "basee"):
             raise ValueError(f"unsupported LSE mode {self.lse_mode!r}")
         if self.kv_layout not in ("combined", "adjacent-split", "independent-split"):

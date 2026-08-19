@@ -143,10 +143,12 @@ def _validate_planned_run_arguments(
     return_lse_base_on_e: bool,
     o_scale: Optional[float],
     ckv_scale: Optional[float],
+    ckv_scale_arr: Optional[torch.Tensor],
     kpe_scale: Optional[float],
     bmm1_scale: Optional[Union[float, torch.Tensor]],
     bmm2_scale: Optional[Union[float, torch.Tensor]],
     skip_softmax_threshold_scale_factor: Optional[float],
+    allow_default_kv_scale: bool = False,
 ) -> None:
     actual_lse_mode = "none"
     if return_lse or lse is not None:
@@ -165,9 +167,9 @@ def _validate_planned_run_arguments(
         _raise_planned_run_argument_mismatch(
             "o_scale", planned_output_scale, actual_output_scale
         )
-    if ckv_scale is not None and kpe_scale is not None:
+    if (ckv_scale is not None or ckv_scale_arr is not None) and kpe_scale is not None:
         actual_scale_mode = "kv-per-tensor"
-    elif ckv_scale is not None or kpe_scale is not None:
+    elif ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None:
         actual_scale_mode = "incomplete-kv-per-tensor"
     elif bmm1_scale is not None and bmm2_scale is not None:
         bmm1_is_tensor = isinstance(bmm1_scale, torch.Tensor)
@@ -182,7 +184,11 @@ def _validate_planned_run_arguments(
         actual_scale_mode = "incomplete-bmm"
     else:
         actual_scale_mode = "default"
-    if actual_scale_mode != planned_scale_mode:
+    if actual_scale_mode != planned_scale_mode and not (
+        allow_default_kv_scale
+        and planned_scale_mode == "default"
+        and actual_scale_mode == "kv-per-tensor"
+    ):
         _raise_planned_run_argument_mismatch(
             "scale mode", planned_scale_mode, actual_scale_mode
         )
@@ -329,15 +335,17 @@ class BatchMLAPagedAttentionWrapper:
             ``"cutlass"`` uses the SM100/SM110 CUTLASS MLA decode kernel. Only
             ``float_workspace_buffer`` is required at construction. Pass
             packed ``kv_cache`` or adjacent split cache views to satisfy the
-            zero-copy packed-native contract. Non-adjacent split caches are
-            rejected by CUTLASS. ``kv_len`` and
+            zero-copy packed-native contract. Planned CUTLASS runs reject
+            non-adjacent split caches. ``kv_len`` and
             ``page_table`` may be captured by ``plan()`` and omitted from ``run()``; planned
             metadata takes precedence over cheap-verified aliases supplied at
             run time. Deprecated: an explicitly requested CUTLASS backend may
             also run without a preceding ``plan()`` when both metadata tensors
-            are supplied to ``run()``. Call ``plan()`` with canonical dense
-            metadata before ``run()`` instead. This compatibility path will be
-            removed in a future release.
+            are supplied to ``run()``. This deprecated path preserves the
+            historical behavior of concatenating independent split inputs on
+            the GPU. Call ``plan()`` with canonical dense metadata before
+            ``run()`` instead. This compatibility path will be removed in a
+            future release.
 
             ``"trtllm-gen"`` uses the dense TRTLLM-GEN MLA decode path.
 
@@ -371,6 +379,7 @@ class BatchMLAPagedAttentionWrapper:
         self._backend_impl: Optional[object] = None
         self._input_contract: Optional[MLAInputContract] = None
         self._auto_selection_trace: Optional[_auto_policy.MLAAutoSelectionTrace] = None
+        self._copy_legacy_cutlass_split_inputs = False
         self._warned_legacy_tensor_arguments = False
         self._warned_positional_arguments = False
 
@@ -484,6 +493,7 @@ class BatchMLAPagedAttentionWrapper:
         self._backend_impl = backend_type.plan_from_wrapper(args)
         self._selected_backend = backend
         self._input_contract = args.input_contract
+        self._copy_legacy_cutlass_split_inputs = False
 
     def _publish_auto_plan(
         self, args: _MLAPlanArguments, result: _auto_policy._MLAAutoPlanResult
@@ -492,6 +502,7 @@ class BatchMLAPagedAttentionWrapper:
         self._backend_impl = result.backend_impl
         self._selected_backend = result.backend_name
         self._input_contract = args.input_contract
+        self._copy_legacy_cutlass_split_inputs = False
         self._auto_selection_trace = result.trace
 
     # Preferred form.
@@ -548,8 +559,8 @@ class BatchMLAPagedAttentionWrapper:
         is_var_seq: Optional[bool] = None,
         use_sinks: bool = False,
         lse_mode: Literal["none", "base2", "basee"] = "none",
-        query_layout: Literal["packed", "split"] = "packed",
-        kv_cache_layout: Literal["packed", "split"] = "packed",
+        query_layout: Literal["packed", "split"] = "split",
+        kv_cache_layout: Literal["packed", "split"] = "split",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
         scale_mode: Literal[
@@ -582,8 +593,8 @@ class BatchMLAPagedAttentionWrapper:
         is_var_seq: Optional[bool] = None,
         use_sinks: bool = False,
         lse_mode: Literal["none", "base2", "basee"] = "none",
-        query_layout: Literal["packed", "split"] = "packed",
-        kv_cache_layout: Literal["packed", "split"] = "packed",
+        query_layout: Literal["packed", "split"] = "split",
+        kv_cache_layout: Literal["packed", "split"] = "split",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
         scale_mode: Literal[
@@ -620,8 +631,8 @@ class BatchMLAPagedAttentionWrapper:
         is_var_seq: Optional[bool] = None,
         use_sinks: bool = False,
         lse_mode: Literal["none", "base2", "basee"] = "none",
-        query_layout: Literal["packed", "split"] = "packed",
-        kv_cache_layout: Literal["packed", "split"] = "packed",
+        query_layout: Optional[Literal["packed", "split"]] = None,
+        kv_cache_layout: Optional[Literal["packed", "split"]] = None,
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
         scale_mode: Literal[
@@ -679,7 +690,10 @@ class BatchMLAPagedAttentionWrapper:
         ``query_layout`` and ``kv_cache_layout`` describe the representations
         supplied to ``run()``. A packed plan accepts packed tensors or adjacent
         split views that can be reinterpreted without a copy; a split plan also
-        accepts packed tensors, which are sliced into zero-copy views.
+        accepts packed tensors, which are sliced into zero-copy views. When
+        omitted, canonical ``metadata`` defaults to packed inputs while the
+        deprecated flat-metadata forms retain their historical split-input
+        default.
 
         With ``use_cuda_graph=True``, the initial successful plan can be used
         for capture and replay. Dense backends (CUTLASS, TRTLLM-GEN, both CuTe
@@ -699,6 +713,7 @@ class BatchMLAPagedAttentionWrapper:
         self._reject_unsafe_cuda_graph_replan()
 
         # Legacy and deprecation handling: Metadata tensors
+        uses_flat_metadata = metadata is None
         if metadata is not None:
             if not isinstance(metadata, MLAPlanMetadata):
                 raise TypeError("metadata must be an MLAPlanMetadata instance.")
@@ -733,10 +748,14 @@ class BatchMLAPagedAttentionWrapper:
 
         # Normalize the supported metadata-driven planning contract.
         deprecated_plan_reasons: list[str] = []
-        if metadata is None:
+        if uses_flat_metadata:
             deprecated_plan_reasons.append(
                 "flat metadata arguments should be replaced with MLAPlanMetadata"
             )
+        if query_layout is None:
+            query_layout = "split" if uses_flat_metadata else "packed"
+        if kv_cache_layout is None:
+            kv_cache_layout = "split" if uses_flat_metadata else "packed"
         if query_layout not in ("packed", "split"):
             raise ValueError(f"unsupported query layout {query_layout!r}")
         if kv_cache_layout not in ("packed", "split"):
@@ -892,6 +911,7 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
@@ -926,6 +946,7 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
@@ -951,6 +972,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
@@ -975,6 +997,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
@@ -1020,6 +1043,7 @@ class BatchMLAPagedAttentionWrapper:
             torch.Tensor
         ] = None,  # deprecated, use ``kv_cache`` instead
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
@@ -1077,7 +1101,7 @@ class BatchMLAPagedAttentionWrapper:
             with ``kpe_cache``.
         kpe_cache : Optional[torch.Tensor]
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
-            ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
+            ``head_dim_kpe`` can be zero for NoPE MLA.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
             When ``o_scale`` is provided, this should be an FP8 tensor.
@@ -1109,14 +1133,15 @@ class BatchMLAPagedAttentionWrapper:
             the ``cutlass`` backend.
         ckv_scale : Optional[float]
             Per-tensor dequantization scale for the compressed-KV cache when
-            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
-            (together with ``kpe_scale``) for the FP8 KV cache path on the
-            ``fa3`` backend. Must be a finite positive value. Must not be
-            provided when ``kv_data_type`` is BF16/FP16.
+            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Exactly
+            one of ``ckv_scale`` or ``ckv_scale_arr`` is required for FP8 KV.
+        ckv_scale_arr : Optional[torch.Tensor]
+            Contiguous float32 per-token, per-128-channel CKV scales with shape
+            ``ckv_cache.shape[:-1] + (head_dim_ckv // 128,)``. Exactly one of
+            ``ckv_scale`` or ``ckv_scale_arr`` is required for FP8 KV.
         kpe_scale : Optional[float]
             Per-tensor dequantization scale for the rope-K cache when
-            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
-            usage rules as ``ckv_scale``.
+            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``).
         sinks : Optional[torch.Tensor]
             Per-head float32 attention sinks. For the CuTe DSL family, sinks
             must be planned with ``use_sinks=True`` and use
@@ -1139,10 +1164,12 @@ class BatchMLAPagedAttentionWrapper:
         Running an explicitly requested CUTLASS backend without first calling
         :meth:`plan` is deprecated. Call ``plan()`` with canonical dense
         metadata before ``run()`` instead. This compatibility path will be
-        removed in a future release.
+        removed in a future release. Independent split query and KV-cache
+        tensors are concatenated on the GPU on each run through this path.
 
         Non-adjacent split cache tensors are rejected by packed-native
-        backends. FA2 and FA3 continue to accept split KV tensors natively.
+        backends outside the deprecated unplanned-CUTLASS compatibility path.
+        FA2 and FA3 continue to accept split KV tensors natively.
 
         Notes
         -----
@@ -1178,10 +1205,13 @@ class BatchMLAPagedAttentionWrapper:
         )
         contract = self._input_contract
         has_fused_scale = bmm1_scale is not None or bmm2_scale is not None
-        has_per_tensor_scale = ckv_scale is not None or kpe_scale is not None
-        if has_fused_scale and has_per_tensor_scale:
+        has_kv_scale = (
+            ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None
+        )
+        if has_fused_scale and has_kv_scale:
             raise ValueError(
-                "fused bmm scales and ckv_scale / kpe_scale are mutually exclusive."
+                "fused bmm scales and ckv_scale / ckv_scale_arr / kpe_scale "
+                "are mutually exclusive."
             )
         bmm1_is_tensor = isinstance(bmm1_scale, torch.Tensor)
         bmm2_is_tensor = isinstance(bmm2_scale, torch.Tensor)
@@ -1194,6 +1224,70 @@ class BatchMLAPagedAttentionWrapper:
                 "bmm1_scale and bmm2_scale must be supplied together as a tensor pair."
             )
 
+        is_unplanned_cutlass = (
+            self._selected_backend is None and self._backend == "cutlass"
+        )
+        if is_unplanned_cutlass or self._copy_legacy_cutlass_split_inputs:
+            if is_unplanned_cutlass and (kv_len is None or page_table is None):
+                raise ValueError(
+                    "unplanned CUTLASS requires both kv_len and page_table metadata."
+                )
+
+            widths = (512, 64)
+            query_kind, query_dtype, query_shape = _structural_mla_input_facts(
+                query, widths=widths, name="query"
+            )
+            kv_kind, kv_dtype, kv_shape = _structural_mla_input_facts(
+                kv_cache, widths=widths, name="KV cache"
+            )
+            if is_unplanned_cutlass:
+                warnings.warn(
+                    "Running an explicitly requested CUTLASS backend without first "
+                    "calling plan() is deprecated; call plan() with canonical dense "
+                    "metadata before run() instead. Independent split query or "
+                    "KV-cache tensors are concatenated on the GPU on every run "
+                    "through this compatibility path, which will be removed in a "
+                    "future release.",
+                    DeprecationWarning,
+                    stacklevel=4,
+                )
+                assert kv_len is not None and page_table is not None
+                self.plan(
+                    metadata=MLAPlanMetadata.dense(
+                        torch.arange(
+                            query_shape[0] + 1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        page_table,
+                        kv_len,
+                        max_q_len=1,
+                    ),
+                    num_heads=query_shape[-2],
+                    head_dim_ckv=widths[0],
+                    head_dim_kpe=widths[1],
+                    page_size=kv_shape[-2],
+                    causal=False,
+                    sm_scale=1.0 / math.sqrt(128 + widths[1]),
+                    q_data_type=query_dtype,
+                    kv_data_type=kv_dtype,
+                    query_layout="packed",
+                    kv_cache_layout="packed",
+                    output_dtype=None if out is None else out.dtype,
+                    output_scale="per-tensor" if o_scale is not None else "none",
+                )
+                self._copy_legacy_cutlass_split_inputs = True
+
+            if query_kind == "independent-split":
+                query = torch.cat(
+                    cast(tuple[torch.Tensor, torch.Tensor], query), dim=-1
+                )
+            if kv_kind == "independent-split":
+                kv_cache = torch.cat(
+                    cast(tuple[torch.Tensor, torch.Tensor], kv_cache), dim=-1
+                )
+
+        contract = self._input_contract
         if contract is not None:
             widths = (contract.head_dim_ckv, contract.head_dim_kpe)
             if None not in widths:
@@ -1224,84 +1318,56 @@ class BatchMLAPagedAttentionWrapper:
                 return_lse_base_on_e=return_lse_base_on_e,
                 o_scale=o_scale,
                 ckv_scale=ckv_scale,
+                ckv_scale_arr=ckv_scale_arr,
                 kpe_scale=kpe_scale,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            )
-
-        # Legacy CUTLASS run-without-plan compatibility path.
-        if self._selected_backend is None and self._backend == "cutlass":
-            warnings.warn(
-                "Running an explicitly requested CUTLASS backend without first "
-                "calling plan() is deprecated; call plan() with canonical dense "
-                "metadata before run() instead. This compatibility path will be "
-                "removed in a future release.",
-                DeprecationWarning,
-                stacklevel=4,
-            )
-            if kv_len is None or page_table is None:
-                raise ValueError(
-                    "unplanned CUTLASS requires both kv_len and page_table metadata."
-                )
-
-            widths = (512, 64)
-            _, query_dtype, query_shape = _structural_mla_input_facts(
-                query, widths=widths, name="query"
-            )
-            kv_kind, kv_dtype, kv_shape = _structural_mla_input_facts(
-                kv_cache, widths=widths, name="KV cache"
-            )
-            if kv_kind == "independent-split":
-                raise ValueError(
-                    "unplanned CUTLASS requires a packed or adjacent-split KV cache."
-                )
-            self.plan(
-                metadata=MLAPlanMetadata.dense(
-                    torch.arange(
-                        query_shape[0] + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ),
-                    page_table,
-                    kv_len,
-                    max_q_len=1,
-                ),
-                num_heads=query_shape[-2],
-                head_dim_ckv=widths[0],
-                head_dim_kpe=widths[1],
-                page_size=kv_shape[-2],
-                causal=False,
-                sm_scale=1.0 / math.sqrt(128 + widths[1]),
-                q_data_type=query_dtype,
-                kv_data_type=kv_dtype,
-                query_layout="packed",
-                kv_cache_layout="packed",
-                output_dtype=None if out is None else out.dtype,
-                output_scale="per-tensor" if o_scale is not None else "none",
+                allow_default_kv_scale=self._selected_backend in ("fa2", "fa3"),
             )
 
         if self._selected_backend in _BATCH_MLA_BACKENDS:
             assert self._backend_impl is not None
             backend_impl = cast(_PlannedWrapperBackend, self._backend_impl)
-            result = backend_impl.run_from_wrapper(
-                query=query,
-                kv_cache=kv_cache,
-                out=out,
-                lse=lse,
-                return_lse=return_lse,
-                profiler_buffer=profiler_buffer,
-                kv_len=kv_len,
-                page_table=page_table,
-                return_lse_base_on_e=return_lse_base_on_e,
-                o_scale=o_scale,
-                ckv_scale=ckv_scale,
-                kpe_scale=kpe_scale,
-                sinks=sinks,
-                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-            )
+            if ckv_scale_arr is None:
+                result = backend_impl.run_from_wrapper(
+                    query=query,
+                    kv_cache=kv_cache,
+                    out=out,
+                    lse=lse,
+                    return_lse=return_lse,
+                    profiler_buffer=profiler_buffer,
+                    kv_len=kv_len,
+                    page_table=page_table,
+                    return_lse_base_on_e=return_lse_base_on_e,
+                    o_scale=o_scale,
+                    ckv_scale=ckv_scale,
+                    kpe_scale=kpe_scale,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                )
+            else:
+                result = backend_impl.run_from_wrapper(
+                    query=query,
+                    kv_cache=kv_cache,
+                    out=out,
+                    lse=lse,
+                    return_lse=return_lse,
+                    profiler_buffer=profiler_buffer,
+                    kv_len=kv_len,
+                    page_table=page_table,
+                    return_lse_base_on_e=return_lse_base_on_e,
+                    o_scale=o_scale,
+                    ckv_scale=ckv_scale,
+                    ckv_scale_arr=ckv_scale_arr,
+                    kpe_scale=kpe_scale,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                )
         else:
             raise RuntimeError(
                 f"BatchMLAPagedAttentionWrapper.run() received unexpected selected backend {self._selected_backend!r}"

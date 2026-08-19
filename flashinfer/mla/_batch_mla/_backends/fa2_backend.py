@@ -8,11 +8,13 @@ You may obtain a copy of the License at
   http://www.apache.org/licenses/LICENSE-2.0
 """
 
+import math
 from typing import Any, Optional, Sequence, Tuple, Union
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
+from flashinfer.utils import check_shape_dtype_device, get_compute_capability
 
 from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
 from .._planning import (
@@ -41,7 +43,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         lse_modes=frozenset({"none", "base2", "basee"}),
         kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
         output_scales=frozenset({"none"}),
-        scale_modes=frozenset({"default"}),
+        scale_modes=frozenset({"default", "kv-per-tensor"}),
     )
 
     def __init__(
@@ -79,6 +81,14 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             raise _BackendPlanUnsupportedError(
                 "fa2 backend does not support this output contract; it only "
                 "supports q_data_type output without o_scale."
+            )
+        if (
+            args.scale_mode == "kv-per-tensor"
+            and args.kv_data_type != torch.float8_e4m3fn
+        ):
+            raise _BackendPlanUnsupportedError(
+                "fa2 backend requires FP8 kv_data_type for the kv-per-tensor "
+                "scale contract."
             )
         args._generated_fa_workspace.raise_if_invalid()
         csr = args.csr
@@ -131,13 +141,37 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             raise _BackendPlanUnsupportedError(
                 "use_profiler is not supported by the fa2 backend."
             )
-        if kv_data_type not in (torch.float16, torch.bfloat16):
+        supported_kv_dtypes = (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        )
+        if kv_data_type not in supported_kv_dtypes:
             raise _BackendPlanUnsupportedError(
                 f"MLA kv_data_type {kv_data_type} is not supported by the fa2 "
-                "backend. Supported dtypes: "
-                f"{[torch.float16, torch.bfloat16]}."
+                f"backend. Supported dtypes: {list(supported_kv_dtypes)}."
             )
-        if q_data_type != kv_data_type:
+        if kv_data_type == torch.float8_e4m3fn:
+            try:
+                major, minor = get_compute_capability(self.device)
+            except ValueError as error:
+                raise _BackendPlanUnsupportedError(str(error)) from error
+            if (major, minor) != (9, 0):
+                raise _BackendPlanUnsupportedError(
+                    f"FP8 kv_data_type for fa2 MLA requires SM90, got SM{major}{minor}."
+                )
+            if q_data_type != torch.bfloat16:
+                raise _BackendPlanUnsupportedError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    f"q_data_type=torch.bfloat16, got {q_data_type}."
+                )
+            if head_dim_ckv != 512 or head_dim_kpe not in (0, 64):
+                raise _BackendPlanUnsupportedError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    "head_dim_ckv=512 and head_dim_kpe in (0, 64), got "
+                    f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
+                )
+        elif q_data_type != kv_data_type:
             raise _BackendPlanUnsupportedError(
                 "fa2 MLA requires query and KV inputs to have matching dtypes."
             )
@@ -177,6 +211,9 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         return_lse: bool,
         profiler_buffer: Optional[torch.Tensor],
         return_lse_base_on_e: bool,
+        ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         self._validate_run_input_dtypes(
             q_nope=q_nope,
@@ -184,6 +221,54 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             ckv_cache=ckv_cache,
             kpe_cache=kpe_cache,
         )
+        if self._kv_data_type == torch.float8_e4m3fn:
+            if (ckv_scale is None) == (ckv_scale_arr is None):
+                raise ValueError(
+                    "Exactly one of ckv_scale or ckv_scale_arr is required when "
+                    "kv_data_type is FP8."
+                )
+            if kpe_scale is None:
+                raise ValueError("kpe_scale is required when kv_data_type is FP8.")
+            ckv_scale_f = 1.0 if ckv_scale is None else float(ckv_scale)
+            kpe_scale_f = float(kpe_scale)
+            if ckv_scale is not None and (
+                not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0
+            ):
+                raise ValueError(
+                    f"ckv_scale must be a finite positive value, got {ckv_scale}"
+                )
+            if not math.isfinite(kpe_scale_f) or kpe_scale_f <= 0.0:
+                raise ValueError(
+                    f"kpe_scale must be a finite positive value, got {kpe_scale}"
+                )
+        else:
+            if (
+                ckv_scale is not None
+                or ckv_scale_arr is not None
+                or kpe_scale is not None
+            ):
+                raise ValueError(
+                    "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
+                    "kv_data_type is FP8."
+                )
+            ckv_scale_f = 1.0
+            kpe_scale_f = 1.0
+
+        if ckv_scale_arr is not None:
+            expected_scale_shape = (
+                *ckv_cache.shape[:-1],
+                self._head_dim_ckv // 128,
+            )
+            check_shape_dtype_device(
+                ckv_scale_arr,
+                expected_scale_shape,
+                torch.float32,
+                ckv_cache.device,
+                "ckv_scale_arr",
+            )
+            if not ckv_scale_arr.is_contiguous():
+                raise ValueError("ckv_scale_arr must be contiguous.")
+
         return self._run_generated_fa_after_input_validation(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -194,8 +279,9 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             return_lse=return_lse,
             profiler_buffer=profiler_buffer,
             return_lse_base_on_e=return_lse_base_on_e,
-            ckv_scale=1.0,  # FP8 KV is unsupported by fa2.
-            kpe_scale=1.0,  # FP8 KV is unsupported by fa2.
+            ckv_scale=ckv_scale_f,
+            kpe_scale=kpe_scale_f,
+            ckv_scale_arr=ckv_scale_arr,
         )
 
     def run_from_wrapper(
@@ -212,6 +298,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         return_lse_base_on_e: bool,
         o_scale: Optional[float],
         ckv_scale: Optional[float],
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float],
         sinks: Optional[torch.Tensor],
         skip_softmax_threshold_scale_factor: Optional[float],
@@ -250,11 +337,6 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             raise ValueError(
                 "o_scale is only supported with the cutlass backend for now."
             )
-        if ckv_scale is not None or kpe_scale is not None:
-            raise ValueError(
-                "ckv_scale / kpe_scale are only supported with the fa3 backend "
-                "and FP8 kv_data_type."
-            )
         return self.run(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -265,6 +347,9 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
             return_lse=return_lse,
             profiler_buffer=profiler_buffer,
             return_lse_base_on_e=return_lse_base_on_e,
+            ckv_scale=ckv_scale,
+            ckv_scale_arr=ckv_scale_arr,
+            kpe_scale=kpe_scale,
         )
 
 

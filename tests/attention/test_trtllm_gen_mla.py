@@ -8,6 +8,7 @@ from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_r
 import flashinfer
 from flashinfer.mla._batch_mla._backends import trtllm_gen_backend
 from flashinfer.mla import (
+    MLAPlanMetadata,
     MLALayerDimensions,
     deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
@@ -33,6 +34,39 @@ def test_grouped_mla_selection_is_not_a_public_option():
     ).parameters
 
     assert "selects_grouped_mla" not in parameters
+
+
+def test_trtllm_gen_mla_launcher_passes_default_fp8_transform_mode():
+    calls = []
+    launcher = trtllm_gen_backend._TrtllmGenMlaDecodeLauncher(
+        lambda *args: calls.append(args)
+    )
+    launcher._multi_ctas_kv_counter_buffer = torch.empty(1, dtype=torch.uint8)
+    launcher._counter_is_preplanned = True
+    query = torch.empty((1, 1, 1, 576))
+    kv_cache = torch.empty((1, 1, 32, 576))
+    workspace = torch.empty(1, dtype=torch.uint8)
+
+    launcher.run(
+        out=torch.empty((1, 1, 1, 512)),
+        query=query,
+        key_cache=kv_cache,
+        value_cache=kv_cache,
+        workspace_buffer=workspace,
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        max_q_len=1,
+        max_seq_len=32,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        batch_size=1,
+        num_qo_heads=1,
+        sparse_mla_top_k=0,
+        sm_count=1,
+        enable_pdl=False,
+    )
+
+    assert calls[0][-1] == 0
 
 
 def trtllm_gen_workspace_softmax_end_bytes_decode(
@@ -575,19 +609,22 @@ def trtllm_batch_decode_mla(
     kv_indices = all_block_ids.int()
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        seq_lens_tensor,
-        layer_dimensions.num_heads,
-        layer_dimensions.head_dimensions.kv_lora_rank,
-        layer_dimensions.head_dimensions.qk_rope_head_dim,
-        page_size,
-        True,
-        sm_scale,
-        q_ref.dtype,
-        kv_cache.dtype,
-        kv_layout="adjacent-split",
+        metadata=MLAPlanMetadata.csr(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_lens_tensor,
+        ),
+        num_heads=layer_dimensions.num_heads,
+        head_dim_ckv=layer_dimensions.head_dimensions.kv_lora_rank,
+        head_dim_kpe=layer_dimensions.head_dimensions.qk_rope_head_dim,
+        page_size=page_size,
+        causal=True,
+        sm_scale=sm_scale,
+        q_data_type=q_ref.dtype,
+        kv_data_type=kv_cache.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
     )
     q_nope = q_ref[..., : layer_dimensions.head_dimensions.kv_lora_rank].reshape(
         -1,
@@ -604,7 +641,11 @@ def trtllm_batch_decode_mla(
     ckv = kv_cache[..., : layer_dimensions.head_dimensions.kv_lora_rank]
     kpe = kv_cache[..., layer_dimensions.head_dimensions.kv_lora_rank :]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=False,
+    )
 
     # cute-dsl fp8 kernel outputs fp8; cast to bf16 to match trtllm-gen / reference
     if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:
@@ -1198,6 +1239,95 @@ def test_trtllm_batch_decode_mla(
         skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         use_cum_seq_lens_q=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("q_len_per_request", [2, 3, 4, 5, 6, 7, 8, 9, 16, 32])
+def test_trtllm_batch_decode_grouped_mla(
+    dtype: torch.dtype,
+    num_heads: int,
+    q_len_per_request: int,
+):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, num_heads),
+        batch_size=1,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=q_len_per_request,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_trtllm_batch_decode_grouped_mla_batch_16(dtype: torch.dtype):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 32),
+        batch_size=16,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_q1_mla():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_fixed_q_batch_stride():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 8),
+        batch_size=2,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=2,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_variable_q_lengths():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=3,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        use_cum_seq_lens_q=True,
     )
 
 

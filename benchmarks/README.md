@@ -30,13 +30,16 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
           deterministic wrapper `auto`. Auto promotion is architecture-primary
           product policy, not a total benchmark-derived performance order;
           backend planners still determine exact support.
+        - On SM100/SM103, `prims-ts` is available as an adapter-backed
+          comparative candidate. It is not a public MLA wrapper backend.
     - `batch_mla_paged_attention` - Dense functional MLA decode.
         - Benchmarks the public functional API separately for `auto`, `xqa`,
           `trtllm-gen`, `cute-dsl`, `fa2`, `fa3`, and `cutlass`. It never
           dispatches through the wrapper benchmark and does not include sparse MLA.
-    - The attention routines accept `--backends prims-ts` on SM100/SM103 to
-      benchmark the experimental task-scheduled attention implementation.
-      `prims_ts` is accepted as an alias.
+    - Stateful attention routines accept `--backends prims-ts` on SM100/SM103
+      to benchmark the experimental task-scheduled attention implementation.
+      `prims_ts` is accepted as an alias. The functional
+      `batch_mla_paged_attention` routine does not accept this adapter.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -243,9 +246,10 @@ requested/resolved backend, explicit correctness, the declared QK NoPE width,
 structured status/reason, phase summaries with explicit sample counts
 (`cuda_graph_*` timings map to the `graph_replay` objective), workspace bytes,
 and
-`peak_memory_delta_bytes` when it is reliably available. Every candidate that
-survives capture retains a distinct 128 MiB workspace so later timing cannot
-alias another wrapper's state. The peak field is candidate-relative: it is the
+`peak_memory_delta_bytes` when it is reliably available. Every public-wrapper
+candidate that survives capture retains a distinct 128 MiB workspace so later
+timing cannot alias another wrapper's state. PrimTS owns its internal workspace
+and does not receive this extra buffer. The peak field is candidate-relative: it is the
 larger of the capture and timing CUDA allocator peaks after subtracting the
 bytes allocated at the start of that phase, rather than the process-wide peak.
 Only `_BackendPlanUnsupportedError` raised by `plan()` is an unsupported
@@ -665,7 +669,7 @@ Legend:
 | **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
 | **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
-| **BatchMLAPagedAttentionWrapper** |  | fa2, auto | fa2, auto | fa2, auto | fa2, fa3, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, auto | fa2, xqa, auto |
+| **BatchMLAPagedAttentionWrapper** |  | fa2, auto | fa2, auto | fa2, auto | fa2, fa3, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, prims-ts, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, prims-ts, auto | fa2, xqa, auto |
 | **batch_mla_paged_attention** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-gen, cute-dsl, auto | fa2, cutlass, trtllm-gen, cute-dsl, auto | fa2, xqa, auto |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |

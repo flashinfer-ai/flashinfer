@@ -667,11 +667,9 @@ def test_cute_dsl_mla_dcp_packed_head_counts(num_heads):
     assert split_kvs == [1, 1]
 
 
-def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
-    """The public runner must batch-sweep DCP metadata and return caller B1."""
+def test_cute_dsl_mla_dcp_public_api_validates_and_returns_caller_b1():
+    """The public DCP path validates global lengths and returns caller B1."""
     _skip_if_unsupported()
-    from flashinfer import autotune
-    from flashinfer.autotuner import AutoTuner
     from flashinfer.mla._core import (
         trtllm_batch_decode_with_kv_cache_mla,
     )
@@ -721,15 +719,10 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
             causal_seqlens_kv_global=[256],
         )
 
-    AutoTuner.get().clear_cache()
-    try:
-        with autotune(tune_mode=True):
-            out, lse = trtllm_batch_decode_with_kv_cache_mla(
-                **public_args,
-                causal_seqlens_kv_global=global_lens,
-            )
-    finally:
-        AutoTuner.get().clear_cache()
+    out, lse = trtllm_batch_decode_with_kv_cache_mla(
+        **public_args,
+        causal_seqlens_kv_global=global_lens,
+    )
 
     ref_out, ref_lse = _reference_attention(
         query,

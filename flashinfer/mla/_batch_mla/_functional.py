@@ -174,9 +174,8 @@ def _mla_decode_tuning_config(
 ) -> TuningConfig:
     """Return a stable per-shape tuning config for the batch sweep.
 
-    ``AutoTuner._find_nearest_profile`` caches by the tuning config. Reusing
-    the config and its initializer closures prevents distinct but equivalent
-    per-call closures from retaining an unbounded profile cache.
+    Reusing the config and its initializer closures avoids rebuilding the
+    batch-sweep description on the decode hot path.
     """
 
     def init_block_tables(shapes, dtype, device):
@@ -196,11 +195,9 @@ def _mla_decode_tuning_config(
 
     has_sparse_lens = sparse_top_k_width > 0
     input_idx = (0, 1, 2, 3, 4) if has_sparse_lens else (0, 1, 2, 3)
-    initializers = (
-        (None, init_block_tables, init_seq_lens, None, init_sparse_top_k_lens)
-        if has_sparse_lens
-        else (None, init_block_tables, init_seq_lens, None)
-    )
+    initializers = [(1, init_block_tables), (2, init_seq_lens)]
+    if has_sparse_lens:
+        initializers.append((4, init_sparse_top_k_lens))
 
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -209,9 +206,9 @@ def _mla_decode_tuning_config(
                 dim_idx=(0,) * len(input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=initializers,
             ),
         ),
+        tensor_initializers=tuple(initializers),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

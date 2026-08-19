@@ -715,8 +715,6 @@ def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
             case.sm_scale,
             case.q_dtype,
             case.kv_dtype,
-            query_layout="split",
-            kv_cache_layout="split",
         )
         first = wrapper.run(
             inputs.q_nope, inputs.q_pe, inputs.ckv_cache, inputs.kpe_cache
@@ -728,7 +726,14 @@ def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
 
     assert warning_count == len(caught)
     assert sum("Positional MLA arguments" in str(item.message) for item in caught) == 1
-    assert sum("Legacy MLA metadata" in str(item.message) for item in caught) == 1
+    assert (
+        sum(
+            "flat metadata arguments should be replaced with MLAPlanMetadata"
+            in str(item.message)
+            for item in caught
+        )
+        == 1
+    )
     assert_mla_close(first, expected_output)
     assert_mla_close(second, expected_output)
 
@@ -765,8 +770,11 @@ def test_packed_native_wrapper_rejects_independent_structural_kv_zero_copy():
 
 
 def test_unplanned_cutlass_warning_is_attributed_to_public_caller(monkeypatch):
+    recorded = []
+
     class Backend:
         def run_from_wrapper(self, **kwargs):
+            recorded.append(kwargs)
             return kwargs["out"]
 
     monkeypatch.setattr(
@@ -775,8 +783,8 @@ def test_unplanned_cutlass_warning_is_attributed_to_public_caller(monkeypatch):
         classmethod(lambda _cls, _args: Backend()),
     )
     wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
-    query = torch.empty(1, 1, 576)
-    kv_cache = torch.empty(1, 1, 576)
+    query = (torch.full((1, 1, 512), 1.0), torch.full((1, 1, 64), 2.0))
+    kv_cache = (torch.full((1, 1, 512), 3.0), torch.full((1, 1, 64), 4.0))
     out = torch.empty(1, 1, 512)
     kv_len = torch.tensor([1], dtype=torch.int32)
     page_table = torch.zeros(1, 1, dtype=torch.int32)
@@ -791,14 +799,23 @@ def test_unplanned_cutlass_warning_is_attributed_to_public_caller(monkeypatch):
             kv_len=kv_len,
             page_table=page_table,
         )
+        wrapper.run(query=query, kv_cache=kv_cache, out=out)
 
-    warning = next(
+    cutlass_warnings = [
         item
         for item in caught
         if "explicitly requested CUTLASS backend" in str(item.message)
-    )
+    ]
+    assert len(cutlass_warnings) == 1
+    warning = cutlass_warnings[0]
     assert warning.filename == __file__
     assert warning.lineno == expected_lineno
+    assert len(recorded) == 2
+    expected_query = torch.cat(query, dim=-1)
+    expected_kv_cache = torch.cat(kv_cache, dim=-1)
+    for call in recorded:
+        torch.testing.assert_close(call["query"], expected_query)
+        torch.testing.assert_close(call["kv_cache"], expected_kv_cache)
 
 
 _TENSOR_FIRST_PRODUCTION_ROWS = (

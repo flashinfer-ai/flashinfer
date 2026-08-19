@@ -316,8 +316,8 @@ def _split_mla_tensor_references(
     left_width, right_width = widths
     if packed.ndim == 0:
         raise ValueError(f"packed {name} must have at least one dimension.")
-    if left_width <= 0 or right_width <= 0:
-        raise ValueError("split widths must be positive.")
+    if left_width <= 0 or right_width < 0:
+        raise ValueError("left split width must be positive and right non-negative.")
     if packed.shape[-1] != left_width + right_width:
         raise ValueError(
             f"packed {name} last dimension does not match planned split widths."
