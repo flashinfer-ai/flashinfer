@@ -43,27 +43,32 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
 
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
     wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    wrapper.plan(torch.tensor([0, 2, 9, 12], device=cuda_device))
+    wrapper.plan(torch.tensor([0, 0, 7, 7, 12], device=cuda_device))
 
     cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
     seq_order_ptr = wrapper._seq_order_buf.data_ptr()
     cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
     chunk_to_seq_ptr = wrapper._chunk_to_seq_buf.data_ptr()
     assert wrapper._cu_seqlens_buf.dtype == torch.int64
-    assert wrapper._cu_seqlens_buf.tolist() == [0, 2, 9, 12]
-    assert wrapper._seq_order_buf.tolist() == [1, 2, 0]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 1, 2, 3]
-    assert wrapper._chunk_to_seq_buf.tolist() == [0, 1, 2]
+    assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
+    assert wrapper._seq_order_buf.tolist() == [1, 3, 0, 2]
+    assert wrapper._cu_chunks_buf.tolist() == [0, 0, 1, 1, 2]
+    assert wrapper._chunk_to_seq_buf.tolist() == [1, 3]
 
-    wrapper.plan(torch.tensor([0, 8, 9, 12], device=cuda_device))
+    wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
     assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
     assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
     assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
     assert wrapper._chunk_to_seq_buf.data_ptr() == chunk_to_seq_ptr
-    assert wrapper._seq_order_buf.tolist() == [0, 2, 1]
+    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
 
     with pytest.raises(ValueError, match="total token count is fixed"):
-        wrapper.plan(torch.tensor([0, 8, 9, 13], device=cuda_device))
+        wrapper.plan(torch.tensor([0, 0, 2, 2, 13], device=cuda_device))
+
+    with pytest.raises(ValueError, match="non-decreasing"):
+        RecurrentKDAPrefillWrapper(cuda_device).plan(
+            torch.tensor([0, 2, 1, 12], device=cuda_device)
+        )
 
 
 def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
@@ -2502,6 +2507,65 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
         expected_state.float(),
         atol=1e-2,
         rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [12, 64])
+def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
+    flash_kda_device, num_heads
+):
+    inputs = _make_inputs(
+        seq_lens=[0, 17, 0, 33],
+        num_heads=num_heads,
+        packed=True,
+        initial_state=True,
+        seed=2040 + num_heads,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    reference_inputs = {
+        **inputs,
+        "initial_state": initial_state_seed.clone(),
+    }
+    reference = _chunk16_debug_reference if num_heads == 12 else _reference
+    expected_output, expected_state = reference(reference_inputs)
+
+    wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
+    wrapper.plan(inputs["cu_seqlens"])
+    output = torch.empty_like(inputs["q"])
+    run_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+    }
+    run_kwargs.pop("cu_seqlens")
+
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    with torch.cuda.stream(capture_stream):
+        wrapper.run(**run_kwargs)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = wrapper.run(**run_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    assert wrapper._workspace._captured
+    torch.testing.assert_close(
+        captured_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        captured_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
 
 

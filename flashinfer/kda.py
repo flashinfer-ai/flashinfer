@@ -135,7 +135,7 @@ def recurrent_kda(
             May be int32 or int64. Frozen prefill converts int32 offsets to
             int64 outside graph capture; graph capture requires caller-provided
             int64 offsets. For frozen prefill, values must start at zero, be
-            strictly increasing, and end at the total token count. This value
+            non-decreasing, and end at the total token count. This value
             contract is not normally host-validated. Eager calls without an
             explicit workspace or ``seq_order`` read these values once per
             unchanged offsets tensor to schedule longer sequences first on
@@ -444,7 +444,9 @@ class RecurrentKDAPrefillWrapper:
         ``cu_seqlens`` may reside on CPU or on this wrapper's CUDA device and
         may use int32 or int64 storage.  Device input is copied to the host for
         validation and sorting.  The resulting metadata is then copied into
-        stable int64/int32 CUDA buffers owned by the wrapper.
+        stable int64/int32 CUDA buffers owned by the wrapper. Repeated offsets
+        represent zero-length sequences and are retained in the sequence plan
+        with zero chunks.
         """
 
         if torch.cuda.is_current_stream_capturing():
@@ -470,9 +472,9 @@ class RecurrentKDAPrefillWrapper:
 
         offsets = tuple(int(value) for value in cu_seqlens.to("cpu").tolist())
         if offsets[0] != 0 or any(
-            right <= left for left, right in zip(offsets, offsets[1:], strict=False)
+            right < left for left, right in zip(offsets, offsets[1:], strict=False)
         ):
-            raise ValueError("cu_seqlens must start at zero and be strictly increasing")
+            raise ValueError("cu_seqlens must start at zero and be non-decreasing")
         num_sequences = len(offsets) - 1
         sequence_order = sorted(
             range(num_sequences),
