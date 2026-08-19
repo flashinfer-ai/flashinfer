@@ -3723,6 +3723,7 @@ def trtllm_batch_decode_with_kv_cache(
                 key_cache=k_cache,
                 value_cache=v_cache,
                 out=out,
+                workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 batch_size=batch_size,

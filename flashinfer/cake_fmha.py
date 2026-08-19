@@ -20,6 +20,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_context_fp8_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_module,
+    load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
 )
 from .utils import get_compute_capability
@@ -114,6 +115,7 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "context_bf16",
         "context_fp8",
         "decode_native_bf16",
+        "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
     }
 )
@@ -161,6 +163,44 @@ def _tma_paged_kv_strides_supported(tensor: torch.Tensor) -> bool:
         stride > 0 and stride * element_size % 16 == 0
         for stride in tensor.stride()[:3]
     )
+
+
+def _decode_native_workspace_supported(
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    block_tables: torch.Tensor,
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    pages_per_block: int,
+    page_table_rows: int,
+    lse: torch.Tensor | None,
+) -> bool:
+    """Mirror one native binding's resolved metadata/LSE workspace layout."""
+
+    if (
+        not workspace_buffer.is_contiguous()
+        or workspace_buffer.device != query.device
+    ):
+        return False
+    even_kv_blocks = (max_seq_len + 127) // 128
+    even_kv_blocks += even_kv_blocks % 2
+    even_kv_blocks = max(4, even_kv_blocks)
+    required_pages = even_kv_blocks * pages_per_block
+    source_pages = int(block_tables.shape[-1])
+    padded_pages = max(required_pages, source_pages)
+    if pages_per_block == 4:
+        padded_pages = (padded_pages + 3) // 4 * 4
+    needs_page_padding = source_pages != padded_pages
+
+    cursor = (batch_size * 4 + 15) // 16 * 16
+    if needs_page_padding:
+        cursor += batch_size * page_table_rows * padded_pages * 4
+        cursor = (cursor + 15) // 16 * 16
+    if lse is None:
+        cursor += query.shape[0] * query.shape[1] * 4
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    return workspace_bytes >= cursor
 
 
 def _manifest_optimized_route_accounting() -> tuple[int, int]:
@@ -212,6 +252,7 @@ def select_cake_fmha_decode_route(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     batch_size: int,
@@ -247,6 +288,18 @@ def select_cake_fmha_decode_route(
         return None
     if key_cache.shape != value_cache.shape:
         return None
+    if any(
+        tensor.device != query.device
+        for tensor in (
+            key_cache,
+            value_cache,
+            out,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+        )
+    ):
+        return None
     if key_cache.stride(3) != 1 or value_cache.stride(3) != 1:
         return None
     if query.shape[0] != batch_size * q_len:
@@ -272,13 +325,15 @@ def select_cake_fmha_decode_route(
         return None
     if sinks is not None and (
         not isinstance(sinks, torch.Tensor)
+        or sinks.device != query.device
         or sinks.dtype != torch.float32
         or sinks.numel() != num_q_heads
         or not sinks.is_contiguous()
     ):
         return None
     if lse is not None and (
-        lse.dtype != torch.float32
+        lse.device != query.device
+        or lse.dtype != torch.float32
         or lse.shape != (query.shape[0], num_q_heads)
         or not lse.is_contiguous()
         or lse.stride() != (num_q_heads, 1)
@@ -313,6 +368,16 @@ def select_cake_fmha_decode_route(
             and uses_shared_paged_kv_idx
             and _tma_paged_kv_strides_supported(key_cache)
             and _tma_paged_kv_strides_supported(value_cache)
+            and _decode_native_workspace_supported(
+                workspace_buffer,
+                query,
+                block_tables,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                pages_per_block=8,
+                page_table_rows=1,
+                lse=lse,
+            )
             and no_block_scales
             and not isinstance(bmm2_scale, torch.Tensor)
             and float(bmm2_scale) == 1.0
@@ -329,6 +394,16 @@ def select_cake_fmha_decode_route(
             and not uses_shared_paged_kv_idx
             and _tma_paged_kv_strides_supported(key_cache)
             and _tma_paged_kv_strides_supported(value_cache)
+            and _decode_native_workspace_supported(
+                workspace_buffer,
+                query,
+                block_tables,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                pages_per_block=4,
+                page_table_rows=2,
+                lse=lse,
+            )
             and no_block_scales
             and not isinstance(bmm2_scale, torch.Tensor)
             and float(bmm2_scale) == 1.0
@@ -340,6 +415,18 @@ def select_cake_fmha_decode_route(
             and key_cache.shape[2:] == (64, 512)
             and kv_layout == "HND"
             and uses_shared_paged_kv_idx
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _decode_native_workspace_supported(
+                workspace_buffer,
+                query,
+                block_tables,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                pages_per_block=2,
+                page_table_rows=1,
+                lse=lse,
+            )
             and no_block_scales
             and sinks is None
             and not isinstance(bmm2_scale, torch.Tensor)
@@ -422,18 +509,29 @@ def get_cake_fmha_decode_module(
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     loader = {
         "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
+        "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
         "decode_native_fp16_nhd": load_cake_fmha_decode_native_fp16_nhd_module,
     }.get(route.component)
     if loader is None:
         raise RuntimeError(
             f"Cake FMHA decode route has no authenticated loader: {route.component}"
         )
-    return loader(
+    common_args = (
         route.target,
         route.batch_size,
         route.q_len,
         route.num_q_heads,
         route.num_kv_heads,
+    )
+    if route.component == "decode_native_fp16_hd512":
+        return loader(
+            *common_args,
+            has_window=route.has_window,
+            use_scale_ptr=route.use_scale_ptr,
+            retain_kv_l2=route.retain_kv_l2,
+        )
+    return loader(
+        *common_args,
         has_sink=route.has_sink,
         has_window=route.has_window,
         use_scale_ptr=route.use_scale_ptr,

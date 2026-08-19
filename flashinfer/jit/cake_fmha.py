@@ -25,7 +25,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "8b61119d40173e65e16d0d23f8e49a39706bceca5c604d92c9072342c1006a5a"
+    "488df6ff2401838b8909d4c77ec3d4665e8a105004606b0df88b6c5e6754fb6b"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -33,6 +33,7 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_context_bf16_jit_binding.cu",
     "jit/cake_fmha_context_fp8_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
+    "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
@@ -45,6 +46,9 @@ _TARGET_FLAGS = {
 }
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+_DECODE_NATIVE_FP16_HD512_JIT_BINDING = (
+    "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu"
+)
 _DECODE_NATIVE_FP16_NHD_JIT_BINDING = (
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu"
 )
@@ -162,7 +166,7 @@ def _validate_decode_native_specialization(
     num_q_heads: int,
     num_kv_heads: int,
     *,
-    has_sink: bool,
+    has_sink: bool | None,
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
@@ -177,12 +181,14 @@ def _validate_decode_native_specialization(
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     if not 1 <= num_q_heads // num_kv_heads <= 8:
         raise ValueError("decode-native requires a head-group ratio in [1, 8]")
-    return {
-        "HAS_SINK": int(has_sink),
+    selector = {
         "HAS_WINDOW": int(has_window),
         "RETAIN_KV_L2": int(retain_kv_l2),
         "USE_SCALE_PTR": int(use_scale_ptr),
     }
+    if has_sink is not None:
+        selector["HAS_SINK"] = int(has_sink)
+    return selector
 
 
 def _get_component_sources(
@@ -763,6 +769,126 @@ def load_cake_fmha_decode_native_fp16_nhd_module(
     return module
 
 
+def get_cake_fmha_decode_native_fp16_hd512_uri(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> str:
+    selector = _validate_decode_native_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=None,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    )
+    return (
+        f"cake_fmha_decode_native_fp16_hd512_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_window{selector['HAS_WINDOW']}_scale{selector['USE_SCALE_PTR']}"
+        f"_retain{selector['RETAIN_KV_L2']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_decode_native_fp16_hd512_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> JitSpec:
+    """Build one authenticated decode-native FP16 head-dim-512 specialization."""
+
+    selector = _validate_decode_native_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=None,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    )
+    sources = _get_component_sources(
+        "decode_native_fp16_hd512",
+        target,
+        selector,
+        _DECODE_NATIVE_FP16_HD512_JIT_BINDING,
+    )
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_native_fp16_hd512_uri(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            has_window=has_window,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=retain_kv_l2,
+        ),
+        sources=list(sources),
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DQ_LEN={q_len}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
+            f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info(
+        "Generated Cake FMHA decode-native FP16 head-dim-512 JIT spec: %s",
+        spec.name,
+    )
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_native_fp16_hd512_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+):
+    module = gen_cake_fmha_decode_native_fp16_hd512_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA decode-native FP16 head-dim-512 module: %s", module)
+    return module
+
+
 @functools.cache
 def gen_cake_fmha_compat_module(target: CakeFmhaTarget) -> JitSpec:
     """Build the complete-domain route from the authenticated source package."""
@@ -811,17 +937,20 @@ __all__ = [
     "gen_cake_fmha_context_fp8_module",
     "gen_cake_fmha_compat_module",
     "gen_cake_fmha_decode_native_bf16_module",
+    "gen_cake_fmha_decode_native_fp16_hd512_module",
     "gen_cake_fmha_decode_native_fp16_nhd_module",
     "get_cake_fmha_context_bf16_uri",
     "get_cake_fmha_context_fp8_uri",
     "get_cake_fmha_compat_uri",
     "get_cake_fmha_csrc_dir",
     "get_cake_fmha_decode_native_bf16_uri",
+    "get_cake_fmha_decode_native_fp16_hd512_uri",
     "get_cake_fmha_decode_native_fp16_nhd_uri",
     "get_cake_fmha_manifest",
     "load_cake_fmha_context_bf16_module",
     "load_cake_fmha_context_fp8_module",
     "load_cake_fmha_compat_module",
     "load_cake_fmha_decode_native_bf16_module",
+    "load_cake_fmha_decode_native_fp16_hd512_module",
     "load_cake_fmha_decode_native_fp16_nhd_module",
 ]
