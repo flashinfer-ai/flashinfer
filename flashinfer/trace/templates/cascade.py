@@ -39,6 +39,11 @@ def _merge_state_reference(v_a, s_a, v_b, s_b):
         v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
     ) / exp_sum.unsqueeze(-1)
     s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
+    both_empty = torch.isneginf(s_max)
+    v_merged = torch.where(
+        both_empty.unsqueeze(-1), torch.zeros_like(v_merged), v_merged
+    )
+    s_merged = torch.where(both_empty, s_max, s_merged)
     return v_merged.to(v_a.dtype), s_merged.to(torch.float32)
 
 
@@ -124,6 +129,11 @@ def _merge_state_in_place_reference(v, s, v_other, s_other, mask=None):
         v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
     ) / exp_sum.unsqueeze(-1)
     s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
+    both_empty = torch.isneginf(s_max)
+    v_merged = torch.where(
+        both_empty.unsqueeze(-1), torch.zeros_like(v_merged), v_merged
+    )
+    s_merged = torch.where(both_empty, s_max, s_merged)
     if mask is not None:
         m = mask.to(torch.bool)
         v_merged = torch.where(m[:, None, None], v_merged, v_a)
@@ -221,6 +231,11 @@ def _merge_states_reference(v, s):
     weights = exp_s / exp_sum  # [seq_len, num_states, num_heads]
     v_merged = (v_f32 * weights.unsqueeze(-1)).sum(dim=1)
     s_merged = (s_max.squeeze(1) + torch.log(exp_sum.squeeze(1))) / math.log(2.0)
+    all_empty = torch.isneginf(s_max.squeeze(1))
+    v_merged = torch.where(
+        all_empty.unsqueeze(-1), torch.zeros_like(v_merged), v_merged
+    )
+    s_merged = torch.where(all_empty, s_max.squeeze(1), s_merged)
     return v_merged.to(v.dtype), s_merged.to(torch.float32)
 
 
