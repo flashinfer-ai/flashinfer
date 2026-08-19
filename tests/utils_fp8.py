@@ -110,6 +110,12 @@ def mxfp8_quantize_reference(
     )
     inv_scale.masked_fill_(scales == 0, 0)
     quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    # Model cvt.rn.satfinite.e4m3x2.f32 explicitly for Inf because PyTorch
+    # float8 conversion behavior differs across toolkit versions.
+    extreme_inf = (scales == 254).unsqueeze(-1) & torch.isinf(blocks)
+    quantized_bits = quantized.view(torch.uint8)
+    quantized_bits.masked_fill_(extreme_inf & (blocks > 0), 0x7E)
+    quantized_bits.masked_fill_(extreme_inf & (blocks < 0), 0xFE)
     return quantized.reshape(*a.shape[:-1], padded_k), _swizzle_mxfp8_scales(
         scales,
         sf_swizzle_layout,
