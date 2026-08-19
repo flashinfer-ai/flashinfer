@@ -255,10 +255,11 @@ def _vsa_run_core(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
 
+    q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
     o_bsa, lse_bsa = fwd_fn(
-        q.unsqueeze(0).contiguous(),
-        k.unsqueeze(0).contiguous(),
-        v.unsqueeze(0).contiguous(),
+        q_b,
+        k_b,
+        v_b,
         q2k_block_index=vsa_q2k_index,
         block_sparse_num=1,  # ignored when q2k_block_nums is provided
         block_sizes=None,
@@ -267,6 +268,19 @@ def _vsa_run_core(
         return_lse=True,
     )
 
+    return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
+
+
+def _vsa_reshape_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """NHD (no batch dim) -> BSHD with an implicit batch size of 1."""
+    return (
+        q.unsqueeze(0).contiguous(),
+        k.unsqueeze(0).contiguous(),
+        v.unsqueeze(0).contiguous(),
+    )
+
+
+def _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse):
     output = o_bsa[0]  # [1, M, H, D] -> [M, H, D]
     if out is not None:
         out.copy_(output)
@@ -279,6 +293,72 @@ def _vsa_run_core(
             lse_out = lse
         return output, lse_out
     return output
+
+
+def _vsa_run_core_blk64(
+    fwd_fn,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    vsa_q2k_index: torch.Tensor,
+    vsa_q2k_num: torch.Tensor,
+    sm_scale: Optional[float],
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+    kv_splits: Optional[Union[int, str]],
+    use_clc: Optional[bool],
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+):
+    """blk64-specific variant of :func:`_vsa_run_core` with kv_splits/use_clc/Sage-FP8 passthrough.
+
+    Kept separate from ``_vsa_run_core`` (used by the blk128/sm120_blk64
+    backends) rather than adding blk64-only kwargs there, so those backends'
+    call sites do not carry always-None dead parameters.
+    """
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+    q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
+
+    is_sage_fp8 = q_scale is not None
+    if is_sage_fp8:
+        # Sage FP8 requires a uniform (dense) top-k: the underlying kernel
+        # only accepts q2k_block_nums=None with a fixed block_sparse_num.
+        uniform_num = int(vsa_q2k_num[0, 0, 0].item())
+        if not torch.all(vsa_q2k_num == uniform_num):
+            raise ValueError(
+                "vsa_sm100_blk64 Sage FP8 requires a uniform number of KV "
+                "blocks per Q-block across the whole sparsity pattern "
+                "(upstream kernel limit: only a fixed block_sparse_num is "
+                "supported, not per-row q2k_block_nums)."
+            )
+        block_nums_arg = None
+        block_sparse_num_arg = uniform_num
+    else:
+        block_nums_arg = vsa_q2k_num
+        block_sparse_num_arg = 1  # ignored when q2k_block_nums is provided
+
+    o_bsa, lse_bsa = fwd_fn(
+        q_b,
+        k_b,
+        v_b,
+        q2k_block_index=vsa_q2k_index,
+        block_sparse_num=block_sparse_num_arg,
+        block_sizes=None,
+        q2k_block_nums=block_nums_arg,
+        softmax_scale=sm_scale,
+        return_lse=True,
+        kv_splits="auto" if kv_splits is None else kv_splits,
+        use_clc=use_clc,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
 
 
 class BlockSparseAttentionWrapper:
@@ -431,6 +511,11 @@ class BlockSparseAttentionWrapper:
         o_data_type: Union[str, torch.dtype] = "float16",
         non_blocking: bool = True,
         block_mask: Optional[torch.Tensor] = None,
+        kv_splits: Optional[Union[int, str]] = None,
+        use_clc: Optional[bool] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -508,6 +593,28 @@ class BlockSparseAttentionWrapper:
             (sparsity must be the same across QO-heads that share a KV-head).
             Only supported for the ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
+        kv_splits : Optional[Union[int, str]]
+            Number of KV splits for the split-KV combine path, or ``"auto"`` to pick a
+            split count from the sparsity heuristics. Only supported for the
+            ``vsa_sm100_blk64`` backend; must be ``None`` for all other backends.
+            ``None`` (default) is equivalent to ``kv_splits=1`` (no split).
+        use_clc : Optional[bool]
+            Override the SM100 blk64 scheduler: ``True`` forces the CLC persistent
+            scheduler, ``False`` forces the static scheduler, ``None`` (default) uses
+            the shape-based heuristic. Only supported for the ``vsa_sm100_blk64`` backend.
+        q_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``q``, shape ``(1, num_qo_heads, seqlen_q)``,
+            float32. Only supported for the ``vsa_sm100_blk64`` backend, and only when
+            ``q``/``k``/``v`` are ``float8_e4m3fn``. Must be provided together with
+            ``k_scale``/``v_scale``, or not at all. The Sage FP8 path additionally
+            requires ``batch_size == 1``, ``num_qo_heads in (4, 8)``, and dense
+            (non-variable) block sparsity -- see :func:`bsa_attn_sm100_blk64_fwd`.
+        k_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``k``, shape
+            ``(1, num_qo_heads, ceil(seqlen_k / 16))``, float32. See ``q_scale``.
+        v_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
+            float32. See ``q_scale``.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -526,6 +633,18 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        if self._backend != "vsa_sm100_blk64" and (
+            kv_splits is not None
+            or use_clc is not None
+            or q_scale is not None
+            or k_scale is not None
+            or v_scale is not None
+        ):
+            raise ValueError(
+                "kv_splits/use_clc/q_scale/k_scale/v_scale are only supported "
+                f"for backend='vsa_sm100_blk64', got backend={self._backend!r}"
+            )
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
@@ -621,7 +740,7 @@ class BlockSparseAttentionWrapper:
             self._sm_scale = sm_scale
             return
 
-        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
+        # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
         if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
@@ -639,10 +758,34 @@ class BlockSparseAttentionWrapper:
                 raise ValueError(
                     f"vsa_sm100_blk64 backend requires head_dim=128 (got {head_dim})"
                 )
-            if q_data_type != torch.bfloat16:
-                raise ValueError(
-                    "vsa_sm100_blk64 backend only supports bfloat16 inputs"
-                )
+            is_sage_fp8 = q_scale is not None
+            if is_sage_fp8:
+                if k_scale is None or v_scale is None:
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires q_scale/k_scale/v_scale "
+                        "to all be provided together"
+                    )
+                if q_data_type != torch.float8_e4m3fn:
+                    raise ValueError(
+                        "vsa_sm100_blk64 backend requires q_data_type=float8_e4m3fn "
+                        "when q_scale is provided"
+                    )
+                if num_qo_heads not in (4, 8):
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires num_qo_heads in (4, 8) "
+                        f"(upstream kernel limit), got {num_qo_heads}"
+                    )
+            else:
+                if k_scale is not None or v_scale is not None:
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires q_scale/k_scale/v_scale "
+                        "to all be provided together"
+                    )
+                if q_data_type != torch.bfloat16:
+                    raise ValueError(
+                        "vsa_sm100_blk64 backend only supports bfloat16 inputs "
+                        "unless q_scale/k_scale/v_scale (Sage FP8) are provided"
+                    )
             # blk64 has no KV-head mapping: the launcher sizes K/V by the Q head
             # count, so num_qo_heads must equal num_kv_heads.
             _vsa_common_checks(
@@ -689,12 +832,22 @@ class BlockSparseAttentionWrapper:
                     "(Q-blocks with zero KV blocks). All Q-blocks must attend to "
                     "at least one KV block."
                 )
+            # Note: the underlying blk64 CuTe-DSL kernel supports
+            # allow_empty_block_nums=True, but FlashInfer keeps rejecting empty
+            # sparse rows here to preserve existing behavior. Lifting this
+            # restriction only requires removing the check above and passing
+            # allow_empty_block_nums=True through to the kernel.
 
             self.M = M
             self.N = N
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._vsa_kv_splits = kv_splits
+            self._vsa_use_clc = use_clc
+            self._vsa_q_scale = q_scale
+            self._vsa_k_scale = k_scale
+            self._vsa_v_scale = v_scale
             return
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
@@ -1042,13 +1195,13 @@ class BlockSparseAttentionWrapper:
                 return_lse,
             )
 
-        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
+        # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
         if self._backend == "vsa_sm100_blk64":
             from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
                 bsa_attn_sm100_blk64_fwd,
             )  # noqa: PLC0415
 
-            return _vsa_run_core(
+            return _vsa_run_core_blk64(
                 bsa_attn_sm100_blk64_fwd,
                 q,
                 k,
@@ -1059,6 +1212,11 @@ class BlockSparseAttentionWrapper:
                 out,
                 lse,
                 return_lse,
+                self._vsa_kv_splits,
+                self._vsa_use_clc,
+                self._vsa_q_scale,
+                self._vsa_k_scale,
+                self._vsa_v_scale,
             )
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------

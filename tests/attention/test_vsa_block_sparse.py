@@ -684,7 +684,7 @@ def test_vsa_performance_vs_dense(workspace):
 
 
 # ===========================================================================
-# blk64 tests — BSA blk64 C++ kernel (kSparseBlockSize=64, kRows=64)
+# blk64 tests — BSA blk64 CuTe-DSL kernel (kSparseBlockSize=64, kRows=64)
 # ===========================================================================
 
 R64 = C64 = 64  # blk64 block granularity
@@ -825,6 +825,144 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     assert torch.isfinite(o).all(), "blk64 output contains non-finite values"
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("kv_splits", [1, 2, 4, "auto"])
+def test_vsa_blk64_kv_splits(kv_splits, workspace):
+    """blk64 output must match the dense reference across kv_splits values."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    num_heads = 8
+    num_blocks = 8
+    M = N = num_blocks * R64
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+        kv_splits=kv_splits,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+def _quantize_fp8_sage(q, k, v, num_heads, seqlen_q, seqlen_k, head_dim):
+    """Per-(head,token) scale for q/k, per-(head,dim) scale for v; symmetric e4m3 quant."""
+    E4M3_MAX = 448.0
+
+    q_scale_hs = q.float().abs().amax(dim=-1).clamp_min(1e-6) / E4M3_MAX  # [Sq, H]
+    q_scale = q_scale_hs.permute(1, 0).unsqueeze(0).contiguous()  # [1, H, Sq]
+    q_fp8 = (
+        (q.float() / q_scale_hs.unsqueeze(-1))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    n_buckets = (seqlen_k + 15) // 16
+    k_amax = (
+        k.float().abs().reshape(n_buckets, 16, num_heads, head_dim).amax(dim=(1, 3))
+    )
+    k_scale = (
+        (k_amax.clamp_min(1e-6) / E4M3_MAX).permute(1, 0).unsqueeze(0).contiguous()
+    )  # [1, H, n_buckets]
+    k_scale_bcast = (
+        k_scale.squeeze(0).permute(1, 0).repeat_interleave(16, dim=0)[:seqlen_k]
+    )  # [N, H]
+    k_fp8 = (
+        (k.float() / k_scale_bcast.unsqueeze(-1))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    v_amax = v.float().abs().amax(dim=0)  # [H, D]
+    v_scale = (v_amax.clamp_min(1e-6) / E4M3_MAX).contiguous()  # [H, D]
+    v_fp8 = (
+        (v.float() / v_scale.unsqueeze(0))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads", [4, 8])
+def test_vsa_blk64_sage_fp8(num_heads, workspace):
+    """Sage-FP8 blk64 path must be close to the bf16 dense reference (loose tol for fp8 noise)."""
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    num_blocks = 8
+    M = N = num_blocks * R64
+
+    q_bf16 = torch.randn(
+        M, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    v_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q_bf16, k_bf16, v_bf16, num_heads, M, N, HEAD_DIM_BLK64
+    )
+
+    # Uniform-density BSR gives every row the same nnz count, satisfying the
+    # Sage-FP8 kernel's "no variable q2k_block_nums" requirement.
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    # Reference uses the dequantized values (fp8 round-trip noise expected).
+    q_deq = (q_fp8.float() * q_scale.squeeze(0).permute(1, 0).unsqueeze(-1)).to(
+        torch.bfloat16
+    )
+    k_deq = (
+        k_fp8.float()
+        * k_scale.squeeze(0)
+        .permute(1, 0)
+        .repeat_interleave(16, dim=0)[:N]
+        .unsqueeze(-1)
+    ).to(torch.bfloat16)
+    v_deq = (v_fp8.float() * v_scale.unsqueeze(0)).to(torch.bfloat16)
+    o_ref = _pytorch_ref(q_deq, k_deq, v_deq, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=torch.float8_e4m3fn,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    o = wrapper.run(q_fp8, k_fp8, v_fp8)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
 
 
 # ---------------------------------------------------------------------------
