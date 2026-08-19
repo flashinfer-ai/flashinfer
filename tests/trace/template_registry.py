@@ -36,6 +36,7 @@ TraceRegistryEntry = tuple[Callable[..., Any], Any, str]
 _TRACE_REGISTRATION_MODULES = (
     "flashinfer.activation",
     "flashinfer.attention._core",
+    "flashinfer.attention.prims_ts.block_sparse",
     "flashinfer.attention.prims_ts.decode",
     "flashinfer.attention.prims_ts.mla_decode",
     "flashinfer.cascade",

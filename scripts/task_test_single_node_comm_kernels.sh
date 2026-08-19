@@ -15,7 +15,7 @@ find . -type f -name '*.pyc' -delete 2>/dev/null || true
 echo "Cache cleaned."
 echo ""
 
-pip install -e . -v
+install_flashinfer_editable
 
 # nvshmem4py-cu12 pins cuda-python<=12.9; letting pip resolve its deps on a
 # cu13 container downgrades cuda-python/cuda-bindings and makes the next

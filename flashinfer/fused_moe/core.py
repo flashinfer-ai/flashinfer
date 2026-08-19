@@ -2113,9 +2113,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         prepare_da_body,
                     )
                 elif routing_logits is None:
-                    # FP8 per tensor scale, pre-computed (packed) routing.
+                    # FP8 per tensor scale, pre-computed routing.
                     result = moe_op.trtllm_fp8_per_tensor_scale_routed_moe(
+                        kwargs["routing_input_mode"],
                         topk_ids,
+                        topk_weights,
                         kwargs["routing_bias"],
                         hidden_states,
                         kwargs["gemm1_weights"],
@@ -3019,7 +3021,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_per_tensor_scale_routed_moe_op(
+        routing_input_mode: int,
         topk_ids: torch.Tensor,
+        expert_weights: torch.Tensor | None,
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -3065,11 +3069,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 hidden_states.device,
                 "output",
             )
-        # Pre-computed routing: the kernel unpacks the routing weights from topk_ids
-        # into this buffer, so it is an OUTPUT (allocated for the autotuner's shape spec).
-        expert_weights = torch.empty(
-            num_tokens, top_k, dtype=torch.bfloat16, device=hidden_states.device
-        )
+        if expert_weights is None:
+            expert_weights = torch.empty(
+                0, dtype=torch.bfloat16, device=hidden_states.device
+            )
 
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
         dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
@@ -3085,6 +3088,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             activation_type=activation_type,
+            use_per_token_scaling=use_routing_scales_on_input,
             num_experts=num_experts,
         )
 
@@ -3101,12 +3105,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
 
         runner_kwargs = {
-            "routing_input_mode": RoutingInputMode.PackedPrecomputed,
+            "routing_input_mode": routing_input_mode,
             "routing_bias": routing_bias,
             "gemm1_weights": gemm1_weights,
             "output1_scales_scalar": output1_scales_scalar,
@@ -3136,10 +3141,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
 
         def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
-            """Launch the unchanged packed FP8 per-tensor operation."""
-            # Preserve the exact packed-routing FFI ABI for baseline and selected tactics.
+            """Launch the FP8 per-tensor operation with one fixed tactic."""
             intermediate_output = moe_op.trtllm_fp8_per_tensor_scale_routed_moe(
+                routing_input_mode,
                 topk_ids,
+                expert_weights,
                 routing_bias,
                 hidden_states,
                 gemm1_weights,
@@ -3168,15 +3174,29 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 [],
                 False,
             )
-            # Convert the native result back to the established public output contract.
             return _unpack_trtllm_moe_output(
-                intermediate_output, output, do_finalize, None
+                intermediate_output, output, do_finalize, None, expert_weights
             )
 
+        routing_mode = RoutingInputMode(routing_input_mode)
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
-        # output format. The exact launcher owns dtype, optional-operand, and top-k validation.
-        da_eligible = do_finalize and 0 < num_experts <= DA_MAX_EXPERTS
+        # output format. FP32 Llama4 weights also need the ordinary launcher's BF16 token-scale
+        # conversion, whose scratch buffer is not part of the prepared-body ABI.
+        da_eligible = (
+            routing_mode
+            in (
+                RoutingInputMode.PackedPrecomputed,
+                RoutingInputMode.UnpackedPrecomputed,
+            )
+            and do_finalize
+            and not (
+                routing_mode is RoutingInputMode.UnpackedPrecomputed
+                and use_routing_scales_on_input
+                and expert_weights.dtype == torch.float32
+            )
+            and 0 < num_experts <= DA_MAX_EXPERTS
+        )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
@@ -3195,7 +3215,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             inputs=moe_inputs.to_list(),
             runner_kwargs=runner_kwargs,
             baseline_tactic=tactic,
-            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            routing_input_mode=routing_input_mode,
             routing_id_index=MoeRunnerInputs.idx("topk_ids"),
             routing_weight_index=MoeRunnerInputs.idx("expert_weights"),
             num_experts=num_experts,
@@ -3206,13 +3226,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
             finish_switch=lambda: _unpack_trtllm_moe_output(
-                [], output, do_finalize, None
+                [], output, do_finalize, None, expert_weights
             ),
         )
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_routed_moe")
     def _fake_trtllm_fp8_per_tensor_scale_routed_moe(
+        routing_input_mode: int,
         topk_ids: torch.Tensor,
+        expert_weights: torch.Tensor | None,
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -4877,7 +4899,8 @@ def trtllm_bf16_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -5087,7 +5110,8 @@ def trtllm_bf16_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -5300,7 +5324,8 @@ def trtllm_fp8_per_tensor_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -5370,7 +5395,7 @@ def trtllm_fp8_per_tensor_scale_moe(
 
 @flashinfer_api(trace=trtllm_fp8_per_tensor_scale_routed_moe_trace)
 def trtllm_fp8_per_tensor_scale_routed_moe(
-    topk_ids: torch.Tensor,
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -5397,17 +5422,20 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 per-tensor-scale MoE operation.
 
-    Like :func:`trtllm_fp8_per_tensor_scale_moe`, but consumes a pre-computed
-    packed ``(expert_id, weight)`` tensor instead of routing logits.  Use this
-    entry point for distributed MoE where routing (top-k selection, including
-    EPLB redundant-expert placement) happens in an external DP/EP dispatch, or
-    for CUDA-graph capture (avoids the CPU-GPU sync from logits processing).
+    Like :func:`trtllm_fp8_per_tensor_scale_moe`, but consumes pre-computed
+    routing instead of routing logits, either as a packed ``(expert_id, weight)``
+    tensor or as a ``(topk_ids, topk_weights)`` pair. Use this entry point for
+    distributed MoE where routing (top-k selection, including EPLB
+    redundant-expert placement) happens in an external DP/EP dispatch, or for
+    CUDA-graph capture (avoids the CPU-GPU sync from logits processing).
 
     Parameters
     ----------
-    topk_ids : torch.Tensor
+    topk_ids : torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
         ``[seq_len, top_k]`` int32 tensor of packed expert indices and weights
         with format ``(expert_id << 16) | (weight_bf16.view(int16))``.
+        Alternatively a ``(topk_ids, topk_weights)`` pair of plain ``int32``
+        indices and ``bfloat16`` or ``float32`` weights.
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias (may be ``None``).
     hidden_states : torch.Tensor
@@ -5467,8 +5495,11 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_routed_moe(
-        topk_ids,
+        routing_mode,
+        topk_ids_tensor,
+        topk_weights,
         routing_bias,
         hidden_states,
         gemm1_weights,
@@ -5843,7 +5874,8 @@ def trtllm_fp8_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``False``).
     weight_layout : int
@@ -6089,7 +6121,8 @@ def trtllm_fp4_block_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6333,7 +6366,8 @@ def trtllm_fp4_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6516,7 +6550,8 @@ def trtllm_mxint4_block_scale_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6666,7 +6701,8 @@ def trtllm_mxint4_block_scale_routed_moe(
         - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
           (``routeScale = 1.0``, ``epsilon = 1e-20``).
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
-        - ``9`` ``Unspecified`` — reserved.
+        - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
+        - ``10`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to run the finalize stage (default ``True``).
     enable_pdl : Optional[bool]

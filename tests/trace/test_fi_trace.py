@@ -214,6 +214,38 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_packed_kda_decode_fi_trace_resolves_singleton_without_output():
+    import flashinfer.kda_decode
+
+    batch_size, num_heads, head_dim = 4, 12, 128
+    hidden_size = num_heads * head_dim
+    defn = flashinfer.kda_decode.packed_kda_decode.fi_trace(
+        mixed_qkv=torch.empty(batch_size, 3 * hidden_size, dtype=torch.bfloat16),
+        raw_gate=torch.empty(batch_size, hidden_size, dtype=torch.bfloat16),
+        raw_beta=torch.empty(batch_size, num_heads, dtype=torch.bfloat16),
+        A_log=torch.empty(num_heads, dtype=torch.float32),
+        dt_bias=torch.empty(hidden_size, dtype=torch.float32),
+        state=torch.empty(
+            batch_size, num_heads, head_dim, head_dim, dtype=torch.bfloat16
+        ),
+        state_indices=torch.arange(batch_size, dtype=torch.int32),
+    )
+
+    _check_defn(defn, "kda", "flashinfer.kda_decode.packed_kda_decode")
+    assert defn["name"] == "packed_kda_decode_h12_d128"
+    assert defn["axes"]["singleton"] == {
+        "type": "const",
+        "value": 1,
+        "description": "Fixed single-token output dimension.",
+    }
+    assert defn["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "singleton",
+        "num_heads",
+        "head_dim",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # rmsnorm
 # ---------------------------------------------------------------------------
@@ -678,11 +710,23 @@ def test_mla_paged_fi_trace():
 
     q_nope = torch.randn(batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16)
     q_pe = torch.randn(batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16)
-    ckv_cache = torch.randn(num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16)
+    ckv_cache = torch.zeros(
+        num_pages, page_size, head_dim_ckv, dtype=torch.float8_e4m3fn
+    )
+    kpe_cache = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn
+    )
+    ckv_scale_arr = torch.ones(
+        num_pages, page_size, head_dim_ckv // 128, dtype=torch.float32
+    )
 
     defn = BatchMLAPagedAttentionWrapper.run.fi_trace(
-        q_nope=q_nope, q_pe=q_pe, ckv_cache=ckv_cache, kpe_cache=kpe_cache
+        q_nope=q_nope,
+        q_pe=q_pe,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        ckv_scale_arr=ckv_scale_arr,
+        kpe_scale=1.0,
     )
     _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
     axes = defn["axes"]
@@ -690,6 +734,15 @@ def test_mla_paged_fi_trace():
     assert axes["head_dim_ckv"]["value"] == head_dim_ckv
     assert axes["head_dim_kpe"]["value"] == head_dim_kpe
     assert axes["page_size"]["value"] == page_size
+    assert axes["ckv_scale_groups"]["type"] == "var"
+    ckv_scale_arr_defn = defn["inputs"]["ckv_scale_arr"]
+    assert ckv_scale_arr_defn["shape"] == [
+        "num_pages",
+        "page_size",
+        "ckv_scale_groups",
+    ]
+    assert ckv_scale_arr_defn["dtype"] == "float32"
+    assert ckv_scale_arr_defn["optional"] is True
 
 
 # ---------------------------------------------------------------------------

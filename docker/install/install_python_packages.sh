@@ -71,9 +71,11 @@ else
   CUDA_EXTRAS=()
 fi
 
+# wheel is imported by flashinfer-jit-cache's build backend, which CI builds
+# without isolation. Resolve the remaining image dependencies together once.
 pip3 install \
   -r /install/requirements.txt \
-  responses pytest scipy build \
+  responses pytest scipy build wheel \
   "${CUDA_PYTHON}" \
   "${NVSHMEM4PY}" \
   "${CUDA_EXTRAS[@]}"

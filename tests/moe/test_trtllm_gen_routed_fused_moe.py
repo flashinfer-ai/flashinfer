@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -264,11 +270,14 @@ def _run_trtllm_gen_routed_fused_moe_case(
     assert mismatch_pct < 6, f"Mismatch percentage is {mismatch_pct:.2f}"
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
+# Routed-vs-logits parity: the coverage is routing_method x quant x routing_format;
+# shape fan-out kept to the boundary corners (shape breadth is fuzzed in
+# tests/moe/test_unified_moe_fuzz.py).
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize("top_k", [8])
 @pytest.mark.parametrize(
     "routing_method_type",
     [
@@ -566,6 +575,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         RoutingMethodType.RenormalizeNaive,
     ],
 )
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked_fp32"])
 def test_trtllm_gen_fp8_per_tensor_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -573,15 +583,15 @@ def test_trtllm_gen_fp8_per_tensor_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    routing_format: Literal["packed", "unpacked_fp32"],
 ):
     """Pre-routed FP8 per-tensor MoE matches the logits (self-routing) kernel.
 
-    Feeds the packed (expert_id << 16 | weight) routing derived from the same
-    logits to ``trtllm_fp8_per_tensor_scale_routed_moe`` and asserts it produces
-    the same output as ``trtllm_fp8_per_tensor_scale_moe``. This is the numeric
-    parity check for the pre-routed per-tensor path used by the vLLM modular
-    (DP/EP/EPLB) kernel. The per-tensor scale scalars are shared verbatim by both
-    calls, so the test isolates the routing path (weights need not be calibrated).
+    Feeds routing derived from the same logits to
+    ``trtllm_fp8_per_tensor_scale_routed_moe`` and asserts it produces the same
+    output as ``trtllm_fp8_per_tensor_scale_moe``. The routed input is either
+    packed or separate IDs and FP32 weights. The per-tensor scale scalars are
+    shared verbatim by both calls, so the test isolates the routing path.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -647,14 +657,18 @@ def test_trtllm_gen_fp8_per_tensor_routed_fused_moe(
     topk_weights = topk_weights_ref.view(num_tokens, num_experts)[
         torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
-    # Format: (expert_id << 16) | (weight_bf16.view(int16))
-    packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
+    if routing_format == "packed":
+        routing_input = (topk_ids << 16) | topk_weights.view(torch.int16).to(
+            torch.int32
+        )
+    else:
+        routing_input = (topk_ids, topk_weights.to(torch.float32))
 
     output = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
     )
     trtllm_fp8_per_tensor_scale_routed_moe(
-        topk_ids=packed_topk_ids,
+        topk_ids=routing_input,
         routing_bias=None,
         hidden_states=hidden_states,
         gemm1_weights=gemm1_weights,

@@ -464,6 +464,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         plan=plan,
         execution=execution,
         operation_started_at=operation_started_at,
+        test_path=selection.test_path,
     )
 
 
