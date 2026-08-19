@@ -92,7 +92,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
 | QuantConfig | dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block) |
 | ExpertConfig | intermediate_size, local sharding params |
-| ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
+| ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
 | ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
@@ -644,7 +644,7 @@ The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_b
 import torch
 from flashinfer.fused_moe import (
     MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
-    ActivationConfig, ExecutionConfig, MoELayer,
+    SwiGLU, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import BackendOptions
@@ -655,7 +655,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=32, top_k=2),
     quant=QuantConfig(variant=QuantVariant.NVFP4),       # MVP: NVFP4 only
     experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
-    activation=ActivationConfig(),                       # MVP: Swiglu only
+    activation=SwiGLU(alpha=1.0, beta=0.0),              # typed + hashable
     backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
     execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
@@ -692,8 +692,44 @@ Key mechanisms (and where they live):
 - **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` (backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7).
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
-- **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
+- **Fail-fast scope:** each runner declares quantization and typed-activation
+  capabilities; unsupported pairs are filtered before build and direct-runner
+  calls raise a specific `NotImplementedError`.
 - **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+
+### Typed activation values and backend parity
+
+The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
+`SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, and `Identity()`.
+Every value exposes `.type` and `.is_gated`; scalar fields participate in
+equality, hashing, repr serialization, and tactic-cache identity. Per-expert
+`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit` tensors remain in
+`MoEWeightPack` backend views and override the scalar-expanded preparation view.
+
+The truthful unified support matrix follows the already executable flat path:
+
+| Runner / quantization | Unified activations |
+| --- | --- |
+| TRTLLM BF16 | SwiGLU, ReLU2 |
+| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
+| TRTLLM DeepSeek block FP8 | SwiGLU |
+| TRTLLM MXFP8 block FP8 | SwiGLU, GeGLU, ReLU2 |
+| TRTLLM NVFP4 / MXFP4 / W4A16 | SwiGLU, GeGLU, SiTU, ReLU2 |
+| TRTLLM MxInt4 | SwiGLU |
+| CUTLASS BF16 / W4A16 | SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2 |
+| CuTe-DSL NVFP4 / W4A16 | SwiGLU, GeGLUTanh, ReLU2, SiTU |
+| b12x NVFP4 | SwiGLU, GeGLUTanh, ReLU2 |
+| b12x W4A16 | SwiGLU, ReLU2 |
+
+CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
+`situ_linear_beta`); its flat kernel does not expose a separate SiTU
+`clamp_limit`, so that non-default field is rejected. b12x W4A16 keeps its
+flat-proven SwiGLU/ReLU2 subset. Identity is modeled for configuration
+completeness but is not advertised by a unified runner because no current
+weight-preparation + launcher combination proves it end-to-end without kernel
+changes. Weight preparation computes GEMM1 rows from `activation.is_gated`
+(`2I` gated, `I` non-gated) and passes that fact into TRTLLM row permutations.
 
 ### Today's MVP Cut
 

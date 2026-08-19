@@ -183,17 +183,22 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.api import (
-    ActivationConfig,
     BackendOptions,
     CutlassBf16Config,
     CutlassW4A16Config,
     CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
+    GeGLU,
+    GeGLUTanh,
     MoEConfig,
     QuantConfig,
     QuantVariant,
+    ReLU2,
     RoutingConfig,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -428,7 +433,14 @@ def _mxint4_act_pack_logits(x, routing_logits, routing_bias):
 
 
 def _bf16_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    activation=None,
 ):
     """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
     but no fp4 requant -- the only intermediate quantization is the bf16 rounding
@@ -436,6 +448,7 @@ def _bf16_reference(
     to match the packed-id truncation in pack_inputs, so the tolerance measures
     kernel error, not oracle mismatch."""
     final_scales = final_scales.to(torch.bfloat16).float()
+    activation = activation or SwiGLU()
     x32, half = x.float(), intermediate_size
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -443,8 +456,42 @@ def _bf16_reference(
         if not mask.any():
             continue
         tok, nth = torch.where(mask)
-        gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
-        inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
+        fc1 = x32[tok] @ w1[local_e].float().t()
+        if isinstance(activation, ReLU2):
+            inter = F.relu(fc1) ** 2
+        else:
+            up, gate = fc1[:, :half], fc1[:, half:]
+            if isinstance(activation, SwiGLU):
+                gate = gate.clamp(max=activation.limit)
+                up = up.clamp(min=-activation.limit, max=activation.limit)
+                inter = (
+                    gate
+                    * torch.sigmoid(activation.alpha * gate)
+                    * (up + activation.beta)
+                )
+            elif isinstance(activation, GeGLU):
+                inter = F.gelu(gate) * up
+            elif isinstance(activation, GeGLUTanh):
+                inter = F.gelu(gate, approximate="tanh") * up
+            elif isinstance(activation, SwiGLUStep):
+                inter = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                    min=-activation.limit, max=activation.limit
+                )
+            elif isinstance(activation, SiTU):
+                if activation.clamp_limit is not None:
+                    up = up.clamp(
+                        min=-activation.clamp_limit, max=activation.clamp_limit
+                    )
+                    gate = gate.clamp(max=activation.clamp_limit)
+                inter = (
+                    activation.linear_scale
+                    * torch.tanh(up / activation.linear_scale)
+                    * activation.gate_scale
+                    * torch.tanh(gate / activation.gate_scale)
+                    * torch.sigmoid(gate)
+                )
+            else:
+                raise AssertionError(f"unsupported BF16 fuzz activation {activation!r}")
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
         out[tok] += final_scales[tok, nth, None] * expert_out
@@ -904,6 +951,17 @@ def _handler_for(cfg):
     return _HANDLER_BY_ID[cfg.variant]
 
 
+def _activation_for(cfg):
+    return {
+        "swiglu": SwiGLU(),
+        "geglu": GeGLU(),
+        "situ": SiTU(),
+        "relu2": ReLU2(),
+        "geglutanh": GeGLUTanh(),
+        "swiglustep": SwiGLUStep(),
+    }[cfg.activation]
+
+
 # ---------------------------------------------------------------------------
 # Config generation: random shapes + routing-load skew (an orthogonal axis -- uniform enforcement,
 # not a numeric mode, so it never changes which checks apply).
@@ -1038,6 +1096,7 @@ class Cfg:
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+    activation: str = "swiglu"
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1076,7 +1135,8 @@ class Cfg:
             else ""
         )
         return (
-            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{self.activation}_{sh}{mode}{self.routing_method.name}_"
+            f"{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1188,6 +1248,16 @@ def _gen(seed):
         ):
             num_fused_shared_experts = rng.randint(1, max_shared)
 
+    activation = "swiglu"
+    if variant == "bf16":
+        # FromLogits and EP require TRTLLM, whose BF16 cubins expose SwiGLU
+        # and ReLU2. CUTLASS-only activations are valid only for non-EP
+        # pre-routed cases.
+        activation = rng.choice(
+            ("swiglu", "relu2")
+            if fromlogits or offset != 0 or local != ne
+            else ("swiglu", "relu2", "geglutanh", "swiglustep")
+        )
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
@@ -1207,6 +1277,7 @@ def _gen(seed):
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
+        activation=activation,
         num_fused_shared_experts=num_fused_shared_experts,
     )
 
@@ -1316,6 +1387,11 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # BF16 FromLogits bias/group routing
+    # Deterministic typed-activation coverage. Keep CUTLASS-only activations
+    # pre-routed so they have an executable candidate.
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_051, activation="relu2"),
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_053, activation="geglutanh"),
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_054, activation="swiglustep"),
     Cfg(
         16,
         7168,
@@ -1670,7 +1746,8 @@ def _master(cfg, handler):
     # Expert-major tensors carry the SHARED rows too (routed first, shared
     # appended); E_local stays routed-only, matching the API contract.
     rows = cfg.n_weight_rows
-    x, w1, w2 = sparse(T, H), sparse(rows, 2 * I, H), sparse(rows, H, I)
+    gemm1_rows = 2 * I if _activation_for(cfg).is_gated else I
+    x, w1, w2 = sparse(T, H), sparse(rows, gemm1_rows, H), sparse(rows, H, I)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -1915,7 +1992,7 @@ def test_unified_moe_fuzz(cfg):
         if cfg.is_unpacked
         else final_scales
     )
-    ref = handler.reference(
+    reference_args = (
         x,
         w1,
         w2,
@@ -1924,6 +2001,10 @@ def test_unified_moe_fuzz(cfg):
         cfg.intermediate,
         cfg.expert_offset,
     )
+    if handler.variant is QuantVariant.BF16:
+        ref = handler.reference(*reference_args, activation=_activation_for(cfg))
+    else:
+        ref = handler.reference(*reference_args)
     ref_abs_max = ref.abs().max().item()
     atol = handler.atol_frac * ref_abs_max + 1e-3
     rtol = handler.rtol
@@ -1952,6 +2033,7 @@ def test_unified_moe_fuzz(cfg):
             hidden_size=cfg.hidden,
             intermediate_size=cfg.intermediate,
             device=dev,
+            activation=_activation_for(cfg),
         )
         # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
@@ -1987,7 +2069,7 @@ def test_unified_moe_fuzz(cfg):
             local_expert_offset=cfg.expert_offset,
             num_fused_shared_experts=cfg.num_fused_shared_experts,
         ),
-        activation=ActivationConfig(),
+        activation=_activation_for(cfg),
         backend=BackendOptions(
             candidates=tuple(BackendCfg() for BackendCfg in wired_backends)
         ),
@@ -2272,7 +2354,7 @@ def test_autotune_cache_coherence(base, variant):
             routing=RoutingConfig(num_experts=E, top_k=top_k),
             quant=QuantConfig(variant=variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
-            activation=ActivationConfig(),
+            activation=SwiGLU(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),
             execution=ExecutionConfig(tune_max_num_tokens=max(_CACHE_TOKEN_SEQ)),
         )

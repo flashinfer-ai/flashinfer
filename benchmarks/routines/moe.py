@@ -2457,7 +2457,6 @@ def testUnifiedNvfp4Moe(args):
     """
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe import (
-        ActivationConfig,
         CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
@@ -2467,6 +2466,7 @@ def testUnifiedNvfp4Moe(args):
         MoEWeightPack,
         QuantConfig,
         QuantVariant,
+        SwiGLU,
         RoutingConfig,
         TrtllmFp4Config,
     )
@@ -2625,7 +2625,7 @@ def testUnifiedNvfp4Moe(args):
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
         ),
-        activation=ActivationConfig(),
+        activation=SwiGLU(),
         backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
         execution=ExecutionConfig(tune_max_num_tokens=max(num_tokens, 8192)),
     )

@@ -39,7 +39,6 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
 )
 from flashinfer.fused_moe.api import (
-    ActivationConfig,
     ActivationType,
     BackendOptions,
     ExecutionConfig,
@@ -48,8 +47,11 @@ from flashinfer.fused_moe.api import (
     MoEConfig,
     QuantConfig,
     QuantVariant,
+    GeGLUTanh,
+    ReLU2,
     RoutingConfig,
     RoutingInputMode,
+    SwiGLU,
 )
 from tests.moe.test_b12x_fused_moe import (  # noqa: E402
     check_accuracy as check_b12x_accuracy,
@@ -69,6 +71,14 @@ from tests.moe.test_b12x_fused_moe import (  # noqa: E402
 
 
 class TestB12xBackendOptions:
+    def test_activation_capabilities_match_flat_backends(self):
+        assert B12xNvfp4Runner.supported_activation_classes == (
+            SwiGLU,
+            GeGLUTanh,
+            ReLU2,
+        )
+        assert B12xW4A16Runner.supported_activation_classes == (SwiGLU, ReLU2)
+
     def test_b12x_is_sm12x_only(self):
         opts = BackendOptions((B12xNvfp4Config(), B12xW4A16Config()))
         assert eval(repr(opts)) == opts
@@ -112,7 +122,7 @@ class TestB12xUnifiedValidation:
         backend,
         variant,
         *,
-        activation=ActivationConfig.swiglu,
+        activation=None,
         experts=None,
         execution=None,
         finalize=None,
@@ -121,7 +131,7 @@ class TestB12xUnifiedValidation:
             routing=RoutingConfig(num_experts=8, top_k=2),
             quant=QuantConfig(variant=variant),
             experts=experts or ExpertConfig(intermediate_size=512),
-            activation=activation,
+            activation=SwiGLU() if activation is None else activation,
             backend=BackendOptions((backend,)),
             execution=execution or ExecutionConfig(),
             finalize=finalize or MoEFinalizeConfig(),
@@ -176,9 +186,7 @@ class TestB12xUnifiedValidation:
             (B12xW4A16Runner, B12xW4A16Config(), QuantVariant.W4A16),
         ),
     )
-    @pytest.mark.parametrize(
-        "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-    )
+    @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
     def test_b12x_accepts_implemented_activations(
         self, monkeypatch, runner_type, backend, variant, activation
     ):
@@ -190,15 +198,24 @@ class TestB12xUnifiedValidation:
         self._mock_environment(monkeypatch)
         assert self._runner(config, runner_type).check_support() is None
 
+    def test_b12x_nvfp4_accepts_geglu_tanh(self, monkeypatch):
+        config = self._config(
+            B12xNvfp4Config(),
+            QuantVariant.NVFP4,
+            activation=GeGLUTanh(),
+        )
+        self._mock_environment(monkeypatch)
+        assert self._runner(config, B12xNvfp4Runner).check_support() is None
+
     def test_b12x_w4a16_rejects_geglu_tanh(self, monkeypatch):
         config = self._config(
             B12xW4A16Config(),
             QuantVariant.W4A16,
-            activation=ActivationConfig(ActivationType.GegluTanh),
+            activation=GeGLUTanh(),
         )
         self._mock_environment(monkeypatch)
         runner = self._runner(config, B12xW4A16Runner)
-        with pytest.raises(NotImplementedError, match="Swiglu or Relu2"):
+        with pytest.raises(NotImplementedError, match="SwiGLU, ReLU2"):
             runner.check_support()
 
     @pytest.mark.parametrize(
@@ -364,8 +381,9 @@ class TestB12xUnifiedValidation:
 # SM120/SM121 b12x conformance
 # ---------------------------------------------------------------------------
 _B12X_ACTIVATIONS = {
-    "silu": ActivationConfig.swiglu,
-    "relu2": ActivationConfig.relu2,
+    "silu": SwiGLU(),
+    "gelu_tanh": GeGLUTanh(),
+    "relu2": ReLU2(),
 }
 
 
@@ -500,6 +518,7 @@ def _b12x_reference(
     return compute_b12x_reference_moe_fp4(
         gemm1_weights=tensors["w1_weight_bf16"].float(),
         gemm2_weights=tensors["w2_weight_bf16"].float(),
+        activation=activation,
         **common,
     )
 
@@ -554,6 +573,7 @@ _B12X_DISPATCH_CASES = (
     (QuantVariant.NVFP4, "silu", 128, 1, 256, 256, 512),
     (QuantVariant.NVFP4, "silu", 515, 8, 384, 256, 512),
     (QuantVariant.NVFP4, "silu", 128, 2, 8, 1024, 2048),
+    (QuantVariant.NVFP4, "gelu_tanh", 64, 2, 64, 512, 256),
     (QuantVariant.NVFP4, "relu2", 1, 1, 256, 256, 512),
     (QuantVariant.NVFP4, "relu2", 128, 2, 256, 256, 512),
     (QuantVariant.NVFP4, "relu2", 512, 8, 256, 256, 512),
