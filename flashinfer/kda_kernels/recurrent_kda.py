@@ -1363,10 +1363,15 @@ def _select_flash_kda_decode_value_split_sm103a(
 def _select_cake_kda_unbounded_softplus_t1_value_split(work: int, sm_count: int) -> int:
     """Apply the B200/B300-measured unbounded-softplus T1 split policy."""
 
-    # Cold-L2 CUPTI screening puts the crossover between B16 and B32 on both
-    # architectures: split16 wins through W/S=3.46 on B200 and 3.20 on B300,
-    # while split8 wins from W/S=6.92 and 6.40 onward, respectively.
-    return 16 if work <= 4 * sm_count else 8
+    # Cold-L2 CUPTI screening establishes the same three bands on B200 and
+    # GB300. Split16 wins through W/S=4, split8 owns the middle band, and
+    # split4 wins at W/S>=8. The exact boundary keeps serving-local H4 on the
+    # unchanged split16 path while routing H32 B64/B128 to split4.
+    if work >= 8 * sm_count:
+        return 4
+    if work <= 4 * sm_count:
+        return 16
+    return 8
 
 
 _FLASH_KDA_DECODE_VALUE_SPLIT_SELECTOR_BY_ARCH: dict[

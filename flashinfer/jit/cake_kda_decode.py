@@ -30,6 +30,7 @@ from .core import (
 from .utils import write_if_different
 
 CakeKDADecodeVariant = Literal[
+    "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
 ]
@@ -44,18 +45,20 @@ _CAKE_KDA_DECODE_NVCC_FLAGS = {
 # The binding uses one numeric target kind to enforce the same execution
 # boundary for JIT and AOT modules. 100 is the CC 10.0/10.3 family target;
 # 1000 and 1003 are exact CC targets used by the CUDA-12.8 compatibility path
-# and the two GB300 direct-T1 performance specializations, respectively.
+# and the three GB300 direct-T1 performance specializations, respectively.
 _CAKE_KDA_DECODE_TARGET_KIND = {
     "sm100f": 100,
     "sm100a": 1000,
     "sm103a": 1003,
 }
 CAKE_KDA_DECODE_VARIANTS: tuple[CakeKDADecodeVariant, ...] = (
+    "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
 )
 
 CAKE_KDA_DECODE_DIRECT_VARIANTS: tuple[CakeKDADecodeVariant, ...] = (
+    "d128_t1_unbounded_softplus_direct_split4",
     "d128_t1_unbounded_softplus_direct_split16",
     "d128_t1_unbounded_softplus_direct_split8",
 )
@@ -84,7 +87,9 @@ def _variant_metadata(
     value_warps = value_rows // 16
     rows_per_group = 2 if coefficient_gram and value_split == 8 else 8
     state_warps = (value_rows // rows_per_group + 1) // 2
-    launch_threads = max(tokens, value_warps, state_warps) * 32
+    launch_threads = (
+        32 if direct_impl else max(tokens, value_warps, state_warps) * 32
+    )
     return CakeKDADecodeVariantMetadata(
         head_dim,
         tokens,
@@ -98,6 +103,9 @@ def _variant_metadata(
 CAKE_KDA_DECODE_VARIANT_METADATA: dict[
     CakeKDADecodeVariant, CakeKDADecodeVariantMetadata
 ] = {
+    "d128_t1_unbounded_softplus_direct_split4": _variant_metadata(
+        1, 2, 4, direct_impl=True
+    ),
     "d128_t1_unbounded_softplus_direct_split16": _variant_metadata(
         1, 2, 16, direct_impl=True
     ),
@@ -206,7 +214,7 @@ def gen_cake_kda_decode_module(
 
     ``sm100f`` is the normal CUDA-12.9+ target for both CC 10.0 and CC 10.3.
     ``sm100a`` preserves CUDA-12.8 B200 support, while ``sm103a`` is limited to
-    the two direct T=1 bodies whose family-target code showed a measurable
+    the three direct T=1 bodies whose family-target code showed a measurable
     GB300 latency regression.
     """
 
