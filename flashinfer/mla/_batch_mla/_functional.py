@@ -895,11 +895,12 @@ def batch_mla_paged_attention(
 
     Packed query and KV tensors concatenate the no-position and RoPE parts on
     the last dimension. Split pairs must have widths ``kv_lora_rank`` and
-    ``qk_rope_head_dim`` respectively. Backends whose native form differs from
-    the provided query form may use a view when the split tensors are adjacent,
-    or a copy for non-adjacent query splits. Independent split KV tensors are
-    not copied into a packed cache; a packed-native backend rejects them unless
-    the split tensors are adjacent views of one packed allocation.
+    ``qk_rope_head_dim`` respectively. Backends whose native form differs use a
+    view when the split tensors are adjacent. In this one-shot functional API,
+    independent splits selected by a packed-native backend are materialized by
+    concatenation; for KV input this is a per-call KV-cache-sized copy. Planned
+    wrapper execution remains zero-copy, so a packed plan rejects independent
+    non-adjacent splits.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
     when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
@@ -957,9 +958,10 @@ def batch_mla_paged_attention(
         physical token indices.
     seq_lens : Optional[torch.Tensor]
         Per-request KV sequence lengths for dense and TRTLLM-GEN paths. For
-        SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
-        flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
-        ``None``, every column in ``block_tables`` is active.
+        SM120/SM121 sparse v32/GLM, pass per-request ``[batch_size]``,
+        per-token ``[batch_size, q_len_per_request]``, or flattened
+        ``[batch_size * q_len_per_request]`` active top-k lengths; if ``None``,
+        every column in ``block_tables`` is active.
     max_seq_len : int
         Maximum KV sequence length used for dense/TRTLLM-GEN scheduling.
         Ignored by the SM120/SM121 sparse v32/GLM backend.
@@ -973,7 +975,8 @@ def batch_mla_paged_attention(
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float. CUTLASS
+        requires its fixed ``1 / sqrt(128 + qk_rope_head_dim)`` scale.
     bmm2_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
         CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires

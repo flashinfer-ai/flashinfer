@@ -583,6 +583,10 @@ class _BatchMLAPagedAttentionXqaBackend:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not hasattr(self, "_module"):
+            raise RuntimeError(
+                "_BatchMLAPagedAttentionXqaBackend.run() called before plan()."
+            )
         packed_query = _resolve_structural_mla_input(
             query,
             desired="packed",

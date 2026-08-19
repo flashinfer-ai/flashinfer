@@ -8,6 +8,14 @@ import torch
 
 import flashinfer
 import flashinfer.mla._batch_mla._functional as mla_functional
+from flashinfer.mla._batch_mla._backends import (
+    cutlass_backend,
+    fa2_backend,
+    fa3_backend,
+)
+from flashinfer.mla._batch_mla._backends._fa_common import (
+    _prepare_functional_fa_request,
+)
 from tests.test_helpers.mla import (
     MLATestCase,
     assert_mla_close,
@@ -189,11 +197,12 @@ _PUBLIC_MLA_API = {
 }
 
 
-def _compare_result(case, result, expected_output, expected_lse):
+def _compare_result(case, result, expected_output, expected_lse, expected_lse_shape):
     actual_output, actual_lse = unpack_mla_result(result, case.lse_mode != "none")
     assert_mla_close(actual_output.reshape_as(expected_output), expected_output)
     if expected_lse is not None:
         assert actual_lse is not None
+        assert actual_lse.shape == expected_lse_shape
         assert_mla_close(actual_lse.reshape_as(expected_lse), expected_lse)
 
 
@@ -205,7 +214,9 @@ def test_explicit_functional_api_matches_reference(case):
     kwargs = functional_kwargs(case, inputs)
     if case.backend == "trtllm-gen":
         out = torch.empty(
-            (2, case.q_len, 128, 512), dtype=case.output_dtype, device="cuda"
+            inputs.query.shape[:-1] + (inputs.ckv_cache.shape[-1],),
+            dtype=case.output_dtype,
+            device=inputs.query.device,
         )
         kwargs["out"] = out
 
@@ -214,7 +225,9 @@ def test_explicit_functional_api_matches_reference(case):
     if case.backend == "trtllm-gen":
         actual = result[0] if isinstance(result, tuple) else result
         assert actual.data_ptr() == out.data_ptr()
-    _compare_result(case, result, expected_output, expected_lse)
+    _compare_result(
+        case, result, expected_output, expected_lse, inputs.query.shape[:-1]
+    )
 
 
 @pytest.mark.parametrize("case", _AUTO_CASES, ids=lambda case: case.case_id)
@@ -225,18 +238,19 @@ def test_functional_auto_matches_reference(case):
 
     result = flashinfer.mla.batch_mla_paged_attention(**functional_kwargs(case, inputs))
 
-    _compare_result(case, result, expected_output, expected_lse)
+    _compare_result(
+        case, result, expected_output, expected_lse, inputs.query.shape[:-1]
+    )
 
 
 def test_functional_exports_and_tensor_first_ownership_are_stable():
     assert hasattr(flashinfer.mla, "batch_mla_paged_attention")
     assert not hasattr(flashinfer.decode, "batch_mla_paged_attention")
     assert not hasattr(flashinfer, "batch_mla_paged_attention")
+    assert set(flashinfer.mla.__all__) == _PUBLIC_MLA_API
     for name in ("MLAQuery", "MLAKVCache"):
         assert name not in flashinfer.mla.__all__
         assert not hasattr(flashinfer.mla, name)
-        with pytest.raises(ImportError):
-            exec(f"from flashinfer.mla import {name}", {})
 
     signature = inspect.signature(flashinfer.mla.BatchMLAPagedAttentionWrapper.run)
     for name in (
@@ -250,10 +264,6 @@ def test_functional_exports_and_tensor_first_ownership_are_stable():
         assert name in signature.parameters
     assert "query_object" not in signature.parameters
     assert "kv" not in signature.parameters
-
-    namespace = {}
-    exec("from flashinfer.mla import *", namespace)
-    assert {name for name in namespace if not name.startswith("__")} == _PUBLIC_MLA_API
 
 
 class _PoisonReference:
@@ -304,6 +314,59 @@ def _raw_functional_request(**overrides):
     )
     values.update(overrides)
     return _FunctionalMLARequest(**values)
+
+
+def test_generated_fa_accepts_distinct_query_and_kv_dtypes():
+    request = _raw_functional_request(
+        q_nope=torch.empty(2, 1, 4, 2, dtype=torch.float16),
+        q_pe=torch.empty(2, 1, 4, 1, dtype=torch.float16),
+        ckv_cache=torch.empty(4, 1, 2, dtype=torch.bfloat16),
+        kpe_cache=torch.empty(4, 1, 1, dtype=torch.bfloat16),
+    )
+
+    prepared = _prepare_functional_fa_request(request)
+
+    assert prepared.q_nope.dtype == torch.float16
+    assert prepared.ckv_cache.dtype == torch.bfloat16
+
+
+def test_functional_fa2_rejects_distinct_query_and_kv_dtypes():
+    request = _raw_functional_request(
+        q_nope=torch.empty(2, 1, 4, 2, dtype=torch.float16),
+        q_pe=torch.empty(2, 1, 4, 1, dtype=torch.float16),
+        ckv_cache=torch.empty(4, 1, 2, dtype=torch.bfloat16),
+        kpe_cache=torch.empty(4, 1, 1, dtype=torch.bfloat16),
+    )
+
+    with pytest.raises(
+        mla_functional._FunctionalBackendUnsupportedError,
+        match="matching dtypes",
+    ):
+        fa2_backend.Fa2MlaRunner._validate_backend_capability(
+            object.__new__(fa2_backend.Fa2MlaRunner), request
+        )
+
+
+def test_cutlass_functional_requires_fixed_softmax_scale():
+    request = _raw_functional_request(
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        bmm1_scale=1.0,
+    )
+
+    with pytest.raises(ValueError, match="fixed softmax scale"):
+        cutlass_backend.CutlassMlaRunner._validate_functional_options(request)
+
+
+def test_functional_fa3_fp8_is_typed_unsupported():
+    request = _raw_functional_request(
+        ckv_cache=torch.empty(4, 1, 2, dtype=torch.float8_e4m3fn),
+    )
+
+    with pytest.raises(mla_functional._FunctionalBackendUnsupportedError):
+        fa3_backend.Fa3MlaRunner._validate_backend_capability(
+            object.__new__(fa3_backend.Fa3MlaRunner), request
+        )
 
 
 def test_packed_functional_selection_materializes_independent_split_inputs(
@@ -366,7 +429,6 @@ def test_functional_split_materialization_warns_once_per_process(monkeypatch):
         mla_functional,
         "_functional_split_materialization_warning_emitted",
         False,
-        raising=False,
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -568,7 +630,6 @@ def test_trtllm_legacy_facade_warns_once_and_preserves_output_identity(monkeypat
         mla_functional,
         "_trtllm_batch_decode_with_kv_cache_mla_warning_emitted",
         False,
-        raising=False,
     )
     case = MLATestCase(
         "sm100-trtllm-legacy", (10, 0), "trtllm-gen", qk_nope_head_dim=128
@@ -598,7 +659,6 @@ def test_xqa_legacy_facade_warns_once_and_matches_reference(monkeypatch):
         mla_functional,
         "_xqa_batch_decode_with_kv_cache_mla_warning_emitted",
         False,
-        raising=False,
     )
     case = MLATestCase("sm120-xqa-legacy", (12, 0), "xqa", qk_nope_head_dim=128)
     require_architecture(case.architecture)
@@ -632,7 +692,6 @@ def test_xqa_legacy_fi_trace_warns_once(monkeypatch):
         mla_functional,
         "_xqa_batch_decode_with_kv_cache_mla_warning_emitted",
         False,
-        raising=False,
     )
     kwargs = dict(
         query=torch.empty(2, 1, 128, 576, dtype=torch.bfloat16),

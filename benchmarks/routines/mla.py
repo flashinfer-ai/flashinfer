@@ -399,7 +399,7 @@ def _mla_result_row(
         mla_kv_layout=args.mla_kv_layout,
         mla_output_scale=args.mla_output_scale,
         mla_scale_mode=args.mla_scale_mode,
-        mla_skip_softmax=args.mla_skip_softmax,
+        mla_skip_softmax=_bool_text(args.mla_skip_softmax),
         mla_measurement_seed=args.random_seed,
         plan_latency_ms=outcome["plan_latency_ms"] or "",
         workspace_bytes=workspace_bytes,
@@ -590,7 +590,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         enable_pdl=args.enable_pdl,
         use_sinks=args.mla_use_sinks,
         lse_mode=args.mla_lse_mode,
-        query_layout="packed",
+        query_layout="split",
         kv_cache_layout=(
             "packed" if args.mla_kv_layout != "independent-split" else "split"
         ),
@@ -1445,8 +1445,9 @@ def run_functional_mla_test(args):
         def replay(*, _kwargs=replay_kwargs):
             return api(**_kwargs)
 
-        outcome["_call"] = replay
-        outcome["_workspace"] = workspace
+        if outcome["status"] == "captured":
+            outcome["_call"] = replay
+            outcome["_workspace"] = workspace
         outcome["_workspace_bytes"] = workspace.numel() * workspace.element_size()
         outcome["_capture_peak_memory_delta_bytes"] = (
             max(
@@ -1463,6 +1464,13 @@ def run_functional_mla_test(args):
         reference_output,
         require_lse=args.mla_lse_mode != "none",
     )
+    for outcome in outcomes:
+        outcome.pop("_captured_output", None)
+        outcome.pop("_call_kwargs", None)
+        outcome.pop("_first_run_ms", None)
+        if outcome["correctness_status"] != "correct":
+            outcome.pop("_call", None)
+            outcome.pop("_workspace", None)
 
     def measure(call, phase):
         with flashinfer.autotune(False, cache=args.autotune_cache):

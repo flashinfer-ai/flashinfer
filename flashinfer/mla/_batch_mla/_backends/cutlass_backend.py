@@ -136,12 +136,11 @@ def get_mla_module():
 class _BatchMLAPagedAttentionCutlassBackend:
     """CUTLASS MLA backend with plan-preferred launch metadata.
 
-    The wrapper passes six raw packed/split query and cache references. This
-    backend resolves packed launcher inputs itself, permits a bounded copy for
-    an independent split query, and retains the deprecated compatibility copy
-    for independent split KV. ``kv_len`` and ``page_table`` may be captured by
-    :meth:`plan`; :meth:`run` then uses those planned tensors unless callers
-    provide cheap-verified aliases of the same tensor views.
+    The wrapper passes structural query and KV-cache references. This backend
+    resolves packed launcher inputs itself and rejects independent non-adjacent
+    split inputs because planned wrapper execution is zero-copy. ``kv_len`` and
+    ``page_table`` may be captured by :meth:`plan`; :meth:`run` then uses those
+    planned tensors unless callers provide validated aliases of the same views.
     """
 
     _plan_capabilities = MLAPlanCapabilities(
@@ -400,6 +399,10 @@ class _BatchMLAPagedAttentionCutlassBackend:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not hasattr(self, "_cached_module"):
+            raise RuntimeError(
+                "_BatchMLAPagedAttentionCutlassBackend.run() called before plan()."
+            )
         packed_query = _resolve_structural_mla_input(
             query,
             desired="packed",
@@ -553,6 +556,12 @@ class CutlassMlaRunner(_FunctionalMLARunner):
             raise ValueError("cutlass MLA scales must be scalar floats.") from error
         if not math.isfinite(bmm1_scale) or not math.isfinite(bmm2_scale):
             raise ValueError("cutlass MLA scales must be finite.")
+        expected_sm_scale = 1.0 / math.sqrt(128 + request.qk_rope_head_dim)
+        if not math.isclose(bmm1_scale, expected_sm_scale, rel_tol=1e-5, abs_tol=1e-8):
+            raise ValueError(
+                "cutlass MLA uses a fixed softmax scale of "
+                f"{expected_sm_scale}, got {bmm1_scale}."
+            )
         if bmm2_scale != 1.0:
             raise ValueError("cutlass MLA requires bmm2_scale == 1.0.")
         if request.sinks is not None:
@@ -677,7 +686,7 @@ class CutlassMlaRunner(_FunctionalMLARunner):
             actual is prepared
             for actual, prepared in zip(inputs, self._inputs, strict=True)
         ):
-            packed_query, kv_cache, kv_len, page_table, sm_scale = self._prepared
+            packed_query, kv_cache, kv_len, page_table, _ = self._prepared
         else:
             request = replace(
                 self.request,
@@ -688,7 +697,7 @@ class CutlassMlaRunner(_FunctionalMLARunner):
             )
             self._validate_functional_options(request)
             normalized = self._normalize_request(request)
-            packed_query, kv_cache, kv_len, page_table, sm_scale = normalized
+            packed_query, kv_cache, kv_len, page_table, _ = normalized
         lse = torch.empty(0, dtype=torch.float32, device=query.device)
         get_mla_module().cutlass_mla_paged_attention(
             self.request.workspace_buffer,
@@ -698,6 +707,6 @@ class CutlassMlaRunner(_FunctionalMLARunner):
             kv_cache,
             kv_len,
             page_table,
-            sm_scale,
+            1.0,
         )
         return out

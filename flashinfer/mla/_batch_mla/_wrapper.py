@@ -213,7 +213,7 @@ class BatchMLAPagedAttentionWrapper:
 
     ``backend="auto"`` deterministically promotes an architecture-preferred
     candidate: FA3 on SM90, TRTLLM-GEN on SM100/SM103, and XQA on SM120/SM121.
-    SM80/SM89; unrecognized architectures retain the conservative FA2-first
+    SM80/SM89 and unrecognized architectures retain the conservative FA2-first
     order. Every ordering remains a complete candidate list, and backend
     planners may fall through only when they report the request unsupported.
 

@@ -326,7 +326,9 @@ def _run_mla_decode_sparse_sm120(
             topk_length = seq_lens.reshape(flat_tokens).contiguous()
         elif seq_lens.ndim == 1 and seq_lens.numel() == flat_tokens:
             topk_length = seq_lens.contiguous()
-        elif not (seq_lens.ndim == 1 and seq_lens.numel() == batch_size):
+        elif seq_lens.ndim == 1 and seq_lens.numel() == batch_size:
+            topk_length = seq_lens.repeat_interleave(q_len_per_request).contiguous()
+        else:
             raise ValueError(
                 "seq_lens for SM120 sparse MLA v32/GLM must be shaped either "
                 f"({batch_size},), ({flat_tokens},), or "

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import flashinfer.fused_moe.core as core_mod
+import flashinfer.autotuner.autotuner as autotuner_module
 from flashinfer import autotune
 from flashinfer.autotuner.autotuner import _get_autotune_context_mode
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
@@ -1027,6 +1028,33 @@ def test_autotune_context_activity_is_thread_local_and_nestable():
     assert other_thread_activity == [None]
 
 
+def test_autotune_entry_failure_rolls_back_global_and_thread_local_state(monkeypatch):
+    tuner = reset_autotuner()
+
+    def fail_on_entry(_message):
+        raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(autotuner_module.logger, "info", fail_on_entry)
+
+    with (
+        pytest.raises(RuntimeError, match="logging failed"),
+        autotune(
+            True,
+            tuning_buckets=(1, 2),
+            round_up=True,
+            skip_ops={"example"},
+        ),
+    ):
+        pytest.fail("autotune context body should not run")
+
+    assert tuner._active_tuning_contexts == 0
+    assert tuner._global_tuning_mode is False
+    assert _get_autotune_context_mode() is None
+    assert tuner._override_tuning_buckets is None
+    assert tuner._override_round_up is False
+    assert tuner._effective_skip_ops == frozenset()
+
+
 def test_nested_cache_only_context_overrides_outer_tuning_mode(monkeypatch):
     tuner = reset_autotuner()
     profile_calls = []
@@ -2038,7 +2066,7 @@ def _wrapper_mla_autotune_profile() -> _MLAAutotuneProfile:
         lse_mode="none",
         output_dtype=torch.float16,
         output_scale="none",
-        scale_mode="none",
+        scale_mode="default",
         skip_softmax=False,
         use_sinks=False,
         causal=False,
@@ -2070,15 +2098,33 @@ def test_wrapper_mla_cache_extras_bucket_batch_and_track_plan_fields():
         assert replace(profile, **{field: value}).cache_extras("fa2") != baseline
 
 
-def test_wrapper_mla_tuning_config_is_memoized():
+def test_wrapper_mla_tuning_config_is_memoized_by_effective_inputs():
     profile = _wrapper_mla_autotune_profile()
-    build_wrapper_tuning_config.cache_clear()
-    try:
-        first = build_wrapper_tuning_config(profile, buckets=(1, 3, 7))
-        second = build_wrapper_tuning_config(replace(profile), buckets=(1, 3, 7))
-        assert second is first
-    finally:
-        build_wrapper_tuning_config.cache_clear()
+    first = build_wrapper_tuning_config(profile, buckets=(1, 3, 7))
+
+    assert (
+        build_wrapper_tuning_config(
+            replace(profile, batch_size=8, causal=True), buckets=(7, 3, 1, 3)
+        )
+        is first
+    )
+    assert (
+        build_wrapper_tuning_config(
+            replace(profile, max_kv_len=profile.max_kv_len + 1),
+            buckets=(1, 3, 7),
+        )
+        is not first
+    )
+    assert (
+        build_wrapper_tuning_config(
+            replace(
+                profile,
+                workspace_page_capacity=profile.workspace_page_capacity + 1,
+            ),
+            buckets=(1, 3, 7),
+        )
+        is not first
+    )
 
 
 def _call_build_mla_decode_tuning_config(
@@ -2228,11 +2274,10 @@ def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
     return runner.get_cache_key_extras([query, None, None, out])
 
 
-def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
-    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+def test_cute_dsl_runner_cache_buckets_sequence_and_tracks_workspace_geometry():
     key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
     key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
-    assert key_257 != key_385
+    assert key_257 == key_385
 
     key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
     assert key_257 != key_small_workspace

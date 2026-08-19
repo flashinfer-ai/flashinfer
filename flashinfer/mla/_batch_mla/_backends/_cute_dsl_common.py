@@ -504,6 +504,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
         bmm1_scale: Optional[Union[float, torch.Tensor]],
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not hasattr(self, "_execution_state"):
+            raise RuntimeError(f"{type(self).__name__}.run() called before plan().")
         state = self._execution_state
         packed_query = _resolve_structural_mla_input(
             query,

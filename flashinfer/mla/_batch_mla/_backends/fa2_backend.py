@@ -137,6 +137,10 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
                 "backend. Supported dtypes: "
                 f"{[torch.float16, torch.bfloat16]}."
             )
+        if q_data_type != kv_data_type:
+            raise _BackendPlanUnsupportedError(
+                "fa2 MLA requires query and KV inputs to have matching dtypes."
+            )
         self._plan_generated_fa(
             module_loader=lambda: _get_batch_mla_fa2_module(
                 q_data_type,
@@ -275,9 +279,13 @@ class Fa2MlaRunner(_GeneratedFaMlaRunner):
         return get_batch_mla_module("fa2", *module_args)
 
     def _validate_backend_capability(self, request: _FunctionalMLARequest) -> None:
-        assert request.ckv_cache is not None
+        assert request.ckv_cache is not None and request.q_nope is not None
         if request.ckv_cache.dtype not in (torch.float16, torch.bfloat16):
             raise _FunctionalBackendUnsupportedError(
                 f"MLA kv_data_type {request.ckv_cache.dtype} is not supported by the fa2 "
                 f"backend. Supported dtypes: {[torch.float16, torch.bfloat16]}."
+            )
+        if request.q_nope.dtype != request.ckv_cache.dtype:
+            raise _FunctionalBackendUnsupportedError(
+                "fa2 MLA requires query and KV inputs to have matching dtypes."
             )

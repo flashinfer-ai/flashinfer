@@ -283,7 +283,7 @@ class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
                 raise _FunctionalBackendUnsupportedError(message)
             raise ValueError(message)
         if (request.return_lse or request.lse is not None) and not supports_lse:
-            message = "cute-dsl-modular does not support LSE."
+            message = f"cute-dsl-{implementation_name} does not support LSE."
             if request.cute_dsl_impl == "auto":
                 raise _FunctionalBackendUnsupportedError(message)
             raise ValueError(message)
@@ -417,7 +417,6 @@ class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
             self.qk_rope_head_dim,
             self.page_size,
             next_positive_power_of_2(self.max_seq_len),
-            self.max_seq_len,
             workspace_bytes,
             self.is_var_seq,
             self.uses_shared_paged_kv_idx,

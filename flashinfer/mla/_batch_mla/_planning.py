@@ -264,8 +264,9 @@ def _derive_csr_from_dense(
             torch.cumsum(live_pages, dim=0, dtype=torch.int32),
         )
     )
+    live_pages_host = live_pages.to(device="cpu").tolist()
     rows = [
-        dense.block_tables[row, : int(live_pages[row].item())]
+        dense.block_tables[row, : int(live_pages_host[row])]
         for row in range(dense.block_tables.shape[0])
     ]
     kv_indices = (

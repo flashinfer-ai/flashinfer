@@ -2436,7 +2436,7 @@ def test_mla_decode_variable_q_auto_uses_cute_dsl_for_head_gap():
     )
 
 
-def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_impl):
+def _batch_mla_wrapper_cute_dsl_case(wrapper_backend, cute_dsl_impl):
     skip_if_unsupported()
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -2486,26 +2486,17 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_im
         is_var_seq=True,
         use_sinks=use_sinks,
         lse_mode="basee" if return_lse else "none",
-        kv_layout="combined",
+        kv_cache_layout="packed",
         output_dtype=torch.bfloat16,
         scale_mode="bmm-scalar",
     )
-    if metadata_form == "dense":
-        wrapper.plan(
-            cum_seq_lens_q=cum_seq_lens_q,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_q_len=1,
-            **common_plan,
-        )
-    else:
-        wrapper.plan(
-            cum_seq_lens_q,
-            torch.tensor([0, 1, 3], dtype=torch.int32, device=device),
-            torch.tensor([0, 2, 3], dtype=torch.int32, device=device),
-            seq_lens,
-            **common_plan,
-        )
+    wrapper.plan(
+        cum_seq_lens_q=cum_seq_lens_q,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_q_len=1,
+        **common_plan,
+    )
 
     wrapper_out = torch.empty(
         (batch_size, num_heads, kv_lora_rank),
@@ -2581,8 +2572,14 @@ def _functional_batch_mla_cute_dsl_result(case):
 
 
 def test_batch_mla_wrapper_cute_dsl_cuda_graph_replays():
-    case = _batch_mla_wrapper_cute_dsl_case("dense", "cute-dsl", "monolithic")
+    case = _batch_mla_wrapper_cute_dsl_case("cute-dsl", "monolithic")
     functional = _functional_batch_mla_cute_dsl_result(case)
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        _run_batch_mla_wrapper_cute_dsl_case(case)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

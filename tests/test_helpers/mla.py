@@ -239,9 +239,6 @@ def functional_kwargs(case: MLATestCase, inputs: MLATestInputs) -> dict:
     }
     if case.backend == "cutlass":
         kwargs["qk_nope_head_dim"] = 512
-        # CUTLASS owns its fixed DeepSeek softmax scale; the functional scalar
-        # is the kernel's output scale and stays neutral for BF16 coverage.
-        kwargs["bmm1_scale"] = 1.0
     if case.backend.startswith("cute-dsl-"):
         kwargs["cute_dsl_impl"] = case.backend.removeprefix("cute-dsl-")
     if case.scale_mode == "bmm-tensor":

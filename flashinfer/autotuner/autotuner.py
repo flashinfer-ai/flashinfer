@@ -1002,6 +1002,10 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
+        with tuner._lock:
+            if tune_mode:
+                tuner._active_tuning_contexts -= 1
+            tuner._global_tuning_mode = tuner._active_tuning_contexts > 0
         _pop_autotune_context()
         if pushed:
             override_stack.pop()

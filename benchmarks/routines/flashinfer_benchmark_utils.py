@@ -557,6 +557,7 @@ routine_cc_to_supported_backends = {
             "cute-dsl-modular",
             "auto",
         ],
+        "10.7": ["fa2", "cutlass", "trtllm-gen", "auto"],
         "12.0": ["fa2", "xqa", "auto"],
         "12.1": ["fa2", "xqa", "auto"],
     },

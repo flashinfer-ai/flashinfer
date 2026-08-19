@@ -14,6 +14,7 @@ from flashinfer.mla._batch_mla._backends import (
     cute_dsl_modular_backend,
     cute_dsl_monolithic_backend,
     fa2_backend,
+    fa3_backend,
     trtllm_gen_backend,
     xqa_backend,
 )
@@ -103,6 +104,45 @@ def _backend_run_kwargs(**overrides):
     }
     kwargs.update(overrides)
     return kwargs
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    (
+        cutlass_backend._BatchMLAPagedAttentionCutlassBackend,
+        cute_dsl_monolithic_backend._BatchMLAPagedAttentionCuteDslMonolithicBackend,
+        trtllm_gen_backend._BatchMLAPagedAttentionTrtllmGenBackend,
+        xqa_backend._BatchMLAPagedAttentionXqaBackend,
+    ),
+)
+def test_backend_run_from_wrapper_requires_plan(backend_type):
+    backend = object.__new__(backend_type)
+
+    with pytest.raises(RuntimeError, match=r"run\(\) called before plan\(\)"):
+        backend.run_from_wrapper(**_backend_run_kwargs())
+
+
+def test_fa3_cpu_plan_is_typed_unsupported():
+    backend = object.__new__(fa3_backend._BatchMLAPagedAttentionFa3Backend)
+    backend.device = torch.device("cpu")
+    metadata = _plan_kwargs()["metadata"]
+
+    with pytest.raises(_BackendPlanUnsupportedError, match="cuda device"):
+        backend.plan(
+            qo_indptr=metadata.qo_indptr,
+            kv_indptr=metadata.kv_indptr,
+            kv_indices=metadata.kv_indices,
+            kv_len_arr=metadata.kv_len_arr,
+            num_heads=1,
+            head_dim_ckv=2,
+            head_dim_kpe=1,
+            page_size=1,
+            causal=False,
+            sm_scale=1.0,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            use_profiler=False,
+        )
 
 
 def test_invalid_input_does_not_fallback(monkeypatch):
@@ -286,6 +326,7 @@ def test_dense_backends_convert_adjacent_split_inputs_without_copy():
     ckv_cache, kpe_cache = kv_storage[..., :2], kv_storage[..., 2:]
     recorded = {}
     backend = object.__new__(cutlass_backend._BatchMLAPagedAttentionCutlassBackend)
+    backend._cached_module = object()
     backend._head_dim_ckv = 2
     backend._head_dim_kpe = 1
     backend.run = lambda **kwargs: recorded.update(kwargs) or "recorded"
@@ -417,6 +458,7 @@ def test_independent_split_to_packed_is_rejected_without_copy():
 
 def test_cutlass_wrapper_rejects_independent_split_kv_without_copy():
     backend = object.__new__(cutlass_backend._BatchMLAPagedAttentionCutlassBackend)
+    backend._cached_module = object()
     backend._head_dim_ckv = 2
     backend._head_dim_kpe = 1
     captured = {}

@@ -588,8 +588,10 @@ def _prepare_functional_fa_request(
         tensor.device == q_nope.device for tensor in (q_pe, ckv_cache, kpe_cache)
     ):
         raise ValueError("query and KV split references must be on the same device.")
-    if not all(tensor.dtype == q_nope.dtype for tensor in (q_pe, ckv_cache, kpe_cache)):
-        raise ValueError("query and KV split references must have the same dtype.")
+    if q_pe.dtype != q_nope.dtype:
+        raise ValueError("q_nope and q_pe must have the same dtype.")
+    if kpe_cache.dtype != ckv_cache.dtype:
+        raise ValueError("ckv_cache and kpe_cache must have the same dtype.")
     if q_nope.shape[-1] != kv_lora_rank or ckv_cache.shape[-1] != kv_lora_rank:
         raise ValueError("q_nope and ckv_cache must match kv_lora_rank.")
     if q_pe.shape[-1] != qk_rope_head_dim or kpe_cache.shape[-1] != qk_rope_head_dim:
@@ -823,10 +825,14 @@ class _GeneratedFaMlaRunner(_FunctionalMLARunner, _BatchMLAGeneratedFaMechanics)
                 "generated FA MLA did not return the requested LSE output."
             )
         flat_out, flat_lse = result
-        return (
-            flat_out.reshape(output_shape),
-            prepared.user_lse if prepared.user_lse is not None else flat_lse,
-        )
+        returned_lse = prepared.user_lse
+        if returned_lse is None:
+            returned_lse = (
+                flat_lse.reshape(request.q_nope.shape[:-1])
+                if request.q_nope.ndim == 4
+                else flat_lse
+            )
+        return flat_out.reshape(output_shape), returned_lse
 
     def forward(
         self,

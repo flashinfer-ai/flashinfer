@@ -147,7 +147,10 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
                 f"MLA kv_data_type {kv_data_type} is not supported. "
                 f"Supported dtypes: {list(supported_kv_dtypes)}."
             )
-        major, minor = get_compute_capability(self.device)
+        try:
+            major, minor = get_compute_capability(self.device)
+        except ValueError as error:
+            raise _BackendPlanUnsupportedError(str(error)) from error
         if (major, minor) != (9, 0):
             raise _BackendPlanUnsupportedError(
                 f"FA3 MLA requires an SM90 (Hopper) device, got SM{major}{minor}."
@@ -326,7 +329,9 @@ class Fa3MlaRunner(_GeneratedFaMlaRunner):
     def _validate_backend_capability(self, request: _FunctionalMLARequest) -> None:
         assert request.ckv_cache is not None and request.q_nope is not None
         if request.ckv_cache.dtype == torch.float8_e4m3fn:
-            raise ValueError("functional fa3 MLA does not support FP8 kv_cache.")
+            raise _FunctionalBackendUnsupportedError(
+                "functional fa3 MLA does not support FP8 kv_cache."
+            )
         supported_kv_dtypes = (torch.float16, torch.bfloat16)
         if request.ckv_cache.dtype not in supported_kv_dtypes:
             raise _FunctionalBackendUnsupportedError(

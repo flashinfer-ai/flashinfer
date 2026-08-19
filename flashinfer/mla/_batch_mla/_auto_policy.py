@@ -299,7 +299,7 @@ def _seq_len_initializer(max_kv_len: int):
     return initialize
 
 
-def _block_table_initializer(profile: _MLAAutotuneProfile):
+def _block_table_initializer(workspace_page_capacity: int):
     def initialize(
         shape: Sequence[int], dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
@@ -307,12 +307,35 @@ def _block_table_initializer(profile: _MLAAutotuneProfile):
         for dimension in shape:
             numel *= dimension
         values = torch.arange(numel, dtype=dtype, device=device).reshape(tuple(shape))
-        return torch.remainder(values, profile.workspace_page_capacity)
+        return torch.remainder(values, workspace_page_capacity)
 
     return initialize
 
 
 @functools.cache
+def _build_wrapper_tuning_config(
+    buckets: tuple[int, ...], max_kv_len: int, workspace_page_capacity: int
+) -> TuningConfig:
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 2, 3),
+                dim_idx=(0, 0, 0, 0),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
+                tensor_initializers=(
+                    autotuner_initializer_zeros,
+                    _block_table_initializer(workspace_page_capacity),
+                    _seq_len_initializer(max_kv_len),
+                    autotuner_initializer_empty,
+                ),
+            ),
+        ),
+        use_cuda_graph=True,
+        use_cold_l2_cache=False,
+    )
+
+
 def build_wrapper_tuning_config(
     profile: _MLAAutotuneProfile, *, buckets: tuple[int, ...]
 ) -> TuningConfig:
@@ -320,25 +343,10 @@ def build_wrapper_tuning_config(
     normalized_buckets = tuple(sorted(set(buckets)))
     if not normalized_buckets:
         raise ValueError("wrapper MLA autotuning requires at least one batch bucket")
-    return TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
-                gen_tuning_buckets=normalized_buckets,
-                map_to_tuning_buckets=make_bucket_mapper(
-                    normalized_buckets, round_map=False
-                ),
-                tensor_initializers=(
-                    autotuner_initializer_zeros,
-                    _block_table_initializer(profile),
-                    _seq_len_initializer(profile.max_kv_len),
-                    autotuner_initializer_empty,
-                ),
-            ),
-        ),
-        use_cuda_graph=True,
-        use_cold_l2_cache=False,
+    return _build_wrapper_tuning_config(
+        normalized_buckets,
+        profile.max_kv_len,
+        profile.workspace_page_capacity,
     )
 
 
@@ -692,16 +700,17 @@ def plan_auto_backend(
             ),
         )
 
+    structural_results = tuple(
+        (candidate, _structural_rejection_reason(args, candidate, backend_types))
+        for candidate in candidates
+    )
     structural_rejections = tuple(
         (candidate, reason)
-        for candidate in candidates
-        if (reason := _structural_rejection_reason(args, candidate, backend_types))
-        is not None
+        for candidate, reason in structural_results
+        if reason is not None
     )
     candidates = tuple(
-        candidate
-        for candidate in candidates
-        if _structural_rejection_reason(args, candidate, backend_types) is None
+        candidate for candidate, reason in structural_results if reason is None
     )
     if not candidates:
         summary = "; ".join(

@@ -316,12 +316,7 @@ benchmark.
 
 ### Batch Testing
 
-Run multiple tests from a file and save results:
-```bash
-python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path /tmp/flashinfer-benchmark-output.csv
-```
-
-For a repository checkout, prefer writing generated results outside the source
+Run multiple tests from a file and write generated results outside the source
 tree:
 
 ```bash

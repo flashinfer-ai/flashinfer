@@ -47,8 +47,10 @@ class StatefulAdapter:
 _MLA_STATEFUL_ADAPTER = StatefulAdapter(
     plan_attr="plan",
     plan_inputs={
+        "qo_indptr": "qo_indptr",
         "kv_indptr": "kv_indptr",
         "kv_indices": "kv_indices",
+        "kv_len_arr": "kv_len_arr",
         "sm_scale": "sm_scale",
     },
 )
@@ -151,6 +153,14 @@ def augment_namespace(
         if val is not None:
             namespace[_ns_key(template, json_key)] = val
     plan_bound = fetch_plan_kwargs(self_obj)
+    metadata = plan_bound.get("metadata")
+    if metadata is not None:
+        for json_key in ("qo_indptr", "kv_indptr", "kv_indices", "kv_len_arr"):
+            key = _ns_key(template, json_key)
+            if namespace.get(key) is None:
+                value = getattr(metadata, json_key, None)
+                if value is not None:
+                    namespace[key] = value
     for json_key, plan_param in adapter.plan_inputs.items():
         key = _ns_key(template, json_key)
         if namespace.get(key) is None:
