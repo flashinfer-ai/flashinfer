@@ -3503,7 +3503,7 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 # ==============================================================================
-# Cache-step stride regression: cache_steps may be larger than processed T.
+# Cache-step stride regression: a logical T view may have a larger batch stride.
 # ==============================================================================
 
 
@@ -3523,13 +3523,14 @@ def test_gdn_decode_mtp_cache_steps_stride(
     num_v_heads: int,
     num_tokens: int,
 ):
-    """Honor the physical cache stride when ``cache_steps > T``.
+    """Honor the physical cache stride of ``cache[:, :T]``.
 
-    The old flat index used ``i_n * T * HV`` even though the public API accepts
-    a larger second cache dimension. For B > 1 that packed batch 1 into batch
-    0's trailing slots and left batch 1's requested slots unwritten. Compare
-    against an exact-T cache and require the padded trailing slots to remain
-    bit-exact sentinels across every FP32/BF16 MTP kernel route.
+    The old flat index used ``i_n * T * HV`` and ignored the larger batch
+    stride carried by a leading view of reusable backing storage. For B > 1
+    that packed batch 1 into batch 0's trailing slots and left batch 1's
+    requested slots unwritten. Compare against an exact-T cache and require
+    the hidden trailing slots to remain bit-exact sentinels across every
+    FP32/BF16 MTP kernel route.
     """
     _skip_if_not_sm90_or_later()
     if state_dtype == torch.bfloat16 and not GDN_DECODE_BF16_STATE_AVAILABLE:
@@ -3552,9 +3553,13 @@ def test_gdn_decode_mtp_cache_steps_stride(
 
     cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
     sentinel = 7.0
-    cache_padded = torch.full(
+    cache_backing = torch.full(
         (B, cache_steps, HV, V, K), sentinel, dtype=state_dtype, device=device
     )
+    cache_view = cache_backing[:, :T]
+    assert cache_view.shape == cache_exact.shape
+    assert cache_view.stride(0) == cache_steps * HV * V * K
+    assert not cache_view.is_contiguous()
 
     common = dict(
         A_log=A_log,
@@ -3579,7 +3584,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded, _ = gated_delta_rule_mtp(
             **common,
             initial_state=initial_state.clone(),
-            intermediate_states_buffer=cache_padded,
+            intermediate_states_buffer=cache_view,
             use_qk_l2norm=True,
         )
     elif T == 1:
@@ -3592,7 +3597,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded = gdn_decode_bf16_state_t1_wide_vec(
             **common,
             initial_state_source=initial_state.clone(),
-            intermediate_states_buffer=cache_padded,
+            intermediate_states_buffer=cache_view,
             use_qk_l2norm_in_kernel=True,
         )
     else:
@@ -3605,16 +3610,16 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded = gdn_decode_bf16_state_mtp(
             **common,
             initial_state_source=initial_state.clone(),
-            intermediate_states_buffer=cache_padded,
+            intermediate_states_buffer=cache_view,
             use_qk_l2norm_in_kernel=True,
         )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(cache_padded[:, :T], cache_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache_view, cache_exact, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
-        cache_padded[:, T:],
-        torch.full_like(cache_padded[:, T:], sentinel),
+        cache_backing[:, T:],
+        torch.full_like(cache_backing[:, T:], sentinel),
         atol=0,
         rtol=0,
     )
@@ -3644,7 +3649,10 @@ def test_gdn_decode_bf16_dense_cache_int64_boundary():
     # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
     # state pool compact and leave the 4.02 GiB cache uninitialized so the test
     # exercises the boundary without unnecessary initialization traffic.
-    cache = torch.empty(B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device)
+    cache_backing = torch.empty(
+        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    cache = cache_backing[:, :T]
     output = gdn_decode_bf16_state_t1_wide_vec(
         A_log=A_log,
         a=a,

@@ -696,11 +696,11 @@ def gated_delta_rule_mtp(
         Pre-allocated output tensor of shape ``[B, T, HV, V]``.
     intermediate_states_buffer : torch.Tensor, optional
         Buffer for caching intermediate states, shape
-        ``[B, cache_steps, HV, V, K]`` with ``cache_steps >= T``
-        (first dim is indexed per-batch, not per-pool-slot — buffer must
-        be at least ``B`` rows and contiguous; must be float32 when
-        provided). When ``None``, intermediate states are not cached.
-        Mutually exclusive with ``ssm_state_indices``.
+        ``[B, T, HV, V, K]`` (first dim is indexed per-batch, not per-pool
+        slot; must be float32 when provided). A leading slice of a larger
+        cache, for example ``cache[:, :T]``, is supported; its batch stride
+        determines the physical cache capacity. When ``None``, intermediate
+        states are not cached. Mutually exclusive with ``ssm_state_indices``.
     ssm_state_indices : torch.Tensor, optional
         Per-token pool scatter indices of shape ``[B, T]`` and dtype
         ``torch.int32``.  When provided, the kernel writes each intermediate
@@ -827,39 +827,56 @@ def gated_delta_rule_mtp(
     else:
         h0_source = initial_state.reshape(pool_size * HV, V, K)
 
-    # Handle intermediate states. The kernel indexes the buffer by batch (i_n),
-    # not by pool slot — see
-    # `flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv` inside
-    # the kernel. So the buffer's first dim MUST be at least B, and the buffer
-    # MUST be contiguous so the reshape returns a free view. We make both
-    # contracts explicit here to fail loudly on caller mistakes (the pre-existing
-    # code silently did out-of-bounds writes when buffer.shape[0] < B).
+    # Handle intermediate states. The public shape remains [B, T, HV, V, K].
+    # A caller may reuse a [B, cache_steps, ...] allocation by passing the
+    # leading view `buffer[:, :T]`; stride(0), not shape(1), then carries the
+    # physical per-batch capacity used by the kernel's flat addressing.
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
 
         assert buffer_size >= B, (
             f"intermediate_states_buffer first dim ({buffer_size}) must be "
             f"at least B={B}: the kernel indexes it by batch (i_n in [0, B)), "
             f"so a smaller buffer causes out-of-bounds writes."
         )
-        assert cache_steps >= T, (
-            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) "
-            f"must be at least T={T} to prevent out-of-bounds indexing"
+        assert tuple(intermediate_states_buffer.shape[1:]) == (T, HV, V, K), (
+            "intermediate_states_buffer must have logical shape "
+            f"[buffer_size, T={T}, HV={HV}, V={V}, K={K}], got "
+            f"{tuple(intermediate_states_buffer.shape)}"
         )
         assert intermediate_states_buffer.dtype == torch.float32, (
             f"intermediate_states_buffer must be float32, "
             f"got {intermediate_states_buffer.dtype}"
         )
-        assert intermediate_states_buffer.is_contiguous(), (
-            "intermediate_states_buffer must be contiguous so the kernel writes "
-            "land in the caller-owned tensor (reshape would otherwise materialize "
-            "a throwaway copy)."
+        cache_step_stride = HV * V * K
+        expected_inner_strides = (cache_step_stride, V * K, K, 1)
+        assert (
+            tuple(intermediate_states_buffer.stride()[1:]) == expected_inner_strides
+        ), (
+            "intermediate_states_buffer must be contiguous within each batch; "
+            f"expected inner strides {expected_inner_strides}, got "
+            f"{tuple(intermediate_states_buffer.stride()[1:])}"
+        )
+        cache_batch_stride = intermediate_states_buffer.stride(0)
+        assert cache_batch_stride % cache_step_stride == 0, (
+            "intermediate_states_buffer batch stride must be a whole number "
+            f"of cache steps; got stride(0)={cache_batch_stride} and "
+            f"step size={cache_step_stride}"
+        )
+        cache_steps = cache_batch_stride // cache_step_stride
+        assert cache_steps >= T, (
+            f"intermediate_states_buffer batch stride encodes {cache_steps} "
+            f"cache steps, fewer than logical T={T}"
         )
 
-        intermediate_states = intermediate_states_buffer.view(
-            buffer_size * cache_steps * HV, V, K
+        # Zero-copy compact alias over the backing storage. This deliberately
+        # spans the physical batch stride, including the hidden trailing cache
+        # slots of a `buffer[:, :T]` view.
+        intermediate_states = intermediate_states_buffer.as_strided(
+            size=(buffer_size * cache_steps * HV, V, K),
+            stride=(V * K, K, 1),
+            storage_offset=intermediate_states_buffer.storage_offset(),
         )
     else:
         cache_steps = T
@@ -924,10 +941,9 @@ def gated_delta_rule_mtp(
         use_pool_indexing=pool_use_pool_indexing,
     )
 
-    # No post-kernel scatter step: the contiguity assert above guarantees
-    # `intermediate_states` is a view of `intermediate_states_buffer`, and the
-    # `use_pool_indexing=True` path makes the kernel write the strided pool
-    # in place. Writes are visible to the caller directly.
+    # No post-kernel scatter step: `intermediate_states` aliases the caller's
+    # backing storage, and the pool-indexing path writes the strided pool in
+    # place. Writes are visible to the caller directly.
 
     # Convert output to target dtype if needed
     if output.dtype != target_dtype:

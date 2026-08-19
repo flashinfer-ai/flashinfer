@@ -75,6 +75,47 @@ def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
     ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
 
 
+def _flatten_intermediate_cache_view(
+    buffer: torch.Tensor,
+    *,
+    batch_size: int,
+    num_tokens: int,
+    num_v_heads: int,
+    v_dim: int,
+    k_dim: int,
+) -> tuple[torch.Tensor, int]:
+    """Return a zero-copy flat alias and its physical per-batch capacity."""
+    expected_shape = (batch_size, num_tokens, num_v_heads, v_dim, k_dim)
+    assert tuple(buffer.shape) == expected_shape, (
+        f"intermediate_states_buffer must have logical shape {expected_shape}, "
+        f"got {tuple(buffer.shape)}"
+    )
+    cache_step_stride = num_v_heads * v_dim * k_dim
+    expected_inner_strides = (cache_step_stride, v_dim * k_dim, k_dim, 1)
+    assert tuple(buffer.stride()[1:]) == expected_inner_strides, (
+        "intermediate_states_buffer must be contiguous within each batch; "
+        f"expected inner strides {expected_inner_strides}, got "
+        f"{tuple(buffer.stride()[1:])}"
+    )
+    cache_batch_stride = buffer.stride(0)
+    assert cache_batch_stride % cache_step_stride == 0, (
+        "intermediate_states_buffer batch stride must be a whole number of "
+        f"cache steps; got stride(0)={cache_batch_stride} and "
+        f"step size={cache_step_stride}"
+    )
+    cache_steps = cache_batch_stride // cache_step_stride
+    assert cache_steps >= num_tokens, (
+        f"intermediate_states_buffer batch stride encodes {cache_steps} cache "
+        f"steps, fewer than logical T={num_tokens}"
+    )
+    flat = buffer.as_strided(
+        size=(batch_size * cache_steps * num_v_heads, v_dim, k_dim),
+        stride=(v_dim * k_dim, k_dim, 1),
+        storage_offset=buffer.storage_offset(),
+    )
+    return flat, cache_steps
+
+
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
@@ -3052,24 +3093,15 @@ def gated_delta_rule_mtp_wide_vec(
     cache_intermediate_states = intermediate_states_buffer is not None
     cache_steps = T_val
     if cache_intermediate_states:
-        # The cache buffer is BATCH-scoped: shape
-        # [B, cache_steps, HV, V, K]. The kernel
-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
-        # mirrors upstream PR #3145.
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B_val, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T_val
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B_val * cache_steps * HV_val, V_val, K_val
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B_val,
+            num_tokens=T_val,
+            num_v_heads=HV_val,
+            v_dim=V_val,
+            k_dim=K_val,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     elif per_token_pool_scatter_flat:
@@ -3412,24 +3444,15 @@ def gated_delta_rule_t1_wide_vec(
 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
-        # The cache buffer is BATCH-scoped: shape
-        # [B, cache_steps, HV, V, K]. The kernel
-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
-        # mirrors upstream PR #3145.
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B_val, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T_val
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B_val * cache_steps * HV_val, V_val, K_val
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B_val,
+            num_tokens=T_val,
+            num_v_heads=HV_val,
+            v_dim=V_val,
+            k_dim=K_val,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     else:
@@ -3630,11 +3653,11 @@ def gated_delta_rule_mtp(
         output_state_indices: Optional [B] int32 - indices for writing updated state.
             Defaults to initial_state_indices when None.
         intermediate_states_buffer: Optional
-            [B, cache_steps, HV, V, K] bf16, where cache_steps >= T. This
-            buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
-            the per-call batch index (i_n), not by the pool slot. Its first
-            dimension must equal B (see the OOB fix mirroring upstream
-            PR #3145).
+            [B, T, HV, V, K] bf16. This buffer is BATCH-scoped, not
+            pool-scoped — the kernel indexes it by the per-call batch index
+            (i_n), not by the pool slot. A leading slice of a larger cache,
+            for example ``cache[:, :T]``, is supported; its batch stride
+            determines the physical cache capacity.
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
@@ -3675,28 +3698,20 @@ def gated_delta_rule_mtp(
     # padded pool) work without a silent .contiguous() clone. See PR #3268.
     h0_source = initial_state_source
 
-    # Handle intermediate states. The cache buffer is BATCH-scoped: shape
-    # [B, cache_steps, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
-    # NOT by cache_idx (pool slot), so a pool_size-sized buffer would be
-    # OOB-prone. Fix mirrors upstream PR #3145.
+    # The public cache shape is [B, T, HV, V, K]. A leading slice of a larger
+    # allocation carries its physical per-batch capacity in stride(0).
     cache_intermediate_states = intermediate_states_buffer is not None
     cache_steps = T
     if cache_intermediate_states:
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T, (
-            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
-        )
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B * cache_steps * HV, V, K
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B,
+            num_tokens=T,
+            num_v_heads=HV,
+            v_dim=V,
+            k_dim=K,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         per_token_pool_scatter_flat = False
     elif ssm_state_indices is not None and tuple(
         int(s) for s in h0_source.stride()
