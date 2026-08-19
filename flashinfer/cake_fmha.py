@@ -151,6 +151,18 @@ def cake_fmha_route_is_optimized(
     )
 
 
+def _tma_paged_kv_strides_supported(tensor: torch.Tensor) -> bool:
+    """Return whether the paged-KV view can be represented by our TMA maps."""
+
+    if tensor.stride(3) != 1:
+        return False
+    element_size = tensor.element_size()
+    return all(
+        stride > 0 and stride * element_size % 16 == 0
+        for stride in tensor.stride()[:3]
+    )
+
+
 def _manifest_optimized_route_accounting() -> tuple[int, int]:
     """Return registered/total optimized counts recorded by the manifest.
 
@@ -290,6 +302,8 @@ def select_cake_fmha_decode_route(
             and key_cache.shape[2:] == (16, 128)
             and kv_layout == "HND"
             and uses_shared_paged_kv_idx
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
             and no_block_scales
             and not isinstance(bmm2_scale, torch.Tensor)
             and float(bmm2_scale) == 1.0
@@ -304,6 +318,8 @@ def select_cake_fmha_decode_route(
             and key_cache.shape[2:] == (32, 128)
             and kv_layout == "NHD"
             and not uses_shared_paged_kv_idx
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
             and no_block_scales
             and not isinstance(bmm2_scale, torch.Tensor)
             and float(bmm2_scale) == 1.0

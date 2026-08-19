@@ -312,6 +312,19 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         )
         is None
     )
+    misaligned_key = torch.empty((4, 2, 16, 129), dtype=torch.bfloat16)[..., :128]
+    assert misaligned_key.stride() == (4128, 2064, 129, 1)
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            query.device,
+            **{
+                **kwargs,
+                "key_cache": misaligned_key,
+                "value_cache": torch.empty_like(misaligned_key),
+            },
+        )
+        is None
+    )
 
 
 def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) -> None:
@@ -365,6 +378,20 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
     assert fp16_route is not None
     assert fp16_route.component == "decode_native_fp16_nhd"
+    misaligned_nhd = torch.empty((4, 32, 2, 129), dtype=torch.float16)[
+        ..., :128
+    ].transpose(-3, -2)
+    assert misaligned_nhd.stride() == (8256, 129, 258, 1)
+    assert (
+        select(
+            fp16_q,
+            misaligned_nhd,
+            torch.empty_like(fp16_q),
+            kv_layout="NHD",
+            shared=False,
+        )
+        is None
+    )
 
     bf16_q = torch.empty((2, 4, 128), dtype=torch.bfloat16)
     bf16q_route = select(
