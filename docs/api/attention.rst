@@ -205,6 +205,10 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 `DeepSeek-V2 <https://arxiv.org/abs/2405.04434>`_, `DeepSeek-V3 <https://arxiv.org/abs/2412.19437>`_,
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
+See the `Batch MLA backend architecture <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/batch_mla_backend_architecture.md>`_
+for the internal ownership, planning, representation, selection, and hot-path
+contracts shared by the wrapper and functional APIs.
+
 .. currentmodule:: flashinfer.mla
 
 PageAttention for MLA
