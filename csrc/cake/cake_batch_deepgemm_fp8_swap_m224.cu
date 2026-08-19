@@ -606,6 +606,24 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                     if (has_block_1 == 0) {
                         break;
                     }
+                    unsigned int group_m_2 = (unsigned int)masked_m[current_group_idx_1];
+                    if (group_m_2 > compute_m_cap) {
+                        group_m_2 = compute_m_cap;
+                    }
+                    unsigned int block_idx_1 = next_block_idx_1 - current_m_cumsum_1 * grid_n_1;
+                    unsigned int blocks_per_l2_group_1 = m_blocks_g_1 * 8;
+                    unsigned int l2_group_1 = block_idx_1 / blocks_per_l2_group_1;
+                    unsigned int first_n_block_1 = l2_group_1 * 8;
+                    unsigned int in_l2_group_1 = block_idx_1 % blocks_per_l2_group_1;
+                    unsigned int remaining_n_blocks_1 = grid_n_1 - first_n_block_1;
+                    unsigned int n_l2_limit_1 = (unsigned int)8;
+                    unsigned int n_blocks_in_group_1 = ((remaining_n_blocks_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_n_blocks_1);
+                    unsigned int m_block_1 = in_l2_group_1 / n_blocks_in_group_1;
+                    unsigned int remaining_m = group_m_2 - m_block_1 * 224;
+                    unsigned int runtime_mma_n = (remaining_m + 15) / 16 * 16;
+                    if (runtime_mma_n > 224) {
+                        runtime_mma_n = 224;
+                    }
                     mbarrier_wait(epilogue_done_addr + (epi_stage_1) * 8, _phase_epilogue_done);
                     #pragma unroll 4
                     for (int iter_k = 0; iter_k < num_k_blocks; iter_k++) {
@@ -630,13 +648,13 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                                 uint64_t b_desc = ((uint64_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 0, b_desc + 0,
-                                    0x10b80000U, tmem_tmem_sfb0, tmem_tmem_sfa0, ((init_flag) ? 0 : 1));
+                                    (((uint32_t)(0x10b80000U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb0, tmem_tmem_sfa0, ((init_flag) ? 0 : 1));
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 2, b_desc + 2,
-                                    0x30b80010U, tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
+                                    (((uint32_t)(0x30b80010U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 4, b_desc + 4,
-                                    0x50b80020U, tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
+                                    (((uint32_t)(0x50b80020U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 6, b_desc + 6,
-                                    0x70b80030U, tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
+                                    (((uint32_t)(0x70b80030U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb0, tmem_tmem_sfa0, 1);
                             }
                             int _mma_a_lo_1 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (tma_stage_1) * 4032;
                             int _mma_b_lo_1 = (((smem_a_addr + 14336) >> 4) & 0x3FFF) + (tma_stage_1) * 4032;
@@ -645,13 +663,13 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                                 uint64_t b_desc = ((uint64_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 0, b_desc + 0,
-                                    0x10b80000U, tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
+                                    (((uint32_t)(0x10b80000U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 2, b_desc + 2,
-                                    0x30b80010U, tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
+                                    (((uint32_t)(0x30b80010U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 4, b_desc + 4,
-                                    0x50b80020U, tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
+                                    (((uint32_t)(0x50b80020U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
                                 tcgen05_mma_mxf8_bs_cta2((tmem_accum + (epi_stage_1 * 224)), a_desc + 6, b_desc + 6,
-                                    0x70b80030U, tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
+                                    (((uint32_t)(0x70b80030U) & ~0x007E0000U) | (((((uint32_t)(runtime_mma_n)) >> 3) & 0x3FU) << 17)), tmem_tmem_sfb1, tmem_tmem_sfa1, 1);
                             }
                         }
                         elect_commit_cg2_multicast(tma_free_addr + (tma_stage_1) * 8, (uint16_t)(3));
@@ -688,11 +706,11 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                 unsigned int m_blocks_g_2 = 0;
                 #pragma unroll 1
                 for (int scan_g_2 = current_group_idx_2; scan_g_2 < num_groups; scan_g_2++) {
-                    unsigned int group_m_2 = (unsigned int)masked_m[scan_g_2];
-                    if (group_m_2 > compute_m_cap) {
-                        group_m_2 = compute_m_cap;
+                    unsigned int group_m_3 = (unsigned int)masked_m[scan_g_2];
+                    if (group_m_3 > compute_m_cap) {
+                        group_m_3 = compute_m_cap;
                     }
-                    m_blocks_g_2 = (group_m_2 + 224 - 1) / 224;
+                    m_blocks_g_2 = (group_m_3 + 224 - 1) / 224;
                     unsigned int next_m_cumsum_2 = current_m_cumsum_2 + m_blocks_g_2;
                     if (next_block_idx_2 < next_m_cumsum_2 * grid_n_2) {
                         current_group_idx_2 = scan_g_2;
@@ -704,18 +722,28 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                 if (has_block_2 == 0) {
                     break;
                 }
-                unsigned int block_idx_1 = next_block_idx_2 - current_m_cumsum_2 * grid_n_2;
-                unsigned int blocks_per_l2_group_1 = m_blocks_g_2 * 8;
-                unsigned int l2_group_1 = block_idx_1 / blocks_per_l2_group_1;
-                unsigned int first_n_block_1 = l2_group_1 * 8;
-                unsigned int in_l2_group_1 = block_idx_1 % blocks_per_l2_group_1;
-                unsigned int remaining_n_blocks_1 = grid_n_2 - first_n_block_1;
-                unsigned int n_l2_limit_1 = (unsigned int)8;
-                unsigned int n_blocks_in_group_1 = ((remaining_n_blocks_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_n_blocks_1);
-                unsigned int m_block_1 = in_l2_group_1 / n_blocks_in_group_1;
-                unsigned int n_block_1 = first_n_block_1 + in_l2_group_1 % n_blocks_in_group_1;
-                unsigned int off_m = m_block_1 * 224;
+                unsigned int group_m_4 = (unsigned int)masked_m[current_group_idx_2];
+                if (group_m_4 > compute_m_cap) {
+                    group_m_4 = compute_m_cap;
+                }
+                unsigned int block_idx_2 = next_block_idx_2 - current_m_cumsum_2 * grid_n_2;
+                unsigned int blocks_per_l2_group_2 = m_blocks_g_2 * 8;
+                unsigned int l2_group_2 = block_idx_2 / blocks_per_l2_group_2;
+                unsigned int first_n_block_2 = l2_group_2 * 8;
+                unsigned int in_l2_group_2 = block_idx_2 % blocks_per_l2_group_2;
+                unsigned int remaining_n_blocks_2 = grid_n_2 - first_n_block_2;
+                unsigned int n_l2_limit_2 = (unsigned int)8;
+                unsigned int n_blocks_in_group_2 = ((remaining_n_blocks_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_n_blocks_2);
+                unsigned int m_block_2 = in_l2_group_2 / n_blocks_in_group_2;
+                unsigned int n_block_1 = first_n_block_2 + in_l2_group_2 % n_blocks_in_group_2;
+                unsigned int off_m = m_block_2 * 224;
                 unsigned int off_n_1 = n_block_1 * 128;
+                unsigned int remaining_m_1 = group_m_4 - off_m;
+                unsigned int runtime_mma_n_1 = (remaining_m_1 + 15) / 16 * 16;
+                if (runtime_mma_n_1 > 224) {
+                    runtime_mma_n_1 = 224;
+                }
+                unsigned int load_block_m = runtime_mma_n_1 / 2;
                 #pragma unroll 1
                 for (int iter_k_1 = 0; iter_k_1 < num_k_blocks_1; iter_k_1++) {
                     mbarrier_wait(tma_free_addr + (load_stage) * 8, _phase_tma_free);
@@ -881,7 +909,7 @@ kernel_flashinfer_blackwell_batch_deepgemm_fp8_seed_swap_m224(CakeTensorMap cons
                         asm volatile(
                             "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                            :: "r"(smem_a_addr + load_stage * 64512), "l"(A), "r"(0), "r"(off_m + cta_rank_0 * 112), "r"((unsigned int)iter_k_1 * 2), "r"(current_group_idx_2),
+                            :: "r"(smem_a_addr + load_stage * 64512), "l"(A), "r"(0), "r"(off_m + cta_rank_0 * load_block_m), "r"((unsigned int)iter_k_1 * 2), "r"(current_group_idx_2),
                                "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x1000000000000000ULL) : "memory");
                         asm volatile(
                             "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
