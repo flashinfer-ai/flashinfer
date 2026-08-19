@@ -10,8 +10,8 @@ from tests.trace.reference_utils import _check, _skip_if_not_sm100_or_103
 @pytest.mark.parametrize(
     "shape_kwargs",
     [
-        dict(batch_size=4, next_n=2, max_context_len=4096, phys_block_kv=64),
-        dict(batch_size=8, next_n=1, max_context_len=2048, phys_block_kv=128),
+        dict(batch_size=4, next_n=2, max_context_len=4096, block_size=64),
+        dict(batch_size=8, next_n=1, max_context_len=2048, block_size=128),
     ],
 )
 def test_fp4_paged_mqa_logits_reference_correctness(shape_kwargs):
