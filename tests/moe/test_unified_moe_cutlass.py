@@ -41,7 +41,7 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.runners import MoERunner
+from flashinfer.fused_moe.runners import MoERunner, _mxfp8_swizzled_act_sf_numel
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
 from flashinfer.tllm_enums import ActivationType
@@ -538,6 +538,117 @@ def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, ma
     runner.config = config
     with pytest.raises(NotImplementedError, match=match):
         runner.check_support()
+
+
+def test_cutlass_mxfp8_rejects_linear_scale_layout():
+    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MxFp8, swizzled_scale_factors=False)
+    )
+    runner._device_arch = 100
+    with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
+        runner.check_support()
+
+
+def test_cutlass_mxfp8_mxfp4_rejects_linear_scale_layout():
+    runner = CutlassMxfp8Mxfp4Runner.__new__(CutlassMxfp8Mxfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MXFP4, swizzled_scale_factors=False)
+    )
+    runner._device_arch = 100
+    with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
+        runner.check_support()
+
+
+def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
+        lambda _version: False,
+    )
+    runner = CutlassFp8BlockRunner.__new__(CutlassFp8BlockRunner)
+    runner.config = _config(quant=QuantConfig(variant=QuantVariant.DeepSeekFp8))
+    runner._device_arch = 90
+    with pytest.raises(NotImplementedError, match="CUDA 12.6 or lower"):
+        runner.check_support()
+
+
+def test_cutlass_mxfp8_rejects_linear_activation_scales():
+    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    hidden = torch.empty(16, 128, dtype=torch.float8_e4m3fn)
+    linear_sf = torch.empty(16, 4, dtype=torch.uint8)
+    act = MoEActivationPack(
+        hidden,
+        linear_sf,
+        torch.zeros(16, 2, dtype=torch.int32),
+        torch.ones(16, 2, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="swizzled"):
+        runner._validate_activation_scale(act)
+
+
+def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():
+    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=256),
+    )
+    runner.device = torch.device("cpu")
+    view = {
+        "fc1_expert_weights": torch.empty(2, 512, 128, dtype=torch.float8_e4m3fn),
+        "fc2_expert_weights": torch.empty(2, 128, 256, dtype=torch.float8_e4m3fn),
+        "fc1_expert_scales": torch.empty(2, 4, dtype=torch.int32),
+        "fc2_expert_scales": torch.empty(2, 4, dtype=torch.int32),
+        "fc1_input_scale": torch.ones(2, dtype=torch.float32),
+        "fc2_input_scale": torch.ones(2, dtype=torch.float32),
+    }
+    with pytest.raises(ValueError, match="fc1_expert_scales"):
+        runner._pack_weight_inputs(view, hidden_size=128)
+
+
+def test_cutlass_w4a8_pack_rejects_malformed_weight_scales():
+    runner = CutlassW4A8Runner.__new__(CutlassW4A8Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.W4A8),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=256),
+    )
+    runner.device = torch.device("cpu")
+    view = {
+        "fc1_expert_weights": torch.empty(2, 512, 64, dtype=torch.uint8),
+        "fc2_expert_weights": torch.empty(2, 128, 128, dtype=torch.uint8),
+        "fc1_expert_scales": torch.empty(2, 4, dtype=torch.bfloat16),
+        "fc2_expert_scales": torch.empty(2, 4, dtype=torch.bfloat16),
+        "fc1_act_scale": torch.ones(128, dtype=torch.bfloat16),
+        "fc2_act_scale": torch.ones(256, dtype=torch.bfloat16),
+        "fc1_zero": torch.empty(0, dtype=torch.bfloat16),
+        "fc2_zero": torch.empty(0, dtype=torch.bfloat16),
+        "fc1_alpha": torch.ones(2, dtype=torch.float32),
+        "fc2_alpha": torch.ones(2, dtype=torch.float32),
+    }
+    with pytest.raises(ValueError, match="fc1_expert_scales"):
+        runner._pack_weight_inputs(view, hidden_size=128)
+
+
+def test_cutlass_humming_pack_rejects_malformed_weight_scales():
+    runner = CutlassHummingRunner.__new__(CutlassHummingRunner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.Humming),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=256),
+    )
+    runner.device = torch.device("cpu")
+    view = {
+        "fc1_expert_weights": torch.empty(2, 512, 64, dtype=torch.uint8),
+        "fc2_expert_weights": torch.empty(2, 128, 128, dtype=torch.uint8),
+        "fc1_expert_scales": torch.empty(2, 4, dtype=torch.uint8),
+        "fc2_expert_scales": torch.empty(2, 4, dtype=torch.uint8),
+        "fc1_residual_scale": torch.ones(2, dtype=torch.float32),
+        "fc2_residual_scale": torch.ones(2, dtype=torch.float32),
+        "fc2_act_global": torch.ones((), dtype=torch.float32),
+    }
+    with pytest.raises(ValueError, match="fc1_expert_scales"):
+        runner._pack_weight_inputs(view, hidden_size=128)
 
 
 def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
@@ -1056,6 +1167,24 @@ def _reference(act: MoEActivationPack, w1: torch.Tensor, w2: torch.Tensor):
             expert_out = (F.silu(gate) * up) @ w2[expert].float().T
             result[token] += act.topk_weights[token, slot] * expert_out
     return result.to(torch.bfloat16)
+
+
+def _dequant_linear_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Dequant packed E2M1 + linear UE8M0 scales without Humming preprocessing."""
+    low = packed & 0xF
+    high = packed >> 4
+    codes = torch.stack((low, high), dim=-1).reshape(
+        packed.shape[0], packed.shape[1], packed.shape[2] * 2
+    )
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    values = magnitudes[codes.to(torch.long) & 0x7]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scale = torch.exp2(scales.to(torch.int16).to(torch.float32) - 127)
+    return values * scale.repeat_interleave(32, dim=-1)
 
 
 def _assert_numerically_close(
@@ -1633,6 +1762,15 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
     expected = _reference(act, w1_dq.to(torch.bfloat16), w2_dq.to(torch.bfloat16))
     assert layer.winner_backend == "cutlass_fp8_block"
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
+    _autotune_and_graph(
+        layer.runners[0],
+        act,
+        weights,
+        expected,
+        rtol=1e-1,
+        atol=1e-1,
+        cache_name="test_moe_cutlass_fp8_block",
+    )
 
 
 @cutlass_mxfp8_mxfp4_required
@@ -1695,6 +1833,15 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
     )
     assert layer.winner_backend == "cutlass_mxfp8_mxfp4"
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
+    _autotune_and_graph(
+        layer.runners[0],
+        act,
+        weights,
+        expected,
+        rtol=1e-1,
+        atol=1e-1,
+        cache_name="test_moe_cutlass_mxfp8_mxfp4",
+    )
 
 
 @cutlass_mxfp8_required
@@ -1738,6 +1885,78 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
     assert layer.winner_backend == "cutlass_mxfp8"
     assert torch.isfinite(actual).all()
     _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
+    _autotune_and_graph(
+        layer.runners[0],
+        act,
+        weights,
+        expected,
+        rtol=2e-1,
+        atol=2e-1,
+        cache_name="test_moe_cutlass_mxfp8",
+    )
+
+
+@cutlass_mxfp8_required
+def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
+    torch.manual_seed(51)
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_tokens, num_experts, top_k = 257, 4, 2
+    hidden_size, intermediate_size = 128, 256
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
+    x_q, x_sf = CutlassMxfp8Config.prepare_activations(x)
+    view = CutlassMxfp8Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    config = _config(
+        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        backend=BackendOptions((CutlassMxfp8Config(),)),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=8192),
+    )
+    act = MoEActivationPack(x_q, x_sf, topk_ids, topk_weights)
+    weights = MoEWeightPack()
+    weights.prepare_for("cutlass_mxfp8", view)
+    runner = MoELayer(config).runners[0]
+    inputs = runner.pack_inputs(act, weights)
+    assert x_sf.numel() == _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+    assert inputs[-1].numel() == x_sf.numel()
+    bucket = map_to_hybrid_bucket(num_tokens, 8192)
+    assert bucket == 512
+    assert runner.tuning_config.constraint_specs
+    infer_numel = runner.tuning_config.constraint_specs[0].infer_shape
+    assert infer_numel([None, (bucket, hidden_size)]) == _mxfp8_swizzled_act_sf_numel(
+        bucket, hidden_size
+    )
+
+    synthesized = list(inputs)
+    synthesized[0] = torch.empty(
+        bucket, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    synthesized[1] = torch.empty(
+        bucket, hidden_size, dtype=torch.float8_e4m3fn, device=device
+    )
+    synthesized[2] = torch.empty(bucket, top_k, dtype=torch.int32, device=device)
+    synthesized[3] = torch.empty(bucket, top_k, dtype=torch.float32, device=device)
+    tuned = runner._prepare_tuning_inputs(synthesized)
+    assert tuned[-1].numel() == _mxfp8_swizzled_act_sf_numel(bucket, hidden_size)
+
+    with autotune(True):
+        _, tactic = AutoTuner.get().choose_one(
+            "test_moe_cutlass_mxfp8_bucket_boundary",
+            [runner],
+            runner.tuning_config,
+            inputs,
+        )
+    actual = runner.forward(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
 
 
 def _dequant_int4(packed, scale, group_size=128):
@@ -1792,6 +2011,15 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference():
     )
     assert layer.winner_backend == "cutlass_w4a8"
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
+    _autotune_and_graph(
+        layer.runners[0],
+        act,
+        weights,
+        expected,
+        rtol=1e-1,
+        atol=1e-1,
+        cache_name="test_moe_cutlass_w4a8",
+    )
 
 
 @cutlass_humming_required
@@ -1817,37 +2045,6 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference():
     w2_lin, w2_sf = _quantize_mxfp4_linear(
         w2.view(num_experts * hidden_size, intermediate_size)
     )
-    from flashinfer.fused_moe.prepare import (
-        preprocess_moe_weights_for_sm90_mixed_gemm_humming,
-    )
-
-    w1_proc, w1_off, _ = preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-        w1_lin.view(num_experts, 2 * intermediate_size, hidden_size // 2),
-        w1_sf.view(num_experts, 2 * intermediate_size, hidden_size // 32),
-        interleave=False,
-    )
-    w2_proc, w2_off, _ = preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-        w2_lin.view(num_experts, hidden_size, intermediate_size // 2),
-        w2_sf.view(num_experts, hidden_size, intermediate_size // 32),
-        interleave=False,
-    )
-    magnitudes = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=device,
-        dtype=torch.float32,
-    )
-
-    def dequant_humming(packed, offset):
-        low = packed & 0xF
-        high = packed >> 4
-        codes = torch.stack((low, high), dim=-1).reshape(
-            packed.shape[0], packed.shape[1], packed.shape[2] * 2
-        )
-        values = magnitudes[codes.to(torch.long) & 0x7]
-        values = torch.where((codes & 0x8) != 0, -values, values)
-        scales = torch.exp2(offset.to(torch.int16).to(torch.float32) - 127)
-        return values * scales.repeat_interleave(32, dim=-1)
-
     config = _config(
         quant=QuantConfig(variant=QuantVariant.Humming),
         experts=ExpertConfig(intermediate_size=intermediate_size),
@@ -1862,8 +2059,23 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference():
     actual = layer(act, weights)
     expected = _reference(
         act,
-        dequant_humming(w1_proc, w1_off).to(torch.bfloat16),
-        dequant_humming(w2_proc, w2_off).to(torch.bfloat16),
+        _dequant_linear_mxfp4(
+            w1_lin.view(num_experts, 2 * intermediate_size, hidden_size // 2),
+            w1_sf.view(num_experts, 2 * intermediate_size, hidden_size // 32),
+        ).to(torch.bfloat16),
+        _dequant_linear_mxfp4(
+            w2_lin.view(num_experts, hidden_size, intermediate_size // 2),
+            w2_sf.view(num_experts, hidden_size, intermediate_size // 32),
+        ).to(torch.bfloat16),
     )
     assert layer.winner_backend == "cutlass_humming"
     _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
+    _autotune_and_graph(
+        layer.runners[0],
+        act,
+        weights,
+        expected,
+        rtol=2e-1,
+        atol=2e-1,
+        cache_name="test_moe_cutlass_humming",
+    )
