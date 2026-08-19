@@ -175,7 +175,12 @@ def _is_cute_dsl_kda_prefill_eligible(
             or initial_state.ndim != 4
             or initial_state.shape[0] <= 0
             or tuple(initial_state.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
-            or not initial_state.is_contiguous()
+            or initial_state.data_ptr() % 16 != 0
+            or initial_state.stride(-1) != 1
+            or initial_state.stride(-2) != _HEAD_DIM
+            or initial_state.stride(-3) != _HEAD_DIM * _HEAD_DIM
+            or initial_state.stride(0) < num_heads * _HEAD_DIM * _HEAD_DIM
+            or initial_state.stride(0) * initial_state.element_size() % 16 != 0
         ):
             return False
         if ssm_state_indices is None and initial_state.shape[0] != num_sequences:

@@ -9599,17 +9599,18 @@ def _unified_fakes(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fstate = (
-        F(state_dtype, (sp, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-        if has_state_in
-        else None
-    )
+
+    def state_pool_fake():
+        return cute.runtime.make_fake_tensor(
+            state_dtype,
+            shape=(sp, sh, DV, DK),
+            stride=(cute.sym_int64(divisibility=8), DV * DK, DK, 1),
+            assumed_align=16,
+        )
+
+    fstate = state_pool_fake() if has_state_in else None
     fout = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
-    ffinal = (
-        F(state_dtype, (sp, sh, DV, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-        if has_state_out
-        else None
-    )
+    ffinal = state_pool_fake() if has_state_out else None
     # State checkpoints: a flat [total_ckpts, H, DV, DK] tensor (same VK layout
     # as final_state) plus per-sequence base offsets; own symbols so capacity is
     # unrelated to n_seq.

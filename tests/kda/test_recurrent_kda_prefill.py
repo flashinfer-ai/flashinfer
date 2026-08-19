@@ -2327,7 +2327,7 @@ def test_cute_dsl_checkpoints_match_cake(
     ("seq_lens", "num_heads", "packed"),
     [((17,), 96, False), ((17, 33), 12, True)],
 )
-def test_cute_dsl_indexed_state_matches_cake(
+def test_cute_dsl_padded_indexed_state_matches_cake(
     flash_kda_device, seq_lens, num_heads, packed
 ):
     inputs = _make_inputs(
@@ -2344,14 +2344,24 @@ def test_cute_dsl_indexed_state_matches_cake(
         dtype=torch.int32,
         device=flash_kda_device,
     )[1:]
-    state_pool = torch.zeros(
-        4, num_heads, 128, 128, dtype=torch.bfloat16, device=flash_kda_device
-    )
-    state_pool[state_indices.to(torch.int64)] = inputs["initial_state"]
+
+    def make_state_pool():
+        slot_numel = num_heads * 128 * 128
+        storage = torch.zeros(
+            (4, slot_numel + 64),
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+        )
+        pool = storage.as_strided(
+            (4, num_heads, 128, 128),
+            (storage.stride(0), 128 * 128, 128, 1),
+        )
+        pool[state_indices.to(torch.int64)] = inputs["initial_state"]
+        return pool
 
     results = {}
     for backend in ("cake", "cute-dsl"):
-        backend_inputs = {**inputs, "initial_state": state_pool.clone()}
+        backend_inputs = {**inputs, "initial_state": make_state_pool()}
         run_kwargs = {
             **_strict_prefill_kwargs(backend_inputs),
             "output": torch.empty_like(inputs["q"]),
