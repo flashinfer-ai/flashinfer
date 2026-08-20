@@ -108,28 +108,36 @@ def test_global_timer_vs_cuda_event(use_cuda_graph, shape):
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
 
-    def time_globaltimer() -> float:
-        kernel(start_ts)
-        work()
-        kernel(end_ts)
-        torch.cuda.synchronize()
-        return (end_ts.item() - start_ts.item()) / 1e6  # ns -> ms
+    def time_both() -> tuple[float, float]:
+        """Time one execution with both timers at once.
 
-    def time_cuda_event() -> float:
+        Timing separate executions would measure run-to-run variation in the
+        GEMMs themselves, not timer disagreement: on a power-limited part the
+        two runs can differ by several percent, which is what the timers are
+        being compared to. Bracketing a single execution removes that variance.
+
+        The stamps sit outside the events, so the %globaltimer interval
+        strictly contains the cudaEvent interval and %globaltimer reads larger
+        by the bracket cost (two stamp launches, order 10us).
+        """
+        kernel(start_ts)
         start_evt.record()
         work()
         end_evt.record()
+        kernel(end_ts)
         torch.cuda.synchronize()
-        return start_evt.elapsed_time(end_evt)  # ms
+        return (
+            start_evt.elapsed_time(end_evt),  # ms
+            (end_ts.item() - start_ts.item()) / 1e6,  # ns -> ms
+        )
 
-    time_cuda_event()  # warm the timed path
-    time_globaltimer()
+    time_both()  # warm the timed path
 
-    # Interleave trials so any clock drift / thermal ramp hits both timers alike.
     event_times, gt_times = [], []
     for _ in range(_TRIALS):
-        event_times.append(time_cuda_event())
-        gt_times.append(time_globaltimer())
+        event_time, gt_time = time_both()
+        event_times.append(event_time)
+        gt_times.append(gt_time)
 
     event_mean = statistics.mean(event_times)
     gt_mean = statistics.mean(gt_times)
