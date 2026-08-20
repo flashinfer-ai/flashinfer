@@ -42,5 +42,6 @@ class MegaConfig:
     megakernel: object
     quantize_input: bool = True
     preprocess_weights: bool = True
-    # TODO: This should probably replace the regular weights parameter
+    # TODO: This should probably just be passed via a top level parameter
+    # when preprocess_weights is False, instead of the regular weights
     transformed_weights: object | None = None
