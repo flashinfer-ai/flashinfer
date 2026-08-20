@@ -1402,28 +1402,44 @@ def test_the_documented_dsl_floor_is_below_the_repo_pin():
     """The DSL floor this package targets and the version the repo installs
     must tell one story.
 
-    ``requirements.txt`` pins the nvidia-cutlass-dsl a FlashInfer install
+    ``requirements.txt`` constrains the nvidia-cutlass-dsl a FlashInfer install
     brings along; ``CUTE_DSL_RUNTIME_FLOOR`` is the oldest release the shipped
     CuTe-DSL kernel must still compile under, because serving stacks resolve
-    the DSL themselves and routinely pin older (vLLM's image downgrades to
-    4.5.2).  The floor therefore has to stay at or below the pin -- a floor
-    ABOVE it would mean the repo's own CI never exercises the version the
-    kernel claims to support, and a floor equal to it would mean the
-    portability allow-list can be widened.  Cheap, needs nothing installed.
+    the DSL themselves and routinely resolve older (vLLM's image downgrades to
+    4.5.2).  The floor therefore has to stay at or below the LOWEST version
+    the requirement admits -- a floor above it would mean the repo's own CI
+    never exercises the version the kernel claims to support.
+
+    The operator is deliberately not assumed.  This test previously matched
+    ``==`` only and broke when upstream relaxed the line from ``==4.7.0`` to
+    ``>=4.6.2a0``: a requirement getting *looser* made the check fail while the
+    property it guards still held.  What matters is the low end of whatever the
+    line admits, which for ``==``, ``>=`` and ``~=`` alike is the version named.
+    Cheap, needs nothing installed.
     """
     path = pathlib.Path(__file__).resolve().parents[2] / "requirements.txt"
     if not path.is_file():
         pytest.skip("requirements.txt is only present in a source checkout")
     requirements = path.read_text(encoding="utf-8")
     match = re.search(
-        r"^nvidia-cutlass-dsl\s*==\s*(\d+)\.(\d+)", requirements, re.MULTILINE
+        r"^nvidia-cutlass-dsl\s*(==|>=|~=)\s*(\d+)\.(\d+)",
+        requirements,
+        re.MULTILINE,
     )
-    assert match, "requirements.txt no longer pins nvidia-cutlass-dsl with =="
-    pinned = (int(match.group(1)), int(match.group(2)))
-    assert pinned >= CUTE_DSL_RUNTIME_FLOOR, (
+    assert match, (
+        "requirements.txt has no nvidia-cutlass-dsl requirement this test "
+        "recognizes (expected ==, >= or ~=). The documented floor now has "
+        "nothing to be checked against -- re-derive it rather than deleting "
+        "the check"
+    )
+    operator = match.group(1)
+    lowest_admitted = (int(match.group(2)), int(match.group(3)))
+    assert lowest_admitted >= CUTE_DSL_RUNTIME_FLOOR, (
         f"the CuTe-DSL impl documents a floor of {CUTE_DSL_RUNTIME_FLOOR} but "
-        f"the repo pins {pinned}; lower the floor or raise the pin, and update "
-        "PORTABLE_CUTE_MATH_PRIMITIVES to match whichever moved"
+        f"requirements.txt admits {operator}{lowest_admitted[0]}."
+        f"{lowest_admitted[1]} at the low end; lower the floor or raise the "
+        "requirement, and update PORTABLE_CUTE_MATH_PRIMITIVES to match "
+        "whichever moved"
     )
 
 
