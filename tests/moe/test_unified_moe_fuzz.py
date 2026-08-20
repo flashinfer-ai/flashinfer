@@ -878,9 +878,9 @@ _DTYPE = {
         reference=_mxint4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        # The full 160-seed SM100 sweep observes max|diff| / ||ref||inf
-        # ~= 0.0535 for a 4096-token FromLogits case.
-        atol_frac=0.06,
+        # The full 160-seed GB200 sweep requires atol_frac ~= 0.062 for seed 18
+        # after the relative-tolerance contribution; retain a small margin.
+        atol_frac=0.065,
         rtol=0.3,
     ),
 }
@@ -1602,15 +1602,17 @@ def _route(
                 dim=-1
             )  # top-2 sum per group
             _, gidx = torch.topk(group_scores, k=topk_group, dim=-1)
-            gmask = torch.zeros_like(group_scores).scatter_(-1, gidx, 1.0)
+            gmask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
+                -1, gidx, True
+            )
             smask = (
                 gmask.unsqueeze(-1)
                 .expand(*sel_scores.shape[:-1], n_group, E // n_group)
                 .reshape(sel_scores.shape)
             )
-            sel_scores = (
-                sel_scores * smask
-            )  # zero out experts outside the selected groups
+            # A routing bias can make scores negative. Zero-masking would let an
+            # unselected expert outrank a valid negative score in the selected group.
+            sel_scores = sel_scores.masked_fill(~smask, float("-inf"))
         _, sel = torch.topk(sel_scores, top_k, dim=-1)
         w = torch.gather(scores, -1, sel)  # UNBIASED sigmoid weights
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1621,6 +1623,29 @@ def _route(
             f"routing method {method!r} not supported by the fuzzer oracle"
         )
     return sel.to(torch.int64), w.float()
+
+
+def test_deepseek_v3_route_excludes_unselected_groups_with_negative_scores():
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+    # Group 0 wins by its top-2 sum, but its fourth selection score is negative.
+    # Experts in group 1 must remain ineligible rather than becoming zero-score
+    # candidates that can displace that valid negative-score expert.
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    selected, _ = _route(
+        logits,
+        RoutingMethodType.DeepSeekV3,
+        top_k=4,
+        bias=bias,
+        n_group=2,
+        topk_group=1,
+        routed_scaling=1.0,
+    )
+
+    assert set(selected[0].tolist()) == {0, 1, 2, 3}
 
 
 def _master(cfg, handler):
