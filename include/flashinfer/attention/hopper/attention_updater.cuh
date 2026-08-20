@@ -113,7 +113,8 @@ __forceinline__ __device__ void apply_exp2(Tensor<Engine0, Layout0>& tensor,
   CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
-    auto row_max = max(mi);
+    // Per-row clamp: fully masked rows (row_max == -inf) yield exp2(-inf) = 0, not NaN.
+    float row_max = ::fmaxf(max(mi), -cuda::std::numeric_limits<float>::max());
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
       tensor(mi, ni) = exp2f(tensor(mi, ni) - row_max);
@@ -130,11 +131,12 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
   CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
-    auto row_max = max(mi);
+    // Per-row clamp for fully masked rows (see apply_exp2 above).
+    float row_max_scaled = ::fmaxf(max(mi) * scale, -cuda::std::numeric_limits<float>::max());
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
-      // row_max * scale is a constant for each row, so we can use fma here
-      tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - row_max * scale);
+      // row_max_scaled is a constant for each row, so we can use fma here
+      tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - row_max_scaled);
     }
   }
 }
@@ -198,7 +200,8 @@ struct OnlineSoftmax {
       // update scores_scale and scale row_sum
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
-        float scores_max_cur = row_max(mi);
+        // Per-row clamp: still-fully-masked rows rescale by 0, not NaN.
+        float scores_max_cur = ::fmaxf(row_max(mi), -cuda::std::numeric_limits<float>::max());
         if constexpr (WITH_SCALE) {
           scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * sm_scale_log2);
         } else {
@@ -228,17 +231,13 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      // Keep fully masked rows at zero instead of normalizing masked entries.
-      if (row_max(mi) == fill_value) {
-        scores_scale(mi) = 0.f;
-        row_sum(mi) = fill_value;
+      // Fully masked row: sum == 0, keep output at zero (avoid 0 * inf = NaN).
+      float inv_sum = (sum > 0.f) ? pv_scale / sum : 0.f;
+      scores_scale(mi) = inv_sum;
+      if constexpr (WITH_SCALE) {
+        row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
       } else {
-        scores_scale(mi) = pv_scale / sum;
-        if constexpr (WITH_SCALE) {
-          row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
-        } else {
-          row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
-        }
+        row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
       }
     }
   };

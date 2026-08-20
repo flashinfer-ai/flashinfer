@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """
-CuteDSL-based Fused MoE API for NVFP4 on Blackwell GPUs.
+CuteDSL-based Fused MoE API for NVFP4 on Blackwell and Rubin GPUs.
 
 This module provides high-level APIs for running Mixture of Experts (MoE)
 computations using CuteDSL kernels.
@@ -89,10 +89,10 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4,
 )
 from .tuner import (
-    ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
     CuteDslFusedMoEW4A16Runner,
     W4A16_MOE_TACTICS,
+    _get_arch_tactics,
 )
 
 # =============================================================================
@@ -152,12 +152,17 @@ def _moe_core_impl(
     top_k: int,
     num_local_experts: int,
     local_expert_offset: int = 0,
-    # Tactic parameters
+    # Tactic parameters (Blackwell)
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    # Tactic parameters (Rubin — when set, use SM107 kernel)
+    gemm1_mma_tiler: Optional[Tuple[int, int, int]] = None,
+    gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
+    gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     # Pre-allocated buffers (for CUDA graph)
     moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
     gemm1_out: Optional[torch.Tensor] = None,
@@ -292,6 +297,17 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
+    # For Rubin, round num_non_exiting_tiles to the next EVEN number to
+    # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
+    # two CTAs get consecutive tile indices; if the count is odd, one CTA
+    # enters the cluster barrier while the other skips it.
+    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+    if is_rubin:
+        kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
+    else:
+        kernel_num_non_exiting_tiles = num_non_exiting_tiles
+
+    # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
         main_event.record()
         moe_output.record_stream(aux_stream)
@@ -323,12 +339,14 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
+            num_non_exiting_tiles=kernel_num_non_exiting_tiles,
             out=gemm1_out,
             **output_kwargs,
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
+            mma_tiler=gemm1_mma_tiler,
+            mma_inst_shape=gemm1_mma_inst_shape,
             enable_pdl=enable_pdl,
             activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
@@ -383,7 +401,7 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=num_non_exiting_tiles,
+        num_non_exiting_tiles=kernel_num_non_exiting_tiles,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
@@ -391,6 +409,8 @@ def _moe_core_impl(
         a_per_token_scale=intermediate_per_token_scale,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
+        mma_tiler=gemm2_mma_tiler,
+        mma_inst_shape=gemm2_mma_inst_shape,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
     )
@@ -462,7 +482,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([100, 103, 107])
     @flashinfer_api
     def __init__(
         self,
@@ -674,6 +694,10 @@ class CuteDslMoEWrapper:
         gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+        gemm1_mma_tiler=None,
+        gemm1_mma_inst_shape=None,
+        gemm2_mma_tiler=None,
+        gemm2_mma_inst_shape=None,
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
@@ -704,6 +728,10 @@ class CuteDslMoEWrapper:
             gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
             gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
             gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+            gemm1_mma_tiler=gemm1_mma_tiler,
+            gemm1_mma_inst_shape=gemm1_mma_inst_shape,
+            gemm2_mma_tiler=gemm2_mma_tiler,
+            gemm2_mma_inst_shape=gemm2_mma_inst_shape,
             moe_sort_buffers=None,
             gemm1_out=None,
             gemm1_out_scale=None,
@@ -878,7 +906,9 @@ class CuteDslMoEWrapper:
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
         if self.quant_mode in ("nvfp4", "w4a4"):
-            return ALL_MOE_TACTICS
+            # _get_arch_tactics() replaces main's ALL_MOE_TACTICS: the tactic
+            # list is now architecture-dependent (Blackwell vs Rubin).
+            return _get_arch_tactics()
         elif self.quant_mode == "w4a16":
             return list(W4A16_MOE_TACTICS)
         else:
@@ -911,6 +941,10 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    gemm1_mma_tiler=None,
+    gemm1_mma_inst_shape=None,
+    gemm2_mma_tiler=None,
+    gemm2_mma_inst_shape=None,
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
@@ -947,6 +981,10 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+        gemm1_mma_tiler=gemm1_mma_tiler,
+        gemm1_mma_inst_shape=gemm1_mma_inst_shape,
+        gemm2_mma_tiler=gemm2_mma_tiler,
+        gemm2_mma_inst_shape=gemm2_mma_inst_shape,
         moe_output=moe_output,
         per_token_scale=per_token_scale,
         aux_stream=aux_stream,
@@ -963,7 +1001,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_nvfp4_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,

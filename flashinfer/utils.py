@@ -291,6 +291,23 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     return properties.major, properties.minor
 
 
+# trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
+# public FMHA packs contain zero of either for sm100a/sm100f/sm103a. Requesting one on another
+# architecture cannot be served, and without this check it surfaces late as a "Missing
+# TRTLLM-GEN kernel" from the launcher rather than as a clear error at the call site.
+def check_trtllm_gen_sm107_only_feature(
+    enabled: Optional[bool], feature_name: str, device: torch.device
+) -> None:
+    if not enabled:
+        return
+    major, minor = get_compute_capability(device)
+    if (major, minor) != (10, 7):
+        raise ValueError(
+            f"{feature_name} is only supported on SM107 (Rubin); the current device is "
+            f"sm{major}{minor}. trtllm-gen exports those cubin variants for SM107 only."
+        )
+
+
 @functools.cache
 def get_gpu_memory_bandwidth(device: torch.device) -> float:
     """
