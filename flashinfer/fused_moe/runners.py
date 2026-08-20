@@ -845,7 +845,7 @@ class CuTileBf16Runner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
             )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."
             )

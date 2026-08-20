@@ -16,6 +16,7 @@ from flashinfer.fused_moe import (
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
@@ -40,8 +41,8 @@ def _config(
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=ActivationConfig.swiglu,
         backend=BackendOptions((CuTileBf16Config(),)),
+        finalize=MoEFinalizeConfig(do_finalize=True),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=tune_max_num_tokens,
         ),
@@ -70,7 +71,7 @@ def test_cutile_bf16_config_architectures_and_registration():
             "QuantVariant.NVFP4",
         ),
         (_config(activation=ActivationConfig.geglu), "Swiglu or Relu2"),
-        (_config(execution=ExecutionConfig(do_finalize=False)), "do_finalize=True"),
+        (_config(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize=True"),
         (_config(execution=ExecutionConfig(enable_pdl=True)), "PDL"),
         (
             _config(
