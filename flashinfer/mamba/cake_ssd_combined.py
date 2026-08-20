@@ -1069,9 +1069,7 @@ class CakeSSDCombined:
             workspace["dt_bias_float"].copy_(dt_bias)
             dt_bias_float = workspace["dt_bias_float"]
         if scan_route != _ROUTE_PREFIX_VARLEN:
-            preprocess_grid = (
-                num_segments * self.nheads + _THREADS - 1
-            ) // _THREADS
+            preprocess_grid = (num_segments * self.nheads + _THREADS - 1) // _THREADS
             with torch.cuda.device(x.device):
                 _load_program("preprocess", arch, device_index).run(
                     dt_float,
@@ -1240,9 +1238,7 @@ class CakeSSDCombined:
                         "preprocess": preprocess_grid,
                         "main": (prefix_grid, 1, 1),
                     },
-                    cuda_stream=int(
-                        torch.cuda.current_stream(x.device).cuda_stream
-                    ),
+                    cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
                 )
             else:
                 _load_program(f"{state_key}_{mode_key}", arch, device_index).run(
