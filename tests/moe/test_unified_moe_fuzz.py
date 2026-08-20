@@ -2124,6 +2124,11 @@ def test_unified_moe_fuzz(cfg):
         layer = MoELayer(config)
     except Exception as e:
         if _is_unsupported(e):
+            if expected_backend_available:
+                pytest.fail(
+                    f"{cfg.label}: expected backend {cfg.expected_backend!r} "
+                    f"failed MoELayer construction: {e}"
+                )
             pytest.skip(f"MoELayer rejected {cfg.label}: {e}")
         raise
 

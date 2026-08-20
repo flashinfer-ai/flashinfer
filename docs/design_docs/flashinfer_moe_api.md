@@ -32,55 +32,34 @@ Problems this creates:
 
 ### Example Overview
 
-```
-# --- Define config once ---
+```python
 config = MoEConfig(
     routing=RoutingConfig(
-        num_experts=256,
+        num_experts=32,
         top_k=8,
         method=RoutingMethodType.DeepSeekV3,
     ),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
-    experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
+    experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
+    activation=SwiGLU(),
+    backend=BackendOptions((CuteDslConfig(), TrtllmFp4Config())),
+    execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
-# --- Find possible backends ---
-backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_fp4":CutlassConfig()}
-# or {"trtllm_fp4":"unsupported reason...", "cutlass_fp4":CutlassConfig()}
-# more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_fp4":CutlassConfig(extra_backend_params...)]
-# --- Prepare Inputs Data ---
+
+# Prepare one native weight view for each candidate backend at model load.
 weight_pack = MoEWeightPack()
-# the data is possibly obtained through helper functions then added here
-weight_pack.prepare_for("trtllm_fp4", trtllm_weights) weight_pack.prepare_for("cutlass_fp4", cutlass_weights)
-act_pack = MoEActivationPack(
-    hidden_states_q=cute_dsl_data["x"],
-    hidden_states_scale=x_sf,
-    selected_experts=cute_dsl_data["token_selected_experts"],
-    final_scales=cute_dsl_data["token_final_scales"],
+weight_pack.prepare_for(
+    "cute_dsl_nvfp4",
+    CuteDslConfig.prepare_weights(w1_bf16, w2_bf16, ...),
 )
-tensors = (act_pack, weight_pack)
-# --- Eager (heuristic backend) ---
-output = moe_layer(tensors, **config, backends=backends)  # optional backends selection
-# --- Autotuned eager ---
+weight_pack.prepare_for(
+    "trtllm_fp4_routed",
+    TrtllmFp4Config.prepare_weights(w1_bf16, w2_bf16, ...),
+)
+
+layer = MoELayer(config)
 with autotune(True):
-    for tensors in calibration_data:
-        output = moe_layer(tensors, **config)
-# --- Production layer (amortized, cached) ---
-layer = MoELayer(**config)
-layer = layer.get_tuned_layer(tensors)  # ensures selection has been done
-output = layer(tensors)
-# --- Benchmark ---
-layer.benchmark(Gemm1Tensors)   # isolate gemm1
-layer.benchmark_all()           # full breakdown
-# --- Variant via immutable replace ---
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
-fp8_layer  = MoELayer(**fp8_config)
-# --- Repro from issue log ---
-repro = MoERepro.from_file("user_issue.log")
-repro.run()
-repro.benchmark_all()
+    output = layer(activation_pack, weight_pack)
 ```
 
 ## 3. Config Hierarchy
@@ -116,44 +95,34 @@ class RoutingConfig:
 
 Individual backend configs provided in an ordered list. The autotuner or heuristic selects among valid candidates at runtime.
 
-```
-# Single backend
-backends = [TrtllmFp4Config()]
-# Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
-# | is associative, returns BackendOptions
-# CutlassConfig is always the universal fallback
-```
+```python
+# NVFP4 candidates share one logical quantization contract.
+nvfp4_backends = BackendOptions((CuteDslConfig(), TrtllmFp4Config()))
 
-Each backend config declares its own preconditions:
-
-```
-class TrtllmFp4Config:
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return arch >= 90  # Hopper+
-class CutlassConfig:
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+# CUTLASS configurations are quantization-specific, not universal fallbacks.
+bf16_backend = BackendOptions((CutlassBf16Config(),))
+w4a16_backend = BackendOptions((CutlassW4A16Config(),))
 ```
 
-### 3.3 MoEConfig — \*\*unpack protocol
+Each backend config declares architecture support; its runner additionally
+checks quantization, routing, activation, finalization, and EP constraints
+before build or launch.
 
-MoEConfig implements keys() and __getitem__ so it can be unpacked directly with \*\*. This allows the same config object to be passed to both the eager function and MoELayer.
+### 3.3 MoEConfig composition
 
-```
+`MoEConfig` is passed directly to `MoELayer` and can be varied immutably with
+`dataclasses.replace`.
+
+```python
 config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CutlassConfig()],
+    activation=SwiGLU(),
+    backend=BackendOptions((CuteDslConfig(), TrtllmFp4Config())),
 )
-# Unpack into any call accepting these kwargs
-output = moe_layer(tensors, **config)
-layer  = MoELayer(**config)
-# Immutable variant
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
+layer = MoELayer(config)
+fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantVariant.MxFp8))
 ```
 
 ## 4. Public API
