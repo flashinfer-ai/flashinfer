@@ -420,6 +420,76 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
         raise
 
 
+@pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+        pytest.param(128, 4, 2, 4, id="grouped-general"),
+        pytest.param(128, 1, 1, 1, id="single128"),
+        pytest.param(384, 1, 1, 1, id="single384"),
+    ],
+)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_type", [torch.float32, torch.float16, torch.bfloat16])
+def test_dsv3_fused_routing_backend_correctness(
+    backend, num_experts, n_group, topk_group, topk, data_type, bias_type
+):
+    """Exercise every Cake schedule and dtype pair alongside the default backend."""
+
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+
+    num_tokens = 7
+    torch.manual_seed(42)
+    scores = torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+    bias = torch.randn(num_experts, device="cuda", dtype=bias_type)
+    routed_scaling_factor = 1.0
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        data_type,
+    )
+
+    topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+    topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+    routing_replay_out = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int16)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        routing_replay_out=routing_replay_out,
+        backend=backend,
+    )
+
+    for token_idx in range(num_tokens):
+        assert set(routing_replay_out[token_idx].tolist()) == set(
+            topk_indices[token_idx].tolist()
+        )
+
+    sorted_values, sorted_order = torch.sort(topk_values, dim=-1, descending=True)
+    sorted_indices = topk_indices.gather(1, sorted_order)
+    all_valid, tokens_with_different_experts = validate_expert_selection(
+        ground_truth, sorted_indices, sorted_values
+    )
+    assert all_valid
+    validate_values(
+        ground_truth, sorted_values, tokens_with_different_experts, data_type
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])
 @pytest.mark.parametrize("num_experts", [256, 384])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])

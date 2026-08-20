@@ -261,6 +261,7 @@ class B12xMoEWrapper:
             allocations. Callers running many identically-shaped wrappers
             (e.g. one per MoE layer) can share a single set, since layers
             execute sequentially. Shapes must match this wrapper's config.
+            Only valid with ``use_cuda_graph=True``.
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -341,10 +342,12 @@ class B12xMoEWrapper:
             allocations.  Callers running many identically-shaped wrappers
             (e.g. one per MoE layer) can share a single set, since layers
             execute sequentially.  Shapes must match this wrapper's config.
+            Only valid with ``use_cuda_graph=True``.
         shared_output : Optional[torch.Tensor]
             Externally allocated output buffer, reused like the workspaces.
             Must be 2-D with shape ``(>= max_num_tokens, hidden_size)``,
-            ``output_dtype``, and a matching device type.
+            ``output_dtype``, and the same device as this wrapper.
+            Only valid with ``use_cuda_graph=True``.
         """
         from ...jit.cpp_ext import get_cuda_version
         from .blackwell_sm12x.moe_dispatch import (
@@ -408,20 +411,38 @@ class B12xMoEWrapper:
         self._folded_w1_alpha: Optional[torch.Tensor] = None
         self._folded_w1_alpha_key: Optional[Tuple] = None
 
+        if not use_cuda_graph and any(
+            resource is not None
+            for resource in (
+                shared_static_workspace,
+                shared_dynamic_workspace,
+                shared_output,
+            )
+        ):
+            raise ValueError(
+                "shared_static_workspace / shared_dynamic_workspace / "
+                "shared_output require use_cuda_graph=True; without "
+                "pre-allocated buffers, run() ignores shared resources."
+            )
+
         if shared_output is not None:
             expected_device = torch.device(self.device)
+            if expected_device.type == "cuda" and expected_device.index is None:
+                # An index-less "cuda" means the current device; resolve it so
+                # the comparison covers the device index, not just the type.
+                expected_device = torch.device("cuda", torch.cuda.current_device())
             if (
                 shared_output.dim() != 2
                 or shared_output.shape[0] < self.max_num_tokens
                 or shared_output.shape[1] != self.hidden_size
                 or shared_output.dtype != self.output_dtype
-                or shared_output.device.type != expected_device.type
+                or shared_output.device != expected_device
             ):
                 raise ValueError(
                     "shared_output must have shape (>=max_num_tokens, "
                     f"hidden_size)=({self.max_num_tokens}, {self.hidden_size}), "
-                    f"dtype {self.output_dtype}, and device type "
-                    f"{expected_device.type!r}; got shape "
+                    f"dtype {self.output_dtype}, and device "
+                    f"{expected_device}; got shape "
                     f"{tuple(shared_output.shape)}, dtype {shared_output.dtype}, "
                     f"device {shared_output.device}."
                 )

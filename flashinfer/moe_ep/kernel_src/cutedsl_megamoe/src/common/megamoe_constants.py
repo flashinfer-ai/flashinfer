@@ -9,6 +9,13 @@ Fp32Max = Float32(3.40282346638528859812e38)
 
 Nvfp4BlockSize = 16
 Mxfp8BlockSize = 32
+Fp8E8M0SfVecSize = 32
+Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
+Fp8GateUpInterleave = 8
+Fp8BlockScaleK = 128
+Fp8Fc2ActivationScaleK = 64
+Fp8WeightScaleBlockN = 128
+Fp8WeightScaleBlockK = 128
 SfPaddingBlock = 128
 TmaLeadingDimByteAlign = 16
 
@@ -20,5 +27,6 @@ Nvfp4E2M1RcpLimit = 1.0 / Nvfp4E2M1Max
 Fp8E4M3RcpLimit = 1.0 / Fp8E4M3FNMax
 Fp8E5M2RcpLimit = 1.0 / Fp8E5M2Max
 
-SupportedMmaTileM = (128, 256)
+# tile_m 64 is reachable only from the BF16 GLU kernel's geometry checks.
+SupportedMmaTileM = (64, 128, 256)
 SupportedMmaTileN = (64, 128, 256)
