@@ -1,6 +1,6 @@
 {
-  "admitted_architecture_rows": 3484,
-  "architecture_row_count": 3538,
+  "admitted_architecture_rows": 3492,
+  "architecture_row_count": 3546,
   "architectures": [
     "sm_100a",
     "sm_103a"
@@ -10,7 +10,7 @@
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264"
   },
   "binary_artifacts": false,
-  "contract_row_count": 1769,
+  "contract_row_count": 1773,
   "contract_rows": [
     {
       "contract": "prefill_focus",
@@ -31743,7 +31743,7 @@
         }
       },
       "domain": "decode",
-      "label": "bf16_sglang_qwen_tp4_verify_t4_b2",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b1",
       "line": 9
     },
     {
@@ -31761,7 +31761,7 @@
         }
       },
       "domain": "decode",
-      "label": "bf16_sglang_qwen_tp4_verify_t4_b3",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b2",
       "line": 10
     },
     {
@@ -31779,7 +31779,7 @@
         }
       },
       "domain": "decode",
-      "label": "bf16_sglang_qwen_tp4_verify_t4_b5",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b3",
       "line": 11
     },
     {
@@ -31797,8 +31797,80 @@
         }
       },
       "domain": "decode",
-      "label": "bf16_sglang_qwen_tp4_verify_t4",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b4",
       "line": 12
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        },
+        "sm_103a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b5",
+      "line": 13
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        },
+        "sm_103a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b6",
+      "line": 14
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        },
+        "sm_103a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp4_verify_t4_b7",
+      "line": 15
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        },
+        "sm_103a": {
+          "route_id": "cake.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp",
+          "status": "cake",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_6b2e78ff65e0"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp4_verify_t4",
+      "line": 16
     }
   ],
   "cuda_headers": [
@@ -31809,7 +31881,7 @@
     }
   ],
   "fail_closed_architecture_rows": 54,
-  "generator_commit": "1ad1faf130d28fe629d13fb01bbdc9d3749676ae",
+  "generator_commit": "69c0e4d73d76b3ba98d2d576454a61797cbb0017",
   "manifest_only": false,
   "schema": "flashinfer-gdn-noncp-decode-standalone-export-v1",
   "scope": {
@@ -31819,11 +31891,11 @@
   },
   "source_only": true,
   "source_pins": {
-    "cake.generated.gdn_decode": "58a0457c16fdc76c7404f1ad5081bdbad485172d776a6f71ab1a66bd32ffe782",
+    "cake.generated.gdn_decode": "fcc5579a422a0883d5de951cc88f5d8ee678c11033f537a417a3d60e42c14211",
     "cake.generated.gdn_prefill": "1916d57242c9c5a9ad2d125f8440ab94f8230a1651ccc76e4108b400deb55a79",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode.regression/part-000.jsonl": "010399b7ddb445712e6c7e7fbfa564056c244a18d9b1c1f62b281c134a1b6582",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode.shapes/part-000.jsonl": "52b5e7bdea334ff63165617cdfe43376502962ff7cfe4ab1f46a0a5b80060c7d",
-    "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode_bf16_serving.shapes/part-000.jsonl": "82263c09f2205f51cd3a68772030f85aea64e96cb4f0ccf646dc3a37a3723f99",
+    "design_doc/active/eval_contract_flashinfer_blackwell_gdn_decode_bf16_serving.shapes/part-000.jsonl": "b037ee4ec04fe0c27ba4fcfa77e05921263c6a4edd188295acd9bcf9cd403a6b",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_prefill.regression/part-000.jsonl": "874306e75bd17dada6e0da48b3a51624445bf7f3adf82650662fcf07a276b2e3",
     "design_doc/active/eval_contract_flashinfer_blackwell_gdn_prefill.shapes/part-000.jsonl": "8ef6b50ea7657b6292b9f7972b6dc6bc0026a2dcf1aef6b60b6b4d4d4248327a"
   },

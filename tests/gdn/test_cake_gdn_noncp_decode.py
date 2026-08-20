@@ -58,10 +58,10 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("1ad1faf130d28fe629d13fb01bbdc9d3749676ae")
-    assert manifest["contract_row_count"] == 1769
-    assert manifest["architecture_row_count"] == 3538
-    assert manifest["admitted_architecture_rows"] == 3484
+    assert manifest["generator_commit"] == ("69c0e4d73d76b3ba98d2d576454a61797cbb0017")
+    assert manifest["contract_row_count"] == 1773
+    assert manifest["architecture_row_count"] == 3546
+    assert manifest["admitted_architecture_rows"] == 3492
     assert manifest["fail_closed_architecture_rows"] == 54
     assert manifest["variant_count"] == len(manifest["variants"]) == 86
     assert manifest["source_only"] is True
@@ -350,7 +350,7 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
                 "indexed_bf16_verify_t4.tile16_fullwarp",
                 "t4_bf16state_tile16",
             )
-            for batch_size in (2, 3, 5, 8)
+            for batch_size in range(1, 9)
         ),
     )
     for overrides, route_suffix, variant_fragment in tp4_rows:
@@ -370,7 +370,7 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
 def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="twelve exact promoted",
+        match="sixteen exact promoted",
     ):
         _decode(
             state_dtype="bfloat16",
@@ -383,12 +383,12 @@ def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
 
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="twelve exact promoted",
+        match="sixteen exact promoted",
     ):
         _decode(
             state_dtype="bfloat16",
             layout="pretranspose",
-            batch_size=4,
+            batch_size=9,
             num_k_heads=4,
             num_q_heads=4,
             num_v_heads=8,
