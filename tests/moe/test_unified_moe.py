@@ -554,6 +554,31 @@ class TestTypedActivationConfig:
             "situ_beta": 2.0,
             "situ_linear_beta": 3.0,
         }
+        # linear_scale=None reaches the CuTe-DSL ABI as "no linear-branch clamp".
+        assert _cute_dsl_activation_kwargs(SiTU(linear_scale=None)) == {
+            "activation_type": int(ActivationType.Swiglu),
+            "situ_beta": 1.0,
+            "situ_linear_beta": None,
+        }
+
+    def test_situ_unclamped_linear_branch_is_expressible(self):
+        activation = SiTU(linear_scale=None)
+        assert activation.linear_scale is None
+        # The unclamped mode must stay hashable/frozen like every other value.
+        assert activation == SiTU(linear_scale=None)
+        assert hash(activation) == hash(SiTU(linear_scale=None))
+        assert activation != SiTU()
+        # Default remains the clamped 1.0 parity value.
+        assert SiTU().linear_scale == 1.0
+
+    def test_situ_unclamped_linear_branch_has_no_per_expert_tensor(self):
+        from flashinfer.fused_moe.prepare import _activation_param_view
+
+        view = _activation_param_view(
+            SiTU(gate_scale=2.0, linear_scale=None), 2, torch.device("cpu")
+        )
+        torch.testing.assert_close(view["gemm1_alpha"], torch.full((2,), 2.0))
+        assert "gemm1_beta" not in view
 
     def test_typed_scalars_require_matching_prepared_metadata(self):
         from flashinfer.fused_moe.runners import (
@@ -574,6 +599,15 @@ class TestTypedActivationConfig:
         _validate_prepared_activation_params(
             overrides, SiTU(clamp_limit=4.0), "TestRunner"
         )
+        # linear_scale=None has no per-expert encoding, so gemm1_beta is not
+        # required; gemm1_alpha still is.
+        _validate_prepared_activation_params(
+            {"gemm1_alpha": torch.ones(2)}, SiTU(linear_scale=None), "TestRunner"
+        )
+        with pytest.raises(ValueError, match="missing activation parameters"):
+            _validate_prepared_activation_params(
+                {}, SiTU(linear_scale=None), "TestRunner"
+            )
 
     @pytest.mark.parametrize(
         "activation,expected_rows",
@@ -846,6 +880,48 @@ class TestMoERunnerSupport:
         runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(clamp_limit=4.0))
         with pytest.raises(NotImplementedError, match="clamp_limit"):
+            runner.check_support()
+
+    def test_cute_dsl_accepts_unclamped_situ_linear_branch(self):
+        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
+        assert runner.check_support() is None
+
+    def test_trtllm_rejects_unclamped_situ_linear_branch(self):
+        # The TRT-LLM per-expert gemm1_beta tensor cannot encode "no clamp",
+        # so the mode CuTe-DSL accepts must be rejected here rather than
+        # silently dropping the parameter.
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
+        with pytest.raises(NotImplementedError, match="linear_scale=None"):
+            runner.check_support()
+
+    def test_b12x_construction_does_not_validate_activation(self):
+        # Regression: resolving the b12x activation name in __init__ raised
+        # before backend selection could filter the runner, so an unsupported
+        # activation aborted MoELayer construction instead of falling back to
+        # another backend that supports it.
+        from flashinfer.fused_moe.runners import B12xNvfp4Runner
+
+        config = self._nvfp4_swiglu(activation=GeGLU())
+        runner = B12xNvfp4Runner(config, device=torch.device("cpu"))
+        assert runner.activation is None
+
+    def test_missing_per_quant_capability_entry_is_rejected(self):
+        # A runner declaring per-quant activation support must declare it for
+        # every variant it accepts; an unmapped variant must not fall back to
+        # the permissive class default.
+        class _UnmappedRunner(TrtllmFp4RoutedRunner):
+            supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.MXFP4)
+            supported_activation_classes_by_quant = {
+                QuantVariant.NVFP4: (SwiGLU,),
+            }
+
+        runner = _UnmappedRunner.__new__(_UnmappedRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.MXFP4), activation=GeGLU()
+        )
+        with pytest.raises(NotImplementedError, match="no entry for QuantVariant"):
             runner.check_support()
 
     @pytest.mark.parametrize(

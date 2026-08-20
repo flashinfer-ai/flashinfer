@@ -682,6 +682,14 @@ equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 `gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit` tensors remain in
 `MoEWeightPack` backend views and override the scalar-expanded preparation view.
 
+`SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
+`linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
+unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
+TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
+has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
+silently dropping the parameter. The default stays `1.0`, so cross-backend
+parity is unchanged unless `None` is requested explicitly.
+
 The truthful unified support matrix follows the already executable flat path:
 
 | Runner / quantization | Unified activations |

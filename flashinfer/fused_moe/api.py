@@ -203,17 +203,25 @@ class SwiGLU(ActivationConfig):
 
 @dataclass(frozen=True)
 class SiTU(ActivationConfig):
-    """SiTU v2 with canonical gate, linear, and optional clamp scales."""
+    """SiTU v2 with canonical gate, linear, and optional clamp scales.
+
+    ``linear_scale`` is the linear-branch soft-clamp scale, applied as
+    ``linear_scale * tanh(linear / linear_scale)``. ``None`` selects the
+    unclamped linear branch, which only the CuTe-DSL backend can express; the
+    TRT-LLM ABI has no encoding for it and its runners reject ``None``. The
+    default stays ``1.0`` so cross-backend parity is unchanged.
+    """
 
     type: ClassVar[ActivationType] = ActivationType.Situ
     gate_scale: float = 1.0
-    linear_scale: float = 1.0
+    linear_scale: Optional[float] = 1.0
     clamp_limit: Optional[float] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _validate_finite("gate_scale", self.gate_scale, positive=True)
-        _validate_finite("linear_scale", self.linear_scale, positive=True)
+        if self.linear_scale is not None:
+            _validate_finite("linear_scale", self.linear_scale, positive=True)
         if self.clamp_limit is not None:
             _validate_finite("clamp_limit", self.clamp_limit, positive=True)
 

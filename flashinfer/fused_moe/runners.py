@@ -233,6 +233,7 @@ def _cute_dsl_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
             # The existing ABI selects SiTU as the SwiGLU epilogue plus beta values.
             "activation_type": int(ActivationType.Swiglu),
             "situ_beta": activation.gate_scale,
+            # None reaches the kernel as "no linear-branch tanh clamp".
             "situ_linear_beta": activation.linear_scale,
         }
     return {"activation_type": int(activation.type)}
@@ -253,7 +254,11 @@ def _validate_prepared_activation_params(
     if isinstance(activation, SwiGLU) and activation != SwiGLU():
         required = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
     elif isinstance(activation, SiTU):
-        required = ("gemm1_alpha", "gemm1_beta")
+        # linear_scale=None is the unclamped linear branch, which has no
+        # per-expert tensor encoding; runners reaching here must have rejected it.
+        required = ("gemm1_alpha",)
+        if activation.linear_scale is not None:
+            required += ("gemm1_beta",)
         if activation.clamp_limit is not None:
             required += ("gemm1_clamp_limit",)
     missing = [name for name in required if name not in view]
@@ -336,9 +341,23 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
-        supported_activations = self.supported_activation_classes_by_quant.get(
-            variant, self.supported_activation_classes
-        )
+        if self.supported_activation_classes_by_quant:
+            # Strict lookup: a runner that declares per-quant capabilities must
+            # declare them for every variant it accepts. Falling back to the
+            # permissive class default would silently admit every activation on
+            # a newly added variant.
+            try:
+                supported_activations = self.supported_activation_classes_by_quant[
+                    variant
+                ]
+            except KeyError:
+                raise NotImplementedError(
+                    f"{type(self).__name__} declares per-quantization activation "
+                    f"support but has no entry for QuantVariant.{variant.name}; "
+                    "add one to supported_activation_classes_by_quant."
+                ) from None
+        else:
+            supported_activations = self.supported_activation_classes
         if not isinstance(self.config.activation, supported_activations):
             names = ", ".join(cls.__name__ for cls in supported_activations)
             raise NotImplementedError(
@@ -1235,6 +1254,14 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
+        activation = self.config.activation
+        if isinstance(activation, SiTU) and activation.linear_scale is None:
+            # gemm1_beta is a per-expert float tensor with no encoding for
+            # "unclamped"; only the CuTe-DSL scalar ABI can express it.
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
+                "the TRT-LLM ABI has no unclamped linear-branch encoding."
+            )
         variant = self.config.quant.variant
         if variant in self.supported_quant_variants:
             from ..utils import get_compute_capability
@@ -2819,6 +2846,11 @@ class _B12xRunner(MoERunner):
     supports_expert_parallelism = False
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
+    # Kernel activation name, resolved in _check_support() rather than
+    # __init__() so an unsupported activation is a filterable
+    # NotImplementedError instead of a constructor failure.
+    activation: str | None
+
     def _check_activation_parameters(self) -> None:
         if (
             isinstance(self.config.activation, SwiGLU)
@@ -2848,15 +2880,23 @@ class _B12xRunner(MoERunner):
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
-    def __init__(self, config: MoEConfig, device: torch.device):
-        super().__init__()
+        # super()._check_support() already rejected activations outside the
+        # declared capability set; translate any residual gap in the name table
+        # into the NotImplementedError that backend selection filters on.
         from .utils import get_b12x_activation_name
 
+        try:
+            self.activation = get_b12x_activation_name(self.config.activation.type)
+        except ValueError as exc:
+            raise NotImplementedError(str(exc)) from exc
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         self.config = config
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self.activation = get_b12x_activation_name(config.activation.type)
+        self.activation = None
         self.tuning_config = TuningConfig()
         self._prepared_weights: dict[str, torch.Tensor] | None = None
         self._inner: Any = None

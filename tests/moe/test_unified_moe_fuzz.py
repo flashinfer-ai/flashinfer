@@ -483,9 +483,15 @@ def _bf16_reference(
                         min=-activation.clamp_limit, max=activation.clamp_limit
                     )
                     gate = gate.clamp(max=activation.clamp_limit)
-                inter = (
-                    activation.linear_scale
+                # linear_scale=None is the unclamped linear branch.
+                linear = (
+                    up
+                    if activation.linear_scale is None
+                    else activation.linear_scale
                     * torch.tanh(up / activation.linear_scale)
+                )
+                inter = (
+                    linear
                     * activation.gate_scale
                     * torch.tanh(gate / activation.gate_scale)
                     * torch.sigmoid(gate)
