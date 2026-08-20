@@ -467,10 +467,12 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
         def __init__(self, *args, **kwargs):
             self.constructor_args = args
             self.constructor_kwargs = kwargs
+            self.run_args = None
             self.run_kwargs = None
             runners.append(self)
 
         def run(self, *args, **kwargs):
+            self.run_args = args
             self.run_kwargs = kwargs
             return (object(), None)
 
@@ -481,14 +483,32 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
     )
     B = SimpleNamespace(shape=(1, 128, 8, 128))
     checkpoint_states = SimpleNamespace(dtype=torch.float16)
+    D = SimpleNamespace(ndim=2)
+    initial_states = SimpleNamespace(dtype=torch.float16)
+    seq_idx = SimpleNamespace(dtype=torch.int32)
+    optional = {
+        "D": D,
+        "z": object(),
+        "dt_bias": object(),
+        "dt_softplus": True,
+        "dt_limit": (-0.5, 0.75),
+        "initial_states": initial_states,
+        "seq_idx": seq_idx,
+        "chunk_indices": object(),
+        "chunk_offsets": object(),
+        "seq_chunk_cumsum": object(),
+        "update_seq_chunk_cumsum": True,
+        "checkpoint_token_indices": object(),
+        "checkpoint_state_slots": object(),
+        "checkpoint_states": checkpoint_states,
+        "out": object(),
+        "return_final_states": False,
+    }
+    positional = (x, object(), object(), B, object())
 
     first = module.ssd_combined_fwd(
-        x,
-        object(),
-        object(),
-        B,
-        object(),
-        checkpoint_states=checkpoint_states,
+        *positional,
+        **optional,
     )
     second = module.ssd_combined_fwd(
         x,
@@ -505,7 +525,21 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
     assert all(
         runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners
     )
-    assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
+    assert runners[0].constructor_args == (128, 8, 64, 128, 8)
+    assert runners[0].constructor_kwargs == {
+        "io_dtype": torch.bfloat16,
+        "state_dtype": torch.float16,
+        "has_d": True,
+        "d_has_hdim": True,
+        "has_initial_states": True,
+        "has_varlen": True,
+        "has_z": True,
+        "seq_idx_dtype": torch.int32,
+        "backend": "cake",
+    }
+    assert runners[0].run_args == positional
+    assert runners[0].run_kwargs == optional
+    assert runners[1].run_kwargs["dt_softplus"] is False
 
 
 def _signature_contract(callable_, *, drop_self=False):
