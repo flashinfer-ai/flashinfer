@@ -469,5 +469,3 @@ def finalize_dist_and_nvshmem(workspace: Workspace | None = None) -> None:
             dist.destroy_process_group()
     except Exception:  # noqa: BLE001
         pass
-
-

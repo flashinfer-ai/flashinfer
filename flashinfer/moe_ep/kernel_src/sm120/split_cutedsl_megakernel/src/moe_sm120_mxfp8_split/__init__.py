@@ -26,7 +26,7 @@ def __getattr__(name):
         return Sm120Fc2CombineKernel
     if name == "compile_topk_reduce":
         return compile_combine_reduce
-    if name in ("GreenContextStreams", "NativeGreenContextGraph"):
+    if name == "NativeGreenContextGraph":
         from .runtime import green_context
 
         return getattr(green_context, name)
@@ -44,7 +44,6 @@ __all__ = [
     "compile_combine_reduce",
     "select_compile_spec",
     # Compatibility exports, loaded lazily through __getattr__.
-    "GreenContextStreams",
     "NativeGreenContextGraph",
     "Sm120DispatchFc1Kernel",
     "Sm120Fc2CombineKernel",

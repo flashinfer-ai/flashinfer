@@ -146,18 +146,18 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
     def extra_smem_storage_class(self) -> type:
         hidden_bytes = self.hidden_bytes
         num_total_experts = self.num_total_experts
+        pull_buffer_bytes = self.num_dispatch_warps * hidden_bytes
+        shared_scratch_i32 = max(
+            num_total_experts,
+            (pull_buffer_bytes + 3) // 4,
+        )
 
         if self.token_back_standalone:
             @cute.struct
             class TokenCommStorage:
                 pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-                smem_expert_count: cute.struct.MemRange[
-                    Int32, num_total_experts
-                ]
-                pull_buffer: cute.struct.Align[
-                    cute.struct.MemRange[
-                        Uint8, self.num_dispatch_warps * hidden_bytes
-                    ],
+                smem_expert_count: cute.struct.Align[
+                    cute.struct.MemRange[Int32, shared_scratch_i32],
                     128,
                 ]
                 tb_pull_mbar: cute.struct.MemRange[Int64, self.num_token_back_warps]
@@ -168,20 +168,37 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     128,
                 ]
 
+                @property
+                def pull_buffer(self):
+                    # Route counting ends before dispatch starts consuming
+                    # the same bytes as its activation pull buffer.
+                    return cute.make_tensor(
+                        cute.recast_ptr(
+                            self.smem_expert_count.data_ptr(), dtype=Uint8
+                        ),
+                        cute.make_layout(pull_buffer_bytes),
+                    )
+
             return TokenCommStorage
 
         @cute.struct
         class TokenCommStorage:
             pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-            smem_expert_count: cute.struct.MemRange[
-                Int32, num_total_experts
-            ]
-            pull_buffer: cute.struct.Align[
-                cute.struct.MemRange[
-                    Uint8, self.num_dispatch_warps * hidden_bytes
-                ],
+            smem_expert_count: cute.struct.Align[
+                cute.struct.MemRange[Int32, shared_scratch_i32],
                 128,
             ]
+
+            @property
+            def pull_buffer(self):
+                # dispatch_prep is complete before any warp reuses this
+                # storage as its activation pull buffer.
+                return cute.make_tensor(
+                    cute.recast_ptr(
+                        self.smem_expert_count.data_ptr(), dtype=Uint8
+                    ),
+                    cute.make_layout(pull_buffer_bytes),
+                )
 
         return TokenCommStorage
 
@@ -533,7 +550,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
     ):
         # MemRange does not support dynamic indexing here; use raw pointers.
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
-        pull_buffer_ptr = token_comm_storage.pull_buffer.data_ptr()
+        pull_buffer_ptr = token_comm_storage.pull_buffer.iterator
         mbar_ptr_warp = pull_mbar_ptr + warp_idx
         if lane_idx == Int32(0):
             cute.arch.mbarrier_init(mbar_ptr_warp, 1)
@@ -1043,7 +1060,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         per participating warp and tile.
         """
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
-        pull_buffer_ptr = token_comm_storage.pull_buffer.data_ptr()
+        pull_buffer_ptr = token_comm_storage.pull_buffer.iterator
         mbar_ptr_warp = pull_mbar_ptr + warp_idx
         if lane_idx == Int32(0):
             cute.arch.mbarrier_init(mbar_ptr_warp, 1)
@@ -1888,7 +1905,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 _iket.range_push("Token_Back_By_Push")
 
             self.token_back_by_push(
-                token_comm_storage.pull_buffer.data_ptr(),
+                token_comm_storage.pull_buffer.iterator,
                 token_comm_storage.pull_mbar.data_ptr(),
                 token_comm_args.fc2_output_workspace,
                 token_comm_args.fc2_done_counter,

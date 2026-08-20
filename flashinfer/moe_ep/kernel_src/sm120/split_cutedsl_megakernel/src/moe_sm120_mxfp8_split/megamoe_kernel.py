@@ -659,13 +659,11 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
     # =========================================================================
 
     def _dispatch_smem_bytes(self) -> int:
-        """SMEM bytes for dispatch pull mbarriers, expert scratch, and token buffer."""
+        """SMEM bytes for dispatch pull mbarriers and aliased count/token scratch."""
         pull_mbar_bytes = _DispatchWarpCount * 8
-        expert_count_bytes = self.num_total_experts * 4
         pull_buffer_bytes = _DispatchWarpCount * self.hidden_bytes
         total = (
             _round_up(pull_mbar_bytes, 16)
-            + _round_up(expert_count_bytes, 16)
             + _round_up(pull_buffer_bytes, 128)
             + 128
         )

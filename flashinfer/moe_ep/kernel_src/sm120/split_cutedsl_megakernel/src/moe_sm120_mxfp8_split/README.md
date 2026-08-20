@@ -33,18 +33,14 @@ The hybrid transport compatibility guard currently requires NVSHMEM 3.7.0.
 
 ## Launch Modes
 
-`mega_runner.py` provides four launch modes:
+`mega_runner.py` provides two launch modes:
 
-- `sequential`: K1, host synchronization, K2, then K3.
-- `concurrent`: K1 and K2 use ordinary CUDA streams and disjoint persistent
-  grid budgets; K3 waits for both streams.
-- `green_context`: CUDA partitions the device SM resource into two disjoint
-  Green Contexts. K1 and K2 run on their respective context streams and K3
-  runs on the primary context after both completion events.
-- `green_graph`: captures K1, K2, and K3 into one native CUDA Graph on
+- `green_graph` (default): captures K1, K2, and K3 into one native CUDA Graph on
   ordinary streams, rebinds the K1 and K2 kernel nodes to disjoint driver
   Green Contexts, instantiates the graph once, and replays it from the caller
   stream. K3 remains on the primary context and depends on both K1 and K2.
+- `sequential`: runs K1, host synchronization, K2, then K3. This mode is kept
+  only for bring-up and debugging.
 
 `heuristic.py` resolves explicit K1/K2/TX/RX SM counts before JIT compilation.
 The benchmark runner can override them with `--k1_sms`, `--k2_sms`,

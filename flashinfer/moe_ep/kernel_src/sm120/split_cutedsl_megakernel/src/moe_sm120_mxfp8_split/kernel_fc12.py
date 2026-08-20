@@ -569,9 +569,19 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
         default_num_ab_stage = min(2, max_num_ab_stage)
         if self.enable_token_comm and getattr(self, "world_size", 1) == 1:
             # With no peer traffic, use the deepest feasible TMA/MMA pipeline.
-            # Multi-rank caps the default at two stages to leave resources for
-            # co-resident dispatch and token-back.
             default_num_ab_stage = max_num_ab_stage
+        elif (
+            self.scheduler_phase_mode == "fc1"
+            and self.mixed_mode
+            and getattr(self, "world_size", 1) <= 4
+        ):
+            # W4A8 K1 remains at one CTA/SM with either two or three AB stages.
+            # The dispatch route-count scratch aliases the later activation
+            # pull buffer, leaving enough SMEM for stage3 on the validated
+            # same-NUMA EP4 path without reducing occupancy. Keep larger EP
+            # worlds on the conservative stage2 default until their transport
+            # overlap is measured independently.
+            default_num_ab_stage = min(3, max_num_ab_stage)
         if self.num_ab_stages_override is not None:
             requested_num_ab_stage = self.num_ab_stages_override
         elif self.jit_config.num_ab_stages_override is not None:
