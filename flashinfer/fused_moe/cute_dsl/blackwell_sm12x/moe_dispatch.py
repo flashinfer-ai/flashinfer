@@ -84,7 +84,14 @@ _DIRECT_MICRO_MAX_N = 512
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
+# Production static band: pairs <= 640 (M <= 80 at topk=8). The kernel's
+# 32-row virtual-expert split keeps every scheduled tile inside the tile64
+# kernel's single computed M step, making the full compact band correct at
+# any per-expert row count.
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
+# The retained NVFP4 path uses the tile64 schedule through 1024 routed pairs.
+# MXFP4 keeps the generic 640-pair compact boundary.
+_STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT = 1024
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 
@@ -98,25 +105,20 @@ _MICRO_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (16, 63),
     (20, 84),
 )
+# Max-active-cluster policy for the retained2 tile64 static band, keyed by
+# routed-row range after the 32-row virtual-expert split.
 _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
-    (24, 148),
-    (32, 169),
-    (40, 132),
-    (48, 149),
-    (64, 134),
-    (80, 175),
-    (96, 171),
-    (120, 125),
-    (128, 130),
-    (160, 171),
-    (192, 166),
-    (256, 141),
-    (320, 158),
-    (512, 175),
-    (640, 188),
+    (64, 110),
+    (256, 92),
+    (448, 110),
+    (512, 92),
+    (640, 110),
+    (768, 92),
+    (1024, 110),
 )
-# Workloads at or below the static cutover (640 routed pairs by default)
-# take the static kernel, so only the 1024 entry is normally reachable.
+# Workloads at or below the static cutover (640 pairs MXFP4, 1024 NVFP4)
+# take the static kernel, so for NVFP4 these entries are reachable only
+# when the dynamic backend is forced; MXFP4 still reaches the 1024 entry.
 _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
@@ -270,9 +272,17 @@ def _select_dynamic_tile_m(
     return _LEVEL_TILE_M
 
 
-def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
+def _get_static_compact_cutover_pairs(
+    activation_precision: str = "fp4",
+    quant_mode: str | None = None,
+) -> int:
     activation_precision = _normalize_activation_precision(activation_precision)
-    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(activation_precision)
+    cache_key = (
+        f"{activation_precision}:{quant_mode}"
+        if quant_mode is not None
+        else activation_precision
+    )
+    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -284,10 +294,17 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
     )
     cutover = _first_env(*cutover_names)
     if cutover is None:
-        cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+        # Only the retained NVFP4 implementation earns the wider band; the
+        # generic implementation (MXFP4, or unspecified quant mode) keeps
+        # the original boundary.
+        cached = (
+            _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
+            if quant_mode == "nvfp4"
+            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+        )
     else:
         cached = max(0, int(cutover))
-    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
+    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[cache_key] = cached
     return cached
 
 
@@ -305,6 +322,13 @@ def _select_moe_mma_tiler_mn(
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     if routed_rows <= 32 and n <= 256:
+        return (64, 128)
+    # The retained2 static path uses narrow tiles throughout the compact band.
+    # The 32-row virtual-expert split bounds each scheduled tile to at most 32
+    # valid rows, so tile64 remains valid regardless of physical expert skew.
+    # 1024 covers the NVFP4 static band; MXFP4's static band ends at its
+    # 640-pair cutover, below which both thresholds pick the same tile.
+    if routed_rows <= 1024:
         return (64, 128)
     if resident_clusters is not None and resident_clusters < sm_count:
         return coarse_tile
@@ -361,9 +385,13 @@ class Sm120StaticMoEWorkspace:
     barrier_count: torch.Tensor  # [1] int32
     barrier_epoch: torch.Tensor  # [1] int32
     active_expert_count: torch.Tensor  # [1] int32
-    weight_expert_ids: torch.Tensor  # [state_E] int32
+    weight_expert_ids: torch.Tensor  # [virt_E] int32
     global_to_local_expert: torch.Tensor  # [weight_E] int32
     compact_topk_ids: torch.Tensor  # [state_E] int32, for micro kernel pre-pass
+    # 32-row virtual-expert split scratch: [weight_E] monotone row allocators
+    # followed by [weight_E, max_chunks] chunk -> local expert id map. The
+    # static route kernel re-initializes it every launch (graph-replay safe).
+    virt_route_scratch: torch.Tensor  # [weight_E*(1+max_chunks)] int32
 
     # Views (set after allocation)
     packed_a_view: torch.Tensor | None = None
@@ -411,10 +439,15 @@ def allocate_sm120_static_workspace(
     sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
-    _check_memref_limit("static packed_input", state_E * max_rows * (k // 2))
-    _check_memref_limit("static packed_input_scale", state_E * rows_pad_k * cols_pad_k)
+    # The 32-row virtual-expert split may open extra compact expert slots for
+    # experts with >32 routed rows. Sum(ceil(rows_e/32)) <= actives +
+    # total_rows/32, so ceil(max_rows/32) extra slots always suffice.
+    max_chunks = (max_rows + 31) // 32
+    virt_E = state_E + max_chunks
+    _check_memref_limit("static packed_input", virt_E * max_rows * (k // 2))
+    _check_memref_limit("static packed_input_scale", virt_E * rows_pad_k * cols_pad_k)
     packed_input = torch.empty(
-        state_E, max_rows, k // 2, dtype=torch.uint8, device=device
+        virt_E, max_rows, k // 2, dtype=torch.uint8, device=device
     )
 
     workspace = Sm120StaticMoEWorkspace(
@@ -427,22 +460,27 @@ def allocate_sm120_static_workspace(
         device=device,
         activation_precision=activation_precision,
         quant_mode=quant_mode,
-        row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
-        token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
-        token_weights=torch.zeros(
-            state_E, max_rows, dtype=torch.float32, device=device
-        ),
+        row_counts=torch.zeros(virt_E, dtype=torch.int32, device=device),
+        token_map=torch.zeros(virt_E, max_rows, dtype=torch.int32, device=device),
+        token_weights=torch.zeros(virt_E, max_rows, dtype=torch.float32, device=device),
         packed_input=packed_input,
         packed_input_scale=torch.empty(
-            state_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device
+            virt_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device
         ),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
         barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
-        weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
+        weight_expert_ids=torch.arange(virt_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
         compact_topk_ids=torch.empty(
             max(state_E, max_rows), dtype=torch.int32, device=device
+        ),
+        virt_route_scratch=torch.empty(
+            # Row allocator + chunk map + work-claim counter (8-slot pad);
+            # shared by the retained NVFP4 and MXFP4 implementation.
+            weight_E * (1 + max_chunks) + 8,
+            dtype=torch.int32,
+            device=device,
         ),
     )
 
@@ -1045,6 +1083,11 @@ def _get_static_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
+    virt_route_scratch_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (weight_E * (1 + (max_rows + 31) // 32) + 8,),
+        assumed_align=4,
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
@@ -1068,6 +1111,7 @@ def _get_static_kernel(
             active_expert_count_fake,
             weight_expert_ids_fake,
             global_to_local_expert_fake,
+            virt_route_scratch_fake,
             input_gs_fake,
             alpha_fake,
             down_alpha_fake,
@@ -1677,7 +1721,9 @@ def launch_sm120_static_moe(
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
         compiled, mac = _get_micro_kernel(
-            workspace.state_E,
+            # Physical compact-expert slot count (state_E + virtual-split
+            # slots); fake tensor extents must match the allocated arrays.
+            int(workspace.row_counts.shape[0]),
             num_experts,
             num_tokens,
             k,
@@ -1697,9 +1743,10 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
             quant_mode=quant_mode,
         )
+        virt_scratch_args: Tuple[Any, ...] = ()
     else:
         compiled, mac = _get_static_kernel(
-            workspace.state_E,
+            int(workspace.row_counts.shape[0]),
             num_experts,
             num_tokens,
             k,
@@ -1718,6 +1765,7 @@ def launch_sm120_static_moe(
             quant_mode=quant_mode,
         )
         launch_ids = flat_ids
+        virt_scratch_args = (workspace.virt_route_scratch,)
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
     # No stream argument: the kernels compile against
@@ -1742,6 +1790,7 @@ def launch_sm120_static_moe(
         workspace.active_expert_count,
         workspace.weight_expert_ids,
         workspace.global_to_local_expert,
+        *virt_scratch_args,
         input_gs,
         weights.w1_alpha,
         weights.w2_alpha,
@@ -1777,7 +1826,7 @@ def select_sm120_moe_backend(
         # Both micro variants launch through the static workspace path.
         return "static"
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
+    if routed_rows <= _get_static_compact_cutover_pairs("fp4", quant_mode=mode):
         return "static"
     return "dynamic"
 

@@ -258,9 +258,11 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
     _clear_static_cutover_env(monkeypatch)
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     try:
+        # NVFP4's retained static implementation owns a wider band (1024
+        # routed pairs) than MXFP4's generic implementation (640 pairs).
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=80,
+                num_tokens=128,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -268,9 +270,17 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
         )
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=81,
+                num_tokens=129,
                 num_topk=8,
                 activation_precision="fp4",
+            )
+            == "dynamic"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=81,
+                num_topk=8,
+                quant_mode="mxfp4",
             )
             == "dynamic"
         )
@@ -3135,7 +3145,7 @@ def _make_cpu_wrapper(monkeypatch, use_cuda_graph=True, **shared):
         hidden_size=256,
         intermediate_size=128,
         use_cuda_graph=use_cuda_graph,
-        max_num_tokens=1024,  # crosses the static/dynamic cutover
+        max_num_tokens=2048,  # crosses the NVFP4 static/dynamic cutover (1024)
         device="cpu",
         **shared,
     )
@@ -3217,7 +3227,7 @@ def test_wrapper_shared_buffers_require_cuda_graph(monkeypatch):
     monkeypatch.setattr(
         moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
     )
-    output = torch.zeros((1024, 256), dtype=torch.bfloat16)
+    output = torch.zeros((2048, 256), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="use_cuda_graph"):
         _make_cpu_wrapper(monkeypatch, use_cuda_graph=False, shared_output=output)
 
