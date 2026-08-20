@@ -2,6 +2,12 @@
 
 *Design Document  ·  v0.1  ·  March 2026*
 
+> [!IMPORTANT]
+> This file preserves the original design discussion. Sections 2–8 are
+> aspirational and their snippets are not runnable API examples. The
+> [MVP As-Built Reference](#mvp-as-built-reference) is the authoritative
+> description of the current pack-based `MoELayer` API.
+
 ## 1. Motivation
 
 FlashInfer currently exposes MoE functionality through a family of flat, positional-argument functions:

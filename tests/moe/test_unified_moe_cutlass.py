@@ -360,6 +360,19 @@ def test_cutlass_per_expert_activation_overrides():
     with pytest.raises(ValueError, match="shape"):
         runner._resolve_activation_params({"gemm1_alpha": torch.ones(3)})
 
+    runner.config = _config(activation=SwiGLUStep())
+    runner._config_activation_params = {
+        "swiglu_alpha": None,
+        "swiglu_beta": None,
+        "swiglu_limit": torch.full((4,), 7.0),
+    }
+    step_limit = torch.arange(4, dtype=torch.float32)
+    resolved = runner._resolve_activation_params({"gemm1_clamp_limit": step_limit})
+    assert resolved["swiglu_limit"] is step_limit
+    for invalid in ("gemm1_alpha", "gemm1_beta"):
+        with pytest.raises(ValueError, match="does not consume"):
+            runner._resolve_activation_params({invalid: torch.ones(4)})
+
 
 @pytest.mark.parametrize(
     "config,match",

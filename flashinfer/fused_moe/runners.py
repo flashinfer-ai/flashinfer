@@ -559,6 +559,13 @@ class _CutlassRunnerBase(MoERunner):
             "gemm1_clamp_limit": "swiglu_limit",
         }
         present = [name for name in aliases if name in view]
+        if isinstance(self.config.activation, SwiGLUStep):
+            ignored = [name for name in ("gemm1_alpha", "gemm1_beta") if name in view]
+            if ignored:
+                raise ValueError(
+                    f"{type(self).__name__}: SwiGLUStep does not consume "
+                    f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
+                )
         if present and not isinstance(self.config.activation, (SwiGLU, SwiGLUStep)):
             raise ValueError(
                 f"{type(self).__name__}: per-expert activation overrides {present} "
