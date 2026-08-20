@@ -1144,7 +1144,7 @@ def test_block_table_width_contract(monkeypatch):
         pytest.skip("paged MQA logits requires SM100a (B200)")
 
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
-    from flashinfer.attn_scores.attn_scores import _validate_block_table_width
+    from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
 
     device = "cuda"
     B, H, D, block_size = 2, 64, 128, 64
@@ -1160,7 +1160,7 @@ def test_block_table_width_contract(monkeypatch):
     # Default (unset): no sync, no check. Exercise the validator directly rather
     # than launching -- a narrow table would genuinely read out of bounds.
     monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
-    assert _validate_block_table_width(narrow, context_lens, block_size, "x") is None
+    assert _validate_paged_bounds(narrow, context_lens, ctx, block_size, "x") is None
 
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     ntb = B * need
@@ -1190,6 +1190,78 @@ def test_block_table_width_contract(monkeypatch):
     # A padded table is accepted even though ctx is not a multiple of 128, and
     # max_context_len being much larger than ctx must NOT tighten the bound.
     fp8_paged_mqa_logits(q8, kv8, w, context_lens, wide, ctx * 8)
+
+
+def test_max_context_len_bound(monkeypatch):
+    """max_context_len must be >= max(context_lens), or the kernel writes OOB.
+
+    The output row is sized from max_context_len while the schedule is derived
+    from context_lens; context_lens=[257] with max_context_len=256 allocates 256
+    columns but schedules splits reaching 512, and the store is unconditional.
+    Checked under FLASHINFER_VALIDATE_INPUTS since the bound needs the per-row
+    lengths from device memory. Regression for PR #4365 review r3824481310.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
+
+    device = "cuda"
+    B, H, D, block_size = 1, 64, 128, 64
+    ctx, max_ml = 257, 256  # the reviewer's example: schedule reaches 512
+
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    width = -(-ctx // 128) * (128 // block_size)
+    block_table = torch.zeros((B, width), dtype=torch.int32, device=device)
+    ntb = B * width
+    w = torch.zeros(B * 1, H, device=device, dtype=torch.float32)
+
+    # Default (unset): no sync, no check -- exercise the validator directly
+    # rather than launching, which would genuinely write out of bounds.
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+    assert (
+        _validate_paged_bounds(block_table, context_lens, max_ml, block_size, "x")
+        is None
+    )
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    q8 = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"max_context_len \(256\) must be at least"):
+        fp8_paged_mqa_logits(q8, kv8, w, context_lens, block_table, max_ml)
+
+    q4 = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"max_context_len \(256\) must be at least"):
+        fp4_paged_mqa_logits(
+            q4,
+            sf4,
+            kv4,
+            w,
+            context_lens,
+            block_table,
+            max_ml,
+            output_dtype=torch.bfloat16,
+        )
+
+    # skip_check=True must not bypass it (silent OOB write).
+    with pytest.raises(ValueError, match=r"max_context_len \(256\) must be at least"):
+        fp8_paged_mqa_logits(
+            q8, kv8, w, context_lens, block_table, max_ml, skip_check=True
+        )
+
+    # Raising max_context_len to the real length makes it legal again.
+    fp8_paged_mqa_logits(q8, kv8, w, context_lens, block_table, ctx)
+
+    # Ragged lengths: only the longest row matters.
+    ragged = torch.tensor([64, 257], dtype=torch.int32, device=device)
+    bt2 = torch.zeros((2, width), dtype=torch.int32, device=device)
+    q8b = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    wb = torch.zeros(2, H, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match=r"max\(context_lens\) \(257\)"):
+        fp8_paged_mqa_logits(q8b, kv8, wb, ragged, bt2, max_ml)
 
 
 def test_precompile_variants():
