@@ -183,6 +183,26 @@ def test_summarize_ninja_missing_non_cuda_header_uses_generic_hint():
     assert "FLASHINFER_EXTRA_CUDAFLAGS" in summary
 
 
+def test_summarize_ninja_missing_cuh_header_uses_cuda_hint():
+    output = (
+        "[1/2] nvcc ... -c kernel.cu -o kernel.cuda.o\n"
+        "FAILED: kernel.cuda.o\n"
+        "kernel.cu:5:10: fatal error: cuda/foo.cuh: "
+        "No such file or directory\n"
+        "compilation terminated.\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    # A CUDA device header (.cuh) must be recognized so it gets an include-path
+    # hint, not be dropped for lacking a .h/.hpp suffix. The "cuda/" path segment
+    # marks it CUDA-related, so it should get the CUDA-wheel hint.
+    assert "fatal error: cuda/foo.cuh" in summary
+    assert "site-packages/nvidia" in summary
+    assert "FLASHINFER_EXTRA_CUDAFLAGS" in summary
+
+
 def test_summarize_ninja_oom_exit_137():
     output = (
         "[7/32] nvcc ... -c fp4_gemm_cutlass___nv_bfloat16_128_32_256.cu ...\n"

@@ -408,7 +408,7 @@ def summarize_ninja_build_failure(output: str) -> str:
     # gets generic include-path guidance so we don't point users at
     # site-packages/nvidia for an unrelated header.
     header_match = re.search(
-        r"([\w./+-]+\.h(?:pp)?):\s*No such file or directory", output
+        r"([\w./+-]+\.(?:h|hpp|cuh)):\s*No such file or directory", output
     )
     if header_match:
         header = header_match.group(1)
