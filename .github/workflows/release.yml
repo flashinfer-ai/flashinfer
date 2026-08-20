@@ -9,6 +9,7 @@ on:
         type: string
   pull_request:
     paths:
+      - '.python-version'
       - '.github/workflows/release.yml'
 
 jobs:
@@ -18,6 +19,7 @@ jobs:
       version: ${{ steps.set-version.outputs.version }}
       release_tag: ${{ steps.set-version.outputs.release_tag }}
       is_pr: ${{ steps.set-version.outputs.is_pr }}
+      python_version: ${{ steps.set-version.outputs.python_version }}
     steps:
       - name: Determine if running in PR mode
         id: check-mode
@@ -42,7 +44,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # A fork's head branch does not exist in the base repository, so use
+          # its repository and immutable SHA for pull-request dry runs.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Verify tag matches version.txt
@@ -55,6 +60,8 @@ jobs:
           fi
 
           VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+          PYTHON_VERSION=$(tr -d '[:space:]' < .python-version)
+          echo "python_version=${PYTHON_VERSION}" >> $GITHUB_OUTPUT
 
           # In PR mode, use version from version.txt with a test suffix
           if [ "${{ github.event_name }}" == "pull_request" ]; then
@@ -90,13 +97,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -124,13 +132,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -176,13 +185,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          # 12.1a is CUDA 13.0 aarch64 only: adding it to cu129 aarch64 too (#3684) pushed that
+          # wheel to 2.14 GiB, past GitHub's 2 GiB release-asset limit (#4519).
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
         run: |
           # Extract CUDA major and minor versions
           CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
@@ -191,7 +203,7 @@ jobs:
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-          mkdir -p ${{ github.workspace }}/ci-cache
+          mkdir -p ${{ github.workspace }}/ci-cache ${{ github.workspace }}/sccache-stats
 
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
@@ -208,10 +220,45 @@ jobs:
             -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
             -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
             -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
+            -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
         timeout-minutes: 360
+
+      - name: Display sccache stats
+        if: always()
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always()
+        env:
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${{ matrix.cuda }}"
+            printf 'matrix_arch=%s\n' "${{ matrix.arch }}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-cuda${{ matrix.cuda }}-${{ matrix.arch }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Display wheel size
         run: du -h flashinfer-jit-cache/dist/*
@@ -359,7 +406,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ needs.setup.outputs.python_version }}
 
       - name: Install twine
         run: |
@@ -411,7 +458,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
         run: |
