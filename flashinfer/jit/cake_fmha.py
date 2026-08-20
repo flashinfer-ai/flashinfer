@@ -25,7 +25,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "c566936ca2bb00eec2d85ac5199a7e5da3e31da9a2c305f94f29e4f866c4ff09"
+    "8c437062eb32fb882a7d6af6059b5ebe5b95e7324e848a83da21e1131ac58457"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -614,6 +614,133 @@ def load_cake_fmha_context_fp8_module(
         enable_sink=enable_sink,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context FP8 module: %s", module)
+    return module
+
+
+def get_cake_fmha_context_nvfp4_uri(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+) -> str:
+    selector = _validate_context_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    if page_size != 16:
+        raise ValueError("Cake NVFP4 context requires page_size=16")
+    return (
+        f"cake_fmha_context_nvfp4_{target}"
+        f"_m{num_m_blocks}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
+        f"_causal{selector['IS_CAUSAL']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_context_nvfp4_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+) -> JitSpec:
+    """Build the authenticated NVFP4-dequant/FP8-context chain."""
+
+    selector = _validate_context_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    if page_size != 16:
+        raise ValueError("Cake NVFP4 context requires page_size=16")
+    dequant_sources = _get_component_launch_sources(
+        "context_nvfp4_dequant", target, {}
+    )
+    context_sources = _get_component_launch_sources(
+        "context_fp8", target, selector
+    )
+    api_binding = get_cake_fmha_csrc_dir() / _CONTEXT_FP8_JIT_BINDING
+    if not api_binding.is_file():
+        raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
+    heads_per_group = num_q_heads // num_kv_heads
+    tok_per_stage = 128 // pack_g
+    spec = gen_jit_spec(
+        name=get_cake_fmha_context_nvfp4_uri(
+            target,
+            num_m_blocks,
+            num_q_heads,
+            num_kv_heads,
+            pack_g,
+            page_size,
+            l2_swizzle,
+        ),
+        sources=[*dequant_sources, *context_sources, api_binding],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DNUM_M_BLOCKS={num_m_blocks}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DHEADS_PER_GROUP={heads_per_group}",
+            f"-DPACK_G={pack_g}",
+            f"-DTOK_PER_STAGE={tok_per_stage}",
+            f"-DL2_SWIZZLE={l2_swizzle}",
+            f"-DPAGE_SIZE={page_size}",
+            "-DVPT=4",
+            "-DCAKE_FMHA_CONTEXT_IS_CAUSAL=1",
+            "-DCAKE_FMHA_CONTEXT_RETURN_LSE=0",
+            "-DCAKE_FMHA_CONTEXT_ENABLE_SINK=0",
+            "-DCAKE_FMHA_CONTEXT_NVFP4=1",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA context NVFP4 JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_context_nvfp4_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    page_size: int,
+    l2_swizzle: int,
+):
+    module = gen_cake_fmha_context_nvfp4_module(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA context NVFP4 module: %s", module)
     return module
 
 
@@ -1552,12 +1679,14 @@ __all__ = [
     "CakeFmhaTarget",
     "gen_cake_fmha_context_bf16_module",
     "gen_cake_fmha_context_fp8_module",
+    "gen_cake_fmha_context_nvfp4_module",
     "gen_cake_fmha_compat_module",
     "gen_cake_fmha_decode_native_bf16_module",
     "gen_cake_fmha_decode_native_fp16_hd512_module",
     "gen_cake_fmha_decode_native_fp16_nhd_module",
     "get_cake_fmha_context_bf16_uri",
     "get_cake_fmha_context_fp8_uri",
+    "get_cake_fmha_context_nvfp4_uri",
     "get_cake_fmha_compat_uri",
     "get_cake_fmha_csrc_dir",
     "get_cake_fmha_decode_native_bf16_uri",
@@ -1566,6 +1695,7 @@ __all__ = [
     "get_cake_fmha_manifest",
     "load_cake_fmha_context_bf16_module",
     "load_cake_fmha_context_fp8_module",
+    "load_cake_fmha_context_nvfp4_module",
     "load_cake_fmha_compat_module",
     "load_cake_fmha_decode_native_bf16_module",
     "load_cake_fmha_decode_native_fp16_hd512_module",

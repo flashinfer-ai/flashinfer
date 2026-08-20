@@ -20,6 +20,7 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_context_fp16_hd256_module,
     gen_cake_fmha_context_fp8_module,
     gen_cake_fmha_context_fp8_hd256_module,
+    gen_cake_fmha_context_nvfp4_module,
     gen_cake_fmha_decode_native_bf16_module,
     gen_cake_fmha_decode_native_fp16_hd512_module,
     gen_cake_fmha_decode_native_fp16_nhd_module,
@@ -31,6 +32,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_context_fp16_hd256_uri,
     get_cake_fmha_context_fp8_uri,
     get_cake_fmha_context_fp8_hd256_uri,
+    get_cake_fmha_context_nvfp4_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_decode_native_fp16_hd512_uri,
     get_cake_fmha_decode_native_fp16_nhd_uri,
@@ -87,7 +89,7 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
     assert cake_api._manifest_optimized_route_accounting() == (1_798, 1_798)
-    assert cake_api._manifest_authenticated_route_accounting() == (1_768, 1_798)
+    assert cake_api._manifest_authenticated_route_accounting() == (1_798, 1_798)
     for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
         manifest_components = tuple(
             dict.fromkeys(
@@ -102,6 +104,9 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
         for component in components
     }
     assert routed_components | {"compat_v1"} == set(manifest["components"])
+    assert cake_api._AUTHENTICATED_JIT_COMPONENTS == routed_components | {
+        "compat_v1"
+    }
 
 
 def test_cake_fmha_jit_spec_uses_versioned_standalone_sources(monkeypatch) -> None:
@@ -407,6 +412,30 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
     assert "-DHEADS_PER_GROUP=8" in spec.extra_cuda_cflags
     assert "-DPACK_G=8" in spec.extra_cuda_cflags
     assert "-DTOK_PER_STAGE=16" in spec.extra_cuda_cflags
+
+
+def test_cake_fmha_context_nvfp4_jit_selects_dequant_and_fp8_chain(
+    monkeypatch,
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_context_nvfp4_module(
+        "sm100a", 1, 32, 4, 8, 16, 8
+    )
+    assert spec.name == get_cake_fmha_context_nvfp4_uri(
+        "sm100a", 1, 32, 4, 8, 16, 8
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "default.cu",
+        "cake_fmha_context_nvfp4_dequant_binding.cu",
+        "enable_sink0_is_causal1_return_lse0.cu",
+        "cake_fmha_context_fp8_binding.cu",
+        "cake_fmha_context_fp8_jit_binding.cu",
+    }
+    assert "-DNUM_KV_HEADS=4" in spec.extra_cuda_cflags
+    assert "-DPAGE_SIZE=16" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_CONTEXT_NVFP4=1" in spec.extra_cuda_cflags
 
 
 @pytest.mark.parametrize(
@@ -971,14 +1000,40 @@ def test_cake_fmha_fp8_route_loads_its_authenticated_adapter(monkeypatch) -> Non
     }
 
 
-def test_cake_fmha_nvfp4_route_fails_closed_to_compat(monkeypatch) -> None:
+def test_cake_fmha_nvfp4_route_loads_authenticated_adapter(monkeypatch) -> None:
     sentinel = object()
+    observed = {}
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
     monkeypatch.setattr(
         cake_api,
         "load_cake_fmha_decode_quant_nvfp4_module",
-        lambda *args: pytest.fail("unauthenticated NVFP4 adapter must not load"),
+        lambda *args: observed.setdefault("args", args) and sentinel,
+    )
+    route = cake_api.CakeFmhaDecodeRoute(
+        target="sm103a",
+        batch_size=2,
+        q_len=1,
+        num_q_heads=4,
+        num_kv_heads=2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=True,
+        component="decode_quant_nvfp4",
+        page_size=32,
+    )
+    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
+    assert observed == {"args": ("sm103a", 2, 1, 4, 2, 32)}
+
+
+def test_cake_fmha_nvfp4_load_failure_fails_closed_to_compat(monkeypatch) -> None:
+    sentinel = object()
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_decode_quant_nvfp4_module",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("JIT unavailable")),
     )
     monkeypatch.setattr(
         cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
@@ -996,13 +1051,27 @@ def test_cake_fmha_nvfp4_route_fails_closed_to_compat(monkeypatch) -> None:
         component="decode_quant_nvfp4",
         page_size=32,
     )
-    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
+    with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
+        assert (
+            cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+            is sentinel
+        )
 
 
 def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
 
-    def select(query, key, out, *, kv_layout, shared, causal, scales=None):
+    def select(
+        query,
+        key,
+        out,
+        *,
+        kv_layout,
+        shared,
+        causal,
+        scales=None,
+        workspace_bytes=1 << 20,
+    ):
         return cake_api.select_cake_fmha_context_route(
             query.device,
             query=query,
@@ -1029,6 +1098,7 @@ def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypat
             is_causal=causal,
             lse=None,
             kv_layout=kv_layout,
+            workspace_buffer=torch.empty(workspace_bytes, dtype=torch.uint8),
         )
 
     fp16_q = torch.empty((16, 4, 256), dtype=torch.float16)
@@ -1067,10 +1137,23 @@ def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypat
     )
     assert nvfp4_route is not None
     assert nvfp4_route.component == "context_nvfp4"
+    assert (
+        select(
+            fp8_q,
+            torch.empty((4, 2, 16, 64), dtype=torch.uint8),
+            torch.empty_like(fp8_q),
+            kv_layout="HND",
+            shared=True,
+            causal=True,
+            scales=torch.empty((4, 2, 16, 8), dtype=torch.float8_e4m3fn),
+            workspace_bytes=1,
+        )
+        is None
+    )
 
     for route in (fp16_route, fp8_hd256_route):
         assert cake_api.cake_fmha_route_is_optimized(route)
-    assert not cake_api.cake_fmha_route_is_optimized(nvfp4_route)
+    assert cake_api.cake_fmha_route_is_optimized(nvfp4_route)
 
 
 @pytest.mark.parametrize(
@@ -1107,6 +1190,66 @@ def test_cake_fmha_context_hd256_route_loads_authenticated_chain(
     )
     assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
     assert observed == {"args": ("sm103a", 2, 10, 2, 32)}
+
+
+def test_cake_fmha_context_nvfp4_route_loads_authenticated_chain(
+    monkeypatch,
+) -> None:
+    sentinel = object()
+    observed = {}
+
+    def load(*args):
+        observed["args"] = args
+        return sentinel
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(cake_api, "load_cake_fmha_context_nvfp4_module", load)
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_nvfp4",
+        num_m_blocks=2,
+        num_q_heads=32,
+        num_kv_heads=4,
+        pack_g=8,
+        page_size=16,
+        l2_swizzle=8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
+    assert observed == {"args": ("sm103a", 2, 32, 4, 8, 16, 8)}
+
+
+def test_cake_fmha_context_nvfp4_load_failure_fails_closed(monkeypatch) -> None:
+    sentinel = object()
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_context_nvfp4_module",
+        lambda *args: (_ for _ in ()).throw(OSError("JIT unavailable")),
+    )
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
+    )
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_nvfp4",
+        num_m_blocks=2,
+        num_q_heads=32,
+        num_kv_heads=4,
+        pack_g=8,
+        page_size=16,
+        l2_swizzle=8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
+        assert (
+            cake_api.get_cake_fmha_context_module(torch.device("cpu"), route)
+            is sentinel
+        )
 
 
 def test_decode_route_miss_fails_closed_to_compat(monkeypatch) -> None:

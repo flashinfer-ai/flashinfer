@@ -6152,6 +6152,7 @@ def trtllm_batch_context_with_kv_cache(
             is_causal=causal,
             lse=lse,
             kv_layout=kv_layout,
+            workspace_buffer=workspace_buffer,
         )
         if not cake_fmha_route_is_optimized(cake_route):
             # compat_v1 takes host scalar scales. Optimized context routes

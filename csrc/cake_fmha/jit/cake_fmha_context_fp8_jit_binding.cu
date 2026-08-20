@@ -50,6 +50,9 @@
 #ifndef CAKE_FMHA_CONTEXT_ENABLE_SINK
 #error "CAKE_FMHA_CONTEXT_ENABLE_SINK must be supplied by the route-specific JIT"
 #endif
+#ifndef CAKE_FMHA_CONTEXT_NVFP4
+#define CAKE_FMHA_CONTEXT_NVFP4 0
+#endif
 
 using tvm::ffi::Optional;
 using tvm::ffi::Variant;
@@ -175,6 +178,24 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   return tm;
 }
 
+CUtensorMap EncodeTmaContiguousPagedKv(void* data, int64_t pages, int64_t page_stride,
+                                       const char* name) {
+  uint64_t global_dim[5] = {128u, PAGE_SIZE, 1u, NUM_Q_HEADS / HEADS_PER_GROUP,
+                            static_cast<uint64_t>(pages)};
+  uint64_t global_strides[4] = {128u, 128u, PAGE_SIZE * 128u,
+                                static_cast<uint64_t>(page_stride)};
+  uint32_t box_dim[5] = {128u, 16u, 1u, 1u, 1u};
+  uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
+  CUtensorMap tm;
+  CUresult result = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, data, global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
+      << "failed to encode Cake FMHA dequantized context " << name << " map";
+  return tm;
+}
+
 __global__ void PrepareContextMetadata(const int* cum_seq_lens_q, const int* seq_lens_kv,
                                        int* expanded_q, int* expanded_kv, int* expanded_cu_q,
                                        int total_bh, int units_per_batch) {
@@ -205,11 +226,21 @@ void cake_paged_attention_context(
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
     bool is_causal, Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(),
+#if CAKE_FMHA_CONTEXT_NVFP4
+                    dl_uint8
+#else
+                    dl_float8_e4m3fn
+#endif
+  );
+  TVM_FFI_ICHECK_EQ(value_cache.dtype(), key_cache.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK(!out_scale_factor.has_value());
+#if CAKE_FMHA_CONTEXT_NVFP4
+  TVM_FFI_ICHECK(key_block_scales.has_value() && value_block_scales.has_value());
+#else
   TVM_FFI_ICHECK(!key_block_scales.has_value() && !value_block_scales.has_value());
+#endif
   TVM_FFI_ICHECK_EQ(skip_softmax_threshold_scale_factor.value_or(0.0f), 0.0f);
   TVM_FFI_ICHECK_EQ(window_left, -1);
   TVM_FFI_ICHECK_EQ(o_sf_scale, -1.0);
@@ -240,10 +271,34 @@ void cake_paged_attention_context(
   TVM_FFI_ICHECK_EQ(value_cache.size(1), key_cache.size(1));
   TVM_FFI_ICHECK_EQ(key_cache.size(2), PAGE_SIZE);
   TVM_FFI_ICHECK_EQ(value_cache.size(2), PAGE_SIZE);
+#if CAKE_FMHA_CONTEXT_NVFP4
+  TVM_FFI_ICHECK_EQ(PAGE_SIZE, 16);
+  TVM_FFI_ICHECK_EQ(key_cache.size(3), 64);
+  TVM_FFI_ICHECK_EQ(value_cache.size(3), 64);
+  TVM_FFI_ICHECK(key_cache.IsContiguous());
+  TVM_FFI_ICHECK(value_cache.IsContiguous());
+  auto const& key_scales = key_block_scales.value();
+  auto const& value_scales = value_block_scales.value();
+  TVM_FFI_ICHECK_EQ(key_scales.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(value_scales.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(key_scales.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(value_scales.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(key_scales.size(0), key_cache.size(0));
+  TVM_FFI_ICHECK_EQ(key_scales.size(1), key_cache.size(1));
+  TVM_FFI_ICHECK_EQ(key_scales.size(2), PAGE_SIZE);
+  TVM_FFI_ICHECK_EQ(key_scales.size(3), 8);
+  TVM_FFI_ICHECK_EQ(value_scales.size(0), key_scales.size(0));
+  TVM_FFI_ICHECK_EQ(value_scales.size(1), key_scales.size(1));
+  TVM_FFI_ICHECK_EQ(value_scales.size(2), key_scales.size(2));
+  TVM_FFI_ICHECK_EQ(value_scales.size(3), key_scales.size(3));
+  TVM_FFI_ICHECK(key_scales.IsContiguous());
+  TVM_FFI_ICHECK(value_scales.IsContiguous());
+#else
   TVM_FFI_ICHECK_EQ(key_cache.size(3), 128);
   TVM_FFI_ICHECK_EQ(value_cache.size(3), 128);
   TVM_FFI_ICHECK_EQ(key_cache.stride(3), 1);
   TVM_FFI_ICHECK_EQ(value_cache.stride(3), 1);
+#endif
 
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1);
   TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
@@ -270,6 +325,10 @@ void cake_paged_attention_context(
   CheckSameDevice(query, seq_lens, "seq_lens");
   CheckSameDevice(query, cum_seq_lens_q, "cum_seq_lens_q");
   CheckSameDevice(query, cum_seq_lens_kv, "cum_seq_lens_kv");
+#if CAKE_FMHA_CONTEXT_NVFP4
+  CheckSameDevice(query, key_scales, "key_block_scales");
+  CheckSameDevice(query, value_scales, "value_block_scales");
+#endif
   if (attention_sinks.has_value()) {
     CheckSameDevice(query, attention_sinks.value(), "attention_sinks");
   }
@@ -293,9 +352,44 @@ void cake_paged_attention_context(
 
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
   cudaStream_t stream = get_stream(query.device());
+  auto* workspace = static_cast<uint8_t*>(workspace_buffer.data_ptr());
+  int64_t actual_workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
+  int64_t workspace_prefix = 0;
   CUtensorMap h_q = EncodeTmaQ(query);
+#if CAKE_FMHA_CONTEXT_NVFP4
+  int64_t pages = key_cache.size(0);
+  TVM_FFI_ICHECK_GT(pages, 0);
+  int64_t output_page_stride =
+      static_cast<int64_t>(NUM_Q_HEADS / HEADS_PER_GROUP) * PAGE_SIZE * 128;
+  TVM_FFI_ICHECK_LE(output_page_stride, static_cast<int64_t>(INT32_MAX));
+  int64_t kv_bytes = pages * output_page_stride;
+  int64_t value_offset = AlignUp(kv_bytes, 16);
+  workspace_prefix = AlignUp(value_offset + kv_bytes, 16);
+  TVM_FFI_ICHECK_GE(actual_workspace_bytes, workspace_prefix)
+      << "Cake FMHA context NVFP4 dequantization requires " << workspace_prefix << " bytes";
+  TVM_FFI_ICHECK_GE(workspace_size, workspace_prefix);
+  auto* dequantized_k = workspace;
+  auto* dequantized_v = workspace + value_offset;
+  int64_t total_groups_64 = pages * (NUM_Q_HEADS / HEADS_PER_GROUP) * PAGE_SIZE * 8;
+  TVM_FFI_ICHECK_LE(total_groups_64, static_cast<int64_t>(INT32_MAX));
+  int total_groups = static_cast<int>(total_groups_64);
+  unsigned int dequant_grid = static_cast<unsigned int>((total_groups_64 + 1023) / 1024);
+  cudaError_t dequant_status = cake_fmha_launch_context_nvfp4_dequant(
+      static_cast<uint8_t*>(key_cache.data_ptr()), static_cast<uint8_t*>(value_cache.data_ptr()),
+      static_cast<uint8_t*>(key_scales.data_ptr()), static_cast<uint8_t*>(value_scales.data_ptr()),
+      dequantized_k, dequantized_v, total_groups, static_cast<int>(output_page_stride),
+      dequant_grid, 1, 1, stream);
+  TVM_FFI_ICHECK_EQ(dequant_status, cudaSuccess)
+      << "Cake FMHA context NVFP4 dequantization failed: "
+      << cudaGetErrorString(dequant_status);
+  CUtensorMap h_k =
+      EncodeTmaContiguousPagedKv(dequantized_k, pages, output_page_stride, "key_cache");
+  CUtensorMap h_v =
+      EncodeTmaContiguousPagedKv(dequantized_v, pages, output_page_stride, "value_cache");
+#else
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
+#endif
   void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
   void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
   void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
@@ -304,11 +398,11 @@ void cake_paged_attention_context(
   int64_t total_bh_64 = batch_size * units_per_batch;
   TVM_FFI_ICHECK_LE(total_bh_64, static_cast<int64_t>(INT32_MAX));
   int total_bh = static_cast<int>(total_bh_64);
-  int64_t seq_q_offset = 0;
-  int64_t seq_kv_offset = AlignUp(total_bh_64 * static_cast<int64_t>(sizeof(int)), 16);
+  int64_t seq_q_offset = workspace_prefix;
+  int64_t seq_kv_offset =
+      AlignUp(seq_q_offset + total_bh_64 * static_cast<int64_t>(sizeof(int)), 16);
   int64_t cu_q_offset = seq_kv_offset + total_bh_64 * static_cast<int64_t>(sizeof(int));
   int64_t cursor = AlignUp(cu_q_offset + total_bh_64 * static_cast<int64_t>(sizeof(int)), 16);
-  int64_t actual_workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
   TVM_FFI_ICHECK_GE(actual_workspace_bytes, cursor)
       << "Cake FMHA context FP8 workspace requires " << cursor << " bytes";
   TVM_FFI_ICHECK_GE(workspace_size, cursor);
@@ -316,7 +410,6 @@ void cake_paged_attention_context(
       multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer);
   TVM_FFI_ICHECK_GE(counter_bytes, 2 * static_cast<int64_t>(sizeof(uint32_t)));
 
-  auto* workspace = static_cast<uint8_t*>(workspace_buffer.data_ptr());
   auto* seq_q_expanded = reinterpret_cast<int*>(workspace + seq_q_offset);
   auto* seq_kv_expanded = reinterpret_cast<int*>(workspace + seq_kv_offset);
   auto* cu_q_expanded = reinterpret_cast<int*>(workspace + cu_q_offset);

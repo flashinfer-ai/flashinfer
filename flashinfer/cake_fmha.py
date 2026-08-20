@@ -19,6 +19,7 @@ from .jit.cake_fmha import (
     get_cake_fmha_manifest,
     load_cake_fmha_context_bf16_module,
     load_cake_fmha_context_fp8_module,
+    load_cake_fmha_context_nvfp4_module,
     load_cake_fmha_context_fp16_hd256_module,
     load_cake_fmha_context_fp8_hd256_module,
     load_cake_fmha_compat_module,
@@ -112,10 +113,9 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Only these components have an authenticated FlashInfer TVM-FFI adapter in
-# the checked-in package.  Candidate routes whose adapter is part of the final
-# export remain fail-closed to compat_v1 until that export and binding digest
-# are updated together.
+# These components have an authenticated FlashInfer TVM-FFI adapter in the
+# checked-in package.  A route remains fail-closed until every component in its
+# declared chain is present here and covered by the adapter digest.
 _AUTHENTICATED_JIT_COMPONENTS = frozenset(
     {
         "compat_v1",
@@ -124,12 +124,14 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "context_fp8",
         "context_fp8_hd256",
         "context_hd256_support",
+        "context_nvfp4_dequant",
         "decode_native_bf16",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
         "decode_quant_bf16q",
         "decode_quant_fp8",
         "decode_quant_fp8_reduce",
+        "decode_quant_nvfp4",
     }
 )
 
@@ -886,6 +888,32 @@ def _context_pack_g(
     return group if packed < unpacked else 1
 
 
+def _context_nvfp4_workspace_supported(
+    workspace_buffer: torch.Tensor | None,
+    key_cache: torch.Tensor,
+    *,
+    batch_size: int,
+    num_q_heads: int,
+    pack_g: int,
+) -> bool:
+    """Bound the dequantized K/V and expanded-metadata workspace exactly."""
+
+    if (
+        workspace_buffer is None
+        or not workspace_buffer.is_contiguous()
+        or workspace_buffer.device != key_cache.device
+        or workspace_buffer.data_ptr() % 16
+    ):
+        return False
+    output_page_stride = key_cache.shape[1] * 16 * 128
+    kv_bytes = key_cache.shape[0] * output_page_stride
+    metadata_offset = ((2 * kv_bytes + 15) // 16) * 16
+    total_bh = batch_size * (num_q_heads // pack_g)
+    seq_kv_offset = ((metadata_offset + total_bh * 4 + 15) // 16) * 16
+    required = ((seq_kv_offset + 2 * total_bh * 4 + 15) // 16) * 16
+    return workspace_buffer.numel() * workspace_buffer.element_size() >= required
+
+
 def select_cake_fmha_context_route(
     device: torch.device,
     *,
@@ -911,6 +939,7 @@ def select_cake_fmha_context_route(
     is_causal: bool,
     lse: torch.Tensor | None,
     kv_layout: str = "HND",
+    workspace_buffer: torch.Tensor | None = None,
 ) -> CakeFmhaContextRoute | None:
     """Select an exact product context route without broadening its contract."""
 
@@ -1042,6 +1071,8 @@ def select_cake_fmha_context_route(
         )
         and query.shape[2] == 128
         and key_cache.shape[2:] == (16, 64)
+        and key_cache.is_contiguous()
+        and value_cache.is_contiguous()
         and kv_layout == "HND"
         and uses_shared_paged_kv_idx
         and is_causal
@@ -1054,8 +1085,8 @@ def select_cake_fmha_context_route(
         and key_block_scales.shape == value_block_scales.shape
         and key_block_scales.shape[:3] == key_cache.shape[:3]
         and key_block_scales.shape[3] == 8
-        and key_block_scales.stride(3) == 1
-        and value_block_scales.stride(3) == 1
+        and key_block_scales.is_contiguous()
+        and value_block_scales.is_contiguous()
     ):
         component = "context_nvfp4"
     if component is None:
@@ -1071,6 +1102,14 @@ def select_cake_fmha_context_route(
         num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
         total_bh = batch_size * (num_q_heads // pack_g)
         l2_swizzle = 8 if total_bh % 8 == 0 else 1
+    if component == "context_nvfp4" and not _context_nvfp4_workspace_supported(
+        workspace_buffer,
+        key_cache,
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        pack_g=pack_g,
+    ):
+        return None
     return CakeFmhaContextRoute(
         target=_cake_fmha_target(device),
         component=component,
@@ -1111,6 +1150,25 @@ def get_cake_fmha_context_module(
             route.num_kv_heads,
             route.page_size,
         )
+    if route.component == "context_nvfp4":
+        try:
+            return load_cake_fmha_context_nvfp4_module(
+                route.target,
+                route.num_m_blocks,
+                route.num_q_heads,
+                route.num_kv_heads,
+                route.pack_g,
+                route.page_size,
+                route.l2_swizzle,
+            )
+        except (OSError, RuntimeError) as error:
+            warnings.warn(
+                "Cake FMHA NVFP4 context loading failed closed to compat_v1: "
+                f"{error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return load_cake_fmha_compat_module(route.target)
     loader = (
         load_cake_fmha_context_bf16_module
         if route.component == "context_bf16"

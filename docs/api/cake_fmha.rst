@@ -21,6 +21,10 @@ matrix was audited.  FlashInfer authenticates every standalone artifact before
 JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive copy
 of that product record.
 
+All 1,798 optimized cells have authenticated high-level adapters for their
+complete component chains.  Selector misses, insufficient route workspace,
+and NVFP4 adapter load failures fail closed to ``compat_v1``.
+
 Optimized routes are fail-closed.  In particular, optimized FP8 decode is
 qualified for HND pages, a shared K/V page table, and GQA group size eight;
 other valid FP8 decode shapes remain Cake-owned and use the authenticated
