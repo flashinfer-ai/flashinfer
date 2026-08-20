@@ -4040,9 +4040,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       static_cast<RoutingInputMode>(routing_input_mode) == RoutingInputMode::PackedPrecomputed &&
       mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1 &&
       num_tokens == 8192 && num_experts == 384 && top_k == 8 && hidden_size == 7168 &&
-      intermediate_size == 512 && local_expert_offset == 0 && local_num_experts == 384 &&
-      nFusedShared == 0 && !routing_bias.has_value() && !gemm1_bias.has_value() &&
-      !gemm1_lora_delta.has_value() && !gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
+      output.size(1) == hidden_size && intermediate_size == 512 && local_expert_offset == 0 &&
+      local_num_experts == 384 && nFusedShared == 0 && !routing_bias.has_value() &&
+      !gemm1_bias.has_value() && !gemm1_lora_delta.has_value() && !gemm1_alpha.has_value() &&
+      !gemm1_beta.has_value() &&
       !gemm1_clamp_limit.has_value() && !gemm2_bias.has_value() &&
       output1_scales_scalar.has_value() && output1_scales_gate_scalar.has_value() &&
       output2_scales_scalar.has_value() && !per_token_scales.has_value() &&

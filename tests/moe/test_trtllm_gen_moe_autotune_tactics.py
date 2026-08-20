@@ -492,8 +492,8 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
     )
 
 
-def test_nvfp4_sm103_8k_fallback_matches_measured_tactic():
-    """The guarded SM103 8K fallback must execute the measured [256, 1] tactic."""
+def test_nvfp4_sm103_8k_fallback_matches_reference_tactics():
+    """The guarded SM103 fallback matches the original and measured tactics."""
     if get_compute_capability(torch.device(device="cuda")) != (10, 3):
         pytest.skip("Requires exact SM103.")
 
@@ -564,14 +564,24 @@ def test_nvfp4_sm103_8k_fallback_matches_measured_tactic():
     )
     assert [256, 1] in [list(tactic) for tactic in valid_tactics]
 
-    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
     fallback = _run(None)
-    measured_tactic = _run([256, 1])
 
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+    original_fallback = _run([128, -1])
+    assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+        "the original [128, -1] fallback was not dispatched through the autotuner cache"
+    )
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+    measured_tactic = _run([256, 1])
     assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
         "the explicit [256, 1] tactic was not dispatched through the autotuner cache"
     )
+
     assert torch.isfinite(fallback).all()
+    assert torch.isfinite(original_fallback).all()
+    assert torch.isfinite(measured_tactic).all()
+    assert torch.equal(fallback, original_fallback)
     assert torch.equal(fallback, measured_tactic)
 
 
