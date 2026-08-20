@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -39,10 +40,14 @@ __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec, float* ds
   }
 }
 
+// One block per expert column; the block reduces the full K extent for all
+// kNumTokens rows at once. kHiddenDim must be a whole number of K iterations
+// (VPT * kBlockSize elements, i.e. a multiple of 1024 for bf16 with a 128-thread
+// block), which is what lets every load be a fully-coalesced 16B vector load.
 template <typename Tin, typename Tout, int kBlockSize, int VPT, int kNumTokens, int kNumExperts,
           int kHiddenDim>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel(Tout* out, Tin const* mat_a,
-                                                             Tin const* mat_b) {
+__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel(Tout* out, Tin const* mat_a,
+                                                                    Tin const* mat_b) {
   // Each block handles one expert column
   int const n_idx = blockIdx.x;
   int const tid = threadIdx.x;
@@ -50,33 +55,39 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(Tout* out, Tin cons
   constexpr int kNumWarps = kBlockSize / kWarpSize;
   // Constants for this kernel
   constexpr int k_elems_per_k_iteration = VPT * kBlockSize;
+  static_assert(kHiddenDim % k_elems_per_k_iteration == 0,
+                "kHiddenDim must be a whole number of K iterations (VPT * kBlockSize)");
   constexpr int k_iterations = kHiddenDim / k_elems_per_k_iteration;  // Total K iterations
 
   // Initialize accumulators for all M rows
   float acc[kNumTokens] = {};
 
-  // Shared memory for warp-level reduction
-  __shared__ float sm_reduction[kNumTokens][kNumWarps];  // kNumWarps
+  // Shared memory for warp-level reduction.
+  //
+  // The final cross-warp reduction below has lane `l` walk row `l` of this
+  // array. With an unpadded row stride of kNumWarps (4 for a 128-thread block)
+  // every one of those lanes lands in the same 4-bank group, so the reads
+  // serialize. Padding the row by one float staggers each lane onto a distinct
+  // bank.
+  //
+  // This mirrors SGLang's copy of the kernel so the two do not drift. Measured
+  // on B200 it makes no difference at router shapes -- the kernel is bound on
+  // streaming the weight column, and this reduction is over kNumWarps values
+  // for at most 16 tokens -- so it is kept for parity, not for speed.
+  constexpr int kSmemPad = (kNumTokens > 8) ? 1 : 0;
+  __shared__ float sm_reduction[kNumTokens][kNumWarps + kSmemPad];
 
   // B matrix is in column-major order, so we can directly load a column for the n_idx expert
   Tin const* b_col = mat_b + n_idx * kHiddenDim;
-
-  // Pre-compute k_base values for each iteration to help compiler optimize
-  // int k_bases[k_iterations];
-  int k_bases[k_iterations];
-#pragma unroll
-  for (int ki = 0; ki < k_iterations; ki++) {
-    k_bases[ki] = ki * k_elems_per_k_iteration + tid * VPT;
-  }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
   // Process the GEMM in chunks
-  for (int ki = 0; ki < k_iterations; ki++) {
-    int const k_base = k_bases[ki];
-
+  int k_base = tid * VPT;
+#pragma unroll
+  for (int ki = 0; ki < k_iterations; ki++, k_base += k_elems_per_k_iteration) {
     // Load B matrix values using vector load (8 bf16 values)
     uint4 b_vec = *reinterpret_cast<uint4 const*>(b_col + k_base);
 
@@ -105,22 +116,13 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(Tout* out, Tin cons
   }
 
   // Perform warp-level reduction
-  int const warpSize = 32;
-  int const warpId = tid / warpSize;
-  int const laneId = tid % warpSize;
-
-  // Register for warp-level reduction results
-  float warp_result[kNumTokens];
-
-#pragma unroll
-  for (int m_idx = 0; m_idx < kNumTokens; m_idx++) {
-    warp_result[m_idx] = acc[m_idx];
-  }
+  int const warpId = tid / kWarpSize;
+  int const laneId = tid % kWarpSize;
 
 // Perform warp-level reduction using optimized butterfly pattern
 #pragma unroll
   for (int m = 0; m < kNumTokens; m++) {
-    float sum = warp_result[m];
+    float sum = acc[m];
 
     // Butterfly reduction pattern
     sum += __shfl_xor_sync(0xffffffff, sum, 16);
@@ -137,21 +139,19 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(Tout* out, Tin cons
 
   __syncthreads();
 
-  // Final reduction across warps (only first thread)
-  if (tid == 0) {
-#pragma unroll
-    for (int m = 0; m < kNumTokens; m++) {
-      float final_sum = 0.0f;
+  // Final reduction across warps. One lane per token (kNumTokens <= 16 < 32, so
+  // a single warp covers every row) instead of serializing all M rows on tid 0.
+  if (warpId == 0 && laneId < kNumTokens) {
+    float final_sum = 0.0f;
 
 // Sum across the kNumWarps
 #pragma unroll
-      for (int w = 0; w < kNumWarps; w++) {
-        final_sum += sm_reduction[m][w];
-      }
-
-      // Write final result
-      out[m * kNumExperts + n_idx] = final_sum;
+    for (int w = 0; w < kNumWarps; w++) {
+      final_sum += sm_reduction[laneId][w];
     }
+
+    // Write final result
+    out[laneId * kNumExperts + n_idx] = static_cast<Tout>(final_sum);
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();

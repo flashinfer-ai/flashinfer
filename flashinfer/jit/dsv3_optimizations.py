@@ -15,11 +15,28 @@ def gen_concat_mla_module() -> JitSpec:
     )
 
 
-def gen_dsv3_router_gemm_module() -> JitSpec:
+def gen_dsv3_router_gemm_module(
+    num_experts: int = 256,
+    hidden_dim: int = 7168,
+    out_float: bool = True,
+) -> JitSpec:
+    """JIT spec for one router-GEMM specialization.
+
+    The kernel keeps the expert count, the hidden dim and the output dtype as
+    compile-time constants (they drive the grid dimension, the unrolled K loop
+    and the store type respectively), so each combination compiles to its own
+    small module. Defaults are the DeepSeek-V3 router shape.
+    """
     return gen_jit_spec(
-        "dsv3_router_gemm",
+        f"dsv3_router_gemm_n{num_experts}_k{hidden_dim}_"
+        + ("f32" if out_float else "bf16"),
         [
             jit_env.FLASHINFER_CSRC_DIR / "dsv3_router_gemm.cu",
+        ],
+        extra_cuda_cflags=[
+            f"-DROUTER_GEMM_NUM_EXPERTS={num_experts}",
+            f"-DROUTER_GEMM_HIDDEN_DIM={hidden_dim}",
+            f"-DROUTER_GEMM_OUT_FLOAT={1 if out_float else 0}",
         ],
     )
 
