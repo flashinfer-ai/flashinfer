@@ -746,7 +746,7 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
 
     assert cake_api.cake_fmha_route_is_optimized(fp16_route)
     assert cake_api.cake_fmha_route_is_optimized(bf16q_route)
-    assert cake_api.cake_fmha_route_is_optimized(nvfp4_route)
+    assert not cake_api.cake_fmha_route_is_optimized(nvfp4_route)
 
     hd512_q = torch.empty((2, 4, 512), dtype=torch.float16)
     stacked_hnd = torch.empty((4, 2, 2, 64, 512), dtype=torch.float16)
@@ -970,17 +970,17 @@ def test_cake_fmha_fp8_route_loads_its_authenticated_adapter(monkeypatch) -> Non
     }
 
 
-def test_cake_fmha_nvfp4_route_loads_its_authenticated_adapter(monkeypatch) -> None:
+def test_cake_fmha_nvfp4_route_fails_closed_to_compat(monkeypatch) -> None:
     sentinel = object()
-    observed = {}
-
-    def load_nvfp4(*args):
-        observed["args"] = args
-        return sentinel
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
     monkeypatch.setattr(
-        cake_api, "load_cake_fmha_decode_quant_nvfp4_module", load_nvfp4
+        cake_api,
+        "load_cake_fmha_decode_quant_nvfp4_module",
+        lambda *args: pytest.fail("unauthenticated NVFP4 adapter must not load"),
+    )
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
     )
     route = cake_api.CakeFmhaDecodeRoute(
         target="sm103a",
@@ -996,38 +996,6 @@ def test_cake_fmha_nvfp4_route_loads_its_authenticated_adapter(monkeypatch) -> N
         page_size=32,
     )
     assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
-    assert observed == {"args": ("sm103a", 2, 1, 4, 2, 32)}
-
-
-def test_cake_fmha_nvfp4_native_failure_falls_back_to_compat(monkeypatch) -> None:
-    sentinel = object()
-    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
-    monkeypatch.setattr(
-        cake_api,
-        "load_cake_fmha_decode_quant_nvfp4_module",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("patch mismatch")),
-    )
-    monkeypatch.setattr(
-        cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
-    )
-    route = cake_api.CakeFmhaDecodeRoute(
-        target="sm103a",
-        batch_size=1,
-        q_len=1,
-        num_q_heads=8,
-        num_kv_heads=1,
-        has_sink=False,
-        has_window=False,
-        use_scale_ptr=False,
-        retain_kv_l2=True,
-        component="decode_quant_nvfp4",
-        page_size=16,
-    )
-    with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
-        assert (
-            cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
-            is sentinel
-        )
 
 
 def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypatch) -> None:

@@ -130,7 +130,6 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "decode_quant_bf16q",
         "decode_quant_fp8",
         "decode_quant_fp8_reduce",
-        "decode_quant_nvfp4",
     }
 )
 
