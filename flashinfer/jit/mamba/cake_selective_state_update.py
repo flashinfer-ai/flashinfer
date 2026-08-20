@@ -225,6 +225,82 @@ def _balanced_worker_count(work: int, cap: int) -> int:
     return (work + trips - 1) // trips
 
 
+def _is_sglang_raw_mtp_cache_layout(
+    *,
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    output: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    dst_state_batch_indices: Optional[torch.Tensor],
+    intermediate_states_buffer: Optional[torch.Tensor],
+    intermediate_state_indices: Optional[torch.Tensor],
+) -> bool:
+    """Recognize the unmaterialized Granite target-verify TensorViews."""
+
+    if x.ndim != 4 or not 1 <= x.shape[0] <= 4:
+        return False
+    batch_size = x.shape[0]
+    if (
+        state.dtype != torch.bfloat16
+        or x.dtype != torch.bfloat16
+        or dt.dtype != torch.bfloat16
+        or A.dtype != torch.float32
+        or B.dtype != torch.bfloat16
+        or C.dtype != torch.bfloat16
+        or D.dtype != torch.bfloat16
+        or dt_bias.dtype != torch.bfloat16
+        or output.dtype != torch.bfloat16
+        or state_batch_indices.dtype != torch.int32
+        or intermediate_states_buffer is None
+        or intermediate_states_buffer.dtype != torch.bfloat16
+        or intermediate_state_indices is None
+        or intermediate_state_indices.dtype != torch.int32
+        or dst_state_batch_indices is not None
+    ):
+        return False
+    if (
+        tuple(state.shape[1:]) != (64, 64, 128)
+        or tuple(x.shape) != (batch_size, 6, 64, 64)
+        or tuple(dt.shape) != (batch_size, 6, 64, 64)
+        or tuple(A.shape) != (64, 64, 128)
+        or tuple(B.shape) != (batch_size, 6, 1, 128)
+        or tuple(C.shape) != tuple(B.shape)
+        or tuple(D.shape) != (64, 64)
+        or tuple(dt_bias.shape) != (64, 64)
+        or tuple(output.shape) != tuple(x.shape)
+        or tuple(intermediate_states_buffer.shape[1:]) != (6, 64, 64, 128)
+        or intermediate_states_buffer.shape[0] < batch_size
+        or tuple(state_batch_indices.shape) != (batch_size,)
+        or tuple(intermediate_state_indices.shape) != (batch_size,)
+    ):
+        return False
+    if (
+        tuple(x.stride()) != (26112, 4352, 64, 1)
+        or tuple(dt.stride()) != (51072, 8512, 1, 0)
+        or tuple(A.stride()) != (1, 0, 0)
+        or tuple(B.stride()) != (26112, 4352, 128, 1)
+        or tuple(C.stride()) != (26112, 4352, 128, 1)
+        or tuple(D.stride()) != (1, 0)
+        or tuple(dt_bias.stride()) != (1, 0)
+    ):
+        return False
+    if not (
+        state.is_contiguous()
+        and output.is_contiguous()
+        and state_batch_indices.is_contiguous()
+        and intermediate_states_buffer.is_contiguous()
+        and intermediate_state_indices.is_contiguous()
+    ):
+        return False
+    return all(tensor.data_ptr() % 16 == 0 for tensor in (x, B, C))
+
+
 def _launch_stp_bf16(
     *,
     state: torch.Tensor,
@@ -332,6 +408,42 @@ def try_cake_selective_state_update(
     algorithm: str,
     dt_softplus: bool,
 ) -> bool:
+    raw_sglang_layout = (
+        dt_bias is not None
+        and state_batch_indices is not None
+        and _is_sglang_raw_mtp_cache_layout(
+            state=state,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            output=output,
+            state_batch_indices=state_batch_indices,
+            dst_state_batch_indices=dst_state_batch_indices,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+        )
+    )
+    legacy_types = (
+        state_batch_indices is not None
+        and state_batch_indices.dtype == torch.int64
+        and dt.dtype == torch.float32
+        and A.dtype == torch.float32
+        and D.dtype == torch.float32
+        and dt_bias is not None
+        and dt_bias.dtype == torch.float32
+        and (
+            dst_state_batch_indices is None
+            or dst_state_batch_indices.dtype == torch.int64
+        )
+        and (
+            intermediate_state_indices is None
+            or intermediate_state_indices.dtype == torch.int64
+        )
+    )
     if (
         dt_bias is None
         or state_batch_indices is None
@@ -340,26 +452,12 @@ def try_cake_selective_state_update(
         or rand_seed is not None
         or cu_seqlens is not None
         or num_accepted_tokens is not None
-        or state_batch_indices.dtype != torch.int64
         or state.ndim != 4
         or state.dtype not in (torch.bfloat16, torch.float32)
         or x.dtype != torch.bfloat16
-        or dt.dtype != torch.float32
-        or A.dtype != torch.float32
         or B.dtype != torch.bfloat16
         or C.dtype != torch.bfloat16
-        or D.dtype != torch.float32
-        or dt_bias.dtype != torch.float32
-    ):
-        return False
-    if (
-        dst_state_batch_indices is not None
-        and dst_state_batch_indices.dtype != torch.int64
-    ):
-        return False
-    if (
-        intermediate_state_indices is not None
-        and intermediate_state_indices.dtype != torch.int64
+        or not (legacy_types or raw_sglang_layout)
     ):
         return False
     device_index = state.device.index
@@ -367,9 +465,6 @@ def try_cake_selective_state_update(
         device_index = torch.cuda.current_device()
     try:
         arch = _target_arch(state.device)
-        dt_compact, A_compact, D_compact, bias_compact = _compact_broadcasts(
-            dt, A, D, dt_bias
-        )
     except ValueError:
         return False
 
@@ -470,6 +565,12 @@ def try_cake_selective_state_update(
             and not disable_state_update
             and state_batch_indices.ndim == 1
         ):
+            try:
+                dt_compact, A_compact, D_compact, bias_compact = (
+                    _compact_broadcasts(dt, A, D, dt_bias)
+                )
+            except ValueError:
+                return False
             _load_program("mtp_short", arch, device_index).run(
                 state,
                 x,
@@ -506,10 +607,42 @@ def try_cake_selective_state_update(
             and intermediate_state_indices is not None
             and state_batch_indices.ndim == 1
         ):
+            total_tiles = batch_size * nheads
+            if raw_sglang_layout:
+                _load_program(
+                    "mtp_cache_bf16_c4_t6_sglang_raw", arch, device_index
+                ).run(
+                    state,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    dt_bias,
+                    output,
+                    state_batch_indices,
+                    intermediate_states_buffer,
+                    intermediate_state_indices,
+                    nheads,
+                    ngroups,
+                    state.stride(0),
+                    intermediate_states_buffer.stride(0),
+                    pad_slot_id,
+                    batch_size,
+                    nheads,
+                    4,
+                )
+                return True
+            try:
+                dt_compact, A_compact, D_compact, bias_compact = (
+                    _compact_broadcasts(dt, A, D, dt_bias)
+                )
+            except ValueError:
+                return False
             num_sms = torch.cuda.get_device_properties(
                 device_index
             ).multi_processor_count
-            total_tiles = batch_size * nheads
             if batch_size < 32 and (num_sms * 10) // total_tiles >= 4:
                 _load_program("mtp_cache_bf16_c4_t6", arch, device_index).run(
                     state,
@@ -583,6 +716,12 @@ def try_cake_selective_state_update(
                 return False
             checkpoint_step = int(nonpad[0, 0].item())
             if checkpoint_step not in (0, 1, 3, 7):
+                return False
+            try:
+                dt_compact, A_compact, D_compact, bias_compact = (
+                    _compact_broadcasts(dt, A, D, dt_bias)
+                )
+            except ValueError:
                 return False
             _load_program(
                 f"dynamic_checkpoint{checkpoint_step}", arch, device_index

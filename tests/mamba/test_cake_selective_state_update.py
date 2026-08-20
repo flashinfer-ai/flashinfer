@@ -3,12 +3,185 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.jit.mamba import cake_selective_state_update as cake
 from flashinfer.mamba import cake_selective_state_update, selective_state_update
+
+
+def _make_sglang_raw_layout_case(batch_size: int):
+    meta = "meta"
+    return {
+        "state": torch.empty(
+            65, 64, 64, 128, dtype=torch.bfloat16, device=meta
+        ),
+        "x": torch.empty_strided(
+            (batch_size, 6, 64, 64),
+            (26112, 4352, 64, 1),
+            dtype=torch.bfloat16,
+            device=meta,
+        ),
+        "dt": torch.empty_strided(
+            (batch_size, 6, 64, 64),
+            (51072, 8512, 1, 0),
+            dtype=torch.bfloat16,
+            device=meta,
+        ),
+        "A": torch.empty_strided(
+            (64, 64, 128), (1, 0, 0), dtype=torch.float32, device=meta
+        ),
+        "B": torch.empty_strided(
+            (batch_size, 6, 1, 128),
+            (26112, 4352, 128, 1),
+            dtype=torch.bfloat16,
+            device=meta,
+        ),
+        "C": torch.empty_strided(
+            (batch_size, 6, 1, 128),
+            (26112, 4352, 128, 1),
+            dtype=torch.bfloat16,
+            device=meta,
+        ),
+        "D": torch.empty_strided(
+            (64, 64), (1, 0), dtype=torch.bfloat16, device=meta
+        ),
+        "dt_bias": torch.empty_strided(
+            (64, 64), (1, 0), dtype=torch.bfloat16, device=meta
+        ),
+        "output": torch.empty(
+            batch_size, 6, 64, 64, dtype=torch.bfloat16, device=meta
+        ),
+        "state_batch_indices": torch.empty(
+            batch_size, dtype=torch.int32, device=meta
+        ),
+        "dst_state_batch_indices": None,
+        "intermediate_states_buffer": torch.empty(
+            5, 6, 64, 64, 128, dtype=torch.bfloat16, device=meta
+        ),
+        "intermediate_state_indices": torch.empty(
+            batch_size, dtype=torch.int32, device=meta
+        ),
+    }
+
+
+@pytest.mark.parametrize("batch_size", range(1, 5))
+def test_sglang_raw_mtp_cache_layout_accepts_observed_graph_batches(
+    batch_size,
+) -> None:
+    assert cake._is_sglang_raw_mtp_cache_layout(
+        **_make_sglang_raw_layout_case(batch_size)
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "x",
+        "dt",
+        "B",
+        "C",
+        "D",
+        "dt_bias",
+        "output",
+        "state_batch_indices",
+        "intermediate_states_buffer",
+        "intermediate_state_indices",
+    ),
+)
+def test_sglang_raw_mtp_cache_layout_rejects_abi_drift(field) -> None:
+    inputs = _make_sglang_raw_layout_case(2)
+    if field == "x":
+        inputs[field] = torch.empty_strided(
+            (2, 6, 64, 64),
+            (26113, 4352, 64, 1),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+    elif field == "dt":
+        inputs[field] = torch.empty_strided(
+            (2, 6, 64, 64),
+            (51072, 8513, 1, 0),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+    elif field in ("B", "C"):
+        inputs[field] = torch.empty_strided(
+            (2, 6, 1, 128),
+            (26112, 4353, 128, 1),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+    elif field in ("D", "dt_bias"):
+        inputs[field] = torch.empty_strided(
+            (64, 64), (1, 0), dtype=torch.float32, device="meta"
+        )
+    elif field == "output":
+        inputs[field] = torch.empty_strided(
+            (2, 6, 64, 64),
+            (24577, 4096, 64, 1),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+    elif field in ("state_batch_indices", "intermediate_state_indices"):
+        inputs[field] = torch.empty(2, dtype=torch.int64, device="meta")
+    else:
+        inputs[field] = torch.empty_strided(
+            (5, 6, 64, 64, 128),
+            (3145729, 524288, 8192, 128, 1),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+    assert not cake._is_sglang_raw_mtp_cache_layout(**inputs)
+
+
+def test_sglang_raw_route_does_not_compact_tensor_views(monkeypatch) -> None:
+    inputs = _make_sglang_raw_layout_case(2)
+    calls = []
+
+    def reject_compaction(*_args):
+        raise AssertionError("raw SGLang route must not create compact views")
+
+    monkeypatch.setattr(cake, "_compact_broadcasts", reject_compaction)
+    monkeypatch.setattr(cake, "_target_arch", lambda _device: "sm_103a")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+    monkeypatch.setattr(
+        cake,
+        "_load_program",
+        lambda name, arch, device_index: SimpleNamespace(
+            run=lambda *args: calls.append((name, arch, device_index, args))
+        ),
+    )
+
+    assert cake.try_cake_selective_state_update(
+        **inputs,
+        z=None,
+        pad_slot_id=-1,
+        disable_state_update=True,
+        state_scale=None,
+        intermediate_state_scales=None,
+        rand_seed=None,
+        cache_steps=6,
+        cu_seqlens=None,
+        num_accepted_tokens=None,
+        algorithm="vertical",
+        dt_softplus=True,
+    )
+    assert len(calls) == 1
+    name, arch, device_index, args = calls[0]
+    assert (name, arch, device_index) == (
+        "mtp_cache_bf16_c4_t6_sglang_raw",
+        "sm_103a",
+        0,
+    )
+    assert args[2] is inputs["dt"]
+    assert args[3] is inputs["A"]
+    assert args[6] is inputs["D"]
+    assert args[7] is inputs["dt_bias"]
 
 
 def test_cake_selective_state_update_sources_match_manifest() -> None:
