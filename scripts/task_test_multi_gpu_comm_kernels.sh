@@ -33,44 +33,49 @@ SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py"
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
+_run_pytest_group() {
+    local files="$1"
+    if [ -z "$files" ]; then
+        echo "(none selected by TEST_PATH)"
+        echo ""
+        return 0
+    fi
+    if [ "$DRY_RUN" == "true" ]; then
+        execute_dry_run "$files"
+    else
+        execute_tests "$files"
+    fi
+}
+
 # Main execution
 main() {
-    # Parse command line arguments
     parse_args "$@"
-
-    # Print test mode banner
     print_test_mode_banner
 
-    # Install and verify (unless dry run)
+    MPI_TEST_FILES="$(filter_files_by_test_path "$MPI_TEST_FILES")"
+    SPAWN_MANAGED_TEST_FILES="$(filter_files_by_test_path "$SPAWN_MANAGED_TEST_FILES")"
+    TORCHRUN_TEST_FILES="$(filter_files_by_test_path "$TORCHRUN_TEST_FILES")"
+    if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}" ]; then
+        echo "No multi-GPU files overlap TEST_PATH=${TEST_PATH}; skipping."
+        exit 0
+    fi
+
     install_and_verify
 
-    # Print test files
     echo "Multi-GPU comm kernel test files (running with: ${PYTEST_COMMAND_PREFIX}):"
     for test_file in $MPI_TEST_FILES; do
         echo "  $test_file"
     done
     echo ""
-
-    # Execute tests or dry run
-    if [ "$DRY_RUN" == "true" ]; then
-        execute_dry_run "$MPI_TEST_FILES"
-    else
-        execute_tests "$MPI_TEST_FILES"
-    fi
+    _run_pytest_group "$MPI_TEST_FILES"
 
     echo "Spawn-managed multi-GPU comm test files (running with plain pytest):"
     for test_file in $SPAWN_MANAGED_TEST_FILES; do
         echo "  $test_file"
     done
     echo ""
+    PYTEST_COMMAND_PREFIX= _run_pytest_group "$SPAWN_MANAGED_TEST_FILES"
 
-    if [ "$DRY_RUN" == "true" ]; then
-        PYTEST_COMMAND_PREFIX= execute_dry_run "$SPAWN_MANAGED_TEST_FILES"
-    else
-        PYTEST_COMMAND_PREFIX= execute_tests "$SPAWN_MANAGED_TEST_FILES"
-    fi
-
-    # Execute torchrun tests (torchrun requires -m pytest, not direct pytest invocation)
     echo "Multi-GPU torchrun test files:"
     for test_file in $TORCHRUN_TEST_FILES; do
         echo "  $test_file"
