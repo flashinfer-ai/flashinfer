@@ -116,13 +116,13 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        del quantize_input
         validate_bf16_forward_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
             fleet_params,
             top_k=self._kernel_config.top_k,
-            quantize_input=quantize_input,
             scales=t.scales,
         )
 
