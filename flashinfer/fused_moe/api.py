@@ -270,6 +270,11 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
+# The source-integrated cuTile BF16 backend is validated on Ada, Hopper, and
+# the SM12x Blackwell family. Keep this explicit rather than treating cuTile's
+# compiler target list as a runtime support guarantee.
+_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
@@ -600,6 +605,44 @@ class CutlassBf16Config:
 
 
 @dataclass(frozen=True)
+class CuTileBf16Config:
+    """Source-integrated cuTile BF16 backend for SM89/SM90/SM120/SM121.
+
+    The MVP supports packed precomputed routing, SwiGLU, and finalized output.
+    Expert parallelism and fused shared experts are not yet supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
+        from .prepare import prepare_cutile_bf16_weights
+
+        return prepare_cutile_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileBf16Config()"
+
+
+@dataclass(frozen=True)
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
@@ -774,6 +817,7 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassConfig,
     CutlassBf16Config,
+    CuTileBf16Config,
     CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
@@ -788,6 +832,7 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassConfig,
     CutlassBf16Config,
+    CuTileBf16Config,
     CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,

@@ -1237,6 +1237,47 @@ def prepare_cutlass_bf16_weights(
     }
 
 
+def prepare_cutile_bf16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the native BF16 weight view for ``CuTileBf16Runner``.
+
+    Unified MoE canonical GEMM1 weights are ``[E, 2I, H]`` in semantic
+    ``[up, gate]`` order. The cuTile grouped GEMM consumes ``[E, H, 2I]``
+    and its activation kernel follows the conventional ``[gate, up]`` layout,
+    so preparation swaps the halves while transposing into K-major storage.
+    GEMM2 similarly changes from ``[E, H, I]`` to ``[E, I, H]``.
+    """
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            "prepare_cutile_bf16_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+    w1 = w1_bf16.to(device)
+    up, gate = w1.chunk(2, dim=1)
+    return {
+        "w1": torch.cat((gate, up), dim=1).transpose(1, 2).contiguous(),
+        "w2": w2_bf16.to(device).transpose(1, 2).contiguous(),
+    }
+
+
 @torch.no_grad()
 def _quantize_mxfp4_linear(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize rows to packed E2M1 with linear per-32 UE8M0 scales.
