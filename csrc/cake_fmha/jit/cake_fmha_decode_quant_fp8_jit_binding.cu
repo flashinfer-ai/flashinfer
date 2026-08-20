@@ -29,6 +29,9 @@
 #ifndef CAKE_FMHA_FULL_BLOCKS
 #error "CAKE_FMHA_FULL_BLOCKS must be supplied by the route-specific JIT"
 #endif
+#ifndef CAKE_FMHA_NVFP4
+#error "CAKE_FMHA_NVFP4 must be supplied by the route-specific JIT"
+#endif
 
 using tvm::ffi::Optional;
 using tvm::ffi::Variant;
@@ -107,22 +110,23 @@ void* TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStream_t stream) {
   return pointer;
 }
 
-CUtensorMap EncodeTmaQuery(TensorView tensor) {
+CUtensorMap EncodeTmaQuery(TensorView tensor, void* data) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK(tensor.IsContiguous());
   TVM_FFI_ICHECK_EQ(tensor.size(0), BATCH_SIZE);
   TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_Q_HEADS);
   TVM_FFI_ICHECK_EQ(tensor.size(2), kHeadDim);
-  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(data) % 16, 0);
   uint64_t global_dim[3] = {
-      kHeadDim, static_cast<uint64_t>(BATCH_SIZE * NUM_Q_HEADS), 1u};
+      kHeadDim,
+      static_cast<uint64_t>(BATCH_SIZE * NUM_KV_HEADS * kTileQ), 1u};
   uint64_t global_strides[2] = {kHeadDim, kHeadDim};
   uint32_t box_dim[3] = {kHeadDim, kTileQ, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, tensor.data_ptr(), global_dim,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, data, global_dim,
       global_strides, box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -134,10 +138,22 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
 CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 4)
       << name << " must be rank-4 HND paged KV";
-  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(tensor.dtype(),
+#if CAKE_FMHA_NVFP4
+                    dl_uint8
+#else
+                    dl_float8_e4m3fn
+#endif
+  );
   TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_KV_HEADS);
   TVM_FFI_ICHECK_EQ(tensor.size(2), CAKE_FMHA_PAGE_SIZE);
-  TVM_FFI_ICHECK_EQ(tensor.size(3), kHeadDim);
+  TVM_FFI_ICHECK_EQ(tensor.size(3),
+#if CAKE_FMHA_NVFP4
+                    kHeadDim / 2
+#else
+                    kHeadDim
+#endif
+  );
   TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
   TVM_FFI_ICHECK_GT(tensor.stride(0), 0);
   TVM_FFI_ICHECK_GT(tensor.stride(1), 0);
@@ -152,14 +168,25 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
       static_cast<uint64_t>(tensor.size(1)),
       static_cast<uint64_t>(tensor.size(0))};
   uint64_t global_strides[4] = {
-      static_cast<uint64_t>(tensor.stride(2)), kHeadDim,
+      static_cast<uint64_t>(tensor.stride(2)),
+#if CAKE_FMHA_NVFP4
+      kHeadDim / 2,
+#else
+      kHeadDim,
+#endif
       static_cast<uint64_t>(tensor.stride(1)),
       static_cast<uint64_t>(tensor.stride(0))};
   uint32_t box_dim[5] = {kHeadDim, 16u, 1u, 1u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, tensor.data_ptr(), global_dim,
+      &tm,
+#if CAKE_FMHA_NVFP4
+      CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
+#else
+      CU_TENSOR_MAP_DATA_TYPE_UINT8,
+#endif
+      5, tensor.data_ptr(), global_dim,
       global_strides, box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -168,17 +195,67 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   return tm;
 }
 
+#if CAKE_FMHA_NVFP4
+CUtensorMap EncodeTmaScale(TensorView tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_KV_HEADS);
+  TVM_FFI_ICHECK_EQ(tensor.size(2), CAKE_FMHA_PAGE_SIZE);
+  TVM_FFI_ICHECK_EQ(tensor.size(3), kHeadDim / 16);
+  TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
+  TVM_FFI_ICHECK_EQ(tensor.stride(2), kHeadDim / 16);
+  TVM_FFI_ICHECK_GT(tensor.stride(0), 0);
+  TVM_FFI_ICHECK_GT(tensor.stride(1), 0);
+  TVM_FFI_ICHECK_EQ(tensor.stride(0) % 16, 0);
+  TVM_FFI_ICHECK_EQ(tensor.stride(1) % 16, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16, 0);
+
+  uint64_t block_bytes = CAKE_FMHA_PAGE_SIZE * (kHeadDim / 16);
+  uint64_t global_dim[3] = {
+      block_bytes, static_cast<uint64_t>(tensor.size(1)),
+      static_cast<uint64_t>(tensor.size(0))};
+  uint64_t global_strides[2] = {
+      static_cast<uint64_t>(tensor.stride(1)),
+      static_cast<uint64_t>(tensor.stride(0))};
+  uint32_t box_dim[3] = {128u, 1u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm;
+  CUresult result = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, tensor.data_ptr(), global_dim,
+      global_strides, box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
+      << "failed to encode Cake FMHA " << name << " tensor map";
+  return tm;
+}
+#endif
+
 __global__ void PrepareQuantDecode(
     const int* page_table, int* padded_page_table, int page_items,
-    int source_pages, int padded_pages, float* bmm1_scalar_ptr,
-    float bmm1_scalar, float* bmm2_scalar_ptr, float bmm2_scalar) {
+    int source_pages, int padded_pages, int page_table_rows,
+    const uint8_t* query, uint8_t* padded_query, int query_items,
+    int group_size, float* bmm1_scalar_ptr, float bmm1_scalar,
+    float* bmm2_scalar_ptr, float bmm2_scalar) {
   int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (padded_page_table != nullptr && index < page_items) {
     int column = index % padded_pages;
-    int batch = index / padded_pages;
+    int row = index / padded_pages;
+    int batch = row / page_table_rows;
+    int table = row % page_table_rows;
     padded_page_table[index] =
         column < source_pages
-            ? page_table[batch * source_pages + column]
+            ? page_table[(batch * page_table_rows + table) * source_pages + column]
+            : 0;
+  }
+  if (padded_query != nullptr && index < query_items) {
+    int col = index % kHeadDim;
+    int row = index / kHeadDim;
+    int group_row = row % kTileQ;
+    int kv_row = row / kTileQ;
+    padded_query[index] =
+        group_row < group_size
+            ? query[(kv_row * group_size + group_row) * kHeadDim + col]
             : 0;
   }
   if (index == 0) {
@@ -214,8 +291,12 @@ SplitPlan ResolveSplitPlan(TensorView seq_lens, int64_t max_kv_len,
   int even_bucket = -1;
   bool split_safe = true;
   for (int length : host_lengths) {
+    TVM_FFI_ICHECK_GT(length, 0)
+        << "optimized quantized decode requires positive KV lengths";
+#if !CAKE_FMHA_NVFP4
     TVM_FFI_ICHECK_GE(length, 512)
         << "optimized FP8 decode requires at least four KV blocks";
+#endif
 #if CAKE_FMHA_FULL_BLOCKS
     TVM_FFI_ICHECK_EQ(length % 128, 0)
         << "optimized FP8 decode requires full 128-token blocks";
@@ -223,8 +304,12 @@ SplitPlan ResolveSplitPlan(TensorView seq_lens, int64_t max_kv_len,
     int blocks = (length + 127) / 128;
     blocks += blocks % 2;
     if (even_bucket < 0) even_bucket = blocks;
+#if CAKE_FMHA_NVFP4
+    even_bucket = std::max(even_bucket, blocks);
+#else
     TVM_FFI_ICHECK_EQ(blocks, even_bucket)
         << "optimized FP8 decode requires one evened-block bucket";
+#endif
     max_seen = std::max(max_seen, length);
     split_safe = split_safe && length % 256 == 0;
   }
@@ -268,8 +353,14 @@ void cake_paged_attention_decode(
     bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens) {
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(),
+#if CAKE_FMHA_NVFP4
+                    dl_uint8
+#else
+                    dl_float8_e4m3fn
+#endif
+  );
+  TVM_FFI_ICHECK_EQ(value_cache.dtype(), key_cache.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK(query.IsContiguous());
   TVM_FFI_ICHECK(out.IsContiguous());
@@ -279,12 +370,20 @@ void cake_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(out.size(2), query.size(2));
   TVM_FFI_ICHECK_EQ(batch_size, BATCH_SIZE);
   TVM_FFI_ICHECK_EQ(max_q_len, 1);
-  TVM_FFI_ICHECK_EQ(NUM_Q_HEADS, 8 * NUM_KV_HEADS);
+  TVM_FFI_ICHECK_EQ(NUM_Q_HEADS % NUM_KV_HEADS, 0);
+  constexpr int kGroupSize = NUM_Q_HEADS / NUM_KV_HEADS;
+  TVM_FFI_ICHECK_GE(kGroupSize, 1);
+  TVM_FFI_ICHECK_LE(kGroupSize, kTileQ);
   TVM_FFI_ICHECK(!out_scale_factor.has_value());
   TVM_FFI_ICHECK(!attention_sinks.has_value());
   TVM_FFI_ICHECK(!cum_seq_lens_q.has_value());
+#if CAKE_FMHA_NVFP4
+  TVM_FFI_ICHECK(key_block_scales.has_value() &&
+                 value_block_scales.has_value());
+#else
   TVM_FFI_ICHECK(!key_block_scales.has_value() &&
                  !value_block_scales.has_value());
+#endif
   TVM_FFI_ICHECK(!lse.has_value());
   TVM_FFI_ICHECK_EQ(lse_stride_tokens, 0);
   TVM_FFI_ICHECK_EQ(lse_stride_heads, 0);
@@ -299,12 +398,16 @@ void cake_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(o_sf_scale, -1.0);
   TVM_FFI_ICHECK_GT(max_kv_len, 0);
   TVM_FFI_ICHECK_GT(sm_count, 0);
-  TVM_FFI_ICHECK(uses_shared_paged_kv_idx.value_or(true));
+  bool shared_page_table = uses_shared_paged_kv_idx.value_or(true);
+#if !CAKE_FMHA_NVFP4
+  TVM_FFI_ICHECK(shared_page_table);
+#endif
   TVM_FFI_ICHECK(workspace_buffer.IsContiguous());
   TVM_FFI_ICHECK_EQ(
       reinterpret_cast<uintptr_t>(workspace_buffer.data_ptr()) % 16, 0);
-  TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(block_tables.ndim(), shared_page_table ? 2 : 3);
   TVM_FFI_ICHECK_EQ(block_tables.size(0), batch_size);
+  if (!shared_page_table) TVM_FFI_ICHECK_EQ(block_tables.size(1), 2);
   TVM_FFI_ICHECK(block_tables.dtype() == dl_int32 ||
                  block_tables.dtype() == dl_uint32);
   TVM_FFI_ICHECK(block_tables.IsContiguous());
@@ -320,6 +423,10 @@ void cake_paged_attention_decode(
   CheckSameDevice(query, workspace_buffer, "workspace_buffer");
   CheckSameDevice(query, block_tables, "block_tables");
   CheckSameDevice(query, seq_lens, "seq_lens");
+#if CAKE_FMHA_NVFP4
+  CheckSameDevice(query, key_block_scales.value(), "key_block_scales");
+  CheckSameDevice(query, value_block_scales.value(), "value_block_scales");
+#endif
 
   auto bmm1_tensor = bmm1_scale.as<ffi::Tensor>();
   auto bmm2_tensor = bmm2_scale.as<ffi::Tensor>();
@@ -356,7 +463,8 @@ void cake_paged_attention_decode(
   cudaStream_t stream = get_stream(query.device());
   SplitPlan plan = ResolveSplitPlan(seq_lens, max_kv_len,
                                     static_cast<int>(sm_count), stream);
-  int64_t source_pages = block_tables.size(1);
+  int64_t source_pages = block_tables.size(block_tables.ndim() - 1);
+  int64_t page_table_rows = shared_page_table ? 1 : 2;
   int64_t required_pages =
       plan.even_blocks * (128 / CAKE_FMHA_PAGE_SIZE);
   int64_t padded_pages = std::max(source_pages, required_pages);
@@ -368,9 +476,16 @@ void cake_paged_attention_decode(
   int64_t bmm2_offset = cursor;
   if (!bmm2_tensor.has_value()) cursor += sizeof(float);
   cursor = AlignUp(cursor, 16);
+  int64_t query_offset = cursor;
+  bool needs_query_padding = kGroupSize != kTileQ;
+  if (needs_query_padding) {
+    cursor += BATCH_SIZE * NUM_KV_HEADS * kTileQ * kHeadDim;
+    cursor = AlignUp(cursor, 16);
+  }
   int64_t page_offset = cursor;
   if (needs_page_padding) {
-    cursor += BATCH_SIZE * padded_pages * static_cast<int64_t>(sizeof(int));
+    cursor += BATCH_SIZE * page_table_rows * padded_pages *
+              static_cast<int64_t>(sizeof(int));
     cursor = AlignUp(cursor, 16);
   }
   int64_t partial_o_offset = cursor;
@@ -391,6 +506,8 @@ void cake_paged_attention_decode(
   auto* padded_page_table =
       needs_page_padding ? reinterpret_cast<int*>(workspace + page_offset)
                          : nullptr;
+  auto* padded_query =
+      needs_query_padding ? workspace + query_offset : nullptr;
   float* bmm1_ptr =
       bmm1_tensor.has_value()
           ? static_cast<float*>(bmm1_tensor.value().data_ptr())
@@ -400,23 +517,39 @@ void cake_paged_attention_decode(
           ? static_cast<float*>(bmm2_tensor.value().data_ptr())
           : reinterpret_cast<float*>(workspace + bmm2_offset);
 
-  CUtensorMap h_q = EncodeTmaQuery(query);
+  void* query_ptr = needs_query_padding ? static_cast<void*>(padded_query)
+                                        : query.data_ptr();
+  CUtensorMap h_q = EncodeTmaQuery(query, query_ptr);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
   void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
   void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
   void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+#if CAKE_FMHA_NVFP4
+  CUtensorMap h_ksf =
+      EncodeTmaScale(key_block_scales.value(), "key_block_scales");
+  CUtensorMap h_vsf =
+      EncodeTmaScale(value_block_scales.value(), "value_block_scales");
+  void* p_ksf = TmaDeviceSlot(h_ksf, query.device().device_id, stream);
+  void* p_vsf = TmaDeviceSlot(h_vsf, query.device().device_id, stream);
+#endif
 
-  int64_t page_items =
-      needs_page_padding ? BATCH_SIZE * padded_pages : 0;
-  int64_t prep_items = std::max<int64_t>(page_items, 1);
+  int64_t page_items = needs_page_padding
+                           ? BATCH_SIZE * page_table_rows * padded_pages
+                           : 0;
+  int64_t query_items = needs_query_padding
+                            ? BATCH_SIZE * NUM_KV_HEADS * kTileQ * kHeadDim
+                            : 0;
+  int64_t prep_items = std::max<int64_t>({page_items, query_items, 1});
   int const prep_threads = 256;
   int const prep_blocks =
       static_cast<int>((prep_items + prep_threads - 1) / prep_threads);
   PrepareQuantDecode<<<prep_blocks, prep_threads, 0, stream>>>(
       static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
       static_cast<int>(page_items), static_cast<int>(source_pages),
-      static_cast<int>(padded_pages),
+      static_cast<int>(padded_pages), static_cast<int>(page_table_rows),
+      static_cast<const uint8_t*>(query.data_ptr()), padded_query,
+      static_cast<int>(query_items), kGroupSize,
       bmm1_tensor.has_value() ? nullptr : bmm1_ptr, bmm1_scalar,
       bmm2_tensor.has_value() ? nullptr : bmm2_ptr, bmm2_scalar);
   TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
@@ -425,6 +558,9 @@ void cake_paged_attention_decode(
   int* page_table_ptr =
       needs_page_padding ? padded_page_table
                          : static_cast<int*>(block_tables.data_ptr());
+  int page_batch_stride =
+      static_cast<int>(page_table_rows * padded_pages);
+  int page_v_offset = shared_page_table ? 0 : static_cast<int>(padded_pages);
   auto* partial_o = reinterpret_cast<float*>(workspace + partial_o_offset);
   auto* partial_max =
       reinterpret_cast<float*>(workspace + partial_max_offset);
@@ -433,14 +569,25 @@ void cake_paged_attention_decode(
   int bmm1_is_log2 = bmm1_tensor.has_value() ? 1 : 0;
   unsigned int grid_x = static_cast<unsigned int>(
       BATCH_SIZE * NUM_KV_HEADS * plan.num_splits);
+#if CAKE_FMHA_NVFP4
+  grid_x = std::min(grid_x, 128u);
+  cudaError_t status = cake_fmha_launch_decode_quant_nvfp4(
+      p_q, p_k, p_v, p_ksf, p_vsf, static_cast<uint8_t*>(out.data_ptr()),
+      page_table_ptr, static_cast<int*>(seq_lens.data_ptr()), bmm1_ptr,
+      bmm2_ptr, partial_o, partial_max, partial_sum, page_batch_stride,
+      page_v_offset, bmm1_is_log2, plan.num_splits, plan.blocks_per_split,
+      grid_x, 1, 1, stream);
+#else
   cudaError_t status = cake_fmha_launch_decode_quant_fp8(
       p_q, p_k, p_v, static_cast<uint8_t*>(out.data_ptr()), page_table_ptr,
       static_cast<int*>(seq_lens.data_ptr()), bmm1_ptr, bmm2_ptr, partial_o,
-      partial_max, partial_sum, static_cast<int>(padded_pages), 0,
+      partial_max, partial_sum, page_batch_stride, page_v_offset,
       bmm1_is_log2, plan.num_splits, plan.blocks_per_split, grid_x, 1, 1,
       stream);
+#endif
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA FP8 decode launch failed: " << cudaGetErrorString(status);
+      << "Cake FMHA quantized decode launch failed: "
+      << cudaGetErrorString(status);
 
   if (plan.num_splits > 1) {
     status = cake_fmha_launch_decode_quant_fp8_reduce(

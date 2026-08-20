@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import importlib.util
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
+
+from filelock import FileLock
 
 from . import env as jit_env
 from .core import (
@@ -25,7 +29,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "3cdc47f827006cd29fb3088a0e3fbdaf5fc0ebfbabe5ae502a9c66b89bda2926"
+    "c566936ca2bb00eec2d85ac5199a7e5da3e31da9a2c305f94f29e4f866c4ff09"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -247,6 +251,31 @@ def _validate_decode_quant_fp8_specialization(
     return {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
 
 
+def _validate_decode_quant_nvfp4_specialization(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> dict[str, int]:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if q_len != 1:
+        raise ValueError("decode-quant NVFP4 requires q_len=1")
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if not 1 <= num_q_heads // num_kv_heads <= 8:
+        raise ValueError("decode-quant NVFP4 requires a head-group ratio in [1, 8]")
+    if page_size not in (16, 32):
+        raise ValueError("decode-quant NVFP4 requires page_size 16 or 32")
+    return {"PAGE_SIZE": page_size}
+
+
 def _get_component_launch_sources(
     component_name: str,
     target: CakeFmhaTarget,
@@ -286,6 +315,81 @@ def _get_component_sources(
     if not api_binding.is_file():
         raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
     return body, launch_binding, api_binding
+
+
+def _get_decode_quant_nvfp4_native_sources(
+    target: CakeFmhaTarget, selector: Mapping[str, int]
+) -> tuple[Path, Path, dict[str, int]]:
+    """Resolve the authenticated native-QMUL4 member and patch denominator."""
+
+    component = get_cake_fmha_manifest()["components"]["decode_quant_nvfp4"]
+    normalized_selector = dict(sorted(selector.items()))
+    matches = [
+        member
+        for member in component["source_family"]
+        if member.get("selector") == normalized_selector
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Cake FMHA NVFP4 selector is not unique: "
+            f"{normalized_selector!r}"
+        )
+    native = matches[0].get("native_qmul4")
+    if not isinstance(native, dict) or native.get("protocol") != "cubin_patch_v1":
+        raise RuntimeError("Cake FMHA NVFP4 native-QMUL4 metadata is missing")
+    arch = _TARGET_MANIFEST_ARCH[target]
+    csrc_dir = get_cake_fmha_csrc_dir()
+    body = csrc_dir / native["sources"][arch]
+    launch_binding = csrc_dir / component["binding_source"]
+    for source in (body, launch_binding):
+        if not source.is_file():
+            raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
+    expected_counts = native["expected_marker_counts"][arch]
+    return body, launch_binding, expected_counts
+
+
+def _patch_and_load_native_qmul4(spec: JitSpec, expected_counts: Mapping[str, int]):
+    """Build, patch the marker-bearing CUDA object, relink, then load."""
+
+    with FileLock(spec.lock_path, thread_local=False):
+        spec.build()
+        if not hasattr(spec, "sources") or not hasattr(spec, "build_dir"):
+            raise RuntimeError("native QMUL4 requires an NVCC JIT specification")
+        if not spec.sources:
+            raise RuntimeError("native QMUL4 JIT produced no CUDA objects")
+        marker_source = spec.sources[0]
+        object_path = spec.build_dir / (
+            f"{marker_source.parent.name}_{marker_source.stem}.cuda.o"
+        )
+        stamp_path = object_path.with_suffix(object_path.suffix + ".qmul4.sha256")
+        object_bytes = object_path.read_bytes()
+        actual_digest = hashlib.sha256(object_bytes).hexdigest()
+        if not (
+            stamp_path.is_file()
+            and stamp_path.read_text().strip() == actual_digest
+        ):
+            patch_path = get_cake_fmha_csrc_dir() / "runtime/cake_fmha_qmul4.py"
+            module_spec = importlib.util.spec_from_file_location(
+                "flashinfer_cake_fmha_qmul4_patch", patch_path
+            )
+            if module_spec is None or module_spec.loader is None:
+                raise RuntimeError("failed to load authenticated Cake QMUL4 patch module")
+            patch_module = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(patch_module)
+            patched = patch_module.patch_qmul4_cubin(
+                object_bytes, expected_counts=expected_counts
+            )
+            patched_digest = hashlib.sha256(patched).hexdigest()
+            temporary = object_path.with_suffix(
+                object_path.suffix + f".qmul4.{os.getpid()}.tmp"
+            )
+            temporary.write_bytes(patched)
+            os.replace(temporary, object_path)
+            stamp_path.write_text(patched_digest + "\n")
+            # The first build linked the deliberately invalid marker body.
+            # Re-run ninja so the newer patched object replaces that image.
+            spec.build()
+        return spec.load()
 
 
 def _validate_context_specialization(
@@ -1349,6 +1453,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
             f"-DCAKE_FMHA_FULL_BLOCKS={selector['FULL_BLOCKS']}",
+            "-DCAKE_FMHA_NVFP4=0",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -1377,6 +1482,120 @@ def load_cake_fmha_decode_quant_fp8_module(
         full_blocks=full_blocks,
     ).build_and_load()
     logger.info("Loaded Cake FMHA FP8 decode/reduce module: %s", module)
+    return module
+
+
+def get_cake_fmha_decode_quant_nvfp4_uri(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> str:
+    selector = _validate_decode_quant_nvfp4_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    return (
+        f"cake_fmha_decode_quant_nvfp4_nativeqmul4_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_page{selector['PAGE_SIZE']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_decode_quant_nvfp4_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> JitSpec:
+    """Build the authenticated portable NVFP4 decode/reducer chain."""
+
+    selector = _validate_decode_quant_nvfp4_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    main_body, main_binding, _ = _get_decode_quant_nvfp4_native_sources(
+        target, selector
+    )
+    reduce_sources = _get_component_launch_sources(
+        "decode_quant_fp8_reduce", target, {}
+    )
+    api_binding = get_cake_fmha_csrc_dir() / _DECODE_QUANT_FP8_JIT_BINDING
+    if not api_binding.is_file():
+        raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_quant_nvfp4_uri(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        ),
+        sources=[main_body, main_binding, *reduce_sources, api_binding],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
+            "-DCAKE_FMHA_FULL_BLOCKS=0",
+            "-DCAKE_FMHA_NVFP4=1",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA NVFP4 decode/reduce JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_quant_nvfp4_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+):
+    selector = _validate_decode_quant_nvfp4_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    _, _, expected_counts = _get_decode_quant_nvfp4_native_sources(
+        target, selector
+    )
+    module = _patch_and_load_native_qmul4(
+        gen_cake_fmha_decode_quant_nvfp4_module(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        ),
+        expected_counts,
+    )
+    logger.info("Loaded Cake FMHA NVFP4 decode/reduce module: %s", module)
     return module
 
 
