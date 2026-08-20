@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -51,10 +57,14 @@ def cache_permute_indices():
     return {}
 
 
-# Test: Sigmoid routing (Sigmoid -> TopK, no renormalization)
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+# Test: Sigmoid routing (Sigmoid -> TopK) and TopKSigmoid routing (TopK -> Sigmoid),
+# neither of which renormalizes the top-K weights.
+# Shape fan-out kept minimal (boundary tokens/intermediate only): the quant x
+# weight-layout x activation matrix is the coverage; shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py.
+@pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -98,6 +108,28 @@ def cache_permute_indices():
                 "enable_autotune": True,
             },
             id="Sigmoid_128e_top8",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopKSigmoid,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="TopKSigmoid_128e_top8",
         ),
     ],
 )
@@ -151,7 +183,8 @@ def test_sigmoid_routing(
     activation_type,
     cache_permute_indices,
 ):
-    """Test Sigmoid routing configurations (Sigmoid -> TopK, no renormalization)."""
+    """Test the unnormalized sigmoid routing configurations, in both selection orders
+    (Sigmoid -> TopK and TopK -> Sigmoid)."""
     run_moe_test(
         num_tokens,
         hidden_size,
@@ -165,7 +198,12 @@ def test_sigmoid_routing(
 
 
 # Test: DeepSeekV3 routing
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+# Shape fan-out kept minimal: intermediate values form a hitting set of every
+# routing config's compatible_intermediate_size (so each config still runs), and
+# token counts are the boundary pair. Shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py; the impl x routing x layout matrix is the
+# coverage this grid exists for.
+@pytest.mark.parametrize("num_tokens", [8, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
@@ -251,6 +289,32 @@ def test_sigmoid_routing(
                 "enable_autotune": True,
             },
             id="DSv3",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
+                "compatible_intermediate_size": [512, 1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
+                "enable_autotune": True,
+                "enable_da_moe": True,
+            },
+            id="DSv3_DA",
         ),
         pytest.param(
             {
@@ -387,8 +451,14 @@ def test_deepseekv3_routing(
     activation_type,
     routing_logits_dtype,
     cache_permute_indices,
+    monkeypatch,
 ):
-    """Test DeepSeekV3 routing configurations."""
+    """Test DeepSeekV3 routing configurations against independent references."""
+    enable_da_moe = routing_config.get("enable_da_moe", False)
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1" if enable_da_moe else "0")
+    if enable_da_moe:
+        monkeypatch.setenv("FLASHINFER_DA_DISTRIBUTIONS", "uniform,ddist:1.1")
+        monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
     run_moe_test(
         num_tokens,
         hidden_size,
@@ -431,6 +501,23 @@ def test_deepseekv3_routing(
                 "enable_autotune": True,
             },
             id="TopK",
+        ),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 2,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+                "compatible_intermediate_size": [512, 768, 1024],
+                "enable_autotune": True,
+                "enable_da_moe": True,
+            },
+            id="TopK_DA",
         ),
     ],
 )
@@ -476,8 +563,14 @@ def test_topk_routing(
     clamp_value,
     routing_logits_dtype,
     cache_permute_indices,
+    monkeypatch,
 ):
-    """Test TopK routing configuration."""
+    """Test TopK routing configurations against independent references."""
+    enable_da_moe = routing_config.get("enable_da_moe", False)
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1" if enable_da_moe else "0")
+    if enable_da_moe:
+        monkeypatch.setenv("FLASHINFER_DA_DISTRIBUTIONS", "uniform,ddist:1.1")
+        monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
     num_experts = routing_config["num_experts"]
     gemm1_alpha = (
         None
@@ -1450,6 +1543,246 @@ def test_deepseek_ngroup1_sigmoid_bias_output_uses_unbiased_sigmoid(
     )
 
 
+def _bf16_moe_route_probe(
+    routing_logits,
+    routing_method_type,
+    num_tokens,
+    num_experts,
+    top_k,
+    enable_pdl,
+):
+    """Run a BF16 MoE rigged so its output exposes the routing decision.
+
+    ``hidden_states[:, 0] = 1`` and the only nonzero GEMM entries are
+    ``w1[e, 0, 0] = w2[e, 0, 0] = 1``, so under Relu2 every selected expert
+    contributes exactly its route weight: ``output[:, 0]`` is the sum of the
+    selected weights and ``routing_replay_out`` records the selected experts.
+    """
+    device = routing_logits.device
+    hidden_size = 512
+    intermediate_size = 512
+    padding = 8
+    activation_type = ActivationType.Relu2
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.BlockMajorK,
+    }
+
+    hidden_states = torch.zeros(
+        (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    hidden_states[:, 0] = 1
+    gemm1_weights = torch.zeros(
+        (num_experts, intermediate_size, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.zeros(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm1_weights[:, 0, 0] = 1
+    gemm2_weights[:, 0, 0] = 1
+
+    moe_impl = BF16Moe()
+    moe_impl._cache_permute_indices = {}
+    weights_data = moe_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    inputs_data = moe_impl.quantize_inputs(
+        hidden_states, weights_data["hidden_states_scale_global"]
+    )
+    quant_data = {**weights_data, **inputs_data}
+    args = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        padding,
+        quant_data["hidden_states"],
+        quant_data["hidden_states_scale"],
+        quant_data["hidden_states_scale_global"],
+        routing_logits,
+        quant_data["gemm1_weights"],
+        quant_data["gemm1_scales"],
+        quant_data["gemm1_scales_global"],
+        quant_data["gemm2_weights"],
+        quant_data["gemm2_scales"],
+        quant_data["gemm2_scales_global"],
+        {},
+        False,
+        activation_type,
+    )
+    static_data = moe_impl.prepare_static_weights_for_kernel(
+        None,
+        args,
+        gemm1_weights,
+        gemm2_weights,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    )
+
+    routing_replay_out = torch.full(
+        (num_tokens, top_k), -1, device=device, dtype=torch.int16
+    )
+    output = trtllm_bf16_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        hidden_states=quant_data["hidden_states"],
+        gemm1_weights=static_data["gemm1_weights"],
+        gemm2_weights=static_data["gemm2_weights"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        use_shuffled_weight=static_data["use_shuffled_weight"],
+        weight_layout=static_data["weight_layout"],
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        norm_topk_prob=False,
+        routing_replay_out=routing_replay_out,
+    )
+    return output, routing_replay_out
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    # Each shape steers routing to a different kernel: <=4 tokens is the static
+    # block kernel, <=16 the dynamic block kernel, <=256 the fused cluster
+    # kernel below 160 experts and the split block-per-token path at or above
+    # it, and larger batches the block-per-token or warp-per-token scores
+    # kernel depending on the expert count.
+    "num_tokens, num_experts",
+    [
+        pytest.param(4, 128, id="static_block"),
+        pytest.param(8, 128, id="dyn_block"),
+        pytest.param(64, 128, id="cluster"),
+        pytest.param(64, 256, id="block_per_token_split"),
+        pytest.param(768, 256, id="block_per_token_large_bs"),
+        pytest.param(768, 128, id="histogram_scores"),
+    ],
+)
+def test_topk_sigmoid_selects_on_raw_logits(num_tokens, num_experts, enable_pdl):
+    """TopKSigmoid ranks raw logits, so it orders experts that sigmoid saturates.
+
+    Four experts get logits far above the point where fp32 sigmoid rounds to
+    exactly 1.0. Sigmoid -> TopK therefore sees a four-way tie and falls back to
+    tie-breaking by expert index, while TopK -> Sigmoid still ranks them by raw
+    magnitude. The indices are picked so the raw-magnitude answer differs from
+    the tie-broken one whichever index direction the tie-break favors.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM Gen BF16 MoE test requires CUDA.")
+    device = torch.device("cuda:0")
+    if not is_sm100a_supported(device):
+        pytest.skip("TRT-LLM Gen BF16 MoE requires SM100a and CUDA 12.8+.")
+
+    top_k = 2
+    saturating = {
+        0: 25.0,
+        num_experts // 2: 40.0,
+        num_experts - 8: 30.0,
+        num_experts - 1: 26.0,
+    }
+    routing_logits = torch.zeros(
+        (num_tokens, num_experts), device=device, dtype=torch.float32
+    )
+    for expert_idx, logit in saturating.items():
+        routing_logits[:, expert_idx] = logit
+
+    topk_output, topk_replay = _bf16_moe_route_probe(
+        routing_logits,
+        RoutingMethodType.TopKSigmoid,
+        num_tokens,
+        num_experts,
+        top_k,
+        enable_pdl,
+    )
+    _, sigmoid_replay = _bf16_moe_route_probe(
+        routing_logits,
+        RoutingMethodType.Sigmoid,
+        num_tokens,
+        num_experts,
+        top_k,
+        enable_pdl,
+    )
+
+    expected = {num_experts // 2, num_experts - 8}  # the two largest raw logits
+    topk_selected = [set(row.tolist()) for row in topk_replay.cpu()]
+    assert all(selected == expected for selected in topk_selected), (
+        f"TopKSigmoid selected {topk_selected[:4]}, expected {expected} for every token"
+    )
+
+    # Sigmoid cannot rank saturated scores, so it must land somewhere else. If
+    # this ever matches, TopKSigmoid has silently become an alias of Sigmoid.
+    sigmoid_selected = [set(row.tolist()) for row in sigmoid_replay.cpu()]
+    assert all(selected != expected for selected in sigmoid_selected), (
+        "Sigmoid -> TopK reproduced the raw-logit ranking, so this input no longer "
+        "distinguishes the two selection orders"
+    )
+
+    # Both survivors saturate, so each contributes a route weight of 1.0.
+    torch.testing.assert_close(
+        topk_output[:, 0].to(torch.float32),
+        torch.full((num_tokens,), 2.0, device=device),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8])
+def test_topk_sigmoid_weights_are_unnormalized(num_tokens):
+    """TopKSigmoid emits sigmoid(raw logit) per expert, with no renormalization."""
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM Gen BF16 MoE test requires CUDA.")
+    device = torch.device("cuda:0")
+    if not is_sm100a_supported(device):
+        pytest.skip("TRT-LLM Gen BF16 MoE requires SM100a and CUDA 12.8+.")
+
+    top_k = 2
+    num_experts = 128
+    routing_logits = torch.full(
+        (num_tokens, num_experts), -20.0, device=device, dtype=torch.float32
+    )
+    routing_logits[:, 7] = 2.0
+    routing_logits[:, 91] = 1.0
+
+    output, routing_replay_out = _bf16_moe_route_probe(
+        routing_logits,
+        RoutingMethodType.TopKSigmoid,
+        num_tokens,
+        num_experts,
+        top_k,
+        enable_pdl=False,
+    )
+
+    selected = [set(row.tolist()) for row in routing_replay_out.cpu()]
+    assert all(row == {7, 91} for row in selected), selected
+
+    # Renormalized routing would instead sum to 1.0.
+    weight_sum = torch.sigmoid(torch.tensor([2.0, 1.0])).sum().item()
+    torch.testing.assert_close(
+        output[:, 0].to(torch.float32),
+        torch.full((num_tokens,), weight_sum, device=device),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        output[:, 1:].to(torch.float32),
+        torch.zeros_like(output[:, 1:].to(torch.float32)),
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
@@ -1528,6 +1861,38 @@ def test_deepseek_ngroup1_sigmoid_bias_output_uses_unbiased_sigmoid(
                 "enable_autotune": False,
             },
             id="SigmoidRenorm_128e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopKSigmoid,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="TopKSigmoid_128e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopKSigmoid,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="TopKSigmoid_256e",
         ),
         pytest.param(
             {
@@ -1929,7 +2294,12 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
 
 
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
-    """FP8 block-scale OA params are currently scoped to MxFp8 SwiGLU."""
+    """FP8 block-scale OA params are scoped to the block-scale recipes with SwiGLU.
+
+    MxFp8 applies them in the fused FC1 epilogue and DeepSeekFp8 in its separate
+    activation kernel; every other quantization type, and every non-SwiGLU
+    activation, would silently drop them.
+    """
     kwargs = {
         "routing_logits": torch.empty((1, 1), dtype=torch.bfloat16),
         "routing_bias": None,
@@ -1951,15 +2321,15 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     }
     per_expert = torch.ones((1,), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+    with pytest.raises(ValueError, match=r"Fp8QuantizationType\.MxFp8"):
         trtllm_fp8_block_scale_moe(
             **kwargs,
-            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             activation_type=ActivationType.Swiglu.value,
             gemm1_alpha=per_expert,
         )
 
-    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_fp8_block_scale_moe(
             **kwargs,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
@@ -1972,18 +2342,18 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     }
     routed_kwargs["topk_ids"] = torch.empty((1, 1), dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+    with pytest.raises(ValueError, match=r"Fp8QuantizationType\.MxFp8"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
-            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             activation_type=ActivationType.Swiglu.value,
             gemm1_beta=per_expert,
         )
 
-    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
-            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
             activation_type=ActivationType.Geglu.value,
             gemm1_alpha=per_expert,
         )
@@ -2427,6 +2797,64 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     torch.testing.assert_close(output_beta_oa, output_beta_oa_ref, atol=1e-1, rtol=1e-1)
     assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
+
+
+def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
+    """DeepSeekFp8 MoE applies the SwiGLU OA params in its unfused activation kernel.
+
+    Unlike MxFp8 there is no fused FC1 epilogue here: the activation kernel reads the
+    per-expert entries itself, resolving the local expert from the permuted token
+    index. Random inputs are used instead of the near-identity setup of the MxFp8 test
+    above, whose mostly-zero 128-element blocks degenerate under DeepSeek block scales.
+
+    ``run_moe_test``'s dequantized reference applies alpha/beta/clamp itself, so a
+    kernel that dropped them would not match it. FC1 outputs land around unit scale
+    for this data generator, so a limit of 2.0 clamps a meaningful fraction of both
+    halves rather than being a no-op.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+
+    num_tokens = 64
+    hidden_size = 512
+    intermediate_size = 512
+    routing_config = {
+        "num_experts": 32,
+        "top_k": 2,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+        "compatible_intermediate_size": [intermediate_size],
+        "enable_autotune": False,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+    }
+    num_experts = routing_config["num_experts"]
+
+    def per_expert(value):
+        return torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
+
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+        routing_config,
+        weight_processing,
+        ActivationType.Swiglu,
+        cache_permute_indices,
+        gemm1_alpha=per_expert(1.702),
+        gemm1_beta=per_expert(1.0),
+        gemm1_clamp_limit=per_expert(2.0),
+    )
 
 
 # ====================================================================================

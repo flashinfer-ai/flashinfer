@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -44,14 +49,14 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports 128x4 SF layout")
         if compute_capability[0] != 12:
             pytest.skip("b12x backend only supports SM120/SM121 GPUs.")
-        if not use_nvfp4:
-            pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
         if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
-        pytest.skip("mx_fp4 is only supported for cudnn, cute-dsl, and auto backends")
+    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
+        pytest.skip(
+            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, and auto backends"
+        )
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -115,18 +120,35 @@ def _test_mm_fp4(
             pytest.fail(str(e))
 
 
-# TODO: Consdier splitting this function up for the various backends
+# Curated smoke set. Randomized breadth over m x {n,k} x fp4-type x backend (nvfp4 +
+# mxfp4, 128x4 layout, tight elementwise oracle, determinism, autotune-winner
+# validation) lives in tests/gemm/test_unified_gemm_fuzz.py's mm_nvfp4/mm_mxfp4
+# adapters. This file keeps, per backend: one odd-M + one large-M case, the 8x4
+# scale-factor layout (NOT fuzzed yet -- fuzzer TODO C1/#2861), the trtllm
+# weight-shuffle path, and each fp4_type at least once.
+_SMOKE_CASES = [
+    # m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+    # (every case must actually run on its target arch: trtllm is the only 8x4-layout
+    #  backend and is bf16-out only; b12x is nvfp4+128x4 only; mxfp4 runs on
+    #  cudnn/cute-dsl/auto only -- see the skip matrix in _test_mm_fp4)
+    (7, 128, 256, torch.bfloat16, "trtllm", True, False, "nvfp4"),
+    (512, 512, 512, torch.bfloat16, "trtllm", False, True, "nvfp4"),
+    (48, 256, 512, torch.bfloat16, "trtllm", False, False, "nvfp4"),
+    (13, 256, 128, torch.bfloat16, "cudnn", True, True, "nvfp4"),
+    (256, 512, 256, torch.float16, "cudnn", True, False, "mxfp4"),
+    (9, 512, 256, torch.bfloat16, "cudnn", True, True, "mxfp4_alpha"),
+    (1, 128, 512, torch.bfloat16, "cutlass", True, False, "nvfp4"),
+    (31, 256, 256, torch.float16, "cutlass", True, True, "nvfp4"),
+    (48, 512, 128, torch.float16, "cute-dsl", True, True, "nvfp4"),
+    (3, 256, 512, torch.bfloat16, "cute-dsl", True, False, "mxfp4"),
+    (17, 128, 128, torch.bfloat16, "b12x", True, False, "nvfp4"),
+    (128, 512, 512, torch.bfloat16, "b12x", True, True, "nvfp4"),
+]
+
+
 @pytest.mark.parametrize(
-    "m",
-    [1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 15, 16, 17, 20, 24, 31, 32, 48, 64, 128, 256, 512],
+    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type", _SMOKE_CASES
 )
-@pytest.mark.parametrize("n", [128, 256, 512])
-@pytest.mark.parametrize("k", [128, 256, 512])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass", "cute-dsl", "b12x"])
-@pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
@@ -136,19 +158,20 @@ def test_mm_fp4(
     )
 
 
-# Split tests for checking auto functionality
-@pytest.mark.parametrize("m", [1, 48, 256, 512])
-@pytest.mark.parametrize("n", [256, 512])
-@pytest.mark.parametrize("k", [256, 512])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("use_128x4_sf_layout", [True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
-def test_mm_fp4_backend_auto(
-    m, n, k, res_dtype, use_128x4_sf_layout, auto_tuning, fp4_type
-):
+# Auto backend: one case per fp4_type, autotune on/off and boundary M covered.
+_AUTO_SMOKE_CASES = [
+    # m, n, k, res_dtype, auto_tuning, fp4_type
+    (1, 256, 512, torch.bfloat16, False, "nvfp4"),
+    (512, 512, 256, torch.float16, True, "nvfp4"),
+    (48, 512, 512, torch.bfloat16, True, "mxfp4"),
+    (256, 256, 256, torch.bfloat16, False, "mxfp4_alpha"),
+]
+
+
+@pytest.mark.parametrize("m,n,k,res_dtype,auto_tuning,fp4_type", _AUTO_SMOKE_CASES)
+def test_mm_fp4_backend_auto(m, n, k, res_dtype, auto_tuning, fp4_type):
     # Some test cases for auto backend.
-    _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
+    _test_mm_fp4(m, n, k, res_dtype, "auto", True, auto_tuning, fp4_type)
 
 
 # Regression (#3560): b12x must accept ragged K (real floor K%32==0, not tile_k=128).
@@ -176,6 +199,26 @@ def test_mm_fp4_b12x_misaligned_k_raises():
     ):
         pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
     m, n, k = 64, 512, 112  # k % 32 == 16
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha,
+            torch.bfloat16,
+            res,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="b12x",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def _nvfp4_operands(m, n, k):
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     g_in = (448 * 6) / a.float().abs().nan_to_num().max()
@@ -186,22 +229,40 @@ def test_mm_fp4_b12x_misaligned_k_raises():
     b_fp4, b_s = nvfp4_quantize(
         b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
     )
-    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of 32"):
-        mm_fp4(
+    return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
+
+
+def test_mm_fp4_b12x_short_k_multi_wave():
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles, a regime the
+    # parametrized shapes never reach. Repeats, since a bad handoff shows
+    # up as a timing-dependent mismatch.
+    device = torch.device("cuda")
+    if not (
+        is_sm12x_supported(device) and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
+    m, n, k = 1024, 4096, 128
+    for _ in range(3):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+        res = mm_fp4(
             a_fp4,
             b_fp4.T,
             a_s,
             b_s.T,
-            1.0 / (g_in * g_w),
+            alpha,
             torch.bfloat16,
-            res,
+            None,
             block_size=16,
             use_8x4_sf_layout=False,
             backend="b12x",
             use_nvfp4=True,
-            skip_check=False,
         )
+        reference = torch.mm(a, b.T)
+        cos_sim = F.cosine_similarity(
+            reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
+        ).item()
+        assert cos_sim > 0.97
 
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():

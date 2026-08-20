@@ -60,6 +60,27 @@ else
     COMMAND=("$@")
 fi
 
+DOCKER_ENV="${DOCKER_ENV} -e PIP_RETRIES=10 -e PIP_DEFAULT_TIMEOUT=60"
+
+# Share pip's downloads with the other jobs that land on this reused runner. In
+# HOME because the workspace is wiped between jobs and /opt needs root.
+# CI_PIP_CACHE_DIR="" opts out.
+: "${CI_PIP_CACHE_DIR=${HOME:-/tmp}/.cache/flashinfer-ci/pip}"
+if [ -n "${CI_PIP_CACHE_DIR}" ] && mkdir -p "${CI_PIP_CACHE_DIR}" 2>/dev/null; then
+    CACHE_MB=$(du -sm "${CI_PIP_CACHE_DIR}" 2>/dev/null | cut -f1)
+    if [ "${CACHE_MB:-0}" -gt "${CI_PIP_CACHE_MAX_MB:-20480}" ]; then
+        echo "Clearing pip cache: ${CACHE_MB} MB exceeds ${CI_PIP_CACHE_MAX_MB:-20480} MB"
+        # Containers write into it as root, so the runner user may need sudo.
+        rm -rf "${CI_PIP_CACHE_DIR:?}" 2>/dev/null \
+            || sudo -n rm -rf "${CI_PIP_CACHE_DIR:?}" 2>/dev/null || true
+        mkdir -p "${CI_PIP_CACHE_DIR}" 2>/dev/null || true
+    fi
+    DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${CI_PIP_CACHE_DIR}:/pip-cache"
+    DOCKER_ENV="${DOCKER_ENV} -e PIP_CACHE_DIR=/pip-cache"
+else
+    echo "Shared pip cache disabled or not writable; downloads will not be reused"
+fi
+
 # Use nvidia-docker if the container is GPU.
 if [[ ${USE_GPU} == "true" ]]; then
     DOCKER_ENV="${DOCKER_ENV} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"

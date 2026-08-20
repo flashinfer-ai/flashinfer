@@ -712,6 +712,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
                     T* const output, void* const intermediate_result,
                     int64_t const* const expert_first_token_offset,
+                    int const* const permuted_token_selected_experts,
                     TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
                     WeightType const* const fc1_expert_weights,
                     ScaleBiasType const* const fc1_expert_biases,
@@ -771,7 +772,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
     return Self::gemm1(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input),
                        static_cast<T*>(output), intermediate_result, expert_first_token_offset,
-                       tma_ws_input_template, static_cast<WeightType const*>(fc1_expert_weights),
+                       /*permuted_token_selected_experts=*/nullptr, tma_ws_input_template,
+                       static_cast<WeightType const*>(fc1_expert_weights),
                        static_cast<ScaleBiasType const*>(fc1_expert_biases), num_valid_tokens_ptr,
                        static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant,
                        fc2_fp8_quant, act_fp8_token_scale, fc1_fp4_act_flat, fc2_fp4_act_flat,
@@ -1078,6 +1080,7 @@ struct GemmProfilerBackend {
     mNeedWeights = need_weights;
     mParallelismConfig = parallelism_config;
     mEnableAlltoall = enable_alltoall;
+    mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mSm90Wfp4Afp8Mode = sm90_wfp4afp8_mode;
     mSM = common::getSMVersion();
 
@@ -1144,6 +1147,7 @@ struct GemmProfilerBackend {
   bool mUseLora{};
   bool mMinLatencyMode{};
   bool mNeedWeights{};
+  bool mUseMxfp8ActScaling{};
   Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled;
 
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};

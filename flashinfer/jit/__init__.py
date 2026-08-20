@@ -84,6 +84,7 @@ from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
+from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
@@ -109,6 +110,9 @@ from .flash_kda import (
     gen_flash_kda_m128_module as gen_flash_kda_m128_module,
 )
 from .flash_kda import (
+    gen_flash_kda_m128_n16_module as gen_flash_kda_m128_n16_module,
+)
+from .flash_kda import (
     get_flash_kda_prefill_module as get_flash_kda_prefill_module,
 )
 from .flash_kda import (
@@ -116,6 +120,9 @@ from .flash_kda import (
 )
 from .flash_kda import (
     load_flash_kda_m128_module as load_flash_kda_m128_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
 )
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,

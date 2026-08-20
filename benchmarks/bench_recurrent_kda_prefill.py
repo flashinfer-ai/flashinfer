@@ -12,11 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUPTI benchmark for the six frozen recurrent-KDA prefill contract shapes.
+"""CUPTI benchmark for recurrent-KDA prefill public API shapes.
+
+The default case set combines the original H64/H96 coverage, six H12 shapes
+representing Kimi-K3's per-rank head count under TP8, and four fixed-layout
+small-BH shapes. ``--case-set`` can select each group independently.
 
 The FlashInfer candidate is always invoked through the public
-``recurrent_kda`` API. With ``--flash-kda-peer``, two commit-verified
-MoonshotAI/FlashKDA measurements are reported:
+``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
+device/shape policy, while ``nonpersistent`` supplies the same explicit
+workspace and packed sequence order used by the historical benchmark to keep
+B200 on the direct schedule family. ``--backend`` selects one public API
+backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
+over the same case set. The resolved backend, schedule variant, and target are
+recorded during untimed warmup. With
+``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
+reported:
 
 * the raw ``_fwd_raw`` kernel timing scope;
 * a public-semantics adapter that follows ``_fwd_raw`` with the same-stream
@@ -30,7 +41,6 @@ build/JIT, and state-pool reset are outside the measured region.
 """
 
 import argparse
-import hashlib
 import json
 import subprocess
 from dataclasses import dataclass
@@ -47,10 +57,13 @@ from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
-FLASH_KDA_PEER_COMMIT = "d2ff19a6a0c82f39f796f637ebd1c36090b1268f"
+FLASH_KDA_PEER_COMMIT = "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
-DEFAULT_STATE_ROTATIONS = 512
+DEFAULT_LEGACY_STATE_ROTATIONS = 1024
+DEFAULT_H12_STATE_ROTATIONS = 4096
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
+BENCHMARKS_DIR = Path(__file__).resolve().parent
+H12_PRESET = BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12.json"
 
 
 @dataclass(frozen=True)
@@ -78,7 +91,57 @@ class PreparedCase:
     metadata: dict
 
 
-CASES = (
+def _load_h12_cases(path: Path = H12_PRESET) -> tuple[Case, ...]:
+    """Load the small checked-in Kimi-K3 TP8 benchmark denominator."""
+
+    payload = json.loads(path.read_text())
+    expected_common = {
+        "num_heads": 12,
+        "head_dim_qk": 128,
+        "head_dim_vo": 128,
+        "dtype": "bfloat16",
+        "initial_state": "provided",
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "beta_is_logit": True,
+        "lower_bound": -5.0,
+    }
+    if payload.get("schema_version") != 1:
+        raise ValueError("H12 preset schema_version must be 1")
+    if payload.get("name") != "recurrent_kda_prefill_h12":
+        raise ValueError("unexpected H12 preset name")
+    if payload.get("common") != expected_common:
+        raise ValueError("unexpected H12 preset common parameters")
+    if payload.get("aggregation") != "per_case_only":
+        raise ValueError("H12 benchmark reports per-case results only")
+
+    raw_cases = payload.get("cases")
+    if not isinstance(raw_cases, list) or len(raw_cases) != 6:
+        raise ValueError("H12 preset must contain six cases")
+    if any(
+        not isinstance(item, dict) or item.get("layout") not in {"fixed", "packed"}
+        for item in raw_cases
+    ):
+        raise ValueError("H12 preset cases must use fixed or packed layout")
+
+    cases = tuple(
+        Case(
+            name=item["name"],
+            num_heads=expected_common["num_heads"],
+            seq_lens=tuple(item["seq_lens"]),
+            packed=item["layout"] == "packed",
+            seed=item["seed"],
+        )
+        for item in raw_cases
+    )
+    if len({case.name for case in cases}) != len(cases):
+        raise ValueError("H12 preset must contain six uniquely named cases")
+    if any(not case.seq_lens or min(case.seq_lens) <= 0 for case in cases):
+        raise ValueError("H12 sequence lengths must be positive")
+    return cases
+
+
+LEGACY_CASES = (
     Case("h96_fixed8192", 96, (8192,), False, 10000),
     Case("h96_mixed", 96, (1300, 547, 2048, 963, 271, 3063), True, 10001),
     Case("h96_uniform", 96, (1024,) * 8, True, 10002),
@@ -86,6 +149,14 @@ CASES = (
     Case("h64_mixed", 64, (1300, 547, 2048, 963, 271, 3063), True, 10004),
     Case("h64_uniform", 64, (1024,) * 8, True, 10005),
 )
+H12_CASES = _load_h12_cases()
+SMALL_BH_CASES = (
+    Case("h8_fixed_65536", 8, (65536,), False, 11000),
+    Case("h4_fixed_65536_holdout", 4, (65536,), False, 11001),
+    Case("h1_fixed_131072", 1, (131072,), False, 11002),
+    Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
+)
+CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
 
 def _require_cupti() -> None:
@@ -114,14 +185,6 @@ def _hardware_metadata(device: torch.device) -> dict:
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
     }
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _git_output(root: Path, *args: str) -> str:
@@ -189,9 +252,7 @@ def _verify_peer_provenance(flash_kda, source_dir: Path) -> dict:
         "source_commit": source_commit,
         "cutlass_commit": cutlass_commit,
         "package_path": str(package_path),
-        "package_sha256": _sha256(package_path),
         "extension_path": str(extension_path),
-        "extension_sha256": _sha256(extension_path),
     }
 
 
@@ -202,7 +263,14 @@ def _make_state_pool(
     return initial_state.unsqueeze(0).expand(rotations, *initial_state.shape).clone()
 
 
-def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedCase:
+def _make_case(
+    case: Case,
+    *,
+    state_rotations: int,
+    candidate_route: str,
+    candidate_backend: str,
+    flash_kda=None,
+) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
     shape = (1, total_tokens, case.num_heads, 128)
     generator = torch.Generator(device="cuda").manual_seed(case.seed)
@@ -237,7 +305,11 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
     ).to(torch.bfloat16)
     candidate_state_pool = _make_state_pool(initial_state, state_rotations)
     candidate_output = torch.empty_like(q)
-    candidate_workspace = RecurrentKDAPrefillWorkspace(q.device)
+    candidate_workspace = (
+        RecurrentKDAPrefillWorkspace(q.device)
+        if candidate_route == "nonpersistent"
+        else None
+    )
     state_cursors = {"pr": [0], "adapted": [0]}
 
     offsets = [0]
@@ -256,7 +328,7 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
             dtype=torch.int32,
             device="cuda",
         )
-        if case.packed
+        if case.packed and candidate_route == "nonpersistent"
         else None
     )
     scale = float(1.0 / np.sqrt(128.0))
@@ -287,6 +359,7 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
             beta_is_logit=True,
             seq_order=seq_order,
             prefill_workspace=candidate_workspace,
+            backend=candidate_backend,
         )
 
     peer_raw_run = None
@@ -376,13 +449,64 @@ def _make_case(case: Case, *, state_rotations: int, flash_kda=None) -> PreparedC
             peer_adapted_state_pool.copy_(initial_state.unsqueeze(0))
             state_cursors["adapted"][0] = 0
 
+    # Observe the actual internal module selected by the public API once during
+    # untimed warmup. This avoids duplicating dispatcher policy in the evidence
+    # harness while keeping route logging out of every timed call.
+    kda_prefill_module = import_module("flashinfer.kda_prefill")
+    kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
+    original_get_module = kda_prefill_module._get_flash_kda_prefill_module
+    original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
+    resolved_cake_routes = []
+    resolved_backends = []
+
+    def recording_get_module(variant, target):
+        resolved_cake_routes.append((variant, target))
+        return original_get_module(variant, target)
+
+    def recording_cute_run(**kwargs):
+        resolved_backends.append("cute-dsl")
+        return original_cute_run(**kwargs)
+
+    kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
+    kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
+    try:
+        candidate_run()
+        torch.cuda.synchronize()
+    finally:
+        kda_prefill_module._get_flash_kda_prefill_module = original_get_module
+        kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
+        reset_state_pools()
+    if resolved_backends:
+        if resolved_backends != ["cute-dsl"] or resolved_cake_routes:
+            raise RuntimeError(
+                "expected exactly one CuTe DSL route during warmup, got "
+                f"backends={resolved_backends}, cake={resolved_cake_routes}"
+            )
+        resolved_backend = "cute-dsl"
+        decomp_ctas = len(case.seq_lens) * case.num_heads * 2
+        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        resolved_variant = "decomp" if decomp_ctas <= sm_count else "engine"
+        resolved_target = "bt16"
+    elif len(resolved_cake_routes) == 1:
+        resolved_backend = "cake"
+        resolved_variant, resolved_target = resolved_cake_routes[0]
+    else:
+        raise RuntimeError(
+            "expected one recurrent-KDA prefill route during warmup, got "
+            f"backends={resolved_backends}, cake={resolved_cake_routes}"
+        )
+
     metadata = {
         "name": case.name,
         "num_heads": case.num_heads,
         "seq_lens": list(case.seq_lens),
         "total_tokens": total_tokens,
         "layout": "packed" if case.packed else "fixed",
-        "variant": "m64" if case.name == "h64_fixed8192" else "m128",
+        "variant": resolved_variant,
+        "target": resolved_target,
+        "candidate_route": candidate_route,
+        "requested_backend": candidate_backend,
+        "resolved_backend": resolved_backend,
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -470,10 +594,41 @@ def main() -> None:
     parser.add_argument("--warmup-ms", type=int, default=20)
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
+        "--case-set",
+        choices=("all", "legacy", "h12", "small_bh"),
+        default="all",
+        help=(
+            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
+            "cases, or the fixed-layout small-BH cases."
+        ),
+    )
+    parser.add_argument(
         "--state-rotations",
         type=int,
-        default=DEFAULT_STATE_ROTATIONS,
-        help="Number of preinitialized same-input state slots per mutable path.",
+        help=(
+            "Override the number of preinitialized same-input state slots per "
+            "mutable path. By default legacy and small-BH cases use "
+            f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
+            f"{DEFAULT_H12_STATE_ROTATIONS} slots."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-route",
+        choices=("dispatcher", "nonpersistent"),
+        default="dispatcher",
+        help=(
+            "Measure the natural public dispatcher or force B200 onto its "
+            "non-persistent direct/M64 family with an explicit workspace."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cute-dsl", "cake"),
+        default="auto",
+        help=(
+            "Select one backend for this invocation of the public recurrent_kda "
+            "API; run separate commands to compare backends."
+        ),
     )
     parser.add_argument(
         "--flash-kda-peer",
@@ -501,7 +656,7 @@ def main() -> None:
 
     if args.warmup_ms <= 0 or args.bench_ms <= 0:
         parser.error("--warmup-ms and --bench-ms must be positive")
-    if args.state_rotations <= 0:
+    if args.state_rotations is not None and args.state_rotations <= 0:
         parser.error("--state-rotations must be positive")
     if args.flash_kda_peer != (args.flash_kda_source_dir is not None):
         parser.error(
@@ -544,11 +699,26 @@ def main() -> None:
             args.flash_kda_source_dir,
         )
 
+    selected_cases = {
+        "all": CASES,
+        "legacy": LEGACY_CASES,
+        "h12": H12_CASES,
+        "small_bh": SMALL_BH_CASES,
+    }[args.case_set]
     results = []
-    for case in CASES:
+    for case in selected_cases:
+        state_rotations = args.state_rotations
+        if state_rotations is None:
+            state_rotations = (
+                DEFAULT_H12_STATE_ROTATIONS
+                if case in H12_CASES
+                else DEFAULT_LEGACY_STATE_ROTATIONS
+            )
         prepared = _make_case(
             case,
-            state_rotations=args.state_rotations,
+            state_rotations=state_rotations,
+            candidate_route=args.candidate_route,
+            candidate_backend=args.backend,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}
@@ -644,7 +814,8 @@ def main() -> None:
         results.append(result)
         if prepared.peer_raw_run is None:
             print(
-                f"{result['name']:<18} {result['variant']:<4} "
+                f"{result['name']:<18} {result['resolved_backend']:<8} "
+                f"{result['variant']:<10} "
                 f"{result['median_us']:10.3f} us"
             )
         else:

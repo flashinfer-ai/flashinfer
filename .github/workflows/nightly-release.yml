@@ -1,5 +1,8 @@
 name: Nightly Release
 
+env:
+  NIGHTLY_RELEASE_REPOSITORY: flashinfer-ai/whl
+
 on:
   schedule:
     # Run at 00:00 UTC every day
@@ -57,7 +60,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -92,7 +95,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -153,7 +156,9 @@ jobs:
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          # 12.1a is CUDA 13.0 aarch64 only: adding it to cu129 aarch64 too (#3684) pushed that
+          # wheel to 2.14 GiB, past GitHub's 2 GiB release-asset limit (#4519).
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
         run: |
           # Extract CUDA major and minor versions
@@ -163,7 +168,7 @@ jobs:
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-          mkdir -p ${{ github.workspace }}/ci-cache
+          mkdir -p ${{ github.workspace }}/ci-cache ${{ github.workspace }}/sccache-stats
 
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
@@ -181,10 +186,45 @@ jobs:
             -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
             -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
             -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
+            -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
         timeout-minutes: 360
+
+      - name: Display sccache stats
+        if: always()
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always()
+        env:
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${{ matrix.cuda }}"
+            printf 'matrix_arch=%s\n' "${{ matrix.arch }}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-cuda${{ matrix.cuda }}-${{ matrix.arch }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Display wheel size
         run: du -h flashinfer-jit-cache/dist/*
@@ -206,25 +246,31 @@ jobs:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      actions: read
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create GitHub Release (empty first)
+      - name: Create nightly release in wheel repository (empty first)
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Requires contents: write access to NIGHTLY_RELEASE_REPOSITORY.
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
           TAG="${{ needs.setup.outputs.release_tag }}"
 
           # Delete existing release and tag if they exist
-          if gh release view "$TAG" &>/dev/null; then
+          if gh release view "$TAG" --repo "${NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
             echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
+            gh release delete "$TAG" \
+              --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+              --yes \
+              --cleanup-tag
           fi
 
           # Create new release without assets first
           gh release create "$TAG" \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
             --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
             --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
             --prerelease
@@ -235,11 +281,13 @@ jobs:
           name: flashinfer-python-dist
           path: dist-python/
 
-      - name: Upload flashinfer-python to release
+      - name: Upload flashinfer-python to wheel release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
 
       - name: Download flashinfer-cubin artifact
         uses: actions/download-artifact@v4
@@ -247,15 +295,18 @@ jobs:
           name: flashinfer-cubin-wheel
           path: dist-cubin/
 
-      - name: Upload flashinfer-cubin to release
+      - name: Upload flashinfer-cubin to wheel release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
 
-      - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
+      - name: Upload flashinfer-jit-cache wheels to wheel release (one at a time to avoid OOM)
         env:
           GH_TOKEN: ${{ github.token }}
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
           # Upload jit-cache wheels one at a time to avoid OOM
           # Each wheel can be several GB, so we download, upload, delete, repeat
@@ -274,8 +325,10 @@ jobs:
 
               # Upload to release
               if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
+                GH_TOKEN="${WHL_TOKEN}" gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* \
+                  --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+                  --clobber
+                echo "✅ Uploaded ${ARTIFACT_NAME} to wheel release repository"
               fi
 
               # Clean up to save disk space before next iteration
@@ -369,7 +422,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Download all JIT cache reports
         uses: actions/download-artifact@v4
@@ -418,13 +471,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
         run: |
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
+            --base-url "https://github.com/${NIGHTLY_RELEASE_REPOSITORY}/releases/download" \
             --release-tag "${{ needs.setup.outputs.release_tag }}" \
             --nightly
 
