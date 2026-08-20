@@ -184,6 +184,36 @@ def test_sglang_raw_route_does_not_compact_tensor_views(monkeypatch) -> None:
     assert args[7] is inputs["dt_bias"]
 
 
+def test_sglang_raw_route_rejects_disabled_softplus(monkeypatch) -> None:
+    inputs = _make_sglang_raw_layout_case(2)
+
+    monkeypatch.setattr(cake, "_target_arch", lambda _device: "sm_103a")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+    monkeypatch.setattr(
+        cake,
+        "_load_program",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("fixed-softplus T6 program must not be loaded")
+        ),
+    )
+
+    assert not cake.try_cake_selective_state_update(
+        **inputs,
+        z=None,
+        pad_slot_id=-1,
+        disable_state_update=True,
+        state_scale=None,
+        intermediate_state_scales=None,
+        rand_seed=None,
+        cache_steps=6,
+        cu_seqlens=None,
+        num_accepted_tokens=None,
+        algorithm="vertical",
+        dt_softplus=False,
+    )
+
+
 def test_cake_selective_state_update_sources_match_manifest() -> None:
     source_dir = cake._source_dir()
     assert len(cake._PROGRAMS) == 13

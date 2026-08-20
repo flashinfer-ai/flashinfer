@@ -602,6 +602,7 @@ def try_cake_selective_state_update(
             and (dim, dstate, token_steps) == (64, 128, 6)
             and z is None
             and dst_state_batch_indices is None
+            and dt_softplus
             and disable_state_update
             and intermediate_states_buffer is not None
             and intermediate_state_indices is not None
