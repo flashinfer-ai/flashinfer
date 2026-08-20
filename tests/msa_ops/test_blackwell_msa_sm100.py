@@ -150,7 +150,7 @@ CASES = [
             kv_lens=[1024],
             num_q_heads=16,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=18,
             return_temperature_lse=True,
@@ -168,7 +168,7 @@ CASES = [
             kv_lens=[1024, 768],
             num_q_heads=16,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=20,
         ),
@@ -185,7 +185,7 @@ CASES = [
             seqlen_kv=128,
             num_q_heads=64,
             num_kv_heads=4,
-            topk=4,
+            topk=16,
             causal=True,
             seed=22,
         ),
@@ -202,13 +202,13 @@ CASES = [
             seqlen_kv=1024,
             num_q_heads=16,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=24,
             force_fused=True,
             use_workspace=False,
         ),
-        id="decode-flat-bf16-q4-k4",
+        id="decode-flat-bf16-q4-k16",
     ),
     pytest.param(
         _attention_case(
@@ -221,13 +221,13 @@ CASES = [
             kv_lens=[129, 257],
             num_q_heads=16,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=25,
             force_fused=True,
             use_workspace=False,
         ),
-        id="decode-flat-bf16-q4-k4-ragged-fallback",
+        id="decode-flat-bf16-q4-k16-ragged",
     ),
     pytest.param(
         _attention_case(
@@ -240,13 +240,13 @@ CASES = [
             seqlen_kv=4096,
             num_q_heads=16,
             num_kv_heads=1,
-            topk=32,
+            topk=16,
             causal=True,
             seed=26,
             force_fused=True,
             use_workspace=False,
         ),
-        id="decode-flat-bf16-q8-k32",
+        id="decode-flat-bf16-q8-k16",
     ),
     pytest.param(
         _attention_case(
@@ -259,7 +259,7 @@ CASES = [
             seqlen_kv=1024,
             num_q_heads=16,
             num_kv_heads=1,
-            topk=8,
+            topk=16,
             causal=True,
             seed=28,
             force_fused=True,
@@ -295,7 +295,7 @@ CASES = [
             q_offset=[3200],
             num_q_heads=8,
             num_kv_heads=2,
-            topk=8,
+            topk=16,
             causal=False,
             seed=23,
         ),
@@ -312,7 +312,7 @@ CASES = [
             q_offset=[0],
             num_q_heads=1,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=29,
             return_temperature_lse=True,
@@ -384,7 +384,7 @@ CASES = [
             kv_lens=[512, 384],
             num_q_heads=8,
             num_kv_heads=2,
-            topk=4,
+            topk=16,
             causal=True,
             seed=38,
             force_fused=False,
@@ -438,7 +438,7 @@ CASES = [
             kv_lens=[257, 129],
             num_q_heads=4,
             num_kv_heads=2,
-            topk=4,
+            topk=16,
             causal=True,
             seed=47,
         ),
@@ -454,7 +454,7 @@ CASES = [
             kv_lens=[385],
             num_q_heads=16,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=49,
         ),
@@ -470,7 +470,7 @@ CASES = [
             kv_lens=[257],
             num_q_heads=4,
             num_kv_heads=2,
-            topk=4,
+            topk=16,
             causal=True,
             seed=51,
         ),
@@ -486,7 +486,7 @@ CASES = [
             kv_lens=[385],
             num_q_heads=8,
             num_kv_heads=2,
-            topk=4,
+            topk=16,
             causal=True,
             seed=53,
         ),
@@ -503,7 +503,7 @@ CASES = [
             kv_lens=[129, 257],
             num_q_heads=8,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=55,
             force_fused=False,
@@ -521,7 +521,7 @@ CASES = [
             kv_lens=[129, 257],
             num_q_heads=8,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=57,
             force_fused=False,
@@ -539,7 +539,7 @@ CASES = [
             kv_lens=[257, 129],
             num_q_heads=8,
             num_kv_heads=1,
-            topk=4,
+            topk=16,
             causal=True,
             seed=59,
             force_fused=True,
@@ -981,111 +981,6 @@ def _invoke_attention(
     if isinstance(value, tuple):
         return value
     return (value,)
-
-
-@pytest.mark.parametrize(
-    ("seqlen_q", "kv_lens"),
-    [
-        pytest.param(4, [1024] * 8, id="q4-kv1024"),
-        pytest.param(8, [4096] * 8, id="q8-kv4096"),
-    ],
-)
-def test_eager_decode_route_uses_m64_for_block_aligned_kv(
-    seqlen_q: int, kv_lens: list[int]
-) -> None:
-    device = _require_supported_gpu()
-    from flashinfer.msa_ops._blackwell_sm100 import _select_decode_route
-
-    q = torch.empty(
-        (len(kv_lens) * seqlen_q, 16, HEAD_DIM),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    k = torch.empty((sum(kv_lens), 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    cu_k = _indptr(kv_lens, device)
-    lengths = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-
-    route = _select_decode_route(
-        q=q,
-        k=k,
-        cu_k=cu_k,
-        kv_lens=lengths,
-        group_size=16,
-        seqlen_q=seqlen_q,
-        paged=False,
-        force_fused=True,
-        workspace=None,
-        route_key=("block-aligned-m64", seqlen_q),
-        capturing=False,
-    )
-
-    assert route == ("m64", False, None)
-
-
-@pytest.mark.parametrize(
-    "kv_lens",
-    [
-        pytest.param([129, 257], id="ragged"),
-        pytest.param([129, 127], id="aligned-total-ragged-sequences"),
-        pytest.param([65 * BLOCK_SIZE], id="over-64-block-limit"),
-    ],
-)
-def test_eager_decode_route_uses_m128_outside_m64_domain(
-    kv_lens: list[int],
-) -> None:
-    device = _require_supported_gpu()
-    from flashinfer.msa_ops._blackwell_sm100 import _select_decode_route
-
-    q = torch.empty(
-        (len(kv_lens) * 4, 16, HEAD_DIM), dtype=torch.bfloat16, device=device
-    )
-    k = torch.empty((sum(kv_lens), 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    cu_k = _indptr(kv_lens, device)
-    lengths = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-
-    route = _select_decode_route(
-        q=q,
-        k=k,
-        cu_k=cu_k,
-        kv_lens=lengths,
-        group_size=16,
-        seqlen_q=4,
-        paged=False,
-        force_fused=True,
-        workspace=None,
-        route_key=("outside-m64-domain", tuple(kv_lens)),
-        capturing=False,
-    )
-
-    assert route == ("m128", False, None)
-
-
-def test_cuda_graph_decode_route_uses_m128() -> None:
-    device = _require_supported_gpu()
-    from flashinfer.msa_ops import MSASparseAttentionWorkspace
-    from flashinfer.msa_ops._blackwell_sm100 import _select_decode_route
-
-    workspace = MSASparseAttentionWorkspace(device)
-    q = torch.empty((4, 16, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    k = torch.empty((4096, 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    cu_k = torch.tensor([0, 4096], dtype=torch.int32, device=device)
-    kv_lens = torch.tensor([4096], dtype=torch.int32, device=device)
-
-    route, persistent_unsplit, path_force_fused = _select_decode_route(
-        q=q,
-        k=k,
-        cu_k=cu_k,
-        kv_lens=kv_lens,
-        group_size=16,
-        seqlen_q=4,
-        paged=False,
-        force_fused=True,
-        workspace=workspace,
-        route_key=("graph-stable-m128",),
-        capturing=False,
-    )
-
-    assert (route, persistent_unsplit, path_force_fused) == ("m128", False, None)
 
 
 @pytest.mark.parametrize("case", CASES)

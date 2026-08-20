@@ -201,6 +201,8 @@ def msa_sparse_decode_attention(
     ``seqlen_q`` query tokens (uniform across the batch) attending only the
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
+    On compute capability 10.0/10.3, ``topk`` must be 16 and Q1 through
+    multi-token decode use the direct persistent M16 path.
 
     Parameters
     ----------
@@ -260,6 +262,8 @@ def msa_sparse_decode_attention(
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
         adapts. NVFP4 KV defaults to the per-block split at every batch size
         (the in-kernel dequant favors the extra parallelism).
+        On compute capability 10.0/10.3 this argument is accepted for API
+        compatibility; the production direct-M16 route does not split.
     workspace : MSASparseAttentionWorkspace, optional
         Caller-owned storage required for CUDA graph capture on compute
         capability 10.0/10.3. Warm the workspace eagerly with the exact
@@ -269,8 +273,9 @@ def msa_sparse_decode_attention(
     Returns
     -------
     torch.Tensor or (torch.Tensor, torch.Tensor)
-        ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype; plus
-        the natural-log LSE if ``return_softmax_lse``.
+        ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype, except
+        uniform FP8 Q/K/V returns BF16; plus the natural-log LSE if
+        ``return_softmax_lse``.
     """
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_decode_attention(

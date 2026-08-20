@@ -125,6 +125,9 @@ from .flash_kda import (
     load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
 )
 from .blackwell_msa import BLACKWELL_MSA_VARIANTS as BLACKWELL_MSA_VARIANTS
+from .blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET as BLACKWELL_MSA_VARIANTS_BY_TARGET,
+)
 from .blackwell_msa import gen_blackwell_msa_module as gen_blackwell_msa_module
 from .blackwell_msa import get_blackwell_msa_module as get_blackwell_msa_module
 from .blackwell_msa import get_blackwell_msa_uri as get_blackwell_msa_uri

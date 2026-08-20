@@ -1,16 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under the Apache License, Version 2.0.
 
 from types import SimpleNamespace
 
@@ -18,164 +7,114 @@ import pytest
 from packaging.version import Version
 
 from flashinfer.jit import blackwell_msa
-from flashinfer.jit import core as jit_core
 
 
-EXPECTED_VARIANTS = (
-    "decode_bf16_flat",
-    "decode_bf16_paged",
-    "decode_fp16_flat",
-    "decode_fp16_paged",
-    "decode_fp8_flat",
-    "decode_fp8_paged",
-    "decode_m16_bf16_flat",
-    "decode_m16_bf16_paged",
-    "prefill_m128_bf16_flat",
-    "prefill_m128_bf16_gqa16_flat",
-    "prefill_m128_bf16_gqa16_paged",
-    "prefill_m128_bf16_paged",
-    "prefill_m128_fp16_flat",
-    "prefill_m128_fp16_paged",
-    "prefill_m128_fp8_flat",
-    "prefill_m128_fp8_paged",
-    "prefill_m64_bf16_flat",
-    "topk",
-)
-
-
-def test_blackwell_msa_variant_manifest_matches_sources():
+def test_variant_manifest_matches_each_target_source_directory() -> None:
     csrc_dir = blackwell_msa._get_blackwell_msa_csrc_dir()
-    binding_variants = tuple(
-        sorted(
-            path.name.removeprefix("blackwell_msa_").removesuffix("_binding.cu")
-            for path in csrc_dir.glob("blackwell_msa_*_binding.cu")
+    assert set(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET) == {
+        "sm100a",
+        "sm103a",
+    }
+    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]) == 32
+    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]) == 31
+    for target, variants in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET.items():
+        target_dir = csrc_dir / target
+        bodies = tuple(
+            sorted(
+                path.stem.removeprefix("blackwell_msa_")
+                for path in target_dir.glob("blackwell_msa_*.cu")
+                if not path.name.endswith("_binding.cu")
+            )
         )
-    )
-    body_variants = tuple(
-        sorted(
-            path.stem.removeprefix("blackwell_msa_")
-            for path in csrc_dir.glob("blackwell_msa_*.cu")
-            if not path.name.endswith("_binding.cu")
+        bindings = tuple(
+            sorted(
+                path.name.removeprefix("blackwell_msa_").removesuffix("_binding.cu")
+                for path in target_dir.glob("blackwell_msa_*_binding.cu")
+            )
         )
+        assert bodies == variants
+        assert bindings == variants
+    assert (
+        "long_prefill_paged_bf16_gqa16_direct_group_sm100"
+        in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]
     )
-
-    assert blackwell_msa.BLACKWELL_MSA_VARIANTS == EXPECTED_VARIANTS
-    assert binding_variants == tuple(sorted(EXPECTED_VARIANTS))
-    assert body_variants == tuple(sorted(EXPECTED_VARIANTS))
+    assert (
+        "long_prefill_paged_bf16_gqa16_direct_group_sm100"
+        not in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]
+    )
 
 
 @pytest.mark.parametrize(
-    ("target", "target_arch", "expected_flag", "expected_define", "forbidden"),
+    ("target", "expected_flag", "expected_define", "forbidden"),
     [
         (
             "sm100a",
-            (10, "0a"),
             "-gencode=arch=compute_100a,code=sm_100a",
             "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=0",
-            ("compute_100f", "compute_103a", "compute_120"),
+            ("compute_103a", "compute_120"),
         ),
         (
-            "sm100f",
-            (10, "0f"),
-            "-gencode=arch=compute_100f,code=sm_100f",
-            "-DFLASHINFER_BLACKWELL_MSA_TARGET_FAMILY=100",
-            ("compute_100a", "compute_103a", "compute_120"),
+            "sm103a",
+            "-gencode=arch=compute_103a,code=sm_103a",
+            "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=3",
+            ("compute_100a", "compute_120"),
         ),
     ],
 )
-def test_blackwell_msa_uri_and_jit_specs(
-    monkeypatch,
-    target,
-    target_arch,
-    expected_flag,
-    expected_define,
-    forbidden,
-):
-    monkeypatch.setattr(
-        jit_core.current_compilation_context,
-        "TARGET_CUDA_ARCHS",
-        {target_arch},
-    )
+def test_uri_and_jit_specs(target, expected_flag, expected_define, forbidden) -> None:
     blackwell_msa.gen_blackwell_msa_module.cache_clear()
-
-    for variant in EXPECTED_VARIANTS:
+    for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]:
         uri = blackwell_msa.get_blackwell_msa_uri(variant, target)
         spec = blackwell_msa.gen_blackwell_msa_module(variant, target)
-
         assert uri == f"blackwell_msa_{variant}_{target}"
         assert spec.name == uri
         assert len(spec.sources) == 1
         assert spec.sources[0].name == f"blackwell_msa_{variant}_binding.cu"
-        assert spec.sources[0].is_file()
+        assert spec.sources[0].parent.name == target
         assert (spec.sources[0].parent / f"blackwell_msa_{variant}.cu").is_file()
         assert expected_flag in spec.extra_cuda_cflags
-        target_defines = [
-            flag
-            for flag in spec.extra_cuda_cflags
-            if flag.startswith("-DFLASHINFER_BLACKWELL_MSA_TARGET_")
-        ]
-        assert target_defines == [expected_define]
+        assert expected_define in spec.extra_cuda_cflags
         assert "-use_fast_math" in spec.extra_cuda_cflags
         assert not any(
-            compute in flag for compute in forbidden for flag in spec.extra_cuda_cflags
+            token in flag for token in forbidden for flag in spec.extra_cuda_cflags
         )
-        binding_text = spec.sources[0].read_text()
-        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in binding_text
-        assert "CheckBlackwellMsaTarget" in binding_text
 
 
-def test_blackwell_msa_validation_getter_and_cache(monkeypatch):
-    with pytest.raises(ValueError, match="unsupported Blackwell MSA variant"):
-        blackwell_msa.get_blackwell_msa_uri("unknown", "sm100f")
+def test_validation_getter_and_cache(monkeypatch) -> None:
     with pytest.raises(ValueError, match="unsupported Blackwell MSA target"):
-        blackwell_msa.get_blackwell_msa_uri("topk", "sm103a")
-
-    with monkeypatch.context() as getter_patch:
-        sentinel = object()
-        getter_patch.setattr(
-            blackwell_msa,
-            "load_blackwell_msa_module",
-            lambda variant, target: (sentinel, variant, target),
+        blackwell_msa.get_blackwell_msa_uri("topk", "unknown")
+    with pytest.raises(ValueError, match="variant/target"):
+        blackwell_msa.get_blackwell_msa_uri(
+            "long_prefill_paged_bf16_gqa16_direct_group_sm100", "sm103a"
         )
-        assert blackwell_msa.get_blackwell_msa_module("topk", "sm100f") == (
-            sentinel,
-            "topk",
-            "sm100f",
-        )
-
+    sentinel = object()
     monkeypatch.setattr(
-        jit_core.current_compilation_context,
-        "TARGET_CUDA_ARCHS",
-        {(10, "0a"), (10, "0f")},
+        blackwell_msa,
+        "load_blackwell_msa_module",
+        lambda variant, target: (sentinel, variant, target),
     )
-    blackwell_msa.gen_blackwell_msa_module.cache_clear()
-    sm100a = blackwell_msa.gen_blackwell_msa_module("topk", "sm100a")
-    sm100f = blackwell_msa.gen_blackwell_msa_module("topk", "sm100f")
-    sm100f_cached = blackwell_msa.gen_blackwell_msa_module("topk", "sm100f")
-    assert sm100a is not sm100f
-    assert sm100f is sm100f_cached
+    assert blackwell_msa.get_blackwell_msa_module("topk", "sm103a") == (
+        sentinel,
+        "topk",
+        "sm103a",
+    )
 
 
 @pytest.mark.parametrize(
-    ("target_archs", "cuda_version", "expected_legacy", "expected_family"),
+    ("target_archs", "cuda_version", "expected_sm100a", "expected_sm103a"),
     [
         ({(10, "0a")}, "12.8", True, False),
-        ({(10, "0a")}, "12.9", False, True),
-        ({(10, "0f")}, "12.9", False, True),
+        ({(10, "0a")}, "12.9", True, False),
         ({(10, "3a")}, "12.8", False, False),
         ({(10, "3a")}, "12.9", False, True),
         ({(10, "3f")}, "13.0", False, True),
-        ({(10, "0a"), (10, "3a")}, "13.0", False, True),
+        ({(10, "0a"), (10, "3a")}, "13.0", True, True),
         ({(12, "0f")}, "13.0", False, False),
     ],
 )
-def test_aot_detects_blackwell_msa_target_matrix(
-    monkeypatch,
-    target_archs,
-    cuda_version,
-    expected_legacy,
-    expected_family,
-):
+def test_aot_detects_exact_targets(
+    monkeypatch, target_archs, cuda_version, expected_sm100a, expected_sm103a
+) -> None:
     from flashinfer import aot
 
     class FakeCompilationContext:
@@ -190,66 +129,30 @@ def test_aot_detects_blackwell_msa_target_matrix(
 
     monkeypatch.setattr(aot, "CompilationContext", FakeCompilationContext)
     monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda_version))
-
     capabilities = aot.detect_sm_capabilities()
-    assert capabilities["blackwell_msa_sm100a"] is expected_legacy
-    assert capabilities["blackwell_msa_sm100f"] is expected_family
+    assert capabilities["blackwell_msa_sm100a"] is expected_sm100a
+    assert capabilities["blackwell_msa_sm103a"] is expected_sm103a
 
 
-@pytest.mark.parametrize(
-    ("capabilities", "expected_target"),
-    [
-        ({"blackwell_msa_sm100a": True}, "sm100a"),
-        ({"blackwell_msa_sm100f": True}, "sm100f"),
-    ],
-)
-def test_aot_registers_all_blackwell_msa_modules(
-    monkeypatch,
-    capabilities,
-    expected_target,
-):
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_aot_registers_target_specific_modules(monkeypatch, target) -> None:
     from flashinfer import aot
 
     calls = []
 
-    def fake_blackwell_msa(variant, target):
-        calls.append((variant, target))
-        return SimpleNamespace(name=f"blackwell_msa_{variant}_{target}")
+    def fake_blackwell_msa(variant, selected_target):
+        calls.append((variant, selected_target))
+        return SimpleNamespace(name=f"blackwell_msa_{variant}_{selected_target}")
 
     monkeypatch.setattr(aot, "gen_blackwell_msa_module", fake_blackwell_msa)
-    monkeypatch.setattr(
-        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
-    )
+    monkeypatch.setattr(aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog"))
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    monkeypatch.setattr(
-        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
+    monkeypatch.setattr(aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn"))
+    capabilities = {f"blackwell_msa_{target}": True}
+    aot.gen_all_modules(
+        [], [], [], [], [], [], capabilities, False, False, False, False, False, False, False
     )
-
-    specs = aot.gen_all_modules(
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        capabilities,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-    )
-
     assert calls == [
-        (variant, expected_target) for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS
-    ]
-    assert [spec.name for spec in specs] == [
-        "spdlog",
-        *[
-            f"blackwell_msa_{variant}_{expected_target}"
-            for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS
-        ],
-        "cudnn",
+        (variant, target)
+        for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]
     ]

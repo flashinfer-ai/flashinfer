@@ -24,59 +24,118 @@ from .core import (
     gen_jit_spec,
     logger,
     sm100a_nvcc_flags,
-    sm100f_nvcc_flags,
+    sm103a_nvcc_flags,
 )
 
 BlackwellMSAVariant = Literal[
-    "decode_bf16_flat",
-    "decode_bf16_paged",
-    "decode_fp16_flat",
-    "decode_fp16_paged",
-    "decode_fp8_flat",
-    "decode_fp8_paged",
     "decode_m16_bf16_flat",
     "decode_m16_bf16_paged",
-    "prefill_m128_bf16_flat",
-    "prefill_m128_bf16_gqa16_flat",
-    "prefill_m128_bf16_gqa16_paged",
-    "prefill_m128_bf16_paged",
-    "prefill_m128_fp16_flat",
-    "prefill_m128_fp16_paged",
-    "prefill_m128_fp8_flat",
-    "prefill_m128_fp8_paged",
-    "prefill_m64_bf16_flat",
+    "decode_m16_bf16_query_fp8_kv_flat",
+    "decode_m16_bf16_query_fp8_kv_paged",
+    "decode_m16_fp16_flat",
+    "decode_m16_fp16_paged",
+    "decode_q1_bf16_query_fp8_kv_exact_flat",
+    "decode_q1_bf16_query_fp8_kv_exact_paged",
+    "decode_q1_bf16_query_fp8_kv_xform2_flat",
+    "decode_q1_bf16_query_fp8_kv_xform2_paged",
+    "decode_uniform_fp8_qkv_paged",
+    "long_prefill_flat_bf16_gqa16_sm100",
+    "long_prefill_flat_bf16_gqa16_sm103",
+    "long_prefill_paged_bf16_gqa16_direct_group_sm100",
+    "long_prefill_paged_bf16_gqa16_sm100",
+    "long_prefill_paged_bf16_gqa16_sm103",
+    "long_prefill_paged_bf16_gqa8_sm100",
+    "long_prefill_paged_bf16_gqa8_sm103",
+    "long_prefill_reduce_flat_bf16_gqa16",
+    "long_prefill_reduce_paged_bf16_gqa16",
+    "long_prefill_reduce_paged_bf16_gqa8",
+    "prefill_m64_bf16_gqa16_flat",
+    "prefill_union_bf16_flat",
+    "prefill_union_bf16_gqa16_flat",
+    "prefill_union_bf16_gqa16_paged_causal_large",
+    "prefill_union_bf16_gqa16_paged_causal_mask64",
+    "prefill_union_bf16_gqa16_paged_noncausal",
+    "prefill_union_bf16_gqa8_flat",
+    "prefill_union_bf16_gqa8_paged",
+    "prefill_union_bf16_paged",
+    "prefill_union_bf16_query_fp8_kv_flat",
+    "prefill_union_bf16_query_fp8_kv_paged",
+    "prefill_union_fp16_flat",
+    "prefill_union_fp16_paged",
     "topk",
 ]
-BlackwellMSATarget = Literal["sm100a", "sm100f"]
+BlackwellMSATarget = Literal["sm100a", "sm103a"]
 
-BLACKWELL_MSA_VARIANTS: tuple[BlackwellMSAVariant, ...] = (
-    "decode_bf16_flat",
-    "decode_bf16_paged",
-    "decode_fp16_flat",
-    "decode_fp16_paged",
-    "decode_fp8_flat",
-    "decode_fp8_paged",
+_COMMON_VARIANTS: tuple[BlackwellMSAVariant, ...] = (
     "decode_m16_bf16_flat",
     "decode_m16_bf16_paged",
-    "prefill_m128_bf16_flat",
-    "prefill_m128_bf16_gqa16_flat",
-    "prefill_m128_bf16_gqa16_paged",
-    "prefill_m128_bf16_paged",
-    "prefill_m128_fp16_flat",
-    "prefill_m128_fp16_paged",
-    "prefill_m128_fp8_flat",
-    "prefill_m128_fp8_paged",
-    "prefill_m64_bf16_flat",
+    "decode_m16_bf16_query_fp8_kv_flat",
+    "decode_m16_bf16_query_fp8_kv_paged",
+    "decode_m16_fp16_flat",
+    "decode_m16_fp16_paged",
+    "decode_q1_bf16_query_fp8_kv_exact_flat",
+    "decode_q1_bf16_query_fp8_kv_exact_paged",
+    "decode_q1_bf16_query_fp8_kv_xform2_flat",
+    "decode_q1_bf16_query_fp8_kv_xform2_paged",
+    "decode_uniform_fp8_qkv_paged",
+    "long_prefill_reduce_flat_bf16_gqa16",
+    "long_prefill_reduce_paged_bf16_gqa16",
+    "long_prefill_reduce_paged_bf16_gqa8",
+    "prefill_m64_bf16_gqa16_flat",
+    "prefill_union_bf16_flat",
+    "prefill_union_bf16_gqa16_flat",
+    "prefill_union_bf16_gqa16_paged_causal_large",
+    "prefill_union_bf16_gqa16_paged_causal_mask64",
+    "prefill_union_bf16_gqa16_paged_noncausal",
+    "prefill_union_bf16_gqa8_flat",
+    "prefill_union_bf16_gqa8_paged",
+    "prefill_union_bf16_paged",
+    "prefill_union_bf16_query_fp8_kv_flat",
+    "prefill_union_bf16_query_fp8_kv_paged",
+    "prefill_union_fp16_flat",
+    "prefill_union_fp16_paged",
     "topk",
+)
+
+BLACKWELL_MSA_VARIANTS_BY_TARGET: dict[
+    BlackwellMSATarget, tuple[BlackwellMSAVariant, ...]
+] = {
+    "sm100a": tuple(
+        sorted(
+            (
+                *_COMMON_VARIANTS,
+                "long_prefill_flat_bf16_gqa16_sm100",
+                "long_prefill_paged_bf16_gqa16_direct_group_sm100",
+                "long_prefill_paged_bf16_gqa16_sm100",
+                "long_prefill_paged_bf16_gqa8_sm100",
+            )
+        )
+    ),
+    "sm103a": tuple(
+        sorted(
+            (
+                *_COMMON_VARIANTS,
+                "long_prefill_flat_bf16_gqa16_sm103",
+                "long_prefill_paged_bf16_gqa16_sm103",
+                "long_prefill_paged_bf16_gqa8_sm103",
+            )
+        )
+    ),
+}
+BLACKWELL_MSA_VARIANTS: tuple[BlackwellMSAVariant, ...] = tuple(
+    sorted(
+        set(BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"])
+        | set(BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"])
+    )
 )
 
 _BLACKWELL_MSA_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
-    "sm100f": sm100f_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
 }
 _BLACKWELL_MSA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=0",
-    "sm100f": "-DFLASHINFER_BLACKWELL_MSA_TARGET_FAMILY=100",
+    "sm103a": "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=3",
 }
 
 
@@ -118,22 +177,23 @@ def _get_blackwell_msa_include_dir() -> Path:
 def get_blackwell_msa_uri(variant: BlackwellMSAVariant, target: BlackwellMSATarget) -> str:
     """Return the target-specific JIT/AOT key for one Blackwell MSA variant."""
 
-    if variant not in BLACKWELL_MSA_VARIANTS:
-        raise ValueError(f"unsupported Blackwell MSA variant: {variant}")
     if target not in _BLACKWELL_MSA_NVCC_FLAGS:
         raise ValueError(f"unsupported Blackwell MSA target: {target}")
+    if variant not in BLACKWELL_MSA_VARIANTS_BY_TARGET[target]:
+        raise ValueError(f"unsupported Blackwell MSA variant/target: {variant}/{target}")
     return f"blackwell_msa_{variant}_{target}"
 
 
 @functools.cache
 def gen_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSATarget) -> JitSpec:
-    """Generate one exact-SM100a or SM100-family Blackwell MSA JIT module."""
+    """Generate one exact-SM100a or exact-SM103a Blackwell MSA JIT module."""
 
     csrc_dir = _get_blackwell_msa_csrc_dir()
     include_dir = _get_blackwell_msa_include_dir()
     uri = get_blackwell_msa_uri(variant, target)
-    body = csrc_dir / f"blackwell_msa_{variant}.cu"
-    binding = csrc_dir / f"blackwell_msa_{variant}_binding.cu"
+    target_dir = csrc_dir / target
+    body = target_dir / f"blackwell_msa_{variant}.cu"
+    binding = target_dir / f"blackwell_msa_{variant}_binding.cu"
     if not body.exists():
         raise FileNotFoundError(f"Blackwell MSA CUDA source not found: {body}")
     if not binding.exists():
@@ -147,7 +207,7 @@ def gen_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSAT
             _BLACKWELL_MSA_TARGET_DEFINE[target],
         ],
         extra_include_paths=[
-            csrc_dir,
+            target_dir,
             csrc_dir.parent,
             include_dir,
         ],
@@ -173,6 +233,7 @@ def get_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSAT
 
 __all__ = [
     "BLACKWELL_MSA_VARIANTS",
+    "BLACKWELL_MSA_VARIANTS_BY_TARGET",
     "BlackwellMSATarget",
     "BlackwellMSAVariant",
     "gen_blackwell_msa_module",

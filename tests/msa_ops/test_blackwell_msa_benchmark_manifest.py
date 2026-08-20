@@ -1,4 +1,4 @@
-"""CPU-only contract tests for the frozen SM100/SM103 MSA benchmark matrix."""
+"""CPU-only contract tests for the SM100/SM103 TopK16 serving portfolio."""
 
 from argparse import Namespace
 from dataclasses import FrozenInstanceError, replace
@@ -9,7 +9,7 @@ import torch
 from benchmarks import bench_blackwell_msa_sm100 as benchmark
 
 
-def test_manifest_freezes_all_thirteen_rows():
+def test_manifest_freezes_the_serving_portfolio():
     stable_ids = tuple(shape.stable_id for shape in benchmark.SHAPE_MANIFEST)
 
     assert stable_ids == benchmark.FROZEN_SHAPE_IDS
@@ -60,10 +60,10 @@ def test_manifest_covers_audited_shape_axes_and_route_complements():
     shapes = benchmark.SHAPE_MANIFEST
 
     assert {shape.kv_layout for shape in shapes} == {"flat_varlen", "paged"}
-    assert {shape.topk for shape in shapes} == {4, 8, 16, 32}
+    assert {shape.topk for shape in shapes} == {16}
     assert {shape.batch_size for shape in shapes}.issuperset({1, 2, 3, 32, 64, 128})
     assert {shape.seqlen_q for shape in shapes}.issuperset({1, 4, 8, 16, 1024, 4096})
-    assert {shape.seqlen_kv for shape in shapes}.issuperset({257, 4096, 8192, 65536})
+    assert {shape.seqlen_kv for shape in shapes}.issuperset({1921, 4096, 8192, 65536})
     assert {shape.num_q_heads // shape.num_kv_heads for shape in shapes}.issuperset(
         {4, 8, 16}
     )
@@ -111,7 +111,7 @@ def test_public_shape_schema_exposes_stable_metadata():
 
 
 def test_paged_cache_builder_pads_partial_final_page_without_changing_tokens():
-    seqlen_kv = 257
+    seqlen_kv = 1921
     num_kv_heads = 1
     head_dim = 2
     block_size = 128
@@ -140,10 +140,10 @@ def test_independent_reference_is_layout_invariant_for_partial_fp16_page():
     common = {
         "batch_size": 1,
         "seqlen_q": 2,
-        "seqlen_kv": 129,
+        "seqlen_kv": 1921,
         "num_q_heads": 2,
         "num_kv_heads": 1,
-        "topk": 4,
+        "topk": 16,
     }
     flat = replace(base, kv_layout="flat_varlen", **common)
     paged = replace(base, kv_layout="paged", **common)

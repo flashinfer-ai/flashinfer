@@ -35,6 +35,13 @@ SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
 only. NVFP4 K/V and views split from a packed paged K/V cache are also
 SM120/SM121-only; the compute capability 10.0/10.3 attention backend requires
 separate contiguous K and V tensors and does not make implicit copies.
+The compute capability 10.0/10.3 backend implements the production TopK16
+contract. Its decode path uses direct persistent M16 ownership for both Q1 and
+multi-token decode; it does not route BF16 decode through prefill or split-K.
+Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
+kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
+BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
+producer and deterministic reduction once the query reaches 8192 tokens.
 Call :func:`flashinfer.msa_ops.supports_packed_kv` with the active device when
 integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.

@@ -71,7 +71,7 @@ def msa_sparse_attention(
     ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
     ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
     Packed NVFP4 is SM120/SM121-only; compute capability 10.0/10.3 supports
-    bf16/fp16 K/V and E4M3 K/V with bf16 Q.
+    bf16/fp16 K/V and E4M3 K/V with bf16 Q, and requires ``topk == 16``.
 
     Parameters
     ----------

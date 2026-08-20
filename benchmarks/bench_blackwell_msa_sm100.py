@@ -19,11 +19,9 @@ Each measured backend/shape pair runs in a fresh process because
 samples.  Timings are cold-L2 spans from the first to the last correlated GPU
 activity (kernel, memcpy, or memset) launched by exactly one public API call.
 Each comparable row is first checked in another isolated process that invokes
-both public APIs on the same tensor objects.  Correctness and performance are
-driven by the same frozen 13-row manifest below. The first six rows preserve
-the original production cases; the remaining rows freeze coverage selected
-from the pinned MiniMax benchmark/correctness suites and FlashInfer boundary
-tests.
+both public APIs on the same tensor objects. Correctness and performance use a
+stable TopK16 serving portfolio below. Complete source-dispatch coverage is
+tracked separately by ``csrc/blackwell_msa/route_manifest.json``.
 
 The pinned MiniMax public sparse-forward API supports BF16 and FP8 E4M3
 storage, but not FP16 input, so FP16 rows are reported explicitly as
@@ -75,7 +73,7 @@ CORRECTNESS_TOLERANCES = {
     "float8_e4m3fn": {"atol": 0.1, "rtol": 0.1},
 }
 
-MANIFEST_VERSION = "msa-sm100-sm103-v2"
+MANIFEST_VERSION = "msa-sm100-sm103-topk16-v3"
 MINIMAX_BENCHMARK_PROVENANCE = (
     "MiniMax-AI/MSA@80434d7f benchmarks/bench_sparse_attention_ops.py:421-528"
 )
@@ -130,12 +128,12 @@ FROZEN_SHAPE_IDS = (
     "decode_fp16_b128_q1_kv4096_h64",
     "decode_fp8_b128_q1_kv4096_h64",
     "official_decode_bf16_b32_q8_kv8192_h64_hkv4_k16_paged",
-    "official_decode_bf16_b64_q8_kv65536_h64_hkv4_k32_paged",
-    "official_prefill_mixed_fp8_b3_q1024_kv8192_h32_hkv2_k8_flat",
-    "official_prefill_bf16_b3_q4096_kv8192_h8_hkv2_k4_paged",
+    "official_decode_bf16_b64_q8_kv65536_h64_hkv4_k16_paged",
+    "official_prefill_mixed_fp8_b3_q1024_kv8192_h32_hkv2_k16_flat",
+    "official_prefill_bf16_b3_q4096_kv8192_h8_hkv2_k16_paged",
     "coverage_decode_fp16_b32_q4_kv8192_h64_hkv4_k16_paged",
     "coverage_decode_mixed_fp8_b32_q1_kv8192_h64_hkv4_k16_flat",
-    "boundary_decode_bf16_b2_q1_kv257_h8_hkv1_k4_paged",
+    "boundary_decode_bf16_b2_q1_kv1921_h8_hkv1_k16_paged",
 )
 
 _PRODUCTION = {
@@ -267,8 +265,8 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         source="minimax_official_sparse_decode_benchmark",
         provenance=MINIMAX_BENCHMARK_PROVENANCE,
         selection_rationale=(
-            "Official long-KV decode coordinate with the documented TopK32 "
-            "option; covers B64, KV65536, and the largest supported TopK."
+            "Long-KV TopK16 decode coordinate covering B64, Q8, KV65536, "
+            "and the paged direct-M16 serving route."
         ),
         operation="sparse_decode",
         batch_size=64,
@@ -279,7 +277,7 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         kv_layout="paged",
         num_q_heads=64,
         num_kv_heads=4,
-        topk=32,
+        topk=16,
         causal=True,
         force_fused=True,
         seed=67,
@@ -291,8 +289,8 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         source="minimax_official_mixed_fp8_correctness",
         provenance=MINIMAX_CORRECTNESS_PROVENANCE,
         selection_rationale=(
-            "Exact nominal coordinate from the official BF16-query/FP8-KV "
-            "matrix; adds asymmetric prefill, TP2 heads, TopK8, and flat FP8."
+            "BF16-query/FP8-KV asymmetric prefill coordinate covering TP2 "
+            "heads, TopK16, and flat FP8 storage."
         ),
         operation="sparse_prefill",
         batch_size=3,
@@ -303,7 +301,7 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         kv_layout="flat_varlen",
         num_q_heads=32,
         num_kv_heads=2,
-        topk=8,
+        topk=16,
         causal=True,
         force_fused=None,
         seed=71,
@@ -315,8 +313,8 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         source="minimax_official_paged_correctness",
         provenance=MINIMAX_CORRECTNESS_PROVENANCE,
         selection_rationale=(
-            "Nominal official paged-correctness coordinate chosen to add GQA4, "
-            "TopK4, batched asymmetric prefill, and a non-GQA16 route."
+            "Paged correctness coordinate covering GQA4, TopK16, batched "
+            "asymmetric prefill, and a non-GQA16 route."
         ),
         operation="sparse_prefill",
         batch_size=3,
@@ -327,7 +325,7 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         kv_layout="paged",
         num_q_heads=8,
         num_kv_heads=2,
-        topk=4,
+        topk=16,
         causal=True,
         force_fused=None,
         seed=73,
@@ -362,8 +360,8 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         tier="flashinfer_coverage",
         source="production_fp8_layout_complement",
         provenance=(
-            "csrc/blackwell_msa/blackwell_msa_decode_fp8_flat.cu and "
-            "MiniMax-AI/MSA@80434d7f mixed-FP8 correctness matrix"
+            "csrc/blackwell_msa/route_manifest.json::"
+            "direct_m16_decode.bf16_query_fp8_kv_flat"
         ),
         selection_rationale=(
             "Complements the production paged FP8 decode row so the distinct "
@@ -392,19 +390,19 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
             "tests/msa_ops/test_blackwell_msa_sm100.py::decode-paged-bf16-m16-ragged"
         ),
         selection_rationale=(
-            "Freezes a partial-final-page boundary where only three blocks are "
-            "valid for TopK4; exercises -1 padding and the paged M16 tail path."
+            "Freezes a partial-final-page boundary with 16 selected blocks; "
+            "exercises the paged direct-M16 tail path."
         ),
         operation="sparse_decode",
         batch_size=2,
         seqlen_q=1,
-        seqlen_kv=257,
+        seqlen_kv=1921,
         q_dtype="bfloat16",
         kv_dtype="bfloat16",
         kv_layout="paged",
         num_q_heads=8,
         num_kv_heads=1,
-        topk=4,
+        topk=16,
         causal=True,
         force_fused=True,
         seed=89,
@@ -416,7 +414,7 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
 def _validate_shape_manifest(shapes: tuple[MSAShape, ...]) -> None:
     stable_ids = tuple(shape.stable_id for shape in shapes)
     if stable_ids != FROZEN_SHAPE_IDS:
-        raise ValueError("the frozen 13-shape manifest must not change")
+        raise ValueError("the stable TopK16 serving portfolio must not change")
     if len(set(stable_ids)) != len(stable_ids):
         raise ValueError("MSA shape stable IDs must be unique")
 
@@ -451,8 +449,8 @@ def _validate_shape_manifest(shapes: tuple[MSAShape, ...]) -> None:
         group_size = shape.num_q_heads // shape.num_kv_heads
         if not 1 <= group_size <= 16:
             raise ValueError(f"GQA group size out of range in {shape.stable_id}")
-        if shape.topk not in {4, 8, 16, 32}:
-            raise ValueError(f"unsupported TopK in {shape.stable_id}")
+        if shape.topk != 16:
+            raise ValueError(f"Blackwell MSA requires TopK16 in {shape.stable_id}")
         if shape.head_dim != HEAD_DIM or shape.block_size != BLOCK_SIZE:
             raise ValueError(f"MSA requires D128/block128 in {shape.stable_id}")
         if (
