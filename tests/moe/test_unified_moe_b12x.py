@@ -402,6 +402,33 @@ class TestB12xUnifiedValidation:
         assert runner.forward([hidden, expert_ids, routing_weights]) is hidden
         assert calls["fc2_input_scale"] is prepared.get("fc2_input_scale")
 
+    @pytest.mark.parametrize("bad_key", ("w1_weight", "w2_weight"))
+    def test_b12x_pack_inputs_rejects_wrong_expert_dim(self, bad_key):
+        local_num_experts = 4
+        view = {
+            "w1_weight": torch.empty(local_num_experts, 32, 8, dtype=torch.uint8),
+            "w1_weight_sf": torch.empty(local_num_experts, 32, 1),
+            "w1_alpha": torch.ones(local_num_experts),
+            "w2_weight": torch.empty(local_num_experts, 16, 8, dtype=torch.uint8),
+            "w2_weight_sf": torch.empty(local_num_experts, 16, 1),
+            "w2_alpha": torch.ones(local_num_experts),
+        }
+        view[bad_key] = view[bad_key][: local_num_experts - 1]
+        weights = MoEWeightPack()
+        weights.prepare_for(B12xW4A16Runner.backend_key, view)
+
+        runner = object.__new__(B12xW4A16Runner)
+        runner._built = True
+        runner._local_num_experts = local_num_experts
+        act = MoEActivationPack(
+            hidden_states_q=torch.empty(1, 16),
+            hidden_states_scale=None,
+            topk_ids=torch.zeros(1, 2, dtype=torch.int32),
+            topk_weights=torch.ones(1, 2),
+        )
+        with pytest.raises(ValueError, match=f"{bad_key} prepared"):
+            runner.pack_inputs(act, weights)
+
 
 # ---------------------------------------------------------------------------
 # SM120/SM121 b12x conformance

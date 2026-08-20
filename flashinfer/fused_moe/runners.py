@@ -2784,12 +2784,14 @@ class _B12xRunner(MoERunner):
         self._require_built()
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
-        first_weight = v[self.required_weight_keys[0]]
-        if first_weight.shape[0] != self._local_num_experts:
-            raise ValueError(
-                f"{self.backend_key} prepared {first_weight.shape[0]} "
-                f"experts, expected {self._local_num_experts} rank-local ones."
-            )
+        # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
+        for key in ("w1_weight", "w2_weight"):
+            prepared_experts = v[key].shape[0]
+            if prepared_experts != self._local_num_experts:
+                raise ValueError(
+                    f"{self.backend_key} {key} prepared {prepared_experts} "
+                    f"experts, expected {self._local_num_experts} rank-local ones."
+                )
 
         hidden_states = act.hidden_states_q
         if hidden_states.dtype != torch.bfloat16:
