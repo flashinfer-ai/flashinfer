@@ -285,13 +285,9 @@ def test_proxy_fp4_paged_varlen(Hq, Hkv, seqs_q):
     mkt = max(-(-s // BLK_KV) for s in seqs_k)
     assert out.shape == (Hq, mkt, total_q)
 
-    q_deq = (
-        _dequant_128x4(
-            q_fp4.reshape(-1, 64).cpu(), q_scale.cpu(), inv_q * inv_k, total_q * Hq
-        )
-        .reshape(total_q, Hq, 128)
-        .to(torch.bfloat16)
-    )
+    q_deq = _dequant_128x4(
+        q_fp4.reshape(-1, 64).cpu(), q_scale.cpu(), inv_q * inv_k, total_q * Hq
+    ).reshape(total_q, Hq, 128)
     # Blocks past a request's own extent stay -inf, so build the padded oracle.
     ref = torch.full((Hq, mkt, total_q), -float("inf"), dtype=torch.float32)
     for b, sk in enumerate(seqs_k):
