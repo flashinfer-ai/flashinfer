@@ -60,10 +60,7 @@ def _select_scan_route(
     promoted prefix program.
     """
 
-    shallow_varlen = (
-        mode_varlen
-        and num_logical_chunks <= num_sequences
-    )
+    shallow_varlen = mode_varlen and num_logical_chunks <= num_sequences
     if dt_min < 0.0 or not shallow_varlen:
         return _ROUTE_EXACT_SCAN
     if prefix_route_selected and nheads >= 8 * ngroups:
@@ -183,6 +180,7 @@ def _bind_prepared_sequence_arguments(
         )
     arguments.append(cuda_stream)
     return tuple(arguments)
+
 
 _PROGRAMS = {
     "metadata": (
@@ -582,8 +580,7 @@ class CakeSSDCombined:
                 "varlen mode requires seq_idx, chunk_indices, and chunk_offsets"
             )
         if not mode_varlen and (
-            any(value is not None for value in metadata)
-            or seq_chunk_cumsum is not None
+            any(value is not None for value in metadata) or seq_chunk_cumsum is not None
         ):
             raise ValueError(
                 "batched mode does not accept varlen metadata or seq_chunk_cumsum"

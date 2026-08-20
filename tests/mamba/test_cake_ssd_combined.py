@@ -358,9 +358,7 @@ def test_cake_ssd_combined_allocation_output_lifetime():
     torch.testing.assert_close(first, retained, rtol=0, atol=0)
     torch.testing.assert_close(first_final, retained_final, rtol=0, atol=0)
 
-    without_final = runner.run(
-        *tensors, **{**arguments, "return_final_states": False}
-    )
+    without_final = runner.run(*tensors, **{**arguments, "return_final_states": False})
     assert isinstance(without_final, tuple)
     assert without_final[1] is None
 
@@ -503,10 +501,7 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
     assert isinstance(first, tuple) and isinstance(second, tuple)
     assert len(runners) == 2 and runners[0] is not runners[1]
     assert all(runner.constructor_kwargs["backend"] == "cake" for runner in runners)
-    assert all(
-        runner.constructor_kwargs["state_dtype"] == torch.float16
-        for runner in runners
-    )
+    assert all(runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners)
     assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
 
 
@@ -543,9 +538,7 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     C = torch.empty_like(B)
     checkpoint_token_indices = torch.tensor([32, 64], dtype=torch.int32)
     checkpoint_state_slots = torch.tensor([0, 2], dtype=torch.int32)
-    checkpoint_states = torch.empty(
-        (3, nheads, 64, 128), dtype=torch.bfloat16
-    )
+    checkpoint_states = torch.empty((3, nheads, 64, 128), dtype=torch.bfloat16)
     runner = module.CakeSSDCombined(
         128,
         nheads,
@@ -641,18 +634,21 @@ def test_source_route_predicates_do_not_bind_program_symbols(
 
 def test_source_direct_preprocess_and_prepared_sequence_binding():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    sentinels = {name: object() for name in (
-        "dt",
-        "A",
-        "dt_bias",
-        "starts",
-        "lengths",
-        "chunk_indices",
-        "chunk_offsets",
-        "delta",
-        "cumsum",
-        "main_x",
-    )}
+    sentinels = {
+        name: object()
+        for name in (
+            "dt",
+            "A",
+            "dt_bias",
+            "starts",
+            "lengths",
+            "chunk_indices",
+            "chunk_offsets",
+            "delta",
+            "cumsum",
+            "main_x",
+        )
+    }
     preprocess, preprocess_grid = module._direct_preprocess_inputs(
         dt=sentinels["dt"],
         A=sentinels["A"],
