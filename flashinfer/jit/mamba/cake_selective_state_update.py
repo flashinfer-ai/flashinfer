@@ -224,6 +224,30 @@ def _compact_broadcasts(
     )
 
 
+def _uniform_checkpoint_step(
+    dst_state_batch_indices: torch.Tensor, pad_slot_id: int
+) -> Optional[int]:
+    """Return the shared checkpoint column, or ``None`` for a non-uniform table."""
+    if (
+        dst_state_batch_indices.ndim != 2
+        or dst_state_batch_indices.shape[0] == 0
+        or dst_state_batch_indices.shape[1] == 0
+    ):
+        return None
+    nonpad = dst_state_batch_indices != pad_slot_id
+    checkpoint_steps = nonpad.to(torch.int64).argmax(dim=1)
+    valid = (nonpad.sum(dim=1) == 1).all() & (
+        checkpoint_steps == checkpoint_steps[0]
+    ).all()
+    selected = torch.where(
+        valid,
+        checkpoint_steps[0],
+        checkpoint_steps.new_full((), -1),
+    )
+    checkpoint_step = int(selected.item())
+    return checkpoint_step if checkpoint_step >= 0 else None
+
+
 def _balanced_worker_count(work: int, cap: int) -> int:
     if work <= cap:
         return work
@@ -715,13 +739,12 @@ def try_cake_selective_state_update(
             and not disable_state_update
             and state_batch_indices.ndim == 1
         ):
-            nonpad = torch.nonzero(
-                dst_state_batch_indices[0] != pad_slot_id,
-                as_tuple=False,
-            )
-            if nonpad.numel() != 1:
+            if torch.cuda.is_current_stream_capturing():
                 return False
-            checkpoint_step = int(nonpad[0, 0].item())
+            checkpoint_step = _uniform_checkpoint_step(
+                dst_state_batch_indices,
+                pad_slot_id,
+            )
             if checkpoint_step not in (0, 1, 3, 7):
                 return False
             try:

@@ -216,17 +216,51 @@ def test_cake_selective_state_update_sources_match_manifest() -> None:
         assert hashlib.sha256(host.read_bytes()).hexdigest() == program.host_sha256
 
 
+@pytest.mark.parametrize(
+    ("destinations", "expected"),
+    (
+        ([[0, -1], [1, -1]], 0),
+        ([[-1, 0], [-1, 1]], 1),
+        ([[0, -1], [-1, 1]], None),
+        ([[0, 2], [1, -1]], None),
+        ([[-1, -1], [1, -1]], None),
+    ),
+)
+def test_uniform_checkpoint_step(destinations, expected) -> None:
+    destination = torch.tensor(destinations, dtype=torch.int64)
+    assert cake._uniform_checkpoint_step(destination, -1) == expected
+
+
+def test_uniform_checkpoint_step_rejects_empty_batch() -> None:
+    destination = torch.empty((0, 2), dtype=torch.int64)
+    assert cake._uniform_checkpoint_step(destination, -1) is None
+
+
 _CASES = (
     ("stp_ratio1", 32, 16, 16, 128, 128, 0, torch.bfloat16, "auto", False, None),
     ("stp_ratio8", 64, 64, 8, 128, 128, 0, torch.bfloat16, "auto", False, None),
     ("stp_ratio8_sat", 128, 64, 8, 128, 128, 0, torch.bfloat16, "auto", False, None),
     ("stp_ratio16", 32, 128, 8, 128, 128, 0, torch.bfloat16, "auto", False, None),
+    (
+        "stp_persistent",
+        257,
+        128,
+        8,
+        128,
+        128,
+        0,
+        torch.bfloat16,
+        "auto",
+        False,
+        None,
+    ),
     ("stp_fp32", 64, 64, 8, 128, 128, 0, torch.float32, "auto", False, None),
     ("mtp_short1", 64, 64, 8, 128, 128, 1, torch.bfloat16, "auto", False, None),
     ("mtp_short2", 64, 64, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
     ("mtp_cache", 1, 64, 8, 64, 128, 6, torch.bfloat16, "vertical", True, None),
     ("mtp_horizontal", 32, 64, 8, 64, 128, 6, torch.bfloat16, "horizontal", True, None),
     ("dynamic0", 1, 16, 1, 64, 128, 1, torch.float32, "simple", False, 0),
+    ("dynamic0_b8", 8, 16, 1, 64, 128, 2, torch.float32, "simple", False, 0),
     ("dynamic1", 1, 16, 1, 64, 128, 4, torch.float32, "simple", False, 1),
     ("dynamic3", 1, 16, 1, 64, 128, 8, torch.float32, "simple", False, 3),
     ("dynamic7", 1, 16, 1, 64, 128, 8, torch.float32, "simple", False, 7),
