@@ -1097,6 +1097,7 @@ class Cfg:
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
     activation: str = "swiglu"
+    expected_backend: str = ""  # curated execution assertion; empty for random cases
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1390,8 +1391,30 @@ _CURATED = [
     # Deterministic typed-activation coverage. Keep CUTLASS-only activations
     # pre-routed so they have an executable candidate.
     Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_051, activation="relu2"),
-    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_053, activation="geglutanh"),
-    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_054, activation="swiglustep"),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_053,
+        activation="geglutanh",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_054,
+        activation="swiglustep",
+        expected_backend="cutlass_bf16",
+    ),
     Cfg(
         16,
         7168,
@@ -1953,6 +1976,21 @@ def test_unified_moe_fuzz(cfg):
             for B in wired_backends
             if _BACKEND_RUNNERS[B].backend_key in _BACKEND_FILTER
         ]
+    expected_backend_available = bool(
+        cfg.expected_backend
+        and any(
+            _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend and B.supported(sm)
+            for B in handler.candidate_configs
+            if B in _BACKEND_RUNNERS
+        )
+    )
+    if expected_backend_available and not any(
+        _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend for B in wired_backends
+    ):
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} was filtered "
+            "before execution"
+        )
     # A backend-scoped crash quarantine must take effect before backend-native
     # weight preparation or MoELayer construction: both can load modules and
     # launch CUDA preparation kernels. Keep the findings so the overall case
@@ -2199,6 +2237,7 @@ def test_unified_moe_fuzz(cfg):
             assert_correct(o, f"{tag} [tactic={tactic}]")
 
     n_ran = 0
+    ran_backends = set()
     expected_failures = []
     for runner in layer.runners:
         try:
@@ -2209,6 +2248,7 @@ def test_unified_moe_fuzz(cfg):
             raise
         tag = f"{runner.backend_key} {cfg.label}"
         n_ran += 1
+        ran_backends.add(runner.backend_key)
 
         known = LEDGER.find(cfg, backend=runner.backend_key)
         if known:  # tracked bug -> run it, tolerate a wrong answer, but flag if it starts passing
@@ -2227,6 +2267,10 @@ def test_unified_moe_fuzz(cfg):
             context=f"all candidate backends quarantined for {cfg.label}",
         )
         pytest.skip(f"no runner ran {cfg.label} on SM{sm}")
+    if expected_backend_available and cfg.expected_backend not in ran_backends:
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} did not execute"
+        )
 
     # (6) autotune-ON: drive the REAL production path -- MoELayer._select_winner profiles every
     # tactic of every runner (the #3168 profiling-IMA class) then selects + caches a winner; the

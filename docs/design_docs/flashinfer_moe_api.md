@@ -711,16 +711,17 @@ The truthful unified support matrix follows the already executable flat path:
 
 | Runner / quantization | Unified activations |
 | --- | --- |
-| TRTLLM BF16 | SwiGLU, ReLU2 |
+| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
 | TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
-| TRTLLM DeepSeek block FP8 | SwiGLU |
-| TRTLLM MXFP8 block FP8 | SwiGLU, GeGLU, ReLU2 |
-| TRTLLM NVFP4 / MXFP4 / W4A16 | SwiGLU, GeGLU, SiTU, ReLU2 |
-| TRTLLM MxInt4 | SwiGLU |
-| CUTLASS BF16 / W4A16 | SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2 |
-| CuTe-DSL NVFP4 / W4A16 | SwiGLU, GeGLUTanh, ReLU2, SiTU |
-| b12x NVFP4 | SwiGLU, GeGLUTanh, ReLU2 |
-| b12x W4A16 | SwiGLU, ReLU2 |
+| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
+| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
+| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
+| TRTLLM W4A16 | SwiGLU |
+| TRTLLM MxInt4 | SwiGLU (typed scalars) |
+| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2 |
+| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
+| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
+| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
 
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU

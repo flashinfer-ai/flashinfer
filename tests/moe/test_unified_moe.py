@@ -807,12 +807,11 @@ class TestMoERunnerSupport:
             ReLU2,
             SiTU,
         )
-        assert TrtllmFp4RoutedRunner.supported_activation_classes == (
-            SwiGLU,
-            GeGLU,
-            SiTU,
-            ReLU2,
-        )
+        assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
+            QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+            QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+            QuantVariant.W4A16: (SwiGLU,),
+        }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
             ReLU2,
@@ -1429,6 +1428,7 @@ def _make_packs_and_config(
     local_num_experts: int | None = None,
     max_tokens: int | None = None,
     activation=None,
+    variant: QuantVariant = QuantVariant.NVFP4,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -1455,9 +1455,10 @@ def _make_packs_and_config(
         top_k=top_k,
     )
 
+    w4a16 = variant is QuantVariant.W4A16
     act_pack = MoEActivationPack(
-        hidden_states_q=tensors["x"],
-        hidden_states_scale=tensors["x_sf"].squeeze(-1),
+        hidden_states_q=tensors["x_bf16"] if w4a16 else tensors["x"],
+        hidden_states_scale=None if w4a16 else tensors["x_sf"].squeeze(-1),
         topk_ids=tensors["token_selected_experts"],
         topk_weights=tensors["token_final_scales"],
     )
@@ -1480,6 +1481,7 @@ def _make_packs_and_config(
         TrtllmFp4Config.prepare_weights(
             tensors["w1_weight_bf16"],
             tensors["w2_weight_bf16"],
+            variant=variant,
             num_local_experts=local_num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1490,7 +1492,7 @@ def _make_packs_and_config(
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(variant=variant),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=local_num_experts,
@@ -1542,6 +1544,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None):
 
 
 @sm100_required
+@pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
 @pytest.mark.parametrize(
     "activation",
     (
@@ -1551,7 +1554,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None):
         ReLU2(),
     ),
 )
-def test_cute_dsl_typed_activation_matches_flat_reference(activation):
+def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
     shape = dict(
         hidden_size=1024,
         intermediate_size=512,
@@ -1561,6 +1564,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(activation):
     act_pack, weight_pack, config, tensors = _make_packs_and_config(
         8,
         activation=activation,
+        variant=variant,
         **shape,
     )
     config = dataclasses.replace(

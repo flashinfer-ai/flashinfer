@@ -1170,7 +1170,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         QuantVariant.W4A16,
     )
     supports_fused_shared_experts = True
-    supported_activation_classes = (SwiGLU, GeGLU, SiTU, ReLU2)
+    supported_activation_classes_by_quant = {
+        QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+        QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+        QuantVariant.W4A16: (SwiGLU,),
+    }
 
     def _check_support(self) -> None:
         super()._check_support()

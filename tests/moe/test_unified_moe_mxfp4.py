@@ -483,9 +483,16 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
 
 
 @pytest.mark.parametrize(
-    "variant", (QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16)
+    "variant,activation",
+    [
+        *[
+            (variant, activation)
+            for variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
+            for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
+        ],
+        (QuantVariant.W4A16, SwiGLU()),
+    ],
 )
-@pytest.mark.parametrize("activation", (SwiGLU(), GeGLU(), SiTU(), ReLU2()))
 def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activation):
     _xfail_w4a16_sm103(variant)
     _, _, config, view, _ = _make_fp4_shared_case(variant, 0, activation=activation)
@@ -502,9 +509,11 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
         ReLU2(),
     ),
 )
-def test_trtllm_nvfp4_new_activations_match_flat_launcher(activation):
+@pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.MXFP4))
+def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
+    _xfail_w4a16_sm103(variant)
     act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
-        QuantVariant.NVFP4,
+        variant,
         0,
         activation=activation,
     )

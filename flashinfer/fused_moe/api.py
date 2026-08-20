@@ -182,7 +182,12 @@ def _validate_finite(name: str, value: float, *, positive: bool = False) -> None
 
 @dataclass(frozen=True)
 class SwiGLU(ActivationConfig):
-    """SwiGLU/OA activation: ``silu(alpha * gate) * (linear + beta)``."""
+    """SwiGLU/OA activation.
+
+    The linear branch is clamped to ``[-limit, limit]`` and the gate branch to
+    ``(-inf, limit]`` before evaluating
+    ``gate * sigmoid(alpha * gate) * (linear + beta)``.
+    """
 
     type: ClassVar[ActivationType] = ActivationType.Swiglu
     alpha: float = DEFAULT_SWIGLU_ALPHA
@@ -664,9 +669,9 @@ class CutlassBf16Config:
     Architecture coverage follows the dense-BF16 legacy flat API. The unified
     GPU tests currently exercise SM90.
 
-    This backend supports packed precomputed routing with SwiGLU and requires
-    ``do_finalize=True``. Expert parallelism and shared experts are not
-    supported.
+    This backend supports packed precomputed routing with SwiGLU,
+    SwiGLU-step, GeGLU-tanh, and ReLU², and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported.
     """
 
     @classmethod
@@ -710,10 +715,10 @@ class CutlassBf16Config:
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
-    This backend supports packed precomputed routing with SwiGLU and requires
-    ``do_finalize=True``. Expert parallelism and shared experts are not
-    supported. Both ``hidden_size`` and ``intermediate_size`` must be divisible
-    by 128.
+    This backend supports packed precomputed routing with SwiGLU,
+    SwiGLU-step, GeGLU-tanh, and ReLU², and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported. Both
+    ``hidden_size`` and ``intermediate_size`` must be divisible by 128.
     """
 
     @classmethod
