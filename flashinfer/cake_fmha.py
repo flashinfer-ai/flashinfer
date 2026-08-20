@@ -18,6 +18,8 @@ from .jit.cake_fmha import (
     get_cake_fmha_manifest,
     load_cake_fmha_context_bf16_module,
     load_cake_fmha_context_fp8_module,
+    load_cake_fmha_context_fp16_hd256_module,
+    load_cake_fmha_context_fp8_hd256_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
@@ -116,7 +118,10 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
     {
         "compat_v1",
         "context_bf16",
+        "context_fp16_hd256",
         "context_fp8",
+        "context_fp8_hd256",
+        "context_hd256_support",
         "decode_native_bf16",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
@@ -942,6 +947,22 @@ def get_cake_fmha_context_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
+    if route.component == "context_fp16_hd256":
+        return load_cake_fmha_context_fp16_hd256_module(
+            route.target,
+            route.num_m_blocks,
+            route.num_q_heads,
+            route.num_kv_heads,
+            route.page_size,
+        )
+    if route.component == "context_fp8_hd256":
+        return load_cake_fmha_context_fp8_hd256_module(
+            route.target,
+            route.num_m_blocks,
+            route.num_q_heads,
+            route.num_kv_heads,
+            route.page_size,
+        )
     loader = (
         load_cake_fmha_context_bf16_module
         if route.component == "context_bf16"

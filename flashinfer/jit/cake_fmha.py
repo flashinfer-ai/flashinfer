@@ -25,13 +25,14 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "aa33d3ce07495554f5afe4feb19aff3407e4960446068dac1a67f14cc110c6cb"
+    "3cdc47f827006cd29fb3088a0e3fbdaf5fc0ebfbabe5ae502a9c66b89bda2926"
 )
 
 _FLASHINFER_BINDINGS = (
     "cake_fmha_jit_binding.cu",
     "jit/cake_fmha_context_bf16_jit_binding.cu",
     "jit/cake_fmha_context_fp8_jit_binding.cu",
+    "jit/cake_fmha_context_hd256_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
@@ -58,6 +59,7 @@ _DECODE_QUANT_BF16Q_JIT_BINDING = "jit/cake_fmha_decode_quant_bf16q_jit_binding.
 _DECODE_QUANT_FP8_JIT_BINDING = "jit/cake_fmha_decode_quant_fp8_jit_binding.cu"
 _CONTEXT_BF16_JIT_BINDING = "jit/cake_fmha_context_bf16_jit_binding.cu"
 _CONTEXT_FP8_JIT_BINDING = "jit/cake_fmha_context_fp8_jit_binding.cu"
+_CONTEXT_HD256_JIT_BINDING = "jit/cake_fmha_context_hd256_jit_binding.cu"
 
 
 def get_cake_fmha_csrc_dir() -> Path:
@@ -587,6 +589,224 @@ def load_cake_fmha_context_fp8_module(
         enable_sink=enable_sink,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context FP8 module: %s", module)
+    return module
+
+
+def _validate_context_hd256_specialization(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> int:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    if num_m_blocks <= 0:
+        raise ValueError("num_m_blocks must be positive")
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    heads_per_group = num_q_heads // num_kv_heads
+    if heads_per_group <= 0:
+        raise ValueError("heads_per_group must be positive")
+    if page_size not in (16, 32, 64, 128, 256, 512, 1024):
+        raise ValueError("HD256 context requires a supported paged-KV page size")
+    return heads_per_group
+
+
+def _get_cake_fmha_context_hd256_uri(
+    kind: Literal["fp16", "fp8"],
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> str:
+    heads_per_group = _validate_context_hd256_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    return (
+        f"cake_fmha_context_{kind}_hd256_{target}"
+        f"_m{num_m_blocks}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_g{heads_per_group}_page{page_size}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+def get_cake_fmha_context_fp16_hd256_uri(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> str:
+    return _get_cake_fmha_context_hd256_uri(
+        "fp16",
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+
+
+def get_cake_fmha_context_fp8_hd256_uri(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> str:
+    return _get_cake_fmha_context_hd256_uri(
+        "fp8",
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+
+
+def _gen_cake_fmha_context_hd256_module(
+    kind: Literal["fp16", "fp8"],
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> JitSpec:
+    heads_per_group = _validate_context_hd256_specialization(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    if kind == "fp16":
+        component = "context_fp16_hd256"
+        selector = {"IS_CAUSAL": 0}
+        is_fp8 = 0
+    else:
+        component = "context_fp8_hd256"
+        selector = {"IS_CAUSAL": 1, "OUTPUT_BF16": 1}
+        is_fp8 = 1
+    main_sources = _get_component_launch_sources(component, target, selector)
+    csrc_dir = get_cake_fmha_csrc_dir()
+    support_source = (
+        csrc_dir
+        / "cuda/context_hd256_support/cake_fmha_hd256_support.cu"
+    )
+    api_binding = csrc_dir / _CONTEXT_HD256_JIT_BINDING
+    for source in (support_source, api_binding):
+        if not source.is_file():
+            raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
+    spec = gen_jit_spec(
+        name=_get_cake_fmha_context_hd256_uri(
+            kind,
+            target,
+            num_m_blocks,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        ),
+        sources=[*main_sources, support_source, api_binding],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DNUM_M_BLOCKS={num_m_blocks}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DHEADS_PER_GROUP={heads_per_group}",
+            f"-DCAKE_FMHA_HD256_FP8={is_fp8}",
+            f"-DCAKE_FMHA_SOURCE_PAGE_SIZE={page_size}",
+        ],
+        extra_include_paths=[
+            csrc_dir,
+            csrc_dir / "include",
+            jit_env.FLASHINFER_CSRC_DIR,
+        ],
+    )
+    logger.info("Generated Cake FMHA context %s HD256 JIT spec: %s", kind, spec.name)
+    return spec
+
+
+@functools.cache
+def gen_cake_fmha_context_fp16_hd256_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> JitSpec:
+    return _gen_cake_fmha_context_hd256_module(
+        "fp16",
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+
+
+@functools.cache
+def gen_cake_fmha_context_fp8_hd256_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> JitSpec:
+    return _gen_cake_fmha_context_hd256_module(
+        "fp8",
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+
+
+@functools.cache
+def load_cake_fmha_context_fp16_hd256_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+):
+    module = gen_cake_fmha_context_fp16_hd256_module(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA context FP16 HD256 module: %s", module)
+    return module
+
+
+@functools.cache
+def load_cake_fmha_context_fp8_hd256_module(
+    target: CakeFmhaTarget,
+    num_m_blocks: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+):
+    module = gen_cake_fmha_context_fp8_hd256_module(
+        target,
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA context FP8 HD256 module: %s", module)
     return module
 
 

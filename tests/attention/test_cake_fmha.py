@@ -17,7 +17,9 @@ from flashinfer.jit.cake_fmha import (
     CAKE_FMHA_MANIFEST_SHA256,
     gen_cake_fmha_compat_module,
     gen_cake_fmha_context_bf16_module,
+    gen_cake_fmha_context_fp16_hd256_module,
     gen_cake_fmha_context_fp8_module,
+    gen_cake_fmha_context_fp8_hd256_module,
     gen_cake_fmha_decode_native_bf16_module,
     gen_cake_fmha_decode_native_fp16_hd512_module,
     gen_cake_fmha_decode_native_fp16_nhd_module,
@@ -25,7 +27,9 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_decode_quant_fp8_module,
     get_cake_fmha_compat_uri,
     get_cake_fmha_context_bf16_uri,
+    get_cake_fmha_context_fp16_hd256_uri,
     get_cake_fmha_context_fp8_uri,
+    get_cake_fmha_context_fp8_hd256_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_decode_native_fp16_hd512_uri,
     get_cake_fmha_decode_native_fp16_nhd_uri,
@@ -371,6 +375,49 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
     assert "-DHEADS_PER_GROUP=8" in spec.extra_cuda_cflags
     assert "-DPACK_G=8" in spec.extra_cuda_cflags
     assert "-DTOK_PER_STAGE=16" in spec.extra_cuda_cflags
+
+
+@pytest.mark.parametrize(
+    ("kind", "generator", "uri", "body", "binding", "fp8_flag"),
+    [
+        (
+            "fp16",
+            gen_cake_fmha_context_fp16_hd256_module,
+            get_cake_fmha_context_fp16_hd256_uri,
+            "is_causal0.cu",
+            "cake_fmha_context_fp16_hd256_binding.cu",
+            "0",
+        ),
+        (
+            "fp8",
+            gen_cake_fmha_context_fp8_hd256_module,
+            get_cake_fmha_context_fp8_hd256_uri,
+            "is_causal1_output_bf161.cu",
+            "cake_fmha_context_fp8_hd256_binding.cu",
+            "1",
+        ),
+    ],
+)
+def test_cake_fmha_context_hd256_jit_selects_main_and_support(
+    monkeypatch, kind, generator, uri, body, binding, fp8_flag
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = generator("sm103a", 2, 10, 2, 32)
+    assert spec.name == uri("sm103a", 2, 10, 2, 32)
+    assert {Path(source).name for source in spec.sources} == {
+        body,
+        binding,
+        "cake_fmha_hd256_support.cu",
+        "cake_fmha_context_hd256_jit_binding.cu",
+    }
+    assert "-DNUM_M_BLOCKS=2" in spec.extra_cuda_cflags
+    assert "-DNUM_Q_HEADS=10" in spec.extra_cuda_cflags
+    assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags
+    assert "-DHEADS_PER_GROUP=5" in spec.extra_cuda_cflags
+    assert f"-DCAKE_FMHA_HD256_FP8={fp8_flag}" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_SOURCE_PAGE_SIZE=32" in spec.extra_cuda_cflags
 
 
 def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
@@ -910,8 +957,45 @@ def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypat
     assert nvfp4_route is not None
     assert nvfp4_route.component == "context_nvfp4"
 
-    for route in (fp16_route, fp8_hd256_route, nvfp4_route):
-        assert not cake_api.cake_fmha_route_is_optimized(route)
+    for route in (fp16_route, fp8_hd256_route):
+        assert cake_api.cake_fmha_route_is_optimized(route)
+    assert not cake_api.cake_fmha_route_is_optimized(nvfp4_route)
+
+
+@pytest.mark.parametrize(
+    ("component", "loader_name"),
+    [
+        ("context_fp16_hd256", "load_cake_fmha_context_fp16_hd256_module"),
+        ("context_fp8_hd256", "load_cake_fmha_context_fp8_hd256_module"),
+    ],
+)
+def test_cake_fmha_context_hd256_route_loads_authenticated_chain(
+    monkeypatch, component, loader_name
+) -> None:
+    sentinel = object()
+    observed = {}
+
+    def load(*args):
+        observed["args"] = args
+        return sentinel
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(cake_api, loader_name, load)
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component=component,
+        num_m_blocks=2,
+        num_q_heads=10,
+        num_kv_heads=2,
+        pack_g=1,
+        page_size=32,
+        l2_swizzle=1,
+        is_causal=component == "context_fp8_hd256",
+        return_lse=False,
+        enable_sink=False,
+    )
+    assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
+    assert observed == {"args": ("sm103a", 2, 10, 2, 32)}
 
 
 def test_unexported_candidate_routes_fail_closed_to_compat(monkeypatch) -> None:
