@@ -21,6 +21,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -35,6 +36,153 @@ _CHUNK_SIZE = 128
 _HEADDIM = 64
 _DSTATE = 128
 _THREADS = 128
+
+_ROUTE_EXACT_SCAN = "exact_scan"
+_ROUTE_SHALLOW_VARLEN = "shallow_varlen"
+_ROUTE_PREFIX_VARLEN = "prefix_varlen"
+
+
+def _select_scan_route(
+    *,
+    mode_varlen: bool,
+    num_logical_chunks: int,
+    num_sequences: int,
+    nheads: int,
+    ngroups: int,
+    dt_min: float,
+    prefix_route_selected: bool,
+) -> str:
+    """Resolve semantic routing without binding generated program identities.
+
+    ``prefix_route_selected`` is deliberately supplied by the generated-source
+    catalog.  This keeps campaign promotion separate from the stable shape
+    predicates and lets the same CPU tests cover both the incumbent and a
+    promoted prefix program.
+    """
+
+    shallow_varlen = (
+        mode_varlen
+        and num_logical_chunks <= num_sequences
+    )
+    if dt_min < 0.0 or not shallow_varlen:
+        return _ROUTE_EXACT_SCAN
+    if prefix_route_selected and nheads >= 8 * ngroups:
+        return _ROUTE_PREFIX_VARLEN
+    return _ROUTE_SHALLOW_VARLEN
+
+
+def _direct_preprocess_inputs(
+    *,
+    dt: object,
+    A: object,
+    dt_bias: object,
+    segment_starts: object,
+    segment_lengths: object,
+    chunk_indices: object,
+    chunk_offsets: object,
+    delta: object,
+    cumsum: object,
+    num_segments: int,
+    nheads: int,
+    seqlen: int,
+    mode_varlen: bool,
+    dt_softplus: bool,
+    dt_limit: Tuple[float, float],
+    threads: int,
+) -> tuple[dict[str, object], tuple[int, int, int]]:
+    """Build the metadata-fused preprocess values and launch grid.
+
+    Generated argument plans consume this name-keyed mapping.  Keeping it
+    name-keyed avoids freezing positional host ABI or module symbols before
+    the final source catalog is emitted.
+    """
+
+    if threads <= 0:
+        raise ValueError(f"preprocess thread count must be positive, got {threads}")
+    dt_min, dt_max = (float(value) for value in dt_limit)
+    values: dict[str, object] = {
+        "dt": dt,
+        "A": A,
+        "dt_bias": dt_bias,
+        "segment_starts": segment_starts,
+        "segment_lengths": segment_lengths,
+        "chunk_indices": chunk_indices,
+        "chunk_offsets": chunk_offsets,
+        "delta": delta,
+        "cumsum": cumsum,
+        "num_segments": num_segments,
+        "nheads": nheads,
+        "seqlen": seqlen,
+        "direct_varlen_metadata": int(mode_varlen),
+        "dt_softplus": int(dt_softplus),
+        "dt_min": dt_min,
+        "dt_max": dt_max,
+    }
+    total_tiles = num_segments * nheads
+    return values, ((total_tiles + threads - 1) // threads, 1, 1)
+
+
+def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
+    """Match the balanced-grid policy shared by shallow and prefix routes."""
+
+    full_grid = min(total_work, sm_count)
+    if total_work <= sm_count:
+        return full_grid
+    for items_per_cta in range(2, 5):
+        if total_work % items_per_cta:
+            continue
+        balanced_grid = total_work // items_per_cta
+        if balanced_grid <= sm_count and balanced_grid * 5 >= sm_count * 4:
+            return balanced_grid
+    return full_grid
+
+
+def _bind_generated_arguments(
+    arg_plan: Sequence[Sequence[str]],
+    values: Mapping[str, object],
+    grid: tuple[int, int, int],
+) -> tuple[object, ...]:
+    """Bind one exporter-owned argument plan without guessing missing values."""
+
+    grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+    arguments: list[object] = []
+    for entry in arg_plan:
+        if len(entry) != 2:
+            raise ValueError(f"generated argument plan entry is invalid: {entry!r}")
+        kind, name = entry
+        if kind == "grid":
+            source: Mapping[str, object] = grid_values
+        elif kind in {"buffer", "tma_buffer", "parameter"}:
+            source = values
+        else:
+            raise ValueError(f"generated argument kind is unsupported: {kind!r}")
+        if name not in source:
+            raise ValueError(f"generated argument {kind}:{name} is unresolved")
+        arguments.append(source[name])
+    return tuple(arguments)
+
+
+def _bind_prepared_sequence_arguments(
+    stage_arg_plans: Sequence[tuple[str, Sequence[Sequence[str]]]],
+    stage_values: Mapping[str, Mapping[str, object]],
+    stage_grids: Mapping[str, tuple[int, int, int]],
+    cuda_stream: int,
+) -> tuple[object, ...]:
+    """Flatten complete stage plans before appending the explicit stream."""
+
+    arguments: list[object] = []
+    for stage, arg_plan in stage_arg_plans:
+        if stage not in stage_values or stage not in stage_grids:
+            raise ValueError(f"generated stage {stage!r} is unresolved")
+        arguments.extend(
+            _bind_generated_arguments(
+                arg_plan,
+                stage_values[stage],
+                stage_grids[stage],
+            )
+        )
+    arguments.append(cuda_stream)
+    return tuple(arguments)
 
 _PROGRAMS = {
     "metadata": (

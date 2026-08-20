@@ -591,3 +591,159 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     assert isinstance(first, tuple) and isinstance(second, tuple)
     assert first[0].data_ptr() != second[0].data_ptr()
     assert first[1].data_ptr() != second[1].data_ptr()
+
+
+@pytest.mark.parametrize(
+    (
+        "mode_varlen",
+        "num_logical_chunks",
+        "num_sequences",
+        "nheads",
+        "ngroups",
+        "dt_min",
+        "prefix_route_selected",
+        "expected",
+    ),
+    [
+        (False, 2, 2, 128, 8, 0.0, True, "exact_scan"),
+        (True, 3, 2, 128, 8, 0.0, True, "exact_scan"),
+        (True, 2, 2, 128, 8, -0.001, True, "exact_scan"),
+        (True, 2, 2, 128, 8, 0.0, False, "shallow_varlen"),
+        (True, 0, 2, 128, 8, 0.0, False, "shallow_varlen"),
+        (True, 2, 2, 8, 8, 0.0, True, "shallow_varlen"),
+        (True, 2, 2, 128, 8, 0.0, True, "prefix_varlen"),
+    ],
+)
+def test_source_route_predicates_do_not_bind_program_symbols(
+    mode_varlen,
+    num_logical_chunks,
+    num_sequences,
+    nheads,
+    ngroups,
+    dt_min,
+    prefix_route_selected,
+    expected,
+):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+
+    actual = module._select_scan_route(
+        mode_varlen=mode_varlen,
+        num_logical_chunks=num_logical_chunks,
+        num_sequences=num_sequences,
+        nheads=nheads,
+        ngroups=ngroups,
+        dt_min=dt_min,
+        prefix_route_selected=prefix_route_selected,
+    )
+
+    assert actual == expected
+
+
+def test_source_direct_preprocess_and_prepared_sequence_binding():
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    sentinels = {name: object() for name in (
+        "dt",
+        "A",
+        "dt_bias",
+        "starts",
+        "lengths",
+        "chunk_indices",
+        "chunk_offsets",
+        "delta",
+        "cumsum",
+        "main_x",
+    )}
+    preprocess, preprocess_grid = module._direct_preprocess_inputs(
+        dt=sentinels["dt"],
+        A=sentinels["A"],
+        dt_bias=sentinels["dt_bias"],
+        segment_starts=sentinels["starts"],
+        segment_lengths=sentinels["lengths"],
+        chunk_indices=sentinels["chunk_indices"],
+        chunk_offsets=sentinels["chunk_offsets"],
+        delta=sentinels["delta"],
+        cumsum=sentinels["cumsum"],
+        num_segments=3,
+        nheads=128,
+        seqlen=256,
+        mode_varlen=True,
+        dt_softplus=False,
+        dt_limit=(0.0, float("inf")),
+        threads=32,
+    )
+    main = {"x_map": sentinels["main_x"], "nheads": 128}
+    stage_plans = (
+        (
+            "preprocess",
+            (
+                ("buffer", "dt"),
+                ("buffer", "chunk_indices"),
+                ("buffer", "chunk_offsets"),
+                ("parameter", "direct_varlen_metadata"),
+                ("parameter", "dt_softplus"),
+                ("grid", "grid_x"),
+                ("grid", "grid_y"),
+                ("grid", "grid_z"),
+            ),
+        ),
+        (
+            "main",
+            (
+                ("tma_buffer", "x_map"),
+                ("parameter", "nheads"),
+                ("grid", "grid_x"),
+                ("grid", "grid_y"),
+                ("grid", "grid_z"),
+            ),
+        ),
+    )
+
+    bound = module._bind_prepared_sequence_arguments(
+        stage_plans,
+        {"preprocess": preprocess, "main": main},
+        {"preprocess": preprocess_grid, "main": (148, 1, 1)},
+        cuda_stream=0x1234,
+    )
+
+    assert preprocess["chunk_indices"] is sentinels["chunk_indices"]
+    assert preprocess["chunk_offsets"] is sentinels["chunk_offsets"]
+    assert preprocess["direct_varlen_metadata"] == 1
+    assert preprocess["dt_softplus"] == 0
+    assert preprocess_grid == (12, 1, 1)
+    assert bound == (
+        sentinels["dt"],
+        sentinels["chunk_indices"],
+        sentinels["chunk_offsets"],
+        1,
+        0,
+        12,
+        1,
+        1,
+        sentinels["main_x"],
+        128,
+        148,
+        1,
+        1,
+        0x1234,
+    )
+
+    assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
+    assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
+    assert module._persistent_grid_size(total_work=129, sm_count=148) == 129
+
+
+def test_source_generated_argument_binding_fails_closed():
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+
+    with pytest.raises(ValueError, match="buffer:missing is unresolved"):
+        module._bind_generated_arguments(
+            (("buffer", "missing"),),
+            {},
+            (1, 1, 1),
+        )
+    with pytest.raises(ValueError, match="kind is unsupported"):
+        module._bind_generated_arguments(
+            (("unknown", "value"),),
+            {"value": object()},
+            (1, 1, 1),
+        )
