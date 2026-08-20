@@ -16,11 +16,17 @@ from types import SimpleNamespace
 
 import torch
 
+from flashinfer.jit import core as jit_core
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.gemm.core import gen_tgv_gemm_sm10x_module
 
 
 def test_tgv_gemm_target_specific_jit_specs_and_aot_inventory(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(10, "0a"), (10, "3a")},
+    )
     monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
 
     specs = [
