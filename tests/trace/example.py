@@ -25,6 +25,7 @@ gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
+fused_kda_decode_packed_t3_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -879,6 +880,40 @@ flashinfer.kda_decode.fused_kda_decode(
     fk_indices,
     fk_state,
     fk_output_gate,
+    fk_norm_weight,
+)
+
+# ── packed fused Kimi K3 speculative decode (conv + KDA + gated RMSNorm) ────
+fkp_N, fkp_T = 2, 3
+fkp_rows = fkp_N * fkp_T
+fkp_slots = fkp_rows + 1
+fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+fkp_conv_storage = torch.zeros(
+    fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
+)
+fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+fkp_raw_gate = torch.randn(1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
+fkp_indices = torch.arange(fkp_rows, 0, -1, dtype=torch.int32, device=device).reshape(
+    fkp_N, fkp_T
+)
+fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device)
+fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
+fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
+fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+flashinfer.kda_decode.fused_kda_decode_packed(
+    fkp_x,
+    fk_weight,
+    fkp_conv_state,
+    fkp_raw_gate,
+    fkp_raw_beta,
+    fk_A_log,
+    fk_dt_bias,
+    fkp_indices,
+    fkp_query_start,
+    fkp_accepted,
+    fkp_state,
+    fkp_output_gate,
     fk_norm_weight,
 )
 

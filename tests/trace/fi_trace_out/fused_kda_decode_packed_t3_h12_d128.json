@@ -1,0 +1,204 @@
+{
+  "name": "fused_kda_decode_packed_t3_h12_d128",
+  "description": "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, and gated RMSNorm with one recurrent checkpoint per token.",
+  "op_type": "kda",
+  "tags": [
+    "fi_api:flashinfer.kda_decode.fused_kda_decode_packed",
+    "stage:decode",
+    "status:experimental"
+  ],
+  "axes": {
+    "num_sequences": {
+      "type": "var",
+      "description": "Number of independent sequences."
+    },
+    "num_tokens": {
+      "type": "const",
+      "value": 3,
+      "description": "Maximum tokens per sequence."
+    },
+    "num_rows": {
+      "type": "var",
+      "description": "Total packed tokens."
+    },
+    "num_sequence_offsets": {
+      "type": "var",
+      "description": "Number of packed sequence boundaries."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 12,
+      "description": "Number of KDA heads."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "KDA head dimension."
+    },
+    "singleton": {
+      "type": "const",
+      "value": 1,
+      "description": "Leading singleton dimension."
+    },
+    "projection_groups": {
+      "type": "const",
+      "value": 3,
+      "description": "Packed QKV projection groups."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1536,
+      "description": "Channels in one projection."
+    },
+    "qkv_width": {
+      "type": "const",
+      "value": 4608,
+      "description": "Packed QKV width."
+    },
+    "conv_width": {
+      "type": "const",
+      "value": 4,
+      "description": "Depthwise convolution width."
+    },
+    "conv_history": {
+      "type": "const",
+      "value": 5,
+      "description": "Cached convolution history."
+    },
+    "num_slots": {
+      "type": "var",
+      "description": "Number of cache slots."
+    }
+  },
+  "constraints": [
+    "num_rows <= num_sequences * num_tokens",
+    "num_sequence_offsets == num_sequences + 1",
+    "num_tokens >= 1",
+    "qkv_width == 3 * num_heads * head_dim",
+    "hidden_size == num_heads * head_dim",
+    "singleton == 1",
+    "projection_groups == 3",
+    "head_dim == 128",
+    "num_heads in (12, 24, 32, 48, 96)",
+    "conv_width == 4",
+    "conv_history == num_tokens + 2"
+  ],
+  "inputs": {
+    "x": {
+      "shape": [
+        "num_rows",
+        "qkv_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight": {
+      "shape": [
+        "projection_groups",
+        "conv_width",
+        "hidden_size"
+      ],
+      "dtype": "float32"
+    },
+    "conv_state": {
+      "shape": [
+        "num_slots",
+        "qkv_width",
+        "conv_history"
+      ],
+      "dtype": "bfloat16"
+    },
+    "raw_gate": {
+      "shape": [
+        "singleton",
+        "num_rows",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "raw_beta": {
+      "shape": [
+        "singleton",
+        "num_rows",
+        "num_heads"
+      ],
+      "dtype": "bfloat16"
+    },
+    "A_log": {
+      "shape": [
+        "num_heads"
+      ],
+      "dtype": "float32"
+    },
+    "dt_bias": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "float32"
+    },
+    "state_indices": {
+      "shape": [
+        "num_sequences",
+        "num_tokens"
+      ],
+      "dtype": "int32"
+    },
+    "query_start_loc": {
+      "shape": [
+        "num_sequence_offsets"
+      ],
+      "dtype": "int32"
+    },
+    "num_accepted_tokens": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "int32"
+    },
+    "state": {
+      "shape": [
+        "num_slots",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32"
+    },
+    "output_gate": {
+      "shape": [
+        "num_rows",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "norm_weight": {
+      "shape": [
+        "head_dim"
+      ],
+      "dtype": "float32"
+    },
+    "lower_bound": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "norm_eps": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "singleton",
+        "num_rows",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

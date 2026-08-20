@@ -229,3 +229,68 @@ fused_kda_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
 )
+
+
+fused_kda_decode_packed_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="fused_kda_decode_packed",
+    description=(
+        "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, "
+        "and gated RMSNorm with one recurrent checkpoint per token."
+    ),
+    axes={
+        "num_sequences": Var(description="Number of independent sequences."),
+        "num_tokens": Const(description="Maximum tokens per sequence.", abbrev="t"),
+        "num_rows": Var(description="Total packed tokens."),
+        "num_sequence_offsets": Var(
+            description="Number of packed sequence boundaries."
+        ),
+        "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
+        "head_dim": Const(description="KDA head dimension.", abbrev="d"),
+        "singleton": Const(description="Leading singleton dimension.", abbrev=""),
+        "projection_groups": Const(
+            description="Packed QKV projection groups.", abbrev=""
+        ),
+        "hidden_size": Const(description="Channels in one projection.", abbrev=""),
+        "qkv_width": Const(description="Packed QKV width.", abbrev=""),
+        "conv_width": Const(description="Depthwise convolution width.", abbrev=""),
+        "conv_history": Const(description="Cached convolution history.", abbrev=""),
+        "num_slots": Var(description="Number of cache slots."),
+    },
+    inputs={
+        "x": Tensor(["num_rows", "qkv_width"]),
+        "weight": Tensor(["projection_groups", "conv_width", "hidden_size"]),
+        "conv_state": Tensor(["num_slots", "qkv_width", "conv_history"]),
+        "raw_gate": Tensor(["singleton", "num_rows", "num_heads", "head_dim"]),
+        "raw_beta": Tensor(["singleton", "num_rows", "num_heads"]),
+        "A_log": Tensor(["num_heads"]),
+        "dt_bias": Tensor(["hidden_size"]),
+        "state_indices": Tensor(["num_sequences", "num_tokens"]),
+        "query_start_loc": Tensor(["num_sequence_offsets"]),
+        "num_accepted_tokens": Tensor(["num_sequences"]),
+        "state": Tensor(["num_slots", "num_heads", "head_dim", "head_dim"]),
+        "output_gate": Tensor(["num_rows", "num_heads", "head_dim"]),
+        "norm_weight": Tensor(["head_dim"]),
+        "lower_bound": Scalar("float32", optional=True),
+        "norm_eps": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["singleton", "num_rows", "num_heads", "head_dim"], dtype_from="x"
+        ),
+    },
+    constraints=[
+        "num_rows <= num_sequences * num_tokens",
+        "num_sequence_offsets == num_sequences + 1",
+        "num_tokens >= 1",
+        "qkv_width == 3 * num_heads * head_dim",
+        "hidden_size == num_heads * head_dim",
+        "singleton == 1",
+        "projection_groups == 3",
+        "head_dim == 128",
+        "num_heads in (12, 24, 32, 48, 96)",
+        "conv_width == 4",
+        "conv_history == num_tokens + 2",
+    ],
+    tags=["stage:decode", "status:experimental"],
+)
