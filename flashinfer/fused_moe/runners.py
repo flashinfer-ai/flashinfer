@@ -265,6 +265,36 @@ def _validate_prepared_activation_params(
         )
 
 
+def _cutlass_activation_params(
+    activation: ActivationConfig,
+    num_experts: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor | None]:
+    """Materialize CUTLASS's optional per-expert activation tensors."""
+    params: dict[str, torch.Tensor | None] = {
+        "swiglu_alpha": None,
+        "swiglu_beta": None,
+        "swiglu_limit": None,
+    }
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        params = {
+            "swiglu_alpha": torch.full(
+                (num_experts,), activation.alpha, dtype=torch.float32, device=device
+            ),
+            "swiglu_beta": torch.full(
+                (num_experts,), activation.beta, dtype=torch.float32, device=device
+            ),
+            "swiglu_limit": torch.full(
+                (num_experts,), activation.limit, dtype=torch.float32, device=device
+            ),
+        }
+    elif isinstance(activation, SwiGLUStep):
+        params["swiglu_limit"] = torch.full(
+            (num_experts,), activation.limit, dtype=torch.float32, device=device
+        )
+    return params
+
+
 class MoERunner(TunableRunner):
     """Unified MoE runner lifecycle: validate, build once, then execute.
 
@@ -513,27 +543,46 @@ class _CutlassRunnerBase(MoERunner):
             )
             activation = self.config.activation
             num_experts = self.config.routing.num_experts
-            self._activation_params: dict[str, torch.Tensor | None] = {
-                "swiglu_alpha": None,
-                "swiglu_beta": None,
-                "swiglu_limit": None,
-            }
-            if isinstance(activation, SwiGLU) and activation != SwiGLU():
-                self._activation_params = {
-                    "swiglu_alpha": torch.full(
-                        (num_experts,), activation.alpha, device=self.device
-                    ),
-                    "swiglu_beta": torch.full(
-                        (num_experts,), activation.beta, device=self.device
-                    ),
-                    "swiglu_limit": torch.full(
-                        (num_experts,), activation.limit, device=self.device
-                    ),
-                }
-            elif isinstance(activation, SwiGLUStep):
-                self._activation_params["swiglu_limit"] = torch.full(
-                    (num_experts,), activation.limit, device=self.device
+            self._activation_params = _cutlass_activation_params(
+                activation, num_experts, self.device
+            )
+            self._config_activation_params = dict(self._activation_params)
+
+    def _resolve_activation_params(
+        self, view: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor | None]:
+        """Apply optional per-expert weight-view overrides to typed scalars."""
+        params = dict(self._config_activation_params)
+        aliases = {
+            "gemm1_alpha": "swiglu_alpha",
+            "gemm1_beta": "swiglu_beta",
+            "gemm1_clamp_limit": "swiglu_limit",
+        }
+        present = [name for name in aliases if name in view]
+        if present and not isinstance(self.config.activation, (SwiGLU, SwiGLUStep)):
+            raise ValueError(
+                f"{type(self).__name__}: per-expert activation overrides {present} "
+                f"are invalid for {type(self.config.activation).__name__}."
+            )
+        expected_shape = (self.config.routing.num_experts,)
+        for source, destination in aliases.items():
+            if source not in view:
+                continue
+            tensor = view[source]
+            if tensor.dtype is not torch.float32:
+                raise TypeError(f"{source} must use torch.float32, got {tensor.dtype}.")
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"{source} must have shape {expected_shape}, got {tuple(tensor.shape)}."
                 )
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{source} is on {tensor.device}, expected {self.device}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{source} must be contiguous.")
+            params[destination] = tensor
+        return params
 
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
@@ -682,6 +731,7 @@ class _CutlassRunnerBase(MoERunner):
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
+        self._activation_params = self._resolve_activation_params(view)
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens

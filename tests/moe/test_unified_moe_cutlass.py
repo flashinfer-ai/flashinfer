@@ -330,6 +330,37 @@ def test_cutlass_bf16_preparation_uses_activation_gating(activation, rows):
     assert view["fc2_expert_weights"].shape == (4, 128, 256)
 
 
+def test_cutlass_integer_scalars_materialize_float32():
+    from flashinfer.fused_moe.runners import _cutlass_activation_params
+
+    params = _cutlass_activation_params(
+        SwiGLU(alpha=2, beta=1, limit=7), 4, torch.device("cpu")
+    )
+    assert all(t is not None and t.dtype is torch.float32 for t in params.values())
+
+
+def test_cutlass_per_expert_activation_overrides():
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0))
+    runner.device = torch.device("cpu")
+    runner._config_activation_params = {
+        "swiglu_alpha": torch.full((4,), 2.0),
+        "swiglu_beta": torch.zeros(4),
+        "swiglu_limit": torch.full((4,), 7.0),
+    }
+    alpha = torch.arange(4, dtype=torch.float32)
+    resolved = runner._resolve_activation_params({"gemm1_alpha": alpha})
+    assert resolved["swiglu_alpha"] is alpha
+    torch.testing.assert_close(resolved["swiglu_beta"], torch.zeros(4))
+
+    with pytest.raises(TypeError, match="torch.float32"):
+        runner._resolve_activation_params(
+            {"gemm1_alpha": torch.ones(4, dtype=torch.int64)}
+        )
+    with pytest.raises(ValueError, match="shape"):
+        runner._resolve_activation_params({"gemm1_alpha": torch.ones(3)})
+
+
 @pytest.mark.parametrize(
     "config,match",
     (

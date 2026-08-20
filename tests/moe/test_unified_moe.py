@@ -1409,6 +1409,15 @@ sm100_required = pytest.mark.skipif(
 )
 
 
+cute_dsl_sm100_required = pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3))
+    ),
+    reason="CuTeDSL unified MoE requires SM100 or SM103",
+)
+
+
 # Small-scale geometry for fast accuracy + dispatch tests.
 SMALL = dict(hidden_size=1024, intermediate_size=512, num_experts=32, top_k=2)
 
@@ -1543,7 +1552,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None):
     )
 
 
-@sm100_required
+@cute_dsl_sm100_required
 @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
 @pytest.mark.parametrize(
     "activation",
