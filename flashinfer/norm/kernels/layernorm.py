@@ -313,7 +313,11 @@ class LayerNormQuantKernel:
 
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
-        if self.H_per_cta >= 8192 and self.num_threads < 256:
+        # Widening to 256 threads at H_per_cta == 8192 helps only on SM120
+        # (RTX 5090: 0.92 -> 1.23 TB/s at batch 1024); B200 regresses 6-17%.
+        if self.num_threads < 256 and (
+            self.H_per_cta > 8192 or (self.H_per_cta == 8192 and self.sm_version == 120)
+        ):
             self.num_threads = 256
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
