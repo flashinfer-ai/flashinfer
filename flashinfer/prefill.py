@@ -4092,9 +4092,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if kv_cache_sf is not None and v.dtype == torch.uint8
             else v.shape[-1]
         )
-        if out is None:
-            # when input dtype is fp8, we need to use bf16 output
+        # Effective output dtype for allocation and validation; an 8-bit cached
+        # dtype is just plan()'s q_data_type default, so fall back to bf16.
+        out_dtype = getattr(self, "_cached_o_data_type", None)
+        if out_dtype is None or out_dtype.itemsize == 1:
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
+        if out is None:
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
@@ -4104,7 +4107,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             check_shape_dtype_device(
                 out,
                 q.shape[:-1] + (out_head_dim,),
-                self._cached_o_data_type,
+                out_dtype,
                 q.device,
                 "out",
             )
