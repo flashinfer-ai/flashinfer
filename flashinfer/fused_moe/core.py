@@ -1673,6 +1673,63 @@ def _alloc_trtllm_moe_output(
     )
 
 
+def _fake_trtllm_moe_output(
+    hidden_states: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    do_finalize: bool,
+    output: Optional[torch.Tensor] = None,
+    expert_weights: Optional[torch.Tensor] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: int = 0,
+) -> List[torch.Tensor]:
+    """Model the native TRTLLM MoE result contract for FakeTensor tracing."""
+    num_tokens = hidden_states.shape[0]
+    if do_finalize:
+        finalized = (
+            output
+            if output is not None and output.shape[1] == hidden_size
+            else hidden_states.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+        )
+        if gemm1_lora_delta is None:
+            return [finalized]
+    else:
+        # Routing-dependent expert padding makes the first dimension dynamic.
+        gemm2_rows = torch.library.get_ctx().new_dynamic_size()
+        finalized = hidden_states.new_empty(
+            (gemm2_rows, hidden_size), dtype=torch.bfloat16
+        )
+
+    total_top_k = top_k + num_fused_shared_experts
+    expanded_idx_to_permuted_idx = hidden_states.new_empty(
+        (num_tokens * total_top_k,), dtype=torch.int32
+    )
+    if not do_finalize:
+        weights = (
+            expert_weights
+            if expert_weights is not None and expert_weights.numel() > 0
+            else hidden_states.new_empty(
+                (num_tokens, total_top_k), dtype=torch.bfloat16
+            )
+        )
+        result = [finalized, weights, expanded_idx_to_permuted_idx]
+    else:
+        result = [finalized, expanded_idx_to_permuted_idx]
+
+    if gemm1_lora_delta is not None:
+        gemm1_rows = torch.library.get_ctx().new_dynamic_size()
+        result.append(
+            hidden_states.new_empty(
+                (gemm1_rows, intermediate_size), dtype=torch.bfloat16
+            )
+        )
+    return result
+
+
 def _unpack_trtllm_moe_output(
     intermediate_output,
     output: torch.Tensor,
@@ -2789,11 +2846,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
@@ -3022,11 +3084,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
@@ -3273,16 +3338,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Fake mode supports only the finalized public result represented by this wrapper.
-        if not do_finalize:
-            raise NotImplementedError(
-                "The fake trtllm_fp8_per_tensor_scale_routed_moe op does not "
-                "support do_finalize=False"
-            )
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_block_scale_moe",
@@ -3600,12 +3664,17 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out
-        _ = num_fused_shared_experts
-        # Propagate the finalized public BF16 result shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-        # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
@@ -3948,13 +4017,17 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out
-        _ = num_fused_shared_experts
-        # Respect a caller-provided output width when tracing the finalized public result.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
-
-        # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=gemm2_weights.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=topk_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
@@ -4213,11 +4286,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+        )
 
     return SimpleNamespace(
         trtllm_bf16_moe=trtllm_bf16_moe_op,

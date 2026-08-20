@@ -23,6 +23,7 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.core import (
+    MoeRunnerInputs,
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
 )
@@ -395,7 +396,11 @@ def test_mxint4_from_logits_supports_fp32():
     )
     act.routing_logits = act.routing_logits.float()
     runner = _build_mxint4_runner(config)
-    output = runner.forward(runner.pack_inputs(act, weights))
+    inputs = runner.pack_inputs(act, weights)
+    packed = MoeRunnerInputs.from_list(inputs)
+    assert packed.topk_ids.numel() == 0
+    assert packed.expert_weights.numel() == 0
+    output = runner.forward(inputs)
     _assert_mxint4_close(output, reference)
 
 

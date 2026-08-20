@@ -230,9 +230,10 @@ class MoEFinalizeConfig:
         partial results into the output.  ``False`` returns the unreduced
         TRTLLM intermediates as ``[gemm2_output, expert_weights,
         expanded_idx_to_permuted_idx]``, leaving the combine to the caller.
-        The routing kernel emits ``expert_weights`` in bfloat16 regardless of
-        the routing-logits dtype. Only backends that advertise unfinalized
-        output support this mode.
+        For FromLogits routing, the routing kernel emits ``expert_weights`` in
+        bfloat16 regardless of the routing-logits dtype. Precomputed routing
+        preserves the caller-provided weights dtype. Only backends that
+        advertise unfinalized output support this mode.
     use_fused_finalize : bool
         Whether supported backends reduce routed outputs in the GEMM2 epilogue
         (atomic accumulation) instead of running a separate reduction kernel.

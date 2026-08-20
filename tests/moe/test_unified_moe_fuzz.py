@@ -1558,6 +1558,8 @@ _CURATED = [
             ("fp8pertensor", 900_052),
             ("deepseekfp8", 900_054),
             ("mxint4", 900_056),
+            ("nvfp4", 900_058),
+            ("mxfp8", 900_060),
         )
         for logits_dtype, seed in (
             ("bf16", seed_base),
@@ -2055,6 +2057,35 @@ def test_unified_moe_fuzz(cfg):
         )
         assert tuple(expert_weights.shape) == (cfg.num_tokens, cfg.top_k)
         assert expanded_idx_to_permuted_idx.numel() == cfg.num_tokens * cfg.top_k
+        torch.testing.assert_close(
+            expert_weights.float(),
+            final_scales.to(torch.bfloat16).float(),
+            rtol=2e-2,
+            atol=2e-3,
+        )
+
+        permutation = expanded_idx_to_permuted_idx.to(torch.long)
+        assert (permutation >= 0).all()
+        assert permutation.unique().numel() == permutation.numel()
+        assert permutation.max().item() < gemm2_output.shape[0]
+
+        recombined = (
+            gemm2_output[permutation]
+            .view(cfg.num_tokens, cfg.top_k, cfg.hidden)
+            .float()
+            .mul(expert_weights.float().unsqueeze(-1))
+            .sum(dim=1)
+        )
+        abs_diff = (recombined - ref).abs()
+        over_tol = abs_diff > (atol + rtol * ref.abs())
+        if over_tol.any():
+            _fail(
+                cfg,
+                "unfinalized host recombination",
+                f"{int(over_tol.sum())}/{recombined.numel()} elems exceed tol",
+                recombined,
+                ref,
+            )
         return
 
     out_shape = (cfg.num_tokens, cfg.hidden)

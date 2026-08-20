@@ -1027,6 +1027,10 @@ class CuteDslNvfp4Runner(MoERunner):
 class _TrtllmRunnerBase(MoERunner):
     """Load the shared TRTLLM-gen module after support validation."""
 
+    _module: Any
+    _inner: Any
+    _static_kwargs: dict[str, Any]
+
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
 
@@ -2481,12 +2485,11 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            topk_ids = hidden_states.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.int32
-            )
-            expert_weights = hidden_states.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # MxInt4 infers routing mode from these placeholders rather than
+            # receiving RoutingInputMode explicitly. Non-empty tensors select
+            # precomputed routing and would suppress routing_logits.
+            topk_ids = hidden_states.new_empty((0,), dtype=torch.int32)
+            expert_weights = hidden_states.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, type(self).__name__
