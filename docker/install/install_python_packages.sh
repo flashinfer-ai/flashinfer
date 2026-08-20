@@ -53,13 +53,15 @@ fi
 
 pip3 install --upgrade "$CUDA_PYTHON"
 pip3 install -r /install/requirements.txt
-pip3 install responses pytest scipy build "$NVSHMEM4PY"
+# wheel: imported by flashinfer-jit-cache's build backend, which CI builds with
+# --no-isolation.
+pip3 install responses pytest scipy build wheel "$NVSHMEM4PY"
 pip3 install --upgrade "$CUDA_PYTHON"
 
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
 else
   pip3 install --upgrade nvidia-cudnn-cu12
 fi

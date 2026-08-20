@@ -103,6 +103,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
@@ -128,8 +130,10 @@ from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
+from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
+from .kda_decode import packed_kda_decode as packed_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops

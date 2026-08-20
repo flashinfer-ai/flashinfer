@@ -31,6 +31,39 @@ if [ -z "${PIP_CONSTRAINT:-}" ]; then
   unset _torch_pin
 fi
 
+# Install only what this branch moved past the image. Installing the full file
+# instead lets one drifted floor re-resolve every other requirement, which is how
+# torch has twice been swapped for a build that does not match the image.
+_reqs_output=$(python "${SCRIPT_DIR}/check_requirements.py" \
+  "${REPO_ROOT}/requirements.txt") && _reqs_status=0 || _reqs_status=$?
+case "${_reqs_status}" in
+  0)
+    echo "Requirements are satisfied by the image; nothing to install."
+    ;;
+  1)
+    echo "Installing requirements this branch changed: ${_reqs_output//$'\n'/ }"
+    _reqs_list=()
+    while IFS= read -r _req; do
+      [ -n "${_req}" ] && _reqs_list+=("${_req}")
+    done <<< "${_reqs_output}"
+    pip install "${_reqs_list[@]}"
+    unset _reqs_list _req
+    ;;
+  *)
+    echo "WARNING: requirement check failed; syncing the full requirements" >&2
+    pip install -r "${REPO_ROOT}/requirements.txt"
+    ;;
+esac
+unset _reqs_output _reqs_status
+
+# Install using only what the image carries; the check above covered the rest.
+# FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
+# hooks' own downloads, which isolation has always swallowed here.
+install_flashinfer_editable() {
+  FLASHINFER_BUILD_NO_PIP=1 \
+    pip install --no-build-isolation --no-deps -e "${1:-.}" -v
+}
+
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
   source "${REPO_ROOT}/ci/setup_python.env"
@@ -43,6 +76,42 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "========================================"
   pip install --force-reinstall "git+https://github.com/apache/tvm-ffi.git@${TVM_FFI_REF}"
   echo "TVM-FFI override complete."
+  echo ""
+fi
+
+# Install quack-kernels for the VSA blk128 backend tests.
+# quack-kernels is NOT a runtime requirement of flashinfer — only users of the
+# blk128 VSA backend need it, so it is intentionally kept out of requirements.txt
+# and installed here for CI only. The blk128 backend supports SM100/SM103, so we
+# install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The correct PyPI distribution name is quack-kernels (top-level package: quack).
+# --no-deps: quack-kernels 0.6.4 hard-pins nvidia-cutlass-dsl==4.6.2, which would
+# downgrade the DSL this job just pinned and leave libs-cu13 skewed (#4555). Its
+# remaining deps are either already installed (torch, apache-tvm-ffi, einops) or
+# listed alongside it here.
+#
+# Match on the full capability, not just the major version: SM107 (Rubin) is
+# also major 10, but the blk128 backend is SM100/SM103 only (see
+# flashinfer/cute_dsl/sparse/sm100_blk128/, and the (10,0)/(10,3) allowlist in
+# tests/attention/test_vsa_block_sparse.py), so those tests skip on Rubin and
+# the install is pure cost there.  --no-deps already prevents the DSL downgrade;
+# skipping the install altogether also avoids perturbing a Rubin environment
+# that nothing in this package needs.
+SM_CAP=$(python -c "import torch; print('%d.%d' % torch.cuda.get_device_capability())" 2>/dev/null || echo "")
+if [ "${SM_CAP}" = "10.0" ] || [ "${SM_CAP}" = "10.3" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_CAP} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "========================================"
+  DSL_VERSION_BEFORE=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext==0.1.5"
+  DSL_VERSION_AFTER=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
+  if [ "${DSL_VERSION_BEFORE}" != "${DSL_VERSION_AFTER}" ]; then
+    echo "ERROR: quack-kernels install moved nvidia-cutlass-dsl from ${DSL_VERSION_BEFORE} to ${DSL_VERSION_AFTER}" >&2
+    return 1 2>/dev/null || exit 1
+  fi
+  # Fail here rather than as a confusing test error if --no-deps left a gap.
+  python -c "import quack"
+  echo "quack-kernels install complete."
   echo ""
 fi
 

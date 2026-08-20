@@ -1,5 +1,5 @@
 """
-MoEDynamicKernel — queue-driven routed NVFP4 MoE kernel for SM120/SM121.
+MoEDynamicKernel — queue-driven routed W4A4 MoE kernel for SM120/SM121.
 
 Ported from the b12x kernel library to FlashInfer.
 
@@ -84,6 +84,7 @@ from flashinfer.cute_dsl.fp4_common import (
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
+    quantize_block_mxfp4,
     get_ptr_as_int64,
     st_global_f32,
     st_global_i32,
@@ -287,7 +288,7 @@ class MoEDynamicKernel:
         self.swiglu_beta = float(swiglu_beta)
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         self.share_input_across_experts = share_input_across_experts
-        tile_k = sf_vec_size * 8
+        tile_k = 128 if sf_vec_size == 32 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         # Scale factors come in 128-row atoms, so for sub-128 MMA tiles the
         # TMA atoms and smem are built at max(128, tile) and the kernel
@@ -356,11 +357,18 @@ class MoEDynamicKernel:
 
         self._hidden_size = hidden_size
 
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
+        if self.sf_vec_size == 32:
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
         atom_layout = cute.make_layout(self.atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
@@ -983,7 +991,7 @@ class MoEDynamicKernel:
         scatter_base = scatter_output.iterator.toint()
         row_counts = launch_params.row_counts
         num_experts = Int32(row_counts.shape[0])
-        sf_blocks_per_row = cols // Int32(16)
+        sf_blocks_per_row = cols // Int32(self.sf_vec_size)
         output_bytes_per_row = cols // Int32(2)
         cols_u32 = cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
@@ -991,7 +999,8 @@ class MoEDynamicKernel:
         num_topk = total_pairs // num_tokens
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
-        num_k_tiles = (cols + Int32(63)) // Int32(64)
+        sf_k_tile = Int32(self.sf_vec_size * 4)
+        num_k_tiles = (cols + sf_k_tile - Int32(1)) // sf_k_tile
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
         materialized_num_groups = (
@@ -1176,10 +1185,14 @@ class MoEDynamicKernel:
 
                             sf_idx = lane_id
                             while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(16)
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                                block_start = sf_idx * Int32(self.sf_vec_size)
+                                values = cute.make_rmem_tensor(
+                                    (self.sf_vec_size,), cutlass.Float32
+                                )
                                 block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
+                                for elem_idx in cutlass.range_constexpr(
+                                    self.sf_vec_size
+                                ):
                                     value = cutlass.Float32(
                                         a_input[
                                             token_idx, block_start + Int32(elem_idx)
@@ -1187,16 +1200,22 @@ class MoEDynamicKernel:
                                     )
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
-                                packed64 = Uint64(0)
                                 scale_byte = Uint8(0)
-                                if self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(
-                                        values, block_max, gs_value
+                                if cutlass.const_expr(self.sf_vec_size == 32):
+                                    packed_lo, packed_hi, scale_byte = (
+                                        quantize_block_mxfp4(values, block_max)
                                     )
                                 else:
-                                    packed64, scale_byte = quantize_block_fp4(
-                                        values, block_max, gs_value
-                                    )
+                                    packed_lo = Uint64(0)
+                                    packed_hi = Uint64(0)
+                                    if self.fast_math:
+                                        packed_lo, scale_byte = quantize_block_fp4_fast(
+                                            values, block_max, gs_value
+                                        )
+                                    else:
+                                        packed_lo, scale_byte = quantize_block_fp4(
+                                            values, block_max, gs_value
+                                        )
 
                                 k_tile_idx = sf_idx // Int32(4)
                                 scale_k_base = k_tile_idx * Int32(32 * 4 * 4) + (
@@ -1205,13 +1224,21 @@ class MoEDynamicKernel:
                                 for cache_slot in cutlass.range_constexpr(8):
                                     output_offset = route_output_base[
                                         cache_slot
-                                    ] + sf_idx * Int32(8)
+                                    ] + sf_idx * Int32(self.sf_vec_size // 2)
                                     st_global_u64(
                                         get_ptr_as_int64(
                                             packed_a_storage, output_offset
                                         ),
-                                        packed64,
+                                        packed_lo,
                                     )
+                                    if cutlass.const_expr(self.sf_vec_size == 32):
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage,
+                                                output_offset + Int32(8),
+                                            ),
+                                            packed_hi,
+                                        )
                                     scale_storage[
                                         route_scale_base[cache_slot] + scale_k_base
                                     ] = scale_byte
@@ -1219,10 +1246,14 @@ class MoEDynamicKernel:
                         else:
                             sf_idx = lane_id
                             while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(16)
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                                block_start = sf_idx * Int32(self.sf_vec_size)
+                                values = cute.make_rmem_tensor(
+                                    (self.sf_vec_size,), cutlass.Float32
+                                )
                                 block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
+                                for elem_idx in cutlass.range_constexpr(
+                                    self.sf_vec_size
+                                ):
                                     value = cutlass.Float32(
                                         a_input[
                                             token_idx, block_start + Int32(elem_idx)
@@ -1230,16 +1261,22 @@ class MoEDynamicKernel:
                                     )
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
-                                packed64 = Uint64(0)
                                 scale_byte = Uint8(0)
-                                if self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(
-                                        values, block_max, gs_value
+                                if cutlass.const_expr(self.sf_vec_size == 32):
+                                    packed_lo, packed_hi, scale_byte = (
+                                        quantize_block_mxfp4(values, block_max)
                                     )
                                 else:
-                                    packed64, scale_byte = quantize_block_fp4(
-                                        values, block_max, gs_value
-                                    )
+                                    packed_lo = Uint64(0)
+                                    packed_hi = Uint64(0)
+                                    if self.fast_math:
+                                        packed_lo, scale_byte = quantize_block_fp4_fast(
+                                            values, block_max, gs_value
+                                        )
+                                    else:
+                                        packed_lo, scale_byte = quantize_block_fp4(
+                                            values, block_max, gs_value
+                                        )
 
                                 topk_slot = Int32(0)
                                 while topk_slot < num_topk:
@@ -1249,14 +1286,22 @@ class MoEDynamicKernel:
                                     )
                                     output_offset = (
                                         phys_row * output_bytes_per_row
-                                        + sf_idx * Int32(8)
+                                        + sf_idx * Int32(self.sf_vec_size // 2)
                                     )
                                     st_global_u64(
                                         get_ptr_as_int64(
                                             packed_a_storage, output_offset
                                         ),
-                                        packed64,
+                                        packed_lo,
                                     )
+                                    if cutlass.const_expr(self.sf_vec_size == 32):
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage,
+                                                output_offset + Int32(8),
+                                            ),
+                                            packed_hi,
+                                        )
                                     # Scale storage is tiled in 128-row SF
                                     # atoms, not MMA tiles.
                                     k_tile_idx = sf_idx // Int32(4)
@@ -1324,10 +1369,14 @@ class MoEDynamicKernel:
                                     gs_value = cutlass.Float32(1.0) / gs_value
                             sf_idx = lane_id
                             while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(16)
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                                block_start = sf_idx * Int32(self.sf_vec_size)
+                                values = cute.make_rmem_tensor(
+                                    (self.sf_vec_size,), cutlass.Float32
+                                )
                                 block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
+                                for elem_idx in cutlass.range_constexpr(
+                                    self.sf_vec_size
+                                ):
                                     value = cutlass.Float32(
                                         a_input[
                                             token_idx, block_start + Int32(elem_idx)
@@ -1335,25 +1384,41 @@ class MoEDynamicKernel:
                                     )
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
-                                packed64 = Uint64(0)
                                 scale_byte = Uint8(0)
-                                if self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(
-                                        values, block_max, gs_value
+                                if cutlass.const_expr(self.sf_vec_size == 32):
+                                    packed_lo, packed_hi, scale_byte = (
+                                        quantize_block_mxfp4(values, block_max)
                                     )
                                 else:
-                                    packed64, scale_byte = quantize_block_fp4(
-                                        values, block_max, gs_value
-                                    )
+                                    packed_lo = Uint64(0)
+                                    packed_hi = Uint64(0)
+                                    if self.fast_math:
+                                        packed_lo, scale_byte = quantize_block_fp4_fast(
+                                            values, block_max, gs_value
+                                        )
+                                    else:
+                                        packed_lo, scale_byte = quantize_block_fp4(
+                                            values, block_max, gs_value
+                                        )
 
                                 output_offset = (
                                     phys_tile * Int32(self.tile_shape_mnk[0])
                                     + row % Int32(self.tile_shape_mnk[0])
-                                ) * output_bytes_per_row + sf_idx * Int32(8)
+                                ) * output_bytes_per_row + sf_idx * Int32(
+                                    self.sf_vec_size // 2
+                                )
                                 st_global_u64(
                                     get_ptr_as_int64(packed_a_storage, output_offset),
-                                    packed64,
+                                    packed_lo,
                                 )
+                                if cutlass.const_expr(self.sf_vec_size == 32):
+                                    st_global_u64(
+                                        get_ptr_as_int64(
+                                            packed_a_storage,
+                                            output_offset + Int32(8),
+                                        ),
+                                        packed_hi,
+                                    )
 
                                 # Scale storage is tiled in 128-row SF atoms,
                                 # not MMA tiles.
@@ -2082,7 +2147,9 @@ class MoEDynamicKernel:
                     # Activation + quant into sA
                     sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
                     packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                    sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                    sf_blocks_per_row = Int32(
+                        self.tile_shape_mnk[2] // self.sf_vec_size
+                    )
                     gs_value = global_scale[task_expert_idx].to(cutlass.Float32)
                     if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
                         0.0
@@ -2156,11 +2223,13 @@ class MoEDynamicKernel:
                             local_row = quant_idx // sf_blocks_per_row
                             row = rows_offset + local_row
                             sf_block = quant_idx - local_row * sf_blocks_per_row
-                            block_start = sf_block * Int32(16)
+                            block_start = sf_block * Int32(self.sf_vec_size)
 
-                            values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                            values = cute.make_rmem_tensor(
+                                (self.sf_vec_size,), cutlass.Float32
+                            )
                             block_max = cutlass.Float32(0.0)
-                            for elem_idx in cutlass.range_constexpr(16):
+                            for elem_idx in cutlass.range_constexpr(self.sf_vec_size):
                                 value = cutlass.Float32(
                                     sC[
                                         local_row,
@@ -2171,27 +2240,42 @@ class MoEDynamicKernel:
                                 values[elem_idx] = value
                                 block_max = fmax_f32(block_max, fabs_f32(value))
 
-                            packed64 = Uint64(0)
                             scale_byte = Uint8(0)
-                            if self.fast_math:
-                                packed64, scale_byte = quantize_block_fp4_fast(
-                                    values, block_max, gs_value
+                            if cutlass.const_expr(self.sf_vec_size == 32):
+                                packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                                    values, block_max
                                 )
                             else:
-                                packed64, scale_byte = quantize_block_fp4(
-                                    values, block_max, gs_value
-                                )
-                            packed_base = sf_block << Int32(3)
+                                packed_lo = Uint64(0)
+                                packed_hi = Uint64(0)
+                                if self.fast_math:
+                                    packed_lo, scale_byte = quantize_block_fp4_fast(
+                                        values, block_max, gs_value
+                                    )
+                                else:
+                                    packed_lo, scale_byte = quantize_block_fp4(
+                                        values, block_max, gs_value
+                                    )
+                            packed_base = sf_block * Int32(self.sf_vec_size // 2)
                             dst_pcol = row & Int32(63)
                             xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
                             row_high = row >> Int32(6)
-                            for byte_idx in cutlass.range_constexpr(8):
+                            for byte_idx in cutlass.range_constexpr(
+                                self.sf_vec_size // 2
+                            ):
                                 src_pcol = packed_base + Int32(byte_idx)
                                 dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
                                 dst_flat = dst_row * packed_cols + dst_pcol
-                                byte_val = Uint8(
-                                    (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
-                                )
+                                if cutlass.const_expr(byte_idx < 8):
+                                    byte_val = Uint8(
+                                        (packed_lo >> Uint64(byte_idx * 8))
+                                        & Uint64(0xFF)
+                                    )
+                                else:
+                                    byte_val = Uint8(
+                                        (packed_hi >> Uint64((byte_idx - 8) * 8))
+                                        & Uint64(0xFF)
+                                    )
                                 sA_u8[dst_flat] = byte_val
 
                             outer_m_idx = row % Int32(32)

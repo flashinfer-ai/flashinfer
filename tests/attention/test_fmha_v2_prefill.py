@@ -1,11 +1,12 @@
 import pytest
 import torch
 import math
+import time
 from typing import Optional, Tuple, Union
 
 import flashinfer
 
-from flashinfer.prefill import fmha_v2_prefill_deepseek
+from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
 
@@ -132,68 +133,95 @@ def attention_ref_torch(
 
     outputs = []
     lse_outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        seq_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        seq_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (seq_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:seq_len].float() * k_scale
-            v_seq = torch.cat(v_pages, dim=0)[:seq_len].float() * v_scale
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                (
+                    paged_kv_cache[pages, 0].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * k_scale
+            )
+            v_seq = (
+                (
+                    paged_kv_cache[pages, 1].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * v_scale
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float() * k_scale
             v_seq = v_flat[kv_start:kv_end].float() * v_scale
 
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        head_dim_v = v_seq.shape[-1]
+
+        # Masks depend only on positions: build once per sequence, shared by
+        # all heads (the previous per-head loop rebuilt them per head).
+        drop_mask = None
+        if causal or window_left >= 0:
+            q_indices = torch.arange(q_len, device=device).unsqueeze(1)
+            kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+            offset = seq_len - q_len
+            keep = torch.ones(q_len, seq_len, dtype=torch.bool, device=device)
+            if causal:
+                keep &= (q_indices + offset) >= kv_indices
+            if window_left >= 0:
+                keep &= kv_indices >= (q_indices + offset - window_left)
+            drop_mask = ~keep
+
+        # Batch the per-head math by KV-head group: identical formula, but one
+        # [G, q_len, kv_len] matmul per KV head instead of a Python loop over
+        # every query head. Grouped (not all-heads-at-once) to bound the
+        # materialized fp32 score matrix at long sequence lengths.
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim_v, dtype=torch.float32, device=device
         )
         if return_lse:
-            lse_seq = torch.zeros(
+            lse_seq = torch.empty(
                 q_len, num_qo_heads, dtype=torch.float32, device=device
             )
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-
-            q_h = q_seq[:, h, :]
-            k_h = k_seq[:, kv_h, :]
-            v_h = v_seq[:, kv_h, :]
-
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
+        for kv_h in range(num_kv_heads):
+            k_h = k_seq[:, kv_h, :]  # [kv_len, head_dim]
+            v_h = v_seq[:, kv_h, :]  # [kv_len, head_dim_v]
+            # [G, q_len, kv_len]; in-place ops below to bound fp32 temporaries.
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
 
             if logits_soft_cap > 0.0:
-                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+                scores.div_(logits_soft_cap).tanh_().mul_(logits_soft_cap)
 
-            if causal:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                causal_mask = (q_indices + offset) >= kv_indices
-                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if drop_mask is not None:
+                scores.masked_fill_(drop_mask, float("-inf"))
 
-            if window_left >= 0:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                window_mask = kv_indices >= (q_indices + offset - window_left)
-                scores = scores.masked_fill(~window_mask, float("-inf"))
-
+            h_lo = kv_h * G
+            h_hi = h_lo + G
             if return_lse:
-                lse_seq[:, h] = torch.logsumexp(scores, dim=-1)
+                lse_seq[:, h_lo:h_hi] = torch.logsumexp(scores, dim=-1).permute(1, 0)
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            o_seq[:, h_lo:h_hi, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
         if return_lse:
@@ -268,64 +296,77 @@ def chunked_attention_ref_torch(
     q_float = q_flat.float()
 
     outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        kv_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        kv_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (kv_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:kv_len].float()
-            v_seq = torch.cat(v_pages, dim=0)[:kv_len].float()
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                paged_kv_cache[pages, 0]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
+            v_seq = (
+                paged_kv_cache[pages, 1]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float()
             v_seq = v_flat[kv_start:kv_end].float()
-
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
-        )
 
         # Absolute KV-space positions for each query token.
         # Query token i corresponds to KV position (kv_len - q_len + i).
         offset = kv_len - q_len
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-            q_h = q_seq[:, h, :]
+        # Build chunked causal mask once per sequence (shared by all heads).
+        # q_abs[i] = offset + i  (absolute KV-space row for query token i)
+        # kv_pos[j] = j           (KV column index)
+        q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
+        kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+
+        # Causal: col <= row
+        causal_mask = kv_pos <= q_abs
+
+        # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
+        chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
+        chunk_mask = kv_pos >= chunk_start
+
+        drop_mask = ~(causal_mask & chunk_mask)
+
+        # Batch the per-head math by KV-head group (see attention_ref_torch).
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        for kv_h in range(num_kv_heads):
             k_h = k_seq[:, kv_h, :]
             v_h = v_seq[:, kv_h, :]
 
-            # scores: [q_len, kv_len]
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
-
-            # Build chunked causal mask.
-            # q_abs[i] = offset + i  (absolute KV-space row for query token i)
-            # kv_pos[j] = j           (KV column index)
-            q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
-            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
-
-            # Causal: col <= row
-            causal_mask = kv_pos <= q_abs
-
-            # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
-            chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
-            chunk_mask = kv_pos >= chunk_start
-
-            mask = causal_mask & chunk_mask
-            scores = scores.masked_fill(~mask, float("-inf"))
+            # scores: [G, q_len, kv_len]
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
+            scores.masked_fill_(drop_mask, float("-inf"))
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            h_lo = kv_h * G
+            o_seq[:, h_lo : h_lo + G, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
 
@@ -413,6 +454,16 @@ def test_fmha_v2_prefill_deepseek(
     )
     scale_bmm1 = q_scale * k_scale * sm_scale
     scale_bmm2 = v_scale
+    scale_bmm1_d = (
+        torch.tensor([scale_bmm1], dtype=torch.float32, device=q.device)
+        if qkv_dtype == torch.float8_e4m3fn
+        else None
+    )
+    scale_bmm2_d = (
+        torch.tensor([scale_bmm2], dtype=torch.float32, device=q.device)
+        if qkv_dtype == torch.float8_e4m3fn
+        else None
+    )
     scale_softmax = 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0
     out, lse = fmha_v2_prefill_deepseek(
         q,
@@ -425,6 +476,8 @@ def test_fmha_v2_prefill_deepseek(
         scale_softmax=scale_softmax,
         scale_bmm1=scale_bmm1,
         scale_bmm2=scale_bmm2,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
         return_lse=True,
         lse=lse,
     )
@@ -449,7 +502,7 @@ def test_fmha_v2_prefill_deepseek(
         )
         out_ref = out_ref.to(o.dtype)
 
-    if q.dtype == torch.float8_e4m3fn and o.dtype == torch.bfloat16:
+    if q.dtype == torch.float8_e4m3fn:
         rtol, atol = 4e-2, 6e-2
         torch.testing.assert_close(out, out_ref.to(o.dtype), rtol=rtol, atol=atol)
     elif q.dtype == torch.bfloat16 and o.dtype == torch.bfloat16:
@@ -459,6 +512,410 @@ def test_fmha_v2_prefill_deepseek(
         rtol, atol = 1e-2, 1e-3
 
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype,o_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    head_dim_qk, head_dim_v = 192, 128
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_v,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_scale = k_scale = v_scale = 1.0
+    if qkv_dtype == torch.float8_e4m3fn:
+        q, q_scale = to_float8(q, dtype=qkv_dtype)
+        k, k_scale = to_float8(k, dtype=qkv_dtype)
+        v, v_scale = to_float8(v, dtype=qkv_dtype)
+        q_scale, k_scale, v_scale = (
+            q_scale.item(),
+            k_scale.item(),
+            v_scale.item(),
+        )
+
+    out = torch.empty(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_v,
+        dtype=o_dtype,
+        device="cuda",
+    )
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim_qk,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim_qk),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": (
+            torch.tensor(
+                [q_scale * k_scale / math.sqrt(head_dim_qk)],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            if qkv_dtype == torch.float8_e4m3fn
+            else None
+        ),
+        "scale_bmm2_d": (
+            torch.tensor([v_scale], dtype=torch.float32, device="cuda")
+            if qkv_dtype == torch.float8_e4m3fn
+            else None
+        ),
+    }
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    expected_out = out.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_heads",
+    [(1, 128, 4), (1, 1024, 32), (2, 129, 4)],
+)
+def test_fmha_v2_prefill_sm120_self_attention(
+    causal, head_dim, batch_size, seq_len, num_heads
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q, q_scale = to_float8(q, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+
+    out = torch.empty(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    out, lse = fmha_v2_prefill_sm120(
+        q,
+        k,
+        v,
+        out,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax=1.0,
+        scale_bmm1=q_scale * k_scale * sm_scale,
+        scale_bmm2=v_scale,
+        scale_bmm1_d=torch.tensor(
+            [q_scale * k_scale * sm_scale],
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        scale_bmm2_d=torch.tensor([v_scale], dtype=torch.float32, device="cuda"),
+        causal=causal,
+        return_lse=True,
+        lse=lse,
+    )
+
+    q_ref = q.float() * q_scale
+    k_ref = k.float() * k_scale
+    v_ref = v.float() * v_scale
+    out_ref, lse_ref = attention_mla_ref_torch(
+        batch_size, q_ref, k_ref, v_ref, causal=causal, sm_scale=sm_scale
+    )
+    lse = lse[..., 0] + torch.log(lse[..., 1] / 256)
+    torch.testing.assert_close(out, out_ref.to(out.dtype), rtol=4e-2, atol=6e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("device_scale", ["bmm1", "bmm2"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fmha_v2_prefill_sm120_optional_device_scales(device_scale, causal, head_dim):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    torch.manual_seed(42)
+    q_ref = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k_ref = torch.randn_like(q_ref)
+    v_ref = torch.randn_like(q_ref)
+    q, q_scale = to_float8(q_ref, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k_ref, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v_ref, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+    scale_bmm1 = q_scale * k_scale / math.sqrt(head_dim)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": scale_bmm1 * (0.5 if device_scale == "bmm1" else 1.0),
+        "scale_bmm2": v_scale * (0.5 if device_scale == "bmm2" else 1.0),
+        "scale_bmm1_d": (
+            torch.tensor([scale_bmm1], dtype=torch.float32, device="cuda")
+            if device_scale == "bmm1"
+            else None
+        ),
+        "scale_bmm2_d": (
+            torch.tensor([v_scale], dtype=torch.float32, device="cuda")
+            if device_scale == "bmm2"
+            else None
+        ),
+        "causal": causal,
+    }
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+
+    expected, _ = attention_mla_ref_torch(
+        batch_size,
+        q.float() * q_scale,
+        k.float() * k_scale,
+        v.float() * v_scale,
+        causal=causal,
+        sm_scale=1.0 / math.sqrt(head_dim),
+    )
+    torch.testing.assert_close(out, expected.to(torch.bfloat16), rtol=4e-2, atol=6e-2)
+
+
+def test_fmha_v2_prefill_sm120_validation():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    shape = (1, 8, 4, 128)
+    q_bf16 = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k_bf16 = torch.randn_like(q_bf16)
+    v_bf16 = torch.randn_like(q_bf16)
+    q = q_bf16.to(torch.float8_e4m3fn)
+    k = k_bf16.to(torch.float8_e4m3fn)
+    v = v_bf16.to(torch.float8_e4m3fn)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    kwargs = {
+        "num_heads": 4,
+        "head_dim": 128,
+        "seq_len": 8,
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(128),
+        "scale_bmm2": 1.0,
+    }
+
+    with pytest.raises(ValueError, match="requires FP8 E4M3 input"):
+        fmha_v2_prefill_sm120(q_bf16, k_bf16, v_bf16, out, **kwargs)
+    with pytest.raises(ValueError, match="requires BF16 output"):
+        fmha_v2_prefill_sm120(q, k, v, out.half(), **kwargs)
+    with pytest.raises(ValueError, match="requires Q/K head_dim=64 or 128"):
+        fmha_v2_prefill_sm120(q, k, v, out, **{**kwargs, "head_dim": 96})
+    q_noncontiguous = q.transpose(-1, -2).contiguous().transpose(-1, -2)
+    with pytest.raises(ValueError, match="must be contiguous"):
+        fmha_v2_prefill_sm120(q_noncontiguous, k, v, out, **kwargs)
+    with pytest.raises(ValueError, match="lse must be provided"):
+        fmha_v2_prefill_sm120(q, k, v, out, return_lse=True, **kwargs)
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    for device_scale_name in ("scale_bmm1_d", "scale_bmm2_d"):
+        with pytest.raises(ValueError, match=r"FP32 CUDA tensor with shape \[1\]"):
+            fmha_v2_prefill_sm120(
+                q,
+                k,
+                v,
+                out,
+                **{device_scale_name: torch.tensor([1.0])},
+                **kwargs,
+            )
+
+
+def test_fmha_v2_prefill_deepseek_validates_seq_len():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+
+    q = torch.empty((1, 8, 4, 192), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    v = torch.empty((1, 8, 4, 128), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(v)
+
+    with pytest.raises(ValueError, match="sequence length must match seq_len"):
+        fmha_v2_prefill_deepseek(
+            q,
+            k,
+            v,
+            out,
+            num_heads=4,
+            head_dim=192,
+            seq_len=7,
+            scale_softmax=0.0,
+        )
+    with pytest.raises(ValueError, match="lse must be provided"):
+        fmha_v2_prefill_deepseek(
+            q,
+            k,
+            v,
+            out,
+            num_heads=4,
+            head_dim=192,
+            seq_len=8,
+            scale_softmax=0.0,
+            return_lse=True,
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    torch.manual_seed(42)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q, q_scale = to_float8(q, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": torch.tensor(
+            [q_scale * k_scale / math.sqrt(head_dim)],
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        "scale_bmm2_d": torch.tensor([v_scale], dtype=torch.float32, device="cuda"),
+        "causal": causal,
+        "return_lse": True,
+        "lse": lse,
+    }
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    expected_out = out.clone()
+    expected_lse = lse.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    kwargs["scale_bmm2_d"].mul_(2.0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected_out * 2.0, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+
+def test_fmha_v2_prefill_sm120_async_enqueue():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads, head_dim = 1, 16384, 32, 128
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q = torch.zeros(shape, dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
+        "scale_bmm2": 1.0,
+        "scale_bmm1_d": torch.tensor(
+            [1.0 / math.sqrt(head_dim)], dtype=torch.float32, device="cuda"
+        ),
+        "scale_bmm2_d": torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        "causal": True,
+    }
+
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    torch.cuda.synchronize()
+
+    timings = []
+    for _ in range(3):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        host_start = time.perf_counter()
+        fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+        host_ms = (time.perf_counter() - host_start) * 1e3
+        end_event.record()
+        end_event.synchronize()
+        timings.append((host_ms, start_event.elapsed_time(end_event)))
+
+    best_ratio = min(host_ms / device_ms for host_ms, device_ms in timings)
+    assert best_ratio < 0.5, (
+        f"FMHAv2 enqueue blocked relative to device execution; timings={timings}, "
+        f"best host/device ratio={best_ratio:.3f}"
+    )
 
 
 def run_trtllm_fmha_v2_prefill_case(
@@ -848,6 +1305,115 @@ def test_trtllm_fmha_v2_prefill(
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
         skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+@pytest.mark.parametrize("input_layout", ["Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"])
+@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
+    input_layout: str,
+    page_size: int,
+    dtype: torch.dtype,
+    num_kv_heads: int,
+) -> None:
+    """Parity test for the non-interleaved paged-KV path: passing separate
+    (k_cache, v_cache) tensors with pre-expanded [B, 2, M] block tables must
+    match the stacked [num_pages, 2, ...] pool with shared [B, M] tables."""
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm12x_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    batch_size = 4
+    max_seq_len = 1024
+    num_qo_heads = 8
+    head_dim = 128
+
+    seq_lens = torch.randint(
+        max_seq_len // 2,
+        max_seq_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_kv_len = seq_lens.max().item()
+    max_q_len = max_kv_len
+    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    total_tokens = cum_seq_lens[-1].item()
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    is_nhd = input_layout == "Q_PAGED_KV_NHD"
+    max_num_blocks = (max_kv_len + page_size - 1) // page_size
+    num_pages = batch_size * max_num_blocks
+    paged_shape = (
+        (num_pages, 2, page_size, num_kv_heads, head_dim)
+        if is_nhd
+        else (num_pages, 2, num_kv_heads, page_size, head_dim)
+    )
+    paged = torch.randn(*paged_shape, dtype=dtype, device=device)
+    q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    block_tables = torch.zeros(
+        batch_size, max_num_blocks, dtype=torch.int32, device=device
+    )
+    for i in range(batch_size):
+        num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
+        block_tables[i, :num_blocks_needed] = torch.arange(
+            i * max_num_blocks,
+            i * max_num_blocks + num_blocks_needed,
+            device=device,
+        )
+
+    workspace_buffer = _get_workspace_buffer()
+
+    def run(qkv_arg, tables):
+        out = torch.zeros(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        return trtllm_fmha_v2_prefill(
+            qkv_arg,
+            input_layout,
+            workspace_buffer=workspace_buffer,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=sm_scale,
+            bmm2_scale=1.0,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens,
+            cum_seq_lens_kv=cum_seq_lens,
+            block_tables=tables,
+            out=out,
+            out_dtype=dtype,
+            mask_mode="CAUSAL",
+            window_left=-1,
+        )
+
+    # Trusted path: stacked [num_pages, 2, ...] pool + shared [B, M] tables.
+    out_stacked = run((q, paged), block_tables)
+
+    # Non-interleaved path: K and V as block-aligned halves of one allocation,
+    # with pre-expanded [B, 2, M] tables (V offsets shifted by delta blocks).
+    fused = torch.empty(2, *paged[:, 0].shape, dtype=dtype, device=device)
+    fused[0].copy_(paged[:, 0])
+    fused[1].copy_(paged[:, 1])
+    k_cache, v_cache = fused[0], fused[1]  # delta == num_pages
+    kv_tables = torch.stack(
+        [block_tables, block_tables + num_pages], dim=1
+    ).int()  # [B, 2, M]
+
+    out_separate = run((q, (k_cache, v_cache)), kv_tables)
+
+    torch.testing.assert_close(
+        out_separate.float(), out_stacked.float(), rtol=1e-3, atol=1e-3
     )
 
 
