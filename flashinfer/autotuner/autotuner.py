@@ -19,15 +19,23 @@ from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Callable,
+    cast,
     Iterable,
     List,
     Optional,
+    Protocol,
     Sequence,
     TypeAlias,
 )
 
 import torch
 
+from flashinfer.fused_moe.factorized import (
+    FactorizedSearchResult,
+    FactorizedTactic,
+    FactorizedTacticSpace,
+    MoeTacticKey,
+)
 from flashinfer.tllm_utils import delay_kernel
 from flashinfer.utils import (
     next_positive_power_of_2,
@@ -46,6 +54,16 @@ from flashinfer.autotuner.initializers import (
 # such as when new kernels or configs are added. In such cases, the tuning configs
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
 _nvfp4_cutlass_version = "0.1"
+
+
+class _FactorizedMoeRunner(Protocol):
+    """Describe the MoE-only coordinate space consumed by factorized search."""
+
+    def get_factorized_tactic_space(
+        self, inputs: list[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return the runner's legal complete FC1/FC2 tactic universe."""
+        ...
 
 
 def _tactic_to_json(tactic: Any) -> Any:
@@ -518,12 +536,6 @@ class TuningConfig:
                 ...         (1, autotuner_initializer_ones),
                 ...     )
                 ... )
-        value_aware_input_indices: Input tensor positions whose contents may vary
-            between profiling samples while their shapes and dtypes remain stable.
-        profile_arena_input_indices: Input tensor positions assigned graph-stable
-            lane views in the reusable A/B profiling arenas. Their contents are
-            staged once per profile even when they are not value-aware. Shared
-            read-only tensors may be omitted and retain one pointer.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -539,154 +551,9 @@ class TuningConfig:
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
-    # list. Use this to inject a deterministic, realistic distribution
-    # for inputs whose default tensor_initializer would be random
-    # (e.g. token_selected_experts in MoE workloads).
+    # list. Use this to inject deterministic representative contents for
+    # inputs whose default tensor initializer is not meaningful.
     inputs_pre_hook: Callable | None = None
-
-
-class ValueProfileArena:
-    """Own two graph-stable profiling arenas for selected tensor inputs.
-
-    Each A/B allocation is larger than twice the device L2 size. Tensor views
-    for one logical invocation occupy a lane within each allocation, while
-    tensor inputs not assigned to the arena continue to alias the caller's
-    objects. Value awareness and arena placement are separate declarations:
-    stable-value activations, outputs, and workspaces can cycle lane addresses
-    while shared read-only model tensors retain one pointer. The same arena is
-    shared by every tactic in one optimization profile so candidates see
-    identical contents and address order.
-    """
-
-    _ALIGNMENT_BYTES = 256
-
-    def __init__(
-        self,
-        inputs: list[Any],
-        arena_input_indices: tuple[int, ...],
-        num_ring_lanes: int,
-        l2_cache_size_bytes: int,
-    ) -> None:
-        """Allocate and populate the two arenas from one logical input sample."""
-        if num_ring_lanes <= 0:
-            raise ValueError("num_ring_lanes must be positive")
-        if not arena_input_indices:
-            raise ValueError("at least one profile-arena input index is required")
-
-        unique_indices = tuple(dict.fromkeys(arena_input_indices))
-        if len(unique_indices) != len(arena_input_indices):
-            raise ValueError("profile-arena input indices must be unique")
-
-        self._base_inputs = list(inputs)
-        self._input_indices = unique_indices
-        self._num_ring_lanes = num_ring_lanes
-        self._slot_layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
-
-        lane_payload_bytes = 0
-        device: torch.device | None = None
-        for input_index in self._input_indices:
-            if input_index < 0 or input_index >= len(inputs):
-                raise IndexError(f"profile-arena input index {input_index} is invalid")
-            tensor = inputs[input_index]
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"profile-arena input {input_index} must be a torch.Tensor"
-                )
-            if not tensor.is_cuda:
-                raise ValueError(f"profile-arena input {input_index} must be on CUDA")
-            if not tensor.is_contiguous():
-                raise ValueError(
-                    f"profile-arena input {input_index} must be contiguous"
-                )
-            if device is None:
-                device = tensor.device
-            elif tensor.device != device:
-                raise ValueError("all profile-arena inputs must use one CUDA device")
-
-            lane_payload_bytes = self._align(lane_payload_bytes)
-            tensor_bytes = tensor.numel() * tensor.element_size()
-            self._slot_layout.append(
-                (input_index, lane_payload_bytes, tensor.dtype, tuple(tensor.shape))
-            )
-            lane_payload_bytes += tensor_bytes
-
-        if lane_payload_bytes == 0:
-            raise ValueError("profile-arena inputs must contain at least one element")
-        assert device is not None
-
-        minimum_arena_bytes = 2 * l2_cache_size_bytes + self._ALIGNMENT_BYTES
-        self._lane_stride_bytes = self._align(
-            max(
-                lane_payload_bytes,
-                (minimum_arena_bytes + num_ring_lanes - 1) // num_ring_lanes,
-            )
-        )
-        arena_bytes = self._lane_stride_bytes * num_ring_lanes
-        self._arenas = (
-            torch.empty(arena_bytes, dtype=torch.uint8, device=device),
-            torch.empty(arena_bytes, dtype=torch.uint8, device=device),
-        )
-        self._lane_inputs = tuple(
-            tuple(self._make_lane_inputs(arena, lane) for lane in range(num_ring_lanes))
-            for arena in self._arenas
-        )
-        self.stage(inputs)
-
-    @classmethod
-    def _align(cls, value: int) -> int:
-        """Round a byte count up to the arena alignment."""
-        return (
-            (value + cls._ALIGNMENT_BYTES - 1)
-            // cls._ALIGNMENT_BYTES
-            * cls._ALIGNMENT_BYTES
-        )
-
-    def _make_lane_inputs(self, arena: torch.Tensor, lane: int) -> list[Any]:
-        """Create one full logical input list backed by a selected arena lane."""
-        lane_inputs = list(self._base_inputs)
-        lane_offset = lane * self._lane_stride_bytes
-        for input_index, slot_offset, dtype, shape in self._slot_layout:
-            template = self._base_inputs[input_index]
-            assert isinstance(template, torch.Tensor)
-            tensor_bytes = template.numel() * template.element_size()
-            byte_view = arena.narrow(0, lane_offset + slot_offset, tensor_bytes)
-            lane_inputs[input_index] = byte_view.view(dtype).view(shape)
-        return lane_inputs
-
-    def stage(self, inputs: list[Any]) -> None:
-        """Copy one content sample into every A/B lane outside timed execution."""
-        for arena_lanes in self._lane_inputs:
-            for lane_inputs in arena_lanes:
-                for input_index in self._input_indices:
-                    source = inputs[input_index]
-                    destination = lane_inputs[input_index]
-                    assert isinstance(source, torch.Tensor)
-                    assert isinstance(destination, torch.Tensor)
-                    if (
-                        source.shape != destination.shape
-                        or source.dtype != destination.dtype
-                    ):
-                        raise ValueError(
-                            f"profile-arena input {input_index} changed shape or dtype"
-                        )
-                    destination.copy_(source)
-
-    def inputs_for_iteration(self, iteration: int) -> list[Any]:
-        """Return A/B-alternating inputs and cycle lanes by invocation index."""
-        arena_index = iteration % 2
-        lane_index = (iteration // 2) % self._num_ring_lanes
-        return self._lane_inputs[arena_index][lane_index]
-
-    def iteration_inputs(self, num_iterations: int) -> list[list[Any]]:
-        """Return the exact ordered logical inputs for requested invocations."""
-        if num_iterations <= 0:
-            raise ValueError("num_iterations must be positive")
-        return [self.inputs_for_iteration(i) for i in range(num_iterations)]
-
-    @property
-    def arena_size_bytes(self) -> int:
-        """Return the byte capacity of each independent A/B arena."""
-        return self._arenas[0].numel()
 
 
 @dataclass(frozen=True)
@@ -1230,6 +1097,10 @@ class AutoTunerStatistics:
     # Maps "custom_op::RunnerClass" to sets of tactic values that failed.
     # Used by the offline blocklist generator to extract per-tactic pass/fail.
     failed_tactics: dict[str, set[Any]] = field(default_factory=dict[str, set[Any]])
+    # Number of complete-tactic profiling attempts for each ordinary operation.
+    profiled_tactic_count: dict[str, int] = field(default_factory=dict[str, int])
+    # Number of legal tactics exposed before an optional factorized search.
+    enumerated_tactic_count: dict[str, int] = field(default_factory=dict[str, int])
 
     def __str__(self) -> str:
         """Return a string representation of collected statistics."""
@@ -1252,6 +1123,10 @@ class AutoTunerStatistics:
                 stats_str += f"  {op}:\n"
                 stats_str += f"    - Total configs tried: {total}\n"
                 stats_str += f"    - Successful configs: {successful}\n"
+                stats_str += (
+                    "    - Complete tactics profiled: "
+                    f"{self.profiled_tactic_count.get(op, 0)}\n"
+                )
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
                     stats_str += "    - Failed profiling combinations:\n"
@@ -1531,6 +1406,11 @@ class AutoTuner:
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
         self._profiling_cache_policies: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
+        # Ordinary factorized results are process-local because they retain measured finalists.
+        self._factorized_search_cache: dict[
+            ProfilingCacheKey,
+            tuple[FactorizedSearchResult, dict[MoeTacticKey, float]],
+        ] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -2234,9 +2114,8 @@ class AutoTuner:
                     # results *for this specific custom_op* in the
                     # current process but this particular input shape
                     # still falls back, that almost always means the
-                    # runtime input is *outside the tuned range* (e.g.
-                    # ``max_num_tokens`` was 2048 during tuning,
-                    # runtime sees 4000).  This is a silent perf
+                    # runtime input is *outside the tuned range* (for example,
+                    # a dynamic dimension exceeded its tuned maximum). This is a silent perf
                     # regression: the fallback tactic is correct but
                     # not optimised for this shape.  Warn once per
                     # unique (op, profile-signature) pair so the user
@@ -2273,9 +2152,9 @@ class AutoTuner:
                                 f"{custom_op} input_shapes={input_shapes}; "
                                 f"falling back to runner={runners[0].__class__.__name__} "
                                 f"tactic=-1.  This shape is outside the tuning "
-                                f"bucket range -- expand tuning_buckets / "
-                                f"max_num_tokens during the next tuning "
-                                f"pass to avoid this perf cliff."
+                                f"bucket range -- expand tuning_buckets or the "
+                                f"operation's dynamic profile bounds during the "
+                                f"next tuning pass to avoid this perf cliff."
                             )
                 return runner, tactic
 
@@ -2343,15 +2222,14 @@ class AutoTuner:
                             )
                         # Synthesize inputs only on the profiling path.
                         tensors = self._prepare_input_tensors(p, inputs)
-                        # Apply the optional inputs_pre_hook to inject a
-                        # deterministic / realistic distribution before
-                        # the per-tactic profile loop.
+                        # Apply optional representative contents before the per-tactic loop.
                         if tuning_config.inputs_pre_hook is not None:
                             tensors = list(tuning_config.inputs_pre_hook(tensors))
-                        prepared_input_batches = (
-                            self._prepare_input_tensors_with_batches(
-                                tensors, tuning_config
-                            )
+                        (
+                            effective_tuning_config,
+                            prepared_input_batches,
+                        ) = self._prepare_input_tensors_with_batches(
+                            tensors, tuning_config
                         )
                         if pbar is None:
                             pbar = tqdm.tqdm(
@@ -2372,7 +2250,121 @@ class AutoTuner:
                             )
                             if r_id == 0 and race_default and -1 not in valid_tactics:
                                 valid_tactics = [-1, *valid_tactics]
+                            self.stats.enumerated_tactic_count[custom_op] = (
+                                self.stats.enumerated_tactic_count.get(custom_op, 0)
+                                + len(
+                                    [
+                                        candidate
+                                        for candidate in valid_tactics
+                                        if candidate != -1
+                                    ]
+                                )
+                            )
                             runner_arg_names = runner_arg_names_map[r]
+                            if getattr(r, "use_factorized_moe_tactic_search", False):
+                                from flashinfer.fused_moe.factorized import (
+                                    FactorizedSearch,
+                                )
+
+                                concrete_tactics = [
+                                    candidate
+                                    for candidate in valid_tactics
+                                    if candidate != -1
+                                ]
+                                if not concrete_tactics:
+                                    continue
+                                get_factorized_space: Callable[
+                                    [list[torch.Tensor]], FactorizedTacticSpace
+                                ] = cast(
+                                    _FactorizedMoeRunner, r
+                                ).get_factorized_tactic_space
+                                factorized_space = get_factorized_space(
+                                    tensors
+                                ).restricted_to_public_tactics(concrete_tactics)
+                                factorized_timings: dict[MoeTacticKey, float] = {}
+                                runner_handles_precompile: bool | None = None
+
+                                def measure_factorized(
+                                    candidate: FactorizedTactic, decisive: bool
+                                ) -> float:
+                                    """Lazily materialize and time one complete runner tactic."""
+                                    nonlocal runner_handles_precompile
+                                    _ = decisive
+                                    public_tactic = candidate.public_identity()
+                                    if isinstance(public_tactic, list):
+                                        if len(public_tactic) != 2:
+                                            raise ValueError(
+                                                "A paired MoE tactic requires exactly two coordinates"
+                                            )
+                                        identity: MoeTacticKey = (
+                                            public_tactic[0],
+                                            public_tactic[1],
+                                        )
+                                    else:
+                                        identity = public_tactic
+                                    cached_timing = factorized_timings.get(identity)
+                                    if cached_timing is not None:
+                                        return cached_timing
+
+                                    # PrimsTS compiles only coordinate points the search visits.
+                                    # A generic preparation-only runner still receives its legacy
+                                    # one-time fallback preparation before the first measurement.
+                                    if runner_handles_precompile is not False:
+                                        handled = r.precompile_tactics(
+                                            tensors, [public_tactic], p, **kwargs
+                                        )
+                                        if runner_handles_precompile is None:
+                                            runner_handles_precompile = handled
+                                            if not handled and (
+                                                "do_preparation" in runner_arg_names
+                                            ):
+                                                r(
+                                                    tensors,
+                                                    tactic=-1,
+                                                    do_preparation=True,
+                                                    **kwargs,
+                                                )
+                                    time_measured = self._profile_single_kernel(
+                                        r,
+                                        tensors,
+                                        public_tactic,
+                                        effective_tuning_config,
+                                        input_tensor_batches=prepared_input_batches,
+                                        **kwargs,
+                                    )
+                                    factorized_timings[identity] = time_measured
+                                    self.stats.profiled_tactic_count[custom_op] = (
+                                        self.stats.profiled_tactic_count.get(
+                                            custom_op, 0
+                                        )
+                                        + 1
+                                    )
+                                    return time_measured
+
+                                search_result = FactorizedSearch(
+                                    max_sweeps=2
+                                ).search_with_finalists(
+                                    factorized_space, measure_factorized
+                                )
+                                winner_tactic = search_result.winner.public_identity()
+                                winner_time = measure_factorized(
+                                    search_result.winner, True
+                                )
+                                factorized_cache_key = AutoTuner._get_cache_key(
+                                    custom_op,
+                                    r,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    r.get_cache_key_extras(tensors),
+                                )
+                                self._factorized_search_cache[factorized_cache_key] = (
+                                    search_result,
+                                    dict(factorized_timings),
+                                )
+                                if winner_time < min_time:
+                                    min_time = winner_time
+                                    runner_id, tactic = r_id, winner_tactic
+                                continue
                             if (
                                 "do_preparation" in runner_arg_names
                                 and len(valid_tactics) > 0
@@ -2389,11 +2381,17 @@ class AutoTuner:
                                     )
                             for tac in valid_tactics:
                                 try:
+                                    self.stats.profiled_tactic_count[custom_op] = (
+                                        self.stats.profiled_tactic_count.get(
+                                            custom_op, 0
+                                        )
+                                        + 1
+                                    )
                                     time_measured = self._profile_single_kernel(
                                         r,
                                         tensors,
                                         tac,
-                                        tuning_config,
+                                        effective_tuning_config,
                                         input_tensor_batches=prepared_input_batches,
                                         **kwargs,
                                     )
@@ -2528,6 +2526,32 @@ class AutoTuner:
 
             return runners[runner_id], tactic
 
+    def get_factorized_search_result(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor],
+    ) -> tuple[FactorizedSearchResult, dict[MoeTacticKey, float]] | None:
+        """Return the process-local ordinary coordinate result for one cache domain."""
+        with self._lock:
+            if self._override_tuning_buckets is not None or self._override_round_up:
+                tuning_config = self._apply_tuning_overrides(tuning_config)
+            input_shapes = tuple(self._get_input_sizes(inputs))
+            nearest_profile = self._find_nearest_profile(input_shapes, tuning_config)
+            cache_key = AutoTuner._get_cache_key(
+                custom_op,
+                runner,
+                nearest_profile,
+                tuning_config,
+                runner.get_cache_key_extras(inputs),
+            )
+            record = self._factorized_search_cache.get(cache_key)
+            if record is None:
+                return None
+            result, timings = record
+            return result, dict(timings)
+
     def rank_tactics(
         self,
         custom_op: str,
@@ -2618,11 +2642,20 @@ class AutoTuner:
             if "do_preparation" in runner_arg_names:
                 runner(tensors, tactic=-1, do_preparation=True, **kwargs)
 
+            (
+                effective_tuning_config,
+                input_tensor_batches,
+            ) = self._prepare_input_tensors_with_batches(tensors, tuning_config)
             scored: list[tuple[float, Any]] = []
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, tensors, tac, tuning_config, **kwargs
+                        runner,
+                        tensors,
+                        tac,
+                        effective_tuning_config,
+                        input_tensor_batches=input_tensor_batches,
+                        **kwargs,
                     )
                 except Exception as e:
                     logger.debug(
@@ -2662,19 +2695,20 @@ class AutoTuner:
     def _profile_single_kernel(
         self,
         runner: TunableRunner,
-        inputs: list[torch.Tensor],
+        inputs: list[Any],
         tactic: Any,
         tuning_config: TuningConfig,
-        input_tensor_batches: list[list[Any]] | None = None,
+        input_tensor_batches: list[list[Any]],
         **kwargs,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
 
         Args:
             runner (TunableRunner): The runner implementation to profile
-            inputs (List[torch.Tensor]): Input tensors for the kernel
+            inputs (List[Any]): Logical inputs whose shapes identify the profile.
             tactic (int): Tactic ID to use for this profiling run
             tuning_config (TuningConfig): Tuning configuration
+            input_tensor_batches: Previously provisioned iteration schedule.
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
@@ -2713,7 +2747,6 @@ class AutoTuner:
         measure_policy = self._effective_measure_policy
 
         profiling_repeat = self._get_profiling_repeat(tuning_config)
-
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
 
@@ -3008,17 +3041,44 @@ class AutoTuner:
 
         return avg_time
 
-    def prepare_tactic_profile(
+    def prepare_profile_schedule(
         self,
         inputs: list[Any],
         tuning_config: TuningConfig,
     ) -> tuple[TuningConfig, list[list[Any]]]:
-        """Prepare one reusable input schedule shared by explicitly profiled tactics."""
+        """Build a retained maximum-profile schedule for explicit profiling.
+
+        ``_prepare_input_tensors`` materializes the logical maximum profile;
+        ``_prepare_input_tensors_with_batches`` owns its physical storage.
+        The returned configuration supersedes ``tuning_config`` because memory
+        or iteration limits may disable cold-L2 profiling. This method does not
+        invoke ``inputs_pre_hook``; retained-schedule callers own value restaging
+        across samples.
+        """
         with self._lock:
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
-            batches = self._prepare_input_tensors_with_batches(inputs, tuning_config)
-            return tuning_config, batches
+
+            # Bucket generation sorts every dynamic dimension, so the last Cartesian profile
+            # provides maximum backing. The batching tier owns all physical provisioning.
+            try:
+                profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                if not profiles:
+                    raise RuntimeError("AutoTuner generated no optimization profiles")
+                backing_inputs = list(self._prepare_input_tensors(profiles[-1], inputs))
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                fallback_config = replace(tuning_config, use_cold_l2_cache=False)
+                logger.warning(
+                    "[Autotuner] Maximum-profile backing does not fit; "
+                    "provisioning the current invocation for non-cold profiling"
+                )
+                return self._prepare_input_tensors_with_batches(inputs, fallback_config)
+            return self._prepare_input_tensors_with_batches(
+                backing_inputs,
+                tuning_config,
+                view_templates=inputs,
+            )
 
     def profile_tactic(
         self,
@@ -3344,8 +3404,7 @@ class AutoTuner:
         tensors: list[torch.Tensor | None] = []
         for i, p in enumerate(profile.shapes):
             if inputs[i] is None:
-                # Some callers pass None for optional tensors (e.g. routing_logits
-                # in non-routed MoE). Preserve None as-is.
+                # Preserve absent optional tensor slots unchanged.
                 tensors.append(None)
             elif any(isinstance(d, DynamicDim) for d in p):
                 tensor = self._create_tensor_like(
@@ -3724,100 +3783,114 @@ class AutoTuner:
 
     def _prepare_input_tensors_with_batches(
         self,
-        inputs: list[Any],
+        backing_inputs: list[Any],
         tuning_config: TuningConfig,
-    ) -> list[list[Any]]:
-        """Create multiple input copies to flush the L2 cache between profiling iterations."""
-        if not tuning_config.use_cold_l2_cache:
-            return [inputs]
+        *,
+        view_templates: list[Any] | None = None,
+    ) -> tuple[TuningConfig, list[list[Any]]]:
+        """Own and batch one complete profiling working set.
 
+        ``backing_inputs`` determines allocated storage, while optional
+        ``view_templates`` determines the shapes passed to the runner. When
+        cold-L2 coverage cannot be guaranteed, the returned configuration
+        explicitly selects non-cold profiling. Non-tensor entries are treated
+        as immutable and shared across replicas.
+        """
         profiling_repeat = self._get_profiling_repeat(tuning_config)
+        if view_templates is None:
+            view_templates = backing_inputs
+        if len(backing_inputs) != len(view_templates):
+            raise ValueError("Backing inputs and view templates must have equal length")
 
-        arena_indices = (
-            tuning_config.profile_arena_input_indices
-            or tuning_config.value_aware_input_indices
-        )
-        if arena_indices:
-            if not set(tuning_config.value_aware_input_indices).issubset(arena_indices):
-                raise ValueError(
-                    "value-aware inputs must be assigned to the profile arena "
-                    "when cold-L2 profiling is enabled"
+        def clone_input(backing: Any, template: Any) -> Any:
+            """Clone one tensor backing or preserve one immutable non-tensor value."""
+            if not isinstance(backing, torch.Tensor):
+                return backing
+            if (
+                isinstance(template, torch.Tensor)
+                and backing.numel() < template.numel()
+            ):
+                # A runtime shape beyond the largest tuning bucket remains authoritative.
+                return template.clone()
+            return backing.clone()
+
+        def clone_backing_inputs() -> list[Any]:
+            """Clone every tensor in one complete profiling working set."""
+            return [
+                clone_input(backing, template)
+                for backing, template in zip(
+                    backing_inputs, view_templates, strict=True
                 )
-            l2_cache_size_bytes = self._get_l2_cache_size_in_bytes()
-            lane_payload_bytes = 0
-            for input_index in arena_indices:
-                if input_index < 0 or input_index >= len(inputs):
-                    raise IndexError(
-                        f"profile-arena input index {input_index} is invalid"
-                    )
-                tensor = inputs[input_index]
-                if not isinstance(tensor, torch.Tensor):
-                    raise TypeError(
-                        f"profile-arena input {input_index} must be a torch.Tensor"
-                    )
-                lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
-                lane_payload_bytes += tensor.numel() * tensor.element_size()
-            lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
-            target_working_set_bytes = (
-                2 * l2_cache_size_bytes + ValueProfileArena._ALIGNMENT_BYTES
-            )
-            # Each lane is visited once in both the A and B arenas, so a
-            # repeat-length schedule can reach at most repeat // 2 lanes per
-            # arena. Do not allocate lanes that the timed replay cannot touch.
-            reachable_ring_lanes = max(profiling_repeat // 2, 1)
-            num_ring_lanes = min(
-                reachable_ring_lanes,
-                max(
-                    1,
-                    (target_working_set_bytes + lane_payload_bytes - 1)
-                    // lane_payload_bytes,
-                ),
-            )
-            arena = ValueProfileArena(
-                inputs,
-                arena_indices,
-                num_ring_lanes=num_ring_lanes,
-                l2_cache_size_bytes=l2_cache_size_bytes,
-            )
-            # Keep the full measurement schedule while cycling through only
-            # enough physical lanes to evict L2. Profiling precision therefore
-            # does not multiply the arena's state/cache allocation.
-            batches = arena.iteration_inputs(profiling_repeat)
-            logger.debug(
-                "[Autotuner] profile-arena cold-L2 profiling uses two "
-                f"{arena.arena_size_bytes}-byte arenas, {num_ring_lanes} physical "
-                f"lanes, and {len(batches)} scheduled iterations"
-            )
-            return batches
+            ]
 
-        one_buffer_bytes = sum(
-            input.numel() * input.element_size()
-            if isinstance(input, torch.Tensor)
+        def current_views(owned_backing: list[Any]) -> list[Any]:
+            """Return requested-shape views while retaining backing storage."""
+            return [
+                (
+                    backing.view(-1)[: template.numel()].view(template.shape)
+                    if isinstance(backing, torch.Tensor)
+                    and isinstance(template, torch.Tensor)
+                    and backing.shape != template.shape
+                    else backing
+                )
+                for backing, template in zip(owned_backing, view_templates, strict=True)
+            ]
+
+        try:
+            first_backing = clone_backing_inputs()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            logger.warning(
+                "[Autotuner] One owned profiling replica does not fit; "
+                "using caller buffers for non-cold profiling"
+            )
+            return replace(tuning_config, use_cold_l2_cache=False), [view_templates]
+        first_views = current_views(first_backing)
+        if not tuning_config.use_cold_l2_cache:
+            return tuning_config, [first_views]
+
+        # Count the current invocation rather than unused maximum-profile capacity. This makes
+        # the ring guarantee describe bytes actually touched during each measured iteration.
+        working_set_bytes = sum(
+            value.numel() * value.element_size()
+            if isinstance(value, torch.Tensor)
             else 0
-            for input in inputs
+            for value in view_templates
         )
-        if one_buffer_bytes <= 0:
-            logger.debug(
-                "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
+        if working_set_bytes <= 0:
+            return replace(tuning_config, use_cold_l2_cache=False), [first_views]
+
+        l2_cache_bytes = self._get_l2_cache_size_in_bytes()
+        num_replicas = 2 * l2_cache_bytes // working_set_bytes + 1
+        requested_iterations = profiling_repeat
+        if num_replicas > requested_iterations:
+            logger.warning(
+                f"[Autotuner] {requested_iterations} iterations cannot traverse "
+                f"the {num_replicas} replicas required for a complete 2x-L2 "
+                f"working set ({working_set_bytes} bytes/replica, "
+                f"{l2_cache_bytes} L2 bytes); using non-cold profiling"
             )
-            return [inputs]
+            return replace(tuning_config, use_cold_l2_cache=False), [first_views]
 
-        num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
-        num_buffers = min(num_buffers, profiling_repeat + 1)
-        # Avoid reusing a warmed batch within the timed graph.
-        if tuning_config.use_cuda_graph and tuning_config.use_cold_l2_graph_replay:
-            num_buffers = max(num_buffers, profiling_repeat)
-
-        inputs_list = [inputs]
-        for _ in range(num_buffers - 1):
-            inputs_list.append(
-                [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
+        batches = [first_views]
+        try:
+            for _ in range(num_replicas - 1):
+                batches.append(current_views(clone_backing_inputs()))
+        except torch.cuda.OutOfMemoryError:
+            allocated_replicas = len(batches)
+            del batches[1:]
+            torch.cuda.empty_cache()
+            logger.warning(
+                f"[Autotuner] Complete 2x-L2 ring allocation failed after "
+                f"{allocated_replicas} of {num_replicas} replicas; "
+                "using non-cold profiling"
             )
-
+            return replace(tuning_config, use_cold_l2_cache=False), batches
         logger.debug(
-            f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
+            f"[Autotuner] use_cold_l2_cache=True, use {num_replicas} "
+            "complete working-set replicas"
         )
-        return inputs_list
+        return tuning_config, batches
 
     def _get_profiling_repeat(self, tuning_config: TuningConfig) -> int:
         profiling_repeat = tuning_config.profiling_repeat
@@ -3833,6 +3906,7 @@ class AutoTuner:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
+            self._factorized_search_cache.clear()
             self._file_configs.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()

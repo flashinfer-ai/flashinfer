@@ -904,7 +904,7 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
     from flashinfer.utils import device_support_pdl
 
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in ((10, 0), (10, 3), (10, 7)):
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")

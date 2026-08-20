@@ -132,7 +132,11 @@ def test_cli_json_cache_restores_in_a_fresh_process(tmp_path: Path) -> None:
         env=environment,
     )
     cache_payload = json.loads(cache.read_text())
-    assert len(cache_payload["_records"]["trtllm_moe_da"]) == 1
+    da_records = cache_payload["_records"]["moe_da"]
+    assert len(da_records) == 1
+    operation_key, record = next(iter(da_records.items()))
+    assert json.loads(operation_key)["backend"] == "trtllm"
+    assert record["backend"] == "trtllm"
     _assert_result_file(tuned)
 
     # A second process proves cache-only replay can restore the same public result contract.

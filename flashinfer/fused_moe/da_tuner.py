@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -244,9 +244,11 @@ class FactorizedTactic:
     fc1: Any
     # Opaque FC2 component identity used only for coordinate grouping.
     fc2: Any
+    # Public runner tactic that resolves to this complete graph-body identity.
+    public_tactic: Any = field(default=None, compare=False, hash=False)
 
     def to_body(self) -> DABody:
-        """Decode one concrete TRTLLM tactic into its graph-body description."""
+        """Decode one concrete backend tactic into its graph-body description."""
         identity = self.tactic
         if (
             not isinstance(identity, tuple)
@@ -255,7 +257,7 @@ class FactorizedTactic:
             or int(identity[1]) < 0
         ):
             raise RuntimeError(
-                "A TRTLLM DA body requires a concrete (tile_n, config_index) identity"
+                "A DA MoE body requires a concrete (tile_n, config_index) identity"
             )
         return DABody(tactic=int(identity[1]), tile_n=self.tile_n)
 
@@ -277,6 +279,8 @@ class FactorizedTacticSpace:
         self._by_components: dict[tuple[int, Any, Any], FactorizedTactic] = {}
         # Complete-identity index resolves deterministic anchors supplied by the runner.
         self._by_identity: dict[Any, FactorizedTactic] = {}
+        # Public runner identities map scalar or paired ordinary tactics to exact DA bodies.
+        self._by_public_identity: dict[Any, FactorizedTactic] = {}
         for tactic in tactics:
             if tactic.tile_n <= 0:
                 raise ValueError("Every factorized tactic requires positive tile_n")
@@ -288,6 +292,13 @@ class FactorizedTacticSpace:
             self._by_tile.setdefault(tactic.tile_n, []).append(tactic)
             self._by_components[component_key] = tactic
             self._by_identity[tactic.tactic] = tactic
+            public_identity = (
+                tactic.tactic if tactic.public_tactic is None else tactic.public_tactic
+            )
+            public_key = self._public_identity_key(public_identity)
+            if public_key in self._by_public_identity:
+                raise ValueError(f"Duplicate public tactic {public_identity!r}")
+            self._by_public_identity[public_key] = tactic
 
         # One legal anchor seeds factorized search independently for each routing tile.
         self._anchors: dict[int, FactorizedTactic] = {}
@@ -311,6 +322,22 @@ class FactorizedTacticSpace:
     def anchor(self, tile_n: int) -> FactorizedTactic:
         """Return the runner-declared legal anchor for one tile."""
         return self._anchors[tile_n]
+
+    def resolve_public_tactic(self, public_tactic: Any) -> FactorizedTactic:
+        """Resolve one ordinary runner tactic to its exact complete DA identity."""
+        try:
+            return self._by_public_identity[self._public_identity_key(public_tactic)]
+        except KeyError as error:
+            raise RuntimeError(
+                f"Ordinary tactic {public_tactic!r} is absent from the legal DA universe"
+            ) from error
+
+    @staticmethod
+    def _public_identity_key(public_tactic: Any) -> Any:
+        """Canonicalize public list tactics for stable identity lookup."""
+        if isinstance(public_tactic, list):
+            return tuple(public_tactic)
+        return public_tactic
 
     def fc1_sweep(self, tile_n: int, fixed_fc2: Any) -> tuple[FactorizedTactic, ...]:
         """Return legal complete tactics varying FC1 with FC2 held fixed."""
