@@ -139,6 +139,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
     mInnerDimMultiplier = 1;
 
+#ifdef ENABLE_FP4
     auto make_humming_runner = [&] {
       mInnerDimMultiplier = 2;
       mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
@@ -152,6 +153,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
                              kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
     };
+#endif
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {

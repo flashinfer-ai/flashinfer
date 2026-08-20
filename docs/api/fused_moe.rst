@@ -69,16 +69,8 @@ CUTLASS Fused MoE
 
     cutlass_fused_moe
 
-cuTile BF16 MoE
+cuTile Fused MoE
 ----------------
-
-The unified ``cutile_bf16`` backend source-integrates a portable BF16 MoE
-pipeline for SM89, SM90, SM120, and SM121. It requires the ``cuda-tile``
-Python package and a ``tileiras``/NVRTC toolchain supporting the target GPU;
-the initial implementation accepts precomputed routing, uses SwiGLU, and
-produces finalized output. Its bucketed autotuner profiles a compact shortlist
-of architecture-specific grouped-GEMM tiles and adjacent ``TILE_M`` values
-rather than the full Cartesian product.
 
 .. autosummary::
     :toctree: ../generated

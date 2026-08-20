@@ -270,9 +270,6 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
-# The source-integrated cuTile BF16 backend is validated on Ada, Hopper, and
-# the SM12x Blackwell family. Keep this explicit rather than treating cuTile's
-# compiler target list as a runtime support guarantee.
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 
 
@@ -606,10 +603,9 @@ class CutlassBf16Config:
 
 @dataclass(frozen=True)
 class CuTileBf16Config:
-    """Source-integrated cuTile BF16 backend for SM89/SM90/SM120/SM121.
+    """cuTile BF16 backend.
 
-    The MVP supports packed precomputed routing, SwiGLU, and finalized output.
-    Expert parallelism and fused shared experts are not yet supported.
+    Expert parallelism and fused shared experts are not supported.
     """
 
     @classmethod
@@ -624,6 +620,7 @@ class CuTileBf16Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: ActivationConfig = ActivationConfig.swiglu,
         device=None,
     ):
         """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
@@ -635,6 +632,7 @@ class CuTileBf16Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation_type=activation.type,
             device=device,
         )
 

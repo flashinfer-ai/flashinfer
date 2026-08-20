@@ -1,8 +1,16 @@
-# Permute stages adapted from NVIDIA TileGym
-# src/tilegym/ops/cutile/moe_align_block.py; grouped GEMM adapted from
-# TileGym's cuTile MoE kernel through LightLM (both MIT).
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """BF16 cuTile kernels for the unified MoE backend.
 
@@ -26,7 +34,9 @@ import cuda.tile as ct
 import torch
 
 from ...cutile.cutile_common import cached_replace_hints
+from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
+from .activation import launch_activation
 
 ConstInt: TypeAlias = ct.Constant[int]
 
@@ -77,6 +87,7 @@ def allocate_workspace(
     intermediate_size: int,
     num_experts: int,
     top_k: int,
+    is_gated: bool,
     block_sizes: Sequence[int],
     device: torch.device,
 ) -> Workspace:
@@ -107,7 +118,10 @@ def allocate_workspace(
         pad_off=torch.empty(num_experts + 1, dtype=int32, device=device),
         slab_tot=torch.empty(num_slabs * epow2, dtype=int32, device=device),
         gemm1_out=torch.empty(
-            num_assignments, 2 * intermediate_size, dtype=bf16, device=device
+            num_assignments,
+            intermediate_size * (2 if is_gated else 1),
+            dtype=bf16,
+            device=device,
         ),
         activation_out=torch.empty(
             num_assignments, intermediate_size, dtype=bf16, device=device
@@ -471,39 +485,6 @@ def _grouped_gemm_bf16(
             )
 
 
-def _silu(x):
-    return x / (1.0 + ct.exp(-x))
-
-
-@ct.kernel
-def _silu_and_mul(
-    X,
-    OUT,
-    I: ConstInt,
-    TILE_I: ConstInt,
-    NUM_TILES: ConstInt,
-):
-    row = ct.bid(0)
-    offsets = ct.bid(1) * TILE_I + ct.arange(TILE_I, dtype=ct.int32)
-    check_bounds = NUM_TILES * TILE_I != I
-    gate = ct.astype(
-        ct.gather(X, (row, offsets), check_bounds=check_bounds, latency=1),
-        ct.float32,
-    )
-    up = ct.astype(
-        ct.gather(X, (row, offsets + I), check_bounds=True, latency=1),
-        ct.float32,
-    )
-    result = _silu(gate) * up
-    ct.scatter(
-        OUT,
-        (row, offsets),
-        ct.astype(result, OUT.dtype),
-        check_bounds=check_bounds,
-        latency=1,
-    )
-
-
 @ct.kernel
 def _combine(
     Y,
@@ -716,6 +697,7 @@ def run_moe(
     output: torch.Tensor,
     workspace: Workspace,
     *,
+    activation_type: ActivationType,
     block_size: int,
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
@@ -741,16 +723,8 @@ def run_moe(
         block_size=block_size,
         config=gemm1_config,
     )
-    intermediate_size = w2.shape[1]
     activation_out = workspace.activation_out[:num_assignments]
-    tile_i = min(next_positive_power_of_2(intermediate_size), 1024)
-    num_tiles = (intermediate_size + tile_i - 1) // tile_i
-    ct.launch(
-        torch.cuda.current_stream(hidden_states.device),
-        (num_assignments, num_tiles),
-        _silu_and_mul,
-        (gemm1_out, activation_out, intermediate_size, tile_i, num_tiles),
-    )
+    launch_activation(gemm1_out, activation_out, activation_type)
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(
         activation_out,

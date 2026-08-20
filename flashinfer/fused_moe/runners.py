@@ -793,17 +793,12 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
 
 
 # ---------------------------------------------------------------------------
-# cuTile runner -- source-integrated BF16 align-block MoE
+# cuTile BF16 runner
 # ---------------------------------------------------------------------------
 
 
 class CuTileBf16Runner(MoERunner):
-    """Unified adapter for the source-integrated cuTile BF16 MoE pipeline.
-
-    The runner is a single-stream resource, matching the other unified MoE
-    runners. It owns reusable intermediate buffers while the kernel module is
-    imported lazily so ``import flashinfer`` does not require cuda-tile.
-    """
+    """Unified adapter for the cuTile BF16 MoE pipeline."""
 
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
@@ -830,9 +825,12 @@ class CuTileBf16Runner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
+        if self.config.activation.type not in (
+            ActivationType.Swiglu,
+            ActivationType.Relu2,
+        ):
             raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
+                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
             )
         if not self.config.execution.do_finalize:
             raise NotImplementedError(
@@ -899,6 +897,7 @@ class CuTileBf16Runner(MoERunner):
                 intermediate_size=self.config.experts.intermediate_size,
                 num_experts=self.config.routing.num_experts,
                 top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
                 block_sizes=self._block_sizes,
                 device=self.device,
             )
@@ -906,8 +905,8 @@ class CuTileBf16Runner(MoERunner):
         self._workspace = workspace
 
     def _gemm_configs(self, k_in: int, n: int) -> list[tuple[int, int, int]]:
-        # Same compact search space as the source kernel. Ordering preserves
-        # its measured decode winners while still admitting shape fallbacks.
+        # Compact search space ordered to preserve measured decode winners
+        # while still admitting shape fallbacks.
         candidates = [
             (128, 32, 4),
             (128, 128, 1),
@@ -915,15 +914,8 @@ class CuTileBf16Runner(MoERunner):
             (64, 64, 4),
         ]
         if self._device_arch == 89:
-            # Ada needs different occupancies for the two expert GEMMs at
-            # prefill sizes: occupancy 2 wins GEMM1 while occupancy 1 avoids
-            # oversubscribing the wider-output GEMM2. The compound autotuner
-            # selects the appropriate pair independently for each bucket.
             candidates.extend(((256, 32, 2), (256, 32, 1)))
         elif self._device_arch == 90:
-            # Hopper benefits from wider N tiles at larger token counts. Keep
-            # the decode-first defaults above, then let bucketed autotuning
-            # select among the stage-specific SM90 winners.
             candidates.extend(
                 (
                     (256, 64, 2),
@@ -932,8 +924,6 @@ class CuTileBf16Runner(MoERunner):
                 )
             )
         elif self._device_arch in (120, 121):
-            # Blackwell prefers the shallower K tile: it wins GEMM1 at
-            # prefill sizes while autotuning can retain an N=128 GEMM2.
             candidates.append((256, 32, 2))
         return [
             config
@@ -955,7 +945,10 @@ class CuTileBf16Runner(MoERunner):
     ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
         hidden_size = inputs[1].shape[1]
         intermediate_size = self.config.experts.intermediate_size
-        gemm1 = self._gemm_configs(hidden_size, 2 * intermediate_size)
+        gemm1_output_size = intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+        gemm1 = self._gemm_configs(hidden_size, gemm1_output_size)
         gemm2 = self._gemm_configs(intermediate_size, hidden_size)
 
         def choose(
@@ -1074,7 +1067,11 @@ class CuTileBf16Runner(MoERunner):
         w1, w2 = view["w1"], view["w2"]
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, hidden_size, 2 * intermediate_size)
+        expected_w1 = (
+            num_experts,
+            hidden_size,
+            intermediate_size * (2 if self.config.activation.is_gated else 1),
+        )
         expected_w2 = (num_experts, intermediate_size, hidden_size)
         if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
             raise TypeError("cuTile BF16 prepared weights must use torch.bfloat16.")
@@ -1132,7 +1129,10 @@ class CuTileBf16Runner(MoERunner):
         hidden_size = inputs[1].shape[1]
         intermediate_size = self.config.experts.intermediate_size
         if tactic == -1:
-            first = self._gemm_configs(hidden_size, 2 * intermediate_size)[0]
+            gemm1_output_size = intermediate_size * (
+                2 if self.config.activation.is_gated else 1
+            )
+            first = self._gemm_configs(hidden_size, gemm1_output_size)[0]
             second_candidates = self._gemm_configs(intermediate_size, hidden_size)
             second = next(
                 (
@@ -1166,6 +1166,7 @@ class CuTileBf16Runner(MoERunner):
             inputs[5],
             inputs[0],
             self._workspace,
+            activation_type=self.config.activation.type,
             block_size=block_size,
             gemm1_config=gemm1_config,
             gemm2_config=gemm2_config,

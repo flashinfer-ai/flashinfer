@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..tllm_enums import ActivationType
 from ..trace.templates.moe import (
     sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch,
     sm90_mixed_gemm_scale_interleave_trace,
@@ -1244,15 +1245,15 @@ def prepare_cutile_bf16_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation_type: ActivationType = ActivationType.Swiglu,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the native BF16 weight view for ``CuTileBf16Runner``.
 
-    Unified MoE canonical GEMM1 weights are ``[E, 2I, H]`` in semantic
-    ``[up, gate]`` order. The cuTile grouped GEMM consumes ``[E, H, 2I]``
-    and its activation kernel follows the conventional ``[gate, up]`` layout,
-    so preparation swaps the halves while transposing into K-major storage.
-    GEMM2 similarly changes from ``[E, H, I]`` to ``[E, I, H]``.
+    Gated canonical GEMM1 weights use ``[E, 2I, H]`` in semantic
+    ``[up, gate]`` order; preparation swaps the halves before transposing.
+    Non-gated weights use ``[E, I, H]`` and need only the transpose. GEMM2
+    changes from ``[E, H, I]`` to ``[E, I, H]`` for both activation families.
     """
     if device is None:
         device = w1_bf16.device
@@ -1262,7 +1263,17 @@ def prepare_cutile_bf16_weights(
             "prepare_cutile_bf16_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation_type = ActivationType(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+        raise ValueError(
+            f"unsupported cuTile BF16 activation {activation_type!r}; expected "
+            "Swiglu or Relu2."
+        )
+    expected_w1 = (
+        num_local_experts,
+        intermediate_size * (2 if activation_type.is_gated else 1),
+        hidden_size,
+    )
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1271,9 +1282,11 @@ def prepare_cutile_bf16_weights(
         )
 
     w1 = w1_bf16.to(device)
-    up, gate = w1.chunk(2, dim=1)
+    if activation_type.is_gated:
+        up, gate = w1.chunk(2, dim=1)
+        w1 = torch.cat((gate, up), dim=1)
     return {
-        "w1": torch.cat((gate, up), dim=1).transpose(1, 2).contiguous(),
+        "w1": w1.transpose(1, 2).contiguous(),
         "w2": w2_bf16.to(device).transpose(1, 2).contiguous(),
     }
 
