@@ -1193,6 +1193,79 @@ def test_source_generated_argument_binding_fails_closed():
         )
 
 
+def test_source_generated_program_runs_catalog_entry(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+
+    class Generated:
+        def run(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(
+        module,
+        "_generated_program_profile",
+        lambda *_: {
+            "entry": "run",
+            "launch_count": 2,
+            "stage_order": ["preprocess", "main"],
+            "stages": {
+                "preprocess": {
+                    "arg_plan": [
+                        ["buffer", "dt"],
+                        ["grid", "grid_x"],
+                    ]
+                },
+                "main": {
+                    "arg_plan": [
+                        ["tma_buffer", "x_map"],
+                        ["parameter", "nheads"],
+                        ["grid", "grid_x"],
+                    ]
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: Generated())
+
+    module._run_generated_program(
+        "prefix_bf16_varlen",
+        "sm_103a",
+        0,
+        stage_values={
+            "preprocess": {"dt": "dt"},
+            "main": {"x_map": "x", "nheads": 128},
+        },
+        stage_grids={"preprocess": (32, 1, 1), "main": (148, 1, 1)},
+        cuda_stream=0x1234,
+    )
+
+    assert calls == [("dt", 32, "x", 128, 148, 0x1234)]
+
+
+def test_source_generated_program_rejects_unresolved_launch_abi(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    monkeypatch.setattr(
+        module,
+        "_generated_program_profile",
+        lambda *_: {
+            "entry": "run",
+            "launch_count": 1,
+            "stage_order": ["preprocess", "main"],
+            "stages": {},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="unresolved launch ABI"):
+        module._run_generated_program(
+            "prefix_bf16_varlen",
+            "sm_103a",
+            0,
+            stage_values={},
+            stage_grids={},
+            cuda_stream=0,
+        )
+
+
 def test_source_generated_catalog_is_sealed_and_inactive():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     module._source_catalog.cache_clear()

@@ -184,6 +184,62 @@ def _bind_prepared_sequence_arguments(
     return tuple(arguments)
 
 
+def _run_generated_program(
+    name: str,
+    arch: str,
+    device_index: int,
+    *,
+    stage_values: Mapping[str, Mapping[str, object]],
+    stage_grids: Mapping[str, tuple[int, int, int]],
+    cuda_stream: int,
+) -> None:
+    """Bind and launch one catalog-sealed, fully prepared kernel sequence."""
+
+    profile = _generated_program_profile(name, arch)
+    entry = profile.get("entry")
+    stage_order = profile.get("stage_order")
+    stages = profile.get("stages")
+    launch_count = profile.get("launch_count")
+    if (
+        not isinstance(entry, str)
+        or not isinstance(stage_order, list)
+        or not stage_order
+        or not all(isinstance(stage, str) for stage in stage_order)
+        or not isinstance(stages, dict)
+        or launch_count != len(stage_order)
+    ):
+        raise RuntimeError(
+            f"Cake SSDCombined generated program {name!r} has unresolved launch ABI"
+        )
+    stage_arg_plans: list[tuple[str, Sequence[Sequence[str]]]] = []
+    for stage in stage_order:
+        stage_profile = stages.get(stage)
+        if not isinstance(stage_profile, dict):
+            raise RuntimeError(
+                f"Cake SSDCombined generated stage {name!r}/{stage!r} is missing"
+            )
+        arg_plan = stage_profile.get("arg_plan")
+        if not isinstance(arg_plan, list):
+            raise RuntimeError(
+                f"Cake SSDCombined generated stage {name!r}/{stage!r} "
+                "has no argument plan"
+            )
+        stage_arg_plans.append((stage, arg_plan))
+    arguments = _bind_prepared_sequence_arguments(
+        stage_arg_plans,
+        stage_values,
+        stage_grids,
+        cuda_stream,
+    )
+    module = _load_generated_program(name, arch, device_index)
+    launch = getattr(module, entry, None)
+    if not callable(launch):
+        raise RuntimeError(
+            f"Cake SSDCombined generated program {name!r} has no entry {entry!r}"
+        )
+    launch(*arguments)
+
+
 _PROGRAMS = {
     "metadata": (
         "cake_mamba_ssd_metadata_device.cu",
@@ -779,6 +835,16 @@ class CakeSSDCombined:
         nchunks = seqlen // _CHUNK_SIZE
         num_sequences = initial_states.shape[0] if mode_varlen else batch
         num_segments = len(chunk_indices) if mode_varlen else batch * nchunks
+        dt_min, dt_max = (float(value) for value in dt_limit)
+        scan_route = _select_scan_route(
+            mode_varlen=mode_varlen,
+            num_logical_chunks=num_segments,
+            num_sequences=num_sequences,
+            nheads=self.nheads,
+            ngroups=self.ngroups,
+            dt_min=dt_min,
+            prefix_route_selected=_prefix_route_selected(),
+        )
         checkpoint_args = (
             checkpoint_token_indices,
             checkpoint_state_slots,
@@ -955,7 +1021,7 @@ class CakeSSDCombined:
             if chunk_offsets is not None
             else self._dummy(x.device, torch.int32)
         )
-        if mode_varlen:
+        if mode_varlen and scan_route != _ROUTE_PREFIX_VARLEN:
             with torch.cuda.device(x.device):
                 _load_program("metadata", arch, device_index).run(
                     seq_i32,
@@ -973,15 +1039,15 @@ class CakeSSDCombined:
                     1,
                     1,
                 )
-            if seq_chunk_cumsum is None or update_seq_chunk_cumsum:
-                with torch.cuda.device(x.device):
-                    seq_chunk_cumsum = self._compute_seq_chunk_cumsum(
-                        seq_idx,
-                        chunk_indices,
-                        chunk_offsets,
-                        num_sequences,
-                        seq_chunk_cumsum,
-                    )
+        if mode_varlen and (seq_chunk_cumsum is None or update_seq_chunk_cumsum):
+            with torch.cuda.device(x.device):
+                seq_chunk_cumsum = self._compute_seq_chunk_cumsum(
+                    seq_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                    num_sequences,
+                    seq_chunk_cumsum,
+                )
 
         dt_float = dt
         if dt.dtype != torch.float32:
@@ -1002,26 +1068,28 @@ class CakeSSDCombined:
         else:
             workspace["dt_bias_float"].copy_(dt_bias)
             dt_bias_float = workspace["dt_bias_float"]
-        dt_min, dt_max = (float(value) for value in dt_limit)
-        preprocess_grid = (num_segments * self.nheads + _THREADS - 1) // _THREADS
-        with torch.cuda.device(x.device):
-            _load_program("preprocess", arch, device_index).run(
-                dt_float,
-                A,
-                dt_bias_float,
-                workspace["starts"],
-                workspace["lengths"],
-                workspace["delta"],
-                workspace["cumsum"],
-                num_segments,
-                self.nheads,
-                int(bool(dt_softplus)),
-                dt_min,
-                dt_max,
-                preprocess_grid,
-                1,
-                1,
-            )
+        if scan_route != _ROUTE_PREFIX_VARLEN:
+            preprocess_grid = (
+                num_segments * self.nheads + _THREADS - 1
+            ) // _THREADS
+            with torch.cuda.device(x.device):
+                _load_program("preprocess", arch, device_index).run(
+                    dt_float,
+                    A,
+                    dt_bias_float,
+                    workspace["starts"],
+                    workspace["lengths"],
+                    workspace["delta"],
+                    workspace["cumsum"],
+                    num_segments,
+                    self.nheads,
+                    int(bool(dt_softplus)),
+                    dt_min,
+                    dt_max,
+                    preprocess_grid,
+                    1,
+                    1,
+                )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
         if D is not None and D.ndim == 2 and not self.d_has_hdim:
@@ -1058,64 +1126,173 @@ class CakeSSDCombined:
         d_mode = 0 if D is None else 2 if self.d_has_hdim and D.ndim == 2 else 1
         state_key = "f16" if self.state_dtype == torch.float16 else "bf16"
         mode_key = "varlen" if mode_varlen else "batched"
-        grid = min(
-            num_sequences * self.nheads,
-            torch.cuda.get_device_properties(x.device).multi_processor_count,
-        )
+        sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+        grid = min(num_sequences * self.nheads, sm_count)
         with torch.cuda.device(x.device):
             # x/B/C are consumed through their stride-aware TMA descriptors.
             # The generated source retains dead raw-pointer ABI slots for the
             # same buffers; pass a valid packed dummy so those legacy host
             # checks do not reject the descriptor-compatible public views.
             unused_bf16 = self._dummy(x.device, torch.bfloat16)
-            _load_program(f"{state_key}_{mode_key}", arch, device_index).run(
-                x,
-                B,
-                C,
-                out,
-                unused_bf16,
-                dt_float,
-                workspace["delta"],
-                workspace["cumsum"],
-                A,
-                unused_bf16,
-                unused_bf16,
-                d_arg,
-                z_arg,
-                dt_bias_float,
-                initial_arg,
-                final_states_arg,
-                checkpoint_states_arg,
-                checkpoint_token_indices_arg,
-                checkpoint_state_slots_arg,
-                seq_i32,
-                seq_i64,
-                chunk_indices_arg,
-                chunk_offsets_arg,
-                cumsum_arg,
-                out,
-                self.nheads,
-                self.ngroups,
-                batch,
-                seqlen,
-                nchunks,
-                num_sequences,
-                num_segments if mode_varlen else nchunks,
-                int(mode_varlen),
-                int(seq_chunk_cumsum is not None),
-                int(seq_idx_int64),
-                d_mode,
-                int(z is not None),
-                int(initial_states is not None),
-                int(bool(dt_softplus)),
-                dt_min,
-                dt_max,
-                int(return_final_states),
-                checkpoint_state_count,
-                grid,
-                1,
-                1,
-            )
+            if scan_route == _ROUTE_PREFIX_VARLEN:
+                program_name = f"prefix_{state_key}_varlen"
+                profile = _generated_program_profile(program_name, arch)
+                stages = profile.get("stages")
+                preprocess_stage = (
+                    stages.get("preprocess") if isinstance(stages, dict) else None
+                )
+                preprocess_block = (
+                    preprocess_stage.get("block")
+                    if isinstance(preprocess_stage, dict)
+                    else None
+                )
+                if (
+                    not isinstance(preprocess_block, list)
+                    or len(preprocess_block) != 3
+                    or not all(isinstance(value, int) for value in preprocess_block)
+                    or preprocess_block[0] <= 0
+                ):
+                    raise RuntimeError(
+                        f"Cake SSDCombined generated program {program_name!r} "
+                        "has no preprocess block"
+                    )
+                preprocess_values, preprocess_grid = _direct_preprocess_inputs(
+                    dt=dt_float,
+                    A=A,
+                    dt_bias=dt_bias_float,
+                    segment_starts=workspace["starts"],
+                    segment_lengths=workspace["lengths"],
+                    chunk_indices=chunk_indices_arg,
+                    chunk_offsets=chunk_offsets_arg,
+                    delta=workspace["delta"],
+                    cumsum=workspace["cumsum"],
+                    num_segments=num_segments,
+                    nheads=self.nheads,
+                    seqlen=seqlen,
+                    mode_varlen=True,
+                    dt_softplus=bool(dt_softplus),
+                    dt_limit=(dt_min, dt_max),
+                    threads=preprocess_block[0],
+                )
+                preprocess_grid = (
+                    max(1, min(preprocess_grid[0], sm_count)),
+                    preprocess_grid[1],
+                    preprocess_grid[2],
+                )
+                prefix_grid = _persistent_grid_size(
+                    total_work=num_sequences * self.nheads,
+                    sm_count=sm_count,
+                )
+                main_values: dict[str, object] = {
+                    "x_map": x,
+                    "b_map": B,
+                    "c_map": C,
+                    "out_map": out,
+                    "x": unused_bf16,
+                    "dt": dt_float,
+                    "delta_precomputed": workspace["delta"],
+                    "cumsum_precomputed": workspace["cumsum"],
+                    "A": A,
+                    "B_tensor": unused_bf16,
+                    "C": unused_bf16,
+                    "D": d_arg,
+                    "z": z_arg,
+                    "dt_bias": dt_bias_float,
+                    "initial_states": initial_arg,
+                    "final_states": final_states_arg,
+                    "checkpoint_states": checkpoint_states_arg,
+                    "checkpoint_token_indices": checkpoint_token_indices_arg,
+                    "checkpoint_state_slots": checkpoint_state_slots_arg,
+                    "seq_idx_i32": seq_i32,
+                    "seq_idx_i64": seq_i64,
+                    "chunk_indices": chunk_indices_arg,
+                    "chunk_offsets": chunk_offsets_arg,
+                    "seq_chunk_cumsum": cumsum_arg,
+                    "out_native": out,
+                    "nheads": self.nheads,
+                    "ngroups": self.ngroups,
+                    "batch": batch,
+                    "seqlen": seqlen,
+                    "nchunks": nchunks,
+                    "sequence_count": num_sequences,
+                    "num_logical_chunks": num_segments,
+                    "mode_varlen": 1,
+                    "has_seq_chunk_cumsum": int(seq_chunk_cumsum is not None),
+                    "seq_idx_int64": int(seq_idx_int64),
+                    "D_mode": d_mode,
+                    "has_z": int(z is not None),
+                    "has_initial": int(initial_states is not None),
+                    "dt_softplus": int(bool(dt_softplus)),
+                    "dt_min": dt_min,
+                    "dt_max": dt_max,
+                    "write_final_states": int(return_final_states),
+                    "checkpoint_state_count": checkpoint_state_count,
+                }
+                _run_generated_program(
+                    program_name,
+                    arch,
+                    device_index,
+                    stage_values={
+                        "preprocess": preprocess_values,
+                        "main": main_values,
+                    },
+                    stage_grids={
+                        "preprocess": preprocess_grid,
+                        "main": (prefix_grid, 1, 1),
+                    },
+                    cuda_stream=int(
+                        torch.cuda.current_stream(x.device).cuda_stream
+                    ),
+                )
+            else:
+                _load_program(f"{state_key}_{mode_key}", arch, device_index).run(
+                    x,
+                    B,
+                    C,
+                    out,
+                    unused_bf16,
+                    dt_float,
+                    workspace["delta"],
+                    workspace["cumsum"],
+                    A,
+                    unused_bf16,
+                    unused_bf16,
+                    d_arg,
+                    z_arg,
+                    dt_bias_float,
+                    initial_arg,
+                    final_states_arg,
+                    checkpoint_states_arg,
+                    checkpoint_token_indices_arg,
+                    checkpoint_state_slots_arg,
+                    seq_i32,
+                    seq_i64,
+                    chunk_indices_arg,
+                    chunk_offsets_arg,
+                    cumsum_arg,
+                    out,
+                    self.nheads,
+                    self.ngroups,
+                    batch,
+                    seqlen,
+                    nchunks,
+                    num_sequences,
+                    num_segments if mode_varlen else nchunks,
+                    int(mode_varlen),
+                    int(seq_chunk_cumsum is not None),
+                    int(seq_idx_int64),
+                    d_mode,
+                    int(z is not None),
+                    int(initial_states is not None),
+                    int(bool(dt_softplus)),
+                    dt_min,
+                    dt_max,
+                    int(return_final_states),
+                    checkpoint_state_count,
+                    grid,
+                    1,
+                    1,
+                )
         out_view = out.permute(0, 3, 4, 1, 2).reshape(
             batch, seqlen, self.nheads, _HEADDIM
         )
