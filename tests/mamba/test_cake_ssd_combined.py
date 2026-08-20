@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import importlib
+import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -505,6 +506,412 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
         runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners
     )
     assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
+
+
+def _signature_contract(callable_, *, drop_self=False):
+    parameters = tuple(inspect.signature(callable_).parameters.values())
+    if drop_self:
+        assert parameters[0].name == "self"
+        parameters = parameters[1:]
+    return tuple((parameter.name, parameter.kind, parameter.default) for parameter in parameters)
+
+
+def test_source_public_api_signatures_are_stable():
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    cake_module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    empty = inspect.Parameter.empty
+
+    constructor_names = (
+        "chunk_size",
+        "nheads",
+        "headdim",
+        "dstate",
+        "ngroups",
+        "io_dtype",
+        "state_dtype",
+        "has_d",
+        "d_has_hdim",
+        "has_initial_states",
+        "has_varlen",
+        "has_z",
+        "seq_idx_dtype",
+        "backend",
+    )
+    constructor_defaults = (
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        torch.bfloat16,
+        torch.bfloat16,
+        True,
+        False,
+        False,
+        False,
+        False,
+        torch.int64,
+        "cute",
+    )
+    assert _signature_contract(module.SSDCombined) == tuple(
+        zip(
+            constructor_names,
+            (positional,) * len(constructor_names),
+            constructor_defaults,
+            strict=True,
+        )
+    )
+
+    run_names = (
+        "x",
+        "dt",
+        "A",
+        "B",
+        "C",
+        "D",
+        "z",
+        "dt_bias",
+        "dt_softplus",
+        "dt_limit",
+        "initial_states",
+        "seq_idx",
+        "chunk_indices",
+        "chunk_offsets",
+        "seq_chunk_cumsum",
+        "update_seq_chunk_cumsum",
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
+        "out",
+        "return_final_states",
+    )
+    run_defaults = (
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        None,
+        None,
+        None,
+        False,
+        (0.0, float("inf")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        None,
+        True,
+    )
+    expected_run = tuple(
+        zip(
+            run_names,
+            (positional,) * len(run_names),
+            run_defaults,
+            strict=True,
+        )
+    )
+    assert _signature_contract(module.SSDCombined.run, drop_self=True) == expected_run
+    assert _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True) == expected_run
+    assert _signature_contract(module.ssd_combined_fwd) == expected_run
+
+    helper_names = (
+        "seq_idx",
+        "chunk_indices",
+        "chunk_offsets",
+        "chunk_size",
+        "num_seqs",
+        "seq_chunk_cumsum",
+        "tile_state",
+    )
+    helper_defaults = (empty, empty, empty, empty, empty, None, None)
+    assert _signature_contract(
+        module.SSDCombined.compute_seq_chunk_cumsum, drop_self=True
+    ) == tuple(
+        zip(
+            helper_names,
+            (positional,) * len(helper_names),
+            helper_defaults,
+            strict=True,
+        )
+    )
+    assert tuple(inspect.signature(module.SSDCombined.tile_state_size).parameters) == (
+        "num_seqs",
+    )
+
+
+def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    cake_module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    utils = importlib.import_module("flashinfer.utils")
+    calls = []
+
+    class CakeRunner:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (10, 3))
+    monkeypatch.setattr(cake_module, "CakeSSDCombined", CakeRunner)
+    runner = module.SSDCombined(
+        128,
+        128,
+        64,
+        128,
+        8,
+        io_dtype=torch.bfloat16,
+        state_dtype=torch.float16,
+        has_d=False,
+        d_has_hdim=True,
+        has_initial_states=True,
+        has_varlen=True,
+        has_z=True,
+        seq_idx_dtype=torch.int32,
+        backend="cake",
+    )
+
+    assert calls == [
+        (
+            (128, 128, 64, 128, 8),
+            {
+                "io_dtype": torch.bfloat16,
+                "state_dtype": torch.float16,
+                "has_d": False,
+                "d_has_hdim": True,
+                "has_initial_states": True,
+                "has_varlen": True,
+                "has_z": True,
+                "seq_idx_dtype": torch.int32,
+            },
+        )
+    ]
+    assert runner._backend == "cake"
+    assert runner._cake_runner.__class__ is CakeRunner
+
+    with pytest.raises(ValueError, match="backend must be 'cute' or 'cake'"):
+        module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
+
+
+def _public_runner_without_constructor(backend, cake_result=None):
+    runner = object.__new__(SSDCombined)
+    runner.chunk_size = 128
+    runner._backend = backend
+
+    class CakeRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return cake_result
+
+    runner._cake_runner = CakeRunner()
+    return runner
+
+
+def _cpu_public_run_inputs(batch=1):
+    x = torch.empty((batch, 128, 2, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, 128, 2), dtype=torch.float32)
+    A = torch.empty((2,), dtype=torch.float32)
+    B = torch.empty((batch, 128, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    return x, dt, A, B, C
+
+
+def test_source_public_cake_dispatch_preserves_full_run_contract():
+    result = (object(), None)
+    runner = _public_runner_without_constructor("cake", result)
+    tensors = _cpu_public_run_inputs()
+    sentinels = {name: object() for name in (
+        "D",
+        "z",
+        "dt_bias",
+        "initial_states",
+        "seq_idx",
+        "chunk_indices",
+        "chunk_offsets",
+        "seq_chunk_cumsum",
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
+    )}
+    out = torch.empty((1, 2, 64, 1, 128), dtype=torch.bfloat16)
+    kwargs = {
+        **sentinels,
+        "dt_softplus": True,
+        "dt_limit": (-0.25, 0.75),
+        "update_seq_chunk_cumsum": True,
+        "out": out,
+        "return_final_states": False,
+    }
+
+    actual = runner.run(*tensors, **kwargs)
+
+    assert actual is result
+    assert runner._cake_runner.calls == [(tensors, kwargs)]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ("seqlen", "a_dtype", "out_shape", "out_dtype", "out_contiguous"),
+)
+def test_source_public_shared_validation_error_parity_without_gpu(invalid):
+    tensors = _cpu_public_run_inputs()
+    kwargs = {}
+    if invalid == "seqlen":
+        x, dt, A, B, C = tensors
+        tensors = (x[:, :-1], dt[:, :-1], A, B[:, :-1], C[:, :-1])
+    elif invalid == "a_dtype":
+        tensors = (*tensors[:2], tensors[2].to(torch.bfloat16), *tensors[3:])
+    elif invalid == "out_shape":
+        kwargs["out"] = torch.empty((1,), dtype=torch.bfloat16)
+    elif invalid == "out_dtype":
+        kwargs["out"] = torch.empty((1, 2, 64, 1, 128), dtype=torch.float16)
+    else:
+        storage = torch.empty((1, 2, 64, 1, 129), dtype=torch.bfloat16)
+        kwargs["out"] = storage[..., :128]
+        assert not kwargs["out"].is_contiguous()
+
+    errors = {}
+    for backend in ("cute", "cake"):
+        runner = _public_runner_without_constructor(backend)
+        with pytest.raises(AssertionError) as exc_info:
+            runner.run(*tensors, **kwargs)
+        errors[backend] = (type(exc_info.value), str(exc_info.value))
+        assert runner._cake_runner.calls == []
+
+    assert errors["cake"] == errors["cute"]
+
+
+def test_source_public_seq_cumsum_helper_contract_without_gpu(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    calls = []
+
+    class SeqCumsumModule:
+        @staticmethod
+        def seq_chunk_cumsum_tile_state_size(num_seqs):
+            calls.append(("tile_state_size", num_seqs))
+            return 19
+
+        @staticmethod
+        def seq_chunk_cumsum(*args):
+            calls.append(("seq_chunk_cumsum", args))
+
+    seq_module = SeqCumsumModule()
+    monkeypatch.setattr(module, "_get_seq_chunk_cumsum_module", lambda: seq_module)
+    runner = object.__new__(module.SSDCombined)
+    runner._seq_cumsum_key = None
+    runner._seq_cumsum_buf = None
+    seq_idx = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+    chunk_indices = torch.tensor([0, 0], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 2], dtype=torch.int32)
+    output = torch.full((3,), -1, dtype=torch.int32)
+    tile_state = torch.empty(19, dtype=torch.uint8)
+
+    returned = runner.compute_seq_chunk_cumsum(
+        seq_idx,
+        chunk_indices,
+        chunk_offsets,
+        128,
+        2,
+        seq_chunk_cumsum=output,
+        tile_state=tile_state,
+    )
+
+    assert returned is output
+    assert calls == [
+        (
+            "seq_chunk_cumsum",
+            (
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                output,
+                tile_state,
+                128,
+                2,
+                2,
+            ),
+        )
+    ]
+    assert runner.tile_state_size(7) == 19
+    assert calls[-1] == ("tile_state_size", 7)
+
+
+def _source_cake_runner_without_constructor():
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    runner = object.__new__(module.CakeSSDCombined)
+    runner.nheads = 2
+    runner.ngroups = 1
+    runner.state_dtype = torch.bfloat16
+    runner.has_d = False
+    runner.d_has_hdim = False
+    runner.has_initial_states = False
+    runner.has_varlen = False
+    runner.has_z = False
+    runner.seq_idx_dtype = torch.int32
+    return runner
+
+
+@pytest.mark.parametrize(
+    "invalid,match",
+    (
+        ("partial", "must be provided together"),
+        ("token_shape", "checkpoint_token_indices must be"),
+        ("token_dtype", "checkpoint_token_indices must be"),
+        ("token_contiguous", "checkpoint_token_indices must be"),
+        ("slot_shape", "checkpoint_state_slots must be"),
+        ("slot_dtype", "checkpoint_state_slots must be"),
+        ("slot_contiguous", "checkpoint_state_slots must be"),
+        ("state_shape", "checkpoint_states must be contiguous"),
+        ("state_dtype", "checkpoint_states must be contiguous"),
+        ("state_contiguous", "checkpoint_states must be contiguous"),
+    ),
+)
+def test_source_cake_checkpoint_validation_without_gpu(invalid, match):
+    runner = _source_cake_runner_without_constructor()
+    tensors = _cpu_public_run_inputs(batch=2)
+    token_storage = torch.tensor([16, -1, 32, -1], dtype=torch.int32)
+    slot_storage = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+    kwargs = {
+        "checkpoint_token_indices": token_storage[:2].clone(),
+        "checkpoint_state_slots": slot_storage[:2].clone(),
+        "checkpoint_states": torch.empty((2, 2, 64, 128), dtype=torch.bfloat16),
+    }
+    if invalid == "partial":
+        kwargs["checkpoint_state_slots"] = None
+    elif invalid == "token_shape":
+        kwargs["checkpoint_token_indices"] = torch.empty(1, dtype=torch.int32)
+    elif invalid == "token_dtype":
+        kwargs["checkpoint_token_indices"] = torch.empty(2, dtype=torch.int64)
+    elif invalid == "token_contiguous":
+        kwargs["checkpoint_token_indices"] = token_storage[::2]
+    elif invalid == "slot_shape":
+        kwargs["checkpoint_state_slots"] = torch.empty(1, dtype=torch.int32)
+    elif invalid == "slot_dtype":
+        kwargs["checkpoint_state_slots"] = torch.empty(2, dtype=torch.int64)
+    elif invalid == "slot_contiguous":
+        kwargs["checkpoint_state_slots"] = slot_storage[::2]
+    elif invalid == "state_shape":
+        kwargs["checkpoint_states"] = torch.empty(
+            (2, 2, 64, 127), dtype=torch.bfloat16
+        )
+    elif invalid == "state_dtype":
+        kwargs["checkpoint_states"] = torch.empty(
+            (2, 2, 64, 128), dtype=torch.float16
+        )
+    else:
+        state_storage = torch.empty((2, 2, 64, 129), dtype=torch.bfloat16)
+        kwargs["checkpoint_states"] = state_storage[..., :128]
+        assert not kwargs["checkpoint_states"].is_contiguous()
+
+    with pytest.raises(ValueError, match=match):
+        runner.run(*tensors, **kwargs)
 
 
 def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
