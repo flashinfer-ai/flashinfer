@@ -145,12 +145,29 @@ def test_aot_registers_target_specific_modules(monkeypatch, target) -> None:
         return SimpleNamespace(name=f"blackwell_msa_{variant}_{selected_target}")
 
     monkeypatch.setattr(aot, "gen_blackwell_msa_module", fake_blackwell_msa)
-    monkeypatch.setattr(aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog"))
+    monkeypatch.setattr(
+        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
+    )
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    monkeypatch.setattr(aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn"))
+    monkeypatch.setattr(
+        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
+    )
     capabilities = {f"blackwell_msa_{target}": True}
     aot.gen_all_modules(
-        [], [], [], [], [], [], capabilities, False, False, False, False, False, False, False
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        capabilities,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
     )
     assert calls == [
         (variant, target)

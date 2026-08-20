@@ -22,7 +22,7 @@ import math
 import os
 import threading
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
@@ -384,9 +384,7 @@ def _validate_scale_arguments(
     if (k_global_scale is not None or v_global_scale is not None) and not (
         allow_uniform_fp8 and uniform_fp8
     ):
-        raise NotImplementedError(
-            "global K/V scales require uniform FP8 Q/K/V decode"
-        )
+        raise NotImplementedError("global K/V scales require uniform FP8 Q/K/V decode")
     return (
         1.0 if k_global_scale is None else float(k_global_scale),
         1.0 if v_global_scale is None else float(v_global_scale),
@@ -660,7 +658,13 @@ def _should_use_long_prefill(
         and batch_size == 1
         and total_q >= 8192
         and (
-            (paged and ((group_size == 8 and max_pages >= 64) or (group_size == 16 and max_pages > 64)))
+            (
+                paged
+                and (
+                    (group_size == 8 and max_pages >= 64)
+                    or (group_size == 16 and max_pages > 64)
+                )
+            )
             or (not paged and group_size == 16 and k_outer_dim >= 8192)
         )
         and q_dtype == k_dtype == v_dtype == torch.bfloat16
@@ -744,7 +748,9 @@ def _build_long_prefill_plan(
         work_group_cap = min(128, 1 << (target - 1).bit_length())
         if group_size == 8 and total_rows == 64:
             work_group_cap = max(work_group_cap, 64)
-    buckets = tuple(value for value in _LONG_WORK_GROUP_BUCKETS if value <= work_group_cap)
+    buckets = tuple(
+        value for value in _LONG_WORK_GROUP_BUCKETS if value <= work_group_cap
+    )
 
     row_ptr = torch.zeros(
         (num_kv_heads, total_rows + 1), dtype=torch.int32, device=q2k_indices.device
@@ -752,16 +758,18 @@ def _build_long_prefill_plan(
     qsplit = torch.full(
         (num_kv_heads, nnz_per_head), -1, dtype=torch.int32, device=q2k_indices.device
     )
-    split_counts_by_head = (
-        (q2k_indices >= 0) & (q2k_indices < total_rows)
-    ).sum(dim=2, dtype=torch.int32)
+    split_counts_by_head = ((q2k_indices >= 0) & (q2k_indices < total_rows)).sum(
+        dim=2, dtype=torch.int32
+    )
     counts_host: list[list[int]] = []
     for head in range(num_kv_heads):
         flat = q2k_indices[head].reshape(-1)
         valid = (flat >= 0) & (flat < total_rows)
         positions = torch.nonzero(valid, as_tuple=False).flatten()
         blocks = flat.index_select(0, positions)
-        counts = torch.bincount(blocks.to(torch.int64), minlength=total_rows).to(torch.int32)
+        counts = torch.bincount(blocks.to(torch.int64), minlength=total_rows).to(
+            torch.int32
+        )
         row_ptr[head, 1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
         counts_host.append([int(value) for value in counts.cpu().tolist()])
         order = torch.argsort(blocks, stable=True)
@@ -771,10 +779,9 @@ def _build_long_prefill_plan(
         packed = q_indices.to(torch.int32) | (
             slots.to(torch.int32) << _LONG_QSPLIT_SLOT_SHIFT
         )
-        packed |= (
-            (split_counts_by_head[head].index_select(0, q_indices) == 1).to(torch.int32)
-            << _LONG_QSPLIT_SINGLE_SHIFT
-        )
+        packed |= (split_counts_by_head[head].index_select(0, q_indices) == 1).to(
+            torch.int32
+        ) << _LONG_QSPLIT_SINGLE_SHIFT
         qsplit[head, : packed.numel()] = packed
 
     work: list[tuple[int, tuple[int, int, int, int, int, int]]] = []
@@ -784,9 +791,13 @@ def _build_long_prefill_plan(
             remaining = row_count
             for group_count in buckets:
                 capacity = group_count * q_tokens_per_group
-                while (remaining + q_tokens_per_group - 1) // q_tokens_per_group >= group_count:
+                while (
+                    remaining + q_tokens_per_group - 1
+                ) // q_tokens_per_group >= group_count:
                     q_count = min(capacity, remaining)
-                    work.append((group_count, (head, kv_block, q_begin, q_count, 0, kv_block)))
+                    work.append(
+                        (group_count, (head, kv_block, q_begin, q_count, 0, kv_block))
+                    )
                     q_begin += q_count
                     remaining -= q_count
             if remaining:
@@ -810,7 +821,9 @@ def _build_long_prefill_plan(
         "row_ptr": row_ptr.contiguous(),
         "qsplit": qsplit.contiguous(),
         "split_counts": split_counts_by_head.transpose(0, 1).contiguous(),
-        "group_segment_ends": tuple(end_by_group[value] for value in _LONG_GROUP_BOUNDARIES),
+        "group_segment_ends": tuple(
+            end_by_group[value] for value in _LONG_GROUP_BOUNDARIES
+        ),
         "work_count": len(work),
         "total_rows": total_rows,
         "nnz_per_head": nnz_per_head,
@@ -842,7 +855,9 @@ def _get_long_prefill_state(
             _implicit_long_prefill_states[signature] = state
     if state.get("signature") != signature:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("long-prefill plan must be warmed before CUDA graph capture")
+            raise RuntimeError(
+                "long-prefill plan must be warmed before CUDA graph capture"
+            )
         state.clear()
         state["signature"] = signature
         state["plan"] = _build_long_prefill_plan(
@@ -902,8 +917,14 @@ def _run_long_prefill_modules(
         dtype=torch.uint8,
         device=q.device,
     )
+    scale_shape: tuple[int, ...]
     if paged and group_size == 16:
-        scale_shape = (_ATTENTION_TOPK, total_q, num_q_heads, _LONG_PARTIAL_SEGMENT_COUNT)
+        scale_shape = (
+            _ATTENTION_TOPK,
+            total_q,
+            num_q_heads,
+            _LONG_PARTIAL_SEGMENT_COUNT,
+        )
         scale_dtype = torch.bfloat16
     elif paged:
         scale_shape = (
@@ -939,14 +960,21 @@ def _run_long_prefill_modules(
     arch_suffix = "sm103" if target == "sm103a" else "sm100"
     if paged:
         direct = target == "sm100a" and group_size == 16 and max_pages == 8192
-        forward_variant = (
-            "long_prefill_paged_bf16_gqa16_direct_group_sm100"
-            if direct
-            else f"long_prefill_paged_bf16_gqa{group_size}_{arch_suffix}"
+        forward_variant = cast(
+            "BlackwellMSAVariant",
+            (
+                "long_prefill_paged_bf16_gqa16_direct_group_sm100"
+                if direct
+                else f"long_prefill_paged_bf16_gqa{group_size}_{arch_suffix}"
+            ),
         )
-        reduce_variant = f"long_prefill_reduce_paged_bf16_gqa{group_size}"
+        reduce_variant = cast(
+            "BlackwellMSAVariant", f"long_prefill_reduce_paged_bf16_gqa{group_size}"
+        )
     else:
-        forward_variant = f"long_prefill_flat_bf16_gqa16_{arch_suffix}"
+        forward_variant = cast(
+            "BlackwellMSAVariant", f"long_prefill_flat_bf16_gqa16_{arch_suffix}"
+        )
         reduce_variant = "long_prefill_reduce_flat_bf16_gqa16"
     forward_grid = (int(plan["work_count"]), 1, 1)
     reduce_grid = ((total_q * num_q_heads + 31) // 32, 1, 1)
@@ -1051,7 +1079,7 @@ def _run_fp8_direct_module(
         "q1_paged_xform2": "decode_q1_bf16_query_fp8_kv_xform2_paged",
         "paged_uniform_fp8": "decode_uniform_fp8_qkv_paged",
     }
-    variant = variants[schedule]
+    variant = cast("BlackwellMSAVariant", variants[schedule])
     q_launch = q.view(torch.uint8) if schedule == "paged_uniform_fp8" else q
     page_table_arg = page_table if paged else q2k_indices.reshape(-1)
     tensors = (
@@ -1066,6 +1094,7 @@ def _run_fp8_direct_module(
         q_offsets,
         kv_lens,
     )
+    scalars: tuple[int | float, ...]
     if schedule == "paged_uniform_fp8":
         scalars = (
             int(q.shape[0]),
@@ -1080,7 +1109,9 @@ def _run_fp8_direct_module(
         grid = (
             _uniform_fp8_decode_grid(
                 total_work_items=total_work_items,
-                num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+                num_sms=torch.cuda.get_device_properties(
+                    q.device
+                ).multi_processor_count,
                 seqlen_q=seqlen_q,
             ),
             1,
@@ -1255,9 +1286,7 @@ def _run_decode_module(
     else:
         q_prefill_dummy = k.reshape(-1, 1, _HEAD_DIM)
         pair_tokens = int(q_prefill_dummy.shape[0]) // 64 * 64
-        k_pair_dummy = q_prefill_dummy[:pair_tokens].reshape(
-            -1, 1, 64, _HEAD_DIM
-        )
+        k_pair_dummy = q_prefill_dummy[:pair_tokens].reshape(-1, 1, 64, _HEAD_DIM)
         v_pair_dummy = v.reshape(-1, 1, _HEAD_DIM)[:pair_tokens].reshape(
             -1, 1, 64, _HEAD_DIM
         )
@@ -1389,7 +1418,9 @@ def blackwell_msa_sparse_attention(
         q, k, v, q2k_indices
     )
     if q.dtype == torch.float8_e4m3fn:
-        raise NotImplementedError("uniform FP8 Q/K/V is supported only by sparse decode")
+        raise NotImplementedError(
+            "uniform FP8 Q/K/V is supported only by sparse decode"
+        )
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and workspace is None:
         raise RuntimeError(
@@ -1472,9 +1503,7 @@ def blackwell_msa_sparse_attention(
             "FLASHINFER_MSA_PREFILL_SCHEDULE", ""
         )
         if requested_prefill_schedule not in {"", "m64"}:
-            raise ValueError(
-                "FLASHINFER_MSA_PREFILL_SCHEDULE must be empty or 'm64'"
-            )
+            raise ValueError("FLASHINFER_MSA_PREFILL_SCHEDULE must be empty or 'm64'")
         if _should_use_long_prefill(
             requested_schedule=requested_prefill_schedule,
             batch_size=batch_size,
@@ -1557,11 +1586,7 @@ def blackwell_msa_sparse_attention(
             q_tile = (
                 _M128_GQA8_Q_TILE
                 if folded_gqa_group == 8
-                else (
-                    _M128_GQA16_Q_TILE
-                    if folded_gqa_group == 16
-                    else _M128_Q_TILE
-                )
+                else (_M128_GQA16_Q_TILE if folded_gqa_group == 16 else _M128_Q_TILE)
             )
         grid = (
             (total_q + q_tile - 1) // q_tile + batch_size - 1,
@@ -1702,11 +1727,7 @@ def blackwell_msa_sparse_decode_attention(
             workspace,
             "decode_out",
             tuple(q.shape),
-            dtype=(
-                torch.bfloat16
-                if q.dtype == torch.float8_e4m3fn
-                else q.dtype
-            ),
+            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             device=q.device,
         )
         lse = _workspace_buffer(
@@ -1743,9 +1764,7 @@ def blackwell_msa_sparse_decode_attention(
         )
         if uniform_fp8:
             if requested_schedule not in {"", "paged_uniform_fp8"}:
-                raise ValueError(
-                    "uniform FP8 Q/K/V decode requires paged_uniform_fp8"
-                )
+                raise ValueError("uniform FP8 Q/K/V decode requires paged_uniform_fp8")
             if not uniform_fp8_direct:
                 raise ValueError(
                     "uniform FP8 Q/K/V requires paged causal Q1-Q32/topk16, "
@@ -1754,7 +1773,11 @@ def blackwell_msa_sparse_decode_attention(
             fp8_schedule = "paged_uniform_fp8"
         else:
             fp8_schedule = _resolve_fp8_q1_schedule(
-                requested=("" if requested_schedule == "batch_attention" else requested_schedule),
+                requested=(
+                    ""
+                    if requested_schedule == "batch_attention"
+                    else requested_schedule
+                ),
                 capturing=capturing,
                 paged=paged,
                 force_fused=force_fused,

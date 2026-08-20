@@ -21,8 +21,7 @@ def test_source_inventory_is_complete_and_hash_locked() -> None:
         Path(entry["target"]) / f"blackwell_msa_{entry['source_unit']}.cu"
         for entry in entries
     } | {
-        Path(entry["target"])
-        / f"blackwell_msa_{entry['source_unit']}_binding.cu"
+        Path(entry["target"]) / f"blackwell_msa_{entry['source_unit']}_binding.cu"
         for entry in entries
     }
     actual_paths = {
@@ -38,9 +37,10 @@ def test_source_inventory_is_complete_and_hash_locked() -> None:
     for entry in entries:
         base = _CSRC_DIR / entry["target"] / f"blackwell_msa_{entry['source_unit']}"
         assert _sha256(base.with_suffix(".cu")) == entry["vendored_sha256"]
-        assert _sha256(base.with_name(base.name + "_binding.cu")) == entry[
-            "binding_sha256"
-        ]
+        assert (
+            _sha256(base.with_name(base.name + "_binding.cu"))
+            == entry["binding_sha256"]
+        )
         assert entry["normalization_schema"] == _INVENTORY["normalization_schema"]
         assert len(entry["replacement_counts"]) == 2
         assert all(value > 0 for value in entry["replacement_counts"].values())
@@ -66,9 +66,7 @@ def test_tma_parameters_are_passed_by_grid_constant_value() -> None:
     )
     for entry in _INVENTORY["entries"]:
         source = (
-            _CSRC_DIR
-            / entry["target"]
-            / f"blackwell_msa_{entry['source_unit']}.cu"
+            _CSRC_DIR / entry["target"] / f"blackwell_msa_{entry['source_unit']}.cu"
         ).read_text()
         if entry["source_unit"] == "topk":
             assert not tma_parameter.search(source)

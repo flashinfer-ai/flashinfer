@@ -36,9 +36,7 @@ def test_route_manifest_covers_exactly_the_production_specializations():
         "fp8_kv_q1_xform2": 2,
         "uniform_fp8_qkv_decode": 1,
     }
-    assert set(manifest["family_predicates"]) == {
-        route["family"] for route in routes
-    }
+    assert set(manifest["family_predicates"]) == {route["family"] for route in routes}
     assert all(manifest["family_predicates"].values())
     assert sum(len(route["architectures"]) for route in routes) == 57
     assert all(route["source_units"] for route in routes)

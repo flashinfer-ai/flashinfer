@@ -174,18 +174,24 @@ def _get_blackwell_msa_include_dir() -> Path:
     )
 
 
-def get_blackwell_msa_uri(variant: BlackwellMSAVariant, target: BlackwellMSATarget) -> str:
+def get_blackwell_msa_uri(
+    variant: BlackwellMSAVariant, target: BlackwellMSATarget
+) -> str:
     """Return the target-specific JIT/AOT key for one Blackwell MSA variant."""
 
     if target not in _BLACKWELL_MSA_NVCC_FLAGS:
         raise ValueError(f"unsupported Blackwell MSA target: {target}")
     if variant not in BLACKWELL_MSA_VARIANTS_BY_TARGET[target]:
-        raise ValueError(f"unsupported Blackwell MSA variant/target: {variant}/{target}")
+        raise ValueError(
+            f"unsupported Blackwell MSA variant/target: {variant}/{target}"
+        )
     return f"blackwell_msa_{variant}_{target}"
 
 
 @functools.cache
-def gen_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSATarget) -> JitSpec:
+def gen_blackwell_msa_module(
+    variant: BlackwellMSAVariant, target: BlackwellMSATarget
+) -> JitSpec:
     """Generate one exact-SM100a or exact-SM103a Blackwell MSA JIT module."""
 
     csrc_dir = _get_blackwell_msa_csrc_dir()

@@ -525,12 +525,8 @@ def gen_all_modules(
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
-    has_blackwell_msa_sm100a = sm_capabilities.get(
-        "blackwell_msa_sm100a", False
-    )
-    has_blackwell_msa_sm103a = sm_capabilities.get(
-        "blackwell_msa_sm103a", False
-    )
+    has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
+    has_blackwell_msa_sm103a = sm_capabilities.get("blackwell_msa_sm103a", False)
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
@@ -582,9 +578,7 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
-                for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[
-                    blackwell_msa_target
-                ]
+                for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
 
     # CUDA 12.8 predates the SM100-family target and retains one exact B200
@@ -1122,10 +1116,7 @@ def detect_sm_capabilities():
             and cuda_version >= Version("12.8")
         ),
         "blackwell_msa_sm103a": (
-            bool(
-                {(10, "3a"), (10, "3f")}
-                & compilation_context.TARGET_CUDA_ARCHS
-            )
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "flash_kda_prefill_sm100a": (
