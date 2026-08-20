@@ -20,9 +20,7 @@ from flashinfer.jit import env as jit_env
 from flashinfer.jit.gemm.core import gen_tgv_gemm_sm10x_module
 
 
-def test_tgv_gemm_target_specific_jit_specs_and_aot_inventory(
-    monkeypatch, tmp_path
-):
+def test_tgv_gemm_target_specific_jit_specs_and_aot_inventory(monkeypatch, tmp_path):
     monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
 
     specs = [
@@ -79,9 +77,7 @@ def test_tgv_gemm_target_specific_jit_specs_and_aot_inventory(
         monkeypatch.setattr(
             aot,
             generator_name,
-            lambda *args, _name=generator_name, **kwargs: SimpleNamespace(
-                name=_name
-            ),
+            lambda *args, _name=generator_name, **kwargs: SimpleNamespace(name=_name),
         )
 
     inventory = aot.gen_all_modules(
