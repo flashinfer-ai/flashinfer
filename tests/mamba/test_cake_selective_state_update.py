@@ -16,9 +16,7 @@ from flashinfer.mamba import cake_selective_state_update, selective_state_update
 def _make_sglang_raw_layout_case(batch_size: int):
     meta = "meta"
     return {
-        "state": torch.empty(
-            65, 64, 64, 128, dtype=torch.bfloat16, device=meta
-        ),
+        "state": torch.empty(65, 64, 64, 128, dtype=torch.bfloat16, device=meta),
         "x": torch.empty_strided(
             (batch_size, 6, 64, 64),
             (26112, 4352, 64, 1),
@@ -46,18 +44,12 @@ def _make_sglang_raw_layout_case(batch_size: int):
             dtype=torch.bfloat16,
             device=meta,
         ),
-        "D": torch.empty_strided(
-            (64, 64), (1, 0), dtype=torch.bfloat16, device=meta
-        ),
+        "D": torch.empty_strided((64, 64), (1, 0), dtype=torch.bfloat16, device=meta),
         "dt_bias": torch.empty_strided(
             (64, 64), (1, 0), dtype=torch.bfloat16, device=meta
         ),
-        "output": torch.empty(
-            batch_size, 6, 64, 64, dtype=torch.bfloat16, device=meta
-        ),
-        "state_batch_indices": torch.empty(
-            batch_size, dtype=torch.int32, device=meta
-        ),
+        "output": torch.empty(batch_size, 6, 64, 64, dtype=torch.bfloat16, device=meta),
+        "state_batch_indices": torch.empty(batch_size, dtype=torch.int32, device=meta),
         "dst_state_batch_indices": None,
         "intermediate_states_buffer": torch.empty(
             5, 6, 64, 64, 128, dtype=torch.bfloat16, device=meta

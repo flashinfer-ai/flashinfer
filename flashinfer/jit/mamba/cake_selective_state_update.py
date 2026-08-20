@@ -572,8 +572,8 @@ def try_cake_selective_state_update(
             and state_batch_indices.ndim == 1
         ):
             try:
-                dt_compact, A_compact, D_compact, bias_compact = (
-                    _compact_broadcasts(dt, A, D, dt_bias)
+                dt_compact, A_compact, D_compact, bias_compact = _compact_broadcasts(
+                    dt, A, D, dt_bias
                 )
             except ValueError:
                 return False
@@ -642,8 +642,8 @@ def try_cake_selective_state_update(
                 )
                 return True
             try:
-                dt_compact, A_compact, D_compact, bias_compact = (
-                    _compact_broadcasts(dt, A, D, dt_bias)
+                dt_compact, A_compact, D_compact, bias_compact = _compact_broadcasts(
+                    dt, A, D, dt_bias
                 )
             except ValueError:
                 return False
@@ -725,8 +725,8 @@ def try_cake_selective_state_update(
             if checkpoint_step not in (0, 1, 3, 7):
                 return False
             try:
-                dt_compact, A_compact, D_compact, bias_compact = (
-                    _compact_broadcasts(dt, A, D, dt_bias)
+                dt_compact, A_compact, D_compact, bias_compact = _compact_broadcasts(
+                    dt, A, D, dt_bias
                 )
             except ValueError:
                 return False
