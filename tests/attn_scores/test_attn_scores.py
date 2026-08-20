@@ -1131,6 +1131,67 @@ def test_fp4_head_dim_num_heads_validation():
         fp4_paged_mqa_logits(q6, sf6, kv_bad, w6, context_lens, block_table, max_ml)
 
 
+def test_block_table_width_contract(monkeypatch):
+    """block_table must be wide enough for the kernel's compute-tile indexing.
+
+    The kernel reads ceil(ctx/128) tiles x (128 // block_size) pages per tile,
+    which exceeds ceil(ctx/block_size) when ctx is not a multiple of 128, so a
+    naturally-sized table is indexed out of bounds. The bound needs the per-row
+    context_lens from device memory, so the check is opt-in behind
+    FLASHINFER_VALIDATE_INPUTS. Regression for PR #4365 review r3824399380.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _validate_block_table_width
+
+    device = "cuda"
+    B, H, D, block_size = 2, 64, 128, 64
+    ctx = 257  # deliberately not a multiple of 128
+    pages = -(-ctx // block_size)  # 5 -- what a caller would naturally allocate
+    need = -(-ctx // 128) * (128 // block_size)  # 6 -- what the kernel indexes
+    assert (pages, need) == (5, 6), "test premise: ctx exposes the tile/page gap"
+
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    narrow = torch.zeros((B, pages), dtype=torch.int32, device=device)
+    wide = torch.zeros((B, need), dtype=torch.int32, device=device)
+
+    # Default (unset): no sync, no check. Exercise the validator directly rather
+    # than launching -- a narrow table would genuinely read out of bounds.
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+    assert _validate_block_table_width(narrow, context_lens, block_size, "x") is None
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    ntb = B * need
+    w = torch.zeros(B * 1, H, device=device, dtype=torch.float32)
+
+    q8 = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"block_table has 5 columns.*indexes up to 6"):
+        fp8_paged_mqa_logits(q8, kv8, w, context_lens, narrow, ctx)
+    fp8_paged_mqa_logits(q8, kv8, w, context_lens, wide, ctx)
+
+    q4 = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"block_table has 5 columns.*indexes up to 6"):
+        fp4_paged_mqa_logits(
+            q4, sf4, kv4, w, context_lens, narrow, ctx, output_dtype=torch.bfloat16
+        )
+    fp4_paged_mqa_logits(
+        q4, sf4, kv4, w, context_lens, wide, ctx, output_dtype=torch.bfloat16
+    )
+
+    # Lives in the API body, so skip_check=True must not bypass it.
+    with pytest.raises(ValueError, match=r"block_table has 5 columns"):
+        fp8_paged_mqa_logits(q8, kv8, w, context_lens, narrow, ctx, skip_check=True)
+
+    # A padded table is accepted even though ctx is not a multiple of 128, and
+    # max_context_len being much larger than ctx must NOT tighten the bound.
+    fp8_paged_mqa_logits(q8, kv8, w, context_lens, wide, ctx * 8)
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
