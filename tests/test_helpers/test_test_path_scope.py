@@ -76,3 +76,15 @@ def test_multi_token_union() -> None:
 def test_prefix_does_not_match_sibling_name() -> None:
     files = "tests/comm/foo.py tests/communication/bar.py"
     assert _filter("tests/comm", files) == "tests/comm/foo.py"
+
+
+def test_task_scripts_source_setup_after_scope_skip() -> None:
+    for name in (
+        "task_test_multi_gpu_comm_kernels.sh",
+        "task_test_multi_node_comm_kernels.sh",
+    ):
+        text = (REPO_ROOT / "scripts" / name).read_text()
+        skip = text.index("skipping.")
+        setup = text.index('source "${SCRIPT_DIR}/setup_test_env.sh"')
+        assert setup > skip, name
+        assert text.count("setup_test_env.sh") == 1, name

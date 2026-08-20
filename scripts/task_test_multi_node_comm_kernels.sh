@@ -4,8 +4,6 @@ set -eo pipefail
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Source test environment setup (handles package overrides like TVM-FFI)
-source "${SCRIPT_DIR}/setup_test_env.sh"
 
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
 # echo "Cleaning Python bytecode cache..."
@@ -36,6 +34,8 @@ main() {
         exit 0
     fi
 
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/setup_test_env.sh"
     install_and_verify
 
     echo "Multi-node comm kernel test files:"
