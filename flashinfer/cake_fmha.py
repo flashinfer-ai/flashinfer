@@ -22,6 +22,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
+    load_cake_fmha_decode_quant_bf16q_module,
 )
 from .utils import get_compute_capability
 
@@ -117,6 +118,7 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "decode_native_bf16",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
+        "decode_quant_bf16q",
     }
 )
 
@@ -201,6 +203,62 @@ def _decode_native_workspace_supported(
         cursor += query.shape[0] * query.shape[1] * 4
     workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
     return workspace_bytes >= cursor
+
+
+def _decode_quant_workspace_supported(
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    block_tables: torch.Tensor,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    page_size: int,
+    max_seq_len: int,
+    page_table_rows: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+) -> bool:
+    """Mirror the BF16Q adapter's padding, scale, and partial workspace."""
+
+    if (
+        not workspace_buffer.is_contiguous()
+        or workspace_buffer.device != query.device
+    ):
+        return False
+    even_kv_blocks = (max_seq_len + 127) // 128
+    even_kv_blocks += even_kv_blocks % 2
+    required_pages = even_kv_blocks * (128 // page_size)
+    source_pages = int(block_tables.shape[-1])
+    padded_pages = max(source_pages, required_pages)
+
+    cursor = 0
+    if not isinstance(bmm1_scale, torch.Tensor):
+        cursor += 4
+    if not isinstance(bmm2_scale, torch.Tensor):
+        cursor += 4
+    cursor = (cursor + 15) // 16 * 16
+    group_size = query.shape[1] // num_kv_heads
+    if group_size != 8:
+        cursor += batch_size * num_kv_heads * 8 * 128 * 2
+        cursor = (cursor + 15) // 16 * 16
+    if source_pages < padded_pages:
+        cursor += batch_size * page_table_rows * padded_pages * 4
+        cursor = (cursor + 15) // 16 * 16
+    cursor += batch_size * query.shape[1] * 128 * 4
+    cursor += 2 * batch_size * query.shape[1] * 4
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    return workspace_bytes >= cursor
+
+
+def _decode_quant_scale_supported(
+    scale: float | torch.Tensor, query: torch.Tensor
+) -> bool:
+    return not isinstance(scale, torch.Tensor) or (
+        scale.device == query.device
+        and scale.dtype == torch.float32
+        and scale.numel() == 1
+        and scale.is_contiguous()
+    )
 
 
 def _manifest_optimized_route_accounting() -> tuple[int, int]:
@@ -466,6 +524,25 @@ def select_cake_fmha_decode_route(
         and kv_layout in ("HND", "NHD")
         and no_block_scales
         and quant_extensions_absent
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
+        and query.data_ptr() % 16 == 0
+        and key_cache.data_ptr() % 16 == 0
+        and value_cache.data_ptr() % 16 == 0
+        and _decode_quant_scale_supported(bmm1_scale, query)
+        and _decode_quant_scale_supported(bmm2_scale, query)
+        and _decode_quant_workspace_supported(
+            workspace_buffer,
+            query,
+            block_tables,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            page_table_rows=1 if uses_shared_paged_kv_idx else 2,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
     ):
         return route("decode_quant_bf16q")
 
@@ -511,6 +588,7 @@ def get_cake_fmha_decode_module(
         "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
         "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
         "decode_native_fp16_nhd": load_cake_fmha_decode_native_fp16_nhd_module,
+        "decode_quant_bf16q": load_cake_fmha_decode_quant_bf16q_module,
     }.get(route.component)
     if loader is None:
         raise RuntimeError(
@@ -530,6 +608,8 @@ def get_cake_fmha_decode_module(
             use_scale_ptr=route.use_scale_ptr,
             retain_kv_l2=route.retain_kv_l2,
         )
+    if route.component == "decode_quant_bf16q":
+        return loader(*common_args, route.page_size)
     return loader(
         *common_args,
         has_sink=route.has_sink,

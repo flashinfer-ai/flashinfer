@@ -25,7 +25,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "488df6ff2401838b8909d4c77ec3d4665e8a105004606b0df88b6c5e6754fb6b"
+    "6243c7d8dde7aabab341f93b2290350404caa417494a3a0088e34fa630e1a30d"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -35,6 +35,7 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
+    "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
@@ -52,6 +53,7 @@ _DECODE_NATIVE_FP16_HD512_JIT_BINDING = (
 _DECODE_NATIVE_FP16_NHD_JIT_BINDING = (
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu"
 )
+_DECODE_QUANT_BF16Q_JIT_BINDING = "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu"
 _CONTEXT_BF16_JIT_BINDING = "jit/cake_fmha_context_bf16_jit_binding.cu"
 _CONTEXT_FP8_JIT_BINDING = "jit/cake_fmha_context_fp8_jit_binding.cu"
 
@@ -189,6 +191,31 @@ def _validate_decode_native_specialization(
     if has_sink is not None:
         selector["HAS_SINK"] = int(has_sink)
     return selector
+
+
+def _validate_decode_quant_bf16q_specialization(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> dict[str, int]:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if q_len != 1:
+        raise ValueError("decode-quant BF16Q requires q_len=1")
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if not 1 <= num_q_heads // num_kv_heads <= 8:
+        raise ValueError("decode-quant BF16Q requires a head-group ratio in [1, 8]")
+    if page_size not in (16, 32, 64):
+        raise ValueError("decode-quant BF16Q requires page_size 16, 32, or 64")
+    return {"PAGE_SIZE": page_size}
 
 
 def _get_component_sources(
@@ -886,6 +913,101 @@ def load_cake_fmha_decode_native_fp16_hd512_module(
         retain_kv_l2=retain_kv_l2,
     ).build_and_load()
     logger.info("Loaded Cake FMHA decode-native FP16 head-dim-512 module: %s", module)
+    return module
+
+
+def get_cake_fmha_decode_quant_bf16q_uri(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> str:
+    selector = _validate_decode_quant_bf16q_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    return (
+        f"cake_fmha_decode_quant_bf16q_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_page{selector['PAGE_SIZE']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_decode_quant_bf16q_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> JitSpec:
+    """Build one authenticated BF16-query/FP8-KV decode specialization."""
+
+    selector = _validate_decode_quant_bf16q_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    )
+    sources = _get_component_sources(
+        "decode_quant_bf16q",
+        target,
+        selector,
+        _DECODE_QUANT_BF16Q_JIT_BINDING,
+    )
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_quant_bf16q_uri(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        ),
+        sources=list(sources),
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA BF16Q decode JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_quant_bf16q_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+):
+    module = gen_cake_fmha_decode_quant_bf16q_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA BF16Q decode module: %s", module)
     return module
 
 
