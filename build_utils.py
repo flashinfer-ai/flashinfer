@@ -16,9 +16,30 @@ limitations under the License.
 
 """Shared build utilities for flashinfer packages."""
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+
+CUTLASS_DSL_BUILD_VERSION = "4.7.0"
+
+
+def get_cutlass_dsl_build_requirement(cuda_major: Optional[str] = None) -> str:
+    """Return the CUDA-specific CuTe DSL requirement for isolated builds.
+
+    CUDA 12 uses the base package while CUDA 13 requires the ``cu13`` extra.
+    Builds without a CUDA target, such as flashinfer-cubin, only need the base
+    package to make FlashInfer's build-time imports available.
+    """
+    if cuda_major is None:
+        cuda_major = os.environ.get("CUDA_MAJOR")
+
+    package = "nvidia-cutlass-dsl"
+    if cuda_major == "13":
+        package += "[cu13]"
+
+    return f"{package}=={CUTLASS_DSL_BUILD_VERSION}"
 
 
 def get_git_version(cwd: Optional[Path] = None) -> str:
