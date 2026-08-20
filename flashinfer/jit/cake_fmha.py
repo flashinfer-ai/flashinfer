@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import importlib.util
 import json
-import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
-
-from filelock import FileLock
 
 from . import env as jit_env
 from .core import (
@@ -315,81 +311,6 @@ def _get_component_sources(
     if not api_binding.is_file():
         raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
     return body, launch_binding, api_binding
-
-
-def _get_decode_quant_nvfp4_native_sources(
-    target: CakeFmhaTarget, selector: Mapping[str, int]
-) -> tuple[Path, Path, dict[str, int]]:
-    """Resolve the authenticated native-QMUL4 member and patch denominator."""
-
-    component = get_cake_fmha_manifest()["components"]["decode_quant_nvfp4"]
-    normalized_selector = dict(sorted(selector.items()))
-    matches = [
-        member
-        for member in component["source_family"]
-        if member.get("selector") == normalized_selector
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(
-            "Cake FMHA NVFP4 selector is not unique: "
-            f"{normalized_selector!r}"
-        )
-    native = matches[0].get("native_qmul4")
-    if not isinstance(native, dict) or native.get("protocol") != "cubin_patch_v1":
-        raise RuntimeError("Cake FMHA NVFP4 native-QMUL4 metadata is missing")
-    arch = _TARGET_MANIFEST_ARCH[target]
-    csrc_dir = get_cake_fmha_csrc_dir()
-    body = csrc_dir / native["sources"][arch]
-    launch_binding = csrc_dir / component["binding_source"]
-    for source in (body, launch_binding):
-        if not source.is_file():
-            raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
-    expected_counts = native["expected_marker_counts"][arch]
-    return body, launch_binding, expected_counts
-
-
-def _patch_and_load_native_qmul4(spec: JitSpec, expected_counts: Mapping[str, int]):
-    """Build, patch the marker-bearing CUDA object, relink, then load."""
-
-    with FileLock(spec.lock_path, thread_local=False):
-        spec.build()
-        if not hasattr(spec, "sources") or not hasattr(spec, "build_dir"):
-            raise RuntimeError("native QMUL4 requires an NVCC JIT specification")
-        if not spec.sources:
-            raise RuntimeError("native QMUL4 JIT produced no CUDA objects")
-        marker_source = spec.sources[0]
-        object_path = spec.build_dir / (
-            f"{marker_source.parent.name}_{marker_source.stem}.cuda.o"
-        )
-        stamp_path = object_path.with_suffix(object_path.suffix + ".qmul4.sha256")
-        object_bytes = object_path.read_bytes()
-        actual_digest = hashlib.sha256(object_bytes).hexdigest()
-        if not (
-            stamp_path.is_file()
-            and stamp_path.read_text().strip() == actual_digest
-        ):
-            patch_path = get_cake_fmha_csrc_dir() / "runtime/cake_fmha_qmul4.py"
-            module_spec = importlib.util.spec_from_file_location(
-                "flashinfer_cake_fmha_qmul4_patch", patch_path
-            )
-            if module_spec is None or module_spec.loader is None:
-                raise RuntimeError("failed to load authenticated Cake QMUL4 patch module")
-            patch_module = importlib.util.module_from_spec(module_spec)
-            module_spec.loader.exec_module(patch_module)
-            patched = patch_module.patch_qmul4_cubin(
-                object_bytes, expected_counts=expected_counts
-            )
-            patched_digest = hashlib.sha256(patched).hexdigest()
-            temporary = object_path.with_suffix(
-                object_path.suffix + f".qmul4.{os.getpid()}.tmp"
-            )
-            temporary.write_bytes(patched)
-            os.replace(temporary, object_path)
-            stamp_path.write_text(patched_digest + "\n")
-            # The first build linked the deliberately invalid marker body.
-            # Re-run ninja so the newer patched object replaces that image.
-            spec.build()
-        return spec.load()
 
 
 def _validate_context_specialization(
@@ -1502,7 +1423,7 @@ def get_cake_fmha_decode_quant_nvfp4_uri(
         page_size,
     )
     return (
-        f"cake_fmha_decode_quant_nvfp4_nativeqmul4_{target}"
+        f"cake_fmha_decode_quant_nvfp4_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_page{selector['PAGE_SIZE']}"
         f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
@@ -1529,8 +1450,8 @@ def gen_cake_fmha_decode_quant_nvfp4_module(
         num_kv_heads,
         page_size,
     )
-    main_body, main_binding, _ = _get_decode_quant_nvfp4_native_sources(
-        target, selector
+    main_sources = _get_component_launch_sources(
+        "decode_quant_nvfp4", target, selector
     )
     reduce_sources = _get_component_launch_sources(
         "decode_quant_fp8_reduce", target, {}
@@ -1547,7 +1468,7 @@ def gen_cake_fmha_decode_quant_nvfp4_module(
             num_kv_heads,
             page_size,
         ),
-        sources=[main_body, main_binding, *reduce_sources, api_binding],
+        sources=[*main_sources, *reduce_sources, api_binding],
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             "-use_fast_math",
@@ -1573,28 +1494,14 @@ def load_cake_fmha_decode_quant_nvfp4_module(
     num_kv_heads: int,
     page_size: int,
 ):
-    selector = _validate_decode_quant_nvfp4_specialization(
+    module = gen_cake_fmha_decode_quant_nvfp4_module(
         target,
         batch_size,
         q_len,
         num_q_heads,
         num_kv_heads,
         page_size,
-    )
-    _, _, expected_counts = _get_decode_quant_nvfp4_native_sources(
-        target, selector
-    )
-    module = _patch_and_load_native_qmul4(
-        gen_cake_fmha_decode_quant_nvfp4_module(
-            target,
-            batch_size,
-            q_len,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-        ),
-        expected_counts,
-    )
+    ).build_and_load()
     logger.info("Loaded Cake FMHA NVFP4 decode/reduce module: %s", module)
     return module
 

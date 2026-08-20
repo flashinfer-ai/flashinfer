@@ -319,7 +319,7 @@ def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
-    assert any("native_qmul4" in str(source) for source in spec.sources)
+    assert not any("native_qmul4" in str(source) for source in spec.sources)
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
     assert "-DNUM_Q_HEADS=4" in spec.extra_cuda_cflags
     assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags

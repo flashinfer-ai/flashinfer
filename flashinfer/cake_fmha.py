@@ -822,7 +822,7 @@ def get_cake_fmha_decode_module(
             return loader(*common_args, route.page_size)
         except (OSError, RuntimeError) as error:
             warnings.warn(
-                "Cake FMHA native-QMUL4 loading failed closed to compat_v1: "
+                "Cake FMHA portable NVFP4 loading failed closed to compat_v1: "
                 f"{error}",
                 RuntimeWarning,
                 stacklevel=2,
