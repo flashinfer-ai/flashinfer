@@ -113,6 +113,52 @@ def gdn_fused_decode_step_supported(
     and keep serving it across a later :func:`torch.cuda.set_device` onto a
     device of a different compute capability.  The inner memo is keyed on the
     *resolved* capability instead.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of decode rows in the call being considered.  The only
+        parameter without a default, because it is the only one that varies
+        across the shipped registry rows (B in {1, 2, 4, 8}).
+    hidden_size : int, default 5120
+        Model hidden size; the ``[B, hidden_size]`` input row width.
+    n_ba : int, default 96
+        Combined width of the b/a projection, i.e. ``w_ba.shape[1]``.
+    qkv_dim : int, default 10240
+        Width of the packed q/k/v projection before the head split.
+    num_qk_heads : int, default 16
+        Number of query/key heads (``h_q``).  Not an independent axis: it is
+        recovered from ``(qkv_dim - num_v_heads * head_dim) / (2 * head_dim)``
+        at dispatch, and is accepted here so a caller can state it rather than
+        rely on that arithmetic.
+    num_v_heads : int, default 48
+        Number of value heads (``hv``).
+    head_dim : int, default 128
+        Per-head dimension (``d``); the recurrent state is ``[hv, d, d]``.
+    conv_width : int, default 4
+        Depthwise causal convolution width.
+    conv_state_len : int, default 3
+        Retained conv-state length, normally ``conv_width - 1``.
+    device : torch.device, optional
+        Device whose compute capability decides the answer.  ``None`` and an
+        index-less ``"cuda"`` both mean *whatever device is current now*, and
+        are resolved on every call — see the note above on why this argument
+        makes the public entry point unsafe to cache.
+    conv_state_layout : str, default ``"SD"``
+        Physical layout of the paged conv-state pool rows: ``"SD"`` for
+        ``(state_len, dim)`` (what vLLM allocates) or ``"DS"`` for
+        ``(dim, state_len)``.  Only the layouts present in the registry are
+        served; a call is routed on the layout *derived from the real tensor
+        strides*, so this argument is a claim used for routing, never trusted
+        at dispatch.
+
+    Returns
+    -------
+    bool
+        ``True`` when :func:`gdn_fused_decode_step` would serve this geometry
+        with a specialized kernel on this device.  ``False`` is not an error:
+        the op remains callable and correct, it just runs the composable path,
+        which is why callers should keep their own optimized composition.
     """
     return _get_gdn_specialized().gdn_fused_decode_supported_geometry(
         batch_size,
