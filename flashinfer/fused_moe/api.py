@@ -308,8 +308,9 @@ _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 # MXFP8 activations x MXFP4 weights matches the flat-API skip.
 _CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
 
-# MXFP8 x MXFP8 is SM100-only in the current flat CUTLASS skip.
-_CUTLASS_MXFP8_ARCHS = (100,)
+# MXFP8 x MXFP8 follows the flat CUTLASS skip: SM10x (major == 10),
+# including B300 SM103. Not claimed on SM11x/SM12x.
+_CUTLASS_MXFP8_ARCHS = (100, 103, 107)
 
 # INT4 W4A8 and Humming MXFP4 x FP8 are Hopper mixed-input paths.
 _CUTLASS_W4A8_ARCHS = (90,)
@@ -848,7 +849,7 @@ class CutlassMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class CutlassMxfp8Config:
-    """CUTLASS MXFP8-activation x MXFP8-weight backend (SM100).
+    """CUTLASS MXFP8-activation x MXFP8-weight backend (SM100 / SM103 / SM107).
 
     Activations are MXFP8 with a swizzled ``input_sf``. Weights stay E4M3 with
     packed int32 scale tiles. Packed precomputed routing with SwiGLU and
