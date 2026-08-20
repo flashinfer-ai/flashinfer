@@ -1888,13 +1888,6 @@ def fp8_gemm_sm100(
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
-    # cute-dsl goes last, matching the ordering _heuristic_func_bmm_fp8 already
-    # documents ("cute-dsl is placed last as it's still experimental").  The
-    # AutoTuner uses runners[0] as its no-profile fallback, so putting the
-    # experimental SM107 runner first made every untuned backend="auto" call on
-    # Rubin go straight to it -- and raise for any shape the SM107 tactic space
-    # cannot serve (m < 256 or n < 128) instead of falling back to cutlass,
-    # cublas or cudnn.
     if "cute-dsl_sm107" in runner_names:
         runners.append(_cute_dsl_fp8_gemm_runner_sm107())
     assert runners, "No suitable runners found"
