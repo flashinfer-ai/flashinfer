@@ -70,6 +70,7 @@ def _get_gdn_specialized():
     return gdn_fused_decode_specialized
 
 
+@flashinfer_api
 def gdn_fused_decode_step_supported(
     batch_size: int,
     hidden_size: int = 5120,
@@ -106,7 +107,12 @@ def gdn_fused_decode_step_supported(
     (see :func:`~flashinfer.gdn_kernels.experimental.
     gdn_fused_decode_specialized.gdn_fused_decode_supported_geometry`) and
     only the first call for a given geometry touches the registry or the
-    device.
+    device.  That memo sits one layer in, and deliberately not on this
+    function: ``device=None`` means "whatever device is current *now*", so a
+    cache keyed on this signature would pin an answer under the key ``None``
+    and keep serving it across a later :func:`torch.cuda.set_device` onto a
+    device of a different compute capability.  The inner memo is keyed on the
+    *resolved* capability instead.
     """
     return _get_gdn_specialized().gdn_fused_decode_supported_geometry(
         batch_size,
