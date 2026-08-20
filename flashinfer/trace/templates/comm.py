@@ -282,3 +282,70 @@ decode_cp_a2a_alltoall_trace = TraceTemplate(
     reference=_decode_cp_a2a_alltoall_reference,
     init=_decode_cp_a2a_alltoall_init,
 )
+
+
+def _dcp_direct_reduce_reference(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    **_unused,
+):
+    """Single-rank reference: the local shard is already the result."""
+    return partial_output.clone(), partial_lse.clone()
+
+
+dcp_direct_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="dcp_direct_reduce",
+    description=(
+        "Destination-owned context-parallel Output/LSE reduce over "
+        "symmetric memory. Single-rank reference is a passthrough; "
+        "multi-rank correctness is exercised by tests/comm."
+    ),
+    axes={
+        "num_tokens": Var(description="Token count along dim 0."),
+        "total_heads": Const(abbrev="h"),
+        "local_heads": Var(
+            description=(
+                "Heads owned by this rank (H_total / world_size). "
+                "Read from optional caller ``out`` when provided."
+            )
+        ),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "partial_output": Tensor(
+            ["num_tokens", "total_heads", "head_dim"],
+            description="Per-rank partial attention output [T, H_total, D].",
+        ),
+        "partial_lse": Tensor(
+            ["num_tokens", "total_heads"],
+            dtype="float32",
+            description="Per-rank partial LSE [T, H_total].",
+        ),
+        "slot": Scalar("int32"),
+        "is_lse_base_on_e": Scalar("int32"),
+        "out": Tensor(
+            ["num_tokens", "local_heads", "head_dim"],
+            optional=True,
+            description="Caller-owned [T, H_local, D] destination.",
+        ),
+        "lse_out": Tensor(
+            ["num_tokens", "local_heads"],
+            optional=True,
+            dtype="float32",
+            description="Caller-owned [T, H_local] LSE destination.",
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens", "local_heads", "head_dim"],
+            dtype_from="partial_output",
+        ),
+        "lse_out": Tensor(
+            ["num_tokens", "local_heads"],
+            dtype="float32",
+        ),
+    },
+    tags=["status:verified", "stage:comm"],
+    reference=_dcp_direct_reduce_reference,
+)
