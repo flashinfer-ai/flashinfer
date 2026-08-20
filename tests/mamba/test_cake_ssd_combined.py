@@ -513,7 +513,9 @@ def _signature_contract(callable_, *, drop_self=False):
     if drop_self:
         assert parameters[0].name == "self"
         parameters = parameters[1:]
-    return tuple((parameter.name, parameter.kind, parameter.default) for parameter in parameters)
+    return tuple(
+        (parameter.name, parameter.kind, parameter.default) for parameter in parameters
+    )
 
 
 def test_source_public_api_signatures_are_stable():
@@ -618,7 +620,10 @@ def test_source_public_api_signatures_are_stable():
         )
     )
     assert _signature_contract(module.SSDCombined.run, drop_self=True) == expected_run
-    assert _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True) == expected_run
+    assert (
+        _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
+        == expected_run
+    )
     assert _signature_contract(module.ssd_combined_fwd) == expected_run
 
     helper_names = (
@@ -727,19 +732,22 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
     result = (object(), None)
     runner = _public_runner_without_constructor("cake", result)
     tensors = _cpu_public_run_inputs()
-    sentinels = {name: object() for name in (
-        "D",
-        "z",
-        "dt_bias",
-        "initial_states",
-        "seq_idx",
-        "chunk_indices",
-        "chunk_offsets",
-        "seq_chunk_cumsum",
-        "checkpoint_token_indices",
-        "checkpoint_state_slots",
-        "checkpoint_states",
-    )}
+    sentinels = {
+        name: object()
+        for name in (
+            "D",
+            "z",
+            "dt_bias",
+            "initial_states",
+            "seq_idx",
+            "chunk_indices",
+            "chunk_offsets",
+            "seq_chunk_cumsum",
+            "checkpoint_token_indices",
+            "checkpoint_state_slots",
+            "checkpoint_states",
+        )
+    }
     out = torch.empty((1, 2, 64, 1, 128), dtype=torch.bfloat16)
     kwargs = {
         **sentinels,
@@ -898,13 +906,9 @@ def test_source_cake_checkpoint_validation_without_gpu(invalid, match):
     elif invalid == "slot_contiguous":
         kwargs["checkpoint_state_slots"] = slot_storage[::2]
     elif invalid == "state_shape":
-        kwargs["checkpoint_states"] = torch.empty(
-            (2, 2, 64, 127), dtype=torch.bfloat16
-        )
+        kwargs["checkpoint_states"] = torch.empty((2, 2, 64, 127), dtype=torch.bfloat16)
     elif invalid == "state_dtype":
-        kwargs["checkpoint_states"] = torch.empty(
-            (2, 2, 64, 128), dtype=torch.float16
-        )
+        kwargs["checkpoint_states"] = torch.empty((2, 2, 64, 128), dtype=torch.float16)
     else:
         state_storage = torch.empty((2, 2, 64, 129), dtype=torch.bfloat16)
         kwargs["checkpoint_states"] = state_storage[..., :128]
