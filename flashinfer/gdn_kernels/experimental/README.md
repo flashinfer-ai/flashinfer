@@ -146,6 +146,34 @@ differs from `flashinfer/gemm/specialized`'s eager
 the CuTe-DSL compile key but is a runtime value, so the full variant set
 cannot be precompiled from the registry alone.
 
+### Not in the AOT build
+
+Neither impl is registered in `flashinfer/aot.py`, so neither ships in
+`flashinfer-jit-cache`. That is a deliberate trade against a shared,
+size-limited cache:
+
+- The **CuTe-DSL** impl — the one that actually serves every registered
+  geometry — is outside the AOT pass entirely. `aot.py` drives `gen_*_module()`
+  nvcc specs; CuTe-DSL kernels cache through `JitSpecCuteDsl` / `cached_ops/`
+  instead. There was never an AOT entry to keep for it.
+- The **CUDA** impl is second in `_AUTO_BACKEND_ORDER`, so on any install where
+  the CuTe-DSL impl loads it is dispatched only after that one is latched off
+  by a failure. Its AOT entry cost one sm120a translation unit in every
+  jit-cache wheel to pre-build a kernel that, in the normal case, never runs.
+
+Both therefore JIT-compile on first eager dispatch — which is already the path
+the CUDA-graph contract above depends on, so this removes a build cost rather
+than changing when compilation happens.
+
+The one deployment this changes is `FLASHINFER_DISABLE_JIT=1` with no JIT cache
+present: neither impl can build, both latch off after their first attempt, and
+the op serves the composable path. It stays **correct**, and the latch clears
+the probe memo, so `gdn_fused_decode_step_supported(...)` starts answering
+`False` and a framework goes back to its own composition after at most one
+declined call per impl. If a JIT-disabled deployment needs the CUDA kernel,
+re-adding the `gen_gdn_fused_decode_module()` spec under `has_sm120` restores
+it; nothing else depends on its absence.
+
 ### `@flashinfer_api` on both; `trace=` only on the op
 
 Both public entry points carry `@flashinfer_api`. The op adds
