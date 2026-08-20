@@ -59,7 +59,7 @@ def _dequant_128x4(xq, sf_flat, mul, rows, d=128):
 
 
 def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal, q_off=None):
-    """Block-max proxy on pre-dequantized bf16 Q/K, single sequence -> [Hq, nb, Sq]."""
+    """Block-max proxy on pre-dequantized Q/K, single sequence -> [Hq, nb, Sq]."""
     Hq = q_deq.shape[1]
     nb = (seqlen_k + BLK_KV - 1) // BLK_KV
     if q_off is None:

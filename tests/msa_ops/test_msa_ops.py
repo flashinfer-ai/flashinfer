@@ -1191,6 +1191,7 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
         (3, 8, 2, 8, 2048, True, False),  # group 4 (Hq/Hkv), q_len 8 -> key-major
         (2, 4, 1, 16, 4096, False, False),  # non-causal packed
         (2, 4, 1, 8, 4096, True, True),  # explicit q_offset masks mid-sequence
+        (2, 4, 1, 16, 4096, True, True),  # explicit q_offset, row-major packed
     ],
 )
 def test_msa_proxy_score_decode_packed(
