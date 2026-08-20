@@ -153,6 +153,15 @@ def test_cutile_bf16_tactic_shortlist(activation, arch, num_tokens):
     assert any(tactic[1] == 256 or tactic[4] == 256 for tactic in tactics)
 
 
+@pytest.mark.parametrize(("k_in", "n"), ((15, 64), (64, 31)))
+def test_cutile_bf16_gemm_configs_reject_unsupported_small_shapes(k_in, n):
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner._device_arch = 90
+
+    with pytest.raises(ValueError, match=rf"no cuTile GEMM tile fits n={n}, k={k_in}"):
+        runner._gemm_configs(k_in, n)
+
+
 def test_cutile_bf16_direct_runner_rejects_tokens_above_tuning_ceiling():
     runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
     runner.config = _config(tune_max_num_tokens=64)
@@ -190,7 +199,7 @@ def test_cutile_bf16_tuning_pre_hook_initializes_routing_and_workspace():
 @pytest.mark.parametrize(
     "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
 )
-def test_cutile_bf16_workspace_cache_is_shape_specific(activation):
+def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     class KernelModule:
         def __init__(self):
             self.calls = []
@@ -210,16 +219,20 @@ def test_cutile_bf16_workspace_cache_is_shape_specific(activation):
 
     runner._ensure_workspace(17, 128)
     first = runner._workspace
+    runner._ensure_workspace(31, 128)
+    same_bucket = runner._workspace
     runner._ensure_workspace(33, 128)
     second = runner._workspace
     runner._ensure_workspace(17, 128)
 
     assert runner._workspace is first
+    assert same_bucket is first
     assert first is not second
     assert len(module.calls) == 2
+    assert [call["num_tokens"] for call in module.calls] == [32, 64]
     assert module.calls[0]["block_sizes"] == (32, 64, 128)
     assert module.calls[0]["is_gated"] is activation.is_gated
-    assert set(runner._workspace_cache) == {(17, 128), (33, 128)}
+    assert set(runner._workspace_cache) == {(32, 128), (64, 128)}
 
 
 @pytest.mark.parametrize(

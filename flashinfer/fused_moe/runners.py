@@ -901,11 +901,12 @@ class CuTileBf16Runner(MoERunner):
             raise ValueError(
                 f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
             )
-        key = (num_tokens, hidden_size)
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        key = (capacity, hidden_size)
         workspace = self._workspace_cache.get(key)
         if workspace is None:
             workspace = self._kernel_module.allocate_workspace(
-                num_tokens=num_tokens,
+                num_tokens=capacity,
                 hidden_size=hidden_size,
                 intermediate_size=self.config.experts.intermediate_size,
                 num_experts=self.config.routing.num_experts,
@@ -938,11 +939,17 @@ class CuTileBf16Runner(MoERunner):
             )
         elif self._device_arch in (120, 121):
             candidates.append((256, 32, 2))
-        return [
+        configs = [
             config
             for config in candidates
             if config[0] <= 2 * n and config[1] <= 2 * k_in
         ]
+        if not configs:
+            raise ValueError(
+                f"{type(self).__name__}: no cuTile GEMM tile fits n={n}, "
+                f"k={k_in}; hidden_size and intermediate_size are too small."
+            )
+        return configs
 
     def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, int]:
         # Padding dominates while each expert receives few rows. The measured
