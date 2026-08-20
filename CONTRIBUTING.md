@@ -88,7 +88,8 @@ Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is 
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `/bot run` | Allowed users | Mirror PR to GitLab and run CI pipeline |
+| `/bot run` | Allowed users | Mirror PR to GitLab and run the full unit-test pipeline |
+| `/bot run tests/<dir-or-file> [tests/...]` | Allowed users | Same pipeline, scoped to one or more paths under `tests/` (whitespace-separated). Invalid tokens are rejected and do not start a pipeline. Multi-GPU and multi-node jobs still run their dedicated scripts. |
 | `/bot status` | Allowed users | Check current pipeline status |
 | `/bot stop` | Allowed users | Cancel a running pipeline |
 
