@@ -878,8 +878,9 @@ _DTYPE = {
         reference=_mxint4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        # The full 160-seed GB200 sweep requires atol_frac ~= 0.062 for seed 18
-        # after the relative-tolerance contribution; retain a small margin.
+        # A 160-seed GB200 (SM100) sweep exercised 17 MxInt4 cases; seed 18
+        # requires atol_frac ~= 0.062 after the relative-tolerance contribution.
+        # Keep a small SM100-calibrated margin; SM103/SM107 remain uncalibrated.
         atol_frac=0.065,
         rtol=0.3,
     ),
