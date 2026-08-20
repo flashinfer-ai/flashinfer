@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "4586a92fe50c36cc3f43ff4592414484178d9637e1430e3387efc30b2a385db9"
-_GENERATOR_COMMIT = "e0d4b22c9a5e05352770ba48acf9825dccf54b8b"
+_MANIFEST_SHA256 = "06bd52b67ef1a6249fcaac23bc573e60ea4a7d383b1eb25d126a9524d3221cb0"
+_GENERATOR_COMMIT = "35878f6bc52fe8ea1d27820d198d55d397d03e0d"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -304,6 +304,10 @@ def _variant_for(
         "decode": "cake.generated.decode",
         "prefill": "cake.generated.prefill",
     }[domain]
+    expected_tma_abi = {
+        "decode": "pointer",
+        "prefill": "grid_constant",
+    }[domain]
     expected_source = f"{source_schedule}:{schedule_attr}"
     matches = [
         record
@@ -311,7 +315,7 @@ def _variant_for(
         if record["domain"] == domain
         and record["source_schedule"] == expected_source
         and record["specializations"] == specializations
-        and record["tma_abi"] == "pointer"
+        and record["tma_abi"] == expected_tma_abi
     ]
     if len(matches) != 1:
         raise CakeGDNUnsupportedError(

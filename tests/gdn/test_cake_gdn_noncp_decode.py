@@ -58,7 +58,7 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("e0d4b22c9a5e05352770ba48acf9825dccf54b8b")
+    assert manifest["generator_commit"] == ("35878f6bc52fe8ea1d27820d198d55d397d03e0d")
     assert manifest["contract_row_count"] == 1777
     assert manifest["architecture_row_count"] == 3554
     assert manifest["admitted_architecture_rows"] == 3500
@@ -66,6 +66,16 @@ def test_manifest_is_frozen_and_source_only() -> None:
     assert manifest["variant_count"] == len(manifest["variants"]) == 89
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
+    prefill = [
+        record for record in manifest["variants"] if record["domain"] == "prefill"
+    ]
+    decode = [
+        record for record in manifest["variants"] if record["domain"] == "decode"
+    ]
+    assert len(prefill) == 70
+    assert {record["tma_abi"] for record in prefill} == {"grid_constant"}
+    assert len(decode) == 19
+    assert {record["tma_abi"] for record in decode} == {"pointer"}
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
