@@ -1112,11 +1112,28 @@ class ProfilingCacheKey:
     extras: tuple[Any, ...]
 
     @property
+    def key_fields(
+        self,
+    ) -> tuple[str, str, tuple[tuple[int, ...], ...], tuple[Any, ...]]:
+        """The runner-identity-free fields that define this entry.
+
+        Excludes ``runner_hash`` (runtime id) exactly like ``file_key``, and
+        is a cheap hashable tuple.  The warm serving path memoises on this
+        instead of ``file_key`` so steady-state lookups never build the
+        ``str()`` key -- that string is only needed to address an on-disk
+        entry, i.e. on a cold store read.
+        """
+        return (
+            self.custom_op,
+            self.runner_class_name,
+            self.nearest_profile,
+            self.extras,
+        )
+
+    @property
     def file_key(self) -> str:
         """Stable string key suitable for on-disk serialisation."""
-        return str(
-            (self.custom_op, self.runner_class_name, self.nearest_profile, self.extras)
-        )
+        return str(self.key_fields)
 
 
 @dataclass
@@ -1475,9 +1492,11 @@ class AutoTuner:
         # stack: v2 does not nest).  Keeps concurrent threads isolated.
         self._v2_local: _V2Local = _V2Local()
         # Managed hits decoded from JSON once, then served from memory.
-        # Keyed by (root, env_hash, file_key): entries decoded from one
-        # store identity are never served under another's.
-        self._managed_decoded: dict[tuple[str, str, str], tuple[str, Any]] = {}
+        # Keyed by (root, env_hash, key_fields): the cheap runner-identity-
+        # free ProfilingCacheKey tuple (not the str() file_key), so the warm
+        # path builds no string.  Entries decoded from one store identity are
+        # never served under another's.
+        self._managed_decoded: dict[tuple[str, str, tuple], tuple[str, Any]] = {}
         # In-memory winner-cache partitions keyed by store/policy identity;
         # the default (v1) partition is `profiling_cache` itself.  Winners
         # tuned under one measurement identity must not short-circuit
@@ -1834,25 +1853,28 @@ class AutoTuner:
                         continue
                     return True, r_id, tactic, stored_profile
 
-            # 2. User-loaded configs (from load_configs or autotune(cache=...))
-            for r_id, cache_key in runner_keys:
-                file_key = cache_key.file_key
-                if file_key in self._file_configs:
-                    runner_name, tactic = self._file_configs[file_key]
-                    if runner_name != runners[r_id].__class__.__name__:
-                        continue
-                    if not self._tactic_still_valid(
-                        runners[r_id], inputs, tactic, custom_op, "config file"
-                    ):
-                        continue
-                    log_key = (custom_op, runner_name)
-                    if log_key not in self._logged_file_hits:
-                        self._logged_file_hits.add(log_key)
-                        logger.info(
-                            f"[Autotuner]: Config cache hit for {custom_op} "
-                            f"(runner={runner_name}, source=config file)"
-                        )
-                    return True, r_id, tactic, None
+            # 2. User-loaded configs (from load_configs or autotune(cache=...)).
+            #    Skipped wholesale when nothing was loaded, so the common
+            #    serving path never builds a file_key string here.
+            if self._file_configs:
+                for r_id, cache_key in runner_keys:
+                    file_key = cache_key.file_key
+                    if file_key in self._file_configs:
+                        runner_name, tactic = self._file_configs[file_key]
+                        if runner_name != runners[r_id].__class__.__name__:
+                            continue
+                        if not self._tactic_still_valid(
+                            runners[r_id], inputs, tactic, custom_op, "config file"
+                        ):
+                            continue
+                        log_key = (custom_op, runner_name)
+                        if log_key not in self._logged_file_hits:
+                            self._logged_file_hits.add(log_key)
+                            logger.info(
+                                f"[Autotuner]: Config cache hit for {custom_op} "
+                                f"(runner={runner_name}, source=config file)"
+                            )
+                        return True, r_id, tactic, None
 
             # 2.5 Managed v2 per-entry store (the active context's store, or
             #     the ambient attached store outside any context); decoded
@@ -1865,11 +1887,14 @@ class AutoTuner:
             if managed_store is not None:
                 store_id = (str(managed_store.root), managed_store.env_hash)
                 for r_id, cache_key in runner_keys:
-                    file_key = cache_key.file_key
-                    memo_key = (*store_id, file_key)
+                    # Warm path: memoise on the cheap hashable key_fields
+                    # tuple, not the str() file_key, so steady-state serving
+                    # rebuilds no string.  file_key is materialised only on a
+                    # cold miss, to address the on-disk entry.
+                    memo_key = (*store_id, cache_key.key_fields)
                     hit = self._managed_decoded.get(memo_key)
                     if hit is None:
-                        entry = managed_store.lookup(file_key)
+                        entry = managed_store.lookup(cache_key.file_key)
                         if entry is not None:
                             hit = (entry[0], _json_to_tactic(entry[1]))
                             self._managed_decoded[memo_key] = hit
