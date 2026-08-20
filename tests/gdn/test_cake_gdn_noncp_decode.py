@@ -200,6 +200,26 @@ def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
 
 
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
+    for arch in ("sm_100a", "sm_103a"):
+        with pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError,
+            match="exact promoted SGLang TP4 BF16 B5/T320",
+        ):
+            _prefill(
+                arch=arch,
+                io_dtype="bfloat16",
+                state_dtype="bfloat16",
+                num_seqs=1,
+                total_seq_len=39,
+                max_seq_len=39,
+                num_q_heads=4,
+                num_k_heads=4,
+                num_v_heads=8,
+                use_initial_state=True,
+                store_final_state=True,
+                use_state_indices=True,
+            )
+
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
         match="checkpoint route requires the frozen FP16/FP32 packed contract",

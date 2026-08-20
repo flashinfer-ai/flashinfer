@@ -402,6 +402,18 @@ def select_cake_gdn_prefill_variant(
         and store_final_state
         and not use_state_indices
     )
+    sglang_tp4_noncheckpoint_route = (
+        io_dtype == "bfloat16"
+        and state_dtype == "bfloat16"
+        and use_initial_state
+        and store_final_state
+        and use_state_indices
+        and checkpoint_every_n_tokens == 0
+        and (num_q_heads, num_k_heads, num_v_heads) == (4, 4, 8)
+        and num_seqs == 5
+        and total_seq_len == 320
+        and max_seq_len == 64
+    )
     sglang_tp4_checkpoint_route = (
         io_dtype == "bfloat16"
         and state_dtype == "bfloat16"
@@ -421,6 +433,15 @@ def select_cake_gdn_prefill_variant(
         raise CakeGDNUnsupportedError(
             "checkpoint route requires the frozen FP16/FP32 packed contract or "
             "the exact SGLang TP4 BF16 indexed B7/T421 contract"
+        )
+    if (
+        use_state_indices
+        and not enable_checkpoints
+        and not sglang_tp4_noncheckpoint_route
+    ):
+        raise CakeGDNUnsupportedError(
+            "indexed non-checkpoint route requires the exact promoted "
+            "SGLang TP4 BF16 B5/T320 contract"
         )
     dvsplit = 2 * num_seqs * num_o_heads <= _ARCH_ACTIVE_CLUSTERS[arch]
     if low_precision_state and not dvsplit:
