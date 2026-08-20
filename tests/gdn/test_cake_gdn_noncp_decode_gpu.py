@@ -332,6 +332,246 @@ def _launch(
     )
 
 
+def _make_fp32_mtp_inputs(
+    *, batch_size: int, seq_len: int
+) -> dict[str, torch.Tensor]:
+    torch.manual_seed(2040 + batch_size + seq_len)
+    device = torch.device("cuda")
+    num_q_heads, num_v_heads = 16, 32
+    packed_qkv = torch.empty(
+        batch_size,
+        seq_len,
+        (2 * num_q_heads + num_v_heads) * _HEAD_SIZE,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    q_flat, k_flat, v_flat = packed_qkv.split(
+        (
+            num_q_heads * _HEAD_SIZE,
+            num_q_heads * _HEAD_SIZE,
+            num_v_heads * _HEAD_SIZE,
+        ),
+        dim=-1,
+    )
+    q = q_flat.view(batch_size, seq_len, num_q_heads, _HEAD_SIZE)
+    k = k_flat.view(batch_size, seq_len, num_q_heads, _HEAD_SIZE)
+    v = v_flat.view(batch_size, seq_len, num_v_heads, _HEAD_SIZE)
+    q.normal_()
+    k.normal_()
+    v.normal_()
+    packed_gates = torch.empty(
+        batch_size,
+        seq_len,
+        2 * num_v_heads + 7,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    a = packed_gates[..., :num_v_heads]
+    b = packed_gates[..., num_v_heads : 2 * num_v_heads]
+    a.normal_().mul_(0.1)
+    b.normal_()
+
+    pool_size = max(9, 3 * batch_size)
+    state_backing = torch.randn(
+        pool_size,
+        2 * num_v_heads,
+        _HEAD_SIZE,
+        _HEAD_SIZE,
+        device=device,
+        dtype=torch.float32,
+    ).mul_(0.01)
+    state = state_backing[:, ::2]
+    if batch_size <= 4:
+        initial_state_indices = torch.tensor(
+            (8, 3, -1, 1)[:batch_size], device=device, dtype=torch.int32
+        )
+        output_state_indices = torch.tensor(
+            (2, 4, -1, 6)[:batch_size], device=device, dtype=torch.int32
+        )
+    else:
+        initial_state_indices = (
+            torch.arange(batch_size, device=device, dtype=torch.int32) * 3
+        )
+        output_state_indices = initial_state_indices + 1
+        initial_state_indices[2] = -1
+        output_state_indices[2] = -1
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "state": state,
+        "state_backing": state_backing,
+        "A_log": torch.randn(
+            num_v_heads, device=device, dtype=torch.float32
+        ).mul_(0.1),
+        "a": a,
+        "dt_bias": torch.randn(
+            num_v_heads, device=device, dtype=torch.float32
+        ).mul_(0.1),
+        "b": b,
+        "out": torch.full(
+            (batch_size, seq_len, num_v_heads, _HEAD_SIZE),
+            7.5,
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+        "intermediate_state": torch.full(
+            (
+                batch_size,
+                seq_len,
+                num_v_heads,
+                _HEAD_SIZE,
+                _HEAD_SIZE,
+            ),
+            3.25,
+            device=device,
+            dtype=torch.float32,
+        ),
+        "initial_state_indices": initial_state_indices,
+        "output_state_indices": output_state_indices,
+    }
+
+
+def _fp32_mtp_reference(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    active_indices = tensors["initial_state_indices"].long().clamp_min(0)
+    state = tensors["state"].index_select(0, active_indices).float()
+    outputs = []
+    checkpoints = []
+    for token in range(tensors["q"].shape[1]):
+        q = torch.nn.functional.normalize(
+            tensors["q"][:, token].float(), p=2.0, dim=-1
+        ).repeat_interleave(2, dim=1)
+        k = torch.nn.functional.normalize(
+            tensors["k"][:, token].float(), p=2.0, dim=-1
+        ).repeat_interleave(2, dim=1)
+        alpha = torch.exp(
+            -torch.exp(tensors["A_log"])
+            * torch.nn.functional.softplus(
+                tensors["a"][:, token].float() + tensors["dt_bias"]
+            )
+        )
+        beta = torch.sigmoid(tensors["b"][:, token].float())
+        state = state * alpha[:, :, None, None]
+        v_delta = (
+            tensors["v"][:, token].float()
+            - torch.einsum("bhvk,bhk->bhv", state, k)
+        ) * beta[:, :, None]
+        state = state + v_delta.unsqueeze(-1) * k.unsqueeze(-2)
+        outputs.append(
+            torch.einsum("bhvk,bhk->bhv", state, q * _SCALE).to(torch.bfloat16)
+        )
+        checkpoints.append(state.clone())
+    return (
+        torch.stack(outputs, dim=1),
+        torch.stack(checkpoints, dim=1),
+        state,
+    )
+
+
+def _load_fp32_mtp(*, batch_size: int, seq_len: int):
+    disable_state_update = seq_len == 2
+    route = cake_gdn.select_cake_gdn_decode_variant(
+        arch=_arch(),
+        batch_size=batch_size,
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        head_size=_HEAD_SIZE,
+        layout="pretranspose",
+        num_k_heads=16,
+        num_q_heads=16,
+        num_v_heads=32,
+        scale=_SCALE,
+        seq_len=seq_len,
+        use_qk_l2norm=True,
+        strided_inputs=True,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=True,
+        cache_steps=seq_len,
+    )
+    return route, cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
+
+
+def _launch_fp32_mtp(
+    entry,
+    tensors: dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    seq_len: int,
+    grid_x: int | None = None,
+) -> None:
+    grid_scale = 512 if seq_len == 2 else 256 if batch_size == 4 else 64
+    args = (
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        tensors["state"],
+        tensors["A_log"],
+        tensors["a"],
+        tensors["dt_bias"],
+        tensors["b"],
+        tensors["out"],
+        tensors["intermediate_state"],
+        tensors["initial_state_indices"],
+    )
+    if seq_len == 4:
+        args += (tensors["output_state_indices"],)
+    entry(
+        *args,
+        grid_x if grid_x is not None else batch_size * grid_scale,
+        1,
+        1,
+    )
+
+
+def _assert_fp32_mtp_result(
+    tensors: dict[str, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    disable_state_update: bool,
+    backing_before: torch.Tensor,
+) -> None:
+    expected_out, expected_cache, expected_final = expected
+    active = torch.where(tensors["initial_state_indices"] >= 0)[0]
+    padding = torch.where(tensors["initial_state_indices"] < 0)[0]
+    torch.testing.assert_close(
+        tensors["out"].index_select(0, active).float(),
+        expected_out.index_select(0, active).float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        tensors["intermediate_state"].index_select(0, active),
+        expected_cache.index_select(0, active),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+    if padding.numel():
+        assert torch.all(tensors["out"].index_select(0, padding) == 7.5)
+        assert torch.all(
+            tensors["intermediate_state"].index_select(0, padding) == 3.25
+        )
+    if disable_state_update:
+        assert torch.equal(tensors["state_backing"], backing_before)
+    else:
+        write_indices = tensors["output_state_indices"].index_select(0, active).long()
+        torch.testing.assert_close(
+            tensors["state"].index_select(0, write_indices),
+            expected_final.index_select(0, active),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        touched = torch.zeros(
+            tensors["state"].shape[0], device=tensors["state"].device, dtype=torch.bool
+        )
+        touched[write_indices] = True
+        assert torch.equal(
+            tensors["state"][~touched], backing_before[:, ::2][~touched]
+        )
+        assert torch.equal(tensors["state_backing"][:, 1::2], backing_before[:, 1::2])
+
+
 def test_exported_prefill_raw_abi_rejects_metadata_mismatch() -> None:
     tensors = _make_prefill_inputs()
     _, entry = _load_prefill()
@@ -355,6 +595,71 @@ def test_exported_decode_raw_abi_rejects_shape_and_grid_mismatch() -> None:
         _launch(entry, tensors, batch_size, state=tensors["state"][:0])
     with pytest.raises(ValueError, match="decode grid"):
         _launch(entry, tensors, batch_size, grid_x=255)
+
+
+def test_exported_fp32_mtp_raw_abi_rejects_cache_and_grid_mismatch() -> None:
+    tensors = _make_fp32_mtp_inputs(batch_size=1, seq_len=2)
+    _, entry = _load_fp32_mtp(batch_size=1, seq_len=2)
+    cache = tensors["intermediate_state"]
+    tensors["intermediate_state"] = cache[:, :1]
+    with pytest.raises(ValueError, match="intermediate_state shape"):
+        _launch_fp32_mtp(entry, tensors, batch_size=1, seq_len=2)
+    tensors["intermediate_state"] = cache
+    with pytest.raises(ValueError, match="FP32 MTP grid"):
+        _launch_fp32_mtp(entry, tensors, batch_size=1, seq_len=2, grid_x=511)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len"), [(1, 2), (4, 4), (16, 4), (64, 4)]
+)
+def test_exported_fp32_mtp_rows_match_torch_on_caller_stream(
+    batch_size: int, seq_len: int
+) -> None:
+    tensors = _make_fp32_mtp_inputs(batch_size=batch_size, seq_len=seq_len)
+    backing_before = tensors["state_backing"].clone()
+    expected = _fp32_mtp_reference(tensors)
+    route, entry = _load_fp32_mtp(batch_size=batch_size, seq_len=seq_len)
+    assert f"t{seq_len}" in route.route_id
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch_fp32_mtp(
+            entry, tensors, batch_size=batch_size, seq_len=seq_len
+        )
+    stream.synchronize()
+    _assert_fp32_mtp_result(
+        tensors,
+        expected,
+        disable_state_update=seq_len == 2,
+        backing_before=backing_before,
+    )
+
+
+@pytest.mark.parametrize(("batch_size", "seq_len"), [(1, 2), (4, 4), (16, 4)])
+def test_exported_fp32_mtp_variants_are_cuda_graph_safe(
+    batch_size: int, seq_len: int
+) -> None:
+    tensors = _make_fp32_mtp_inputs(batch_size=batch_size, seq_len=seq_len)
+    backing_before = tensors["state_backing"].clone()
+    expected = _fp32_mtp_reference(tensors)
+    _, entry = _load_fp32_mtp(batch_size=batch_size, seq_len=seq_len)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch_fp32_mtp(entry, tensors, batch_size=batch_size, seq_len=seq_len)
+    stream.synchronize()
+    tensors["state_backing"].copy_(backing_before)
+    tensors["out"].fill_(7.5)
+    tensors["intermediate_state"].fill_(3.25)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _launch_fp32_mtp(entry, tensors, batch_size=batch_size, seq_len=seq_len)
+    graph.replay()
+    stream.synchronize()
+    _assert_fp32_mtp_result(
+        tensors,
+        expected,
+        disable_state_update=seq_len == 2,
+        backing_before=backing_before,
+    )
 
 
 def _make_bf16_serving_inputs(

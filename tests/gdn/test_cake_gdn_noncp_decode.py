@@ -58,12 +58,12 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("69c0e4d73d76b3ba98d2d576454a61797cbb0017")
-    assert manifest["contract_row_count"] == 1773
-    assert manifest["architecture_row_count"] == 3546
-    assert manifest["admitted_architecture_rows"] == 3492
+    assert manifest["generator_commit"] == ("e0d4b22c9a5e05352770ba48acf9825dccf54b8b")
+    assert manifest["contract_row_count"] == 1777
+    assert manifest["architecture_row_count"] == 3554
+    assert manifest["admitted_architecture_rows"] == 3500
     assert manifest["fail_closed_architecture_rows"] == 54
-    assert manifest["variant_count"] == len(manifest["variants"]) == 86
+    assert manifest["variant_count"] == len(manifest["variants"]) == 89
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -247,6 +247,65 @@ def test_decode_resolver_selects_all_promoted_physical_routes() -> None:
     pretranspose = _decode(layout="pretranspose")
     assert pretranspose.route_id == "cake.gdn_decode.indexed_fp32_t1_splitv8"
     assert "pretranspose_splitv8" in pretranspose.variant_name
+
+
+def test_decode_resolver_selects_exact_promoted_fp32_mtp_rows() -> None:
+    rows = (
+        (
+            dict(
+                batch_size=1,
+                seq_len=2,
+                disable_state_update=True,
+                cache_steps=2,
+            ),
+            "indexed_fp32_mtp_t2.inline_tile8_verify_cache",
+            "mtp_t2_inline_tile8",
+        ),
+        (
+            dict(batch_size=4, seq_len=4, cache_steps=4),
+            "indexed_fp32_mtp_t4.splitv8_update_cache",
+            "mtp_t4_splitv8",
+        ),
+        *(
+            (
+                dict(batch_size=batch_size, seq_len=4, cache_steps=4),
+                "indexed_fp32_mtp_t4.tile64_update_cache",
+                "mtp_t4_splitv2_tile64",
+            )
+            for batch_size in (16, 64)
+        ),
+    )
+    for overrides, route_suffix, variant_fragment in rows:
+        route = _decode(
+            layout="pretranspose",
+            strided_inputs=True,
+            cache_intermediate_states=True,
+            **overrides,
+        )
+        assert route.route_id.endswith(route_suffix)
+        assert variant_fragment in route.variant_name
+
+
+def test_decode_resolver_fails_closed_for_unpromoted_fp32_mtp_rows() -> None:
+    base = {
+        "layout": "pretranspose",
+        "strided_inputs": True,
+        "cache_intermediate_states": True,
+        "seq_len": 4,
+        "cache_steps": 4,
+    }
+    for overrides in (
+        {"batch_size": 5},
+        {"batch_size": 4, "strided_inputs": False},
+        {"batch_size": 4, "cache_intermediate_states": False},
+        {"batch_size": 4, "cache_steps": 5},
+        {"batch_size": 4, "num_v_heads": 64},
+    ):
+        with pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError,
+            match="FP32 MTP decode is limited",
+        ):
+            _decode(**(base | overrides))
 
 
 def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:

@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "d5fed18426e689d262b1aca18e487c25dd30401df0c26c3256c03a65bc67193f"
-_GENERATOR_COMMIT = "69c0e4d73d76b3ba98d2d576454a61797cbb0017"
+_MANIFEST_SHA256 = "4586a92fe50c36cc3f43ff4592414484178d9637e1430e3387efc30b2a385db9"
+_GENERATOR_COMMIT = "e0d4b22c9a5e05352770ba48acf9825dccf54b8b"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -108,12 +108,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1773,
-        3546,
-        3492,
+        1777,
+        3554,
+        3500,
         54,
-        86,
-        86,
+        89,
+        89,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -482,7 +482,7 @@ def select_cake_gdn_decode_variant(
     cache_intermediate_states: bool = False,
     cache_steps: int = 0,
 ) -> CakeGDNRoute:
-    """Resolve one frozen FP32 T=1 or exact promoted BF16 serving row."""
+    """Resolve one frozen FP32 T=1/MTP or exact promoted BF16 serving row."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
@@ -608,9 +608,65 @@ def select_cake_gdn_decode_variant(
         return CakeGDNRoute(f"{route}.wide{tile_v}", record["name"])
 
     if seq_len != 1:
-        raise CakeGDNUnsupportedError(
-            "FP32-state child contract requires sequence length 1"
+        promoted_fp32_mtp = {
+            (1, 2, True, True, 2): (
+                "gdn_decode_pretranspose_mtp_t2_inline_tile8",
+                "cake.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache",
+            ),
+            (4, 4, True, False, 4): (
+                "gdn_decode_pretranspose_mtp_t4_splitv8",
+                "cake.gdn_decode.indexed_fp32_mtp_t4.splitv8_update_cache",
+            ),
+            (16, 4, True, False, 4): (
+                "gdn_decode_pretranspose_mtp_t4_splitv2_tile64",
+                "cake.gdn_decode.indexed_fp32_mtp_t4.tile64_update_cache",
+            ),
+            (64, 4, True, False, 4): (
+                "gdn_decode_pretranspose_mtp_t4_splitv2_tile64",
+                "cake.gdn_decode.indexed_fp32_mtp_t4.tile64_update_cache",
+            ),
+        }
+        fp32_mtp_key = (
+            batch_size,
+            seq_len,
+            strided_inputs,
+            disable_state_update,
+            cache_steps,
         )
+        selected = promoted_fp32_mtp.get(fp32_mtp_key)
+        if (
+            layout != "pretranspose"
+            or (num_q_heads, num_k_heads, num_v_heads) != (16, 16, 32)
+            or not cache_intermediate_states
+            or selected is None
+        ):
+            raise CakeGDNUnsupportedError(
+                "FP32 MTP decode is limited to promoted B1/T2 verify and "
+                "B4/B16/B64 T4 update rows"
+            )
+        schedule_attr, route = selected
+        specializations: dict[str, int | float] = {
+            "H": num_q_heads,
+            "HV": num_v_heads,
+            "INTERMEDIATE_BATCH_STRIDE": cache_steps * num_v_heads * 128 * 128,
+            "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+            "SCALE": scale,
+            "STRIDED_INPUTS": 1,
+        }
+        if schedule_attr != "gdn_decode_pretranspose_mtp_t2_inline_tile8":
+            specializations.update(
+                {
+                    "CACHE_INTERMEDIATE_STATES": 1,
+                    "T_STEPS": seq_len,
+                    "UPDATE_STATE": 1,
+                }
+            )
+        record = _variant_for(
+            domain="decode",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+        return CakeGDNRoute(route, record["name"])
     if disable_state_update or cache_intermediate_states or cache_steps:
         raise CakeGDNUnsupportedError(
             "FP32-state T=1 child contract requires state update and no cache"
