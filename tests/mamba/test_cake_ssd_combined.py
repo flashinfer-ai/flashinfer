@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import importlib
 import inspect
 from contextlib import nullcontext
@@ -1190,3 +1191,97 @@ def test_source_generated_argument_binding_fails_closed():
             {"value": object()},
             (1, 1, 1),
         )
+
+
+def test_source_generated_catalog_is_sealed_and_inactive():
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    module._source_catalog.cache_clear()
+
+    catalog = module._source_catalog()
+
+    assert catalog["source_status"] == "prepared_nonterminal"
+    assert catalog["prefix_route_selected"] is False
+    assert set(catalog["programs"]) == {
+        "prefix_bf16_varlen",
+        "prefix_f16_varlen",
+    }
+    for program in catalog["programs"].values():
+        assert set(program) == {"sm_100a", "sm_103a"}
+        for profile in program.values():
+            assert profile["launch_count"] == 2
+            assert profile["stage_order"] == ["preprocess", "main"]
+            assert len(profile["device_sources"]) == 2
+            sources = [profile["host_source"], *profile["device_sources"]]
+            for source in sources:
+                path = module._source_dir() / "generated" / source["path"]
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
+
+
+def test_source_generated_multistage_loader_binds_exact_cubins(
+    monkeypatch, tmp_path
+):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    host = generated / "host.cpp"
+    first = generated / "first.cu"
+    second = generated / "second.cu"
+    host.write_text("host source\n", encoding="utf-8")
+    first.write_text("first source\n", encoding="utf-8")
+    second.write_text("second source\n", encoding="utf-8")
+
+    def source(path, module_ident=None, compile_flags=None):
+        payload = (generated / path).read_bytes()
+        result = {"path": path, "sha256": hashlib.sha256(payload).hexdigest()}
+        if module_ident is not None:
+            result["module_ident"] = module_ident
+            result["compile_flags"] = compile_flags
+        return result
+
+    profile = {
+        "entry": "run_prepared",
+        "host_source": source("host.cpp"),
+        "device_sources": [
+            source("first.cu", "first_ident", []),
+            source("second.cu", "second_ident", ["--use_fast_math"]),
+        ],
+    }
+    nvcc = tmp_path / "cuda" / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.touch()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        output = module.Path(command[-1])
+        source_path = module.Path(command[-3])
+        output.write_bytes(source_path.read_bytes())
+        return SimpleNamespace(returncode=0, stderr="")
+
+    loaded = object()
+    load_calls = []
+
+    def load_inline(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return loaded
+
+    monkeypatch.setattr(module, "_generated_program_profile", lambda *_: profile)
+    monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
+    monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
+    monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    module._load_generated_program.cache_clear()
+
+    actual = module._load_generated_program("prefix_bf16_varlen", "sm_103a", 0)
+
+    assert actual is loaded
+    assert len(calls) == 2
+    assert "--use_fast_math" not in calls[0][0]
+    assert "--use_fast_math" in calls[1][0]
+    assert len(load_calls) == 1
+    assert load_calls[0][1]["cpp_sources"] == "host source\n"
+    assert set(load_calls[0][1]["embed_cubin"]) == {
+        "first_ident",
+        "second_ident",
+    }

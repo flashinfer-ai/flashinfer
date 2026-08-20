@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ _THREADS = 128
 _ROUTE_EXACT_SCAN = "exact_scan"
 _ROUTE_SHALLOW_VARLEN = "shallow_varlen"
 _ROUTE_PREFIX_VARLEN = "prefix_varlen"
+_SOURCE_CATALOG_RELATIVE_PATH = Path("generated") / "source_catalog.json"
 
 
 def _select_scan_route(
@@ -230,6 +232,84 @@ def _source_dir() -> Path:
     return checkout
 
 
+@functools.cache
+def _source_catalog() -> Mapping[str, object]:
+    """Load the sealed generated-source catalog shipped with the package."""
+
+    catalog_path = _source_dir() / _SOURCE_CATALOG_RELATIVE_PATH
+    if not catalog_path.is_file():
+        raise RuntimeError(
+            "Cake SSDCombined generated-source catalog is missing: "
+            f"{catalog_path}"
+        )
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    if not isinstance(catalog, dict) or catalog.get("schema_version") != 1:
+        raise RuntimeError("Cake SSDCombined generated-source catalog is invalid")
+    status = catalog.get("source_status")
+    selected = catalog.get("prefix_route_selected")
+    if status not in {"prepared_nonterminal", "terminal"} or not isinstance(
+        selected, bool
+    ):
+        raise RuntimeError(
+            "Cake SSDCombined generated-source catalog has unresolved selection state"
+        )
+    if selected and status != "terminal":
+        raise RuntimeError(
+            "Cake SSDCombined prefix source cannot be selected before terminal promotion"
+        )
+    programs = catalog.get("programs")
+    if not isinstance(programs, dict):
+        raise RuntimeError(
+            "Cake SSDCombined generated-source catalog has no program inventory"
+        )
+    return catalog
+
+
+def _prefix_route_selected() -> bool:
+    """Return the sealed promotion decision without inferring it from symbols."""
+
+    return bool(_source_catalog()["prefix_route_selected"])
+
+
+def _generated_program_profile(name: str, arch: str) -> Mapping[str, object]:
+    programs = _source_catalog()["programs"]
+    assert isinstance(programs, dict)
+    program = programs.get(name)
+    if not isinstance(program, dict):
+        raise ValueError(f"unknown Cake SSDCombined generated program: {name}")
+    profile = program.get(arch)
+    if not isinstance(profile, dict):
+        raise ValueError(
+            f"Cake SSDCombined generated program {name!r} has no {arch} source"
+        )
+    return profile
+
+
+def _sealed_source_bytes(
+    source_dir: Path,
+    relative_path: object,
+    expected_sha256: object,
+) -> tuple[Path, bytes]:
+    if not isinstance(relative_path, str) or not isinstance(expected_sha256, str):
+        raise RuntimeError("Cake SSDCombined generated source identity is unresolved")
+    root = source_dir.resolve()
+    path = (root / "generated" / relative_path).resolve()
+    if root != path and root not in path.parents:
+        raise RuntimeError(
+            f"Cake SSDCombined generated source path escapes its package: {path}"
+        )
+    if not path.is_file():
+        raise RuntimeError(f"Cake SSDCombined generated source is missing: {path}")
+    payload = path.read_bytes()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "Cake SSDCombined generated source identity drift: "
+            f"{path} has sha256={actual_sha256}, expected {expected_sha256}"
+        )
+    return path, payload
+
+
 def _target_arch(device: Optional[torch.device] = None) -> str:
     capability = torch.cuda.get_device_capability(device)
     if capability == (10, 0):
@@ -318,6 +398,112 @@ def _load_program(name: str, arch: str, device_index: int):
             module_name,
             cpp_sources=host_source.read_text(encoding="utf-8"),
             embed_cubin={module_ident: cubin_path.read_bytes()},
+            extra_include_paths=[str(nvcc.parent.parent / "include")],
+            extra_cflags=["-O3"],
+            extra_ldflags=["-lcuda"],
+            build_directory=str(build_dir),
+        )
+
+
+@functools.cache
+def _load_generated_program(name: str, arch: str, device_index: int):
+    """Build one catalog-bound multi-stage source program."""
+
+    profile = _generated_program_profile(name, arch)
+    source_dir = _source_dir()
+    host = profile.get("host_source")
+    device_sources = profile.get("device_sources")
+    entry = profile.get("entry")
+    if (
+        not isinstance(host, dict)
+        or not isinstance(device_sources, list)
+        or not device_sources
+        or not isinstance(entry, str)
+    ):
+        raise RuntimeError(
+            f"Cake SSDCombined generated program {name!r} is incomplete"
+        )
+    _host_path, host_payload = _sealed_source_bytes(
+        source_dir,
+        host.get("path"),
+        host.get("sha256"),
+    )
+
+    nvcc = _nvcc()
+    digest = hashlib.sha256()
+    digest.update(host_payload)
+    digest.update(arch.encode())
+    digest.update(str(nvcc).encode())
+    resolved_devices: list[tuple[str, Path, bytes, list[str]]] = []
+    for source in device_sources:
+        if not isinstance(source, dict):
+            raise RuntimeError(
+                f"Cake SSDCombined generated program {name!r} has invalid device source"
+            )
+        module_ident = source.get("module_ident")
+        compile_flags = source.get("compile_flags")
+        if not isinstance(module_ident, str) or not isinstance(compile_flags, list):
+            raise RuntimeError(
+                f"Cake SSDCombined generated program {name!r} has unresolved device ABI"
+            )
+        if not all(isinstance(flag, str) for flag in compile_flags):
+            raise RuntimeError(
+                f"Cake SSDCombined generated program {name!r} has invalid compile flags"
+            )
+        source_path, source_payload = _sealed_source_bytes(
+            source_dir,
+            source.get("path"),
+            source.get("sha256"),
+        )
+        digest.update(module_ident.encode())
+        digest.update(source_payload)
+        digest.update("\0".join(compile_flags).encode())
+        resolved_devices.append(
+            (module_ident, source_path, source_payload, compile_flags)
+        )
+
+    key = digest.hexdigest()[:16]
+    module_name = f"cake_mamba_ssd_{name}_{arch}_cuda{device_index}_{key}"
+    build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = build_dir / f"{module_name}.lock"
+    with FileLock(lock_path, thread_local=False):
+        cubins: dict[str, bytes] = {}
+        for module_ident, source_path, _source_payload, compile_flags in (
+            resolved_devices
+        ):
+            cubin_path = build_dir / f"{module_ident}.cubin"
+            if not cubin_path.is_file():
+                temporary_cubin = build_dir / (
+                    f"{module_ident}.{os.getpid()}.tmp.cubin"
+                )
+                command = [
+                    str(nvcc),
+                    "-cubin",
+                    f"-arch={arch}",
+                    "--std=c++17",
+                    "-O3",
+                    "-I",
+                    str(nvcc.parent.parent / "include"),
+                    *compile_flags,
+                    str(source_path),
+                    "-o",
+                    str(temporary_cubin),
+                ]
+                process = subprocess.run(command, text=True, capture_output=True)
+                if process.returncode != 0:
+                    temporary_cubin.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Cake SSDCombined nvcc failed for {name}/{module_ident} "
+                        f"({arch}):\n{process.stderr}"
+                    )
+                os.replace(temporary_cubin, cubin_path)
+            cubins[module_ident] = cubin_path.read_bytes()
+
+        return cpp.load_inline(
+            module_name,
+            cpp_sources=host_payload.decode("utf-8"),
+            embed_cubin=cubins,
             extra_include_paths=[str(nvcc.parent.parent / "include")],
             extra_cflags=["-O3"],
             extra_ldflags=["-lcuda"],
