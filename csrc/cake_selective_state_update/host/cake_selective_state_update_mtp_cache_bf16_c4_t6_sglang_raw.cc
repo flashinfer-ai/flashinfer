@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw_4123ffa2ea);
+TVM_FFI_EMBED_CUBIN(cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw_bce0e723e8);
 
 namespace cake_host_shim {
 
@@ -97,22 +97,14 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
   CheckDtype(arg_state, "state", 4, 16, 1);
   CheckCudaTensor(arg_x, "x");
   CheckDtype(arg_x, "x", 4, 16, 1);
-  TVM_FFI_CHECK(arg_x.ndim() >= 3, ValueError)
-      << "x must have at least 3 dimensions";
   CheckCudaTensor(arg_dt, "dt");
   CheckDtype(arg_dt, "dt", 4, 16, 1);
-  TVM_FFI_CHECK(arg_dt.ndim() >= 3, ValueError)
-      << "dt must have at least 3 dimensions";
   CheckCudaTensor(arg_A, "A");
   CheckDtype(arg_A, "A", 2, 32, 1);
   CheckCudaTensor(arg_B, "B");
   CheckDtype(arg_B, "B", 4, 16, 1);
-  TVM_FFI_CHECK(arg_B.ndim() >= 3, ValueError)
-      << "B must have at least 3 dimensions";
   CheckCudaTensor(arg_C, "C");
   CheckDtype(arg_C, "C", 4, 16, 1);
-  TVM_FFI_CHECK(arg_C.ndim() >= 3, ValueError)
-      << "C must have at least 3 dimensions";
   CheckCudaTensor(arg_D, "D");
   CheckDtype(arg_D, "D", 4, 16, 1);
   CheckCudaTensor(arg_dt_bias, "dt_bias");
@@ -360,21 +352,9 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
   uint64_t v_state_stride_slot = (uint64_t)arg_state_stride_slot;
   uint64_t v_intermediate_stride_slot = (uint64_t)arg_intermediate_stride_slot;
   int64_t v_pad_slot_id = (int64_t)arg_pad_slot_id;
-  int64_t v_B_stride_p0 = arg_B.stride(0);
-  int64_t v_B_stride_p1 = arg_B.stride(1);
-  int64_t v_B_stride_p2 = arg_B.stride(2);
-  int64_t v_C_stride_p0 = arg_C.stride(0);
-  int64_t v_C_stride_p1 = arg_C.stride(1);
-  int64_t v_C_stride_p2 = arg_C.stride(2);
-  int64_t v_x_stride_p0 = arg_x.stride(0);
-  int64_t v_x_stride_p1 = arg_x.stride(1);
-  int64_t v_x_stride_p2 = arg_x.stride(2);
-  int64_t v_dt_stride_p0 = arg_dt.stride(0);
-  int64_t v_dt_stride_p1 = arg_dt.stride(1);
-  int64_t v_dt_stride_p2 = arg_dt.stride(2);
-  void* kargs[] = {&p_state, &p_x, &p_dt, &p_A, &p_B, &p_C, &p_D, &p_dt_bias, &p_output, &p_state_batch_indices, &p_intermediate_state, &p_intermediate_state_indices, &v_nheads, &v_ngroups, &v_state_stride_slot, &v_intermediate_stride_slot, &v_pad_slot_id, &v_B_stride_p0, &v_B_stride_p1, &v_B_stride_p2, &v_C_stride_p0, &v_C_stride_p1, &v_C_stride_p2, &v_x_stride_p0, &v_x_stride_p1, &v_x_stride_p2, &v_dt_stride_p0, &v_dt_stride_p1, &v_dt_stride_p2};
+  void* kargs[] = {&p_state, &p_x, &p_dt, &p_A, &p_B, &p_C, &p_D, &p_dt_bias, &p_output, &p_state_batch_indices, &p_intermediate_state, &p_intermediate_state_indices, &v_nheads, &v_ngroups, &v_state_stride_slot, &v_intermediate_stride_slot, &v_pad_slot_id};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw_4123ffa2ea, "kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw_bce0e723e8, "kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 

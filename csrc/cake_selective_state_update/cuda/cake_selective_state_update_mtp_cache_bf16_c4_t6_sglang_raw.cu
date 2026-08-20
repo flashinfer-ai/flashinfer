@@ -132,7 +132,7 @@ __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 7) void
-kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, int* __restrict__ state_batch_indices, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ intermediate_state_indices, int nheads, int ngroups, unsigned long long state_stride_slot, unsigned long long intermediate_stride_slot, long long pad_slot_id, long long B_stride_p0, long long B_stride_p1, long long B_stride_p2, long long C_stride_p0, long long C_stride_p1, long long C_stride_p2, long long x_stride_p0, long long x_stride_p1, long long x_stride_p2, long long dt_stride_p0, long long dt_stride_p1, long long dt_stride_p2)
+kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, int* __restrict__ state_batch_indices, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ intermediate_state_indices, int nheads, int ngroups, unsigned long long state_stride_slot, unsigned long long intermediate_stride_slot, long long pad_slot_id)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -164,9 +164,10 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
     int head = blockIdx.y;
     int cta_z = blockIdx.z;
     int dim_base = cta_z * 16;
+    long long source_slot = (long long)state_batch_indices[batch];
+    int logical_nheads = nheads;
     int heads_per_group = nheads / ngroups;
     int group = head / heads_per_group;
-    long long source_slot = (long long)state_batch_indices[batch];
     long long b_batch_base = (long long)(batch * 6 * ngroups * 128);
     long long b_step_stride = (long long)(ngroups * 128);
     long long b_group_stride = 128;
@@ -179,19 +180,25 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
     long long dt_batch_base = (long long)(batch * 6 * nheads);
     long long dt_step_stride = nheads;
     long long dt_head_stride = 1;
+    unsigned long long source_state_stride = state_stride_slot;
+    unsigned long long intermediate_slot_stride = intermediate_stride_slot;
     {
-        b_batch_base = (long long)batch * B_stride_p0;
-        b_step_stride = B_stride_p1;
-        b_group_stride = B_stride_p2;
-        c_batch_base = (long long)batch * C_stride_p0;
-        c_step_stride = C_stride_p1;
-        c_group_stride = C_stride_p2;
-        x_batch_base = (long long)batch * x_stride_p0;
-        x_step_stride = x_stride_p1;
-        x_head_stride = x_stride_p2;
-        dt_batch_base = (long long)batch * dt_stride_p0;
-        dt_step_stride = dt_stride_p1;
-        dt_head_stride = dt_stride_p2;
+        logical_nheads = 64;
+        group = 0;
+        b_batch_base = (long long)batch * 26112;
+        b_step_stride = 4352;
+        b_group_stride = 128;
+        c_batch_base = b_batch_base;
+        c_step_stride = b_step_stride;
+        c_group_stride = b_group_stride;
+        x_batch_base = (long long)batch * 26112;
+        x_step_stride = 4352;
+        x_head_stride = 64;
+        dt_batch_base = (long long)batch * 51072;
+        dt_step_stride = 8512;
+        dt_head_stride = 1;
+        source_state_stride = 524288;
+        intermediate_slot_stride = 3145728;
     }
     #pragma unroll
     for (int pack_turn = 0; pack_turn < 3; pack_turn++) {
@@ -224,7 +231,7 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
         int col_2 = pack_in_row * 8;
         int state_row = (head * 64 + dim_base + row) * 128 + col_2;
         if (source_slot != pad_slot_id) {
-            unsigned long long state_index = (unsigned long long)source_slot * state_stride_slot + (unsigned long long)state_row;
+            unsigned long long state_index = (unsigned long long)source_slot * source_state_stride + (unsigned long long)state_row;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(s_state_addr + (unsigned int)((row * 128 + col_2) * 2)), "l"(state + state_index));
         } else {
@@ -266,8 +273,8 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
         unsigned long long intermediate_step_stride = 0;
         unsigned long long intermediate_row_base = 0;
         {
-            intermediate_step_stride = (unsigned long long)(nheads * 64 * 128);
-            intermediate_row_base = (unsigned long long)cache_slot * intermediate_stride_slot + (unsigned long long)((head * 64 + dim_index) * 128);
+            intermediate_step_stride = (unsigned long long)(logical_nheads * 64 * 128);
+            intermediate_row_base = (unsigned long long)cache_slot * intermediate_slot_stride + (unsigned long long)((head * 64 + dim_index) * 128);
         }
         unsigned int state_carrier[1];
         unsigned int b_carrier[4];
@@ -366,7 +373,7 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
             float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, partial, 1);
             partial += _shfl_xor_2;
             if (member == 0) {
-                int output_index = ((batch * 6 + step_3) * nheads + head) * 64 + dim_index;
+                int output_index = ((batch * 6 + step_3) * logical_nheads + head) * 64 + dim_index;
                 output[output_index] = partial + d_value * x_value;
             }
             {
@@ -403,7 +410,7 @@ kernel_cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw(__nv_bfloat16
                 int next_dim_base = dim_base + (dim_pass + 1) * 16;
                 int state_row_1 = (head * 64 + next_dim_base + row_1) * 128 + col_3;
                 if (source_slot != pad_slot_id) {
-                    unsigned long long state_index_1 = (unsigned long long)source_slot * state_stride_slot + (unsigned long long)state_row_1;
+                    unsigned long long state_index_1 = (unsigned long long)source_slot * source_state_stride + (unsigned long long)state_row_1;
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                         :: "r"(s_state_addr + (unsigned int)((row_1 * 128 + col_3) * 2)), "l"(state + state_index_1));
                 } else {

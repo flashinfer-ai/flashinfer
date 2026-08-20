@@ -2,6 +2,7 @@
 // tvm-ffi host launcher for Cake kernel 'kernel_cake_selective_state_update_mtp_short'.
 #include <cuda.h>
 #include <cuda_runtime.h>
+
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -26,11 +27,29 @@ inline void CheckCudaTensor(const TensorView& t, const char* name) {
       << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
 }
 
-inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
-                                const char* reference_name) {
+inline void CheckSameCudaDevice(
+    const TensorView& t,
+    const TensorView& reference,
+    const char* name,
+    const char* reference_name) {
   TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
       << name << " must be on the same CUDA device as " << reference_name
-      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
+      << ": got cuda:" << t.device().device_id
+      << " versus cuda:" << reference.device().device_id;
+}
+
+inline void CheckCurrentCudaDevice(
+    const TensorView& reference,
+    const char* reference_name) {
+  int current_device = -1;
+  cudaError_t error = cudaGetDevice(&current_device);
+  TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
+      << "cudaGetDevice failed while validating " << reference_name
+      << ": cudaError=" << static_cast<int>(error);
+  TVM_FFI_CHECK(current_device == reference.device().device_id, ValueError)
+      << "current CUDA device must match " << reference_name
+      << ": current=cuda:" << current_device
+      << ", tensor=cuda:" << reference.device().device_id;
 }
 
 inline void CheckContiguous(const TensorView& t, const char* name) {
@@ -59,25 +78,21 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     return;
   }
   int64_t step = t.stride(outer_last);
-  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
+  TVM_FFI_CHECK(step > 0, ValueError)
+      << name << " physical strides must be positive";
   int64_t expected = step;
   for (int axis = outer_last - 1; axis >= 0; --axis) {
     expected *= t.size(axis + 1);
     if (t.size(axis) > 1) {
       TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
           << name << " leading dims are not physically foldable above " << trailing
-          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected "
-          << expected;
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis)
+          << ", expected " << expected;
     }
   }
 }
 
-void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView arg_A,
-         TensorView arg_B, TensorView arg_C, TensorView arg_D, TensorView arg_dt_bias,
-         TensorView arg_output, TensorView arg_state_batch_indices, int64_t arg_batch_size,
-         int64_t arg_nheads, int64_t arg_dim, int64_t arg_dstate, int64_t arg_ngroups,
-         int64_t arg_token_steps, int64_t arg_state_stride_slot, int64_t arg_dt_softplus,
-         int64_t arg_pad_slot_id, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_D, TensorView arg_dt_bias, TensorView arg_output, TensorView arg_state_batch_indices, int64_t arg_batch_size, int64_t arg_nheads, int64_t arg_dim, int64_t arg_dstate, int64_t arg_ngroups, int64_t arg_token_steps, int64_t arg_state_stride_slot, int64_t arg_dt_softplus, int64_t arg_pad_slot_id, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_state, "state");
   CheckDtype(arg_state, "state", 4, 16, 1);
   CheckContiguous(arg_state, "state");
@@ -115,7 +130,8 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
       << "scalar 'nheads' value " << arg_nheads
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_dim >= -2147483648LL && arg_dim <= 2147483647LL, ValueError)
-      << "scalar 'dim' value " << arg_dim << " is outside i32 range [-2147483648, 2147483647]";
+      << "scalar 'dim' value " << arg_dim
+      << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_dstate >= -2147483648LL && arg_dstate <= 2147483647LL, ValueError)
       << "scalar 'dstate' value " << arg_dstate
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -125,18 +141,12 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
   TVM_FFI_CHECK(arg_token_steps >= -2147483648LL && arg_token_steps <= 2147483647LL, ValueError)
       << "scalar 'token_steps' value " << arg_token_steps
       << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_state_stride_slot >= 0LL && arg_state_stride_slot <= 9223372036854775807LL,
-                ValueError)
+  TVM_FFI_CHECK(arg_state_stride_slot >= 0LL && arg_state_stride_slot <= 9223372036854775807LL, ValueError)
       << "scalar 'state_stride_slot' value " << arg_state_stride_slot
       << " is outside u64 range [0, 9223372036854775807]";
   TVM_FFI_CHECK(arg_dt_softplus >= -2147483648LL && arg_dt_softplus <= 2147483647LL, ValueError)
       << "scalar 'dt_softplus' value " << arg_dt_softplus
       << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(
-      arg_pad_slot_id >= -9223372036854775808LL && arg_pad_slot_id <= 9223372036854775807LL,
-      ValueError)
-      << "scalar 'pad_slot_id' value " << arg_pad_slot_id
-      << " is outside i64 range [-9223372036854775808, 9223372036854775807]";
   CheckSameCudaDevice(arg_x, arg_state, "x", "state");
   CheckSameCudaDevice(arg_dt, arg_state, "dt", "state");
   CheckSameCudaDevice(arg_A, arg_state, "A", "state");
@@ -146,9 +156,106 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
   CheckSameCudaDevice(arg_dt_bias, arg_state, "dt_bias", "state");
   CheckSameCudaDevice(arg_output, arg_state, "output", "state");
   CheckSameCudaDevice(arg_state_batch_indices, arg_state, "state_batch_indices", "state");
+  CheckCurrentCudaDevice(arg_state, "state");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y << ", "
-      << grid_z << ")";
+      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+  TVM_FFI_CHECK(arg_state.ndim() == 4, ValueError)
+      << "state must have rank 4, got " << arg_state.ndim();
+  TVM_FFI_CHECK(arg_state.size(1) == arg_nheads, ValueError)
+      << "state dimension 1 must equal " << (arg_nheads)      << ", got " << arg_state.size(1);
+  TVM_FFI_CHECK(arg_state.size(2) == 128, ValueError)
+      << "state dimension 2 must equal " << (128)      << ", got " << arg_state.size(2);
+  TVM_FFI_CHECK(arg_state.size(3) == 128, ValueError)
+      << "state dimension 3 must equal " << (128)      << ", got " << arg_state.size(3);
+  TVM_FFI_CHECK(arg_x.ndim() == 4, ValueError)
+      << "x must have rank 4, got " << arg_x.ndim();
+  TVM_FFI_CHECK(arg_x.size(0) == arg_batch_size, ValueError)
+      << "x dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_x.size(0);
+  TVM_FFI_CHECK(arg_x.size(1) == arg_token_steps, ValueError)
+      << "x dimension 1 must equal " << (arg_token_steps)      << ", got " << arg_x.size(1);
+  TVM_FFI_CHECK(arg_x.size(2) == arg_nheads, ValueError)
+      << "x dimension 2 must equal " << (arg_nheads)      << ", got " << arg_x.size(2);
+  TVM_FFI_CHECK(arg_x.size(3) == 128, ValueError)
+      << "x dimension 3 must equal " << (128)      << ", got " << arg_x.size(3);
+  TVM_FFI_CHECK(arg_dt.ndim() == 3, ValueError)
+      << "dt must have rank 3, got " << arg_dt.ndim();
+  TVM_FFI_CHECK(arg_dt.size(0) == arg_batch_size, ValueError)
+      << "dt dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_dt.size(0);
+  TVM_FFI_CHECK(arg_dt.size(1) == arg_token_steps, ValueError)
+      << "dt dimension 1 must equal " << (arg_token_steps)      << ", got " << arg_dt.size(1);
+  TVM_FFI_CHECK(arg_dt.size(2) == arg_nheads, ValueError)
+      << "dt dimension 2 must equal " << (arg_nheads)      << ", got " << arg_dt.size(2);
+  TVM_FFI_CHECK(arg_A.ndim() == 1, ValueError)
+      << "A must have rank 1, got " << arg_A.ndim();
+  TVM_FFI_CHECK(arg_A.size(0) == arg_nheads, ValueError)
+      << "A dimension 0 must equal " << (arg_nheads)      << ", got " << arg_A.size(0);
+  TVM_FFI_CHECK(arg_B.ndim() == 4, ValueError)
+      << "B must have rank 4, got " << arg_B.ndim();
+  TVM_FFI_CHECK(arg_B.size(0) == arg_batch_size, ValueError)
+      << "B dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_B.size(0);
+  TVM_FFI_CHECK(arg_B.size(1) == arg_token_steps, ValueError)
+      << "B dimension 1 must equal " << (arg_token_steps)      << ", got " << arg_B.size(1);
+  TVM_FFI_CHECK(arg_B.size(2) == arg_ngroups, ValueError)
+      << "B dimension 2 must equal " << (arg_ngroups)      << ", got " << arg_B.size(2);
+  TVM_FFI_CHECK(arg_B.size(3) == 128, ValueError)
+      << "B dimension 3 must equal " << (128)      << ", got " << arg_B.size(3);
+  TVM_FFI_CHECK(arg_C.ndim() == 4, ValueError)
+      << "C must have rank 4, got " << arg_C.ndim();
+  TVM_FFI_CHECK(arg_C.size(0) == arg_batch_size, ValueError)
+      << "C dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_C.size(0);
+  TVM_FFI_CHECK(arg_C.size(1) == arg_token_steps, ValueError)
+      << "C dimension 1 must equal " << (arg_token_steps)      << ", got " << arg_C.size(1);
+  TVM_FFI_CHECK(arg_C.size(2) == arg_ngroups, ValueError)
+      << "C dimension 2 must equal " << (arg_ngroups)      << ", got " << arg_C.size(2);
+  TVM_FFI_CHECK(arg_C.size(3) == 128, ValueError)
+      << "C dimension 3 must equal " << (128)      << ", got " << arg_C.size(3);
+  TVM_FFI_CHECK(arg_D.ndim() == 1, ValueError)
+      << "D must have rank 1, got " << arg_D.ndim();
+  TVM_FFI_CHECK(arg_D.size(0) == arg_nheads, ValueError)
+      << "D dimension 0 must equal " << (arg_nheads)      << ", got " << arg_D.size(0);
+  TVM_FFI_CHECK(arg_dt_bias.ndim() == 1, ValueError)
+      << "dt_bias must have rank 1, got " << arg_dt_bias.ndim();
+  TVM_FFI_CHECK(arg_dt_bias.size(0) == arg_nheads, ValueError)
+      << "dt_bias dimension 0 must equal " << (arg_nheads)      << ", got " << arg_dt_bias.size(0);
+  TVM_FFI_CHECK(arg_output.ndim() == 4, ValueError)
+      << "output must have rank 4, got " << arg_output.ndim();
+  TVM_FFI_CHECK(arg_output.size(0) == arg_batch_size, ValueError)
+      << "output dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_output.size(0);
+  TVM_FFI_CHECK(arg_output.size(1) == arg_token_steps, ValueError)
+      << "output dimension 1 must equal " << (arg_token_steps)      << ", got " << arg_output.size(1);
+  TVM_FFI_CHECK(arg_output.size(2) == arg_nheads, ValueError)
+      << "output dimension 2 must equal " << (arg_nheads)      << ", got " << arg_output.size(2);
+  TVM_FFI_CHECK(arg_output.size(3) == 128, ValueError)
+      << "output dimension 3 must equal " << (128)      << ", got " << arg_output.size(3);
+  TVM_FFI_CHECK(arg_state_batch_indices.ndim() == 1, ValueError)
+      << "state_batch_indices must have rank 1, got " << arg_state_batch_indices.ndim();
+  TVM_FFI_CHECK(arg_state_batch_indices.size(0) == arg_batch_size, ValueError)
+      << "state_batch_indices dimension 0 must equal " << (arg_batch_size)      << ", got " << arg_state_batch_indices.size(0);
+  TVM_FFI_CHECK(arg_batch_size >= 1, ValueError)
+      << "batch_size must be >= 1, got " << arg_batch_size;
+  TVM_FFI_CHECK(arg_nheads >= 1, ValueError)
+      << "nheads must be >= 1, got " << arg_nheads;
+  TVM_FFI_CHECK(arg_ngroups > 0 && arg_nheads % arg_ngroups == 0, ValueError)
+      << "nheads must be divisible by ngroups";
+  TVM_FFI_CHECK(arg_dim == 128, ValueError)
+      << "dim must equal " << (128)      << ", got " << arg_dim;
+  TVM_FFI_CHECK(arg_dstate == 128, ValueError)
+      << "dstate must equal " << (128)      << ", got " << arg_dstate;
+  TVM_FFI_CHECK(arg_ngroups >= 1, ValueError)
+      << "ngroups must be >= 1, got " << arg_ngroups;
+  TVM_FFI_CHECK(arg_token_steps >= 1, ValueError)
+      << "token_steps must be >= 1, got " << arg_token_steps;
+  TVM_FFI_CHECK(arg_token_steps <= 2, ValueError)
+      << "token_steps must be <= 2, got " << arg_token_steps;
+  TVM_FFI_CHECK(arg_state_stride_slot >= 1, ValueError)
+      << "state_stride_slot must be >= 1, got " << arg_state_stride_slot;
+  TVM_FFI_CHECK(grid_x == arg_batch_size * arg_nheads, ValueError)
+      << "grid_x must equal " << (arg_batch_size * arg_nheads)      << ", got " << grid_x;
+  TVM_FFI_CHECK(grid_y == 1, ValueError)
+      << "grid_y must equal " << (1)      << ", got " << grid_y;
+  TVM_FFI_CHECK(grid_z == 1, ValueError)
+      << "grid_z must equal " << (1)      << ", got " << grid_z;
 
   DLDevice dev = arg_state.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
@@ -171,29 +278,9 @@ void Run(TensorView arg_state, TensorView arg_x, TensorView arg_dt, TensorView a
   uint64_t v_state_stride_slot = (uint64_t)arg_state_stride_slot;
   int32_t v_dt_softplus = (int32_t)arg_dt_softplus;
   int64_t v_pad_slot_id = (int64_t)arg_pad_slot_id;
-  void* kargs[] = {&p_state,
-                   &p_x,
-                   &p_dt,
-                   &p_A,
-                   &p_B,
-                   &p_C,
-                   &p_D,
-                   &p_dt_bias,
-                   &p_output,
-                   &p_state_batch_indices,
-                   &v_batch_size,
-                   &v_nheads,
-                   &v_dim,
-                   &v_dstate,
-                   &v_ngroups,
-                   &v_token_steps,
-                   &v_state_stride_slot,
-                   &v_dt_softplus,
-                   &v_pad_slot_id};
+  void* kargs[] = {&p_state, &p_x, &p_dt, &p_A, &p_B, &p_C, &p_D, &p_dt_bias, &p_output, &p_state_batch_indices, &v_batch_size, &v_nheads, &v_dim, &v_dstate, &v_ngroups, &v_token_steps, &v_state_stride_slot, &v_dt_softplus, &v_pad_slot_id};
 
-  static auto kernel =
-      TVM_FFI_EMBED_CUBIN_GET_KERNEL(cake_selective_state_update_mtp_short_4262bee913,
-                                     "kernel_cake_selective_state_update_mtp_short");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(cake_selective_state_update_mtp_short_4262bee913, "kernel_cake_selective_state_update_mtp_short");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 
