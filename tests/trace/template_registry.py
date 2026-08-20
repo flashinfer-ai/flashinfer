@@ -61,6 +61,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.prepare",
     "flashinfer.gdn_decode",
     "flashinfer.gdn_prefill",
+    "flashinfer.gated_act_mxfp8",
     "flashinfer.gemm.gemm_base",
     "flashinfer.gemm.gemm_bf16_fp4",
     "flashinfer.gemm.gemm_svdquant",

@@ -29,6 +29,12 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
+)
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
+)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
