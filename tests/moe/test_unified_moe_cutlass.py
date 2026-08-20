@@ -581,7 +581,7 @@ def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
     runner = CutlassFp8BlockRunner.__new__(CutlassFp8BlockRunner)
     runner.config = _config(quant=QuantConfig(variant=QuantVariant.DeepSeekFp8))
     runner._device_arch = 90
-    with pytest.raises(NotImplementedError, match="CUDA 12.6 or lower"):
+    with pytest.raises(NotImplementedError, match="requires CUDA 12.8 or newer"):
         runner.check_support()
 
 

@@ -434,7 +434,7 @@ class _CutlassRunnerBase(MoERunner):
 
             if not is_cuda_version_at_least("12.8"):
                 raise NotImplementedError(
-                    "FP8 block scaling not implemented for CUDA 12.6 or lower."
+                    "FP8 block scaling requires CUDA 12.8 or newer."
                 )
 
     def __init__(self, config: MoEConfig, device: torch.device):
