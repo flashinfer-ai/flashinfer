@@ -112,7 +112,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from flashinfer.fused_moe.da_config import TrtllmDaConfig
+    from flashinfer.fused_moe.da_config import DaMoeConfig
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -1691,16 +1691,11 @@ def cutlass_fused_moe_workspace_size(
 # trtllmgen-moe-fp8
 
 
-def _enabled_trtllm_da_config() -> Optional["TrtllmDaConfig"]:
+def _enabled_da_moe_config() -> Optional["DaMoeConfig"]:
     """Resolve the complete DA configuration only when its master switch is enabled."""
-    from flashinfer.fused_moe.da_config import (
-        TrtllmDaConfig,
-        is_trtllm_da_enabled,
-    )
+    from flashinfer.fused_moe.da_config import get_enabled_da_moe_config
 
-    if not is_trtllm_da_enabled():
-        return None
-    return TrtllmDaConfig.from_environment()
+    return get_enabled_da_moe_config()
 
 
 def get_trtllm_moe_sm100_module():
@@ -2160,10 +2155,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_bf16_moe",
             tuner=tuner,
             config=da_config,
@@ -2411,10 +2407,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_per_tensor_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -2666,10 +2663,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
             tuner=tuner,
             config=da_config,
@@ -3236,10 +3234,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -3626,7 +3625,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
 
@@ -3635,6 +3634,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_weight_index = MoeRunnerInputs.idx("expert_weights")
         runtime = TrtllmDaRuntime(moe_runner)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp4_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -3975,10 +3975,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_mxint4_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -4238,7 +4239,7 @@ def canonicalize_trtllm_moe_routing_(
     canonical: TRTLLMCanonicalRouting,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
+    dtype_act: int,
     *,
     top_k: int,
     n_group: Optional[int],
@@ -4260,7 +4261,7 @@ def canonicalize_trtllm_moe_routing_(
     runtime.canonicalize_routing(
         routing_logits,
         routing_bias,
-        hidden_states,
+        dtype_act,
         canonical.tensors(),
         top_k,
         n_group,
@@ -4289,9 +4290,28 @@ class TrtllmDaRuntime:
         self._body_runner = runtime.DABodyRunner(moe_runner)
 
     @property
+    def backend(self) -> str:
+        """Return the explicit ordinary backend identity used by shared DA state."""
+        return "trtllm"
+
+    @property
     def moe_runner(self) -> "TrtllmMoERunner":
         """Return the composed ordinary full-operation runner."""
         return self._moe_runner
+
+    def normalize_baseline_tactic(
+        self,
+        factorized_space: Any,
+        baseline_tactic: Any,
+    ) -> tuple[int, int]:
+        """Return one concrete TRTLLM baseline in the shared DA body identity."""
+        del factorized_space
+        identity = tuple(int(value) for value in baseline_tactic)
+        if len(identity) != 2 or identity[1] < 0:
+            raise RuntimeError(
+                "DA tuning requires one concrete ordinary baseline tactic"
+            )
+        return identity
 
     def max_multi_tile_tokens(self, num_experts: int) -> int:
         """Return the native fused-preamble token bound for one expert domain."""
@@ -4373,7 +4393,7 @@ class TrtllmDaRuntime:
             canonical,
             moe_inputs.routing_logits,
             runner_kwargs.get("routing_bias"),
-            moe_inputs.hidden_states,
+            int(self._moe_runner.dtype_act),
             top_k=self._moe_runner.top_k,
             n_group=runner_kwargs.get("n_group"),
             topk_group=runner_kwargs.get("topk_group"),

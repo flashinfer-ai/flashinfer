@@ -65,7 +65,12 @@ from .api import (  # noqa: F401
     TrtllmMxInt4Config,
 )
 from .layer import MoELayer  # noqa: F401
+from .da_config import DaMoeConfig, TrtllmDaConfig  # noqa: F401
 from .da_runtime import (  # noqa: F401
+    DaMoeBackend,
+    da_moe_acquire_graph_leases,
+    da_moe_diagnostics,
+    da_moe_release_resources,
     trtllm_moe_acquire_da_graph_leases,
     trtllm_moe_da_diagnostics,
     trtllm_moe_release_da_resources,
@@ -124,6 +129,7 @@ from .core import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+    populate_trtllm_moe_routing_metadata_,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
@@ -239,6 +245,8 @@ __all__ = [
     # Unified configs, packs, and runners
     "B12xNvfp4Config",
     "B12xNvfp4Runner",
+    "DaMoeBackend",
+    "DaMoeConfig",
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
@@ -275,8 +283,12 @@ __all__ = [
     "RoutingInputMode",
     "TrtllmMoERoutingMetadata",
     "TrtllmMoERoutingMetadataSlot",
+    "populate_trtllm_moe_routing_metadata_",
     "trtllm_moe_allocate_routing_metadata",
     "trtllm_moe_allocate_routing_metadata_multi_tile",
+    "da_moe_acquire_graph_leases",
+    "da_moe_diagnostics",
+    "da_moe_release_resources",
     "trtllm_moe_acquire_da_graph_leases",
     "trtllm_moe_da_diagnostics",
     "trtllm_moe_release_da_resources",
@@ -285,6 +297,7 @@ __all__ = [
     "MoELayer",
     "MoEWeightPack",
     "TrtllmBf16RoutedRunner",
+    "TrtllmDaConfig",
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",

@@ -1,4 +1,4 @@
-"""Environment and explicit configuration for TRTLLM distribution-aware MoE."""
+"""Environment and explicit configuration for distribution-aware MoE."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ from flashinfer.fused_moe.da_tuner import (
 _FALSE_VALUES = {"", "0", "false", "no", "off", "none"}
 
 
-def is_trtllm_da_enabled() -> bool:
-    """Return the DA master switch without parsing the remaining configuration."""
-    return _environment_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", False)
+def is_da_moe_enabled(*, default: bool = False) -> bool:
+    """Return the DA switch, honoring a backend-specific default when unset."""
+    return _environment_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", default)
 
 
 def _environment_bool(name: str, default: bool) -> bool:
@@ -46,8 +46,8 @@ def _environment_nonnegative_float(name: str, default: float) -> float:
 
 
 @dataclass(frozen=True)
-class TrtllmDaConfig:
-    """Resolved product configuration used for tuning, cache identity, and replay."""
+class DaMoeConfig:
+    """Resolved backend-neutral configuration for DA tuning and replay."""
 
     # Whether the existing public MoE calls may publish DA capture plans.
     enabled: bool
@@ -65,7 +65,7 @@ class TrtllmDaConfig:
     control_overhead_us: float
 
     @classmethod
-    def from_environment(cls) -> TrtllmDaConfig:
+    def from_environment(cls, *, default_enabled: bool = False) -> DaMoeConfig:
         """Resolve the preserved environment contract and validate it atomically."""
         # Parse the ordered realization catalog first because its total cardinality is a hard
         # selector-storage constraint, not a tuning-time fallback condition.
@@ -88,7 +88,7 @@ class TrtllmDaConfig:
         # Construct only after every dependent value is validated so callers never observe a
         # partially resolved environment configuration.
         return cls(
-            enabled=is_trtllm_da_enabled(),
+            enabled=is_da_moe_enabled(default=default_enabled),
             distributions=distributions,
             samples_per_distribution=samples,
             factorized_search=_environment_bool(
@@ -113,3 +113,19 @@ class TrtllmDaConfig:
             "baseline_guard_margin": self.baseline_guard_margin,
             "control_overhead_us": self.control_overhead_us,
         }
+
+
+# Compatibility alias for existing TRTLLM DA callers.
+TrtllmDaConfig = DaMoeConfig
+
+
+def is_trtllm_da_enabled() -> bool:
+    """Return the backend-neutral DA switch through the historical TRTLLM name."""
+    return is_da_moe_enabled()
+
+
+def get_enabled_da_moe_config(*, default_enabled: bool = False) -> DaMoeConfig | None:
+    """Resolve DA configuration using the calling backend's default policy."""
+    if not is_da_moe_enabled(default=default_enabled):
+        return None
+    return DaMoeConfig.from_environment(default_enabled=default_enabled)

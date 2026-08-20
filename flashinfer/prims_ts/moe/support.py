@@ -656,16 +656,23 @@ def is_prims_ts_fp8_per_tensor_supported(
             return False, "routing scales on input are only supported for Llama4"
         routing_logits = getattr(moe_inputs, "routing_logits", None)
         if routing_logits is None:
-            return False, "routing logits are required for routing scales on input"
-        try:
-            per_token_sf_dtype = _merge_per_token_sf_dtype(
-                per_token_sf_dtype,
-                _per_token_sf_dtype_value(routing_logits),
-                current_name="fc1_per_channel_weight_scale",
-                candidate_name="routing_logits",
-            )
-        except ValueError as exc:
-            return False, str(exc)
+            # DA canonical bodies replace live logits with graph-stable routed weights while
+            # retaining the original logits dtype in the immutable runner identity.
+            expert_weights = getattr(moe_inputs, "expert_weights", None)
+            static_extras = dict(getattr(runner, "_cache_key_static_extras", ()))
+            if expert_weights is None or expert_weights.numel() == 0:
+                return False, "routing logits are required for routing scales on input"
+            per_token_sf_dtype = int(static_extras.get("per_token_sf_dtype", 1))
+        else:
+            try:
+                per_token_sf_dtype = _merge_per_token_sf_dtype(
+                    per_token_sf_dtype,
+                    _per_token_sf_dtype_value(routing_logits),
+                    current_name="fc1_per_channel_weight_scale",
+                    candidate_name="routing_logits",
+                )
+            except ValueError as exc:
+                return False, str(exc)
     elif kwargs.get("gemm1_bias") is not None:
         return False, "gemm1_bias is not supported"
     if kwargs.get("num_fused_shared_experts", 0):

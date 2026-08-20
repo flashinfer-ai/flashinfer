@@ -1,4 +1,4 @@
-"""Automatic tuning, preparation, and capture dispatch for TRTLLM DA MoE."""
+"""Backend-neutral automatic tuning, preparation, and capture dispatch for DA MoE."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, TypeVar
 
 import torch
 
 from flashinfer.autotuner import AutoTuner, TuningConfig, TunableRunner
-from flashinfer.fused_moe.da_config import TrtllmDaConfig
+from flashinfer.fused_moe.da_config import DaMoeConfig
 from flashinfer.fused_moe.da_moe import (
     DABody,
     DAMoEDispatcher,
@@ -38,9 +39,28 @@ from flashinfer.tllm_enums import RoutingInputMode
 
 _ResultT = TypeVar("_ResultT")
 
+# Generic AutoTuner namespace for backend-explicit DA plan records.
+DA_MOE_CACHE_NAMESPACE = "moe_da"
+
+
+class DaMoeBackend(str, Enum):
+    """Ordinary MoE backend participating in the shared DA control plane."""
+
+    # TensorRT-LLM Gen fused-MoE bodies.
+    TRTLLM = "trtllm"
+    # CUTLASS Primitives and Task Scheduling MoE bodies.
+    PRIMS_TS = "prims_ts"
+
+    @classmethod
+    def parse(cls, value: DaMoeBackend | str) -> DaMoeBackend:
+        """Normalize one public backend spelling into a stable cache identity."""
+        if isinstance(value, cls):
+            return value
+        return cls(str(value))
+
 
 @dataclass(frozen=True)
-class TrtllmDaRoutingAdapter:
+class DaMoeRoutingAdapter:
     """Stage and restore one public precomputed-routing representation."""
 
     # Fused-MoE flat input containing raw or packed expert IDs.
@@ -115,9 +135,11 @@ class TrtllmDaRoutingAdapter:
 
 
 @dataclass(frozen=True)
-class TrtllmDaOperationKey:
+class DaMoeOperationKey:
     """Process-local identity of one shape/static-configuration DA domain."""
 
+    # Ordinary body backend; serialized explicitly to prevent cross-backend reuse.
+    backend: DaMoeBackend
     # Public custom-operation name sharing the ordinary AutoTuner namespace.
     custom_op: str
     # CUDA device owning profiling, preparation, and captured resources.
@@ -156,6 +178,7 @@ class TrtllmDaOperationKey:
         # Compact sorted JSON makes logically identical operation domains byte-for-byte equal.
         return json.dumps(
             {
+                "backend": self.backend.value,
                 "custom_op": self.custom_op,
                 "input_identity": self.input_identity,
                 "runner_identity": self.runner_identity,
@@ -176,11 +199,12 @@ class TrtllmDaOperationKey:
         )
 
 
-def make_trtllm_da_operation_key(
+def make_da_moe_operation_key(
+    backend: DaMoeBackend | str,
     custom_op: str,
     runner: TunableRunner,
     inputs: Sequence[Any],
-    config: TrtllmDaConfig,
+    config: DaMoeConfig,
     *,
     num_experts: int,
     local_expert_offset: int,
@@ -191,7 +215,7 @@ def make_trtllm_da_operation_key(
     routing_id_index: int,
     routing_weight_index: int,
     routed_scaling_factor: float | None,
-) -> TrtllmDaOperationKey:
+) -> DaMoeOperationKey:
     """Build one automatic DA registry identity from public operation inputs."""
     # Derive the device and concrete token bucket from the first tensor in the exact runner ABI.
     tensor = next(value for value in inputs if isinstance(value, torch.Tensor))
@@ -205,7 +229,8 @@ def make_trtllm_da_operation_key(
         else ((0,), type(value).__name__)
         for value in inputs
     )
-    return TrtllmDaOperationKey(
+    return DaMoeOperationKey(
+        backend=DaMoeBackend.parse(backend),
         custom_op=custom_op,
         device_index=device_index,
         input_identity=input_identity,
@@ -246,7 +271,11 @@ def _stable_runner_identity(runner: TunableRunner) -> str:
 
     # Runtime caches contain process-local details and must not affect persistent tactic identity.
     fields = {
-        name: normalize(value)
+        name: (
+            f"{type(value).__module__}.{type(value).__qualname__}"
+            if name == "moe_op"
+            else normalize(value)
+        )
         for name, value in runner.__dict__.items()
         if not name.endswith("_cache")
     }
@@ -257,7 +286,7 @@ def _stable_runner_identity(runner: TunableRunner) -> str:
     )
 
 
-def collect_trtllm_da_bindings(
+def collect_da_moe_bindings(
     inputs: Sequence[Any], runner_kwargs: Mapping[str, Any]
 ) -> tuple[torch.Tensor, ...]:
     """Collect every stable tensor address captured by inputs or exact-ABI kwargs."""
@@ -272,9 +301,10 @@ def collect_trtllm_da_bindings(
 
 def run_dist_aware_tactic(
     *,
+    backend: DaMoeBackend | str,
     custom_op: str,
     tuner: AutoTuner,
-    config: TrtllmDaConfig,
+    config: DaMoeConfig,
     runner: TunableRunner,
     runtime: Any,
     tuning_config: TuningConfig,
@@ -295,15 +325,25 @@ def run_dist_aware_tactic(
     finish_switch: Callable[[], _ResultT],
 ) -> _ResultT:
     """Run the shared automatic DA lifecycle around one exact ordinary ABI."""
+    # The public operation and its typed runtime must identify the same ordinary backend. Catch a
+    # crossed adapter before it can publish cache state or graph resources under the wrong domain.
+    backend_identity = DaMoeBackend.parse(backend)
+    runtime_backend = DaMoeBackend.parse(runtime.backend)
+    if runtime_backend is not backend_identity:
+        raise ValueError(
+            "DA runtime backend does not match its operation domain: "
+            f"{runtime_backend.value} != {backend_identity.value}"
+        )
     # The adapter declares the only content-mutable inputs used by value-aware profiling and
     # later device-side distribution selection.
-    routing_adapter = TrtllmDaRoutingAdapter(
+    routing_adapter = DaMoeRoutingAdapter(
         routing_id_index=routing_id_index,
         routing_weight_index=routing_weight_index,
         routing_input_mode=routing_input_mode,
     )
     # Scaling changes routed values, output semantics, and tactic timing, so it partitions DA state.
-    key = make_trtllm_da_operation_key(
+    key = make_da_moe_operation_key(
+        backend_identity,
         custom_op,
         runner,
         inputs,
@@ -334,11 +374,11 @@ def run_dist_aware_tactic(
         for index, value in enumerate(inputs)
         if index not in inactive_binding_indices
     ]
-    bindings = collect_trtllm_da_bindings(binding_inputs, runner_kwargs)
+    bindings = collect_da_moe_bindings(binding_inputs, runner_kwargs)
     # Generic AutoTuner context owns profiling. Ordinary calls restore published state and never
     # tune implicitly.
     if tuner.is_tuning_mode:
-        state = TRTLLM_DA_REGISTRY.get_or_create(key)
+        state = DA_MOE_REGISTRY.get_or_create(key)
         state.tune_and_prepare(
             tuner=tuner,
             config=config,
@@ -351,9 +391,9 @@ def run_dist_aware_tactic(
             runner_kwargs=runner_kwargs,
             bindings=bindings,
         )
-        TRTLLM_DA_REGISTRY.publish_cache(tuner)
+        DA_MOE_REGISTRY.publish_cache(tuner)
     else:
-        state = TRTLLM_DA_REGISTRY.find_or_restore(key, tuner)
+        state = DA_MOE_REGISTRY.find_or_restore(key, tuner)
     # Warmup prepares graph-stable resources outside capture; a missing or rejected plan keeps the
     # exact ordinary baseline path.
     if state is None:
@@ -412,10 +452,10 @@ def run_dist_aware_tactic(
     )
 
 
-class TrtllmDaOperationState:
+class DaMoeOperationState:
     """Own one automatic DA domain from tuning through graph lease creation."""
 
-    def __init__(self, key: TrtllmDaOperationKey) -> None:
+    def __init__(self, key: DaMoeOperationKey) -> None:
         """Create pristine fallback state for one immutable operation domain."""
         # Immutable process-local registry identity.
         self.key = key
@@ -460,12 +500,12 @@ class TrtllmDaOperationState:
         self,
         *,
         tuner: AutoTuner,
-        config: TrtllmDaConfig,
+        config: DaMoeConfig,
         runner: TunableRunner,
         runtime: Any,
         tuning_config: TuningConfig,
         inputs: list[Any],
-        routing_adapter: TrtllmDaRoutingAdapter,
+        routing_adapter: DaMoeRoutingAdapter,
         baseline_tactic: Any,
         runner_kwargs: Mapping[str, Any],
         bindings: Sequence[torch.Tensor],
@@ -496,21 +536,35 @@ class TrtllmDaOperationState:
         self,
         *,
         tuner: AutoTuner,
-        config: TrtllmDaConfig,
+        config: DaMoeConfig,
         runner: TunableRunner,
         tuning_config: TuningConfig,
         inputs: list[Any],
-        routing_adapter: TrtllmDaRoutingAdapter,
+        routing_adapter: DaMoeRoutingAdapter,
         baseline_tactic: Any,
         runner_kwargs: Mapping[str, Any],
         runtime: Any,
     ) -> None:
         """Measure factorized candidates and compile the confirmed baseline guard."""
-        normalized_baseline = tuple(int(value) for value in baseline_tactic)
-        if len(normalized_baseline) != 2 or normalized_baseline[1] < 0:
-            raise RuntimeError(
-                "DA tuning requires one concrete ordinary baseline tactic"
+        # A heuristic ordinary fallback is executable but cannot be compared or captured as a
+        # concrete DA body. Preserve ordinary execution and publish an explicit DA fallback.
+        if baseline_tactic == -1:
+            self.dispatcher.clear_plan()
+            self._published_policy = DAPlanMode.DA_FALLBACK.value
+            self._eager_body = None
+            self._eager_distribution = None
+            self._policy_fallback_reason = (
+                "ordinary backend did not provide a concrete baseline tactic"
             )
+            return
+
+        # Resolve the backend's public ordinary tactic once into the common graph-body identity.
+        # PrimsTS may publish a scalar config index while TRTLLM already publishes the pair.
+        factorized_space = runner.get_factorized_tactic_space(inputs)  # type: ignore[attr-defined]
+        normalized_baseline = runtime.normalize_baseline_tactic(
+            factorized_space,
+            baseline_tactic,
+        )
 
         # FromLogits bodies require the fused multi-tile preamble during candidate profiling.
         # Reject unsupported large-token shapes before staging any routing values or allocating
@@ -534,7 +588,6 @@ class TrtllmDaOperationState:
         # Snapshot caller routing before staging synthetic realizations; the finally block below
         # restores it even when profiling or plan compilation fails.
         original_routing = routing_adapter.snapshot(inputs)
-        factorized_space = runner.get_factorized_tactic_space(inputs)  # type: ignore[attr-defined]
 
         # Logits routing is canonicalized outside body timing so every tactic profiles the same
         # precomputed mutable expert-ID/weight pair.
@@ -803,12 +856,14 @@ class TrtllmDaOperationState:
             # binding: the next ordinary warmup call retries after graph teardown releases pins.
             self._transient_preparation_failure = str(error)
             logger.warning(
-                f"TRTLLM DA resources are leased; capture will temporarily use NoDA: {error}"
+                f"{self.key.backend.value} DA resources are leased; "
+                f"capture will temporarily use NoDA: {error}"
             )
         except Exception as error:  # noqa: BLE001
             self._preparation_failures[failure_key] = str(error)
             logger.warning(
-                f"TRTLLM DA preparation failed; capture will use NoDA: {error}"
+                f"{self.key.backend.value} DA preparation failed; "
+                f"capture will use NoDA: {error}"
             )
 
     def dispatch(
@@ -868,6 +923,7 @@ class TrtllmDaOperationState:
         if plan is None:
             return {
                 "schema": 1,
+                "backend": self.key.backend.value,
                 "policy": DAPlanMode.DA_FALLBACK.value,
                 "fallback_reason": self._policy_fallback_reason,
                 **eager_record,
@@ -876,6 +932,7 @@ class TrtllmDaOperationState:
         # padding is reconstructed during restore.
         return {
             "schema": 1,
+            "backend": self.key.backend.value,
             "policy": self._published_policy,
             **eager_record,
             "num_selector_exemplars": plan.num_selector_exemplars,
@@ -901,6 +958,10 @@ class TrtllmDaOperationState:
                 return
             if record.get("schema") != 1:
                 raise ValueError("Unsupported current DA tuning-cache schema")
+            if record.get("backend") != self.key.backend.value:
+                raise ValueError(
+                    "Cached DA backend does not match its operation domain"
+                )
             policy = record.get("policy")
             self._restore_eager_body(record)
             if policy == DAPlanMode.DA_FALLBACK.value:
@@ -975,6 +1036,16 @@ class TrtllmDaOperationState:
             self._eager_distribution = None
             self._eager_body = None
             return
+        if distribution is None and isinstance(raw_body, Mapping):
+            if record.get("policy") != DAPlanMode.DA_FALLBACK.value:
+                raise ValueError("Cached DA eager-dispatch selection is inconsistent")
+            # A deliberate DA fallback may preserve its concrete ordinary baseline for eager
+            # dispatch without attributing that shape-only tactic to a synthetic distribution.
+            self._eager_distribution = None
+            self._eager_body = DABody(
+                tile_n=int(raw_body["tile_n"]), tactic=int(raw_body["tactic"])
+            )
+            return
         if distribution not in ("ddist:1.1", "uniform") or not isinstance(
             raw_body, Mapping
         ):
@@ -1008,6 +1079,7 @@ class TrtllmDaOperationState:
         # Preserve the inspected parallel-root proof alongside policy and selected-body data.
         topology = self._last_topology
         return {
+            "backend": self.key.backend.value,
             "operation_key": self.key.cache_key(),
             "tuned": self._tuned,
             "policy": self._published_policy,
@@ -1074,42 +1146,45 @@ class TrtllmDaOperationState:
         }
 
 
-class TrtllmDaRegistry:
+class DaMoeRegistry:
     """Own process-local automatic DA operation states and cache publication."""
 
     def __init__(self) -> None:
         """Create an empty thread-safe state registry."""
         # State indexed by immutable operation domain.
-        self._states: dict[TrtllmDaOperationKey, TrtllmDaOperationState] = {}
+        self._states: dict[DaMoeOperationKey, DaMoeOperationState] = {}
         # Registry lock protecting lookup and cache snapshots.
         self._lock = threading.RLock()
 
-    def get_or_create(self, key: TrtllmDaOperationKey) -> TrtllmDaOperationState:
+    def get_or_create(self, key: DaMoeOperationKey) -> DaMoeOperationState:
         """Return one stable state object for an operation domain."""
         with self._lock:
-            return self._states.setdefault(key, TrtllmDaOperationState(key))
+            return self._states.setdefault(key, DaMoeOperationState(key))
 
-    def find(self, key: TrtllmDaOperationKey) -> TrtllmDaOperationState | None:
+    def find(self, key: DaMoeOperationKey) -> DaMoeOperationState | None:
         """Return a previously tuned operation state without creating one."""
         with self._lock:
             return self._states.get(key)
 
     def find_or_restore(
-        self, key: TrtllmDaOperationKey, tuner: AutoTuner
-    ) -> TrtllmDaOperationState | None:
+        self, key: DaMoeOperationKey, tuner: AutoTuner
+    ) -> DaMoeOperationState | None:
         """Return process state or transactionally restore its cache record."""
         state = self.find(key)
         if state is not None:
             return state
-        record = tuner.get_namespaced_records("trtllm_moe_da").get(key.cache_key())
+        record = tuner.get_namespaced_records(DA_MOE_CACHE_NAMESPACE).get(
+            key.cache_key()
+        )
         if record is None:
             return None
-        candidate = TrtllmDaOperationState(key)
+        candidate = DaMoeOperationState(key)
         try:
             candidate.restore_cache_record(record)
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             logger.warning(
-                f"Ignoring invalid TRTLLM DA tuning-cache record; retuning is required: {error}"
+                "Ignoring invalid "
+                f"{key.backend.value} DA tuning-cache record; retuning is required: {error}"
             )
             return None
         with self._lock:
@@ -1117,7 +1192,7 @@ class TrtllmDaRegistry:
 
     def publish_cache(self, tuner: AutoTuner) -> None:
         """Merge tuned states into the shared fused-MoE cache namespace."""
-        records = tuner.get_namespaced_records("trtllm_moe_da")
+        records = tuner.get_namespaced_records(DA_MOE_CACHE_NAMESPACE)
         with self._lock:
             records.update(
                 {
@@ -1126,7 +1201,7 @@ class TrtllmDaRegistry:
                     if (record := state.cache_record()) is not None
                 }
             )
-        tuner.publish_namespaced_records("trtllm_moe_da", records)
+        tuner.publish_namespaced_records(DA_MOE_CACHE_NAMESPACE, records)
 
     def acquire_graph_leases(self, graph: torch.cuda.CUDAGraph) -> tuple[Any, ...]:
         """Lease every DA state injected into the just-completed outer graph."""
@@ -1156,21 +1231,51 @@ class TrtllmDaRegistry:
         return tuple(state.diagnostics() for state in states)
 
 
-TRTLLM_DA_REGISTRY = TrtllmDaRegistry()
+DA_MOE_REGISTRY = DaMoeRegistry()
+
+# Compatibility aliases for callers that imported the original internal names.
+TrtllmDaRoutingAdapter = DaMoeRoutingAdapter
+TrtllmDaOperationKey = DaMoeOperationKey
+TrtllmDaOperationState = DaMoeOperationState
+TrtllmDaRegistry = DaMoeRegistry
+TRTLLM_DA_REGISTRY = DA_MOE_REGISTRY
+
+
+def da_moe_acquire_graph_leases(
+    graph: torch.cuda.CUDAGraph,
+) -> tuple[Any, ...]:
+    """Commit every backend's DA injection in one completed outer graph."""
+    return DA_MOE_REGISTRY.acquire_graph_leases(graph)
+
+
+def da_moe_diagnostics(
+    backend: DaMoeBackend | str | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Return synchronized DA diagnostics, optionally filtered by backend."""
+    diagnostics = DA_MOE_REGISTRY.diagnostics()
+    if backend is None:
+        return diagnostics
+    backend_value = DaMoeBackend.parse(backend).value
+    return tuple(item for item in diagnostics if item["backend"] == backend_value)
+
+
+def da_moe_release_resources() -> int:
+    """Release idle DA resources while preserving every live graph lease."""
+    return DA_MOE_REGISTRY.release_idle_resources()
 
 
 def trtllm_moe_acquire_da_graph_leases(
     graph: torch.cuda.CUDAGraph,
 ) -> tuple[Any, ...]:
     """Commit every automatic TRTLLM DA injection in one completed outer graph."""
-    return TRTLLM_DA_REGISTRY.acquire_graph_leases(graph)
+    return da_moe_acquire_graph_leases(graph)
 
 
 def trtllm_moe_da_diagnostics() -> tuple[dict[str, Any], ...]:
     """Return synchronized automatic DA plan and topology benchmark diagnostics."""
-    return TRTLLM_DA_REGISTRY.diagnostics()
+    return da_moe_diagnostics(DaMoeBackend.TRTLLM)
 
 
 def trtllm_moe_release_da_resources() -> int:
     """Release every idle TRTLLM DA binding while preserving live-graph resources."""
-    return TRTLLM_DA_REGISTRY.release_idle_resources()
+    return da_moe_release_resources()

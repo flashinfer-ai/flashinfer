@@ -2063,7 +2063,7 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     must collapse to a single cache entry.
     """
     # The factory must return the identical object for the same expert count.
-    assert moe_topk_ids_init(128) is moe_topk_ids_init(128)
+    assert moe_topk_ids_init(128) is moe_topk_ids_init(128, packed=False)
 
     AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
@@ -2138,7 +2138,11 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             output=torch.empty((8, 4096)),
             routing_logits=None,
             topk_ids=topk_ids,
-            expert_weights=None,
+            expert_weights=(
+                None
+                if routing_input_mode == RoutingInputMode.PackedPrecomputed
+                else torch.ones((8, 8), dtype=torch.bfloat16)
+            ),
             hidden_states=torch.empty((8, 4096)),
             hidden_states_scale=None,
             gemm1_lora_delta=None,

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any, Optional
 
 import torch
 
@@ -39,8 +40,19 @@ from ..utils import (
 from .inputs import MoeRunnerInputs
 
 
+MoeTensorInitializer = Callable[
+    [tuple[int, ...], torch.dtype, torch.device], torch.Tensor
+]
+
+
+def _has_payload(tensor: Optional[torch.Tensor]) -> bool:
+    return tensor is not None and tensor.numel() > 0
+
+
 @functools.cache
-def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
+def moe_topk_ids_init(
+    num_experts: int, *, packed: bool = False
+) -> MoeTensorInitializer:
     """Return a top-k-id initializer for a given expert count.
 
     ``PackedPrecomputed`` profiling needs ``(expert_id << 16) | bf16(weight)``,

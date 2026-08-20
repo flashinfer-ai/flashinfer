@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import Any, List, Optional
+from collections.abc import Callable, Sequence
+from typing import Any, Generic, List, Optional, TypeVar
 
 import torch
 
@@ -30,7 +31,9 @@ from flashinfer.autotuner import (
     TuningConfig,
 )
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
+from flashinfer.fused_moe.factorized import FactorizedTacticSpace, MoeTactic
 from flashinfer.fused_moe.shared.tuning import (
+    MoeTensorInitializer,
     make_moe_tuning_config,
     make_repeating_tensor_initializer,
     moe_topk_ids_init,
@@ -55,6 +58,7 @@ from .config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
+    PrimsTsGemmPair,
     valid_prims_ts_bf16_moe_tactics,
     valid_prims_ts_deepseek_fp8_moe_tactics,
     valid_prims_ts_fp8_per_tensor_moe_tactics,
@@ -62,6 +66,22 @@ from .config_mapper import (
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
     valid_prims_ts_mxfp8_mxfp8_moe_tactics,
     valid_prims_ts_nvfp4_moe_tactics,
+)
+from .da_body import (
+    PrimsTsBf16BodyWorkspace,
+    PrimsTsBodyExecution,
+    PrimsTsBodyRouting,
+    PrimsTsBodySource,
+    PrimsTsBodyWorkspace,
+    PrimsTsDeepSeekFp8BodyWorkspace,
+    PrimsTsFp8PerTensorBodyWorkspace,
+    PrimsTsMxfp4Bf16BodyWorkspace,
+    PrimsTsMxfp4Mxfp8BodyWorkspace,
+    PrimsTsMxfp8BodyWorkspace,
+    PrimsTsNvfp4BodyWorkspace,
+    PrimsTsOrdinaryBodySource,
+    PrimsTsPreparedBodySource,
+    PrimsTsRoutingMetadata,
 )
 from .support import (
     is_prims_ts_bf16_supported,
@@ -196,6 +216,18 @@ def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
     ]
 
 
+def _decode_routing_outputs(
+    moe_inputs: MoeRunnerInputs, routing_out: Sequence[Any]
+) -> tuple[torch.Tensor, ...]:
+    """Decode reusable native outputs while preserving caller-owned expert weights."""
+    routing_views = _torch_views_of_ffi_tensors(routing_out)
+    expert_weights = _select_expert_weights(moe_inputs, routing_views[0])
+    return (
+        expert_weights,
+        *routing_views[1:],
+    )
+
+
 def _gemm1_oa_flags_from_kwargs(kwargs: dict) -> dict[str, bool]:
     return {
         "has_gemm1_alpha": kwargs.get("gemm1_alpha") is not None,
@@ -227,8 +259,11 @@ def _gemm1_oa_io_kwargs(kwargs: dict) -> dict[str, torch.Tensor | None]:
     }
 
 
-def _filter_valid_moe_tactics(valid_tactics: List[Any], map_tactic) -> List[Any]:
-    filtered_tactics = []
+def _filter_valid_moe_tactics(
+    valid_tactics: Sequence[MoeTactic],
+    map_tactic: Callable[[MoeTactic], PrimsTsGemmPair],
+) -> List[MoeTactic]:
+    filtered_tactics: List[MoeTactic] = []
     for tactic in valid_tactics:
         try:
             pair = map_tactic(tactic)
@@ -241,11 +276,13 @@ def _filter_valid_moe_tactics(valid_tactics: List[Any], map_tactic) -> List[Any]
     return filtered_tactics
 
 
-def _with_default_moe_tactic(valid_tactics: List[Any]) -> List[Any]:
+def _with_default_moe_tactic(
+    valid_tactics: Sequence[MoeTactic],
+) -> List[MoeTactic]:
     return [-1, *[tactic for tactic in valid_tactics if tactic != -1]]
 
 
-def _concrete_tactic(pair) -> list[int]:
+def _concrete_tactic(pair: PrimsTsGemmPair) -> list[int]:
     return [int(pair.tile_n), int(pair.moe_config_index)]
 
 
@@ -299,9 +336,13 @@ def _nvfp4_per_token_global_scale_inv() -> float:
 
 
 def _pad_mxfp8_linear_scale_for_prims(
-    scale: torch.Tensor, *, num_tokens: int, hidden_size: int
+    scale: torch.Tensor,
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Pad compact MXFP8 token scales to the routed LINEAR SF layout."""
+    """Pad compact MXFP8 token scales into caller-owned or new LINEAR storage."""
 
     sf_cols = int(hidden_size) // 32
     padded_cols = round_up(sf_cols, 16)
@@ -315,9 +356,11 @@ def _pad_mxfp8_linear_scale_for_prims(
     if src.shape[1] == padded_cols and src.is_contiguous():
         return src
 
-    padded = torch.empty(
-        (int(num_tokens), padded_cols), dtype=torch.uint8, device=scale.device
-    )
+    padded = output
+    if padded is None:
+        padded = torch.empty(
+            (int(num_tokens), padded_cols), dtype=torch.uint8, device=scale.device
+        )
     padded.fill_(0x7F)
     padded[:, :sf_cols].copy_(src[:, :sf_cols])
     return padded
@@ -332,8 +375,12 @@ def _quantize_nvfp4_fc1_output_for_fc2(
     top_k: int,
     intermediate_size: int,
     tile_n: int,
+    activation_output: torch.Tensor | None = None,
+    activation_output_scale: torch.Tensor | None = None,
+    per_token_scale_fc2: torch.Tensor | None = None,
+    launch: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize routed BF16 FC1 output into the NVFP4 activation used by FC2."""
+    """Quantize routed BF16 FC1 output into caller-owned or newly allocated FC2 inputs."""
 
     if gemm1_output.dtype != torch.bfloat16:
         raise ValueError("per-token NVFP4 FC1 output must be bfloat16")
@@ -351,14 +398,23 @@ def _quantize_nvfp4_fc1_output_for_fc2(
             f"{max_padded_tokens}"
         )
 
-    activation_output = torch.empty(
-        (max_padded_tokens, intermediate_size // 2),
-        dtype=torch.uint8,
-        device=gemm1_output.device,
-    )
-    per_token_scale_fc2 = torch.empty(
-        (max_padded_tokens,), dtype=torch.float32, device=gemm1_output.device
-    )
+    if activation_output is None:
+        activation_output = torch.empty(
+            (max_padded_tokens, intermediate_size // 2),
+            dtype=torch.uint8,
+            device=gemm1_output.device,
+        )
+    else:
+        required_activation_values = max_padded_tokens * (intermediate_size // 2)
+        activation_output = activation_output.flatten()[
+            :required_activation_values
+        ].view(max_padded_tokens, intermediate_size // 2)
+    if per_token_scale_fc2 is None:
+        per_token_scale_fc2 = torch.empty(
+            (max_padded_tokens,), dtype=torch.float32, device=gemm1_output.device
+        )
+    else:
+        per_token_scale_fc2 = per_token_scale_fc2.flatten()[:max_padded_tokens]
 
     sf_row_tile = 128 if tile_n >= 128 else 8
     sf_rows = round_up(max_padded_tokens, sf_row_tile)
@@ -369,9 +425,14 @@ def _quantize_nvfp4_fc1_output_for_fc2(
             "NVFP4 activation scale buffer is too small: "
             f"need {required_sf_values}, got {gemm1_output_scale.numel()}"
         )
-    activation_output_scale = gemm1_output_scale[:required_sf_values].view(
-        sf_rows, sf_cols
-    )
+    if activation_output_scale is None:
+        activation_output_scale = gemm1_output_scale[:required_sf_values].view(
+            sf_rows, sf_cols
+        )
+    else:
+        activation_output_scale = activation_output_scale.flatten()[
+            :required_sf_values
+        ].view(sf_rows, sf_cols)
 
     input_view = torch.as_strided(
         gemm1_output,
@@ -384,24 +445,105 @@ def _quantize_nvfp4_fc1_output_for_fc2(
     major, minor = get_compute_capability(gemm1_output.device)
     from flashinfer.quantization.fp4_quantization import get_fp4_quantization_module
 
-    get_fp4_quantization_module(
-        f"{major * 10 + minor}"
-    ).nvfp4_quant_and_per_token_scale_out_sm100(
-        input_view,
-        _nvfp4_per_token_global_scale_inv(),
-        activation_output,
-        activation_output_scale,
-        per_token_scale_fc2,
-        expanded_idx_to_permuted_idx,
-        sf_layout,
-    )
+    if launch:
+        get_fp4_quantization_module(
+            f"{major * 10 + minor}"
+        ).nvfp4_quant_and_per_token_scale_out_sm100(
+            input_view,
+            _nvfp4_per_token_global_scale_inv(),
+            activation_output,
+            activation_output_scale,
+            per_token_scale_fc2,
+            expanded_idx_to_permuted_idx,
+            sf_layout,
+        )
     return activation_output, activation_output_scale, per_token_scale_fc2
 
 
-class _PrimsTsMoERunnerMixin:
+BodyWorkspaceT = TypeVar("BodyWorkspaceT", bound=PrimsTsBodyWorkspace)
+
+
+class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
+    # PrimsTS exposes complete legal FC1/FC2 pairs for ordinary coordinate search.
+    use_factorized_moe_tactic_search = True
+    # Exact dtype-specific record used to decode prepared body workspace tensors.
+    body_workspace_type: type[BodyWorkspaceT]
+    # Immutable cache-key dimensions supplied by the active public MoE wrapper.
     _cache_key_static_extras: tuple = ()
 
-    def set_cache_key_static_extras(self, **kwargs) -> None:
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: MoeTactic = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Run the ordinary routed PrimsTS MoE path through its exact dtype ABI."""
+        return self._execute_body_source(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            body_source=PrimsTsOrdinaryBodySource(),
+            **kwargs,
+        )
+
+    def prepare_body_workspace(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: MoeTactic,
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Allocate one tactic's exact body workspace outside CUDA Graph capture."""
+        return self._execute_body_source(
+            inputs,
+            tactic=tactic,
+            do_preparation=True,
+            body_source=PrimsTsOrdinaryBodySource(),
+            **kwargs,
+        )
+
+    def _body_workspace_from_sequence(
+        self, tensors: Sequence[torch.Tensor]
+    ) -> BodyWorkspaceT:
+        """Decode prepared tensors through this runner's exact body ABI record."""
+        return self.body_workspace_type.from_sequence(tensors)
+
+    def run_prepared_body(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: MoeTactic,
+        routing_metadata: Sequence[torch.Tensor],
+        body_workspace: Sequence[torch.Tensor],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Launch one body from graph-live routing and preallocated typed storage."""
+        routing = PrimsTsRoutingMetadata.from_sequence(routing_metadata).body_view()
+        workspace = self._body_workspace_from_sequence(body_workspace)
+        source = PrimsTsPreparedBodySource(
+            PrimsTsBodyExecution(routing=routing, workspace=workspace)
+        )
+        return self._execute_body_source(
+            inputs,
+            tactic=tactic,
+            do_preparation=False,
+            body_source=source,
+            **kwargs,
+        )
+
+    def _topk_ids_initializer(
+        self, moe_inputs: MoeRunnerInputs
+    ) -> MoeTensorInitializer:
+        """Return the cached initializer matching the PrimsTS routed body ABI."""
+        expert_weights = moe_inputs.expert_weights
+        uses_unpacked_routing = (
+            expert_weights is not None and expert_weights.numel() > 0
+        )
+        return moe_topk_ids_init(
+            self.num_experts,
+            packed=not uses_unpacked_routing,
+        )
+
+    def set_cache_key_static_extras(self, **kwargs: Any) -> None:
         fc1_per_channel_weight_scale, fc2_per_channel_weight_scale = (
             _split_per_channel_weight_scale_from_kwargs(kwargs)
         )
@@ -460,18 +602,54 @@ class _PrimsTsMoERunnerMixin:
             *getattr(self, "_cache_key_static_extras", ()),
         )
 
+    def _factorized_tactic_space(
+        self,
+        inputs: List[torch.Tensor],
+        resolve_pair: Callable[[MoeTactic], PrimsTsGemmPair],
+    ) -> FactorizedTacticSpace:
+        """Build legal fused-MoE coordinates from complete PrimsTS config rows."""
+        from flashinfer.fused_moe.factorized import (
+            FactorizedTactic,
+            FactorizedTacticSpace,
+        )
+
+        tactics = []
+        anchors = {}
+        # Each raw tactic remains the public `[tile_n, moe_config_index]` identity. Factor
+        # coordinates only expose its resolved FC1/FC2 rows to the shared search algorithm.
+        for raw_tactic in self.get_valid_tactics(inputs, None):  # type: ignore[arg-type]
+            if raw_tactic == -1:
+                continue
+            pair = resolve_pair(raw_tactic)
+            identity = (int(pair.tile_n), int(pair.moe_config_index))
+            tactics.append(
+                FactorizedTactic(
+                    tactic=identity,
+                    tile_n=pair.tile_n,
+                    fc1=pair.fc1.prims_ts_gemm_config_index,
+                    fc2=pair.fc2.prims_ts_gemm_config_index,
+                    public_tactic=(
+                        tuple(raw_tactic)
+                        if isinstance(raw_tactic, list)
+                        else raw_tactic
+                    ),
+                )
+            )
+            anchors.setdefault(pair.tile_n, identity)
+        return FactorizedTacticSpace(tactics, anchors)
+
     def precompile_tactics(
         self,
         inputs: List[torch.Tensor],
-        tactics: List[Any],
+        tactics: List[MoeTactic],
         profile: OptimizationProfile,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool:
         del profile
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         hidden_states = moe_inputs.hidden_states
 
-        def _precompile_one(tactic: Any) -> None:
+        def _precompile_one(tactic: MoeTactic) -> None:
             try:
                 compile_only = getattr(self, "_precompile_tactic_compile_only", None)
                 if compile_only is not None:
@@ -489,27 +667,27 @@ class _PrimsTsMoERunnerMixin:
                     f"{self.__class__.__name__} tactic {tactic}: {exc}"
                 )
 
-        # Compilation is mostly host-side; fan out tactics when there are several.
-        max_workers = min(4, max(1, len(tactics)))
-        if max_workers == 1 or len(tactics) <= 1:
-            for tactic in tactics:
-                _precompile_one(tactic)
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                list(pool.map(_precompile_one, tactics))
+        # CUTLASS DSL owns an MLIR location/context on the invoking thread. Compiling in worker
+        # threads can escape Python exception handling and abort the process, so keep this phase
+        # deterministic on the autotuner's caller thread; GPU profiling remains unchanged.
+        for tactic in tactics:
+            _precompile_one(tactic)
         return True
 
 
-class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsBf16MoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsBf16BodyWorkspace], TunableRunner
+):
     """Autotuned Prims-TS BF16 MoE runner using shared TRT-LLM routing/finalize."""
+
+    # Exact intermediate ABI used by BF16 prepared bodies.
+    body_workspace_type = PrimsTsBf16BodyWorkspace
 
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -520,7 +698,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         weight_layout: int = WeightLayout.MajorK,
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -560,7 +738,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
@@ -600,14 +778,48 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsBf16MoERunner.valid_tactics_dict[instance_key]
 
-    def forward(
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal BF16 FC1/FC2 factors and deterministic tile anchors."""
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        num_tokens = moe_inputs.hidden_states.shape[0]
+        flags = _gemm_config_flags_from_static_extras(self)
+
+        def resolve_pair(raw_tactic: MoeTactic) -> PrimsTsGemmPair:
+            """Resolve one complete public BF16 tactic into its paired configs."""
+            return map_trtllm_bf16_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=flags["fc1_has_bias"],
+                fc2_has_bias=flags["fc2_has_bias"],
+                enable_pdl=dict(self._cache_key_static_extras).get("enable_pdl", False),
+                **{
+                    name: flags[name]
+                    for name in (
+                        "has_gemm1_alpha",
+                        "has_gemm1_beta",
+                        "has_gemm1_clamp_limit",
+                    )
+                },
+            )
+
+        return self._factorized_tactic_space(inputs, resolve_pair)
+
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        del do_preparation
+        *,
+        body_source: PrimsTsBodySource[PrimsTsBf16BodyWorkspace],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute BF16 from ordinary routing or one prepared typed body source."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         hidden_states = moe_inputs.hidden_states
@@ -642,43 +854,72 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            kwargs["gemm1_weights"],
-            kwargs["gemm2_weights"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["use_shuffled_weight"],
-            kwargs["weight_layout"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
+        def route_and_allocate() -> PrimsTsBodyExecution[PrimsTsBf16BodyWorkspace]:
+            """Route ordinarily and package the resulting BF16 body ABI."""
+            routing_out = self.moe_op.trtllm_moe_run_routing(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["gemm2_weights"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["use_shuffled_weight"],
+                kwargs["weight_layout"],
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=PrimsTsBf16BodyWorkspace(gemm1_output, gemm2_output),
+            )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        # The source either performs ordinary routing now or supplies a graph-stable DA record.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = body_workspace.gemm1_output
+        gemm2_output = body_workspace.gemm2_output
+        if do_preparation:
+            return list(body_workspace.tensors())
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -771,14 +1012,19 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         return _launch_arg_tuple(io, stream)
 
 
-class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsNvfp4MoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsNvfp4BodyWorkspace], TunableRunner
+):
     """Autotuned Prims-TS NVFP4xNVFP4 MoE runner."""
+
+    # Exact intermediate ABI used by NVFP4 prepared bodies.
+    body_workspace_type = PrimsTsNvfp4BodyWorkspace
 
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -789,7 +1035,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         weight_layout: int = WeightLayout.MajorK,
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -827,7 +1073,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         uses_per_token_scaling = moe_inputs.per_token_scale is not None
@@ -876,14 +1122,75 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsNvfp4MoERunner.valid_tactics_dict[instance_key]
 
-    def forward(
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal NVFP4 FC1/FC2 factors and deterministic tile anchors."""
+        from flashinfer.fused_moe.factorized import (
+            FactorizedTactic,
+            FactorizedTacticSpace,
+        )
+
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        num_tokens = moe_inputs.hidden_states.shape[0]
+        uses_per_token_scaling = moe_inputs.per_token_scale is not None
+        per_token_sf_dtype = (
+            _per_token_sf_dtype_value(moe_inputs.per_token_scale)
+            if uses_per_token_scaling
+            else 1
+        )
+        gemm_config_flags = _gemm_config_flags_from_static_extras(self)
+
+        # Resolve only enumerated complete tactics. The factorized search may compose FC1/FC2
+        # coordinates only when that composition maps back to one of these legal config rows.
+        tactics = []
+        anchors = {}
+        for raw_tactic in self.get_valid_tactics(inputs, None):  # type: ignore[arg-type]
+            if raw_tactic == -1:
+                continue
+            pair = map_trtllm_nvfp4_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=gemm_config_flags["fc1_has_bias"],
+                fc2_has_bias=gemm_config_flags["fc2_has_bias"],
+                has_gemm1_alpha=gemm_config_flags["has_gemm1_alpha"],
+                has_gemm1_beta=gemm_config_flags["has_gemm1_beta"],
+                has_gemm1_clamp_limit=gemm_config_flags["has_gemm1_clamp_limit"],
+                use_per_token_sf_b=uses_per_token_scaling,
+                per_token_sf_dtype=per_token_sf_dtype,
+                enable_pdl=dict(self._cache_key_static_extras).get("enable_pdl", False),
+            )
+            identity = (int(pair.tile_n), int(pair.moe_config_index))
+            tactics.append(
+                FactorizedTactic(
+                    tactic=identity,
+                    tile_n=pair.tile_n,
+                    fc1=pair.fc1.prims_ts_gemm_config_index,
+                    fc2=pair.fc2.prims_ts_gemm_config_index,
+                    public_tactic=(
+                        tuple(raw_tactic)
+                        if isinstance(raw_tactic, list)
+                        else raw_tactic
+                    ),
+                )
+            )
+            anchors.setdefault(pair.tile_n, identity)
+        return FactorizedTacticSpace(tactics, anchors)
+
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        del do_preparation
+        *,
+        body_source: PrimsTsBodySource[PrimsTsNvfp4BodyWorkspace],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute NVFP4 from ordinary routing or one prepared typed body source."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         hidden_states = moe_inputs.hidden_states
@@ -919,55 +1226,186 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             raise RuntimeError(
                 f"Config not supported by Prims-TS NVFP4 kernel ({reason})"
             )
+        fc1_cfg = pair.fc1.cfg.build()
+        fc2_cfg = pair.fc2.cfg.build()
 
         import cuda.bindings.driver as cuda_drv
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            moe_inputs.hidden_states_scale,
-            kwargs["gemm1_weights"],
-            kwargs["gemm1_weights_scale"],
-            kwargs["gemm2_weights"],
-            kwargs["gemm2_weights_scale"],
-            kwargs["output1_scale_scalar"],
-            kwargs["output1_scale_gate_scalar"],
-            kwargs["output2_scale_scalar"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(kwargs.get("weight_layout", self.weight_layout)),
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm1_output_scale,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        def route_and_allocate() -> PrimsTsBodyExecution[PrimsTsNvfp4BodyWorkspace]:
+            """Route ordinarily and package the tactic-dependent NVFP4 body ABI."""
+            # Ordinary execution and out-of-capture preparation use the established router to
+            # allocate the exact NVFP4 body ABI. Preparation returns before launching either GEMM.
+            routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                moe_inputs.hidden_states_scale,
+                kwargs["gemm1_weights"],
+                kwargs["gemm1_weights_scale"],
+                kwargs["gemm2_weights"],
+                kwargs["gemm2_weights_scale"],
+                kwargs["output1_scale_scalar"],
+                kwargs["output1_scale_gate_scalar"],
+                kwargs["output2_scale_scalar"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(kwargs.get("weight_layout", self.weight_layout)),
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm1_output_scale,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            empty_quantized_field = torch.empty(
+                0, dtype=torch.uint8, device=hidden_states.device
+            )
+            empty_bf16_field = torch.empty(
+                0, dtype=torch.bfloat16, device=hidden_states.device
+            )
+            if gemm1_output.dtype == torch.bfloat16:
+                gemm1_output_quantized = empty_quantized_field
+                gemm1_output_bf16 = gemm1_output
+            else:
+                gemm1_output_quantized = gemm1_output
+                gemm1_output_bf16 = empty_bf16_field
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=PrimsTsNvfp4BodyWorkspace(
+                    gemm1_output_quantized,
+                    gemm1_output_bf16,
+                    gemm1_output_scale,
+                    gemm2_output,
+                    empty_quantized_field,
+                    empty_quantized_field,
+                    empty_quantized_field,
+                    empty_quantized_field,
+                ),
+            )
+
+        # The prepared source bypasses routing and preserves every lane-owned pointer.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = (
+            body_workspace.gemm1_output_bf16
+            if uses_per_token_scaling and not fc1_cfg.has_epilogue_quant
+            else body_workspace.gemm1_output_quantized
+        )
+        gemm1_output_scale = body_workspace.gemm1_output_scale
+        gemm2_output = body_workspace.gemm2_output
+
+        # Some per-token configurations retain BF16 FC1 output instead of the router's packed
+        # allocation. Materialize that exact tactic ABI before publishing a preparation workspace.
+        if (
+            not body_source.preallocated
+            and uses_per_token_scaling
+            and not fc1_cfg.has_epilogue_quant
+        ):
+            gemm1_output = torch.empty(
+                (int(gemm1_output.shape[0]), self.intermediate_size),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            body_workspace = PrimsTsNvfp4BodyWorkspace(
+                body_workspace.gemm1_output_quantized,
+                gemm1_output,
+                gemm1_output_scale,
+                gemm2_output,
+                body_workspace.activation_output,
+                body_workspace.activation_output_scale,
+                body_workspace.per_token_scale_fc2,
+                body_workspace.expert_weights_bf16,
+            )
+        # Per-token FC2 quantization owns three additional graph-stable destinations. Allocate
+        # them during preparation, then reuse those exact lane pointers during child capture.
+        if uses_per_token_scaling and fc2_cfg.has_per_token_sf_b:
+            preallocated = body_source.preallocated
+            activation_output, activation_output_scale, per_token_scale_fc2 = (
+                _quantize_nvfp4_fc1_output_for_fc2(
+                    gemm1_output=gemm1_output,
+                    gemm1_output_scale=gemm1_output_scale,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    num_tokens=num_tokens,
+                    top_k=self.top_k,
+                    intermediate_size=self.intermediate_size,
+                    tile_n=pair.tile_n,
+                    activation_output=(
+                        body_workspace.activation_output if preallocated else None
+                    ),
+                    activation_output_scale=(
+                        body_workspace.activation_output_scale if preallocated else None
+                    ),
+                    per_token_scale_fc2=(
+                        body_workspace.per_token_scale_fc2 if preallocated else None
+                    ),
+                    launch=False,
+                )
+            )
+            body_workspace = PrimsTsNvfp4BodyWorkspace(
+                body_workspace.gemm1_output_quantized,
+                body_workspace.gemm1_output_bf16,
+                gemm1_output_scale,
+                gemm2_output,
+                activation_output,
+                activation_output_scale,
+                per_token_scale_fc2,
+                body_workspace.expert_weights_bf16,
+            )
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        if expert_weights.dtype != torch.bfloat16 and not body_source.preallocated:
+            expert_weights_bf16 = torch.empty_like(expert_weights, dtype=torch.bfloat16)
+            body_workspace = PrimsTsNvfp4BodyWorkspace(
+                body_workspace.gemm1_output_quantized,
+                body_workspace.gemm1_output_bf16,
+                body_workspace.gemm1_output_scale,
+                body_workspace.gemm2_output,
+                body_workspace.activation_output,
+                body_workspace.activation_output_scale,
+                body_workspace.per_token_scale_fc2,
+                expert_weights_bf16,
+            )
+        if do_preparation:
+            return list(body_workspace.tensors())
+
         if (
             moe_inputs.routing_logits is not None
             and moe_inputs.routing_logits.numel() > 0
@@ -979,7 +1417,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 dim=-1,
             ).values.to(torch.bfloat16)
         elif expert_weights.dtype != torch.bfloat16:
-            expert_weights = expert_weights.to(torch.bfloat16)
+            body_workspace.expert_weights_bf16.copy_(expert_weights)
+            expert_weights = body_workspace.expert_weights_bf16
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
@@ -987,15 +1426,6 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             kwargs,
         )
-        fc1_cfg = pair.fc1.cfg.build()
-        fc2_cfg = pair.fc2.cfg.build()
-        if uses_per_token_scaling and not fc1_cfg.has_epilogue_quant:
-            gemm1_output = torch.empty(
-                (int(gemm1_output.shape[0]), self.intermediate_size),
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
-            )
-
         common_io_kwargs = dict(
             hidden_states=hidden_states,
             hidden_states_scale=moe_inputs.hidden_states_scale,
@@ -1037,11 +1467,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         fc2_io_kwargs = common_io_kwargs
         if uses_per_token_scaling and fc2_cfg.has_per_token_sf_b:
-            (
-                activation_output,
-                activation_output_scale,
-                per_token_scale_fc2,
-            ) = _quantize_nvfp4_fc1_output_for_fc2(
+            _quantize_nvfp4_fc1_output_for_fc2(
                 gemm1_output=gemm1_output,
                 gemm1_output_scale=gemm1_output_scale,
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -1049,6 +1475,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 top_k=self.top_k,
                 intermediate_size=self.intermediate_size,
                 tile_n=pair.tile_n,
+                activation_output=activation_output,
+                activation_output_scale=activation_output_scale,
+                per_token_scale_fc2=per_token_scale_fc2,
             )
             fc2_io_kwargs = {
                 **common_io_kwargs,
@@ -1086,14 +1515,19 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         return _launch_arg_tuple(io, stream)
 
 
-class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsMxfp4Mxfp8MoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsMxfp4Mxfp8BodyWorkspace], TunableRunner
+):
     """Autotuned Prims-TS MXFP4xMXFP8 MoE runner."""
+
+    # Exact intermediate ABI used by MXFP4xMXFP8 prepared bodies.
+    body_workspace_type = PrimsTsMxfp4Mxfp8BodyWorkspace
 
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -1104,7 +1538,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         weight_layout: int = WeightLayout.MajorK,
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -1164,7 +1598,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
@@ -1203,12 +1637,43 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsMxfp4Mxfp8MoERunner.valid_tactics_dict[instance_key]
 
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal MXFP4xMXFP8 FC1/FC2 factors and tile anchors."""
+        num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+        flags = _gemm_config_flags_from_static_extras(self)
+
+        def resolve_pair(raw_tactic: MoeTactic) -> PrimsTsGemmPair:
+            """Resolve one complete public MXFP4xMXFP8 tactic row."""
+            return map_trtllm_mxfp4_mxfp8_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=flags["fc1_has_bias"],
+                fc2_has_bias=flags["fc2_has_bias"],
+                enable_pdl=dict(self._cache_key_static_extras).get("enable_pdl", False),
+                **{
+                    name: flags[name]
+                    for name in (
+                        "has_gemm1_alpha",
+                        "has_gemm1_beta",
+                        "has_gemm1_clamp_limit",
+                    )
+                },
+            )
+
+        return self._factorized_tactic_space(inputs, resolve_pair)
+
     def precompile_tactics(
         self,
         inputs: List[torch.Tensor],
-        tactics: List[Any],
+        tactics: List[MoeTactic],
         profile: OptimizationProfile,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool:
         del profile
         moe_inputs = MoeRunnerInputs.from_list(inputs)
@@ -1359,15 +1824,16 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         return True
 
-    def forward(
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        if do_preparation:
-            return None
+        *,
+        body_source: PrimsTsBodySource[PrimsTsMxfp4Mxfp8BodyWorkspace],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute MXFP4xMXFP8 from ordinary or prepared typed body inputs."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         hidden_states = moe_inputs.hidden_states
@@ -1402,49 +1868,84 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            moe_inputs.hidden_states_scale,
-            kwargs["gemm1_weights"],
-            kwargs["gemm1_weights_scale"],
-            kwargs["gemm2_weights"],
-            kwargs["gemm2_weights_scale"],
-            kwargs["output1_scale_scalar"],
-            kwargs["output1_scale_gate_scalar"],
-            kwargs["output2_scale_scalar"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(kwargs.get("weight_layout", self.weight_layout)),
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
+        def route_and_allocate() -> PrimsTsBodyExecution[
+            PrimsTsMxfp4Mxfp8BodyWorkspace
+        ]:
+            """Route ordinarily and package the MXFP4xMXFP8 body ABI."""
+            routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                moe_inputs.hidden_states_scale,
+                kwargs["gemm1_weights"],
+                kwargs["gemm1_weights_scale"],
+                kwargs["gemm2_weights"],
+                kwargs["gemm2_weights_scale"],
+                kwargs["output1_scale_scalar"],
+                kwargs["output1_scale_gate_scalar"],
+                kwargs["output2_scale_scalar"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(kwargs.get("weight_layout", self.weight_layout)),
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm1_output_scale,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm1_output_scale,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=PrimsTsMxfp4Mxfp8BodyWorkspace(
+                    gemm1_output, gemm1_output_scale, gemm2_output
+                ),
+            )
+
+        # Resolve ordinary routing or reuse the graph-stable record supplied by DA.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = body_workspace.gemm1_output
+        gemm1_output_scale = body_workspace.gemm1_output_scale
+        gemm2_output = body_workspace.gemm2_output
+        if do_preparation:
+            return list(body_workspace.tensors())
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -1520,14 +2021,19 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         return _launch_arg_tuple(io, stream)
 
 
-class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsMxfp4Bf16MoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsMxfp4Bf16BodyWorkspace], TunableRunner
+):
     """Autotuned Prims-TS MXFP4xBF16 MoE runner."""
+
+    # Exact intermediate ABI used by MXFP4xBF16 prepared bodies.
+    body_workspace_type = PrimsTsMxfp4Bf16BodyWorkspace
 
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -1538,7 +2044,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         weight_layout: int = WeightLayout.MajorK,
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -1576,7 +2082,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
@@ -1615,14 +2121,47 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsMxfp4Bf16MoERunner.valid_tactics_dict[instance_key]
 
-    def forward(
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal MXFP4xBF16 FC1/FC2 factors and tile anchors."""
+        num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+        flags = _gemm_config_flags_from_static_extras(self)
+
+        def resolve_pair(raw_tactic: MoeTactic) -> PrimsTsGemmPair:
+            """Resolve one complete public MXFP4xBF16 tactic row."""
+            return map_trtllm_mxfp4_bf16_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=flags["fc1_has_bias"],
+                fc2_has_bias=flags["fc2_has_bias"],
+                enable_pdl=dict(self._cache_key_static_extras).get("enable_pdl", False),
+                **{
+                    name: flags[name]
+                    for name in (
+                        "has_gemm1_alpha",
+                        "has_gemm1_beta",
+                        "has_gemm1_clamp_limit",
+                    )
+                },
+            )
+
+        return self._factorized_tactic_space(inputs, resolve_pair)
+
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        del do_preparation
+        *,
+        body_source: PrimsTsBodySource[PrimsTsMxfp4Bf16BodyWorkspace],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute MXFP4xBF16 from ordinary or prepared typed body inputs."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         hidden_states = moe_inputs.hidden_states
@@ -1657,47 +2196,76 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_bf16(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            kwargs["gemm1_weights"],
-            kwargs["gemm1_weights_scale"],
-            kwargs["gemm2_weights"],
-            kwargs["gemm2_weights_scale"],
-            kwargs["output1_scale_scalar"],
-            kwargs["output1_scale_gate_scalar"],
-            kwargs["output2_scale_scalar"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(kwargs.get("weight_layout", self.weight_layout)),
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
+        def route_and_allocate() -> PrimsTsBodyExecution[PrimsTsMxfp4Bf16BodyWorkspace]:
+            """Route ordinarily and package the MXFP4xBF16 body ABI."""
+            routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_bf16(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["gemm1_weights_scale"],
+                kwargs["gemm2_weights"],
+                kwargs["gemm2_weights_scale"],
+                kwargs["output1_scale_scalar"],
+                kwargs["output1_scale_gate_scalar"],
+                kwargs["output2_scale_scalar"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(kwargs.get("weight_layout", self.weight_layout)),
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=PrimsTsMxfp4Bf16BodyWorkspace(gemm1_output, gemm2_output),
+            )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        # Resolve ordinary routing or reuse the graph-stable record supplied by DA.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = body_workspace.gemm1_output
+        gemm2_output = body_workspace.gemm2_output
+        if do_preparation:
+            return list(body_workspace.tensors())
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -1771,14 +2339,19 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         return _launch_arg_tuple(io, stream)
 
 
-class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsFp8PerTensorMoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsFp8PerTensorBodyWorkspace], TunableRunner
+):
     """Autotuned Prims-TS FP8 per-tensor MoE runner."""
+
+    # Exact intermediate ABI used by FP8 per-tensor prepared bodies.
+    body_workspace_type = PrimsTsFp8PerTensorBodyWorkspace
 
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -1788,7 +2361,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         use_shuffled_weight: bool = True,
         weight_layout: int = WeightLayout.MajorK,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -1826,7 +2399,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         static_extras = dict(getattr(self, "_cache_key_static_extras", ()))
@@ -1894,14 +2467,57 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsFp8PerTensorMoERunner.valid_tactics_dict[instance_key]
 
-    def forward(
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal FP8 per-tensor FC1/FC2 factors and tile anchors."""
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        num_tokens = moe_inputs.hidden_states.shape[0]
+        extras = dict(self._cache_key_static_extras)
+        flags = _gemm_config_flags_from_static_extras(self)
+        use_fc1_scale = bool(extras.get("fc1_per_channel_weight_scale", False))
+        use_fc2_scale = bool(extras.get("fc2_per_channel_weight_scale", False))
+        use_routing_scale = bool(extras.get("use_routing_scales_on_input", False))
+        scale_dtype = int(extras.get("per_token_sf_dtype", 1))
+
+        def resolve_pair(raw_tactic: MoeTactic) -> PrimsTsGemmPair:
+            """Resolve one complete public FP8 per-tensor tactic row."""
+            return map_trtllm_fp8_per_tensor_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=flags["fc1_has_bias"],
+                fc2_has_bias=flags["fc2_has_bias"],
+                fc1_use_per_token_sf_a=use_fc1_scale,
+                fc2_use_per_token_sf_a=use_fc2_scale,
+                use_per_token_sf_b=use_routing_scale,
+                per_token_sf_dtype=scale_dtype,
+                enable_pdl=bool(extras.get("enable_pdl", False)),
+                **{
+                    name: flags[name]
+                    for name in (
+                        "has_gemm1_alpha",
+                        "has_gemm1_beta",
+                        "has_gemm1_clamp_limit",
+                    )
+                },
+            )
+
+        return self._factorized_tactic_space(inputs, resolve_pair)
+
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        del do_preparation
+        *,
+        body_source: PrimsTsBodySource[PrimsTsFp8PerTensorBodyWorkspace],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute FP8 per-tensor from ordinary or prepared typed body inputs."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         ok, reason = is_prims_ts_fp8_per_tensor_supported(
@@ -1926,20 +2542,27 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         use_routing_scales_on_input = bool(
             kwargs.get("use_routing_scales_on_input", False)
         )
-        per_token_sf_dtype = _fp8_per_tensor_scale_dtype(
-            fc1_per_channel_weight_scale_dtype=(
-                _per_token_sf_dtype_value(fc1_per_channel_weight_scale)
-                if use_fc1_per_channel_weight_scale
-                else None
-            ),
-            fc2_per_channel_weight_scale_dtype=(
-                _per_token_sf_dtype_value(fc2_per_channel_weight_scale)
-                if use_fc2_per_channel_weight_scale
-                else None
-            ),
-            use_routing_scales_on_input=use_routing_scales_on_input,
-            routing_logits=moe_inputs.routing_logits,
-        )
+        if use_routing_scales_on_input and moe_inputs.routing_logits is None:
+            # Prepared FromLogits bodies consume canonical expert weights rather than logits, but
+            # retain the public logits dtype in the runner's immutable cache-key extras.
+            per_token_sf_dtype = int(
+                dict(self._cache_key_static_extras).get("per_token_sf_dtype", 1)
+            )
+        else:
+            per_token_sf_dtype = _fp8_per_tensor_scale_dtype(
+                fc1_per_channel_weight_scale_dtype=(
+                    _per_token_sf_dtype_value(fc1_per_channel_weight_scale)
+                    if use_fc1_per_channel_weight_scale
+                    else None
+                ),
+                fc2_per_channel_weight_scale_dtype=(
+                    _per_token_sf_dtype_value(fc2_per_channel_weight_scale)
+                    if use_fc2_per_channel_weight_scale
+                    else None
+                ),
+                use_routing_scales_on_input=use_routing_scales_on_input,
+                routing_logits=moe_inputs.routing_logits,
+            )
         pair = map_trtllm_fp8_per_tensor_moe_tactic(
             requested_tactic,
             activation_type=int(self.activation_type),
@@ -1971,46 +2594,77 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         ):
             routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp8_per_tensor(
-            routing_logits_for_routing,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            kwargs["gemm1_weights"],
-            kwargs["output1_scale_scalar"],
-            kwargs["output1_scale_gate_scalar"],
-            kwargs["gemm2_weights"],
-            kwargs["output2_scale_scalar"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs.get("use_routing_scales_on_input", False),
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(kwargs.get("weight_layout", self.weight_layout)),
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
+        def route_and_allocate() -> PrimsTsBodyExecution[
+            PrimsTsFp8PerTensorBodyWorkspace
+        ]:
+            """Route ordinarily and package the FP8 per-tensor body ABI."""
+            routing_out = self.moe_op.trtllm_moe_run_routing_fp8_per_tensor(
+                routing_logits_for_routing,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["output1_scale_scalar"],
+                kwargs["output1_scale_gate_scalar"],
+                kwargs["gemm2_weights"],
+                kwargs["output2_scale_scalar"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs.get("use_routing_scales_on_input", False),
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(kwargs.get("weight_layout", self.weight_layout)),
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=PrimsTsFp8PerTensorBodyWorkspace(gemm1_output, gemm2_output),
+            )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        # Resolve ordinary routing or reuse the graph-stable record supplied by DA.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = body_workspace.gemm1_output
+        gemm2_output = body_workspace.gemm2_output
+        if do_preparation:
+            return list(body_workspace.tensors())
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -2094,14 +2748,18 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         return _launch_arg_tuple(io, stream)
 
 
-class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
+class PrimsTsFp8BlockScaleMoERunner(
+    _PrimsTsMoERunnerMixin[PrimsTsDeepSeekFp8BodyWorkspace | PrimsTsMxfp8BodyWorkspace],
+    TunableRunner,
+):
     """Autotuned Prims-TS FP8 block-scale MoE runner."""
 
+    # Cached valid tactics partitioned by the complete static problem identity.
     valid_tactics_dict: dict = {}
 
     def __init__(
         self,
-        moe_op,
+        moe_op: Any,
         *,
         top_k: int,
         num_local_experts: int,
@@ -2112,7 +2770,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         use_shuffled_weight: bool = True,
         weight_layout: int = WeightLayout.MajorK,
         num_experts: Optional[int] = None,
-    ):
+    ) -> None:
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -2134,6 +2792,17 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = False
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+
+    def _body_workspace_from_sequence(
+        self, tensors: Sequence[torch.Tensor]
+    ) -> PrimsTsDeepSeekFp8BodyWorkspace | PrimsTsMxfp8BodyWorkspace:
+        """Decode the distinct DeepSeek or MXFP8 workspace selected by this runner."""
+        workspace_type = (
+            PrimsTsDeepSeekFp8BodyWorkspace
+            if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            else PrimsTsMxfp8BodyWorkspace
+        )
+        return workspace_type.from_sequence(tensors)
 
     def _make_tuning_config(
         self,
@@ -2158,7 +2827,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
+    ) -> List[MoeTactic]:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         num_tokens = moe_inputs.hidden_states.shape[0]
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
@@ -2205,14 +2874,59 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
         return PrimsTsFp8BlockScaleMoERunner.valid_tactics_dict[instance_key]
 
-    def forward(
+    def get_factorized_tactic_space(
+        self, inputs: List[torch.Tensor]
+    ) -> FactorizedTacticSpace:
+        """Return legal FP8 block-scale FC1/FC2 factors and tile anchors."""
+        num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+        flags = _gemm_config_flags_from_static_extras(self)
+        extras = dict(self._cache_key_static_extras)
+
+        def resolve_pair(raw_tactic: MoeTactic) -> PrimsTsGemmPair:
+            """Resolve one complete public FP8 block-scale tactic row."""
+            if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                return map_trtllm_deepseek_fp8_moe_tactic(
+                    raw_tactic,
+                    num_tokens=num_tokens,
+                    top_k=self.top_k,
+                    num_local_experts=self.num_local_experts,
+                    weight_layout=int(self.weight_layout),
+                    enable_pdl=bool(extras.get("enable_pdl", False)),
+                )
+            return map_trtllm_mxfp8_mxfp8_moe_tactic(
+                raw_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(self.weight_layout),
+                fc1_has_bias=flags["fc1_has_bias"],
+                fc2_has_bias=flags["fc2_has_bias"],
+                enable_pdl=bool(extras.get("enable_pdl", False)),
+                **{
+                    name: flags[name]
+                    for name in (
+                        "has_gemm1_alpha",
+                        "has_gemm1_beta",
+                        "has_gemm1_clamp_limit",
+                    )
+                },
+            )
+
+        return self._factorized_tactic_space(inputs, resolve_pair)
+
+    def _execute_body_source(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: MoeTactic = -1,
         do_preparation: bool = False,
-        **kwargs,
-    ):
-        del do_preparation
+        *,
+        body_source: PrimsTsBodySource[
+            PrimsTsDeepSeekFp8BodyWorkspace | PrimsTsMxfp8BodyWorkspace
+        ],
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Execute block FP8 from ordinary routing or a prepared typed body source."""
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
         hidden_states = moe_inputs.hidden_states
@@ -2257,49 +2971,102 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp8_block_scale(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            moe_inputs.hidden_states_scale,
-            kwargs["gemm1_weights"],
-            kwargs["gemm1_weights_scale"],
-            kwargs["gemm2_weights"],
-            kwargs["gemm2_weights_scale"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(kwargs.get("weight_layout", self.weight_layout)),
-            int(self.activation_type),
-            int(self.fp8_quantization_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm1_output_scale,
-            activation_output,
-            activation_output_scale,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        def route_and_allocate() -> PrimsTsBodyExecution[Any]:
+            """Route ordinarily and package the selected block-scale body ABI."""
+            routing_out = self.moe_op.trtllm_moe_run_routing_fp8_block_scale(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                moe_inputs.hidden_states_scale,
+                kwargs["gemm1_weights"],
+                kwargs["gemm1_weights_scale"],
+                kwargs["gemm2_weights"],
+                kwargs["gemm2_weights_scale"],
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["enable_pdl"],
+                resolved_tactic,
+                int(kwargs.get("weight_layout", self.weight_layout)),
+                int(self.activation_type),
+                int(self.fp8_quantization_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm1_output_scale,
+                activation_output,
+                activation_output_scale,
+                gemm2_output,
+            ) = _decode_routing_outputs(moe_inputs, routing_out)
+            if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                workspace = PrimsTsDeepSeekFp8BodyWorkspace(
+                    gemm1_output,
+                    gemm1_output_scale,
+                    activation_output,
+                    activation_output_scale,
+                    gemm2_output,
+                )
+            else:
+                padded_scale = _pad_mxfp8_linear_scale_for_prims(
+                    moe_inputs.hidden_states_scale,
+                    num_tokens=num_tokens,
+                    hidden_size=self.hidden_size,
+                )
+                workspace = PrimsTsMxfp8BodyWorkspace(
+                    gemm1_output,
+                    gemm1_output_scale,
+                    activation_output,
+                    activation_output_scale,
+                    gemm2_output,
+                    padded_scale,
+                )
+            return PrimsTsBodyExecution(
+                routing=PrimsTsBodyRouting(
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    num_non_exiting_ctas=num_non_exiting_ctas,
+                    total_num_padded_tokens=total_num_padded_tokens,
+                ),
+                workspace=workspace,
+            )
+
+        # Resolve ordinary routing or reuse the graph-stable record supplied by DA.
+        execution = body_source.resolve(route_and_allocate)
+        routing_metadata = execution.routing
+        body_workspace = execution.workspace
+        expert_weights = routing_metadata.expert_weights
+        expanded_idx_to_permuted_idx = routing_metadata.expanded_idx_to_permuted_idx
+        permuted_idx_to_token_idx = routing_metadata.permuted_idx_to_token_idx
+        tile_idx = routing_metadata.tile_idx
+        mn_limit = routing_metadata.mn_limit
+        num_non_exiting_ctas = routing_metadata.num_non_exiting_ctas
+        total_num_padded_tokens = routing_metadata.total_num_padded_tokens
+        gemm1_output = body_workspace.gemm1_output
+        gemm1_output_scale = body_workspace.gemm1_output_scale
+        activation_output = body_workspace.activation_output
+        activation_output_scale = body_workspace.activation_output_scale
+        gemm2_output = body_workspace.gemm2_output
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -2317,9 +3084,12 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 moe_inputs.hidden_states_scale,
                 num_tokens=num_tokens,
                 hidden_size=self.hidden_size,
+                output=body_workspace.hidden_states_scale_padded,
             )
             activation_output = gemm1_output
             activation_output_scale = gemm1_output_scale
+        if do_preparation:
+            return list(body_workspace.tensors())
 
         common_io_kwargs = dict(
             fp8_quantization_type=int(self.fp8_quantization_type),

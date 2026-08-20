@@ -22,6 +22,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
+from flashinfer.fused_moe.factorized import MoeTactic
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,
@@ -120,12 +121,18 @@ def prims_ts_bf16_moe_op(
         )
 
     if routing_logits is not None:
+        routing_input_mode = RoutingInputMode.FromLogits
         topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
         expert_weights = torch.empty(
             0, dtype=routing_logits.dtype, device=hidden_states.device
         )
     else:
         assert topk_ids is not None
+        routing_input_mode = (
+            RoutingInputMode.UnpackedPrecomputed
+            if expert_weights is not None
+            else RoutingInputMode.PackedPrecomputed
+        )
         if topk_ids.dtype != torch.int32:
             raise ValueError(
                 "topk_ids must be int32 for Prims-TS BF16 precomputed routing"
@@ -196,6 +203,7 @@ def prims_ts_bf16_moe_op(
         activation_type=activation_type,
         norm_topk_prob=norm_topk_prob,
         routing_replay_out=routing_replay_out,
+        routing_input_mode=routing_input_mode,
     )
     moe_runner.set_cache_key_static_extras(**common_kwargs)
     ok, reason = is_prims_ts_bf16_supported(
@@ -224,12 +232,41 @@ def prims_ts_bf16_moe_op(
     if not ok:
         raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
 
-    intermediate_output = moe_runner.forward(
-        moe_inputs.to_list(),
-        tactic=tactic,
-        **common_kwargs,
+    def run_selected_tactic(
+        selected_tactic: MoeTactic,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        """Run one concrete PrimsTS BF16 tactic and rebuild the public result."""
+        intermediate_output = moe_runner.forward(
+            moe_inputs.to_list(),
+            tactic=selected_tactic,
+            **common_kwargs,
+        )
+        return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+
+    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+        return run_selected_tactic(tactic)
+
+    from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da
+
+    return run_prims_ts_da(
+        custom_op="flashinfer::prims_ts_bf16_moe",
+        runner=moe_runner,
+        tuning_config=tuning_config,
+        inputs=moe_inputs.to_list(),
+        runner_kwargs=common_kwargs,
+        baseline_tactic=tactic,
+        routing_input_mode=routing_input_mode,
+        num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        routed_scaling_factor=routed_scaling_factor,
+        run_fixed_tactic=run_selected_tactic,
+        finish_switch=lambda: unpack_trtllm_moe_output([], output, do_finalize, None),
     )
-    return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
 
 
 @register_fake_op("flashinfer::prims_ts_bf16_moe")
