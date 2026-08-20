@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import importlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -507,3 +508,86 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
         for runner in runners
     )
     assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
+
+
+def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = {}
+
+    class Program:
+        def __init__(self, name):
+            self.name = name
+
+        def run(self, *args):
+            calls[self.name] = args
+
+    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
+    monkeypatch.setattr(
+        module,
+        "_load_program",
+        lambda name, _arch, _device_index: Program(name),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(multi_processor_count=1),
+    )
+
+    batch, seqlen, nheads, ngroups = 2, 128, 1, 1
+    x = torch.empty((batch, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, ngroups, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    checkpoint_token_indices = torch.tensor([32, 64], dtype=torch.int32)
+    checkpoint_state_slots = torch.tensor([0, 2], dtype=torch.int32)
+    checkpoint_states = torch.empty(
+        (3, nheads, 64, 128), dtype=torch.bfloat16
+    )
+    runner = module.CakeSSDCombined(
+        128,
+        nheads,
+        64,
+        128,
+        ngroups,
+        io_dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        has_d=False,
+        d_has_hdim=False,
+        has_initial_states=False,
+        has_varlen=False,
+        has_z=False,
+        seq_idx_dtype=torch.int32,
+    )
+
+    first = runner.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        dt_softplus=False,
+        checkpoint_token_indices=checkpoint_token_indices,
+        checkpoint_state_slots=checkpoint_state_slots,
+        checkpoint_states=checkpoint_states,
+    )
+    second = runner.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        dt_softplus=False,
+        checkpoint_token_indices=checkpoint_token_indices,
+        checkpoint_state_slots=checkpoint_state_slots,
+        checkpoint_states=checkpoint_states,
+    )
+
+    assert calls["preprocess"][-6] == 0
+    assert calls["bf16_batched"][-8] == 0
+    assert calls["bf16_batched"][-4] == checkpoint_states.shape[0]
+    assert isinstance(first, tuple) and isinstance(second, tuple)
+    assert first[0].data_ptr() != second[0].data_ptr()
+    assert first[1].data_ptr() != second[1].data_ptr()
