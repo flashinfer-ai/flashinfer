@@ -20,6 +20,7 @@ from typing import Optional, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.msa import msa_topk_select_trace
 from ..utils import is_sm12x_supported
 
 
@@ -108,7 +109,7 @@ def _get_compiled_topk_chunked(topk: int, tiled: bool):
     return _compile_topk(TopKSelectChunkedSm12x(topk=topk, tiled=tiled), 4, 7)
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_topk_select_trace)
 def msa_topk_select(
     max_score: torch.Tensor,
     topk: int,
