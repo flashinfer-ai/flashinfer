@@ -23,6 +23,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
     load_cake_fmha_decode_quant_bf16q_module,
+    load_cake_fmha_decode_quant_fp8_module,
 )
 from .utils import get_compute_capability
 
@@ -45,6 +46,7 @@ class CakeFmhaDecodeRoute:
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
         "decode_quant_bf16q",
+        "decode_quant_fp8_reduce",
         "decode_quant_fp8",
         "decode_quant_nvfp4",
     ] = "decode_native_bf16"
@@ -119,6 +121,8 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
         "decode_quant_bf16q",
+        "decode_quant_fp8",
+        "decode_quant_fp8_reduce",
     }
 )
 
@@ -259,6 +263,68 @@ def _decode_quant_scale_supported(
         and scale.numel() == 1
         and scale.is_contiguous()
     )
+
+
+def _decode_quant_fp8_seq_lens_supported(
+    seq_lens: torch.Tensor, max_seq_len: int
+) -> bool:
+    """Resolve the exact full-block/even-bucket route domain, or fail closed."""
+
+    if seq_lens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        lengths = [int(value) for value in seq_lens.detach().cpu().tolist()]
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    if not lengths or max(lengths) != max_seq_len:
+        return False
+    if any(length < 512 or length % 128 for length in lengths):
+        return False
+    evened_buckets = {
+        ((length + 127) // 128 + 1) // 2 * 2 for length in lengths
+    }
+    return len(evened_buckets) == 1
+
+
+def _decode_quant_fp8_workspace_supported(
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    block_tables: torch.Tensor,
+    *,
+    batch_size: int,
+    page_size: int,
+    max_seq_len: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+) -> bool:
+    """Check a conservative upper bound for runtime split-KV workspace."""
+
+    if (
+        not workspace_buffer.is_contiguous()
+        or workspace_buffer.device != query.device
+    ):
+        return False
+    even_kv_blocks = (max_seq_len + 127) // 128
+    even_kv_blocks += even_kv_blocks % 2
+    max_splits = max(1, (even_kv_blocks + 3) // 4)
+    required_pages = even_kv_blocks * (128 // page_size)
+    source_pages = int(block_tables.shape[-1])
+    padded_pages = max(source_pages, required_pages)
+
+    cursor = 0
+    if not isinstance(bmm1_scale, torch.Tensor):
+        cursor += 4
+    if not isinstance(bmm2_scale, torch.Tensor):
+        cursor += 4
+    cursor = (cursor + 15) // 16 * 16
+    if source_pages < padded_pages:
+        cursor += batch_size * padded_pages * 4
+        cursor = (cursor + 15) // 16 * 16
+    partial_rows = batch_size * query.shape[1] * max_splits
+    cursor += partial_rows * 128 * 4
+    cursor += 2 * partial_rows * 4
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    return workspace_bytes >= cursor
 
 
 def _manifest_optimized_route_accounting() -> tuple[int, int]:
@@ -507,6 +573,24 @@ def select_cake_fmha_decode_route(
         and quant_extensions_absent
         and max_seq_len >= 512
         and max_seq_len % 128 == 0
+        and _decode_quant_fp8_seq_lens_supported(seq_lens, max_seq_len)
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
+        and query.data_ptr() % 16 == 0
+        and key_cache.data_ptr() % 16 == 0
+        and value_cache.data_ptr() % 16 == 0
+        and _decode_quant_scale_supported(bmm1_scale, query)
+        and _decode_quant_scale_supported(bmm2_scale, query)
+        and _decode_quant_fp8_workspace_supported(
+            workspace_buffer,
+            query,
+            block_tables,
+            batch_size=batch_size,
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
     ):
         return route("decode_quant_fp8")
 
@@ -589,6 +673,7 @@ def get_cake_fmha_decode_module(
         "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
         "decode_native_fp16_nhd": load_cake_fmha_decode_native_fp16_nhd_module,
         "decode_quant_bf16q": load_cake_fmha_decode_quant_bf16q_module,
+        "decode_quant_fp8": load_cake_fmha_decode_quant_fp8_module,
     }.get(route.component)
     if loader is None:
         raise RuntimeError(
@@ -610,6 +695,8 @@ def get_cake_fmha_decode_module(
         )
     if route.component == "decode_quant_bf16q":
         return loader(*common_args, route.page_size)
+    if route.component == "decode_quant_fp8":
+        return loader(*common_args, route.page_size, full_blocks=True)
     return loader(
         *common_args,
         has_sink=route.has_sink,

@@ -22,6 +22,7 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_decode_native_fp16_hd512_module,
     gen_cake_fmha_decode_native_fp16_nhd_module,
     gen_cake_fmha_decode_quant_bf16q_module,
+    gen_cake_fmha_decode_quant_fp8_module,
     get_cake_fmha_compat_uri,
     get_cake_fmha_context_bf16_uri,
     get_cake_fmha_context_fp8_uri,
@@ -29,6 +30,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_native_fp16_hd512_uri,
     get_cake_fmha_decode_native_fp16_nhd_uri,
     get_cake_fmha_decode_quant_bf16q_uri,
+    get_cake_fmha_decode_quant_fp8_uri,
     get_cake_fmha_manifest,
 )
 
@@ -251,6 +253,44 @@ def test_cake_fmha_decode_quant_bf16q_jit_selects_one_manifest_member(
     assert "-DNUM_Q_HEADS=4" in spec.extra_cuda_cflags
     assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_PAGE_SIZE=32" in spec.extra_cuda_cflags
+
+
+def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
+    monkeypatch,
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_decode_quant_fp8_module(
+        "sm103a",
+        2,
+        1,
+        16,
+        2,
+        32,
+        full_blocks=True,
+    )
+    assert spec.name == get_cake_fmha_decode_quant_fp8_uri(
+        "sm103a",
+        2,
+        1,
+        16,
+        2,
+        32,
+        full_blocks=True,
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "full_blocks1_page_size32.cu",
+        "cake_fmha_decode_quant_fp8_binding.cu",
+        "default.cu",
+        "cake_fmha_decode_quant_fp8_reduce_binding.cu",
+        "cake_fmha_decode_quant_fp8_jit_binding.cu",
+    }
+    assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
+    assert "-DNUM_Q_HEADS=16" in spec.extra_cuda_cflags
+    assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_PAGE_SIZE=32" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_FULL_BLOCKS=1" in spec.extra_cuda_cflags
 
 
 def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
@@ -609,6 +649,56 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
 
 
+def test_cake_fmha_fp8_decode_route_requires_exact_full_block_bucket(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    batch_size, num_q_heads, num_kv_heads, page_size = 2, 16, 2, 16
+    query = torch.empty(
+        (batch_size, num_q_heads, 128), dtype=torch.float8_e4m3fn
+    )
+    key = torch.empty(
+        (64, num_kv_heads, page_size, 128), dtype=torch.float8_e4m3fn
+    )
+    out = torch.empty_like(query)
+    block_tables = torch.zeros((batch_size, 32), dtype=torch.int32)
+
+    def select(seq_lens: torch.Tensor, max_seq_len: int):
+        return cake_api.select_cake_fmha_decode_route(
+            query.device,
+            query=query,
+            key_cache=key,
+            value_cache=torch.empty_like(key),
+            out=out,
+            workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            q_len=1,
+            max_seq_len=max_seq_len,
+            window_left=-1,
+            bmm1_scale=0.125,
+            bmm2_scale=1.0,
+            o_scale=1.0,
+            sinks=None,
+            kv_layout="HND",
+            uses_shared_paged_kv_idx=True,
+            cum_seq_lens_q=None,
+            key_block_scales=None,
+            value_block_scales=None,
+            skip_softmax_threshold_scale_factor=None,
+            enable_block_sparse_attention=False,
+            lse=None,
+        )
+
+    route = select(torch.tensor([512, 512], dtype=torch.int32), 512)
+    assert route is not None
+    assert route.component == "decode_quant_fp8"
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert select(torch.tensor([511, 512], dtype=torch.int32), 512) is None
+    assert select(torch.tensor([512, 640], dtype=torch.int32), 640) is None
+
+
 def test_cake_fmha_fp16_nhd_route_loads_its_authenticated_adapter(monkeypatch) -> None:
     fp16_sentinel = object()
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
@@ -713,6 +803,44 @@ def test_cake_fmha_bf16q_route_loads_its_authenticated_adapter(monkeypatch) -> N
     assert observed == {"args": ("sm100a", 2, 1, 4, 2, 32)}
 
 
+def test_cake_fmha_fp8_route_loads_its_authenticated_adapter(monkeypatch) -> None:
+    fp8_sentinel = object()
+    observed = {}
+
+    def load_fp8(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return fp8_sentinel
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_decode_quant_fp8_module",
+        load_fp8,
+    )
+    route = cake_api.CakeFmhaDecodeRoute(
+        target="sm103a",
+        batch_size=2,
+        q_len=1,
+        num_q_heads=16,
+        num_kv_heads=2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
+        component="decode_quant_fp8",
+        page_size=16,
+    )
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+        is fp8_sentinel
+    )
+    assert observed == {
+        "args": ("sm103a", 2, 1, 16, 2, 16),
+        "kwargs": {"full_blocks": True},
+    }
+
+
 def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
 
@@ -800,7 +928,7 @@ def test_unexported_candidate_routes_fail_closed_to_compat(monkeypatch) -> None:
         has_window=False,
         use_scale_ptr=False,
         retain_kv_l2=True,
-        component="decode_quant_fp8",
+        component="decode_quant_nvfp4",
     )
     assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
 

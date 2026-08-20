@@ -25,7 +25,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "6243c7d8dde7aabab341f93b2290350404caa417494a3a0088e34fa630e1a30d"
+    "aa33d3ce07495554f5afe4feb19aff3407e4960446068dac1a67f14cc110c6cb"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -36,6 +36,7 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu",
+    "jit/cake_fmha_decode_quant_fp8_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
@@ -54,6 +55,7 @@ _DECODE_NATIVE_FP16_NHD_JIT_BINDING = (
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu"
 )
 _DECODE_QUANT_BF16Q_JIT_BINDING = "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu"
+_DECODE_QUANT_FP8_JIT_BINDING = "jit/cake_fmha_decode_quant_fp8_jit_binding.cu"
 _CONTEXT_BF16_JIT_BINDING = "jit/cake_fmha_context_bf16_jit_binding.cu"
 _CONTEXT_FP8_JIT_BINDING = "jit/cake_fmha_context_fp8_jit_binding.cu"
 
@@ -218,12 +220,36 @@ def _validate_decode_quant_bf16q_specialization(
     return {"PAGE_SIZE": page_size}
 
 
-def _get_component_sources(
+def _validate_decode_quant_fp8_specialization(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    *,
+    full_blocks: bool,
+) -> dict[str, int]:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if q_len != 1:
+        raise ValueError("decode-quant FP8 requires q_len=1")
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads != 8 * num_kv_heads:
+        raise ValueError("decode-quant FP8 requires a head-group ratio of 8")
+    if page_size not in (16, 32, 64):
+        raise ValueError("decode-quant FP8 requires page_size 16, 32, or 64")
+    return {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
+
+
+def _get_component_launch_sources(
     component_name: str,
     target: CakeFmhaTarget,
     selector: Mapping[str, int],
-    jit_binding: str,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path]:
     component = get_cake_fmha_manifest()["components"][component_name]
     normalized_selector = dict(sorted(selector.items()))
     matches = [
@@ -239,10 +265,24 @@ def _get_component_sources(
     csrc_dir = get_cake_fmha_csrc_dir()
     body = csrc_dir / matches[0]["sources"][_TARGET_MANIFEST_ARCH[target]]
     launch_binding = csrc_dir / component["binding_source"]
-    api_binding = csrc_dir / jit_binding
-    for source in (body, launch_binding, api_binding):
+    for source in (body, launch_binding):
         if not source.is_file():
             raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
+    return body, launch_binding
+
+
+def _get_component_sources(
+    component_name: str,
+    target: CakeFmhaTarget,
+    selector: Mapping[str, int],
+    jit_binding: str,
+) -> tuple[Path, Path, Path]:
+    body, launch_binding = _get_component_launch_sources(
+        component_name, target, selector
+    )
+    api_binding = get_cake_fmha_csrc_dir() / jit_binding
+    if not api_binding.is_file():
+        raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
     return body, launch_binding, api_binding
 
 
@@ -1008,6 +1048,115 @@ def load_cake_fmha_decode_quant_bf16q_module(
         page_size,
     ).build_and_load()
     logger.info("Loaded Cake FMHA BF16Q decode module: %s", module)
+    return module
+
+
+def get_cake_fmha_decode_quant_fp8_uri(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    *,
+    full_blocks: bool,
+) -> str:
+    selector = _validate_decode_quant_fp8_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+        full_blocks=full_blocks,
+    )
+    return (
+        f"cake_fmha_decode_quant_fp8_{target}"
+        f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
+        f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
+        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+@functools.cache
+def gen_cake_fmha_decode_quant_fp8_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    *,
+    full_blocks: bool,
+) -> JitSpec:
+    """Build the authenticated FP8 decode plus split-KV reducer chain."""
+
+    selector = _validate_decode_quant_fp8_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+        full_blocks=full_blocks,
+    )
+    main_sources = _get_component_launch_sources(
+        "decode_quant_fp8", target, selector
+    )
+    reduce_sources = _get_component_launch_sources(
+        "decode_quant_fp8_reduce", target, {}
+    )
+    api_binding = get_cake_fmha_csrc_dir() / _DECODE_QUANT_FP8_JIT_BINDING
+    if not api_binding.is_file():
+        raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_quant_fp8_uri(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+            full_blocks=full_blocks,
+        ),
+        sources=[*main_sources, *reduce_sources, api_binding],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DBATCH_SIZE={batch_size}",
+            f"-DNUM_Q_HEADS={num_q_heads}",
+            f"-DNUM_KV_HEADS={num_kv_heads}",
+            f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
+            f"-DCAKE_FMHA_FULL_BLOCKS={selector['FULL_BLOCKS']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA FP8 decode/reduce JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_quant_fp8_module(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    *,
+    full_blocks: bool,
+):
+    module = gen_cake_fmha_decode_quant_fp8_module(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+        full_blocks=full_blocks,
+    ).build_and_load()
+    logger.info("Loaded Cake FMHA FP8 decode/reduce module: %s", module)
     return module
 
 
