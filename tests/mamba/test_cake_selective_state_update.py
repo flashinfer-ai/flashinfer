@@ -216,7 +216,7 @@ def test_sglang_raw_route_rejects_disabled_softplus(monkeypatch) -> None:
 
 def test_cake_selective_state_update_sources_match_manifest() -> None:
     source_dir = cake._source_dir()
-    assert len(cake._PROGRAMS) == 13
+    assert len(cake._PROGRAMS) == 14
     for name, program in cake._PROGRAMS.items():
         device = source_dir / "cuda" / f"cake_selective_state_update_{name}.cu"
         host = source_dir / "host" / f"cake_selective_state_update_{name}.cc"

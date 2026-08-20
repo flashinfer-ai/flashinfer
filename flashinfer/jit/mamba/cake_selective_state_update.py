@@ -73,6 +73,12 @@ _PROGRAMS = {
         "babe752c7baf690ec9eee6d799e5a4d7e7ae80fb5626246b55c6d637fc19c885",
         "573f0a9c88675540b344726fe42f71d1cce226b4df49662fbc9066c17b7c51f8",
     ),
+    "mtp_cache_bf16_c4_t6_sglang_raw": _Program(
+        "cake_selective_state_update_mtp_cache_bf16_c4_t6_sglang_raw_4123ffa2ea",
+        (),
+        "5411ea71684cd8151da626004cf864c37be8824466dbbc7811aed314233e442f",
+        "1c116054551aba2b4db54a93b6e8efd36f3fffe4f0c1bbdd5c3f7bca314d541b",
+    ),
     "mtp_horizontal": _Program(
         "cake_selective_state_update_mtp_horizontal_65ba035815",
         ("--fmad=false",),
