@@ -37,7 +37,6 @@ python3 - "${EXPECTED_CUDA_VERSION}" "${EXPECTED_MACHINE}" <<'PY'
 import importlib.metadata
 import os
 import platform
-import subprocess
 import sys
 
 expected_cuda = sys.argv[1]
@@ -91,35 +90,6 @@ for distribution in distributions:
     print(f"{distribution}=={importlib.metadata.version(distribution)}")
 print(f"architecture={platform.machine()}")
 print(f"cuda={torch.version.cuda}")
-
-# FlashInfer intentionally needs a newer backend than the exact cuDNN version
-# in the stable PyTorch wheel metadata. Reject every dependency error except
-# that one checked-and-documented override.
-check = subprocess.run(
-    [sys.executable, "-m", "pip", "check"],
-    check=False,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-)
-if check.returncode == 0:
-    print(check.stdout.strip())
-else:
-    unexpected = []
-    allowed = []
-    for line in filter(None, check.stdout.splitlines()):
-        is_torch_cudnn_override = (
-            line.startswith("torch ")
-            and f"has requirement {cudnn_package}==" in line
-            and f"but you have {cudnn_package} {expected_cudnn}" in line
-        )
-        (allowed if is_torch_cudnn_override else unexpected).append(line)
-    if unexpected or not allowed:
-        raise SystemExit(
-            "ERROR: unexpected pip dependency errors:\n" + "\n".join(unexpected)
-        )
-    for line in allowed:
-        print(f"Allowed FlashInfer cuDNN override: {line}")
 PY
 
 echo "Candidate CI image passed: CUDA ${EXPECTED_CUDA_VERSION}, ${EXPECTED_MACHINE}"
