@@ -501,7 +501,9 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
     assert isinstance(first, tuple) and isinstance(second, tuple)
     assert len(runners) == 2 and runners[0] is not runners[1]
     assert all(runner.constructor_kwargs["backend"] == "cake" for runner in runners)
-    assert all(runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners)
+    assert all(
+        runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners
+    )
     assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
 
 
