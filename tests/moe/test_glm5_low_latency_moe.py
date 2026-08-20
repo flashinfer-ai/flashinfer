@@ -164,6 +164,8 @@ def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
             "set FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR to run the GLM5 dump replay"
         )
 
+    if not all(key in os.environ for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")):
+        pytest.skip("run the GLM5 dump replay under torchrun --nproc_per_node=8")
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -244,3 +246,17 @@ def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
     max_abs_error = (actual.float() - expected.float()).abs().max().item()
     print(f"rank={rank} max_abs_error={max_abs_error:.6e} threshold={threshold:.6e}")
     assert max_abs_error <= threshold
+
+
+def test_glm5_tp8_dump_replay_requires_torchrun(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLASHINFER_GLM5_LOW_LATENCY_MOE_DUMP_DIR", str(tmp_path))
+    for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(
+        pytest.skip.Exception,
+        match="run the GLM5 dump replay under torchrun --nproc_per_node=8",
+    ):
+        test_glm5_low_latency_moe_tp8_dump_replay()

@@ -829,7 +829,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
       if (rows_active <= 0) continue;
 
       int const e_id = smem_unique_eid[b_idx];
-      int const count = static_cast<int>(smem_bucket_count[e_id]);
+      int const count = min(static_cast<int>(smem_bucket_count[e_id]), kMaxM);
       int const n_groups_routed = (count + 7) >> 3;  // 1 or 2
 
       for (int g = 0; g < n_groups_routed; ++g) {
@@ -1181,7 +1181,7 @@ static CUtensorMap make_w_down_tmap(void* base_ptr, int num_experts, int K_local
 }
 
 constexpr size_t kWDownTmaDescCacheCap = 256;
-constexpr int kMaxCudaDevicesForSmemAttr = 16;
+constexpr int kMaxCudaDevicesForSmemAttr = 64;
 
 struct WDownTmaDescKey {
   void const* base;

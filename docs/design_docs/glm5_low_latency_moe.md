@@ -6,11 +6,14 @@ gate/up projections, SwiGLU, the down projections, and routed/shared reduction
 into two CUDA launches. It is intended for tensor-parallel decode with one to
 four tokens per rank.
 
-The CUDA implementation is adapted from the `fuse_more_kernels` branch of
-[`yijingl-nvidia/TensorRT-LLM`](https://github.com/yijingl-nvidia/TensorRT-LLM/tree/fuse_more_kernels),
-at source revision `73dd714d5`. The port replaces the Torch custom-op boundary
-with TVM FFI, uses caller-owned outputs and reusable workspaces, and integrates
-with FlashInfer's JIT, AOT, trace, test, and benchmark infrastructure.
+These low-latency kernels are inspired by the design of
+[TileRT](https://github.com/tile-ai/TileRT), a tile-based runtime for
+ultra-low-latency LLM inference with fused kernels.
+
+The ported files retain their NVIDIA copyright and Apache-2.0 license notices.
+The port replaces the Torch custom-op boundary with TVM FFI, uses caller-owned
+outputs and reusable workspaces, and integrates with FlashInfer's JIT, AOT,
+trace, test, and benchmark infrastructure.
 
 ## Supported contract
 

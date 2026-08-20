@@ -356,7 +356,7 @@ def main() -> None:
                 print(
                     f"all_ranks={world_size} tokens={args.tokens} path={name} "
                     f"mean_us={means[index].item():.3f} "
-                    f"median_us={all_stats[:, index, 1].mean().item():.3f} "
+                    f"mean_rank_median_us={all_stats[:, index, 1].mean().item():.3f} "
                     f"rank_mean_range_us=[{all_stats[:, index, 0].min().item():.3f}, "
                     f"{all_stats[:, index, 0].max().item():.3f}]",
                     flush=True,
