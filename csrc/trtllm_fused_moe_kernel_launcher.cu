@@ -4027,8 +4027,44 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens,
-                                                        totalExpertsPerToken, totalLocalExperts);
+  auto resolved_tactic = resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens,
+                                                 totalExpertsPerToken, totalLocalExperts);
+
+  // On SM103, the exact no-bias routed NVFP4 workload from #4190 is consistently faster with
+  // [tile_N=256, config=1] than with the generic fallback's tile_N=128 choice. Keep the
+  // override as narrow as the measured workload: all explicit tactics and every other
+  // architecture, shape, dtype, epilogue, routing mode, and PDL setting retain the generic
+  // fallback policy.
+  bool const matches_sm103_nvfp4_8k_fallback =
+      config_index[0] == -1 && config_index[1] == -1 &&
+      static_cast<RoutingInputMode>(routing_input_mode) == RoutingInputMode::PackedPrecomputed &&
+      mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1 &&
+      num_tokens == 8192 && num_experts == 384 && top_k == 8 && hidden_size == 7168 &&
+      intermediate_size == 512 && local_expert_offset == 0 && local_num_experts == 384 &&
+      nFusedShared == 0 && !routing_bias.has_value() && !gemm1_bias.has_value() &&
+      !gemm1_lora_delta.has_value() && !gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
+      !gemm1_clamp_limit.has_value() && !gemm2_bias.has_value() &&
+      output1_scales_scalar.has_value() && output1_scales_gate_scalar.has_value() &&
+      output2_scales_scalar.has_value() && !per_token_scales.has_value() &&
+      routing_method_type == static_cast<int64_t>(RoutingMethodType::Renormalize) &&
+      n_group.value_or(0) == 0 && topk_group.value_or(0) == 0 &&
+      !routed_scaling_factor.has_value() && do_finalize && enable_pdl &&
+      act_type == static_cast<int64_t>(ActivationType::Swiglu) &&
+      !routing_replay_out.has_value() && da_routing_metadata.empty() && da_body_workspace.empty() &&
+      !is_da_body_preparation;
+  if (matches_sm103_nvfp4_8k_fallback) {
+    int device_major = 0;
+    int device_minor = 0;
+    CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&device_major, cudaDevAttrComputeCapabilityMajor,
+                                            hidden_states.device().device_id));
+    CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor,
+                                            hidden_states.device().device_id));
+    if (device_major == 10 && device_minor == 3) {
+      resolved_tactic = {256, 1};
+    }
+  }
+
+  auto const [tile_N, config] = resolved_tactic;
 
   // Get the launcher for the selected tile_N
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
