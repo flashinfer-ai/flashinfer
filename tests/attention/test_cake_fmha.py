@@ -1285,6 +1285,13 @@ def test_decode_route_miss_fails_closed_to_compat(monkeypatch) -> None:
     assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), None) is sentinel
 
 
+def test_context_route_miss_fails_closed_to_compat(monkeypatch) -> None:
+    sentinel = object()
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(cake_api, "load_cake_fmha_compat_module", lambda target: sentinel)
+    assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), None) is sentinel
+
+
 def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
     monkeypatch,
 ) -> None:
