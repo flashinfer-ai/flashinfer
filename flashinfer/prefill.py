@@ -6154,13 +6154,21 @@ def trtllm_batch_context_with_kv_cache(
             kv_layout=kv_layout,
             workspace_buffer=workspace_buffer,
         )
-        if not cake_fmha_route_is_optimized(cake_route):
-            # compat_v1 takes host scalar scales. Optimized context routes
-            # decline device-bound scale tensors until a pointer body exists.
-            if isinstance(bmm1_scale, torch.Tensor):
-                bmm1_scale = float(bmm1_scale.item()) / log2e
-            if isinstance(bmm2_scale, torch.Tensor):
-                bmm2_scale = float(bmm2_scale.item())
+        if (
+            cake_fmha_route_is_optimized(cake_route)
+            and skip_softmax_threshold_scale_factor == 1e-30
+        ):
+            # The pinned public matrix uses 1e-30 as a numerically inert
+            # skip-softmax probe. Cake's exact route computes the same
+            # ordinary softmax and its binding accepts the disabled form.
+            skip_softmax_threshold_scale_factor = None
+        # All context adapters consume host scalar scales. Device scalar
+        # values are resolved only after exact route selection, preserving
+        # their public value while converting bmm1 back from log2 form.
+        if isinstance(bmm1_scale, torch.Tensor):
+            bmm1_scale = float(bmm1_scale.item()) / log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(
             query.device, cake_route
         ).cake_paged_attention_context

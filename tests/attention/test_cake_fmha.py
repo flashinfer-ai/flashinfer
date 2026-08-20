@@ -41,6 +41,10 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_quant_nvfp4_uri,
     get_cake_fmha_manifest,
 )
+from tests.test_helpers.cake_fmha_capability import (
+    PINNED_FLASHINFER_REVISION,
+    replay_selectors,
+)
 
 
 def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
@@ -107,6 +111,28 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     assert cake_api._AUTHENTICATED_JIT_COMPONENTS == routed_components | {
         "compat_v1"
     }
+
+
+def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
+    monkeypatch,
+) -> None:
+    """Replay every valid public cell, not only manifest route-name totals."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    report = replay_selectors()
+    manifest = get_cake_fmha_manifest()
+
+    assert PINNED_FLASHINFER_REVISION == CAKE_FMHA_FLASHINFER_MATRIX_REVISION
+    assert report.raw_cases == 80_768
+    assert report.valid_cases == 57_280
+    assert report.optimized_cases == 1_798
+    assert report.compat_cases == 55_482
+    assert report.route_counts == dict(
+        sorted(manifest["capability"]["route_counts"].items())
+    )
+    assert report.digest == (
+        "d47bf01c2d27409c6a39759d02e30bb9df65e98c353f53d7335081dd26b3f3a8"
+    )
 
 
 def test_cake_fmha_jit_spec_uses_versioned_standalone_sources(monkeypatch) -> None:
@@ -1316,6 +1342,23 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         )
         is None
     )
+    assert cake_api.select_cake_fmha_context_route(
+        query.device,
+        **{
+            **kwargs,
+            "skip_softmax_threshold_scale_factor": 1e-30,
+        },
+    ) == route
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            query.device,
+            **{
+                **kwargs,
+                "skip_softmax_threshold_scale_factor": 1e-4,
+            },
+        )
+        is None
+    )
 
     fp8_query = torch.empty((64, 32, 128), dtype=torch.float8_e4m3fn)
     fp8_key = torch.empty((4, 4, 64, 128), dtype=torch.float8_e4m3fn)
@@ -1356,6 +1399,30 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         return_lse=False,
         enable_sink=False,
     )
+    assert cake_api.select_cake_fmha_context_route(
+        fp8_query.device,
+        query=fp8_query,
+        key_cache=fp8_key,
+        value_cache=torch.empty_like(fp8_key),
+        out=torch.empty_like(fp8_query),
+        block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        batch_size=2,
+        max_q_len=32,
+        max_kv_len=64,
+        window_left=-1,
+        bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
+        bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
+        sinks=None,
+        uses_shared_paged_kv_idx=False,
+        cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=1e-30,
+        is_causal=True,
+        lse=None,
+    ) == fp8_route
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
 
@@ -1544,7 +1611,7 @@ def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> Non
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
-def test_cake_context_fp8_shared_tables_matches_reference(monkeypatch) -> None:
+def test_cake_context_fp8_nhd_device_scale_skip_matches_reference(monkeypatch) -> None:
     from tests.attention.test_trtllm_gen_attention_prefill import (
         _test_trtllm_batch_prefill,
     )
@@ -1556,7 +1623,7 @@ def test_cake_context_fp8_shared_tables_matches_reference(monkeypatch) -> None:
 
     monkeypatch.setattr(prefill, "trtllm_batch_context_with_kv_cache", cake_context)
     _test_trtllm_batch_prefill(
-        kv_layout="HND",
+        kv_layout="NHD",
         batch_size=2,
         page_size=64,
         num_kv_heads=4,
@@ -1570,9 +1637,10 @@ def test_cake_context_fp8_shared_tables_matches_reference(monkeypatch) -> None:
         enable_sink=False,
         max_q_len=32,
         max_kv_len=159,
-        device_scale=False,
+        device_scale=True,
         head_dim=128,
         uses_shared_paged_kv_idx=True,
+        skips_softmax=True,
     )
 
 

@@ -114,10 +114,14 @@ void* TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStream_t stream) {
 CUtensorMap EncodeTmaQt(TensorView tensor) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float16);
-  TVM_FFI_ICHECK(tensor.IsContiguous());
   TVM_FFI_ICHECK_EQ(tensor.size(2), 128);
+  TVM_FFI_ICHECK_EQ(tensor.stride(2), 1);
+  TVM_FFI_ICHECK_GT(tensor.stride(0), 0);
+  TVM_FFI_ICHECK_GT(tensor.stride(1), 0);
+  TVM_FFI_ICHECK_EQ(tensor.stride(0), tensor.size(1) * tensor.stride(1));
   uint64_t global_dim[3] = {64u, static_cast<uint64_t>(tensor.size(0) * tensor.size(1)), 2u};
-  uint64_t global_strides[2] = {256u, 128u};
+  uint64_t global_strides[2] = {
+      static_cast<uint64_t>(tensor.stride(1) * sizeof(__half)), 128u};
   uint32_t box_dim[3] = {64u, 8u, 2u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
@@ -195,9 +199,12 @@ void cake_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float16);
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_float16);
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float16);
-  TVM_FFI_ICHECK(query.IsContiguous());
   TVM_FFI_ICHECK_EQ(query.ndim(), 3);
   TVM_FFI_ICHECK_EQ(query.size(2), 128);
+  TVM_FFI_ICHECK_EQ(query.stride(2), 1);
+  TVM_FFI_ICHECK_GT(query.stride(0), 0);
+  TVM_FFI_ICHECK_GT(query.stride(1), 0);
+  TVM_FFI_ICHECK_EQ(query.stride(0), query.size(1) * query.stride(1));
   TVM_FFI_ICHECK_EQ(out.ndim(), 3);
   TVM_FFI_ICHECK_EQ(out.size(0), query.size(0));
   TVM_FFI_ICHECK_EQ(out.size(1), query.size(1));

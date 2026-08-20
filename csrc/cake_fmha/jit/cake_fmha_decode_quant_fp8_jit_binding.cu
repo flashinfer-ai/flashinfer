@@ -110,10 +110,11 @@ void* TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStream_t stream) {
   return pointer;
 }
 
-CUtensorMap EncodeTmaQuery(TensorView tensor, void* data) {
+CUtensorMap EncodeTmaQuery(TensorView tensor, void* data,
+                           bool data_is_padded) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK(tensor.IsContiguous());
+  TVM_FFI_ICHECK(data_is_padded || tensor.IsContiguous());
   TVM_FFI_ICHECK_EQ(tensor.size(0), BATCH_SIZE);
   TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_Q_HEADS);
   TVM_FFI_ICHECK_EQ(tensor.size(2), kHeadDim);
@@ -235,7 +236,8 @@ __global__ void PrepareQuantDecode(
     const int* page_table, int* padded_page_table, int page_items,
     int source_pages, int padded_pages, int page_table_rows,
     const uint8_t* query, uint8_t* padded_query, int query_items,
-    int group_size, float* bmm1_scalar_ptr, float bmm1_scalar,
+    int group_size, int64_t query_stride_batch, int64_t query_stride_head,
+    int64_t query_stride_dim, float* bmm1_scalar_ptr, float bmm1_scalar,
     float* bmm2_scalar_ptr, float bmm2_scalar) {
   int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (padded_page_table != nullptr && index < page_items) {
@@ -253,9 +255,13 @@ __global__ void PrepareQuantDecode(
     int row = index / kHeadDim;
     int group_row = row % kTileQ;
     int kv_row = row / kTileQ;
+    int batch = kv_row / NUM_KV_HEADS;
+    int kv_head = kv_row % NUM_KV_HEADS;
+    int source_head = kv_head * group_size + group_row;
     padded_query[index] =
         group_row < group_size
-            ? query[(kv_row * group_size + group_row) * kHeadDim + col]
+            ? query[batch * query_stride_batch + source_head * query_stride_head +
+                    col * query_stride_dim]
             : 0;
   }
   if (index == 0) {
@@ -362,7 +368,11 @@ void cake_paged_attention_decode(
   );
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), key_cache.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK(query.IsContiguous());
+  TVM_FFI_ICHECK_EQ(query.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(query.stride(2), 1);
+  TVM_FFI_ICHECK_GT(query.stride(0), 0);
+  TVM_FFI_ICHECK_GT(query.stride(1), 0);
+  TVM_FFI_ICHECK_EQ(query.stride(0), query.size(1) * query.stride(1));
   TVM_FFI_ICHECK(out.IsContiguous());
   TVM_FFI_ICHECK_EQ(out.ndim(), 3);
   TVM_FFI_ICHECK_EQ(out.size(0), query.size(0));
@@ -477,7 +487,7 @@ void cake_paged_attention_decode(
   if (!bmm2_tensor.has_value()) cursor += sizeof(float);
   cursor = AlignUp(cursor, 16);
   int64_t query_offset = cursor;
-  bool needs_query_padding = kGroupSize != kTileQ;
+  bool needs_query_padding = kGroupSize != kTileQ || !query.IsContiguous();
   if (needs_query_padding) {
     cursor += BATCH_SIZE * NUM_KV_HEADS * kTileQ * kHeadDim;
     cursor = AlignUp(cursor, 16);
@@ -519,7 +529,7 @@ void cake_paged_attention_decode(
 
   void* query_ptr = needs_query_padding ? static_cast<void*>(padded_query)
                                         : query.data_ptr();
-  CUtensorMap h_q = EncodeTmaQuery(query, query_ptr);
+  CUtensorMap h_q = EncodeTmaQuery(query, query_ptr, needs_query_padding);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
   void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
@@ -549,7 +559,8 @@ void cake_paged_attention_decode(
       static_cast<int>(page_items), static_cast<int>(source_pages),
       static_cast<int>(padded_pages), static_cast<int>(page_table_rows),
       static_cast<const uint8_t*>(query.data_ptr()), padded_query,
-      static_cast<int>(query_items), kGroupSize,
+      static_cast<int>(query_items), kGroupSize, query.stride(0),
+      query.stride(1), query.stride(2),
       bmm1_tensor.has_value() ? nullptr : bmm1_ptr, bmm1_scalar,
       bmm2_tensor.has_value() ? nullptr : bmm2_ptr, bmm2_scalar);
   TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)

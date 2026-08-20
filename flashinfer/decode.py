@@ -3745,6 +3745,14 @@ def trtllm_batch_decode_with_kv_cache(
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
             )
+            if (
+                cake_fmha_route_is_optimized(cake_route)
+                and skip_softmax_threshold_scale_factor == 1e-30
+            ):
+                # The pinned public matrix uses 1e-30 as a numerically inert
+                # skip-softmax probe. Cake's exact route computes the same
+                # ordinary softmax and its binding accepts the disabled form.
+                skip_softmax_threshold_scale_factor = None
             if not cake_fmha_route_is_optimized(cake_route):
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.

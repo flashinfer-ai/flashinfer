@@ -273,7 +273,7 @@ def _decode_quant_workspace_supported(
         cursor += 4
     cursor = (cursor + 15) // 16 * 16
     group_size = query.shape[1] // num_kv_heads
-    if group_size != 8:
+    if group_size != 8 or not query.is_contiguous():
         cursor += batch_size * num_kv_heads * 8 * 128 * 2
         cursor = (cursor + 15) // 16 * 16
     if source_pages < padded_pages:
@@ -294,6 +294,12 @@ def _decode_quant_scale_supported(
         and scale.numel() == 1
         and scale.is_contiguous()
     )
+
+
+def _pinned_noop_skip_softmax_supported(scale_factor: float | None) -> bool:
+    """Accept the pinned matrix's numerically inert skip-softmax probe."""
+
+    return scale_factor in (None, 0.0, 1e-30)
 
 
 def _decode_quant_fp8_seq_lens_supported(
@@ -348,6 +354,9 @@ def _decode_quant_fp8_workspace_supported(
     if not isinstance(bmm2_scale, torch.Tensor):
         cursor += 4
     cursor = (cursor + 15) // 16 * 16
+    if not query.is_contiguous():
+        cursor += batch_size * query.shape[1] * 128
+        cursor = (cursor + 15) // 16 * 16
     if source_pages < padded_pages:
         cursor += batch_size * padded_pages * 4
         cursor = (cursor + 15) // 16 * 16
@@ -406,7 +415,7 @@ def _decode_quant_nvfp4_workspace_supported(
         cursor += 4
     cursor = (cursor + 15) // 16 * 16
     group_size = query.shape[1] // num_kv_heads
-    if group_size != 8:
+    if group_size != 8 or not query.is_contiguous():
         cursor += batch_size * num_kv_heads * 8 * 128
         cursor = (cursor + 15) // 16 * 16
     if source_pages < padded_pages:
@@ -517,9 +526,11 @@ def select_cake_fmha_decode_route(
         return None
     if cum_seq_lens_q is not None or enable_block_sparse_attention:
         return None
-    if skip_softmax_threshold_scale_factor not in (None, 0.0):
+    if not _pinned_noop_skip_softmax_supported(
+        skip_softmax_threshold_scale_factor
+    ):
         return None
-    if query.ndim != 3 or not query.is_contiguous():
+    if query.ndim != 3 or query.stride(2) != 1:
         return None
     if out.shape != query.shape or not out.is_contiguous():
         return None
@@ -545,6 +556,12 @@ def select_cake_fmha_decode_route(
         return None
     num_q_heads = int(query.shape[1])
     num_kv_heads = int(key_cache.shape[1])
+    if (
+        query.stride(0) <= 0
+        or query.stride(1) <= 0
+        or query.stride(0) != num_q_heads * query.stride(1)
+    ):
+        return None
     if num_q_heads <= 0 or num_kv_heads <= 0 or num_q_heads % num_kv_heads:
         return None
     if not 1 <= num_q_heads // num_kv_heads <= 8:
@@ -601,7 +618,8 @@ def select_cake_fmha_decode_route(
     no_block_scales = key_block_scales is None and value_block_scales is None
     if dtypes == (torch.bfloat16,) * 4:
         if (
-            query.shape[2] == 128
+            query.is_contiguous()
+            and query.shape[2] == 128
             and key_cache.shape[2:] == (16, 128)
             and kv_layout == "HND"
             and uses_shared_paged_kv_idx
@@ -651,6 +669,7 @@ def select_cake_fmha_decode_route(
             return route("decode_native_fp16_nhd", selected_page_size=32)
         if (
             query.shape[2] == 512
+            and query.is_contiguous()
             and key_cache.shape[2:] == (64, 512)
             and kv_layout == "HND"
             and uses_shared_paged_kv_idx
@@ -675,7 +694,12 @@ def select_cake_fmha_decode_route(
             return route("decode_native_fp16_hd512", selected_page_size=64)
         return None
 
-    quant_extensions_absent = sinks is None and lse is None and window_left == -1
+    quant_extensions_absent = (
+        sinks is None
+        and lse is None
+        and window_left == -1
+        and skip_softmax_threshold_scale_factor in (None, 0.0)
+    )
     if (
         dtypes == (torch.float8_e4m3fn,) * 4
         and q_len == 1
@@ -945,9 +969,13 @@ def select_cake_fmha_context_route(
 
     if batch_size <= 0 or max_q_len <= 0 or max_kv_len <= 0 or window_left != -1:
         return None
-    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+    if not _decode_quant_scale_supported(
+        bmm1_scale, query
+    ) or not _decode_quant_scale_supported(bmm2_scale, query):
         return None
-    if skip_softmax_threshold_scale_factor not in (None, 0.0):
+    if not _pinned_noop_skip_softmax_supported(
+        skip_softmax_threshold_scale_factor
+    ):
         return None
     if query.ndim != 3 or query.stride(2) != 1:
         return None
@@ -1012,13 +1040,19 @@ def select_cake_fmha_context_route(
 
     dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
     no_block_scales = key_block_scales is None and value_block_scales is None
+    host_scalar_scales = not isinstance(
+        bmm1_scale, torch.Tensor
+    ) and not isinstance(bmm2_scale, torch.Tensor)
     component = None
     if (
         dtypes == (torch.bfloat16,) * 4
         and query.shape[2] == 128
         and key_cache.shape[3] == 128
-        and kv_layout == "HND"
+        and kv_layout in ("HND", "NHD")
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
         and no_block_scales
+        and host_scalar_scales
         and float(bmm2_scale) == 1.0
     ):
         component = "context_bf16"
@@ -1026,7 +1060,9 @@ def select_cake_fmha_context_route(
         dtypes == (torch.float8_e4m3fn,) * 4
         and query.shape[2] == 128
         and key_cache.shape[3] == 128
-        and kv_layout == "HND"
+        and kv_layout in ("HND", "NHD")
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
         and no_block_scales
     ):
         component = "context_fp8"
@@ -1037,6 +1073,7 @@ def select_cake_fmha_context_route(
         and kv_layout == "NHD"
         and not uses_shared_paged_kv_idx
         and no_block_scales
+        and host_scalar_scales
         and not is_causal
         and sinks is None
         and lse is None
@@ -1078,6 +1115,7 @@ def select_cake_fmha_context_route(
         and is_causal
         and sinks is None
         and lse is None
+        and skip_softmax_threshold_scale_factor in (None, 0.0)
         and key_block_scales is not None
         and value_block_scales is not None
         and key_block_scales.dtype == torch.float8_e4m3fn

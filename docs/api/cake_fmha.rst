@@ -22,8 +22,12 @@ JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive copy
 of that product record.
 
 All 1,798 optimized cells have authenticated high-level adapters for their
-complete component chains.  Selector misses, insufficient route workspace,
-and NVFP4 adapter load failures fail closed to ``compat_v1``.
+complete component chains.  The selector accepts the pinned matrix's normalized
+NHD context views and device scalar FP8/NVFP4 scales.  Its numerically inert
+``1e-30`` skip-softmax probe is canonicalized to ordinary softmax only after an
+exact optimized match; other nonzero thresholds remain compatibility routes.
+Selector misses, insufficient route workspace, and NVFP4 adapter load failures
+fail closed to ``compat_v1``.
 
 Optimized routes are fail-closed.  In particular, optimized FP8 decode is
 qualified for HND pages, a shared K/V page table, and GQA group size eight;
@@ -31,14 +35,16 @@ other valid FP8 decode shapes remain Cake-owned and use the authenticated
 complete-domain component.
 
 The manifest's per-route counts are inventory metadata, not a proof that a
-particular high-level selector revision reproduces the pinned matrix.  Before
-promotion, both a fresh source checkout and the installed wheel must replay the
-independent pinned capability corpus (80,768 raw cells, 57,280 valid cells) and
-match its route intent exactly: 1,400 existing optimized cells plus 398 added
-optimized cells, while the remaining 55,482 valid cells select
-``compat_v1``.  The same source and wheel runs must then exercise the selected
-route on SM100a and SM103a; representative family tests and manifest-count
-accounting do not replace that gate.
+particular high-level selector revision reproduces the pinned matrix.  The
+checked-in allocation-free replay therefore enumerates the independent pinned
+capability corpus (80,768 raw cells, 57,280 valid cells), calls the actual
+high-level selectors, and authenticates every case/route pair with canonical
+SHA-256 ``d47bf01c2d27409c6a39759d02e30bb9df65e98c353f53d7335081dd26b3f3a8``.
+It requires exactly 1,798 optimized cells and 55,482 ``compat_v1`` cells, with
+the same per-route accounting as the manifest.  Both a fresh source checkout
+and the installed wheel must execute this replay and then exercise selected
+routes on SM100a and SM103a; representative family tests and manifest-count
+accounting do not replace those gates.
 
 The distributed-context-parallel feature remains additive.  Supplying
 ``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects

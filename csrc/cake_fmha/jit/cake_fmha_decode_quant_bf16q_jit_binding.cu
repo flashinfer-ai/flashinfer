@@ -139,6 +139,7 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
 
 __global__ void PrepareQuantDecode(
     const __nv_bfloat16* query, __nv_bfloat16* padded_query, int query_items, int group_size,
+    int64_t query_stride_batch, int64_t query_stride_head, int64_t query_stride_dim,
     const int* page_table, int* padded_page_table, int page_items, int table_rows,
     int source_pages, int padded_pages, float* bmm1_scalar_ptr, float bmm1_scalar,
     float* bmm2_scalar_ptr, float bmm2_scalar) {
@@ -149,9 +150,11 @@ __global__ void PrepareQuantDecode(
     int kv_head = (index / (kHeadDim * kTileQ)) % NUM_KV_HEADS;
     int batch = index / (kHeadDim * kTileQ * NUM_KV_HEADS);
     int source_head = kv_head * group_size + padded_head;
-    padded_query[index] = padded_head < group_size
-                              ? query[(batch * NUM_Q_HEADS + source_head) * kHeadDim + dim]
-                              : __float2bfloat16(0.0f);
+    padded_query[index] =
+        padded_head < group_size
+            ? query[batch * query_stride_batch + source_head * query_stride_head +
+                    dim * query_stride_dim]
+            : __float2bfloat16(0.0f);
   }
   if (padded_page_table != nullptr && index < page_items) {
     int column = index % padded_pages;
@@ -188,8 +191,11 @@ void cake_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_bfloat16);
   TVM_FFI_ICHECK_EQ(query.ndim(), 3);
-  TVM_FFI_ICHECK(query.IsContiguous());
   TVM_FFI_ICHECK_EQ(query.size(2), kHeadDim);
+  TVM_FFI_ICHECK_EQ(query.stride(2), 1);
+  TVM_FFI_ICHECK_GT(query.stride(0), 0);
+  TVM_FFI_ICHECK_GT(query.stride(1), 0);
+  TVM_FFI_ICHECK_EQ(query.stride(0), query.size(1) * query.stride(1));
   TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(query.data_ptr()) % 16, 0);
   TVM_FFI_ICHECK_EQ(out.ndim(), 3);
   TVM_FFI_ICHECK_EQ(out.size(0), query.size(0));
@@ -292,7 +298,7 @@ void cake_paged_attention_decode(
   int64_t padded_pages = std::max<int64_t>(source_pages, required_pages);
   bool needs_page_padding = source_pages < padded_pages;
   int group_size = NUM_Q_HEADS / NUM_KV_HEADS;
-  bool needs_query_padding = group_size != kTileQ;
+  bool needs_query_padding = group_size != kTileQ || !query.IsContiguous();
 
   int64_t cursor = 0;
   int64_t bmm1_offset = cursor;
@@ -352,7 +358,8 @@ void cake_paged_attention_decode(
   int const blocks = static_cast<int>((prep_items + threads - 1) / threads);
   PrepareQuantDecode<<<blocks, threads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(query.data_ptr()), padded_query,
-      static_cast<int>(padded_query_items), group_size,
+      static_cast<int>(padded_query_items), group_size, query.stride(0),
+      query.stride(1), query.stride(2),
       static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
       static_cast<int>(page_items), table_rows, static_cast<int>(source_pages),
       static_cast<int>(padded_pages), bmm1_tensor.has_value() ? nullptr : bmm1_ptr, bmm1_scalar,
