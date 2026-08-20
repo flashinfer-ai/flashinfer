@@ -169,6 +169,22 @@ def _reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor
     )
 
 
+def _collapse_to_vmk(partitioned_sf: cute.Tensor):
+    """Collapse a partitioned scale-factor view down to rank-3 ``(V, MN, K)``.
+
+    ``cute.flatten`` normalizes *nesting* but not the *number* of modes. The
+    SF SMEM layout carries a ``blk_sf // mma_nsf`` K sub-mode whose extent is
+    ``1`` for NVF4 (``mma_nsf == 4``) but ``2`` for MXF4 (``mma_nsf == 2``),
+    so MXF4 keeps one extra non-degenerate K mode and the view ends up at
+    rank 4. The mainloop indexes these fragments as ``t[None, tile, k_block]``,
+    which requires exactly rank 3, so fold the trailing K modes into one.
+    """
+    rank = cute.rank(partitioned_sf)
+    if rank > 3:
+        partitioned_sf = cute.group_modes(partitioned_sf, 2, rank)
+    return partitioned_sf
+
+
 class DenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) for
     Blackwell GeForce architecture using warp-level MMA.
@@ -572,22 +588,6 @@ class DenseGemmKernel:
             dst = cute.group_modes(dst, src_rank - 1, dst_rank)
         return src, dst
 
-    @staticmethod
-    def _collapse_to_vmk(partitioned_sf: cute.Tensor):
-        """Collapse a partitioned scale-factor view down to rank-3 ``(V, MN, K)``.
-
-        ``cute.flatten`` normalizes *nesting* but not the *number* of modes. The
-        SF SMEM layout carries a ``blk_sf // mma_nsf`` K sub-mode whose extent is
-        ``1`` for NVF4 (``mma_nsf == 4``) but ``2`` for MXF4 (``mma_nsf == 2``),
-        so MXF4 keeps one extra non-degenerate K mode and the view ends up at
-        rank 4. The mainloop indexes these fragments as ``t[None, tile, k_block]``,
-        which requires exactly rank 3, so fold the trailing K modes into one.
-        """
-        rank = cute.rank(partitioned_sf)
-        if rank > 3:
-            partitioned_sf = cute.group_modes(partitioned_sf, 2, rank)
-        return partitioned_sf
-
     def _partition_fragment_SFA(
         self,
         sfa_tensor: cute.Tensor,
@@ -600,7 +600,7 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
-        partitioned_sfa = self._collapse_to_vmk(partitioned_sfa)
+        partitioned_sfa = _collapse_to_vmk(partitioned_sfa)
         return cute.make_fragment_like(partitioned_sfa)
 
     def _partition_fragment_SFB(
@@ -616,7 +616,7 @@ class DenseGemmKernel:
         partitioned_sfb = thr_tensor[thr_vnk, (None, None)]
         partitioned_sfb = cute.group_modes(cute.flatten(partitioned_sfb), 0, 2)
         partitioned_sfb = cute.group_modes(partitioned_sfb, 1, 3)
-        partitioned_sfb = self._collapse_to_vmk(partitioned_sfb)
+        partitioned_sfb = _collapse_to_vmk(partitioned_sfb)
         return cute.make_fragment_like(partitioned_sfb)
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):

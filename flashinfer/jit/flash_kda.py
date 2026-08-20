@@ -27,7 +27,13 @@ from .core import (
     sm100f_nvcc_flags,
 )
 
-FlashKDAVariant = Literal["m64", "m128", "m128_n16", "persistent_m128"]
+FlashKDAVariant = Literal[
+    "m64",
+    "m128",
+    "m128_n16",
+    "persistent_m128",
+    "small_bh_m128",
+]
 FlashKDATarget = Literal["sm100a", "sm100f"]
 
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
@@ -35,6 +41,7 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m128",
     "m128_n16",
     "persistent_m128",
+    "small_bh_m128",
 )
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -54,6 +61,7 @@ _FLASH_KDA_MODULE_IDENTS = {
     "m128": "ea022a2f1f",
     "m128_n16": "ef8b47d690",
     "persistent_m128": "64bc19d01c",
+    "small_bh_m128": "73369168de",
 }
 
 _FLASH_KDA_BINDING_STEMS = {
@@ -61,6 +69,7 @@ _FLASH_KDA_BINDING_STEMS = {
     "m128": "flashkda_bf16_fused_m128",
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
+    "small_bh_m128": "cake_flashkda_bf16_small_bh_m128",
 }
 
 
@@ -167,6 +176,12 @@ def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("persistent_m128", target)
 
 
+def gen_flash_kda_small_bh_m128_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the fixed-layout small-BH owner/helper M128 module."""
+
+    return gen_flash_kda_module("small_bh_m128", target)
+
+
 @functools.cache
 def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Build or load one physical, target-specific FlashKDA module."""
@@ -200,6 +215,12 @@ def load_flash_kda_persistent_m128_module(target: FlashKDATarget):
     return load_flash_kda_module("persistent_m128", target)
 
 
+def load_flash_kda_small_bh_m128_module(target: FlashKDATarget):
+    """Load the fixed-layout small-BH owner/helper M128 module."""
+
+    return load_flash_kda_module("small_bh_m128", target)
+
+
 def get_flash_kda_prefill_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
 
@@ -214,6 +235,7 @@ __all__ = [
     "gen_flash_kda_m128_module",
     "gen_flash_kda_m128_n16_module",
     "gen_flash_kda_persistent_m128_module",
+    "gen_flash_kda_small_bh_m128_module",
     "gen_flash_kda_module",
     "get_flash_kda_prefill_module",
     "get_flash_kda_uri",
@@ -221,5 +243,6 @@ __all__ = [
     "load_flash_kda_m128_module",
     "load_flash_kda_m128_n16_module",
     "load_flash_kda_persistent_m128_module",
+    "load_flash_kda_small_bh_m128_module",
     "load_flash_kda_module",
 ]

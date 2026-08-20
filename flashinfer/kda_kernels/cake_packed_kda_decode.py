@@ -21,9 +21,13 @@ from typing import Literal, Optional
 import torch
 
 from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.cake_kda_packed_t1 import (
+    CakeKDAPackedT1Target,
+    get_cake_kda_packed_t1_module,
+    select_cake_kda_packed_t1_variant,
+)
 from ..jit.cake_flash_kda_packed_t1 import (
-    FlashKDAPackedT1Target,
-    _variant_for_batch,
+    _variant_for_batch as _legacy_variant_for_batch,
     get_flash_kda_packed_t1_module,
 )
 from ..utils import get_compute_capability
@@ -33,7 +37,7 @@ _HEAD_DIM = 128
 _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 
 
-def _target_for_device(device: torch.device) -> FlashKDAPackedT1Target:
+def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
     """Select the legacy exact target or the SM100-family target."""
 
     compute_capability = get_compute_capability(device)
@@ -54,6 +58,36 @@ def _target_for_device(device: torch.device) -> FlashKDAPackedT1Target:
         "or 10.3 in the SM100 family; got "
         f"{compute_capability[0]}.{compute_capability[1]}"
     )
+
+
+def _optimized_alignment_flags(
+    mixed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[bool, bool]:
+    """Resolve only the physical alignment facts used by the final selector."""
+
+    state_aligned = (
+        isinstance(state, torch.Tensor)
+        and state.ndim >= 1
+        and int(state.data_ptr()) % 16 == 0
+        and int(state.stride(0)) % 8 == 0
+    )
+    aux_vec4_aligned = (
+        isinstance(raw_gate, torch.Tensor)
+        and raw_gate.ndim >= 1
+        and isinstance(dt_bias, torch.Tensor)
+        and int(mixed_qkv.data_ptr()) % 8 == 0
+        and (int(mixed_qkv.data_ptr()) + _HEADS * _HEAD_DIM * mixed_qkv.element_size())
+        % 8
+        == 0
+        and int(mixed_qkv.stride(0)) % 4 == 0
+        and int(raw_gate.data_ptr()) % 8 == 0
+        and int(raw_gate.stride(0)) % 4 == 0
+        and int(dt_bias.data_ptr()) % 16 == 0
+    )
+    return state_aligned, aux_vec4_aligned
 
 
 def run_packed_kda_decode(
@@ -104,9 +138,20 @@ def run_packed_kda_decode(
         raise ValueError("output must be contiguous with shape [B,1,12,128]")
     output_view = output.view(batch, _HEADS, _HEAD_DIM)
 
-    variant = _variant_for_batch(batch)
     target = _target_for_device(mixed_qkv.device)
-    module = get_flash_kda_packed_t1_module(variant, target)
+    state_aligned, aux_vec4_aligned = _optimized_alignment_flags(
+        mixed_qkv, raw_gate, dt_bias, state
+    )
+    optimized_variant = select_cake_kda_packed_t1_variant(
+        batch,
+        state_aligned=state_aligned,
+        aux_vec4_aligned=aux_vec4_aligned,
+    )
+    if optimized_variant is None:
+        legacy_variant = _legacy_variant_for_batch(batch)
+        module = get_flash_kda_packed_t1_module(legacy_variant, target)
+    else:
+        module = get_cake_kda_packed_t1_module(optimized_variant, target)
     module.run(
         mixed_qkv,
         raw_gate,
