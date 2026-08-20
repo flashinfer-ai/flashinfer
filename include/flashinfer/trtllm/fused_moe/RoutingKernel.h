@@ -218,6 +218,9 @@ namespace routingPrecomputed {
 /// Maximum number of tile-specific metadata outputs fused into one routing launch.
 inline constexpr int32_t kMaxRoutingMetadataTiles = 8;
 
+/// Maximum token count materialized by one fused multi-tile routing launch.
+inline constexpr int32_t kMaxTokensMultiTileCluster = 8192;
+
 /// Storage representation supplied to the fused precomputed-routing launch.
 enum class ExpertIdType : int32_t { Packed = 0, Int16 = 1, Int32 = 2 };
 
