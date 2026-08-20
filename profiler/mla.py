@@ -19,12 +19,36 @@ import argparse
 import torch
 
 import flashinfer
-from flashinfer.profiler import export_to_perfetto_trace
+
+
+def _check_mla_profiler_support(backend):
+    if backend != "fa3":
+        raise ValueError(
+            "Intra-kernel MLA profiling is only implemented for the FA3 backend, "
+            f"got backend={backend!r}."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Intra-kernel MLA profiling requires an NVIDIA Hopper GPU, but CUDA "
+            "is not available."
+        )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = torch.cuda.get_device_capability(device)
+    if major != 9:
+        raise RuntimeError(
+            "Intra-kernel MLA profiling with the FA3 backend requires an NVIDIA "
+            f"Hopper GPU (compute capability 9.x); found "
+            f"{torch.cuda.get_device_name(device)} (compute capability {major}.{minor})."
+        )
 
 
 def profile_deepseek_mla_decode(
     batch_size, seq_len, num_heads, profiler_buffer_size, backend
 ):
+    _check_mla_profiler_support(backend)
+    from flashinfer.profiler import export_to_perfetto_trace
+
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 1
