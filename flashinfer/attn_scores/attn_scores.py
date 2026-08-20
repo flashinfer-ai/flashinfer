@@ -28,6 +28,7 @@ Both are SM100 (B200-class Blackwell) only.
 
 import functools
 import importlib.util
+import os
 from typing import Tuple
 
 import numpy as np
@@ -163,13 +164,14 @@ def _validate_paged_inputs(
     Int32 fakes; a CPU or int64 tensor would make the kernel dereference a bad
     pointer or misread storage) and have exactly ``batch_size`` rows.
 
-    NOTE (caller invariant, not checked here — would need a device sync): the
-    kernel reads ceil(context_lens[b]/128) compute tiles * (128 // block_size)
-    physical blocks per row, so ``block_table`` must have at least
+    NOTE (caller invariant, not checked here): the kernel reads
+    ceil(context_lens[b]/128) compute tiles * (128 // block_size) physical
+    blocks per row, so ``block_table`` must have at least
     ``max_b ceil(context_lens[b]/128) * (128 // block_size)`` columns. A
-    narrower block_table causes an out-of-bounds read. Verifying this cheaply is
-    impossible without a D2H copy of context_lens (which would break CUDA-graph
-    capture), so it is the caller's responsibility."""
+    narrower block_table causes an out-of-bounds read. The bound needs the
+    per-row lengths from device memory, so it cannot be checked here without a
+    D2H copy; :func:`_validate_block_table_width` performs it when
+    ``FLASHINFER_VALIDATE_INPUTS`` is set."""
     if not (context_lens.is_cuda and context_lens.dtype == torch.int32):
         raise ValueError(
             f"context_lens must be an int32 CUDA tensor, got "
@@ -232,6 +234,55 @@ def _validate_out(
             f"the SPLIT_KV=256-padded trailing region. Use "
             f"padded_context_len(max_context_len) for the column count. "
             f"Got shape {tuple(out.shape)}."
+        )
+
+
+def _sync_input_validation_enabled() -> bool:
+    """``FLASHINFER_VALIDATE_INPUTS=1`` opts into checks that need a device sync."""
+    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+
+
+def _validate_block_table_width(
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    fn_name: str,
+) -> None:
+    """Debug-mode check that ``block_table`` is wide enough for the kernel.
+
+    The kernel walks KV in ``_COMPUTE_BLOCK_KV``-token compute tiles and reads
+    ``_COMPUTE_BLOCK_KV // block_size`` pages per tile, so it indexes columns up
+    to ``ceil(ctx / _COMPUTE_BLOCK_KV) * (_COMPUTE_BLOCK_KV // block_size)``.
+    That exceeds the natural ``ceil(ctx / block_size)`` whenever ctx is not a
+    multiple of ``_COMPUTE_BLOCK_KV`` -- ctx=257 with block_size=64 needs 6
+    columns, not 5.  The kernel only guards that the *tile* exists, not that
+    every page in it does, so a naturally-sized table is read out of bounds:
+    interior rows silently pick up the next row's entry (a valid pool index
+    belonging to another sequence), and the last row reads past the allocation,
+    feeding a wild index to the KV TMA load.
+
+    The bound depends on the per-row ``context_lens``, which live on device, so
+    this costs a D2H copy.  It is therefore opt-in via
+    ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph capture, where
+    a sync is illegal.  ``max_context_len`` cannot stand in for the per-row
+    lengths: it is the output width (typically the model maximum), so it
+    over-estimates the requirement by the ratio between it and the real lengths.
+    """
+    if not _sync_input_validation_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    pages_per_tile = _COMPUTE_BLOCK_KV // block_size
+    tiles = (context_lens.to(torch.int64) + _COMPUTE_BLOCK_KV - 1) // _COMPUTE_BLOCK_KV
+    need = int((tiles * pages_per_tile).max().item())  # D2H sync
+    if block_table.shape[1] < need:
+        raise ValueError(
+            f"{fn_name}: block_table has {block_table.shape[1]} columns but the "
+            f"kernel indexes up to {need} for these context_lens with "
+            f"block_size={block_size} (ceil(ctx/{_COMPUTE_BLOCK_KV}) compute "
+            f"tiles x {pages_per_tile} pages per tile). Columns past a "
+            f"sequence's real pages are read but masked, so they may hold any "
+            f"valid pool index (0 works)."
         )
 
 
@@ -830,6 +881,13 @@ def fp8_paged_mqa_logits(
         context_lens:    [batch_size]  int32  (CUDA)
         block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
                          Values are physical block indices into kv_fused's dim 0.
+                         max_blocks_per_seq must be at least
+                         max_b round_up(context_lens[b], 128) // block_size --
+                         wider than ceil(context_lens[b] / block_size) when a
+                         length is not a multiple of 128 (context_len=257 with
+                         block_size=64 needs 6 columns, not 5).  Extra entries
+                         may be any valid index (0); too few is an out-of-bounds
+                         read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
         max_context_len: int  maximum KV sequence length
         output_dtype:    output tensor dtype (float32 or float16)
         epi_dtype:       epilogue accumulation dtype (float32 or float16)
@@ -884,6 +942,9 @@ def fp8_paged_mqa_logits(
         w_2d = weights.reshape(B, next_n * H).t()  # [next_n*H, B]
     kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
 
+    _validate_block_table_width(
+        block_table, context_lens, block_size, "fp8_paged_mqa_logits"
+    )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
@@ -1089,6 +1150,13 @@ def fp4_paged_mqa_logits(
         context_lens:    [batch_size]  int32  (CUDA)
         block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
                          Values are physical block indices into kv_fused's dim 0.
+                         max_blocks_per_seq must be at least
+                         max_b round_up(context_lens[b], 128) // block_size --
+                         wider than ceil(context_lens[b] / block_size) when a
+                         length is not a multiple of 128 (context_len=257 with
+                         block_size=64 needs 6 columns, not 5).  Extra entries
+                         may be any valid index (0); too few is an out-of-bounds
+                         read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
         max_context_len: int  maximum KV sequence length
         sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor.
                          Determines both sf_q's packing and the scale-factor
@@ -1161,6 +1229,9 @@ def fp4_paged_mqa_logits(
         w_2d = weights.reshape(B, next_n * H).t()
     kv_flat = kv_fused.flatten(1)
 
+    _validate_block_table_width(
+        block_table, context_lens, block_size, "fp4_paged_mqa_logits"
+    )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
