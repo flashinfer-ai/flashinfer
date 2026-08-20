@@ -776,7 +776,7 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
 
     assert cake_api.cake_fmha_route_is_optimized(fp16_route)
     assert cake_api.cake_fmha_route_is_optimized(bf16q_route)
-    assert not cake_api.cake_fmha_route_is_optimized(nvfp4_route)
+    assert cake_api.cake_fmha_route_is_optimized(nvfp4_route)
 
     hd512_q = torch.empty((2, 4, 512), dtype=torch.float16)
     stacked_hnd = torch.empty((4, 2, 2, 64, 512), dtype=torch.float16)
@@ -1058,7 +1058,7 @@ def test_cake_fmha_nvfp4_load_failure_fails_closed_to_compat(monkeypatch) -> Non
         )
 
 
-def test_cake_fmha_context_candidate_selection_for_unexported_families(monkeypatch) -> None:
+def test_cake_fmha_context_candidate_selection_for_adapter_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
 
     def select(
