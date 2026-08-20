@@ -192,7 +192,7 @@ def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="checkpoint route requires FP16",
+        match="checkpoint route requires the frozen FP16/FP32 packed contract",
     ):
         _prefill(
             io_dtype="bfloat16",
