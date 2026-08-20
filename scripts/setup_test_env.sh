@@ -97,10 +97,18 @@ fi
 # downgrade the DSL this job just pinned and leave libs-cu13 skewed (#4555). Its
 # remaining deps are either already installed (torch, apache-tvm-ffi, einops) or
 # listed alongside it here.
-SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
-if [ "${SM_MAJOR}" = "10" ]; then
+#
+# Match on the full capability, not just the major version: SM107 (Rubin) is
+# also major 10, but the blk128 backend is SM100/SM103 only (see
+# flashinfer/cute_dsl/sparse/sm100_blk128/, and the (10,0)/(10,3) allowlist in
+# tests/attention/test_vsa_block_sparse.py), so those tests skip on Rubin and
+# the install is pure cost there.  --no-deps already prevents the DSL downgrade;
+# skipping the install altogether also avoids perturbing a Rubin environment
+# that nothing in this package needs.
+SM_CAP=$(python -c "import torch; print('%d.%d' % torch.cuda.get_device_capability())" 2>/dev/null || echo "")
+if [ "${SM_CAP}" = "10.0" ] || [ "${SM_CAP}" = "10.3" ]; then
   echo "========================================"
-  echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "Detected SM${SM_CAP} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
   echo "========================================"
   DSL_VERSION_BEFORE=$(python -c "import importlib.metadata as m; print(m.version('nvidia-cutlass-dsl'))" 2>/dev/null || echo "")
   pip install --no-deps "quack-kernels==0.6.4" "torch-c-dlpack-ext==0.1.5"
