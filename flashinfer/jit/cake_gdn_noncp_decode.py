@@ -34,8 +34,8 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-gdn-noncp-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "de4f74c8ba9526bd75c073bbf177d7737e3c31d4c84a0abc66865818bd86da63"
-_GENERATOR_COMMIT = "eb862f0aa7742c1eb0b6275e48ef3d70ac53e1c3"
+_MANIFEST_SHA256 = "03fcbc8bede1843773be6706c4cc67703f25b2808bf3eea990eb20a8582fe8f4"
+_GENERATOR_COMMIT = "1ad1faf130d28fe629d13fb01bbdc9d3749676ae"
 _BASELINE_REVISIONS = {
     "decode": "1bc1cd99461e61fe99a4a35aa873879ac08130b5",
     "prefill": "8044d94bf9acc5369857baf88d28906bb32bf264",
@@ -108,12 +108,12 @@ def _manifest() -> dict[str, Any]:
         True,
         False,
         _BASELINE_REVISIONS,
-        1768,
-        3536,
-        3476,
-        60,
-        82,
-        82,
+        1769,
+        3538,
+        3484,
+        54,
+        86,
+        86,
         "one listed Cake variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -337,6 +337,7 @@ def select_cake_gdn_prefill_variant(
     store_final_state: bool,
     checkpoint_every_n_tokens: int,
     use_state_indices: bool,
+    seq_lens: tuple[int, ...] | None = None,
 ) -> CakeGDNRoute:
     """Resolve host-visible non-CP metadata to one frozen Cake variant."""
 
@@ -390,18 +391,34 @@ def select_cake_gdn_prefill_variant(
             "low-precision state requires BF16 I/O, initial+final state, "
             "no checkpoints, and packed state"
         )
-    if enable_checkpoints and (
-        io_dtype != "float16"
-        or state_dtype != "float32"
-        or use_initial_state
-        or not store_final_state
-        or use_state_indices
+    legacy_checkpoint_route = (
+        io_dtype == "float16"
+        and state_dtype == "float32"
+        and not use_initial_state
+        and store_final_state
+        and not use_state_indices
+    )
+    sglang_tp4_checkpoint_route = (
+        io_dtype == "bfloat16"
+        and state_dtype == "bfloat16"
+        and use_initial_state
+        and store_final_state
+        and use_state_indices
+        and checkpoint_every_n_tokens == 64
+        and (num_q_heads, num_k_heads, num_v_heads) == (4, 4, 8)
+        and seq_lens == (52, 93, 15, 107, 72, 61, 21)
+        and num_seqs == 7
+        and total_seq_len == 421
+        and max_seq_len == 107
+    )
+    if enable_checkpoints and not (
+        legacy_checkpoint_route or sglang_tp4_checkpoint_route
     ):
         raise CakeGDNUnsupportedError(
-            "checkpoint route requires FP16 I/O, FP32 state, no initial state, "
-            "final state, and packed state"
+            "checkpoint route requires the frozen FP16/FP32 packed contract or "
+            "the exact SGLang TP4 BF16 indexed B7/T421 contract"
         )
-    dvsplit = 4 * num_seqs * num_o_heads <= _ARCH_ACTIVE_CLUSTERS[arch]
+    dvsplit = 2 * num_seqs * num_o_heads <= _ARCH_ACTIVE_CLUSTERS[arch]
     if low_precision_state and not dvsplit:
         raise CakeGDNUnsupportedError(
             "low-precision state requires the DV-split physical schedule"

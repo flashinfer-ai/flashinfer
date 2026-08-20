@@ -58,12 +58,12 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["generator_commit"] == ("eb862f0aa7742c1eb0b6275e48ef3d70ac53e1c3")
-    assert manifest["contract_row_count"] == 1768
-    assert manifest["architecture_row_count"] == 3536
-    assert manifest["admitted_architecture_rows"] == 3476
-    assert manifest["fail_closed_architecture_rows"] == 60
-    assert manifest["variant_count"] == len(manifest["variants"]) == 82
+    assert manifest["generator_commit"] == ("1ad1faf130d28fe629d13fb01bbdc9d3749676ae")
+    assert manifest["contract_row_count"] == 1769
+    assert manifest["architecture_row_count"] == 3538
+    assert manifest["admitted_architecture_rows"] == 3484
+    assert manifest["fail_closed_architecture_rows"] == 54
+    assert manifest["variant_count"] == len(manifest["variants"]) == 86
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
@@ -157,6 +157,38 @@ def test_prefill_resolver_selects_sglang_tp4_bf16_indexed_row() -> None:
     }
 
 
+def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
+    route = _prefill(
+        arch="sm_103a",
+        io_dtype="bfloat16",
+        state_dtype="bfloat16",
+        num_seqs=7,
+        total_seq_len=421,
+        max_seq_len=107,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=8,
+        use_initial_state=True,
+        store_final_state=True,
+        checkpoint_every_n_tokens=64,
+        use_state_indices=True,
+        seq_lens=(52, 93, 15, 107, 72, 61, 21),
+    )
+
+    assert route.route_id == "cake.gdn_prefill.noncp.checkpoints.dvsplit"
+    record = cake_gdn._kernel_record(route.variant_name)
+    assert record["specializations"] == {
+        "ENABLE_CHECKPOINTS": 1,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1,
+    }
+
+
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -166,6 +198,25 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
             io_dtype="bfloat16",
             use_initial_state=False,
             checkpoint_every_n_tokens=64,
+        )
+
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError,
+        match="exact SGLang TP4 BF16 indexed B7/T421",
+    ):
+        _prefill(
+            io_dtype="bfloat16",
+            state_dtype="bfloat16",
+            num_seqs=7,
+            total_seq_len=421,
+            max_seq_len=107,
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=8,
+            use_initial_state=True,
+            store_final_state=True,
+            checkpoint_every_n_tokens=64,
+            use_state_indices=True,
         )
 
     with pytest.raises(
