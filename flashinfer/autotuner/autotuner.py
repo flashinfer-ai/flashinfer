@@ -192,7 +192,7 @@ _CACHE_GENERATION_KEY = "_generation"
 _INDETERMINATE_META_VALUES = (None, "unknown", "None")
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_cublas_version() -> str:
     """Return the cuBLAS version as ``major.minor.patch`` (cached: probing
     spawns ldconfig subprocesses and the result is static per process).
@@ -1199,7 +1199,7 @@ class _CuptiInfraError(RuntimeError):
     process instead of marking every tactic as failed."""
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _load_cupti():
     """Return the ``cupti`` module if cupti-python >= 13 is usable, else None.
 
@@ -1257,6 +1257,12 @@ def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list
     once per tactic; flush + disable suffices) and deliberately
     per-measurement enable/disable (session-scoped tracing would instrument
     every intervening warmup/synthesis kernel).
+
+    Raises:
+        _CuptiInfraError: CUPTI activity tracing could not be initialised
+            (e.g. another subscriber holds the single-subscriber activity
+            API).  Callers timing tactics must catch it and fall back to
+            CUDA-event timing, as ``_profile_single_kernel`` does.
     """
     cupti = _load_cupti()
     assert cupti is not None
@@ -1586,7 +1592,7 @@ class AutoTuner:
     @property
     def _effective_measure_policy(self):
         """Active autotune_v2 measurement policy for this thread, or ``None``."""
-        return getattr(self._v2_local, "measure", None)
+        return self._v2_local.measure
 
     def _apply_measure_policy(
         self, tuning_config: TuningConfig, policy
@@ -1666,14 +1672,14 @@ class AutoTuner:
         working after warmup exits.
         """
         local = self._v2_local
-        if getattr(local, "active", False):
+        if local.active:
             return local.store
         return self._managed_cache
 
     @property
     def _in_v2_context(self) -> bool:
         """Whether an autotune_v2 context is open on this thread."""
-        return getattr(self._v2_local, "active", False)
+        return self._v2_local.active
 
     def _winner_cache(self) -> dict:
         """In-memory winner-cache partition for the active MEASUREMENT identity.
@@ -2788,6 +2794,12 @@ class AutoTuner:
         kernel starts).  Input-buffer rotation is not usable here because
         the CUDA-graph mode replays a single captured iteration, which
         binds the captured tensors.
+
+        Raises:
+            _CuptiInfraError: propagated from ``_cupti_measure_spans`` when
+                CUPTI tracing cannot initialise.  ``_profile_single_kernel``
+                catches it and disables the cupti path for the process; a
+                new caller must handle it or it will surface as a crash.
         """
         with _profile_measurement_scope():
             for _ in range(self.warmup):
