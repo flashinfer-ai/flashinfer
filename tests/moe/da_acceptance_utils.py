@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from benchmarks.bench_trtllm_moe_da import BenchmarkShape, _benchmark_precision
+from benchmarks.bench_moe_da import BenchmarkShape, _benchmark_precision
 from flashinfer.utils import get_compute_capability
 
 
