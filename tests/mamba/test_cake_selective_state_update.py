@@ -299,7 +299,11 @@ def _make_case(case):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case[0])
-def test_cake_selective_state_update_matches_flashinfer(case) -> None:
+def test_cake_selective_state_update_matches_flashinfer(case, monkeypatch) -> None:
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake selective state update requires SM100 or SM103")
+
     inputs = _make_case(case)
     reference = dict(inputs)
     candidate = dict(inputs)
@@ -313,8 +317,19 @@ def test_cake_selective_state_update_matches_flashinfer(case) -> None:
             "intermediate_states_buffer"
         ].clone()
 
+    cake_hits = []
+    original_try_cake = cake.try_cake_selective_state_update
+
+    def strict_try_cake(**kwargs):
+        hit = original_try_cake(**kwargs)
+        cake_hits.append(hit)
+        return hit
+
+    monkeypatch.setattr(cake, "try_cake_selective_state_update", strict_try_cake)
+
     out_reference = selective_state_update(**reference, backend="flashinfer")
     out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True], "promoted test row fell back instead of running Cake"
     torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         candidate["state"], reference["state"], atol=1e-2, rtol=1e-2

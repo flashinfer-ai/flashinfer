@@ -214,8 +214,10 @@ def selective_state_update(
     algorithm : str
         Algorithm to use: "auto", "simple", "vertical", "horizontal"
     backend : str
-        Backend to use: "auto", "flashinfer", or "cake". Cake is source-built
-        on SM100/SM103 and falls back to FlashInfer outside its promoted rows.
+        Backend to use: "auto", "flashinfer", or "cake". Both "auto" and
+        "flashinfer" use FlashInfer. Cake is an opt-in source-built backend on
+        SM100/SM103; backend="cake" falls back to FlashInfer outside Cake's
+        promoted rows.
 
     Returns
     -------
