@@ -42,19 +42,22 @@ codegen-time quantities.
 # (PEP 563 string-ifies class-body annotations, which breaks ``@cute.struct``
 # element-type introspection).  See moe_nvfp4_swapab/megamoe_kernel.py.
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int64, Int32
+
+from common.host_utils import get_cutedsl_target_arch
 
 try:
-    from cutlass.cute import iket  # type: ignore  # noqa: F401 -- imported for DSL registration side effects
+    from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    pass
+    from src.iket_compat import iket
 
 from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
+from moe_nvfp4_swapab.moe_utils import spin_wait
 from moe_nvfp4_swapab.topk_reduce import TopkReduce
 from src.token_comm import (
     CombineFormat,
@@ -112,7 +115,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
         ] = "epi_warps",
-        epi_flag_batch: Union[int, Tuple[int, int]] = 1,
+        epi_flag_batch: Tuple[int, int] = (1, 1),
         flag_batch: int = 1,
         gate_up_clamp: Optional[float] = None,
         apply_topk_in_fc1: bool = True,
@@ -1040,7 +1043,12 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )
-            TopkReduce(self.hidden, self.num_topk, self.combine_format)(
+            TopkReduce(
+                self.hidden,
+                self.num_topk,
+                self.combine_format,
+                sm_arch=get_cutedsl_target_arch(),
+            )(
                 combine_target,
                 combine_sf,
                 output_activation,

@@ -292,13 +292,22 @@ install_and_verify() {
         python -c "import pytest_timeout"
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.
+        # version skew between libs-base and libs-cu13.  requirements.txt
+        # cannot add the extra conditionally, hence the separate install.
+        #
+        # Keep this a floor, not an exact pin: an exact ==4.7.0 downgrades a
+        # newer CuTe DSL that the test image may ship (the Rubin image ships
+        # 4.8.0a0), which removes cutlass.utils.rubin_helpers and the sm_107a
+        # Arch member and so disables every SM107 path for the whole run.
+        # The a0 suffix is required for pip to consider pre-releases at all.
         if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
+            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.7.0a0"
         fi
 
-        # Install local python sources
-        pip install -e . -v --no-deps
+        # Install local python sources. The env var keeps --no-build-isolation
+        # from activating the build hooks' own downloads (see setup_test_env.sh).
+        FLASHINFER_BUILD_NO_PIP=1 \
+            pip install -e . -v --no-deps --no-build-isolation
         echo ""
 
         # Verify installation

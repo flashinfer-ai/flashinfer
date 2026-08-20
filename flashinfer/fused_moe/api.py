@@ -215,36 +215,60 @@ class ExpertConfig:
 
 
 @dataclass(frozen=True)
-class ExecutionConfig:
-    """Runtime execution parameters.
+class MoEFinalizeConfig:
+    """How the finalize (combine) step behaves.
+
+    Split out of ``ExecutionConfig`` for the same reason ``RoutingConfig`` is
+    its own config: finalize is a distinct architectural concern (how the
+    per-expert partials are reduced back into one row per token), not a
+    runtime knob like PDL or the autotuner token budget.
 
     Parameters
     ----------
     do_finalize : bool
-        Whether to apply routing-weight scaling and accumulate into output.
-    enable_pdl : bool or None
-        Persistent device launch.  ``None`` → auto (True for sm90+).
-    tune_max_num_tokens : int
-        Token budget hint for autotuner / CUDA graph capture.
+        Whether to apply routing-weight scaling and accumulate the per-expert
+        partial results into the output.  ``False`` returns the unreduced
+        per-expert partials, leaving the combine to the caller — only the
+        backends that advertise it support this.
     use_fused_finalize : bool
-        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue
+        (atomic accumulation) instead of running a separate reduction kernel.
+        Backends that do not support it ignore the flag.
     """
 
     do_finalize: bool = True
-    enable_pdl: Optional[bool] = None
-    tune_max_num_tokens: int = 8192
     use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
         if not self.do_finalize:
             parts.append(f"do_finalize={self.do_finalize!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        return f"MoEFinalizeConfig({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Runtime execution parameters.
+
+    Parameters
+    ----------
+    enable_pdl : bool or None
+        Persistent device launch.  ``None`` → auto (True for sm90+).
+    tune_max_num_tokens : int
+        Token budget hint for autotuner / CUDA graph capture.
+    """
+
+    enable_pdl: Optional[bool] = None
+    tune_max_num_tokens: int = 8192
+
+    def __repr__(self) -> str:
+        parts = []
         if self.enable_pdl is not None:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
-        if not self.use_fused_finalize:
-            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -648,8 +672,8 @@ class CuteDslConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 — tighten when CuteDSL adds more targets
-        return arch in (100, 103)
+        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
@@ -876,6 +900,8 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Appended last so existing positional construction keeps working.
+    finalize: MoEFinalizeConfig = field(default_factory=MoEFinalizeConfig)
 
     def __post_init__(self) -> None:
         # Not in check_support(): MoELayer swallows its exceptions to filter

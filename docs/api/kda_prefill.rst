@@ -45,7 +45,11 @@ CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
 include the frozen module identity so an older schedule cannot satisfy a
 refreshed request. Runtime routing remains device-specific: persistent M128
 is restricted to measured 148/152-SM CC 10.0 devices, while CC 10.3 uses the
-direct schedules.
+direct schedules. On either capability, fixed-layout calls with at most eight
+total sequence/head tasks, at most eight heads, and at least 2,048 tokens per
+sequence use the small-BH owner/helper schedule when all eight CTAs per task
+can reside concurrently. Calls outside that measured region continue through
+the existing direct or fallback route; it is not a public-input allowlist.
 
 The frozen H12 N16 schedule's residual recurrence rounds four intermediates
 through BF16: the state/K
@@ -79,7 +83,9 @@ size without synchronizing the device to inspect permutation values.
 When ``seq_order=None``, a cached identity order is used. H12 selects the
 dedicated M128 schedule with a 16-token recurrence chunk for both fixed and
 packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64 value-split kernel;
-all remaining eligible inputs select the general 32-token M128 schedule.
+the fixed small-BH region described above selects its eight-CTA owner/helper
+schedule; all remaining eligible inputs select the general 32-token M128
+schedule.
 
 State and graph semantics
 -------------------------
@@ -125,15 +131,16 @@ be used during CUDA graph capture.
 CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
-state, beta padding, and separate 768-byte M64, M128-N32, and M128-N16 TMA
-descriptor blocks. It binds to the device and CUDA stream of its first
-``recurrent_kda`` call.
+state, beta padding, separate TMA descriptor blocks, and the small-BH compact
+packet ring with its generation counters. It binds to the device and CUDA
+stream of its first ``recurrent_kda`` call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
 beta, and output tensors, then synchronize that stream before capture. Packed
 graphs must also pass preallocated int64 ``cu_seqlens`` and int32
 ``seq_order``. The warm call prepares descriptors; capture accepts only the
 exact warmed pointer, shape, stride, and dtype signature and performs no
-descriptor preparation.
+descriptor preparation. Warm the largest intended small-BH shape before
+capturing so its packet-ring storage is already allocated.
 
 The workspace must outlive its graph and every replay. Use one distinct
 workspace for each captured ``recurrent_kda`` invocation, including two KDA

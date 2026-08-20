@@ -7,6 +7,8 @@ public-API cases. `reduce_kda_h12.py` combines successful SM100a and SM103a
 result files without producing a cross-shape aggregate. The benchmark defaults
 to the natural device/shape dispatcher and records its resolved module; use
 `--candidate-route nonpersistent` for a B200 direct-family route A/B.
+`bench_recurrent_kda_prefill.py --case-set small_bh` runs the four fixed-layout
+small-BH cases through the same cold-L2 CUPTI path.
 
 ## Overview
 

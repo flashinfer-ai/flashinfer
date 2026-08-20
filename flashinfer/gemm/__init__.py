@@ -44,11 +44,16 @@ from .routergemm import (
 # Import CuTe-DSL kernels if available
 _cute_dsl_kernels = []
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.utils import (
+        is_cute_dsl_available,
+        is_rubin_cute_dsl_available,
+    )
 
     if is_cute_dsl_available():
-        from .kernels.grouped_gemm_masked_blackwell import (
+        from .kernels.grouped_gemm_masked_wrapper import (
             grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+        )
+        from .kernels.grouped_gemm_masked_blackwell import (
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
         )
@@ -58,6 +63,17 @@ try:
             "Sm100BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
         ]
+
+        # The SM107 kernel imports cutlass.utils.rubin_helpers at module scope,
+        # which only exists from CuTe DSL 4.8. Gate it separately and extend the
+        # export list incrementally: sharing the try/except above would let an
+        # older DSL take the Blackwell exports down with it.
+        if is_rubin_cute_dsl_available():
+            from .kernels.grouped_gemm_masked_rubin import (
+                Sm107BlockScaledPersistentDenseGemmKernel as Sm107BlockScaledPersistentDenseGemmKernel,
+            )
+
+            _cute_dsl_kernels.append("Sm107BlockScaledPersistentDenseGemmKernel")
 except ImportError:
     pass
 
