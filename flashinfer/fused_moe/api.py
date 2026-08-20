@@ -305,11 +305,13 @@ _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
 # DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
-# MXFP8 activations x MXFP4 weights matches the flat-API skip.
+# MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
+# MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
+# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
 _CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
 
-# MXFP8 x MXFP8 follows the flat CUTLASS skip: SM10x (major == 10),
-# including B300 SM103. Not claimed on SM11x/SM12x.
+# MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
+# (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
 _CUTLASS_MXFP8_ARCHS = (100, 103, 107)
 
 # INT4 W4A8 and Humming MXFP4 x FP8 are Hopper mixed-input paths.
