@@ -239,8 +239,7 @@ def _source_catalog() -> Mapping[str, object]:
     catalog_path = _source_dir() / _SOURCE_CATALOG_RELATIVE_PATH
     if not catalog_path.is_file():
         raise RuntimeError(
-            "Cake SSDCombined generated-source catalog is missing: "
-            f"{catalog_path}"
+            f"Cake SSDCombined generated-source catalog is missing: {catalog_path}"
         )
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     if not isinstance(catalog, dict) or catalog.get("schema_version") != 1:
@@ -420,9 +419,7 @@ def _load_generated_program(name: str, arch: str, device_index: int):
         or not device_sources
         or not isinstance(entry, str)
     ):
-        raise RuntimeError(
-            f"Cake SSDCombined generated program {name!r} is incomplete"
-        )
+        raise RuntimeError(f"Cake SSDCombined generated program {name!r} is incomplete")
     _host_path, host_payload = _sealed_source_bytes(
         source_dir,
         host.get("path"),
@@ -469,9 +466,12 @@ def _load_generated_program(name: str, arch: str, device_index: int):
     lock_path = build_dir / f"{module_name}.lock"
     with FileLock(lock_path, thread_local=False):
         cubins: dict[str, bytes] = {}
-        for module_ident, source_path, _source_payload, compile_flags in (
-            resolved_devices
-        ):
+        for (
+            module_ident,
+            source_path,
+            _source_payload,
+            compile_flags,
+        ) in resolved_devices:
             cubin_path = build_dir / f"{module_ident}.cubin"
             if not cubin_path.is_file():
                 temporary_cubin = build_dir / (

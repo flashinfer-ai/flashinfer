@@ -1217,9 +1217,7 @@ def test_source_generated_catalog_is_sealed_and_inactive():
                 assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
 
 
-def test_source_generated_multistage_loader_binds_exact_cubins(
-    monkeypatch, tmp_path
-):
+def test_source_generated_multistage_loader_binds_exact_cubins(monkeypatch, tmp_path):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     generated = tmp_path / "generated"
     generated.mkdir()
