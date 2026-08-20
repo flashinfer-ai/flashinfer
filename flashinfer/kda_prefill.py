@@ -74,6 +74,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
         self._small_bh_helper_done: Optional[torch.Tensor] = None
+        self._cute_dsl_workspace: Optional[torch.Tensor] = None
         self._descriptor_storages = {
             variant: torch.empty(
                 (

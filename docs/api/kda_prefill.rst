@@ -4,8 +4,8 @@ flashinfer.kda_prefill
 ======================
 
 Optimized recurrent Kimi Delta Attention (KDA) prefill support. The
-:func:`flashinfer.kda.recurrent_kda` facade dispatches a strict ordinary
-multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
+:func:`flashinfer.kda.recurrent_kda` facade exposes frozen Cake and source-level
+CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
 .. currentmodule:: flashinfer.kda_prefill
 
@@ -14,10 +14,34 @@ multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
 
     RecurrentKDAPrefillWorkspace
 
+.. currentmodule:: flashinfer.kda
+
+.. autosummary::
+    :toctree: ../generated
+
+    RecurrentKDAPrefillWrapper
+
+Backend selection
+-----------------
+
+``backend="auto"`` selects the source-level CuTe DSL backend for eligible
+ordinary multi-token prefill and falls back to the frozen Cake backend for
+unsupported contracts. Decode retains the existing KDA decode routing.
+``backend="cake"`` and ``backend="cute-dsl"`` select a backend strictly and
+raise when its contract is unsupported.
+
+For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
+It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
+head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
+layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
+contract as Cake. ``checkpoint_cu_starts`` must always be int64. Packed
+``cu_seqlens`` must be int64 during CUDA graph capture. The CuTe DSL schedule
+is non-persistent.
+
 Optimized Blackwell prefill subset
 -----------------------------------
 
-``flashinfer.kda.recurrent_kda`` uses the frozen prefill backend only when
+The strict Cake backend is available only when
 every condition below holds:
 
 * the device has compute capability 10.0 (SM100a; B200/GB200) or 10.3
@@ -36,8 +60,7 @@ every condition below holds:
   features are not enabled. Plain int32 ``ssm_state_indices`` and native
   prefill checkpoints are supported by direct M128.
 
-Calls outside that subset retain the existing CuTe-DSL path. In particular,
-T=1 decode and speculative decode are not rerouted.
+T=1 decode and speculative decode are not handled by either prefill backend.
 
 CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
 ``sm_100a`` modules. With CUDA 12.9 or newer, JIT and AOT compile one
@@ -66,10 +89,11 @@ Fixed input omits ``cu_seqlens``. Packed input has ``B=1`` and accepts a
 contiguous CUDA int32 or int64 ``cu_seqlens``. The frozen binding consumes
 int64 offsets; pass int64 directly for CUDA graph capture to avoid an
 in-capture conversion allocation. Offset values are a caller contract:
-``cu_seqlens[0] == 0``, entries are strictly increasing (every sequence is
-non-empty), and ``cu_seqlens[-1] == total_tokens``. FlashInfer does not
-synchronize the device to inspect these values; invalid offsets may cause
-out-of-bounds device access.
+``cu_seqlens[0] == 0``, entries are non-decreasing, and
+``cu_seqlens[-1] == total_tokens``. CuTe DSL accepts equal adjacent offsets for
+zero-length sequences; Cake requires every sequence to be non-empty.
+FlashInfer does not synchronize the device to inspect these values; invalid
+offsets may cause out-of-bounds device access.
 
 Packed scheduling
 -----------------
@@ -80,12 +104,23 @@ is a permutation of ``[0, N)``. Ordering sequences by decreasing length
 reduces the final partial wave. FlashInfer validates dtype, device, rank, and
 size without synchronizing the device to inspect permutation values.
 
-When ``seq_order=None``, a cached identity order is used. H12 selects the
-dedicated M128 schedule with a 16-token recurrence chunk for both fixed and
-packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64 value-split kernel;
-the fixed small-BH region described above selects its eight-CTA owner/helper
-schedule; all remaining eligible inputs select the general 32-token M128
-schedule.
+For Cake, omitting ``seq_order`` uses its cached eager scheduling metadata. H12
+selects the dedicated M128 schedule with a 16-token recurrence chunk for both
+fixed and packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64
+value-split kernel; the fixed small-BH region described above selects its
+eight-CTA owner/helper schedule; all remaining eligible inputs select the
+general 32-token M128 schedule.
+
+For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
+caches a stable decreasing-length order on the host. CuTe DSL decomp retains
+the original sequence order because its CTA grid fits in one wave.
+``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
+needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
+decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address buffers. The
+decomp prep kernel binary-searches this compact prefix instead of carrying a
+dense chunk-to-sequence tensor. The number of sequences, total tokens, and
+total BT=16 chunks are fixed by the first plan so the metadata and launch
+geometry remain valid across CUDA Graph replays.
 
 State and graph semantics
 -------------------------
