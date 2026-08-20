@@ -344,57 +344,17 @@ cutile_bf16_required = pytest.mark.skipif(
 
 @cutile_bf16_required
 @pytest.mark.parametrize(
+    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
+)
+@pytest.mark.parametrize(
+    ("num_tokens", "num_experts", "top_k", "hidden_size", "intermediate_size"),
     (
-        "activation",
-        "num_tokens",
-        "num_experts",
-        "top_k",
-        "hidden_size",
-        "intermediate_size",
-    ),
-    (
-        pytest.param(ActivationConfig.swiglu, 1, 2, 1, 64, 96, id="swiglu-decode"),
-        pytest.param(
-            ActivationConfig.swiglu,
-            7,
-            3,
-            2,
-            96,
-            160,
-            id="swiglu-non-power-of-two-experts",
-        ),
-        pytest.param(ActivationConfig.swiglu, 17, 4, 2, 128, 256, id="swiglu-baseline"),
-        pytest.param(ActivationConfig.swiglu, 33, 8, 4, 256, 128, id="swiglu-top-k-4"),
-        pytest.param(
-            ActivationConfig.swiglu, 9, 64, 8, 128, 256, id="swiglu-many-experts"
-        ),
-        pytest.param(
-            ActivationConfig.swiglu,
-            4,
-            4,
-            2,
-            2048,
-            768,
-            id="swiglu-model-dimensions",
-        ),
-        pytest.param(
-            ActivationConfig.relu2,
-            7,
-            3,
-            2,
-            96,
-            160,
-            id="relu2-non-power-of-two-experts",
-        ),
-        pytest.param(
-            ActivationConfig.relu2,
-            4,
-            4,
-            2,
-            2048,
-            768,
-            id="relu2-model-dimensions",
-        ),
+        pytest.param(1, 2, 1, 64, 96, id="decode"),
+        pytest.param(7, 3, 2, 96, 160, id="non-power-of-two-experts"),
+        pytest.param(17, 4, 2, 128, 256, id="baseline"),
+        pytest.param(33, 8, 4, 256, 128, id="top-k-4"),
+        pytest.param(9, 64, 8, 128, 256, id="many-experts"),
+        pytest.param(4, 4, 2, 2048, 768, id="model-dimensions"),
     ),
 )
 def test_cutile_bf16_runner_matches_reference(
@@ -475,7 +435,10 @@ def test_cutile_bf16_runner_matches_reference(
 
 
 @cutile_bf16_required
-def test_cutile_bf16_runner_supports_tuned_block_sizes():
+@pytest.mark.parametrize(
+    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
+)
+def test_cutile_bf16_runner_supports_tuned_block_sizes(activation):
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, num_experts, top_k = 17, 4, 2
@@ -484,13 +447,14 @@ def test_cutile_bf16_runner_supports_tuned_block_sizes():
         num_experts=num_experts,
         top_k=top_k,
         intermediate_size=intermediate_size,
+        activation=activation,
     )
     hidden_states = torch.randn(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=device
     )
     canonical_w1 = torch.randn(
         num_experts,
-        2 * intermediate_size,
+        intermediate_size * (2 if activation.is_gated else 1),
         hidden_size,
         dtype=torch.bfloat16,
         device=device,
@@ -515,6 +479,7 @@ def test_cutile_bf16_runner_supports_tuned_block_sizes():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
     )
     weights = MoEWeightPack()
     weights.prepare_for("cutile_bf16", native)
@@ -525,7 +490,12 @@ def test_cutile_bf16_runner_supports_tuned_block_sizes():
         MoEActivationPack(hidden_states, None, topk_ids, topk_weights), weights
     )
     expected = _reference_moe(
-        hidden_states, topk_ids, topk_weights, canonical_w1, canonical_w2
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        canonical_w1,
+        canonical_w2,
+        activation.type,
     )
     tuned_gemms = {
         89: (256, 32, 2, 256, 32, 1),
@@ -539,16 +509,23 @@ def test_cutile_bf16_runner_supports_tuned_block_sizes():
 
 
 @cutile_bf16_required
-def test_cutile_bf16_runner_is_cuda_graph_capturable():
+@pytest.mark.parametrize(
+    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
+)
+def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
     device = torch.device("cuda")
     num_tokens, hidden_size, intermediate_size = 4, 128, 256
-    config = _config(intermediate_size=intermediate_size, tune_max_num_tokens=4)
+    config = _config(
+        intermediate_size=intermediate_size,
+        tune_max_num_tokens=4,
+        activation=activation,
+    )
     hidden_states = torch.randn(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=device
     )
     canonical_w1 = torch.randn(
         4,
-        2 * intermediate_size,
+        intermediate_size * (2 if activation.is_gated else 1),
         hidden_size,
         dtype=torch.bfloat16,
         device=device,
@@ -571,6 +548,7 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable():
             num_local_experts=4,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
         ),
     )
     runner = CuTileBf16Runner(config, device)
@@ -596,17 +574,24 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable():
     torch.cuda.synchronize()
 
     expected = _reference_moe(
-        hidden_states, ids, routing_weights, canonical_w1, canonical_w2
+        hidden_states,
+        ids,
+        routing_weights,
+        canonical_w1,
+        canonical_w2,
+        activation.type,
     )
     torch.testing.assert_close(output, expected, rtol=3e-2, atol=5e-1)
 
 
 @cutile_bf16_required
-def test_cutile_bf16_runs_through_unified_layer():
+@pytest.mark.parametrize(
+    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
+)
+def test_cutile_bf16_runs_through_unified_layer(activation):
     torch.manual_seed(1)
     device = torch.device("cuda")
     num_tokens, hidden_size, intermediate_size = 4, 128, 256
-    activation = ActivationConfig.relu2
     config = _config(
         intermediate_size=intermediate_size,
         tune_max_num_tokens=4,
@@ -617,7 +602,7 @@ def test_cutile_bf16_runs_through_unified_layer():
     )
     canonical_w1 = torch.randn(
         4,
-        intermediate_size,
+        intermediate_size * (2 if activation.is_gated else 1),
         hidden_size,
         dtype=torch.bfloat16,
         device=device,

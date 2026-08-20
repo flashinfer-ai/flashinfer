@@ -14,8 +14,8 @@
 
 """BF16 cuTile kernels for the unified MoE backend.
 
-The implementation uses the align-block representation also used by LightLM:
-routing assignments are stably grouped by expert and padded to a fixed M tile.
+The implementation uses an align-block representation: routing assignments
+are stably grouped by expert and padded to a fixed M tile.
 Both expert GEMMs consume that representation and leave their results in the
 original assignment order, allowing a deterministic weighted combine.
 

@@ -27,6 +27,7 @@ from ...utils import next_positive_power_of_2
 ConstInt: TypeAlias = ct.Constant[int]
 
 _SWIGLU = int(ActivationType.Swiglu)
+_RELU2 = int(ActivationType.Relu2)
 SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
 
 
@@ -34,9 +35,12 @@ def _apply_activation(x, activation_type: ConstInt):
     """Apply activation math in FP32; ``activation_type`` is compile-time."""
     if activation_type == _SWIGLU:
         return x / (1.0 + ct.exp(-x))
-    # launch_activation admits only ReLU2 after the SwiGLU branch.
-    relu = ct.maximum(x, 0.0)
-    return relu * relu
+    elif activation_type == _RELU2:
+        relu = ct.maximum(x, 0.0)
+        return relu * relu
+    else:
+        # Unsupported codes are rejected by launch_activation before tracing.
+        return x
 
 
 @ct.kernel
@@ -70,7 +74,7 @@ def _gated_activation(
 
 
 @ct.kernel
-def _plain_activation(
+def _ungated_activation(
     X,
     OUT,
     activation_type: ConstInt,
@@ -121,7 +125,7 @@ def launch_activation(
 
     tile_i = min(next_positive_power_of_2(intermediate_size), 1024)
     num_tiles = (intermediate_size + tile_i - 1) // tile_i
-    kernel = _gated_activation if activation_type.is_gated else _plain_activation
+    kernel = _gated_activation if activation_type.is_gated else _ungated_activation
     ct.launch(
         torch.cuda.current_stream(x.device),
         (x.shape[0], num_tiles),
