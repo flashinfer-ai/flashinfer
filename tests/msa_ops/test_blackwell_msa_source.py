@@ -62,13 +62,18 @@ def test_each_binding_includes_its_device_source_and_exports_run() -> None:
 
 def test_tma_parameters_are_passed_by_grid_constant_value() -> None:
     tma_parameter = re.compile(
-        r"\bconst __grid_constant__ BlackwellMsaTensorMap [A-Za-z0-9_]+\b"
+        r"\bconst __grid_constant__ "
+        r"(?:BlackwellMsaTensorMap|CUtensorMap) [A-Za-z0-9_]+\b"
     )
     for entry in _INVENTORY["entries"]:
+        source_unit = entry["source_unit"]
         source = (
-            _CSRC_DIR / entry["target"] / f"blackwell_msa_{entry['source_unit']}.cu"
+            _CSRC_DIR / entry["target"] / f"blackwell_msa_{source_unit}.cu"
         ).read_text()
-        if entry["source_unit"] == "topk":
+        tma_free = source_unit == "topk" or source_unit.startswith(
+            "long_prefill_reduce_"
+        )
+        if tma_free:
             assert not tma_parameter.search(source)
         else:
             assert tma_parameter.search(source)
