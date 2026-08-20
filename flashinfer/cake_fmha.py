@@ -826,13 +826,13 @@ def select_cake_fmha_decode_route(
     return None
 
 
-def get_cake_fmha_decode_module(
+def _resolve_cake_fmha_decode_module(
     device: torch.device, route: CakeFmhaDecodeRoute | None
-):
-    """Load an optimized decode module, or the authenticated portable fallback."""
+) -> tuple[Any, bool]:
+    """Resolve a decode module and whether its optimized ABI remains active."""
 
     if route is None or not cake_fmha_route_is_optimized(route):
-        return load_cake_fmha_compat_module(_cake_fmha_target(device))
+        return load_cake_fmha_compat_module(_cake_fmha_target(device)), False
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     loader = {
@@ -855,19 +855,22 @@ def get_cake_fmha_decode_module(
         route.num_kv_heads,
     )
     if route.component == "decode_native_fp16_hd512":
-        return loader(
-            *common_args,
-            has_window=route.has_window,
-            use_scale_ptr=route.use_scale_ptr,
-            retain_kv_l2=route.retain_kv_l2,
+        return (
+            loader(
+                *common_args,
+                has_window=route.has_window,
+                use_scale_ptr=route.use_scale_ptr,
+                retain_kv_l2=route.retain_kv_l2,
+            ),
+            True,
         )
     if route.component == "decode_quant_bf16q":
-        return loader(*common_args, route.page_size)
+        return loader(*common_args, route.page_size), True
     if route.component == "decode_quant_fp8":
-        return loader(*common_args, route.page_size, full_blocks=True)
+        return loader(*common_args, route.page_size, full_blocks=True), True
     if route.component == "decode_quant_nvfp4":
         try:
-            return loader(*common_args, route.page_size)
+            return loader(*common_args, route.page_size), True
         except (OSError, RuntimeError) as error:
             warnings.warn(
                 "Cake FMHA portable NVFP4 loading failed closed to compat_v1: "
@@ -875,14 +878,26 @@ def get_cake_fmha_decode_module(
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return load_cake_fmha_compat_module(route.target)
-    return loader(
-        *common_args,
-        has_sink=route.has_sink,
-        has_window=route.has_window,
-        use_scale_ptr=route.use_scale_ptr,
-        retain_kv_l2=route.retain_kv_l2,
+            return load_cake_fmha_compat_module(route.target), False
+    return (
+        loader(
+            *common_args,
+            has_sink=route.has_sink,
+            has_window=route.has_window,
+            use_scale_ptr=route.use_scale_ptr,
+            retain_kv_l2=route.retain_kv_l2,
+        ),
+        True,
     )
+
+
+def get_cake_fmha_decode_module(
+    device: torch.device, route: CakeFmhaDecodeRoute | None
+):
+    """Load an optimized decode module, or the authenticated portable fallback."""
+
+    module, _ = _resolve_cake_fmha_decode_module(device, route)
+    return module
 
 
 def _context_tile_mma_work(q_len: int, kv_len: int, tokens_per_tile: int) -> int:

@@ -6123,7 +6123,6 @@ def trtllm_batch_context_with_kv_cache(
 
     if backend == "cake":
         from .cake_fmha import (
-            cake_fmha_route_is_optimized,
             get_cake_fmha_context_module,
             select_cake_fmha_context_route,
         )
@@ -6154,13 +6153,10 @@ def trtllm_batch_context_with_kv_cache(
             kv_layout=kv_layout,
             workspace_buffer=workspace_buffer,
         )
-        if (
-            cake_fmha_route_is_optimized(cake_route)
-            and skip_softmax_threshold_scale_factor == 1e-30
-        ):
+        if skip_softmax_threshold_scale_factor == 1e-30:
             # The pinned public matrix uses 1e-30 as a numerically inert
-            # skip-softmax probe. Cake's exact route computes the same
-            # ordinary softmax and its binding accepts the disabled form.
+            # skip-softmax probe. Both exact routes and compat_v1 consume the
+            # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
         # All context adapters consume host scalar scales. Device scalar
         # values are resolved only after exact route selection, preserving

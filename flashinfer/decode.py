@@ -3712,8 +3712,7 @@ def trtllm_batch_decode_with_kv_cache(
 
         if backend == "cake":
             from .cake_fmha import (
-                cake_fmha_route_is_optimized,
-                get_cake_fmha_decode_module,
+                _resolve_cake_fmha_decode_module,
                 select_cake_fmha_decode_route,
             )
 
@@ -3745,24 +3744,22 @@ def trtllm_batch_decode_with_kv_cache(
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
             )
-            if (
-                cake_fmha_route_is_optimized(cake_route)
-                and skip_softmax_threshold_scale_factor == 1e-30
-            ):
+            if skip_softmax_threshold_scale_factor == 1e-30:
                 # The pinned public matrix uses 1e-30 as a numerically inert
-                # skip-softmax probe. Cake's exact route computes the same
-                # ordinary softmax and its binding accepts the disabled form.
+                # skip-softmax probe. Both exact routes and compat_v1 consume
+                # the disabled form at the FFI boundary.
                 skip_softmax_threshold_scale_factor = None
-            if not cake_fmha_route_is_optimized(cake_route):
+            cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
+                query.device, cake_route
+            )
+            if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.
                 if isinstance(bmm1_scale, torch.Tensor):
                     bmm1_scale = float(bmm1_scale.item()) / log2e
                 if isinstance(bmm2_scale, torch.Tensor):
                     bmm2_scale = float(bmm2_scale.item())
-            run_func = get_cake_fmha_decode_module(
-                query.device, cake_route
-            ).cake_paged_attention_decode
+            run_func = cake_module.cake_paged_attention_decode
 
         run_func(
             out,

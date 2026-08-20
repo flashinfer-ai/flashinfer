@@ -1292,6 +1292,132 @@ def test_context_route_miss_fails_closed_to_compat(monkeypatch) -> None:
     assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), None) is sentinel
 
 
+@pytest.mark.parametrize(
+    ("skip_softmax_threshold_scale_factor", "expected_ffi_value"),
+    [(1e-30, None), (1e-4, 1e-4)],
+)
+def test_cake_public_decode_route_miss_canonicalizes_only_pinned_noop_skip(
+    monkeypatch,
+    skip_softmax_threshold_scale_factor,
+    expected_ffi_value,
+) -> None:
+    observed = {}
+
+    def run(*args):
+        observed["args"] = args
+
+    compat_module = SimpleNamespace(cake_paged_attention_decode=run)
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: compat_module
+    )
+    monkeypatch.setattr(decode, "get_device_sm_count", lambda device: 1)
+
+    query = torch.empty((2, 4, 256), dtype=torch.bfloat16)
+    key = torch.empty((4, 2, 16, 256), dtype=torch.bfloat16)
+    result = cake_api.cake_batch_decode_with_kv_cache(
+        query,
+        (key, torch.empty_like(key)),
+        torch.empty(4096, dtype=torch.uint8),
+        torch.zeros((2, 2), dtype=torch.int32),
+        torch.tensor([16, 16], dtype=torch.int32),
+        16,
+        bmm1_scale=0.125,
+        bmm2_scale=1.0,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+
+    assert result.shape == query.shape
+    assert observed["args"][26] == expected_ffi_value
+
+
+@pytest.mark.parametrize(
+    ("skip_softmax_threshold_scale_factor", "expected_ffi_value"),
+    [(1e-30, None), (1e-4, 1e-4)],
+)
+def test_cake_public_context_route_miss_canonicalizes_only_pinned_noop_skip(
+    monkeypatch,
+    skip_softmax_threshold_scale_factor,
+    expected_ffi_value,
+) -> None:
+    observed = {}
+
+    def run(*args):
+        observed["args"] = args
+
+    compat_module = SimpleNamespace(cake_paged_attention_context=run)
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: compat_module
+    )
+    monkeypatch.setattr(prefill, "get_device_sm_count", lambda device: 1)
+
+    query = torch.empty((4, 4, 256), dtype=torch.bfloat16)
+    key = torch.empty((4, 2, 16, 256), dtype=torch.bfloat16)
+    result = cake_api.cake_batch_context_with_kv_cache(
+        query,
+        (key, torch.empty_like(key)),
+        torch.empty(4096, dtype=torch.uint8),
+        torch.zeros((2, 2), dtype=torch.int32),
+        torch.tensor([16, 16], dtype=torch.int32),
+        max_q_len=2,
+        max_kv_len=16,
+        bmm1_scale=0.125,
+        bmm2_scale=1.0,
+        batch_size=2,
+        cum_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 16, 32], dtype=torch.int32),
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+
+    assert result.shape == query.shape
+    assert observed["args"][26] == expected_ffi_value
+
+
+def test_cake_public_nvfp4_loader_failure_materializes_compat_scale_abi(
+    monkeypatch,
+) -> None:
+    observed = {}
+
+    def run(*args):
+        observed["args"] = args
+
+    compat_module = SimpleNamespace(cake_paged_attention_decode=run)
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_decode_quant_nvfp4_module",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("JIT unavailable")),
+    )
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: compat_module
+    )
+    monkeypatch.setattr(decode, "get_compute_capability", lambda device: (10, 3))
+    monkeypatch.setattr(decode, "get_device_sm_count", lambda device: 1)
+
+    query = torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn)
+    key = torch.empty((4, 2, 16, 64), dtype=torch.uint8)
+    scale = torch.empty((4, 2, 16, 8), dtype=torch.float8_e4m3fn)
+    with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
+        result = cake_api.cake_batch_decode_with_kv_cache(
+            query,
+            (key, torch.empty_like(key)),
+            torch.empty(1 << 20, dtype=torch.uint8),
+            torch.zeros((2, 2), dtype=torch.int32),
+            torch.tensor([16, 16], dtype=torch.int32),
+            16,
+            bmm1_scale=torch.tensor(0.125, dtype=torch.float32),
+            bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
+            kv_cache_sf=(scale, torch.empty_like(scale)),
+        )
+
+    assert result.shape == query.shape
+    assert isinstance(observed["args"][11], float)
+    assert isinstance(observed["args"][12], float)
+    assert observed["args"][11] == pytest.approx(0.125)
+    assert observed["args"][12] == pytest.approx(0.75)
+
+
 def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
     monkeypatch,
 ) -> None:
