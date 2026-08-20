@@ -170,7 +170,7 @@ def _validate_paged_inputs(
     ``max_b ceil(context_lens[b]/128) * (128 // block_size)`` columns. A
     narrower block_table causes an out-of-bounds read. The bound needs the
     per-row lengths from device memory, so it cannot be checked here without a
-    D2H copy; :func:`_validate_block_table_width` performs it when
+    D2H copy; :func:`_validate_paged_bounds` performs it when
     ``FLASHINFER_VALIDATE_INPUTS`` is set."""
     if not (context_lens.is_cuda and context_lens.dtype == torch.int32):
         raise ValueError(
@@ -242,13 +242,27 @@ def _sync_input_validation_enabled() -> bool:
     return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
 
 
-def _validate_block_table_width(
+def _validate_paged_bounds(
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
+    max_context_len: int,
     block_size: int,
     fn_name: str,
 ) -> None:
-    """Debug-mode check that ``block_table`` is wide enough for the kernel.
+    """Debug-mode bounds checks that need the per-row ``context_lens``.
+
+    Two invariants keep the kernel inside its buffers, and both depend on values
+    that live in device memory, so one D2H copy covers both.
+
+    1. ``max(context_lens) <= max_context_len``.  The output row is sized from
+       ``max_context_len`` while the schedule is derived from ``context_lens``,
+       and nothing ties the two together.  A longer sequence schedules splits
+       past the end of the allocated row, and the kernel stores unconditionally,
+       so it writes there -- silent corruption rather than a fault.  e.g.
+       context_lens=[257] with max_context_len=256 allocates 256 columns while
+       the schedule reaches 512.
+
+    2. ``block_table`` wide enough for the kernel
 
     The kernel walks KV in ``_COMPUTE_BLOCK_KV``-token compute tiles and reads
     ``_COMPUTE_BLOCK_KV // block_size`` pages per tile, so it indexes columns up
@@ -272,9 +286,19 @@ def _validate_block_table_width(
         return
     if torch.cuda.is_current_stream_capturing():
         return
+    lens = context_lens.tolist()  # the single D2H sync; both checks use it
+    if not lens:
+        return
+    longest = max(lens)
+    if longest > max_context_len:
+        raise ValueError(
+            f"{fn_name}: max_context_len ({max_context_len}) must be at least "
+            f"max(context_lens) ({longest}). The output row is sized from "
+            f"max_context_len but the schedule follows context_lens, so a longer "
+            f"sequence is written past the end of the row."
+        )
     pages_per_tile = _COMPUTE_BLOCK_KV // block_size
-    tiles = (context_lens.to(torch.int64) + _COMPUTE_BLOCK_KV - 1) // _COMPUTE_BLOCK_KV
-    need = int((tiles * pages_per_tile).max().item())  # D2H sync
+    need = max(-(-c // _COMPUTE_BLOCK_KV) for c in lens) * pages_per_tile
     if block_table.shape[1] < need:
         raise ValueError(
             f"{fn_name}: block_table has {block_table.shape[1]} columns but the "
@@ -879,6 +903,7 @@ def fp8_paged_mqa_logits(
                            [KV SF  : block_size * 4        bytes, one float32/token]
         weights:         [batch_size*next_n, num_heads]  float32  per-head weights
         context_lens:    [batch_size]  int32  (CUDA)
+                         No entry may exceed max_context_len.
         block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
@@ -888,7 +913,10 @@ def fp8_paged_mqa_logits(
                          block_size=64 needs 6 columns, not 5).  Extra entries
                          may be any valid index (0); too few is an out-of-bounds
                          read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
-        max_context_len: int  maximum KV sequence length
+        max_context_len: int  maximum KV sequence length; must be >=
+                         max(context_lens).  The output row is sized from this
+                         while the schedule follows context_lens, so a smaller
+                         value is an out-of-bounds write.
         output_dtype:    output tensor dtype (float32 or float16)
         epi_dtype:       epilogue accumulation dtype (float32 or float16)
         acc_dtype:       MMA accumulator dtype (float32 or float16)
@@ -942,8 +970,8 @@ def fp8_paged_mqa_logits(
         w_2d = weights.reshape(B, next_n * H).t()  # [next_n*H, B]
     kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
 
-    _validate_block_table_width(
-        block_table, context_lens, block_size, "fp8_paged_mqa_logits"
+    _validate_paged_bounds(
+        block_table, context_lens, max_context_len, block_size, "fp8_paged_mqa_logits"
     )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
@@ -1148,6 +1176,7 @@ def fp4_paged_mqa_logits(
                            [KV SF  : block_size * head_dim/sf_vec_size bytes]
         weights:         [batch_size*next_n, num_heads]  float32  per-head weights
         context_lens:    [batch_size]  int32  (CUDA)
+                         No entry may exceed max_context_len.
         block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
@@ -1157,7 +1186,10 @@ def fp4_paged_mqa_logits(
                          block_size=64 needs 6 columns, not 5).  Extra entries
                          may be any valid index (0); too few is an out-of-bounds
                          read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
-        max_context_len: int  maximum KV sequence length
+        max_context_len: int  maximum KV sequence length; must be >=
+                         max(context_lens).  The output row is sized from this
+                         while the schedule follows context_lens, so a smaller
+                         value is an out-of-bounds write.
         sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor.
                          Determines both sf_q's packing and the scale-factor
                          bytes of each fused KV row (head_dim/sf_vec_size).
@@ -1229,8 +1261,8 @@ def fp4_paged_mqa_logits(
         w_2d = weights.reshape(B, next_n * H).t()
     kv_flat = kv_fused.flatten(1)
 
-    _validate_block_table_width(
-        block_table, context_lens, block_size, "fp4_paged_mqa_logits"
+    _validate_paged_bounds(
+        block_table, context_lens, max_context_len, block_size, "fp4_paged_mqa_logits"
     )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
