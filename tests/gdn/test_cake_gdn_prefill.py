@@ -668,6 +668,141 @@ def test_public_dispatch_preserves_upstream_sm100_cp_extensions(
     assert calls == [expected_route]
 
 
+def test_bf16_checkpoint_is_rejected_by_generic_sm100_cp() -> None:
+    q = torch.zeros((103, 4, 128), dtype=torch.bfloat16)
+    output = torch.empty((103, 8, 128), dtype=torch.bfloat16)
+    state = torch.empty((1, 8, 128, 128), dtype=torch.bfloat16)
+    checkpoints = torch.empty((1, 8, 128, 128), dtype=torch.bfloat16)
+
+    reason = gdn_prefill._cp_delta_rule_rejection_reason(
+        arch_major=10,
+        cuda_major=13,
+        q=q,
+        k=q,
+        v=torch.zeros((103, 8, 128), dtype=torch.bfloat16),
+        g=torch.zeros((103, 8), dtype=torch.float32),
+        beta=torch.zeros((103, 8), dtype=torch.float32),
+        output=output,
+        initial_state=state,
+        output_state=state,
+        checkpoint_every_n_tokens=64,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=torch.tensor([0, 1], dtype=torch.int64),
+        state_indices=None,
+        cp_chunk_len=None,
+    )
+
+    assert reason == (
+        "CP delta rule state checkpointing requires the Cake-supported "
+        "FP32 checkpoint contract"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    reason="requires an exact SM100a or SM103a GPU",
+)
+def test_exact_b1_bf16_checkpoint_auto_falls_back_and_explicit_cp_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(4254)
+    total = 103
+    hq, hk, hv = 4, 4, 8
+    q = torch.randn((total, hq, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.nn.functional.normalize(
+        torch.randn((total, hk, 128), dtype=torch.float32, device="cuda"),
+        p=2.0,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = torch.randn((total, hv, 128), dtype=torch.bfloat16, device="cuda")
+    alpha = torch.rand((total, hv), dtype=torch.float32, device="cuda")
+    beta = torch.rand((total, hv), dtype=torch.float32, device="cuda")
+    cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device="cuda")
+    checkpoint_cu_starts = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    initial_state = (
+        torch.randn((1, hv, 128, 128), dtype=torch.bfloat16, device="cuda")
+        * 0.01
+    )
+
+    reference_output = torch.empty((total, hv, 128), dtype=q.dtype, device="cuda")
+    reference_state = torch.empty_like(initial_state)
+    reference_checkpoint = torch.full_like(initial_state, float("nan"))
+    gdn_prefill.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        output=reference_output,
+        output_state=reference_state,
+        state_checkpoints=reference_checkpoint,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=64,
+        use_cp=False,
+    )
+
+    real_non_cp = gdn_prefill.chunk_gated_delta_rule_sm100
+    calls: list[str] = []
+
+    def observed_non_cp(*args, **kwargs):
+        calls.append("non_cp")
+        return real_non_cp(*args, **kwargs)
+
+    def forbidden_cp(*_args, **_kwargs):
+        raise AssertionError("BF16 checkpoint entered generic CP without checkpoint I/O")
+
+    monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm100", observed_non_cp)
+    monkeypatch.setattr(gdn_prefill, "cp_delta_rule_dsl_sm100", forbidden_cp)
+    output = torch.empty_like(reference_output)
+    output_state = torch.empty_like(reference_state)
+    checkpoint = torch.full_like(reference_checkpoint, float("nan"))
+    with pytest.warns(RuntimeWarning, match="falling back to non-CP"):
+        actual_output, actual_state = gdn_prefill.chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=checkpoint,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=64,
+            use_cp="auto",
+        )
+
+    torch.cuda.synchronize()
+    assert calls == ["non_cp"]
+    assert torch.isfinite(checkpoint).all()
+    torch.testing.assert_close(actual_output, reference_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_state, reference_state, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(checkpoint, reference_checkpoint, atol=1e-2, rtol=1e-2)
+
+    with pytest.raises(ValueError, match="Cake-supported FP32 checkpoint"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=checkpoint,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=64,
+            use_cp=True,
+        )
+
+
 def test_public_dispatch_fails_closed_when_cake_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

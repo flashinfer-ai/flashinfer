@@ -118,6 +118,11 @@ def _cp_delta_rule_rejection_reason(
             checkpoint_cu_starts=checkpoint_cu_starts,
             cp_chunk_len=cp_chunk_len,
         )
+        if checkpoint_every_n_tokens > 0 and not use_cake:
+            return (
+                "CP delta rule state checkpointing requires the Cake-supported "
+                "FP32 checkpoint contract"
+            )
         if use_cake and _chunk_gated_delta_rule_cake_sm100 is None:
             return "Cake-only CP delta rule SM100 kernel is unavailable"
         if not use_cake and cp_delta_rule_dsl_sm100 is None:
@@ -266,8 +271,10 @@ def chunk_gated_delta_rule(
         Whether to use context parallelism when low-parallelism heuristics
         match. SM100/SM103 uses the Cake-only four-stage implementation for
         the original CP feature domain and FP32 boundary checkpoints. FP8
-        state/checkpoints and an unrelated explicit private CP chunk length
-        retain the CuTe-DSL implementation.
+        state without checkpoints and an unrelated explicit private CP chunk
+        length retain the CuTe-DSL implementation. Checkpoint configurations
+        outside the Cake FP32 contract fall back to non-CP in ``"auto"`` mode
+        and fail closed when CP is explicitly required.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
         and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
