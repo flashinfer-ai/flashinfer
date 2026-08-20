@@ -1660,6 +1660,8 @@ def _autotune_and_graph(runner, act, weights, expected, *, rtol, atol, cache_nam
             runner.tuning_config,
             inputs,
         )
+    assert isinstance(tactic, tuple) and len(tactic) == 2
+    assert all(stage_tactic >= 0 for stage_tactic in tactic)
     actual = runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
     assert torch.isfinite(actual).all()
@@ -1954,6 +1956,8 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
             runner.tuning_config,
             inputs,
         )
+    assert isinstance(tactic, tuple) and len(tactic) == 2
+    assert all(stage_tactic >= 0 for stage_tactic in tactic)
     actual = runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
     assert torch.isfinite(actual).all()

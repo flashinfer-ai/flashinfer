@@ -577,6 +577,11 @@ class TrtllmMxInt4Config:
         return "TrtllmMxInt4Config()"
 
 
+# Breaking change: the deprecated, unregistered CutlassConfig placeholder was
+# removed. It was never a runnable MoELayer backend (supported() always False).
+# Use a quant-specific Cutlass*Config below instead.
+
+
 @dataclass(frozen=True)
 class CutlassBf16Config:
     """CUTLASS BF16 backend for the unified MoE API.
