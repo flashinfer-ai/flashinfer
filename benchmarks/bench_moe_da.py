@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark matched ordinary and distribution-aware TRTLLM routed MoE graphs."""
+"""Benchmark matched ordinary and distribution-aware MoE graphs by backend."""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ import math
 import os
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import torch
 
+from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     QuantConfig,
@@ -27,18 +29,29 @@ from flashinfer.fused_moe import (
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
+    da_moe_acquire_graph_leases,
+    da_moe_diagnostics,
+    da_moe_release_resources,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
     trtllm_bf16_routed_moe,
+    trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
-    trtllm_moe_acquire_da_graph_leases,
-    trtllm_moe_da_diagnostics,
     trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.da_tuner import (
     DADistribution,
     RoutingRealizationFactory,
     RoutingRealizationKey,
+)
+from flashinfer.fused_moe.backends.prims_ts.bf16_op import (
+    prims_ts_bf16_routed_moe,
+)
+from flashinfer.fused_moe.backends.prims_ts.fp8_op import (
+    prims_ts_fp8_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
 )
 from flashinfer.tllm_enums import (
     DtypeTrtllmGen,
@@ -58,6 +71,9 @@ PRECISIONS = (
     "mxfp8",
     "mxint4",
 )
+
+# Ordinary backends participating independently in the shared DA lifecycle.
+BACKENDS = ("trtllm", "prims_ts")
 
 PRECISION_ALIASES = {
     # Name mapping for MXFP4 weights with MXFP8 activations.
@@ -99,12 +115,16 @@ class PreparedPrecision:
 
     # User-facing precision spelling written to the result table.
     name: str
+    # Ordinary backend supplying every body in this prepared invocation.
+    backend: str
     # Immutable model geometry used by this prepared invocation.
     shape: BenchmarkShape
     # Plain int32 expert IDs mutated between distribution replays.
     expert_ids: torch.Tensor
     # BF16 routing weights mutated with the expert IDs.
     routing_weights: torch.Tensor
+    # Optional graph-stable logits used by FromLogits-only public backends.
+    routing_logits: torch.Tensor | None
     # Packed int32 view for ABIs that consume score and ID in one tensor.
     packed_routing: torch.Tensor | None
     # Stable finalized BF16 destination captured into both graphs.
@@ -116,6 +136,12 @@ class PreparedPrecision:
         """Copy one live distribution into the graph-stable routing buffers."""
         self.expert_ids.copy_(expert_ids)
         self.routing_weights.copy_(routing_weights)
+        if self.routing_logits is not None:
+            self.routing_logits.fill_(-32)
+            selected_logits = routing_weights.float().clamp_min_(1e-6).log().add_(32)
+            self.routing_logits.scatter_(
+                1, expert_ids.to(torch.int64), selected_logits.to(self.routing_logits)
+            )
         if self.packed_routing is not None:
             packed = (expert_ids << 16) | (
                 routing_weights.view(torch.int16).to(torch.int32) & 0xFFFF
@@ -124,7 +150,7 @@ class PreparedPrecision:
 
 
 @contextlib.contextmanager
-def _temporary_environment(**updates: str | None):
+def _temporary_environment(**updates: str | None) -> Iterator[None]:
     """Apply process configuration for one lifecycle phase and restore it."""
     previous = {name: os.environ.get(name) for name in updates}
     try:
@@ -176,8 +202,21 @@ def _canonical_inputs(shape: BenchmarkShape) -> tuple[torch.Tensor, ...]:
     return hidden, w1, w2, ids, weights
 
 
-def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
-    """Prepare one exact public TRTLLM routed-MoE precision contract."""
+def _prepare_precision(
+    name: str,
+    shape: BenchmarkShape,
+    backend: str = "trtllm",
+    routing_input_mode: str = "routed",
+) -> PreparedPrecision:
+    """Prepare one exact public routed-MoE precision contract for a backend."""
+    if backend not in BACKENDS:
+        raise ValueError(f"Unsupported MoE backend {backend!r}")
+    if routing_input_mode not in ("routed", "logits"):
+        raise ValueError(f"Unsupported routing input mode {routing_input_mode!r}")
+    if routing_input_mode == "logits" and name not in ("nvfp4", "fp8_per_tensor"):
+        raise ValueError(
+            "FromLogits benchmarking currently targets NVFP4 and FP8 per-tensor"
+        )
     # All precision families share one deterministic logical problem and stable output tensor.
     hidden, w1, w2, ids, routing_weights = _canonical_inputs(shape)
     output = torch.empty(
@@ -224,18 +263,29 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
             device=hidden.device,
         )
 
+        routing_logits = (
+            torch.empty(
+                shape.num_tokens,
+                shape.num_experts,
+                device=hidden.device,
+                dtype=torch.bfloat16,
+            )
+            if routing_input_mode == "logits"
+            else None
+        )
+
         def invoke() -> torch.Tensor:
-            """Invoke the exact FP4-family routed ABI into the stable output."""
-            # Forward the variant-specific quantized tensors through the common public wrapper.
-            result = trtllm_fp4_block_scale_routed_moe(
-                topk_ids=(ids, routing_weights),
+            """Invoke the exact FP4-family public ABI into the stable output."""
+            kwargs = dict(
                 routing_bias=None,
                 hidden_states=hidden_q,
                 hidden_states_scale=hidden_scale,
                 gemm1_weights=view["gemm1_weights"],
                 gemm1_weights_scale=view["gemm1_weights_scale"],
                 gemm1_bias=None,
-                gemm1_alpha=view.get("gemm1_alpha"),
+                gemm1_alpha=(
+                    None if backend == "prims_ts" else view.get("gemm1_alpha")
+                ),
                 gemm1_beta=None,
                 gemm1_clamp_limit=None,
                 gemm2_weights=view["gemm2_weights"],
@@ -246,27 +296,77 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
                 output2_scale_scalar=view.get("output2_scale_scalar"),
                 **common,
             )
+            if routing_input_mode == "logits":
+                fp4_op = (
+                    prims_ts_fp4_block_scale_moe
+                    if backend == "prims_ts"
+                    else trtllm_fp4_block_scale_moe
+                )
+                result = fp4_op(routing_logits=routing_logits, **kwargs)
+            else:
+                fp4_op = (
+                    prims_ts_fp4_block_scale_routed_moe
+                    if backend == "prims_ts"
+                    else trtllm_fp4_block_scale_routed_moe
+                )
+                result = fp4_op(topk_ids=(ids, routing_weights), **kwargs)
             # Normalize the historical tensor/list return spellings for matched benchmarking.
             return result[0] if isinstance(result, list) else result
 
         return PreparedPrecision(
-            name, shape, ids, routing_weights, None, output, invoke
+            name,
+            backend,
+            shape,
+            ids,
+            routing_weights,
+            routing_logits,
+            None,
+            output,
+            invoke,
         )
 
     packed = torch.empty_like(ids)
     if name == "bf16":
-        view = TrtllmBf16Config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=shape.local_num_experts,
-            hidden_size=shape.hidden_size,
-            intermediate_size=shape.intermediate_size,
-            device=hidden.device,
-        )
+        if backend == "prims_ts":
+            # PrimsTS consumes its ordinary three-dimensional shuffled MajorK ABI; the TRTLLM
+            # benchmark helper intentionally produces a different four-dimensional block ABI.
+            gemm1_weights = torch.stack(
+                [
+                    shuffle_matrix_a(
+                        reorder_rows_for_gated_act_gemm(weight).view(torch.uint8),
+                        128,
+                    ).view(torch.bfloat16)
+                    for weight in w1
+                ]
+            ).contiguous()
+            gemm2_weights = torch.stack(
+                [
+                    shuffle_matrix_a(weight.view(torch.uint8), 128).view(torch.bfloat16)
+                    for weight in w2
+                ]
+            ).contiguous()
+            view = {
+                "gemm1_weights": gemm1_weights,
+                "gemm2_weights": gemm2_weights,
+            }
+        else:
+            view = TrtllmBf16Config.prepare_weights(
+                w1,
+                w2,
+                num_local_experts=shape.local_num_experts,
+                hidden_size=shape.hidden_size,
+                intermediate_size=shape.intermediate_size,
+                device=hidden.device,
+            )
 
         def invoke() -> torch.Tensor:
             """Invoke the exact packed BF16 routed ABI into the stable output."""
-            result = trtllm_bf16_routed_moe(
+            bf16_op = (
+                prims_ts_bf16_routed_moe
+                if backend == "prims_ts"
+                else trtllm_bf16_routed_moe
+            )
+            result = bf16_op(
                 topk_ids=packed,
                 hidden_states=hidden,
                 gemm1_weights=view["gemm1_weights"],
@@ -292,21 +392,48 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
             device=hidden.device,
         )
 
-        def invoke() -> torch.Tensor:
-            """Invoke the exact packed per-tensor FP8 routed ABI."""
-            result = trtllm_fp8_per_tensor_scale_routed_moe(
-                topk_ids=packed,
-                routing_bias=None,
-                hidden_states=hidden_q,
-                gemm1_weights=view["gemm1_weights"],
-                output1_scales_scalar=view["output1_scales_scalar"],
-                output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
-                gemm2_weights=view["gemm2_weights"],
-                output2_scales_scalar=view["output2_scales_scalar"],
-                use_routing_scales_on_input=False,
-                **common,
+        if backend == "prims_ts":
+            routing_logits = torch.empty(
+                shape.num_tokens,
+                shape.num_experts,
+                device=hidden.device,
+                dtype=torch.bfloat16,
             )
-            return result[0] if isinstance(result, list) else result
+
+            def invoke() -> torch.Tensor:
+                """Invoke the FromLogits-only PrimsTS FP8 per-tensor ABI."""
+                result = prims_ts_fp8_per_tensor_scale_moe(
+                    routing_logits=routing_logits,
+                    routing_bias=None,
+                    hidden_states=hidden_q,
+                    gemm1_weights=view["gemm1_weights"],
+                    output1_scales_scalar=view["output1_scales_scalar"],
+                    output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
+                    gemm2_weights=view["gemm2_weights"],
+                    output2_scales_scalar=view["output2_scales_scalar"],
+                    use_routing_scales_on_input=False,
+                    **common,
+                )
+                return result[0] if isinstance(result, list) else result
+
+        else:
+            routing_logits = None
+
+            def invoke() -> torch.Tensor:
+                """Invoke the exact packed TRTLLM per-tensor FP8 routed ABI."""
+                result = trtllm_fp8_per_tensor_scale_routed_moe(
+                    topk_ids=packed,
+                    routing_bias=None,
+                    hidden_states=hidden_q,
+                    gemm1_weights=view["gemm1_weights"],
+                    output1_scales_scalar=view["output1_scales_scalar"],
+                    output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
+                    gemm2_weights=view["gemm2_weights"],
+                    output2_scales_scalar=view["output2_scales_scalar"],
+                    use_routing_scales_on_input=False,
+                    **common,
+                )
+                return result[0] if isinstance(result, list) else result
 
     elif name in ("fp8_block", "mxfp8"):
         variant = (
@@ -333,10 +460,35 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
             if name == "fp8_block"
             else Fp8QuantizationType.MxFp8
         )
+        if backend == "prims_ts" and name == "fp8_block":
+            # DeepSeek preparation is intentionally unshuffled for TRTLLM. PrimsTS' ordinary
+            # MajorK ABI shuffles payload rows with a 64-row epilogue tile; its FP32 scales stay
+            # in the original 128x128 block layout.
+            view["gemm1_weights"] = torch.stack(
+                [
+                    shuffle_matrix_a(weight.view(torch.uint8), 64).view(
+                        torch.float8_e4m3fn
+                    )
+                    for weight in view["gemm1_weights"]
+                ]
+            ).contiguous()
+            view["gemm2_weights"] = torch.stack(
+                [
+                    shuffle_matrix_a(weight.view(torch.uint8), 64).view(
+                        torch.float8_e4m3fn
+                    )
+                    for weight in view["gemm2_weights"]
+                ]
+            ).contiguous()
 
         def invoke() -> torch.Tensor:
             """Invoke the exact packed block-FP8 routed ABI."""
-            result = trtllm_fp8_block_scale_routed_moe(
+            fp8_op = (
+                prims_ts_fp8_block_scale_routed_moe
+                if backend == "prims_ts"
+                else trtllm_fp8_block_scale_routed_moe
+            )
+            result = fp8_op(
                 topk_ids=packed,
                 routing_bias=None,
                 hidden_states=hidden_q,
@@ -345,7 +497,7 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
                 gemm1_weights_scale=view["gemm1_weights_scale"],
                 gemm2_weights=view["gemm2_weights"],
                 gemm2_weights_scale=view["gemm2_weights_scale"],
-                use_shuffled_weight=name == "mxfp8",
+                use_shuffled_weight=backend == "prims_ts" or name == "mxfp8",
                 weight_layout=WeightLayout.MajorK.value,
                 fp8_quantization_type=fp8_type,
                 **common,
@@ -380,7 +532,17 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
 
     else:
         raise ValueError(f"Unsupported precision {name!r}")
-    return PreparedPrecision(name, shape, ids, routing_weights, packed, output, invoke)
+    return PreparedPrecision(
+        name,
+        backend,
+        shape,
+        ids,
+        routing_weights,
+        routing_logits if name == "fp8_per_tensor" else None,
+        packed,
+        output,
+        invoke,
+    )
 
 
 def _realization(
@@ -460,10 +622,11 @@ def _matching_diagnostic(
     precision: str,
     shape: BenchmarkShape | None = None,
     distributions: tuple[str, ...] | None = None,
+    backend: str = "trtllm",
 ) -> dict[str, object]:
     """Return the exact diagnostic for one precision, shape, and tuner catalog."""
     # Resolve the public operation and activation dtype expected for this precision family.
-    expected = {
+    trtllm_expected = {
         "nvfp4": "flashinfer::trtllm_fp4_block_scale_moe",
         "mxfp4": "flashinfer::trtllm_fp4_block_scale_moe",
         "w4a16": "flashinfer::trtllm_fp4_block_scale_moe",
@@ -473,6 +636,18 @@ def _matching_diagnostic(
         "mxfp8": "flashinfer::trtllm_fp8_block_scale_moe",
         "mxint4": "flashinfer::trtllm_mxint4_block_scale_moe",
     }[precision]
+    prims_expected = {
+        "nvfp4": "flashinfer::prims_ts_fp4_block_scale_moe",
+        "mxfp4": "flashinfer::prims_ts_fp4_block_scale_moe",
+        "w4a16": "flashinfer::prims_ts_fp4_block_scale_moe",
+        "bf16": "flashinfer::prims_ts_bf16_moe",
+        "fp8_per_tensor": "flashinfer::prims_ts_fp8_per_tensor_scale_moe",
+        "fp8_block": "flashinfer::prims_ts_fp8_block_scale_moe",
+        "mxfp8": "flashinfer::prims_ts_fp8_block_scale_moe",
+        # PrimsTS has no ordinary MXINT4 body; this value is never selected.
+        "mxint4": "flashinfer::trtllm_mxint4_block_scale_moe",
+    }[precision]
+    expected = prims_expected if backend == "prims_ts" else trtllm_expected
     expected_dtype_act = {
         "nvfp4": DtypeTrtllmGen.E2m1,
         "mxfp4": DtypeTrtllmGen.MxE4m3,
@@ -491,7 +666,7 @@ def _matching_diagnostic(
         if distributions is None
         else [DADistribution.parse(item).name for item in distributions]
     )
-    for item in trtllm_moe_da_diagnostics():
+    for item in da_moe_diagnostics(backend):
         operation_key = json.loads(str(item["operation_key"]))
         runner_identity = json.loads(operation_key["runner_identity"])
         config_identity = json.loads(operation_key["config_identity"])
@@ -528,10 +703,14 @@ def _benchmark_precision(
     tune: bool,
     warmup: int,
     iterations: int,
+    backend: str = "trtllm",
+    routing_input_mode: str = "routed",
 ) -> list[dict[str, object]]:
     """Run matched NoDA and DA graphs for all distributions of one precision."""
+    if backend == "prims_ts" and precision == "fp8_per_tensor":
+        routing_input_mode = "logits"
     # Prepare one public ABI and seed both lifecycle paths with the same first realization.
-    prepared = _prepare_precision(precision, shape)
+    prepared = _prepare_precision(precision, shape, backend, routing_input_mode)
     factory = RoutingRealizationFactory()
     first_ids, first_weights = _realization(factory, shape, distributions[0])
     prepared.stage(first_ids, first_weights)
@@ -567,10 +746,10 @@ def _benchmark_precision(
         prepared.invoke()
         torch.cuda.synchronize()
         da_graph = _capture(prepared.invoke)
-        leases = trtllm_moe_acquire_da_graph_leases(da_graph)
+        leases = da_moe_acquire_graph_leases(da_graph)
 
     # Validate capture policy and graph-lease ownership before collecting performance rows.
-    captured_diagnostic = _matching_diagnostic(precision, shape, distributions)
+    captured_diagnostic = _matching_diagnostic(precision, shape, distributions, backend)
     captured_policy = captured_diagnostic.get("policy")
     capture_fallback_reason = captured_diagnostic.get("capture_fallback_reason")
     if captured_policy == "da_switch" and not leases and not capture_fallback_reason:
@@ -614,12 +793,13 @@ def _benchmark_precision(
             torch.testing.assert_close(da_output, no_da_output, rtol=3e-2, atol=3e-2)
             no_da_ms = _time_graph(no_da_graph, flush_buffers, warmup, iterations)
             da_ms = _time_graph(da_graph, flush_buffers, warmup, iterations)
-            diagnostic = _matching_diagnostic(precision, shape, distributions)
+            diagnostic = _matching_diagnostic(precision, shape, distributions, backend)
             topology = diagnostic.get("topology") or {}
             selected_body = diagnostic.get("selected_body")
             if diagnostic.get("policy") == "da_single_body":
                 selected_body = 0
             row = {
+                "backend": backend,
                 "precision": precision,
                 "distribution": DADistribution.parse(distribution).name,
                 "num_tokens": shape.num_tokens,
@@ -629,6 +809,7 @@ def _benchmark_precision(
                 "hidden_size": shape.hidden_size,
                 "intermediate_size": shape.intermediate_size,
                 "execution_mode": "graph",
+                "routing_input_mode": routing_input_mode,
                 "noda_ms": no_da_ms,
                 "da_ms": da_ms,
                 "speedup_da_over_noda": no_da_ms / da_ms,
@@ -665,6 +846,7 @@ def _benchmark_precision(
         da_graph.reset()
         for lease in leases:
             lease.release()
+        da_moe_release_resources()
     return rows
 
 
@@ -680,6 +862,10 @@ def _parse_args() -> argparse.Namespace:
     """Parse the preserved DA benchmark and cache compatibility contract."""
     # Preserve historical cache aliases while presenting tuning-cache terminology to new users.
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=BACKENDS, default="trtllm")
+    parser.add_argument(
+        "--routing-input-mode", choices=("routed", "logits"), default="routed"
+    )
     parser.add_argument(
         "--precision", default="nvfp4", help="Comma-separated precision list or all"
     )
@@ -730,9 +916,14 @@ def main() -> int:
     """Execute the requested precision/token matrix and persist its evidence."""
     # Normalize precision aliases and reject incompatible cache/shard arguments before GPU work.
     args = _parse_args()
-    requested_precision_names = (
-        PRECISIONS if args.precision == "all" else _parse_csv(args.precision)
-    )
+    if args.precision == "all":
+        requested_precision_names = (
+            tuple(name for name in PRECISIONS if name != "mxint4")
+            if args.backend == "prims_ts"
+            else PRECISIONS
+        )
+    else:
+        requested_precision_names = _parse_csv(args.precision)
     unknown = sorted(
         set(requested_precision_names) - set(PRECISIONS) - set(PRECISION_ALIASES)
     )
@@ -741,6 +932,8 @@ def main() -> int:
     precision_names = tuple(
         PRECISION_ALIASES.get(name, name) for name in requested_precision_names
     )
+    if args.backend == "prims_ts" and "mxint4" in precision_names:
+        raise SystemExit("PrimsTS does not yet provide an ordinary MXINT4 MoE body")
     if args.skip_autotune and not args.cache:
         raise SystemExit("--skip-autotune requires --cache/--tuning-cache")
     if args.local_num_experts > args.num_experts:
@@ -774,6 +967,8 @@ def main() -> int:
                     not args.skip_autotune,
                     args.warmup,
                     args.iters,
+                    args.backend,
+                    args.routing_input_mode,
                 )
             )
             gc.collect()

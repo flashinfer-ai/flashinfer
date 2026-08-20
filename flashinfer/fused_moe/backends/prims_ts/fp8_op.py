@@ -22,6 +22,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
+from flashinfer.fused_moe.factorized import MoeTactic
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,
@@ -351,6 +352,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
         fc1_per_channel_weight_scale=fc1_per_channel_weight_scale,
         fc2_per_channel_weight_scale=fc2_per_channel_weight_scale,
         routing_replay_out=routing_replay_out,
+        routing_input_mode=RoutingInputMode.FromLogits,
     )
     moe_runner.set_cache_key_static_extras(**common_kwargs)
     ok, reason = is_prims_ts_fp8_per_tensor_supported(
@@ -384,14 +386,39 @@ def prims_ts_fp8_per_tensor_scale_moe(
             f"Config not supported by Prims-TS FP8 per-tensor kernel ({reason})"
         )
 
-    intermediate_output = moe_runner.forward(
-        moe_inputs.to_list(),
-        tactic=tactic,
-        **common_kwargs,
+    def run_selected_tactic(
+        selected_tactic: MoeTactic,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        """Run one concrete PrimsTS FP8 per-tensor tactic."""
+        intermediate_output = moe_runner.forward(
+            moe_inputs.to_list(), tactic=selected_tactic, **common_kwargs
+        )
+        return output if do_finalize else intermediate_output
+
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+
+    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+        return run_selected_tactic(tactic)
+
+    from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da
+
+    return run_prims_ts_da(
+        custom_op="flashinfer::prims_ts_fp8_per_tensor_scale_moe",
+        runner=moe_runner,
+        tuning_config=tuning_config,
+        inputs=moe_inputs.to_list(),
+        runner_kwargs=common_kwargs,
+        baseline_tactic=tactic,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        routed_scaling_factor=routed_scaling_factor,
+        run_fixed_tactic=run_selected_tactic,
+        finish_switch=lambda: output,
     )
-    if do_finalize:
-        return output
-    return intermediate_output
 
 
 @register_fake_op("flashinfer::prims_ts_fp8_per_tensor_scale_moe")
@@ -966,14 +993,39 @@ def _prims_ts_fp8_block_scale_moe_impl(
             f"Config not supported by Prims-TS FP8 block-scale kernel ({reason})"
         )
 
-    intermediate_output = moe_runner.forward(
-        moe_inputs.to_list(),
-        tactic=tactic,
-        **common_kwargs,
+    def run_selected_tactic(
+        selected_tactic: MoeTactic,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        """Run one concrete PrimsTS FP8 block-scale tactic."""
+        intermediate_output = moe_runner.forward(
+            moe_inputs.to_list(), tactic=selected_tactic, **common_kwargs
+        )
+        return output if do_finalize else intermediate_output
+
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+
+    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+        return run_selected_tactic(tactic)
+
+    from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da
+
+    return run_prims_ts_da(
+        custom_op="flashinfer::prims_ts_fp8_block_scale_moe",
+        runner=moe_runner,
+        tuning_config=tuning_config,
+        inputs=moe_inputs.to_list(),
+        runner_kwargs=common_kwargs,
+        baseline_tactic=tactic,
+        routing_input_mode=routing_input_mode,
+        num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        routed_scaling_factor=routed_scaling_factor,
+        run_fixed_tactic=run_selected_tactic,
+        finish_switch=lambda: output,
     )
-    if do_finalize:
-        return output
-    return intermediate_output
 
 
 @register_fake_op("flashinfer::prims_ts_fp8_block_scale_moe")
