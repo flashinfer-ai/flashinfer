@@ -1879,10 +1879,18 @@ class _StopAfterSelection(Exception):
         ("100", frozenset({"fp4_quantization_120f"}), "fp4_quantization_100"),
     ],
 )
-def test_fp4_quantization_module_selection(monkeypatch, backend, aot_names, expected):
+def test_fp4_quantization_module_selection(
+    monkeypatch, tmp_path, backend, aot_names, expected
+):
     """CPU-only check of the SM12x arch-vs-family module selection."""
+    from flashinfer.jit import env as jit_env
     from flashinfer.jit.core import JitSpec
     from flashinfer.quantization import fp4_quantization as fp4q
+
+    for name in aot_names:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / f"{name}.so").touch()
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", tmp_path)
 
     selected = []
 
@@ -1890,9 +1898,6 @@ def test_fp4_quantization_module_selection(monkeypatch, backend, aot_names, expe
         selected.append(self.name)
         raise _StopAfterSelection
 
-    monkeypatch.setattr(
-        JitSpec, "is_aot", property(lambda self: self.name in aot_names)
-    )
     monkeypatch.setattr(JitSpec, "build_and_load", fake_build_and_load)
 
     fp4q.get_fp4_quantization_module.cache_clear()
