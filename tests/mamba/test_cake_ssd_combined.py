@@ -737,6 +737,84 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
         module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
 
 
+def test_source_public_constructor_hardware_error_parity_without_gpu(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    utils = importlib.import_module("flashinfer.utils")
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (12, 0))
+    errors = {}
+
+    for backend in ("cute", "cake"):
+        with pytest.raises(ValueError) as exc_info:
+            module.SSDCombined(128, 2, 64, 128, 1, backend=backend)
+        errors[backend] = (type(exc_info.value), str(exc_info.value))
+
+    assert errors["cake"] == errors["cute"]
+
+
+def test_source_public_cake_constructor_rejects_non_exported_arch_without_gpu(
+    monkeypatch,
+):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    utils = importlib.import_module("flashinfer.utils")
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (11, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (11, 0))
+
+    with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
+        module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
+
+
+@pytest.mark.parametrize(
+    "backend,invalid,exception,match",
+    (
+        ("cute", "io_dtype", AssertionError, "io_dtype must be bfloat16"),
+        ("cute", "state_dtype", AssertionError, "state_dtype must be one of"),
+        ("cake", "chunk_size", ValueError, "requires chunk_size=128"),
+        ("cake", "headdim", ValueError, "requires chunk_size=128"),
+        ("cake", "dstate", ValueError, "requires chunk_size=128"),
+        ("cake", "nheads", ValueError, "requires positive nheads"),
+        ("cake", "ngroups", ValueError, "requires positive nheads"),
+        ("cake", "head_group_ratio", ValueError, "requires positive nheads"),
+        ("cake", "io_dtype", ValueError, "requires bfloat16 IO"),
+        ("cake", "state_dtype", ValueError, "state dtype must be"),
+        ("cake", "seq_idx_dtype", ValueError, "seq_idx dtype must be"),
+    ),
+)
+def test_source_public_backend_constructor_validation_without_gpu(
+    monkeypatch, backend, invalid, exception, match
+):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    utils = importlib.import_module("flashinfer.utils")
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (10, 3))
+    constructor = {
+        "chunk_size": 128,
+        "nheads": 2,
+        "headdim": 64,
+        "dstate": 128,
+        "ngroups": 1,
+        "io_dtype": torch.bfloat16,
+        "state_dtype": torch.bfloat16,
+        "seq_idx_dtype": torch.int32,
+        "backend": backend,
+    }
+    replacements = {
+        "chunk_size": 64,
+        "headdim": 32,
+        "dstate": 64,
+        "nheads": 0,
+        "ngroups": 0,
+        "io_dtype": torch.float16,
+        "state_dtype": torch.float32,
+        "seq_idx_dtype": torch.float32,
+    }
+    if invalid == "head_group_ratio":
+        constructor.update(nheads=3, ngroups=2)
+    else:
+        constructor[invalid] = replacements[invalid]
+
+    with pytest.raises(exception, match=match):
+        module.SSDCombined(**constructor)
+
+
 def _public_runner_without_constructor(backend, cake_result=None):
     runner = object.__new__(SSDCombined)
     runner.chunk_size = 128
@@ -800,13 +878,22 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
 
 
 @pytest.mark.parametrize(
-    "invalid",
-    ("seqlen", "a_dtype", "out_shape", "out_dtype", "out_contiguous"),
+    "invalid,exception",
+    (
+        ("x_rank", ValueError),
+        ("seqlen", AssertionError),
+        ("a_dtype", AssertionError),
+        ("out_shape", AssertionError),
+        ("out_dtype", AssertionError),
+        ("out_contiguous", AssertionError),
+    ),
 )
-def test_source_public_shared_validation_error_parity_without_gpu(invalid):
+def test_source_public_shared_validation_error_parity_without_gpu(invalid, exception):
     tensors = _cpu_public_run_inputs()
     kwargs = {}
-    if invalid == "seqlen":
+    if invalid == "x_rank":
+        tensors = (torch.empty((128, 2, 64), dtype=torch.bfloat16), *tensors[1:])
+    elif invalid == "seqlen":
         x, dt, A, B, C = tensors
         tensors = (x[:, :-1], dt[:, :-1], A, B[:, :-1], C[:, :-1])
     elif invalid == "a_dtype":
@@ -823,7 +910,7 @@ def test_source_public_shared_validation_error_parity_without_gpu(invalid):
     errors = {}
     for backend in ("cute", "cake"):
         runner = _public_runner_without_constructor(backend)
-        with pytest.raises(AssertionError) as exc_info:
+        with pytest.raises(exception) as exc_info:
             runner.run(*tensors, **kwargs)
         errors[backend] = (type(exc_info.value), str(exc_info.value))
         assert runner._cake_runner.calls == []
@@ -899,6 +986,299 @@ def _source_cake_runner_without_constructor():
     runner.has_z = False
     runner.seq_idx_dtype = torch.int32
     return runner
+
+
+def _source_cake_varlen_arguments(runner, tensors):
+    batch, seqlen = tensors[0].shape[:2]
+    runner.has_initial_states = True
+    runner.has_varlen = True
+    return {
+        "initial_states": torch.empty(
+            (batch, runner.nheads, 64, 128), dtype=runner.state_dtype
+        ),
+        "seq_idx": torch.empty((batch, seqlen), dtype=runner.seq_idx_dtype),
+        "chunk_indices": torch.arange(batch, dtype=torch.int32),
+        "chunk_offsets": torch.zeros(batch, dtype=torch.int32),
+        "seq_chunk_cumsum": torch.arange(batch + 1, dtype=torch.int32),
+    }
+
+
+# Validation below dispatch is backend-specific: lock each backend's complete
+# rejection surface separately while the pre-dispatch test above enforces exact
+# exception-type/message parity for the shared public contract.
+@pytest.mark.parametrize(
+    "invalid,match",
+    (
+        ("x_shape", "x must have shape"),
+        ("b_shape", "B must have shape"),
+        ("c_shape", "C must have the same shape as B"),
+        ("x_dtype", "x, B, and C must be bfloat16"),
+        ("b_dtype", "x, B, and C must be bfloat16"),
+        ("c_dtype", "x, B, and C must be bfloat16"),
+        ("dt_shape", "dt must have shape"),
+        ("a_shape", "A must have shape"),
+        ("dt_dtype", "dt must be bfloat16 or float32"),
+        ("d_presence", "runtime D/z presence must match"),
+        ("z_presence", "runtime D/z presence must match"),
+        ("initial_presence", "runtime initial_states presence must match"),
+        ("varlen_metadata", "varlen mode requires seq_idx"),
+        ("batched_metadata", "batched mode does not accept varlen metadata"),
+        ("batched_cumsum", "batched mode does not accept varlen metadata"),
+        ("varlen_initial", "varlen mode requires initial_states"),
+        ("initial_dtype", "initial_states dtype must match state_dtype"),
+        ("d_shape", "D must have shape"),
+        ("d_dtype", "D must have shape"),
+        ("z_shape", "z must have the same shape and dtype as x"),
+        ("z_dtype", "z must have the same shape and dtype as x"),
+        ("initial_shape", "initial_states must have shape"),
+        ("seq_idx_shape", "seq_idx shape or dtype"),
+        ("seq_idx_dtype", "seq_idx shape or dtype"),
+        ("chunk_indices_dtype", "matching int32 vectors"),
+        ("chunk_offsets_dtype", "matching int32 vectors"),
+        ("chunk_indices_ndim", "matching int32 vectors"),
+        ("chunk_vector_shape", "matching int32 vectors"),
+        ("seq_cumsum_shape", "seq_chunk_cumsum shape or dtype"),
+        ("seq_cumsum_dtype", "seq_chunk_cumsum shape or dtype"),
+    ),
+)
+def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, match):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
+    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    cake_runner = _source_cake_runner_without_constructor()
+    runner = _public_runner_without_constructor("cake")
+    runner._cake_runner = cake_runner
+    tensors = list(_cpu_public_run_inputs(batch=2))
+    kwargs = {}
+
+    if invalid == "x_shape":
+        tensors[0] = torch.empty((2, 128, 3, 64), dtype=torch.bfloat16)
+    elif invalid == "b_shape":
+        tensors[3] = torch.empty((2, 128, 2, 128), dtype=torch.bfloat16)
+    elif invalid == "c_shape":
+        tensors[4] = torch.empty((2, 128, 1, 127), dtype=torch.bfloat16)
+    elif invalid in {"x_dtype", "b_dtype", "c_dtype"}:
+        tensor_index = {"x_dtype": 0, "b_dtype": 3, "c_dtype": 4}[invalid]
+        tensors[tensor_index] = tensors[tensor_index].to(torch.float16)
+    elif invalid == "dt_shape":
+        tensors[1] = torch.empty((2, 128, 3), dtype=torch.float32)
+    elif invalid == "a_shape":
+        tensors[2] = torch.empty((3,), dtype=torch.float32)
+    elif invalid == "dt_dtype":
+        tensors[1] = tensors[1].to(torch.float16)
+    elif invalid == "d_presence":
+        cake_runner.has_d = True
+    elif invalid == "z_presence":
+        cake_runner.has_z = True
+    elif invalid == "initial_presence":
+        cake_runner.has_initial_states = True
+    elif invalid == "varlen_metadata":
+        cake_runner.has_initial_states = True
+        cake_runner.has_varlen = True
+        kwargs["initial_states"] = torch.empty(
+            (2, 2, 64, 128), dtype=torch.bfloat16
+        )
+    elif invalid == "batched_metadata":
+        kwargs["seq_idx"] = torch.empty((2, 128), dtype=torch.int32)
+    elif invalid == "batched_cumsum":
+        kwargs["seq_chunk_cumsum"] = torch.empty(3, dtype=torch.int32)
+    elif invalid == "varlen_initial":
+        cake_runner.has_varlen = True
+        kwargs.update(
+            seq_idx=torch.empty((2, 128), dtype=torch.int32),
+            chunk_indices=torch.arange(2, dtype=torch.int32),
+            chunk_offsets=torch.zeros(2, dtype=torch.int32),
+        )
+    elif invalid == "initial_dtype":
+        cake_runner.has_initial_states = True
+        kwargs["initial_states"] = torch.empty(
+            (2, 2, 64, 128), dtype=torch.float16
+        )
+    elif invalid in {"d_shape", "d_dtype"}:
+        cake_runner.has_d = True
+        kwargs["D"] = torch.empty(
+            (2, 63),
+            dtype=torch.bfloat16 if invalid == "d_shape" else torch.float16,
+        )
+        if invalid == "d_dtype":
+            kwargs["D"] = torch.empty(2, dtype=torch.float16)
+    elif invalid in {"z_shape", "z_dtype"}:
+        cake_runner.has_z = True
+        kwargs["z"] = torch.empty(
+            (2, 127, 2, 64) if invalid == "z_shape" else tensors[0].shape,
+            dtype=torch.bfloat16 if invalid == "z_shape" else torch.float16,
+        )
+    else:
+        kwargs.update(_source_cake_varlen_arguments(cake_runner, tensors))
+        if invalid == "initial_shape":
+            kwargs["initial_states"] = torch.empty(
+                (2, 2, 64, 127), dtype=torch.bfloat16
+            )
+        elif invalid == "seq_idx_shape":
+            kwargs["seq_idx"] = torch.empty((1, 128), dtype=torch.int32)
+        elif invalid == "seq_idx_dtype":
+            kwargs["seq_idx"] = torch.empty((2, 128), dtype=torch.int64)
+        elif invalid == "chunk_indices_dtype":
+            kwargs["chunk_indices"] = torch.arange(2, dtype=torch.int64)
+        elif invalid == "chunk_offsets_dtype":
+            kwargs["chunk_offsets"] = torch.zeros(2, dtype=torch.int64)
+        elif invalid == "chunk_indices_ndim":
+            kwargs["chunk_indices"] = torch.zeros((1, 2), dtype=torch.int32)
+        elif invalid == "chunk_vector_shape":
+            kwargs["chunk_offsets"] = torch.zeros(3, dtype=torch.int32)
+        elif invalid == "seq_cumsum_shape":
+            kwargs["seq_chunk_cumsum"] = torch.empty(2, dtype=torch.int32)
+        elif invalid == "seq_cumsum_dtype":
+            kwargs["seq_chunk_cumsum"] = torch.empty(3, dtype=torch.int64)
+
+    with pytest.raises(ValueError, match=match):
+        runner.run(*tensors, **kwargs)
+
+
+def _source_cute_runner_without_constructor():
+    runner = _public_runner_without_constructor("cute")
+    runner._io_torch_dtype = torch.bfloat16
+    runner._cumsum_dtype = object()
+    runner._state_torch_dtype = torch.bfloat16
+    runner._has_d = False
+    runner._d_has_hdim = False
+    runner._has_init_states = False
+    runner._has_varlen = False
+    runner._has_z = False
+    runner._get_or_alloc_fstate = lambda batch: torch.empty(
+        (batch, 2, 64, 128), dtype=runner._state_torch_dtype
+    )
+    return runner
+
+
+@pytest.mark.parametrize(
+    "invalid,exception,match",
+    (
+        ("checkpoint", ValueError, "require SSDCombined backend='cake'"),
+        ("seq_idx_shape", AssertionError, "seq_idx shape"),
+        ("seq_idx_dtype", AssertionError, "seq_idx must be int32 or int64"),
+        ("chunk_indices_ndim", AssertionError, "chunk_indices must be 1D"),
+        ("chunk_indices_dtype", AssertionError, "chunk_indices must be int32"),
+        ("chunk_offsets_ndim", AssertionError, "chunk_offsets must be 1D"),
+        ("chunk_offsets_dtype", AssertionError, "chunk_offsets must be int32"),
+        ("chunk_vector_shape", AssertionError, "must have the same shape"),
+        ("x_dtype", AssertionError, "x dtype"),
+        ("b_dtype", AssertionError, "B dtype"),
+        ("c_dtype", AssertionError, "C dtype"),
+        ("d_dtype", AssertionError, "D dtype"),
+        ("z_dtype", AssertionError, "z dtype"),
+        ("initial_dtype", AssertionError, "init_states dtype"),
+        ("varlen_initial", ValueError, "initial_states must be provided"),
+    ),
+)
+def test_source_public_cute_backend_validation_without_gpu(
+    monkeypatch, invalid, exception, match
+):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+
+    def chunk_cumsum(dt, _a, chunk_size, **_kwargs):
+        batch, seqlen, nheads = dt.shape
+        shape = (batch, nheads, seqlen // chunk_size, chunk_size)
+        return torch.empty(shape, dtype=torch.float32), torch.empty(
+            shape, dtype=torch.bfloat16
+        )
+
+    monkeypatch.setattr(module, "chunk_cumsum_fwd", chunk_cumsum)
+    monkeypatch.setattr(module.cutlass_torch, "dtype", lambda _: torch.float32)
+    runner = _source_cute_runner_without_constructor()
+    tensors = list(_cpu_public_run_inputs(batch=2))
+    kwargs = {}
+    seq_idx = torch.empty((2, 128), dtype=torch.int32)
+    chunk_indices = torch.arange(2, dtype=torch.int32)
+    chunk_offsets = torch.zeros(2, dtype=torch.int32)
+
+    if invalid == "checkpoint":
+        kwargs.update(
+            checkpoint_token_indices=torch.zeros(2, dtype=torch.int32),
+            checkpoint_state_slots=torch.zeros(2, dtype=torch.int32),
+            checkpoint_states=torch.empty((1, 2, 64, 128), dtype=torch.bfloat16),
+        )
+    elif invalid == "seq_idx_shape":
+        kwargs["seq_idx"] = torch.empty((1, 128), dtype=torch.int32)
+    elif invalid == "seq_idx_dtype":
+        kwargs["seq_idx"] = torch.empty((2, 128), dtype=torch.float32)
+    elif invalid == "chunk_indices_ndim":
+        kwargs["chunk_indices"] = torch.empty((1, 2), dtype=torch.int32)
+    elif invalid == "chunk_indices_dtype":
+        kwargs["chunk_indices"] = torch.empty(2, dtype=torch.int64)
+    elif invalid == "chunk_offsets_ndim":
+        kwargs["chunk_offsets"] = torch.empty((1, 2), dtype=torch.int32)
+    elif invalid == "chunk_offsets_dtype":
+        kwargs["chunk_offsets"] = torch.empty(2, dtype=torch.int64)
+    elif invalid == "chunk_vector_shape":
+        kwargs.update(
+            chunk_indices=chunk_indices,
+            chunk_offsets=torch.empty(3, dtype=torch.int32),
+        )
+    elif invalid in {"x_dtype", "b_dtype", "c_dtype"}:
+        tensor_index = {"x_dtype": 0, "b_dtype": 3, "c_dtype": 4}[invalid]
+        tensors[tensor_index] = tensors[tensor_index].to(torch.float16)
+    elif invalid == "d_dtype":
+        runner._has_d = True
+        kwargs["D"] = torch.empty(2, dtype=torch.float16)
+    elif invalid == "z_dtype":
+        kwargs["z"] = torch.empty_like(tensors[0], dtype=torch.float16)
+    elif invalid == "initial_dtype":
+        runner._has_init_states = True
+        kwargs["initial_states"] = torch.empty(
+            (2, 2, 64, 128), dtype=torch.float16
+        )
+    elif invalid == "varlen_initial":
+        kwargs.update(
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+
+    with pytest.raises(exception, match=match):
+        runner.run(*tensors, **kwargs)
+
+
+@pytest.mark.parametrize("invalid", ("dt_bias_shape", "dt_bias_dtype"))
+def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
+    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
+    cake_runner = _source_cake_runner_without_constructor()
+    cake_runner._get_workspace = lambda **_: {
+        "final": torch.empty((2, 2, 64, 128), dtype=torch.bfloat16)
+    }
+    cake_runner._dummy = lambda device, dtype: torch.empty(
+        1, dtype=dtype, device=device
+    )
+    runner = _public_runner_without_constructor("cake")
+    runner._cake_runner = cake_runner
+    tensors = _cpu_public_run_inputs(batch=2)
+    dt_bias = torch.empty(
+        3 if invalid == "dt_bias_shape" else 2,
+        dtype=torch.float32 if invalid == "dt_bias_shape" else torch.float16,
+    )
+
+    with pytest.raises(ValueError, match="dt_bias must have shape"):
+        runner.run(*tensors, dt_bias=dt_bias)
+
+
+def test_source_public_cake_rejects_non_cuda_inputs_without_gpu(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
+    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    cake_runner = _source_cake_runner_without_constructor()
+    cake_runner._get_workspace = lambda **_: {
+        "final": torch.empty((1, 2, 64, 128), dtype=torch.bfloat16)
+    }
+    runner = _public_runner_without_constructor("cake")
+    runner._cake_runner = cake_runner
+
+    with pytest.raises(ValueError, match="inputs must be on a CUDA device"):
+        runner.run(*_cpu_public_run_inputs())
 
 
 @pytest.mark.parametrize(
