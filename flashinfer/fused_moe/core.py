@@ -635,6 +635,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_packed_weights: bool,
             use_fused_finalize: bool,
             use_wfp4afp8_humming: bool,
+            tune_max_num_tokens: int = 8192,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -651,6 +652,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.use_w4_group_scaling = use_w4_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.use_wfp4afp8_humming = use_wfp4afp8_humming
+            self.tune_max_num_tokens = tune_max_num_tokens
             self.min_latency_mode = min_latency_mode
             self.enable_pdl = enable_pdl
             self.use_packed_weights = use_packed_weights
@@ -669,6 +671,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.activation_type = activation_type
             # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
             self.gemm_idx_for_tuning: Optional[int] = None
+            # Per-bucket synthesized op inputs for op-level tuning. The
+            # "_cache" suffix keeps it out of the TunableRunner hash.
+            self._op_tuning_io_cache: dict = {}
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = module.init(
@@ -684,6 +689,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 )
 
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
+            # Op-level tuning is enabled exactly where gather-A tactics
+            # compete; probe the enumeration once per instance. Must run AFTER
+            # fused_moe_runner is assigned.
+            runner = self.fused_moe_runner
+            try:
+                is_gather_a = runner.get_tactic_is_gather_a
+                n1 = runner.get_gemm1_tactic_count()
+                self.has_gather_a_tactics = any(is_gather_a(t) for t in range(n1))
+            except AttributeError:
+                self.has_gather_a_tactics = False
 
         def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
             # Stage profiling passes only activation and weight tensors, so the
@@ -770,21 +785,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 return [-1]
             valid_tactics = valid_tactics if valid_tactics else all_tactics
 
-            # For MoE problems that are supported by gather-A grouped gemm fusion,
-            # we drop the dense TMA-WS configs from tactics as they are constantly
-            # outperformed by the gather-A counterparts.
-            if stage == 1:
-                try:
-                    is_gather_a = self.fused_moe_runner.get_tactic_is_gather_a
-                    is_tma_ws = self.fused_moe_runner.get_tactic_is_tma_ws
-                    has_gather_a = any(is_gather_a(t) for t in valid_tactics)
-                except AttributeError:
-                    has_gather_a = False
-                if has_gather_a:
-                    kept = [
-                        t for t in valid_tactics if is_gather_a(t) or not is_tma_ws(t)
-                    ]
-                    valid_tactics = kept or valid_tactics
+            # Min-latency mode bypasses the permute pipeline that produces the
+            # gather-A index array, so gather tactics cannot run (or be
+            # profiled) there; drop them instead of relying on the autotuner's
+            # per-tactic exception handling.
+            if stage == 1 and self.min_latency_mode and self.has_gather_a_tactics:
+                is_gather_a = self.fused_moe_runner.get_tactic_is_gather_a
+                kept = [t for t in valid_tactics if not is_gather_a(t)]
+                valid_tactics = kept or valid_tactics
 
             if not self.use_w4_group_scaling:
                 return valid_tactics
@@ -845,6 +853,22 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 fc2_expert_weights,
                 fc2_expert_biases,
             ) = inputs
+
+            # Large buckets are timed at OP level: the candidate tactic is
+            # pinned inside a full run_moe call, so the measurement reflects the
+            # actual context the tactic will run in.
+            if tactic != -1 and self._op_level_tuning_eligible(x):
+                self._run_gemm_profile_in_op_level(
+                    x,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                    tactic,
+                    kwargs["gemm_idx"],
+                )
+                return
+
             self.fused_moe_runner.run_gemm_profile(
                 x,
                 fc1_expert_weights,
@@ -865,6 +889,86 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 do_preparation,
                 self.enable_pdl,
                 self.activation_type,
+                self.tune_max_num_tokens,
+            )
+
+        def _op_level_tuning_eligible(self, x: torch.Tensor) -> bool:
+            # Op-level (full run_moe) tuning applies where the isolated-kernel
+            # duel is known to mis-rank and the op-level signal is strong:
+            #   - buckets of at least 1024 tokens: multi-CTA-cluster configs
+            #     win isolated duels but pay a co-scheduling tax in the real
+            #     op stream; below this the winners are sm80/1x1 configs with
+            #     no such bias, and candidate deltas (a few us) drown in the
+            #     op-level launch/PDL jitter;
+            #   - gather-A tactics present
+            #   - not min-latency
+            return (
+                x.shape[0] >= 1024
+                and not self.min_latency_mode
+                and self.has_gather_a_tactics
+            )
+
+        def _run_gemm_profile_in_op_level(
+            self,
+            x: torch.Tensor,
+            fc1_expert_weights: torch.Tensor,
+            fc1_expert_biases: Optional[torch.Tensor],
+            fc2_expert_weights: torch.Tensor,
+            fc2_expert_biases: Optional[torch.Tensor],
+            tactic: int,
+            gemm_idx: int,
+        ) -> None:
+            m = x.shape[0]
+            key = (m, x.device.index)
+            cached = self._op_tuning_io_cache.get(key)
+            if cached is None:
+                # Same synthesized routing / scales / output buffer for every
+                # candidate of this bucket, so tactics duel on identical work.
+                num_experts_total = fc1_expert_weights.shape[0] * self.ep_size
+                token_selected_experts = make_random_topk_ids(
+                    num_experts_total, m, self.top_k, x.device
+                )
+                token_final_scales = torch.full(
+                    (m, self.top_k),
+                    1.0 / self.top_k,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                output = torch.empty(
+                    (m, x.shape[1]), dtype=self.output_dtype, device=x.device
+                )
+                cached = (token_selected_experts, token_final_scales, output)
+                self._op_tuning_io_cache[key] = cached
+
+            token_selected_experts, token_final_scales, output = cached
+            profile_ids = [tactic, -1] if gemm_idx == 1 else [-1, tactic]
+            self.fused_moe_runner.run_moe(
+                output,
+                x,
+                token_selected_experts,
+                token_final_scales,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
+                [],
+                None,
+                None,
+                None,
+                None,
+                True,
+                self.tp_size,
+                self.tp_rank,
+                self.ep_size,
+                self.ep_rank,
+                self.cluster_size,
+                self.cluster_rank,
+                self.enable_alltoall,
+                self.min_latency_mode,
+                profile_ids,
+                self.enable_pdl,
+                self.activation_type,
+                None,
             )
 
         @classmethod
@@ -946,6 +1050,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_packed_weights=use_packed_weights,
             use_fused_finalize=use_fused_finalize,
             use_wfp4afp8_humming=use_wfp4afp8_humming,
+            tune_max_num_tokens=tune_max_num_tokens,
         )
 
         if profile_ids is None:
