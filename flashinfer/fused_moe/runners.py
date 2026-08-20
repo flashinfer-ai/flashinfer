@@ -658,15 +658,13 @@ class _CutlassRunnerBase(MoERunner):
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
         scale_inputs = self._pack_activation_scale_inputs(act)
 
+        # Token-dynamic dims are only the packed prerouted buffers (output,
+        # hidden, topk_ids, topk_weights). Per-tensor FP8 dequant is 0-dim;
+        # MXFP8 input_sf is a swizzled 1-D buffer resized by ConstraintSpec.
+        # Sniffing shape[0] == num_tokens treated a (1,) scale at M=1 as
+        # token-dynamic and let autotune replace it with a bucket-sized tensor.
         input_idxs: tuple[int, ...] = (0, 1, 2, 3)
         dim_idxs: tuple[int, ...] = (0, 0, 0, 0)
-        scale_token_idxs = []
-        for offset, tensor in enumerate(scale_inputs):
-            if tensor.dim() >= 1 and tensor.shape[0] == num_tokens:
-                scale_token_idxs.append(4 + len(weight_inputs) + offset)
-        if scale_token_idxs:
-            input_idxs = input_idxs + tuple(scale_token_idxs)
-            dim_idxs = dim_idxs + tuple(0 for _ in scale_token_idxs)
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
@@ -734,9 +732,9 @@ class _CutlassRunnerBase(MoERunner):
             return
         if self._x_dtype is torch.float8_e4m3fn:
             scale = act.hidden_states_scale
-            if scale is None or scale.numel() != 1 or scale.dtype is not torch.float32:
+            if scale is None or scale.dim() != 0 or scale.dtype is not torch.float32:
                 raise ValueError(
-                    f"{type(self).__name__} requires a scalar float32 "
+                    f"{type(self).__name__} requires a 0-dim float32 "
                     "hidden_states_scale dequant factor."
                 )
             return
@@ -984,8 +982,6 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
     ) -> List[torch.Tensor]:
-        from ..utils import round_up
-
         (
             w1,
             w2,
@@ -1221,6 +1217,11 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
         )
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            raise ValueError(
+                "Cutlass MXFP8xMXFP4 requires hidden_size and intermediate_size "
+                f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
+            )
         expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:

@@ -805,7 +805,8 @@ class CutlassMxfp8Mxfp4Config:
 
     Activations are MXFP8 with a swizzled ``input_sf``. Weights are packed
     MXFP4 viewed as int64 at launch. Packed precomputed routing with SwiGLU
-    and ``do_finalize=True``.
+    and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
+    must be divisible by 128.
     """
 
     @classmethod

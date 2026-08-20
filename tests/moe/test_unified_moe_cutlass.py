@@ -298,15 +298,26 @@ def test_prepare_cutlass_mxfp8_mxfp4_weights_rejects_invalid_source_contract():
             intermediate_size=32,
         )
 
-    w1 = torch.empty(2, 64, 32, dtype=torch.bfloat16)
-    w2 = torch.empty(2, 32, 32, dtype=torch.bfloat16)
+    w1 = torch.empty(2, 128, 64, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="divisible by 128"):
+        CutlassMxfp8Mxfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=64,
+            intermediate_size=64,
+        )
+
+    w1 = torch.empty(2, 256, 128, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 128, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="requires CUDA"):
         CutlassMxfp8Mxfp4Config.prepare_weights(
             w1,
             w2,
             num_local_experts=2,
-            hidden_size=32,
-            intermediate_size=32,
+            hidden_size=128,
+            intermediate_size=128,
             device=torch.device("cpu"),
         )
 
@@ -584,6 +595,58 @@ def test_cutlass_mxfp8_rejects_linear_activation_scales():
     )
     with pytest.raises(ValueError, match="swizzled"):
         runner._validate_activation_scale(act)
+
+
+def test_cutlass_fp8_per_tensor_rejects_nonscalar_activation_scale():
+    runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
+    hidden = torch.empty(1, 128, dtype=torch.float8_e4m3fn)
+    act = MoEActivationPack(
+        hidden,
+        torch.ones(1, dtype=torch.float32),
+        torch.zeros(1, 2, dtype=torch.int32),
+        torch.ones(1, 2, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="0-dim float32"):
+        runner._validate_activation_scale(act)
+
+
+def test_cutlass_fp8_per_tensor_pack_keeps_scalar_scale_static():
+    runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
+    runner.config = _config(quant=QuantConfig(variant=QuantVariant.FP8PerTensor))
+    runner.device = torch.device("cpu")
+    runner._inner = object()
+    runner._built = True
+    runner._ensure_workspace = lambda *_args, **_kwargs: None
+    runner._pack_weight_inputs = lambda _view, _hidden_size: [
+        torch.empty(1) for _ in runner._required_weight_keys
+    ]
+    act = MoEActivationPack(
+        torch.empty(1, 128, dtype=torch.float8_e4m3fn),
+        torch.ones((), dtype=torch.float32),
+        torch.zeros(1, 2, dtype=torch.int32),
+        torch.full((1, 2), 0.5, dtype=torch.float32),
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        runner.backend_key,
+        {key: torch.empty(1) for key in runner._required_weight_keys},
+    )
+    runner.pack_inputs(act, weights)
+    spec = runner.tuning_config.dynamic_tensor_specs[0]
+    assert spec.input_idx == (0, 1, 2, 3)
+
+
+def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
+    runner = CutlassMxfp8Mxfp4Runner.__new__(CutlassMxfp8Mxfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MXFP4),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=64),
+    )
+    runner.device = torch.device("cpu")
+    view = {key: torch.empty(1) for key in runner._required_weight_keys}
+    with pytest.raises(ValueError, match="divisible by 128"):
+        runner._pack_weight_inputs(view, hidden_size=64)
 
 
 def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():

@@ -1212,9 +1212,10 @@ def prepare_cutlass_bf16_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical BF16 view consumed by ``CutlassBf16Runner``.
 
-    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order and
-    ``w2_bf16`` is ``[E, H, I]``.  CUTLASS BF16 paths consume these dense
-    tensors directly; preparation validates the source contract
+    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order (same as
+    the flat CUTLASS SwiGLU split that tests name ``(w3, w1)``: up first, gate
+    second) and ``w2_bf16`` is ``[E, H, I]``.  CUTLASS BF16 paths consume these
+    dense tensors directly; preparation validates the source contract
     and materializes contiguous tensors on the requested device.
     """
     if device is None:
@@ -1369,11 +1370,12 @@ def prepare_cutlass_nvfp4_weights(
     """Build the CUTLASS NVFP4 view consumed by ``CutlassNvfp4Runner``.
 
     Canonical source is BF16 ``w1_bf16 [E, 2*I, H]`` in semantic ``[up, gate]``
-    order and ``w2_bf16 [E, H, I]``. Each expert is quantized independently with
-    ``fp4_quantize`` (``sf_vec_size=16``, swizzled scales) so 128-row swizzle
-    tiles never cross expert boundaries. Global scales are fixed at 1.0 to
-    match the other unified NVFP4 prepares; the kernel still receives the
-    six-tensor CUTLASS ``quant_scales`` contract.
+    order (same as the flat CUTLASS SwiGLU split that tests name ``(w3, w1)``:
+    up first, gate second) and ``w2_bf16 [E, H, I]``. Each expert is quantized
+    independently with ``fp4_quantize`` (``sf_vec_size=16``, swizzled scales)
+    so 128-row swizzle tiles never cross expert boundaries. Global scales are
+    fixed at 1.0 to match the other unified NVFP4 prepares; the kernel still
+    receives the six-tensor CUTLASS ``quant_scales`` contract.
 
     Do not reuse TRTLLM shuffled or BlockMajorK tensors: CUTLASS consumes the
     packed uint8 payload plus the swizzled ``fp4_quantize`` scale buffer.
@@ -1613,7 +1615,11 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
     intermediate_size: int,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the CUTLASS MXFP4 weight view consumed with MXFP8 activations."""
+    """Build the CUTLASS MXFP4 weight view consumed with MXFP8 activations.
+
+    MXFP4 block scales are 32-wide, but the fused-MoE binding still requires
+    ``hidden_size`` and ``intermediate_size`` divisible by 128.
+    """
     w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
         w1_bf16,
         w2_bf16,
@@ -1621,7 +1627,7 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_mxfp4_weights",
-        alignment=32,
+        alignment=128,
         require_cuda=True,
         device=device,
     )
