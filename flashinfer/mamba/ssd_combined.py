@@ -316,7 +316,7 @@ class SSDCombined:
                 f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
             )
         if backend == "cake":
-            from ..jit.mamba.cake_ssd_combined import CakeSSDCombined
+            from .cake_ssd_combined import CakeSSDCombined
 
             self._cake_runner = CakeSSDCombined(
                 chunk_size,
@@ -848,7 +848,13 @@ def ssd_combined_fwd(
 
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
-    state_dtype = initial_states.dtype if initial_states is not None else torch.bfloat16
+    state_dtype = (
+        initial_states.dtype
+        if initial_states is not None
+        else checkpoint_states.dtype
+        if checkpoint_states is not None
+        else torch.bfloat16
+    )
     runner = SSDCombined(
         128,
         nheads,

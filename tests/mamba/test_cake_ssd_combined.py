@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -244,7 +247,8 @@ def test_cake_ssd_combined_updates_caller_buffers():
     expected_cumsum = arguments["seq_chunk_cumsum"]
     actual_cumsum = torch.full_like(expected_cumsum, -1)
     out = torch.empty((1, 8, 64, 2, 128), dtype=torch.bfloat16, device="cuda")
-    actual = SSDCombined(**constructor, backend="cake").run(
+    runner = SSDCombined(**constructor, backend="cake")
+    actual = runner.run(
         *tensors,
         **{
             **arguments,
@@ -257,6 +261,17 @@ def test_cake_ssd_combined_updates_caller_buffers():
     torch.testing.assert_close(actual_cumsum, expected_cumsum, rtol=0, atol=0)
     assert actual[0].untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
 
+    preserved_cumsum = actual_cumsum.clone()
+    runner.run(
+        *tensors,
+        **{
+            **arguments,
+            "seq_chunk_cumsum": actual_cumsum,
+            "update_seq_chunk_cumsum": False,
+        },
+    )
+    torch.testing.assert_close(actual_cumsum, preserved_cumsum, rtol=0, atol=0)
+
 
 def test_cake_ssd_combined_writes_selected_checkpoint_state():
     capability = torch.cuda.get_device_capability()
@@ -267,7 +282,13 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state():
     sequence_start = 96
     checkpoint_length = 128
     checkpoint_token = sequence_start + checkpoint_length
-    checkpoint_state = torch.empty_like(arguments["initial_states"][:1])
+    checkpoint_states = torch.full(
+        (3, *arguments["initial_states"].shape[1:]),
+        torch.nan,
+        dtype=arguments["initial_states"].dtype,
+        device="cuda",
+    )
+    checkpoint_state = checkpoint_states[2:3]
     full_arguments = {
         **arguments,
         # Expose sequence 1's checkpoint inside physical chunk 1 as a logical
@@ -279,9 +300,9 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state():
             [-1, checkpoint_token], dtype=torch.int32, device="cuda"
         ),
         "checkpoint_state_slots": torch.tensor(
-            [-1, 0], dtype=torch.int32, device="cuda"
+            [-1, 2], dtype=torch.int32, device="cuda"
         ),
-        "checkpoint_states": checkpoint_state,
+        "checkpoint_states": checkpoint_states,
     }
     SSDCombined(**constructor, backend="cake").run(*tensors, **full_arguments)
 
@@ -313,6 +334,7 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state():
         atol=1e-2,
         rtol=1e-2,
     )
+    assert torch.isnan(checkpoint_states[:2]).all()
 
 
 def test_cake_ssd_combined_allocation_output_lifetime():
@@ -322,12 +344,37 @@ def test_cake_ssd_combined_allocation_output_lifetime():
 
     constructor, tensors, arguments = _case()
     runner = SSDCombined(**constructor, backend="cake")
-    first, _ = runner.run(*tensors, **arguments)
+    first, first_final = runner.run(*tensors, **arguments)
     retained = first.clone()
-    second, _ = runner.run(*tensors, **arguments)
+    retained_final = first_final.clone()
+    second, second_final = runner.run(*tensors, **arguments)
 
     assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
+    assert (
+        first_final.untyped_storage().data_ptr()
+        != second_final.untyped_storage().data_ptr()
+    )
     torch.testing.assert_close(first, retained, rtol=0, atol=0)
+    torch.testing.assert_close(first_final, retained_final, rtol=0, atol=0)
+
+    without_final = runner.run(
+        *tensors, **{**arguments, "return_final_states": False}
+    )
+    assert isinstance(without_final, tuple)
+    assert without_final[1] is None
+
+
+def test_cake_ssd_combined_supports_disabled_softplus():
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case()
+    arguments["dt_softplus"] = False
+
+    expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+    _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -410,3 +457,53 @@ def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
         errors[backend] = (type(exc_info.value), str(exc_info.value))
 
     assert errors["cake"] == errors["cute"]
+
+
+def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    runners = []
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            self.constructor_args = args
+            self.constructor_kwargs = kwargs
+            self.run_kwargs = None
+            runners.append(self)
+
+        def run(self, *args, **kwargs):
+            self.run_kwargs = kwargs
+            return (object(), None)
+
+    monkeypatch.setattr(module, "SSDCombined", Runner)
+    x = SimpleNamespace(
+        shape=(1, 128, 8, 64),
+        dtype=torch.bfloat16,
+    )
+    B = SimpleNamespace(shape=(1, 128, 8, 128))
+    checkpoint_states = SimpleNamespace(dtype=torch.float16)
+
+    first = module.ssd_combined_fwd(
+        x,
+        object(),
+        object(),
+        B,
+        object(),
+        checkpoint_states=checkpoint_states,
+    )
+    second = module.ssd_combined_fwd(
+        x,
+        object(),
+        object(),
+        B,
+        object(),
+        checkpoint_states=checkpoint_states,
+    )
+
+    assert isinstance(first, tuple) and isinstance(second, tuple)
+    assert len(runners) == 2 and runners[0] is not runners[1]
+    assert all(runner.constructor_kwargs["backend"] == "cake" for runner in runners)
+    assert all(
+        runner.constructor_kwargs["state_dtype"] == torch.float16
+        for runner in runners
+    )
+    assert all(runner.run_kwargs["dt_softplus"] is False for runner in runners)
