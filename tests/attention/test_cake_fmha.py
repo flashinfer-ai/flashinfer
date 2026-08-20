@@ -87,6 +87,7 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
     assert cake_api._manifest_optimized_route_accounting() == (1_798, 1_798)
+    assert cake_api._manifest_authenticated_route_accounting() == (1_768, 1_798)
     for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
         manifest_components = tuple(
             dict.fromkeys(

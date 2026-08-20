@@ -425,9 +425,32 @@ def _manifest_optimized_route_accounting() -> tuple[int, int]:
     """
 
     route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
-    total = sum(count for name, count in route_counts.items() if name != "cake_fmha_compat_v1")
+    total = sum(
+        count
+        for name, count in route_counts.items()
+        if name != "cake_fmha_compat_v1"
+    )
     registered = sum(route_counts.get(name, 0) for name in _PRODUCT_ROUTE_COMPONENTS)
     return registered, total
+
+
+def _manifest_authenticated_route_accounting() -> tuple[int, int]:
+    """Return runnable/total optimized counts recorded by the manifest."""
+
+    route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
+    total = sum(
+        count
+        for name, count in route_counts.items()
+        if name != "cake_fmha_compat_v1"
+    )
+    authenticated = sum(
+        route_counts.get(route_name, 0)
+        for route_name, components in _PRODUCT_ROUTE_COMPONENTS.items()
+        if all(
+            component in _AUTHENTICATED_JIT_COMPONENTS for component in components
+        )
+    )
+    return authenticated, total
 
 
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
