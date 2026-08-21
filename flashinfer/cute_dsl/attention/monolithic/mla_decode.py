@@ -541,6 +541,12 @@ def cute_dsl_mla_decode(
         Whether to return LSE values.  When True, the function returns
         ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
         the caller supplied).
+    lse_scale : float, default=1 / LOG2_E
+        Multiplier applied to the LSE at the store. This kernel computes LSE in
+        base 2, so the default ``1 / LOG2_E`` returns natural-log values and
+        ``1.0`` returns base-2. Set from ``return_lse_base_on_e`` by
+        ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla``. Has no effect
+        when ``return_lse`` is False.
     cum_seq_lens_q : Optional[torch.Tensor]
         Device-resident int32 cumulative query lengths with shape
         ``[B + 1]``. When provided, selects compact variable-Q input and
