@@ -1448,6 +1448,86 @@ def test_stale_schedule_meta_detected(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_oversized_out_returns_exact_rows(variant):
+    """An oversized out= must return exactly batch_size*next_n rows.
+
+    A shared max-batch buffer is the CUDA-graph pattern: one address-stable
+    allocation reused across captures of different batch sizes. Returning all
+    capacity rows would hand a consumer that derives its batch from
+    scores.shape[0] both the wrong row count and stale values. Regression for
+    PR #4365 review r3824692495.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_context_len,
+    )
+
+    device = "cuda"
+    torch.manual_seed(5)
+    B, next_n, H, D, block_size, ctx = 2, 1, 64, 128, 64, 512
+    MAX_B = 8  # buffer sized for the largest capture
+    rows = B * next_n
+
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    padded = padded_context_len(ctx)
+    dtype = torch.float32 if variant == "fp8" else torch.bfloat16
+    SENTINEL = -12345.0
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(ntb, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv = _make_fused_kv_fp8(
+            (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+        )
+        call = lambda o: fp8_paged_mqa_logits(  # noqa: E731
+            q, kv, w, context_lens, block_table, ctx, out=o
+        )
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        sf_q = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+        call = lambda o: fp4_paged_mqa_logits(  # noqa: E731
+            q,
+            sf_q,
+            kv,
+            w,
+            context_lens,
+            block_table,
+            ctx,
+            output_dtype=torch.bfloat16,
+            out=o,
+        )
+
+    big = torch.full((MAX_B * next_n, padded), SENTINEL, device=device, dtype=dtype)
+    res = call(big)
+
+    assert res.shape == (rows, ctx), (
+        f"expected exactly {rows} rows, got {tuple(res.shape)}"
+    )
+    assert res.data_ptr() == big.data_ptr(), "must stay a view of the caller's buffer"
+
+    # rows past the real batch are left alone -- nothing stale is exposed
+    assert torch.all(big[rows:] == SENTINEL), "surplus rows must not be written"
+
+    # an exactly-sized buffer gives the same values
+    exact = torch.empty((rows, padded), device=device, dtype=dtype)
+    assert torch.equal(res, call(exact))
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
