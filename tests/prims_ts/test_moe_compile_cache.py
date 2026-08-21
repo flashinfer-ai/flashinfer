@@ -16,6 +16,17 @@ from flashinfer.prims_ts.batched_gemm import batched_gemm_run
 from flashinfer.prims_ts.moe import compile_cache
 
 
+def test_persistent_kernel_name_covers_full_compile_key():
+    key = ("cfg", "fc1", "options", 0, "sm100a")
+
+    assert compile_cache._persistent_kernel_name(
+        key
+    ) != compile_cache._persistent_kernel_name(("cfg", "fc1", "options", 1, "sm100a"))
+    assert compile_cache._persistent_kernel_name(
+        key
+    ) != compile_cache._persistent_kernel_name(("cfg", "fc1", "options", 0, "sm103a"))
+
+
 def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, request):
     compiled = []
     target = [(0, "sm100a")]
