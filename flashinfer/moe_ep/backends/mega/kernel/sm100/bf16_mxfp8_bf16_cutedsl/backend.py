@@ -149,10 +149,21 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import bf16_mxfp8_mega_moe
+        from ......kernel_src.cutedsl_megamoe import (
+            autotune_bf16_mxfp8_mega_moe,
+            bf16_mxfp8_mega_moe,
+        )
 
         if self._autotune_pending:
-            raise NotImplementedError("mixed MegaMoE autotuning is not implemented.")
+            autotune_bf16_mxfp8_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=output.shape[0],
+                gate_up_clamp=_clamp(self._kernel_config),
+            )
+            self._autotune_pending = False
         bf16_mxfp8_mega_moe(
             output,
             transformed_weights[0],
