@@ -5759,7 +5759,7 @@ def fmha_v2_prefill_sm120(
     ``scale_bmm2`` and contains the V dequantization scale. If either is
     omitted, the kernel uses the corresponding host-encoded scale.
 
-    This entry point is validated for SM120. SM121 support is not enabled.
+    This entry point is validated for SM120 and SM121.
 
     Parameters
     ----------
