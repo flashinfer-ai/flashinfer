@@ -19,6 +19,7 @@ from flashinfer.fused_moe import (
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
@@ -49,9 +50,7 @@ def _config(**overrides) -> MoEConfig:
         experts=ExpertConfig(intermediate_size=256),
         activation=ActivationConfig.swiglu,
         backend=BackendOptions((CutlassBf16Config(),)),
-        execution=ExecutionConfig(
-            do_finalize=True, enable_pdl=False, tune_max_num_tokens=64
-        ),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
     values.update(overrides)
     return MoEConfig(**values)
@@ -315,7 +314,7 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
             "Swiglu",
         ),
         (
-            _config(execution=ExecutionConfig(do_finalize=False)),
+            _config(finalize=MoEFinalizeConfig(do_finalize=False)),
             "do_finalize=True",
         ),
         (
@@ -398,7 +397,7 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     (
         _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
         _config(activation=ActivationConfig(ActivationType.Relu2)),
-        _config(execution=ExecutionConfig(do_finalize=False)),
+        _config(finalize=MoEFinalizeConfig(do_finalize=False)),
         _config(
             experts=ExpertConfig(
                 intermediate_size=256,
@@ -771,7 +770,6 @@ def _make_case(num_tokens: int = 16):
     config = _config(
         experts=ExpertConfig(intermediate_size=intermediate_size),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),
@@ -827,7 +825,6 @@ def _make_w4a16_case(num_tokens: int = 16):
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
         execution=ExecutionConfig(
-            do_finalize=True,
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
         ),

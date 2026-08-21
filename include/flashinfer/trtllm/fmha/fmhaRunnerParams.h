@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -338,6 +338,10 @@ struct TllmGenFmhaRunnerParams {
   bool mSkipsSoftmaxWhenPossible;
   // Skip softmax threshold scale factor.
   float mSkipSoftmaxThresholdScaleFactor;
+  // Whether to use the FP16 softmax accumulator (BF16 kernels only).
+  bool mUseFp16Softmax;
+  // Whether to use the sparse-compression kernel variants (FP8 Q kernels only).
+  bool mUsesSpcompress;
   // Sparse MLA type. DeepSeek V4 uses DynamicTokenSparse with per-query-token top-k lengths.
   TrtllmGenSparseMlaType mSparseMlaType;
   // The top k value for sparse MLA.
@@ -418,6 +422,10 @@ struct TllmGenSelectKernelParams {
   bool mSelectNewKernel;
   // Do we enable skip softmax?
   bool mSkipsSoftmaxWhenPossible;
+  // Use FP16 softmax or not.
+  bool mUseFp16Softmax;
+  // Use spcompress or not.
+  bool mUsesSpcompress;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -446,6 +454,8 @@ struct TllmGenSelectKernelParams {
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
+        mUseFp16Softmax(params.mUseFp16Softmax),
+        mUsesSpcompress(params.mUsesSpcompress),
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),

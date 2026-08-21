@@ -43,6 +43,7 @@ from flashinfer.fused_moe.api import (
     ActivationType,
     BackendOptions,
     ExecutionConfig,
+    MoEFinalizeConfig,
     ExpertConfig,
     MoEConfig,
     QuantConfig,
@@ -114,6 +115,7 @@ class TestB12xUnifiedValidation:
         activation=ActivationConfig.swiglu,
         experts=None,
         execution=None,
+        finalize=None,
     ):
         return MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
@@ -122,6 +124,7 @@ class TestB12xUnifiedValidation:
             activation=activation,
             backend=BackendOptions((backend,)),
             execution=execution or ExecutionConfig(),
+            finalize=finalize or MoEFinalizeConfig(),
         )
 
     @pytest.mark.parametrize("runner_type", (B12xNvfp4Runner, B12xW4A16Runner))
@@ -237,7 +240,7 @@ class TestB12xUnifiedValidation:
         config = self._config(
             B12xNvfp4Config(),
             QuantVariant.NVFP4,
-            execution=ExecutionConfig(do_finalize=False),
+            finalize=MoEFinalizeConfig(do_finalize=False),
         )
         self._mock_environment(monkeypatch)
         runner = self._runner(config)

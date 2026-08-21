@@ -81,6 +81,7 @@ FP8 Quantization
     mxfp8_quantize
     mxfp8_grouped_quantize
     mxfp8_dequantize_host
+    per_token_group_quant_8bit
 
 .. note::
 

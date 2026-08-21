@@ -2312,14 +2312,16 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k, routed_scaling_factor
         _, group_idx = torch.topk(
             group_scores, k=topk_group, dim=-1, largest=True, sorted=True
         )
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(-1, group_idx, 1)
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(-1, group_idx, True)
         score_mask = (
             group_mask.unsqueeze(-1)
             .expand(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group])
             .reshape(scores_shape)
         )
-        scores_with_bias = scores_with_bias * score_mask
+        # A routing bias can make scores negative. Zero-masking would let an
+        # unselected expert outrank a valid negative score in the selected group.
+        scores_with_bias = scores_with_bias.masked_fill(~score_mask, float("-inf"))
 
     _, topk_idx = torch.topk(
         scores_with_bias, k=top_k, dim=-1, largest=True, sorted=True
@@ -2435,6 +2437,25 @@ def routing_reference_sigmoid_renorm(
     topk_values = topk_values.to(expert_logits.dtype)
 
     scores = torch.zeros_like(sigmoid_scores, dtype=expert_logits.dtype)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
+def routing_reference_topk_sigmoid(expert_logits, top_k, num_experts, padding):
+    """TopK -> Sigmoid routing reference.
+
+    Selection ranks the raw logits; sigmoid is applied only to the survivors.
+    Sigmoid is monotonic, so this picks the same experts as
+    ``routing_reference_sigmoid_renorm(norm_topk_prob=False)`` unless the
+    logits are large enough for sigmoid to saturate to exactly 1.0.
+    """
+    topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
+    topk_values = torch.sigmoid(topk_values.float()).to(expert_logits.dtype)
+
+    scores = torch.zeros_like(expert_logits)
     for i in range(topk_idx.shape[0]):
         for j in range(topk_idx.shape[1]):
             scores[i, topk_idx[i, j]] = topk_values[i, j]
@@ -3342,7 +3363,11 @@ RENORMALIZE_ZERO_HIDDEN_STATES = [
     pytest.param(False, id="RandomHiddenStates"),
 ]
 
-RENORMALIZE_NUM_TOKENS = [8, 768, 3072]
+# Shape fan-out is deliberately SMALL (boundary token counts + boundary intermediate
+# sizes only): the quant x routing x weight-layout matrix below is the coverage that
+# matters for kernel selection, and randomized shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py. Extend the fuzzer, not these lists.
+RENORMALIZE_NUM_TOKENS = [8, 3072]
 RENORMALIZE_HIDDEN_SIZES = [1024]
 RENORMALIZE_INTERMEDIATE_SIZES = [1024, 768, 512, 384]
 
@@ -3699,6 +3724,10 @@ def run_moe_test(
     elif routing_method_type == RoutingMethodType.Sigmoid:
         permute_info, scores = routing_reference_sigmoid_renorm(
             expert_logits, top_k, num_experts, padding, norm_topk_prob=False
+        )
+    elif routing_method_type == RoutingMethodType.TopKSigmoid:
+        permute_info, scores = routing_reference_topk_sigmoid(
+            expert_logits, top_k, num_experts, padding
         )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(

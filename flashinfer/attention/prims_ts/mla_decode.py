@@ -1438,6 +1438,35 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     must retain stable ``qo_indptr`` storage; its values may change only while
     that packed-offset contract and the captured query/output extent remain
     valid. No backend fallback or scheduling knob is exposed.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed or packed query tensor with concatenated latent and RoPE heads.
+    kv_cache : torch.Tensor
+        Compact paged latent K/V cache.
+    workspace_buffer : torch.Tensor
+        Caller-owned byte workspace for this semantic key.
+    kv_lora_rank, qk_rope_head_dim : int
+        Latent and RoPE dimensions.
+    block_tables : torch.Tensor
+        Dense physical-page table for each request.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths.
+    max_seq_len : int
+        Static maximum K/V length used for policy selection and JIT caching.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    bmm1_scale, bmm2_scale : float
+        QK and value/output scaling factors.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    out_dtype : torch.dtype
+        Output dtype.
     """
 
     packed_query = qo_indptr is not None
@@ -1569,6 +1598,7 @@ class BatchMLADecodePagedTSWrapper:
 
     @flashinfer_api
     def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._planned = False
 
     @flashinfer_api
@@ -1608,6 +1638,27 @@ class BatchMLADecodePagedTSWrapper:
         preserve ``q_len[b] <= seq_lens[b]`` for each request. One wrapper
         instance supports only one in-flight run or captured-graph replay because
         it owns mutable scratch; use separate wrappers for concurrent execution.
+
+        Parameters
+        ----------
+        block_tables : torch.Tensor
+            Dense physical-page table for each request.
+        seq_lens : torch.Tensor
+            Live K/V sequence lengths.
+        num_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
+            MLA head geometry and K/V page size.
+        seq_len_q : int, optional
+            Backward-compatible fixed-query length alias.
+        qo_indptr : torch.Tensor, optional
+            Cumulative query offsets selecting packed-query mode.
+        max_seq_len_q : int, optional
+            Static packed-query length bound.
+        q_data_type, kv_data_type, o_data_type : torch.dtype
+            Query, K/V, and output dtypes used to compile the plan.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        max_kv_len : int, optional
+            Static K/V length bound; defaults to the metadata maximum.
         """
 
         _validate_mask(mask_type)
@@ -1757,7 +1808,19 @@ class BatchMLADecodePagedTSWrapper:
         bmm2_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch the most recently planned MLA decode on the current stream."""
+        """Launch the most recently planned MLA decode on the current stream.
+
+        Parameters
+        ----------
+        query : torch.Tensor
+            Runtime fixed or packed query tensor matching the plan.
+        kv_cache : torch.Tensor
+            Runtime compact paged latent K/V cache.
+        bmm1_scale, bmm2_scale : float
+            QK and value/output scaling factors.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1824,7 +1887,35 @@ def batch_decode_mla_with_paged_kv_cache(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """One-shot convenience wrapper for fixed or packed-query MLA decode."""
+    """One-shot convenience wrapper for fixed or packed-query MLA decode.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed or packed query tensor with concatenated latent and RoPE heads.
+    kv_cache : torch.Tensor
+        Compact paged latent K/V cache.
+    block_tables : torch.Tensor
+        Dense physical-page table for each request.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    kv_lora_rank, qk_rope_head_dim : int
+        Latent and RoPE dimensions.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    max_kv_len : int, optional
+        Static K/V length bound; defaults to the metadata maximum.
+    bmm1_scale, bmm2_scale : float
+        QK and value/output scaling factors.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    out_dtype : torch.dtype
+        Output dtype.
+    """
 
     packed_query = qo_indptr is not None
     _validate_query(query, packed_query=packed_query)
