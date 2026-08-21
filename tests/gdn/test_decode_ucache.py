@@ -70,23 +70,6 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.long_running
 
-# These kernels compile through @cute.experimental.jit, which resolves the
-# device arch inside the DSL rather than taking one from FlashInfer. A DSL that
-# predates the device therefore raises `KeyError: 'sm_107a'` from its Arch enum
-# with no FlashInfer frame to intercept, and CUTE_DSL_ARCH=sm_100f does not help
-# because that path never consults it. native_only=True is the matching
-# predicate: the family-conditional target is not a substitute here.
-if torch.cuda.is_available():
-    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
-
-    if not is_cute_dsl_arch_supported(
-        *torch.cuda.get_device_capability(0), native_only=True
-    ):
-        pytest.skip(
-            "installed CuTe DSL cannot natively target this GPU architecture",
-            allow_module_level=True,
-        )
-
 DEV = "cuda"
 # Qwen3.5-122B GDN geometry at TP1; T=4 == MTP draft-3 verify window.
 H, HV, K, V = 16, 64, 128, 128
