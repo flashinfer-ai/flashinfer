@@ -12,6 +12,7 @@ typedef short int          int16_t;
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
@@ -48,7 +49,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumulated, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, int elements_per_token, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, bool enable_pdl)
+kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumulated, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, int elements_per_token, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, bool enable_pdl)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -74,6 +75,12 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
     float value = 0.0f;
     if (active_lane != 0) {
         value = accumulated[token * elements_per_token + column];
+        if (payload_dtype_code == 0) {
+            value = __bfloat162float(__float2bfloat16(value));
+        }
+        if (payload_dtype_code == 1) {
+            value = __half2float(__float2half_rn(value));
+        }
     }
     float scaled_value = value;
     if (quant_mode == 3) {
