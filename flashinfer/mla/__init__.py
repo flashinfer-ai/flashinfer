@@ -22,9 +22,16 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
     }
 )
 
+_SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
+    {
+        "SparseMLASm120DecodeConfig",
+        "supported_sparse_mla_sm120_configs",
+    }
+)
+
 
 def __getattr__(name: str):
-    """Resolve PrimTS MLA APIs without loading their runtime at import."""
+    """Resolve lazily-exported MLA APIs without loading their runtime at import."""
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
         from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
@@ -32,8 +39,17 @@ def __getattr__(name: str):
         value = getattr(prims_ts_mla_decode, name)
         globals()[name] = value
         return value
+    if name in _SPARSE_MLA_SM120_LAZY_EXPORTS:
+        from . import _sparse_mla_sm120
+
+        value = getattr(_sparse_mla_sm120, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+    """Include lazily-exported names alongside the module globals."""
+    return sorted(
+        set(globals()) | _PRIMS_TS_LAZY_EXPORTS | _SPARSE_MLA_SM120_LAZY_EXPORTS
+    )

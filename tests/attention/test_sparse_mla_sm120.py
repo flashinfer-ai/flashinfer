@@ -455,6 +455,43 @@ def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> Non
     with pytest.raises(
         ValueError,
         match=r"no decode kernel.*num_tokens=1, num_heads=16, topk=384",
+    ) as excinfo:
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            d_v=d_v,
+        )
+    # The error must name the actual mismatch, not just the token count.
+    msg = str(excinfo.value)
+    assert "topk=384 is not instantiated for num_heads=16" in msg
+    assert "available topk: [128, 192, 256, 512, 1024]" in msg
+    assert "supported_sparse_mla_sm120_configs" in msg
+
+
+def test_sparse_mla_sm120_decode_wrong_page_block_size_fails_before_prefill() -> None:
+    """A decode shape with an uninstantiated page size names the page size."""
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 1, 16, 128
+    d_qk = d_v = 512
+    page_block_size = 128  # decode kernels only exist for 64
+
+    q = torch.empty((num_tokens, num_heads, d_qk), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty(
+        (1, page_block_size, 1, 584), dtype=torch.uint8, device=device
+    )
+    indices = torch.zeros((num_tokens, topk), dtype=torch.int32, device=device)
+    output = torch.empty(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        ValueError,
+        match=r"page_block_size=128 is unsupported",
     ):
         sparse_mla_sm120_paged_attention(
             q,
