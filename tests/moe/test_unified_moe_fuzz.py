@@ -2005,6 +2005,11 @@ def test_unified_moe_fuzz(cfg):
             if B in _BACKEND_RUNNERS
         )
     )
+    # The debug allowlist deliberately narrows execution to one backend, so it
+    # must retire the curated assertion rather than trip it: otherwise bisecting
+    # with FLASHINFER_UMOE_FUZZ_BACKENDS fails every curated case by design.
+    if _BACKEND_FILTER and cfg.expected_backend not in _BACKEND_FILTER:
+        expected_backend_available = False
     if expected_backend_available and not any(
         _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend for B in wired_backends
     ):
@@ -2023,6 +2028,12 @@ def test_unified_moe_fuzz(cfg):
         quarantine = LEDGER.skip_backend(cfg, backend_key)
         if quarantine:
             quarantined_backends.append((quarantine, backend_key))
+            # A quarantined backend is intentionally never launched, so the
+            # curated "expected backend must execute" assertion cannot hold.
+            # Leaving it armed would report a ledger-tracked crash as a plain
+            # test failure instead of the XFAIL the ledger asks for.
+            if backend_key == cfg.expected_backend:
+                expected_backend_available = False
         else:
             healthy_backends.append(BackendCfg)
     wired_backends = healthy_backends

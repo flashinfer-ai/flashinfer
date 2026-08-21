@@ -1610,10 +1610,18 @@ def _make_packs_and_config(
 # ---------------------------------------------------------------------------
 
 
-def _compute_ref(act_pack, tensors, shape, activation=None):
-    """bf16 ground-truth MoE output for the given pack + shape."""
+def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False):
+    """bf16 ground-truth MoE output for the given pack + shape.
+
+    ``wrong_formula`` evaluates a deliberately different activation over the
+    same weights (plain ReLU where ReLU^2 is called for), for use as a negative
+    control that proves a tolerance can distinguish activation formulas.
+    """
     activation = activation or SwiGLU()
-    activation_kwargs = {"activation_type": int(activation.type)}
+    activation_kwargs = {
+        "activation_type": int(activation.type),
+        "wrong_formula": wrong_formula,
+    }
     if isinstance(activation, SwiGLU):
         activation_kwargs.update(
             swiglu_alpha=activation.alpha,
@@ -1712,7 +1720,10 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
         ActivationType.GegluTanh: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
     }.get(activation.type)
     control_reference = (
-        reference * 4.0
+        # Non-gated ReLU2 has no same-gating scalar variant to perturb, so use a
+        # genuinely different non-gated formula (plain ReLU) over the same
+        # weights rather than a rescaled output, which would only test magnitude.
+        _compute_ref(act_pack, tensors, shape, activation, wrong_formula=True)
         if control is None
         else _compute_ref(act_pack, tensors, shape, control)
     )

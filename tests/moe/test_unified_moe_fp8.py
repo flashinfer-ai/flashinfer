@@ -661,6 +661,7 @@ def _per_tensor_fp8_reference(
     expert_offset: int = 0,
     routing_scales_on_input: bool = False,
     activation=None,
+    wrong_formula: bool = False,
 ) -> torch.Tensor:
     activation = activation or SwiGLU()
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
@@ -679,7 +680,11 @@ def _per_tensor_fp8_reference(
         if routing_scales_on_input:
             routed_x = routed_x * routing_weights[token, slot, None]
         gemm1 = routed_x @ w1_deq[local_expert].t()
-        if isinstance(activation, ReLU2):
+        if wrong_formula:
+            # Negative-control path: a genuinely different non-gated formula
+            # (plain ReLU instead of ReLU^2) over the same weights and scales.
+            intermediate = F.relu(gemm1)
+        elif isinstance(activation, ReLU2):
             intermediate = F.relu(gemm1) ** 2
         else:
             up = gemm1[:, :INTERMEDIATE]
@@ -712,6 +717,7 @@ def _make_per_tensor_fp8_case(
     local_num_experts: int = NUM_EXPERTS,
     local_expert_offset: int = 0,
     activation=None,
+    with_wrong_formula_reference: bool = False,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -814,24 +820,58 @@ def _make_per_tensor_fp8_case(
         routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
         activation=activation,
     )
-    return act, weights, config, ref, selected_experts
+    if not with_wrong_formula_reference:
+        return act, weights, config, ref, selected_experts
+    # Same inputs and scales, deliberately wrong activation formula: the
+    # negative control for the permissive tolerance in
+    # _assert_per_tensor_fp8_close.
+    wrong_ref = _per_tensor_fp8_reference(
+        x,
+        w1,
+        w2,
+        selected_experts,
+        routing_weights,
+        input_scale,
+        intermediate_scale,
+        expert_offset=local_expert_offset,
+        routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
+        activation=activation,
+        wrong_formula=True,
+    )
+    return act, weights, config, ref, selected_experts, wrong_ref
 
 
 def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
-def _assert_per_tensor_fp8_discriminates(out: torch.Tensor, ref: torch.Tensor) -> None:
+def _assert_per_tensor_fp8_discriminates(
+    out: torch.Tensor, wrong_ref: torch.Tensor
+) -> None:
     """Negative control for the percentage-based tolerance above.
 
-    ``check_accuracy`` passes when 99% of elements are within a generous
+    ``check_accuracy`` passes when 99% of elements are within atol=0.05 /
     rtol=0.3, so a pass alone does not prove the comparison could detect a wrong
-    activation formula. Confirm a perturbed reference is actually rejected.
+    activation formula. ``wrong_ref`` must come from a genuinely different
+    activation rather than a rescaled output: these outputs are small enough
+    that a modest scale factor stays inside atol and would make this control
+    vacuous.
     """
-    with pytest.raises(Exception, match="[Mm]ismatch"):
+    try:
         check_accuracy(
-            out.float(), ref.float() * 1.5, atol=0.05, rtol=0.3, percent=0.99
+            out.float(), wrong_ref.float(), atol=0.05, rtol=0.3, percent=0.99
         )
+    except Exception as exc:
+        # Only a tolerance rejection counts as discrimination. check_accuracy
+        # also raises on non-finite inputs, and swallowing that would let a NaN
+        # or Inf output masquerade as a passing negative control.
+        if "Mismatch percentage" not in str(exc):
+            raise
+        return
+    pytest.fail(
+        "output also matched a deliberately wrong activation reference; the "
+        "tolerance cannot detect a wrong-formula regression."
+    )
 
 
 @pytest.mark.parametrize(
@@ -858,13 +898,14 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
 @pytest.mark.parametrize("activation", (ReLU2(),))
 def test_fp8_per_tensor_new_activation_matches_reference(activation):
-    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+    act, weights, config, ref, _, wrong_ref = _make_per_tensor_fp8_case(
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         activation=activation,
+        with_wrong_formula_reference=True,
     )
     layer_out = MoELayer(config)(act, weights)
     _assert_per_tensor_fp8_close(layer_out, ref)
-    _assert_per_tensor_fp8_discriminates(layer_out, ref)
+    _assert_per_tensor_fp8_discriminates(layer_out, wrong_ref)
 
     runner = _build_per_tensor_fp8_runner(config)
     direct = runner.forward(runner.pack_inputs(act, weights))

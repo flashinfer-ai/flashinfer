@@ -474,7 +474,10 @@ def prepare_trtllm_fp4_weights(
     Parameters
     ----------
     w1_bf16 : Tensor
-        Gate+up expert weights ``[num_local_experts, 2*intermediate_size, hidden_size]``.
+        Expert weights for GEMM1. Gated activations use
+        ``[num_local_experts, 2*intermediate_size, hidden_size]`` in ``[up, gate]``
+        order; non-gated activations (ReLU2) use
+        ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
     num_local_experts, hidden_size, intermediate_size : int
@@ -1208,7 +1211,10 @@ def prepare_trtllm_bf16_weights(
     Parameters
     ----------
     w1_bf16 : Tensor
-        Gate+up expert weights ``[num_local_experts, 2*intermediate_size, hidden_size]``.
+        Expert weights for GEMM1. Gated activations use
+        ``[num_local_experts, 2*intermediate_size, hidden_size]`` in ``[up, gate]``
+        order; non-gated activations (ReLU2) use
+        ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
     num_local_experts, hidden_size, intermediate_size : int
@@ -1296,10 +1302,12 @@ def prepare_cutlass_bf16_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical BF16 view consumed by ``CutlassBf16Runner``.
 
-    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order and
-    ``w2_bf16`` is ``[E, H, I]``.  CUTLASS BF16 paths consume these dense
-    tensors directly; preparation validates the source contract
-    and materializes contiguous tensors on the requested device.
+    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order for gated
+    activations, or ``[E, I, H]`` for non-gated ones (ReLU2); the row
+    count follows ``activation.is_gated``. ``w2_bf16`` is ``[E, H, I]``.
+    CUTLASS BF16 paths consume these dense tensors directly; preparation
+    validates the source contract and materializes contiguous tensors on the
+    requested device.
     """
     if device is None:
         device = w1_bf16.device
@@ -1463,8 +1471,10 @@ def prepare_cute_dsl_nvfp4_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL NVFP4 ``cute_dsl_nvfp4`` weight view.
 
-    Gemm1 weights get the SwiGLU linear/gate interleave; both gemms are NVFP4
-    block-quantized (swizzled) with scales converted to the CuteDSL MMA layout.
+    Gemm1 weights get the linear/gate interleave only for gated activations;
+    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is. Both
+    gemms are NVFP4 block-quantized (swizzled) with scales converted to the
+    CuteDSL MMA layout.
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.

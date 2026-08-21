@@ -128,7 +128,15 @@ config = MoEConfig(
     backend=BackendOptions((CuteDslConfig(), TrtllmFp4Config())),
 )
 layer = MoELayer(config)
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantVariant.MxFp8))
+
+# Backends are quantization-specific, so a variant change must carry a matching
+# backend: CuteDslConfig and TrtllmFp4Config do not support MxFp8, and reusing
+# them here would leave MoELayer with no usable runner.
+fp8_config = dataclasses.replace(
+    config,
+    quant=QuantConfig(variant=QuantVariant.MxFp8),
+    backend=BackendOptions((TrtllmFp8BlockConfig(),)),
+)
 ```
 
 ## 4. Public API
