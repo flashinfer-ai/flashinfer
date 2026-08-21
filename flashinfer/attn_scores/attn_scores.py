@@ -13,15 +13,23 @@
 # limitations under the License.
 """Paged MQA logits: FP8 and FP4 attention-score kernels for Blackwell (SM100).
 
-These kernels compute, for each batch element b and KV position pos:
+These kernels compute, for each batch element b, speculative slot t, and KV
+position pos:
 
-    output[b*next_n + t, pos] = relu(Σ_h w[b*next_n+t, h] · (Q[b,t,h,:] @ K[pos,:]ᵀ)) · scale[pos]
+    output[b*next_n + t, pos] = Σ_h w[b*next_n+t, h] · relu(Q[b,t,h,:] @ K[pos,:]ᵀ)
 
 where K is paged via block_table, used for sparse attention indexing in DeepSeek MLA.
 
-Two variants:
-  fp8_paged_mqa_logits — FP8 Q/K with per-token FP32 KV scales
-  fp4_paged_mqa_logits — MXFP4 Q/K with per-(token, K-group) UE8M0 block scales
+ReLU is applied per head, *before* weighting and reduction -- not to the sum.
+With head scores [1, -1] and weights [1, 1] the result is 1, not 0, and negative
+weights can make the output negative.
+
+Two variants, differing in how their scale factors enter:
+  fp8_paged_mqa_logits — FP8 Q/K; the per-token FP32 KV scale multiplies the
+                         result, so the expression above gains a `· scale[pos]`
+  fp4_paged_mqa_logits — MXFP4 Q/K; the per-(token, K-group) UE8M0 scales are
+                         folded into dequantizing Q and K, so there is no
+                         trailing scale factor
 
 Both are SM100 (B200-class Blackwell) only.
 """

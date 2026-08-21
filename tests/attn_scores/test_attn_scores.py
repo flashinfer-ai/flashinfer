@@ -1947,6 +1947,64 @@ def test_precompile_output_dtypes_is_honoured_and_validated():
     precompile_paged_mqa_logits(variants=("fp4",), output_dtypes=(torch.bfloat16,))
 
 
+def test_relu_is_applied_per_head_before_weighting():
+    """The kernel computes Σ_h w·relu(dot), not relu(Σ_h w·dot).
+
+    The module and trace-template docstrings previously documented the latter.
+    The two disagree whenever head scores have mixed signs: with scores [1, -1]
+    and weights [1, 1] the kernel returns 1 while relu-of-the-sum returns 0.
+    They also disagree on range -- relu-of-the-sum cannot be negative, but the
+    kernel can be with negative weights. Regression for PR #4365 review
+    r3825128740; the references were always right, so only prose was wrong and
+    no existing test could have caught it.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, next_n, H, D, block_size, ctx = 1, 1, 64, 128, 64, 64
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+
+    # head 0 sees +1, head 1 sees -1 against the same K column; all others zero
+    q = torch.zeros(B, next_n, H, D, device=device)
+    kv = torch.zeros(ntb, block_size, D, device=device)
+    kv[block_table[0, 0].item(), 0, 0] = 1.0
+    q[0, 0, 0, 0] = 1.0
+    q[0, 0, 1, 0] = -1.0
+
+    scale = _ceil_to_ue8m0_fp(
+        kv.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+    ).squeeze(-1)
+    kv_fused = _make_fused_kv_fp8(
+        (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+    )
+    q8 = q.to(torch.float8_e4m3fn)
+
+    w = torch.zeros(B * next_n, H, device=device, dtype=torch.float32)
+    w[0, 0] = 1.0
+    w[0, 1] = 1.0
+    out = fp8_paged_mqa_logits(q8, kv_fused, w, context_lens, block_table, ctx)
+    torch.cuda.synchronize()
+    # Σ w·relu(dot) = 1·1 + 1·0 = 1 (times the KV scale, which is 1 here);
+    # relu(Σ w·dot) = relu(0) = 0.
+    assert out[0, 0].item() > 0.5, (
+        f"expected ~1 from per-head ReLU, got {out[0, 0].item()}; "
+        "relu-of-the-sum would give 0"
+    )
+
+    # negative weights: relu-of-the-sum could never be negative, the kernel can
+    w_neg = torch.zeros(B * next_n, H, device=device, dtype=torch.float32)
+    w_neg[0, 0] = -1.0
+    out_neg = fp8_paged_mqa_logits(q8, kv_fused, w_neg, context_lens, block_table, ctx)
+    torch.cuda.synchronize()
+    assert out_neg[0, 0].item() < -0.5, (
+        f"expected a negative logit with a negative weight, got {out_neg[0, 0].item()}"
+    )
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
