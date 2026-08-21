@@ -8,7 +8,7 @@ import flashinfer
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import is_sm120a_supported, is_sm12x_supported
 
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
@@ -616,8 +616,8 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
 def test_fmha_v2_prefill_sm120_self_attention(
     causal, head_dim, batch_size, seq_len, num_heads
 ):
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only validated on SM120 GPUs.")
 
     torch.manual_seed(42)
     q = torch.randn(
@@ -684,8 +684,8 @@ def test_fmha_v2_prefill_sm120_self_attention(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_fmha_v2_prefill_sm120_optional_device_scales(device_scale, causal, head_dim):
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only validated on SM120 GPUs.")
 
     batch_size, seq_len, num_heads = 1, 128, 4
     shape = (batch_size, seq_len, num_heads, head_dim)
@@ -733,8 +733,8 @@ def test_fmha_v2_prefill_sm120_optional_device_scales(device_scale, causal, head
 
 
 def test_fmha_v2_prefill_sm120_validation():
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only validated on SM120 GPUs.")
 
     shape = (1, 8, 4, 128)
     q_bf16 = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
@@ -814,8 +814,8 @@ def test_fmha_v2_prefill_deepseek_validates_seq_len():
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only validated on SM120 GPUs.")
 
     batch_size, seq_len, num_heads = 1, 128, 4
     shape = (batch_size, seq_len, num_heads, head_dim)
@@ -873,8 +873,10 @@ def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
 
 
 def test_fmha_v2_prefill_sm120_async_enqueue():
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip(
+            "fmha_v2_prefill_sm120 async enqueue is only validated on SM120 GPUs."
+        )
 
     batch_size, seq_len, num_heads, head_dim = 1, 16384, 32, 128
     shape = (batch_size, seq_len, num_heads, head_dim)
