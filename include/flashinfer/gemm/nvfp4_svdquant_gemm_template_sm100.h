@@ -67,9 +67,8 @@ using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
 // The rank-r LoRA-up is fused in the mainloop. Match the stock NVFP4 epilogue so the per-column
 // bias is added without a separate bandwidth-bound kernel.
-using FusionOperation =
-    cutlass::epilogue::fusion::LinCombPerColBias<OutElementType, float, OutElementType, ElementC,
-                                                 float>;
+using FusionOperation = cutlass::epilogue::fusion::PerColLinCombPerColBiasEltAct<
+    cutlass::epilogue::thread::Identity, OutElementType, float, OutElementType, ElementC, float>;
 
 // Every kernel shape uses a dynamic cluster type so each tile can benchmark stock-compatible
 // runtime cluster shapes without multiplying the generated kernel variants.
@@ -236,8 +235,8 @@ size_t workspace_size_for_tactic(int m, int n, int k, RuntimeTactic const& tacti
 template <class Config>
 void run_tactic(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
                 float const* alpha, void const* D, void const* L1, void const* bias, int m, int n,
-                int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-                RuntimeTactic const& tactic, bool enable_pdl) {
+                int k, int lora_rank, bool alpha_is_per_col, char* ws, size_t wsBytes,
+                cudaStream_t stream, RuntimeTactic const& tactic, bool enable_pdl) {
   using Gemm = typename Config::Gemm;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   typename Gemm::Arguments args{};
@@ -267,11 +266,13 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   args.epilogue.ptr_D = static_cast<OutElementType*>(out);
   args.epilogue.dC = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
   args.epilogue.dD = args.epilogue.dC;
-  // out = alpha * acc + bias[N] (alpha via device scalar pointer). A null bias is a no-op.
+  // out = alpha * acc + bias[N]. Alpha may be a device scalar or a per-column vector.
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta = 0.0f;
   args.epilogue.thread.alpha_ptr = alpha;
   args.epilogue.thread.beta_ptr = nullptr;
+  args.epilogue.thread.dAlpha = {cute::_0{}, alpha_is_per_col, int64_t(0)};
+  args.epilogue.thread.dBeta = {cute::_0{}, false, int64_t(0)};
   args.epilogue.thread.bias_ptr = static_cast<OutElementType const*>(bias);
 
   if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>)
@@ -297,23 +298,23 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   if (st != cutlass::Status::kSuccess) throw std::runtime_error("nvfp4_svdquant_gemm: run failed");
 }
 
-#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                           \
-  template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                         \
-                                                    RuntimeTactic const& tactic);                \
-  template void run_tactic<Config>(void* out, void const* A, void const* B, void const* sfa,     \
-                                   void const* sfb, float const* alpha, void const* D,           \
-                                   void const* L1, void const* bias, int m, int n, int k,        \
-                                   int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream, \
-                                   RuntimeTactic const& tactic, bool enable_pdl);
+#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                          \
+  template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                        \
+                                                    RuntimeTactic const& tactic);               \
+  template void run_tactic<Config>(                                                             \
+      void* out, void const* A, void const* B, void const* sfa, void const* sfb,                \
+      float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, \
+      int lora_rank, bool alpha_is_per_col, char* ws, size_t wsBytes, cudaStream_t stream,      \
+      RuntimeTactic const& tactic, bool enable_pdl);
 
-#define EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                                \
-  extern template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                  \
-                                                           RuntimeTactic const& tactic);         \
-  extern template void run_tactic<Config>(                                                       \
-      void* out, void const* A, void const* B, void const* sfa, void const* sfb,                 \
-      float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k,  \
-      int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream, RuntimeTactic const& tactic, \
-      bool enable_pdl);
+#define EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                               \
+  extern template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                 \
+                                                           RuntimeTactic const& tactic);        \
+  extern template void run_tactic<Config>(                                                      \
+      void* out, void const* A, void const* B, void const* sfa, void const* sfb,                \
+      float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, \
+      int lora_rank, bool alpha_is_per_col, char* ws, size_t wsBytes, cudaStream_t stream,      \
+      RuntimeTactic const& tactic, bool enable_pdl);
 
 // The per-shape kernels are explicitly instantiated in Jinja-generated translation units (one per
 // kernel shape, see csrc/nvfp4_svdquant_gemm_cutlass_sm100.jinja) so they compile in parallel.

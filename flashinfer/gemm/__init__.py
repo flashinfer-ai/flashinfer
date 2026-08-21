@@ -29,6 +29,8 @@ from .gemm_bf16_fp4 import (
 )
 
 from .gemm_svdquant import (
+    SVDQUANT_SUPPORTS_FUSED_SWIGLU as SVDQUANT_SUPPORTS_FUSED_SWIGLU,
+    SVDQUANT_SUPPORTS_PER_OUTPUT_ALPHA as SVDQUANT_SUPPORTS_PER_OUTPUT_ALPHA,
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
@@ -130,6 +132,11 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "SVDQUANT_SUPPORTS_FUSED_SWIGLU",
+        "SVDQUANT_SUPPORTS_PER_OUTPUT_ALPHA",
+        "mm_nvfp4_svdquant",
+        "nvfp4_quantize_smooth",
+        "svdquant_linear",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
