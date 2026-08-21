@@ -12,6 +12,10 @@ from tests.trace.reference_utils import _check, _skip_if_not_sm100_or_103
     [
         dict(batch_size=4, next_n=2, max_context_len=4096, block_size=64),
         dict(batch_size=8, next_n=1, max_context_len=2048, block_size=128),
+        # max_context_len is a free axis and need not be page-aligned: the last
+        # physical page then runs past the output width (257 -> 5*64 = 320).
+        dict(batch_size=2, next_n=2, max_context_len=257, block_size=64),
+        dict(batch_size=2, next_n=1, max_context_len=513, block_size=128),
     ],
 )
 def test_fp4_paged_mqa_logits_reference_correctness(shape_kwargs):
