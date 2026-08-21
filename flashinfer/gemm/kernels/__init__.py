@@ -29,14 +29,22 @@ Supported architectures:
 - SM107 (Rubin): bmm_fp8_rubin.py
 """
 
-from flashinfer.cute_dsl.utils import (
-    is_cute_dsl_available,
-    is_rubin_cute_dsl_available,
+import importlib.util
+
+# Probed here rather than imported from cute_dsl.utils, which has a top-level
+# `import cutlass` and so is unimportable in the wheel build envs (#4651).
+_CUTE_DSL_AVAILABLE = (
+    importlib.util.find_spec("cutlass") is not None
+    and importlib.util.find_spec("cutlass.cute") is not None
+)
+_RUBIN_CUTE_DSL_AVAILABLE = (
+    _CUTE_DSL_AVAILABLE
+    and importlib.util.find_spec("cutlass.utils.rubin_helpers") is not None
 )
 
 __all__ = []
 
-if is_cute_dsl_available():
+if _CUTE_DSL_AVAILABLE:
     from .bmm_fp8_wrapper import (
         bmm_fp8_cute_dsl,
         cute_bmm_fp8_can_implement,
@@ -47,7 +55,7 @@ if is_cute_dsl_available():
 
     # SM107 kernels need CuTe DSL >= 4.8; skip the re-export on older DSL so
     # that importing FlashInfer still works there.
-    if is_rubin_cute_dsl_available():
+    if _RUBIN_CUTE_DSL_AVAILABLE:
         from .bmm_fp8_rubin import SM107PersistentDenseGemmKernel
 
     __all__ += [
@@ -62,5 +70,5 @@ if is_cute_dsl_available():
         "PersistentDenseGemmKernel",
     ]
 
-    if is_rubin_cute_dsl_available():
+    if _RUBIN_CUTE_DSL_AVAILABLE:
         __all__ += ["SM107PersistentDenseGemmKernel"]
