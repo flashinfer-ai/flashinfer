@@ -31,7 +31,7 @@ from typing import (
 import torch
 
 from flashinfer.autotune_cache import ManagedCacheEntry
-from flashinfer.fused_moe.factorized import (
+from flashinfer.fused_moe.tactic_search import (
     FactorizedSearchResult,
     FactorizedTactic,
     FactorizedTacticSpace,
@@ -2351,7 +2351,7 @@ class AutoTuner:
                             )
                             runner_arg_names = runner_arg_names_map[r]
                             if getattr(r, "use_factorized_moe_tactic_search", False):
-                                from flashinfer.fused_moe.factorized import (
+                                from flashinfer.fused_moe.tactic_search import (
                                     FactorizedSearch,
                                 )
 

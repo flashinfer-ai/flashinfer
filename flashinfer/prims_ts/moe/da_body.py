@@ -18,7 +18,7 @@ from typing import (
 
 import torch
 
-from flashinfer.fused_moe.factorized import MoeTactic
+from flashinfer.fused_moe.tactic_search import MoeTactic
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe.core import TrtllmMoERoutingMetadataSlot
