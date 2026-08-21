@@ -288,6 +288,18 @@ _CUTLASS_ACTIVATION_PARAM_KEYS = frozenset(
 )
 
 
+def _cutlass_activation_required_keys(activation: ActivationConfig) -> frozenset[str]:
+    """Keys a cached mapping must supply as tensors for ``activation``.
+
+    Derived from the activation rather than hardcoded, so it cannot drift from
+    what :func:`_cutlass_activation_params` actually materializes. Uses a cheap
+    zero-expert probe: the key set depends only on the activation's type and
+    scalars, never on the expert count or device.
+    """
+    probe = _cutlass_activation_params(activation, 0, torch.device("cpu"))
+    return frozenset(name for name, value in probe.items() if value is not None)
+
+
 def _cutlass_activation_params(
     activation: ActivationConfig,
     num_experts: int,
@@ -599,9 +611,16 @@ class _CutlassRunnerBase(MoERunner):
         # kernel defaults just as silently. Cache the result so repeated packing
         # reuses the same tensors -- reallocating them would invalidate the raw
         # pointers captured by an existing CUDA graph.
+        # Key presence alone is not enough: an all-None mapping carries every
+        # canonical key yet is exactly what a *default* activation produces, so
+        # a non-default one would silently lose its scalars. A cache is usable
+        # only when it supplies a tensor everywhere the configured activation
+        # needs one -- which is precisely the set of keys the activation itself
+        # declares non-None.
         config_params = getattr(self, "_config_activation_params", None)
-        if config_params is None or not set(config_params).issuperset(
-            _CUTLASS_ACTIVATION_PARAM_KEYS
+        required = _cutlass_activation_required_keys(self.config.activation)
+        if config_params is None or any(
+            config_params.get(name) is None for name in required
         ):
             config_params = _cutlass_activation_params(
                 self.config.activation,
@@ -1284,7 +1303,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         QuantVariant.W4A16,
     )
     supports_fused_shared_experts = True
-    supported_activation_classes_by_quant = {
+    supported_activation_classes_by_quant: ClassVar[
+        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+    ] = {
         QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
         QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
         QuantVariant.W4A16: (SwiGLU,),
@@ -1763,7 +1784,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         QuantVariant.MxFp8,
     )
     supports_fused_shared_experts = True
-    supported_activation_classes_by_quant = {
+    supported_activation_classes_by_quant: ClassVar[
+        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+    ] = {
         QuantVariant.DeepSeekFp8: (SwiGLU,),
         QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
     }

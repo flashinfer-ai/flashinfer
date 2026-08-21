@@ -148,7 +148,7 @@ def test_failed_support_check_does_not_authorize_build():
     runner.config = _config()
     runner._support_checked = True
 
-    with pytest.raises(NotImplementedError, match="QuantVariant.BF16"):
+    with pytest.raises(NotImplementedError, match=r"QuantVariant\.BF16"):
         runner.check_support()
     with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
         runner.build()
@@ -391,7 +391,8 @@ def test_cutlass_derived_activation_params_are_cached():
 def test_cutlass_incomplete_activation_param_cache_is_rederived():
     # An empty or partial mapping is uninitialized state, not a request for
     # kernel defaults; resolving it must re-derive rather than drop the scalars.
-    for stale in ({}, {"swiglu_alpha": torch.full((4,), 9.0)}):
+    all_none = {"swiglu_alpha": None, "swiglu_beta": None, "swiglu_limit": None}
+    for stale in ({}, {"swiglu_alpha": torch.full((4,), 9.0)}, all_none):
         runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
         runner.config = _config(activation=SwiGLU(alpha=2.0, beta=1.0, limit=7.0))
         runner.device = torch.device("cpu")
@@ -417,7 +418,7 @@ def test_cutlass_per_expert_activation_overrides():
     assert resolved["swiglu_alpha"] is alpha
     torch.testing.assert_close(resolved["swiglu_beta"], torch.zeros(4))
 
-    with pytest.raises(TypeError, match="torch.float32"):
+    with pytest.raises(TypeError, match=r"torch\.float32"):
         runner._resolve_activation_params(
             {"gemm1_alpha": torch.ones(4, dtype=torch.int64)}
         )

@@ -31,7 +31,7 @@ Two sections:
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable
+from typing import Callable, ClassVar
 
 import pytest
 import torch
@@ -928,8 +928,11 @@ class TestMoERunnerSupport:
         # every variant it accepts; an unmapped variant must not fall back to
         # the permissive class default.
         class _UnmappedRunner(TrtllmFp4RoutedRunner):
-            supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.MXFP4)
-            supported_activation_classes_by_quant = {
+            supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = (
+                QuantVariant.NVFP4,
+                QuantVariant.MXFP4,
+            )
+            supported_activation_classes_by_quant: ClassVar[dict] = {
                 QuantVariant.NVFP4: (SwiGLU,),
             }
 
