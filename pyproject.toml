@@ -25,8 +25,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl==4.7.0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]==4.7.0"]
+cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -70,6 +70,12 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+# Workload registry of the experimental fused GDN decode backends, loaded at
+# runtime via importlib.resources.
+"flashinfer.gdn_kernels.experimental" = ["*.json"]
+# Their in-package JIT kernel source, compiled on demand by
+# flashinfer/jit/gdn_fused_decode.py, like the sm100_blk64 sources below.
+"flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # JIT sources for the sm100_blk64 BSA kernel extension (compiled on-demand via
 # torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/sm100_blk64/loader.py).
 # These live inside the package tree rather than csrc/, so they must be
@@ -124,6 +130,9 @@ exclude = [
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
   "build/",
 ]
 
@@ -148,6 +157,9 @@ extend-exclude = [
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
 ]
 force-exclude = true
 

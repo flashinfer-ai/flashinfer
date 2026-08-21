@@ -56,7 +56,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/))
+          exclude: ^(flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py))
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

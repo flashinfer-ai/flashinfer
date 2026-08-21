@@ -225,6 +225,9 @@ class MoERunner(TunableRunner):
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
     # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
+    # Cleared by backends whose kernels cannot map global expert ids onto a
+    # local shard (local_expert_offset / local_num_experts != num_experts).
+    supports_expert_parallelism: ClassVar[bool] = True
 
     config: MoEConfig
 
@@ -245,6 +248,7 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
         self._assert_shared_experts_supported()
+        self._assert_expert_parallelism_supported()
 
     def _assert_shared_experts_supported(self) -> None:
         """Reject S > 0 for backends that have not opted in."""
@@ -253,6 +257,22 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support fused shared experts "
                 f"(num_fused_shared_experts={s})."
+            )
+
+    def _assert_expert_parallelism_supported(self) -> None:
+        """Reject EP shards for backends that cannot compute a local expert subset."""
+        if self.supports_expert_parallelism:
+            return
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
+        if experts.local_expert_offset != 0 or (
+            local_num_experts != self.config.routing.num_experts
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support expert parallelism "
+                f"(local_expert_offset={experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts} of "
+                f"{self.config.routing.num_experts})."
             )
 
     def build(self) -> None:
@@ -334,6 +354,7 @@ class _CutlassRunnerBase(MoERunner):
     """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supports_expert_parallelism = False
     _supported_archs: ClassVar[tuple[int, ...]]
     _weight_dtype: ClassVar[torch.dtype]
     _use_w4_group_scaling: ClassVar[bool]
@@ -353,14 +374,6 @@ class _CutlassRunnerBase(MoERunner):
         if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."
-            )
-        experts = self.config.experts
-        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not yet support expert parallelism."
             )
         if self._device_arch not in self._supported_archs:
             raise RuntimeError(
@@ -2630,6 +2643,7 @@ class _B12xRunner(MoERunner):
     """Shared unified adapter over ``B12xMoEWrapper``."""
 
     backend_key: ClassVar[str] = ""
+    supports_expert_parallelism = False
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
     def _check_support(self) -> None:
@@ -2649,14 +2663,6 @@ class _B12xRunner(MoERunner):
                 f"b12x unified MoE requires SM120 or SM121, got SM{major}{minor}."
             )
 
-        experts = self.config.experts
-        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
-        ):
-            raise NotImplementedError(
-                "b12x unified MoE does not support expert parallelism."
-            )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 

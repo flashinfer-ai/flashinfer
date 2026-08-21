@@ -229,7 +229,12 @@ class NcclEpHandle(Handle):
         _t = _pc() if _HP else None
         world_size = self._fleet.bootstrap.world_size
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # The recv row mirrors the sent row (shape AND dtype). This is
+        # FleetParams.token_hidden_size for plain BF16 dispatch, but a kernel
+        # backend's pack_dispatch_payload may send a narrower packed row (e.g.
+        # MXFP8 payload + scale bytes as uint8) within the transport's
+        # token_hidden_size * dtype_bytes byte budget.
+        hidden = x.shape[1]
 
         # Fleet-cached recv buffer (a fresh Handle is created every forward, so
         # per-handle caching never hits; the fleet persists).
@@ -307,7 +312,8 @@ class NcclEpHandle(Handle):
 
         world_size = self._world_size
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # Recv row mirrors the sent row; see _dispatch_ll.
+        hidden = x.shape[1]
         m = max_per_rank * world_size
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
@@ -371,7 +377,8 @@ class NcclEpHandle(Handle):
         import torch
 
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # Recv row mirrors the sent row; see _dispatch_ll.
+        hidden = x.shape[1]
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
 
@@ -404,7 +411,7 @@ class NcclEpHandle(Handle):
         cached = self._hot.get("ht_recv_bufs")
         if (
             cached is None
-            or cached[0].shape[0] != num_recv
+            or cached[0].shape != (num_recv, hidden)
             or cached[1].shape[1] != self._top_k
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device

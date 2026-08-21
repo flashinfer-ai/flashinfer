@@ -67,6 +67,7 @@ from .jit.flash_kda import (
     gen_flash_kda_m128_module,
     gen_flash_kda_m128_n16_module,
     gen_flash_kda_persistent_m128_module,
+    gen_flash_kda_small_bh_m128_module,
 )
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
@@ -575,6 +576,7 @@ def gen_all_modules(
                     gen_flash_kda_m64_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
                     gen_flash_kda_m128_n16_module(flash_kda_target),
+                    gen_flash_kda_small_bh_m128_module(flash_kda_target),
                 ]
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
@@ -619,6 +621,16 @@ def gen_all_modules(
             gen_cake_kda_packed_t1_module(variant, "sm100f")
             for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
+
+    # The experimental fused GDN decode step is deliberately NOT built here.
+    # Its preferred backend is CuTe-DSL, which this AOT pass does not cover at
+    # all, so an AOT entry could only ever pre-build the second-choice CUDA
+    # impl -- which never serves a registered geometry on an install where the
+    # CuTe-DSL one loads.  Paying jit-cache size for a kernel that does not run
+    # is the wrong trade when that budget is shared with kernels that do.  It
+    # JIT-compiles on first eager dispatch instead, which is already how the
+    # CuTe-DSL impl reaches the CUDA-graph capture phase warm.  See
+    # flashinfer/gdn_kernels/experimental/README.md.
 
     if add_act:
         for act_name in act_func_def_str:
@@ -700,6 +712,7 @@ def gen_all_modules(
             gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
             gen_moe_alltoall_module,
+            gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
             gen_vllm_comm_module,
@@ -725,6 +738,10 @@ def gen_all_modules(
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
+        # No architecture gate: the kernels use only plain PTX loads/stores
+        # and CUDA IPC, and target PCIe machines without NVLink, which is
+        # orthogonal to the SM version.
+        jit_specs.append(gen_pcie_ipc_comm_module())
 
     if add_misc:
         jit_specs += [
@@ -1175,7 +1192,7 @@ def main():
     parser.add_argument(
         "--add-comm",
         type=parse_bool,
-        help="Add communication kernels (trtllm_comm, vllm_comm)",
+        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm)",
     )
     parser.add_argument(
         "--add-gemma",
