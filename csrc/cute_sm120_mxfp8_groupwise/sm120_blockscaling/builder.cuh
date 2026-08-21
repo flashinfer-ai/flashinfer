@@ -75,8 +75,7 @@ struct SM120BlockScalingMMAConfig {
 
 template <int TileM_ = 128, int TileN_ = 128, int TileK_ = 128, int Stages_ = 4,
           int ScaleGranularityM_ = 1, int ScaleGranularityN_ = 128, int ScaleGranularityK_ = 128,
-          sm120_common::GemmType GemmType_ = sm120_common::GemmType::Normal,
-          bool SwapAB_ = false>
+          sm120_common::GemmType GemmType_ = sm120_common::GemmType::Normal, bool SwapAB_ = false>
 struct SM120BlockScalingBuilder {
   using ElementA = cute::float_e4m3_t;
   using ElementB = cute::float_e4m3_t;

@@ -26,7 +26,6 @@ from flashinfer.grouped_mm import moe_gemm_mxfp8_nt_groupwise
 from flashinfer.grouped_mm.cute_sm120_mxfp8_groupwise.core import (
     _CuteSm120Mxfp8MoeRunner,
     _MXFP8_MOE_PLAIN_TACTICS_GRANK32,
-    _MXFP8_MOE_TACTICS,
     _MXFP8_MOE_TACTICS_GRANK128,
 )
 from flashinfer.utils import is_sm120a_supported
