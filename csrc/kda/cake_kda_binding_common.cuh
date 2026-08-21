@@ -509,7 +509,7 @@ inline void PackBetaForTmaIfNeeded(const TensorView& beta, const TensorView& bet
 
 template <int ChunkTokens>
 inline CUtensorMap EncodeQkTma(const TensorView& tensor, const char* name) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
   TVM_FFI_ICHECK(tensor.ndim() >= 2) << name << " must have at least two dimensions";
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
@@ -538,7 +538,7 @@ inline CUtensorMap EncodeQkTma(const TensorView& tensor, const char* name) {
 template <int ValueRows, int ChunkTokens>
 inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   static_assert(ValueRows == 64 || ValueRows == 128);
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
@@ -564,7 +564,7 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
 
 template <int ChunkTokens>
 inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
@@ -589,7 +589,7 @@ inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
 
 template <int ChunkTokens>
 inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t outer1 = tensor.numel() / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
@@ -619,7 +619,7 @@ inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
 template <int ValueRows, int ChunkTokens>
 inline CUtensorMap EncodeOutputTma(const TensorView& tensor) {
   static_assert(ValueRows == 64 || ValueRows == 128);
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
