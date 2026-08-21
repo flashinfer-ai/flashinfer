@@ -8199,7 +8199,7 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
                 a,
                 b.T,
                 a_descale,
-                b_descale.T,
+                b_descale.mT if b_descale.ndim == 2 else b_descale,
                 alpha,
                 out,
                 self._use_8x4_sf_layout,
