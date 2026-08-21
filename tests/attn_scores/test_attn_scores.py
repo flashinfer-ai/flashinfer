@@ -1877,6 +1877,76 @@ def test_precompile_targets_the_requested_device():
     )
 
 
+def test_precompile_warms_fp4_float32_output():
+    """precompile must cover the output dtypes a deployment actually runs.
+
+    output_dtype is part of the compile cache key, so warming only the API
+    default (bfloat16) left a first-request JIT for any consumer binding logits
+    as C float. Asserted via cache hits, with an unwarmed dtype required to
+    miss -- otherwise the test would pass even if nothing were warmed.
+    Regression for PR #4365 review r3825087342.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_gpu_arch,
+        _cached_num_sms,
+        _to_cutlass,
+    )
+
+    dev = torch.cuda.current_device()
+    arch = _cached_gpu_arch(dev)
+    sms = _cached_num_sms(dev)
+    f32 = _to_cutlass(torch.float32)
+
+    # The in-process cache is shared across the whole session, and other tests
+    # in this file compile fp4 with every supported output dtype. Without
+    # clearing it, "float16 must miss" below is decided by test ordering rather
+    # than by what precompile warmed. Clearing only drops the in-memory entries;
+    # the on-disk CuTe-DSL cache still serves them, so repopulation is a load.
+    _cached_compile_fp4_kernel.cache_clear()
+
+    precompile_paged_mqa_logits(variants=("fp4",))
+
+    # both the API default and float32 must now be hits
+    for out_dtype in (torch.bfloat16, torch.float32):
+        hits = _cached_compile_fp4_kernel.cache_info().hits
+        _cached_compile_fp4_kernel(
+            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch
+        )
+        assert _cached_compile_fp4_kernel.cache_info().hits == hits + 1, (
+            f"precompile did not warm fp4 output_dtype={out_dtype}"
+        )
+
+    # a dtype outside the warmed set must miss, or the assertions above are vacuous
+    misses = _cached_compile_fp4_kernel.cache_info().misses
+    _cached_compile_fp4_kernel(
+        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch
+    )
+    assert _cached_compile_fp4_kernel.cache_info().misses > misses, (
+        "float16 was not warmed but did not miss -- the cache key ignores "
+        "output_dtype, so the hit assertions above prove nothing"
+    )
+
+
+def test_precompile_output_dtypes_is_honoured_and_validated():
+    """An explicit output_dtypes tuple builds only those, and is checked up front."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import precompile_paged_mqa_logits
+
+    # fp8 does not support bfloat16; reject before compiling anything
+    with pytest.raises(ValueError, match="does not support output dtype"):
+        precompile_paged_mqa_logits(variants=("fp8",), output_dtypes=(torch.bfloat16,))
+
+    # fp4 does support it, so the same tuple is fine there
+    precompile_paged_mqa_logits(variants=("fp4",), output_dtypes=(torch.bfloat16,))
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
