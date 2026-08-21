@@ -1416,9 +1416,9 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        if variant in (
-            "m128_unbounded_softplus",
-            "m128_bt64_unbounded_softplus",
+        if (
+            variant == "m128_unbounded_softplus"
+            or variant == "m128_bt64_unbounded_softplus"
         ):
             module = _get_cake_kda_prefill_module(
                 variant, _select_cake_kda_prefill_target(q.device)
