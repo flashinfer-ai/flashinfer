@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple, replace
@@ -142,7 +143,45 @@ from ..utils import (
     get_compute_capability,
 )
 
-DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+# cuDNN's cuBLASLt-backed matmul engine -- the plan candidate that
+# BuildPlanPolicy HEURISTICS_CHOICE picks first -- asks for a flat 32 MiB plus a
+# 256 byte pointer-alignment slack on SM90 and newer, for every shape. At the old
+# 32 MiB the very first cuDNN GEMM of a process therefore always grew this buffer;
+# see _gemm_workspace_at_least() for why growing it is unsafe.
+DEFAULT_WORKSPACE_SIZE = 40 * 1024 * 1024
+
+
+def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor:
+    """Return a workspace of at least ``size`` bytes, never moving ``workspace``.
+
+    ``workspace`` is a process-wide cached buffer shared by every call on this lane,
+    including calls already captured into CUDA graphs. ``Tensor.resize_()`` to a
+    larger size frees the old storage and returns a new address, which leaves those
+    graphs replaying against a pointer the caching allocator has since handed to
+    something else (flashinfer-ai/flashinfer#4549). Hand back a call-local buffer
+    instead -- the same thing the CUTLASS runners in ``csrc/`` do when the provided
+    workspace is too small.
+    """
+    if workspace.numel() >= size:
+        return workspace
+
+    # A call-local buffer would come from (and be freed back into) the capturing
+    # graph's private pool, which a later capture in that pool could then reuse.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"cuDNN asked for a {size} byte GEMM workspace but the shared buffer is "
+            f"only {workspace.numel()} bytes, and the current stream is capturing a "
+            "CUDA graph, where neither growing the shared buffer nor allocating a "
+            "new one is safe. Run this shape once outside the capture region first."
+        )
+
+    warnings.warn(
+        f"cuDNN asked for a {size} byte GEMM workspace, larger than the shared "
+        f"{workspace.numel()} byte buffer; falling back to a per-call allocation.",
+        stacklevel=2,
+    )
+    return torch.empty(size, dtype=torch.uint8, device=workspace.device)
+
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -2825,9 +2864,69 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
     return plan_index
 
 
+# Building a cuDNN execution plan is the step that does cuDNN's one-time,
+# host-side initialisation work: it loads kernel modules, may invoke NVRTC for the
+# runtime-compiled engines, and -- for the cuBLASLt-backed matmul engine that
+# BuildPlanPolicy HEURISTICS_CHOICE picks as plan candidate 0 -- makes the
+# process's first ``cublasLtCreate()`` call.  None of that belongs inside a CUDA
+# graph capture:
+#
+#   * cuDNN's own sources state that the first ``cublasLtCreate()`` "cannot be
+#     executed when the graph capture is enabled", and its legacy RNN and
+#     multi-head-attention paths each do an explicit warm-up call to get that
+#     first create out of the way.  The backend matmul path FlashInfer uses has
+#     no such protection.
+#   * cuDNN carries a separate work-around for lazy kernel-module loading under
+#     capture in its convolution path, again not present on the matmul path.
+#   * cudnn-frontend's own ``Graph::warmup()`` gives up immediately when it finds
+#     a capture already active, rather than doing this work under capture.
+#
+# FlashInfer's graph builders are ``functools.lru_cache``'d on shape, so a shape
+# first seen inside a capture region would build its plan right there.  Refuse,
+# and tell the caller to warm the shape up outside the capture instead.  There is
+# no cudnn-frontend Python binding for ``Graph::warmup()``, so "warm up" here
+# means running the same op once eagerly.
+_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE = (
+    os.environ.get("FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE", "0") == "1"
+)
+
+
+class CudnnPlanBuildInCaptureError(RuntimeError):
+    """A cuDNN execution plan was about to be built during CUDA graph capture.
+
+    Raised by :func:`_check_cudnn_plan_build_not_capturing`.  It has its own type
+    so that the ``except Exception -> retry with tactic=-1`` fallbacks in the
+    cuDNN runners can let it through: retrying would just build a *different*
+    plan under the same capture, and would silently succeed whenever the
+    ``tactic=-1`` plan for that shape happened to be cached already.
+    """
+
+
+def _check_cudnn_plan_build_not_capturing(what: str) -> None:
+    """Refuse to build a cuDNN execution plan while capturing a CUDA graph."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
+    message = (
+        f"Building a cuDNN {what} execution plan while the current stream is "
+        "capturing a CUDA graph. cuDNN does its one-time host-side setup here "
+        "(kernel module load, NVRTC compilation, the first cublasLtCreate()), "
+        "which cuDNN itself documents as unsafe under capture. Run this shape "
+        "once outside the capture region to warm it up first; FlashInfer caches "
+        "the plan per shape, so the captured call will then reuse it. Set "
+        "FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE=1 to downgrade this to a "
+        "warning."
+    )
+    if _ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE:
+        warnings.warn(message, stacklevel=3)
+        return
+    raise CudnnPlanBuildInCaptureError(message)
+
+
 def _finalize_cudnn_graph_for_tactic(
     graph, tactic, heur_modes, deselect_eng0: bool = False
 ) -> None:
+    _check_cudnn_plan_build_not_capturing("GEMM")
     graph.validate()
     graph.build_operation_graph()
 
@@ -3089,8 +3188,7 @@ def execute_cudnn_gemm_fp4_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3324,8 +3422,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3408,8 +3505,7 @@ def execute_cudnn_gemm_mxfp8_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
 
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3631,8 +3727,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3750,8 +3845,7 @@ def execute_cudnn_gemm_fp8_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3889,8 +3983,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -4055,6 +4148,10 @@ def _cudnn_gemm_fp8_runner():
                         out.dtype,
                         tactic=tactic,
                     )
+            except CudnnPlanBuildInCaptureError:
+                # Retrying with tactic=-1 would build a plan under the same
+                # capture; let the caller see the real problem.
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN fp8 GEMM tactic failed; falling back to default "
@@ -4184,8 +4281,7 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -4360,8 +4456,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -4571,6 +4666,10 @@ def _cudnn_gemm_bf16_runner(
                     )
                 else:
                     _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=tactic)
+            except CudnnPlanBuildInCaptureError:
+                # Retrying with tactic=-1 would build a plan under the same
+                # capture; let the caller see the real problem.
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN bf16 GEMM tactic failed; falling back to default "
@@ -5496,6 +5595,10 @@ def _cudnn_mm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnPlanBuildInCaptureError:
+                # Retrying with tactic=-1 would build a plan under the same
+                # capture; let the caller see the real problem.
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN mxfp8 GEMM tactic failed; falling back to default "
@@ -5970,6 +6073,10 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                         workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnPlanBuildInCaptureError:
+                # Retrying with tactic=-1 would build a plan under the same
+                # capture; let the caller see the real problem.
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN fp4 GEMM tactic failed; falling back to default "
@@ -9588,6 +9695,10 @@ def _cudnn_gemm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnPlanBuildInCaptureError:
+                # Retrying with tactic=-1 would build a plan under the same
+                # capture; let the caller see the real problem.
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN mxfp8 GEMM tactic failed; falling back to default "

@@ -26,6 +26,7 @@ from .gemm_base import (
     CUDNN_AVAILABLE,
     DEFAULT_WORKSPACE_SIZE,
     UIDs,
+    _gemm_workspace_at_least,
     _check_cudnn_fp4_availability,
     _get_cudnn_handle,
     _get_cudnn_override_shape_workspace_size,
@@ -267,8 +268,7 @@ def execute_cudnn_bf16_fp4_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
     handle = _get_cudnn_handle(a.device, stream)
@@ -330,8 +330,7 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     if plan_index < 0:
         graph.execute(
