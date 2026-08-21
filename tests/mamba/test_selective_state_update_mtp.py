@@ -1126,6 +1126,387 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
             assert states_match, f"Intermediate state at step {t} mismatch"
 
 
+@torch.no_grad()
+def _tree_parent_state_reference(inputs):
+    """Independent PyTorch recurrence for tree parent-state restoration."""
+    state_cache = inputs["state_cache"]
+    state_scale = inputs.get("state_scale")
+    x = inputs["x"]
+    batch, num_steps, nheads, _ = x.shape
+    ngroups = inputs["B"].shape[2]
+    heads_per_group = nheads // ngroups
+
+    output = torch.empty_like(x)
+    intermediate_states = inputs["intermediate_states_buffer"].clone()
+    intermediate_scales = (
+        inputs["intermediate_state_scales"].clone()
+        if inputs.get("intermediate_state_scales") is not None
+        else None
+    )
+
+    for batch_idx in range(batch):
+        state_slot = int(inputs["slot_idx"][batch_idx])
+        current_state = state_cache[state_slot].float()
+        if state_scale is not None:
+            current_state *= state_scale[state_slot].float()
+
+        cache_slot = (
+            int(inputs["intermediate_slot_idx"][batch_idx])
+            if inputs.get("intermediate_slot_idx") is not None
+            else state_slot
+        )
+
+        for step in range(num_steps):
+            parent_step = int(inputs["retrieve_parent_token"][batch_idx, step])
+            if 0 <= parent_step < step:
+                current_state = intermediate_states[cache_slot, parent_step].float()
+                if intermediate_scales is not None:
+                    current_state *= intermediate_scales[
+                        cache_slot, parent_step
+                    ].unsqueeze(-1)
+
+            x_step = x[batch_idx, step].float()
+            dt_step = inputs["dt"][batch_idx, step].float() + inputs["dt_bias"].float()
+            dt_step = torch.nn.functional.softplus(dt_step)
+
+            B_step = torch.repeat_interleave(
+                inputs["B"][batch_idx, step].float(),
+                heads_per_group,
+                dim=0,
+            ).unsqueeze(1)
+            C_step = torch.repeat_interleave(
+                inputs["C"][batch_idx, step].float(),
+                heads_per_group,
+                dim=0,
+            ).unsqueeze(1)
+            dA = torch.exp(inputs["A"].float() * dt_step.unsqueeze(-1))
+            current_state = current_state * dA + B_step * dt_step.unsqueeze(
+                -1
+            ) * x_step.unsqueeze(-1)
+
+            if state_cache.dtype == torch.int16:
+                int16_max = torch.iinfo(torch.int16).max
+                amax = current_state.abs().amax(dim=-1)
+                encode_scale = torch.where(
+                    amax == 0,
+                    torch.ones_like(amax),
+                    int16_max / amax,
+                )
+                intermediate_states[cache_slot, step] = (
+                    torch.round(current_state * encode_scale.unsqueeze(-1))
+                    .clamp(-int16_max, int16_max)
+                    .to(torch.int16)
+                )
+                intermediate_scales[cache_slot, step] = 1.0 / encode_scale
+            else:
+                intermediate_states[cache_slot, step] = current_state.to(
+                    state_cache.dtype
+                )
+
+            output_step = (current_state * C_step).sum(dim=-1)
+            output_step += inputs["D"].float() * x_step
+            if inputs.get("z") is not None:
+                output_step *= torch.nn.functional.silu(
+                    inputs["z"][batch_idx, step].float()
+                )
+            output[batch_idx, step] = output_step.to(output.dtype)
+
+    return output, intermediate_states, intermediate_scales
+
+
+class TestSelectiveStateUpdateMTPRetrieveParentToken:
+    """Test tree speculative decoding with parent-state restoration."""
+
+    @staticmethod
+    def _make_inputs(state_dtype=torch.bfloat16, index_dtype=torch.int64):
+        inputs = create_test_inputs(
+            2,
+            8,
+            64,
+            128,
+            2,
+            input_dtype=torch.bfloat16,
+            state_dtype=state_dtype,
+            generate_intermediate_states_buffer=True,
+            generate_retrieve_parent_token=True,
+            cache_steps=4,
+            seed=0,
+        )
+        inputs["slot_idx"] = inputs["slot_idx"].to(index_dtype)
+        inputs["intermediate_slot_idx"] = inputs["intermediate_slot_idx"].to(
+            index_dtype
+        )
+        inputs["retrieve_parent_token"] = inputs["retrieve_parent_token"].to(
+            index_dtype
+        )
+        return inputs
+
+    @staticmethod
+    def _run(inputs, **overrides):
+        kwargs = {
+            "D": inputs["D"],
+            "z": inputs.get("z"),
+            "dt_bias": inputs["dt_bias"],
+            "dt_softplus": True,
+            "state_batch_indices": inputs["slot_idx"],
+            "disable_state_update": True,
+            "intermediate_states_buffer": inputs.get("intermediate_states_buffer"),
+            "intermediate_state_indices": inputs.get("intermediate_slot_idx"),
+            "intermediate_state_scales": inputs.get("intermediate_state_scales"),
+            "state_scale": inputs.get("state_scale"),
+            "cache_steps": inputs["cache_steps"],
+            "retrieve_parent_token": inputs["retrieve_parent_token"],
+            "algorithm": "simple",
+        }
+        kwargs.update(overrides)
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "state_dtype,index_dtype,algorithm,generate_z",
+        [
+            (torch.bfloat16, torch.int32, "auto", True),
+            (torch.int16, torch.int64, "simple", False),
+        ],
+    )
+    def test_tree_parent_state_matches_reference(
+        self,
+        state_dtype,
+        index_dtype,
+        algorithm,
+        generate_z,
+    ):
+        batch, nheads, dim, dstate, ngroups, cache_steps = 2, 8, 64, 128, 2, 4
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            input_dtype=torch.bfloat16,
+            weight_dtype=torch.float32,
+            matrixA_dtype=torch.float32,
+            state_dtype=state_dtype,
+            generate_z=generate_z,
+            generate_intermediate_states_buffer=True,
+            generate_retrieve_parent_token=True,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+        parent_steps = [
+            [-1, 0, 0, 2],
+            [-1, -1, 3, cache_steps + 1],
+        ]
+        # Exercise arbitrary tensor strides as well as valid branches and
+        # ignored negative/forward/out-of-range references.
+        inputs["retrieve_parent_token"] = (
+            torch.tensor(parent_steps, dtype=index_dtype, device="cuda")
+            .T.contiguous()
+            .T
+        )
+        inputs["slot_idx"] = inputs["slot_idx"].to(index_dtype)
+        inputs["intermediate_slot_idx"] = torch.tensor(
+            [1, 0], dtype=index_dtype, device="cuda"
+        )
+        state_before = inputs["state_cache"][inputs["slot_idx"].long()].clone()
+
+        y_ref, intermediate_states_ref, intermediate_scales_ref = (
+            _tree_parent_state_reference(inputs)
+        )
+
+        y_test = self._run(inputs, algorithm=algorithm)
+
+        output_atol = 1e-2 if state_dtype == torch.int16 else 2e-2
+        torch.testing.assert_close(
+            y_ref,
+            y_test,
+            atol=output_atol,
+            rtol=1e-2,
+        )
+        assert torch.equal(
+            inputs["state_cache"][inputs["slot_idx"].long()],
+            state_before,
+        )
+
+        if state_dtype == torch.int16:
+            ref_cache = (
+                intermediate_states_ref.float() * intermediate_scales_ref.unsqueeze(-1)
+            )
+            test_cache = inputs["intermediate_states_buffer"].float() * inputs[
+                "intermediate_state_scales"
+            ].unsqueeze(-1)
+        else:
+            ref_cache = intermediate_states_ref
+            test_cache = inputs["intermediate_states_buffer"]
+        cache_atol = 1e-3 if state_dtype == torch.int16 else 5e-3
+        torch.testing.assert_close(
+            ref_cache,
+            test_cache,
+            atol=cache_atol,
+            rtol=1e-2,
+        )
+        if state_dtype == torch.int16:
+            torch.testing.assert_close(
+                intermediate_scales_ref,
+                inputs["intermediate_state_scales"],
+                atol=1e-7,
+                rtol=1e-3,
+            )
+
+    @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.int16])
+    def test_tree_parent_state_updates_main_state(self, state_dtype):
+        inputs = self._make_inputs(state_dtype=state_dtype)
+        inputs["retrieve_parent_token"] = torch.tensor(
+            [[-1, 0, 0, 2], [-1, 0, 1, 0]],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        inputs["intermediate_slot_idx"] = torch.tensor(
+            [1, 0], dtype=torch.int64, device="cuda"
+        )
+
+        self._run(inputs, disable_state_update=False)
+
+        for batch_idx in range(inputs["x"].shape[0]):
+            state_slot = int(inputs["slot_idx"][batch_idx])
+            cache_slot = int(inputs["intermediate_slot_idx"][batch_idx])
+            torch.testing.assert_close(
+                inputs["state_cache"][state_slot],
+                inputs["intermediate_states_buffer"][
+                    cache_slot, inputs["cache_steps"] - 1
+                ],
+                atol=0,
+                rtol=0,
+            )
+            if state_dtype == torch.int16:
+                torch.testing.assert_close(
+                    inputs["state_scale"][state_slot].squeeze(-1),
+                    inputs["intermediate_state_scales"][
+                        cache_slot, inputs["cache_steps"] - 1
+                    ],
+                    atol=0,
+                    rtol=0,
+                )
+
+    @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.int16])
+    def test_tree_parent_state_honors_buffer_step_stride(self, state_dtype):
+        inputs = self._make_inputs(state_dtype=state_dtype)
+        batch, _, nheads, dim = inputs["x"].shape
+        dstate = inputs["state_cache"].shape[-1]
+        buffer_steps = inputs["cache_steps"] + 2
+        inputs["intermediate_states_buffer"] = torch.zeros(
+            batch,
+            buffer_steps,
+            nheads,
+            dim,
+            dstate,
+            dtype=state_dtype,
+            device="cuda",
+        )
+        if state_dtype == torch.int16:
+            inputs["intermediate_state_scales"] = torch.zeros(
+                batch,
+                buffer_steps,
+                nheads,
+                dim,
+                dtype=torch.float32,
+                device="cuda",
+            )
+        inputs["intermediate_slot_idx"] = torch.tensor(
+            [1, 0], dtype=torch.int64, device="cuda"
+        )
+
+        y_ref, states_ref, scales_ref = _tree_parent_state_reference(inputs)
+        y_test = self._run(inputs)
+
+        torch.testing.assert_close(y_ref, y_test, atol=2e-2, rtol=1e-2)
+        if state_dtype == torch.int16:
+            states_ref = states_ref.float() * scales_ref.unsqueeze(-1)
+            states_test = inputs["intermediate_states_buffer"].float() * inputs[
+                "intermediate_state_scales"
+            ].unsqueeze(-1)
+        else:
+            states_test = inputs["intermediate_states_buffer"]
+        torch.testing.assert_close(
+            states_ref,
+            states_test,
+            atol=1e-3 if state_dtype == torch.int16 else 5e-3,
+            rtol=1e-2,
+        )
+
+    def test_tree_parent_state_requires_cache_index_capacity(self):
+        inputs = self._make_inputs()
+        with pytest.raises(
+            RuntimeError,
+            match=r"intermediate_states_buffer\.size\(0\) must be >=",
+        ):
+            self._run(inputs, intermediate_state_indices=None)
+
+    def test_tree_parent_state_requires_matching_scale_capacity(self):
+        inputs = self._make_inputs(state_dtype=torch.int16)
+        inputs["intermediate_states_buffer"] = torch.zeros(
+            3,
+            inputs["cache_steps"],
+            *inputs["state_cache"].shape[1:],
+            dtype=torch.int16,
+            device="cuda",
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"intermediate_state_scales\.size\(0\) must match",
+        ):
+            self._run(inputs)
+
+    def test_tree_parent_state_rejects_invalid_parent_dtype(self):
+        inputs = self._make_inputs()
+        with pytest.raises(ValueError, match="dtype int32 or int64"):
+            self._run(
+                inputs,
+                retrieve_parent_token=inputs["retrieve_parent_token"].float(),
+            )
+
+    def test_tree_parent_state_requires_intermediate_buffer(self):
+        inputs = self._make_inputs()
+        with pytest.raises(ValueError, match="intermediate_states_buffer is required"):
+            self._run(inputs, intermediate_states_buffer=None)
+
+    def test_tree_parent_state_requires_scales_for_int16_cache(self):
+        inputs = self._make_inputs(state_dtype=torch.int16)
+        with pytest.raises(
+            ValueError,
+            match="intermediate_state_scales is required",
+        ):
+            self._run(inputs, intermediate_state_scales=None)
+
+    def test_tree_parent_state_rejects_mismatched_index_dtype(self):
+        inputs = self._make_inputs(index_dtype=torch.int64)
+        with pytest.raises(
+            RuntimeError,
+            match=r"state_batch_indices\s+and retrieve_parent_token",
+        ):
+            self._run(
+                inputs,
+                retrieve_parent_token=inputs["retrieve_parent_token"].int(),
+            )
+
+    def test_tree_parent_state_rejects_short_cache(self):
+        inputs = self._make_inputs()
+        with pytest.raises(RuntimeError, match="must be >= ntokens_mtp"):
+            self._run(inputs, cache_steps=3)
+
+    def test_tree_parent_state_rejects_non_simple_algorithm(self):
+        inputs = self._make_inputs()
+        with pytest.raises(RuntimeError, match="only supported by the 'simple'"):
+            self._run(inputs, algorithm="horizontal")
+
+
 class TestSelectiveStateUpdateMTPIndicesDtypeMismatch:
     """Test that selective_state_update fails with dtype mismatch between indices."""
 

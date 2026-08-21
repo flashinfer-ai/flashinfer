@@ -24,7 +24,8 @@
 // 1. All warps cooperatively cp.async B/C/x/dt into smem.
 // 2. Each thread loads its state columns from global memory directly into rState[] registers.
 // 3. cp_async_wait_group<0>() + __syncthreads() — single sync.
-// 4. Step loop: pure register compute + smem reads for B/C/x. No further syncs until epilogue.
+// 4. Step loop: register compute + smem reads for B/C/x. Tree decoding also reloads
+//    cached parent states and uses a warp sync to publish quantization scales.
 
 #pragma once
 
@@ -78,6 +79,9 @@ struct SimpleStorage {
   // Precomputed per-step destination batch indices for state writes.
   // -1 means "skip this step".
   int64_t state_dst_slots[NTOKENS];
+  // Parent step to restore before each recurrence. -1 means keep the state
+  // already held in registers.
+  int64_t state_parent_steps[NTOKENS];
   // State prefetch buffer: cp.async loads state here before the barrier.
   // Single stage for DPC=16 (1 pass), 2 stages for DPC>16 (pipelined).
   alignas(128) state_t state_in[STATE_STAGES][ROWS_PER_PASS][DSTATE_PAD];
@@ -248,17 +252,38 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
                                   step * params.dst_state_batch_indices_stride_T]);
       sram.state_dst_slots[step] = (dst_idx == params.pad_slot_id) ? SKIP : dst_idx;
     } else if (params.intermediate_states) {
-      // MTP cache: consecutive step slots within the icache entry
+      // MTP cache: consecutive step slots within the icache entry. Use the
+      // tensor's actual step capacity rather than cache_steps, since callers
+      // may allocate extra step capacity.
       auto const* __restrict__ intermediate_state_indices =
           reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
       auto const icache_idx = intermediate_state_indices
                                   ? static_cast<int64_t>(intermediate_state_indices[seq_idx])
                                   : state_batch;
-      sram.state_dst_slots[step] = icache_idx * params.cache_steps + step;
+      sram.state_dst_slots[step] = icache_idx * params.intermediate_state_steps + step;
     } else {
       // Final-state only: write at last step
       sram.state_dst_slots[step] =
           (step == seq_len - 1 && params.update_state) ? state_batch : SKIP;
+    }
+
+    auto const* __restrict__ retrieve_parent_token =
+        reinterpret_cast<stateIndex_t const*>(params.retrieve_parent_token);
+    if (retrieve_parent_token) {
+      sram.state_parent_steps[step] = SKIP;
+      if constexpr (!IS_PAD) {
+        if (step > 0 && step < seq_len) {
+          auto const parent_step = static_cast<int64_t>(
+              retrieve_parent_token[seq_idx * params.retrieve_parent_token_stride_batch +
+                                    step * params.retrieve_parent_token_stride_T]);
+          // Ignore invalid or forward references rather than reading unwritten
+          // cache. Even parent == step - 1 is reloaded: the cache dtype is part
+          // of the tree-decoding contract, especially for quantized state.
+          if (parent_step >= 0 && parent_step < step) {
+            sram.state_parent_steps[step] = parent_step;
+          }
+        }
+      }
     }
   }
 
@@ -310,8 +335,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
 
   // Unified state write path: pick destination pointer and stride based on mode.
   // The per-step slot indices are precomputed in sram.state_dst_slots[].
-  // For istate: dst_slot = icache_idx * cache_steps + step, so the flat slot
-  // index works with both state stride (nheads*DIM*DSTATE) and scale stride (nheads*DIM).
+  // For istate, dst_slot uses the buffer's actual step capacity, so the flat
+  // slot index works with both state stride (nheads*DIM*DSTATE) and scale
+  // stride (nheads*DIM).
   auto* __restrict__ write_state_ptr = state_ptr;
   int64_t write_state_stride = params.state_stride_batch;
   [[maybe_unused]] auto* __restrict__ write_scale_ptr =
@@ -393,6 +419,35 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       if (step >= seq_len) break;
       // Prefetch dst_slot early so the LDS latency is hidden by the compute below
       int64_t const dst_slot = sram.state_dst_slots[step];
+      if (params.retrieve_parent_token) {
+        int64_t const parent_step = sram.state_parent_steps[step];
+        if (parent_step != simple_horiz::SKIP_WRITE_STATE) {
+          int64_t const parent_slot = sram.state_dst_slots[parent_step];
+          auto const parent_base = parent_slot * write_state_stride + (int64_t)head * DIM * DSTATE +
+                                   (int64_t)dd * DSTATE;
+          [[maybe_unused]] float parent_decode_scale = 1.f;
+          if constexpr (scaleState) {
+            parent_decode_scale =
+                write_scale_ptr[parent_slot * write_scale_stride + head * DIM + dd];
+          }
+#pragma unroll
+          for (int t = 0; t < numTiles; t++) {
+            int const col0 = baseCol(t, 0);
+            if (col0 >= DSTATE) continue;
+            packed_tile_t const parent_tile =
+                *reinterpret_cast<packed_tile_t const*>(&write_state_ptr[parent_base + col0]);
+#pragma unroll
+            for (int p = 0; p < pairsPerTileMember; p++) {
+              rState[t][p] = toFloat2(&parent_tile.val[p * 2]);
+              if constexpr (scaleState) {
+                float2 const decode_scale2 = {parent_decode_scale, parent_decode_scale};
+                mul_f32x2(rState[t][p], rState[t][p], decode_scale2);
+              }
+            }
+          }
+        }
+      }
+
       float const dt_value = *dt_step;
       float const dA = __expf(A_val * dt_value);
       float const x_value = toFloat(x_step[local_row]);
@@ -439,6 +494,8 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       // Unified state write: use precomputed slot index from sram
       {
         if (dst_slot != simple_horiz::SKIP_WRITE_STATE) {
+          bool const write_main_state =
+              params.intermediate_states && params.update_state && step == seq_len - 1;
           [[maybe_unused]] float encode_scale = 1.f;
           if constexpr (scaleState) {
             encode_scale =
@@ -466,14 +523,28 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
                   e, rand_ints);
             }
             *reinterpret_cast<packed_tile_t*>(&write_state_ptr[dst_base + col0]) = rOut;
+            if (write_main_state) {
+              auto const main_base = state_ptr_offset + (int64_t)dd * DSTATE;
+              *reinterpret_cast<packed_tile_t*>(&state_ptr[main_base + col0]) = rOut;
+            }
           }
           // Write decode scale
           if constexpr (scaleState) {
             if (member == 0) {
-              write_scale_ptr[dst_slot * write_scale_stride + head * DIM + dd] = 1.f / encode_scale;
+              float const decode_scale = 1.f / encode_scale;
+              write_scale_ptr[dst_slot * write_scale_stride + head * DIM + dd] = decode_scale;
+              if (write_main_state) {
+                state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd] =
+                    decode_scale;
+              }
             }
           }
         }
+      }
+      if (params.retrieve_parent_token) {
+        // State values are written by the reading lane, but block scales are
+        // produced by lane 0 and consumed by the other lanes on later steps.
+        __syncwarp();
       }
     }  // step loop
 

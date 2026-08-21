@@ -342,7 +342,8 @@ void run_selective_state_update_mtp(
     Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
     Optional<TensorView> rand_seed, int64_t cache_steps, Optional<TensorView> cu_seqlens,
-    Optional<TensorView> num_accepted_tokens, int64_t algorithm) {
+    Optional<TensorView> num_accepted_tokens, Optional<TensorView> retrieve_parent_token,
+    int64_t algorithm) {
   bool const is_varlen = (x.dim() == 3 && cu_seqlens.has_value());
   // Extract dimensions from input tensors
   int64_t batch;
@@ -477,6 +478,47 @@ void run_selective_state_update_mtp(
   validate_intermediate_states_buffer(intermediate_states_buffer);
   validate_state_scale(state_scale, state_cache_size, nheads, dim);
 
+  if (retrieve_parent_token.has_value()) {
+    auto const& parents = retrieve_parent_token.value();
+    CHECK_CUDA(parents);
+    CHECK_DIM(2, parents);
+    FLASHINFER_CHECK(!is_varlen, "retrieve_parent_token is not supported with varlen (cu_seqlens)");
+    FLASHINFER_CHECK(parents.size(0) == batch, "retrieve_parent_token.size(0) must equal batch (",
+                     batch, ")");
+    FLASHINFER_CHECK(parents.size(1) == ntokens_mtp,
+                     "retrieve_parent_token.size(1) must equal ntokens_mtp (", ntokens_mtp, ")");
+    FLASHINFER_CHECK(parents.dtype().code == kDLInt &&
+                         (parents.dtype().bits == 32 || parents.dtype().bits == 64),
+                     "retrieve_parent_token must have dtype int32 or int64");
+    FLASHINFER_CHECK(intermediate_states_buffer.has_value(),
+                     "intermediate_states_buffer is required when retrieve_parent_token is "
+                     "provided");
+    FLASHINFER_CHECK(!state_scale.has_value() || intermediate_state_scales.has_value(),
+                     "intermediate_state_scales is required for tree decoding with scaled state");
+    FLASHINFER_CHECK(cache_steps >= ntokens_mtp, "cache_steps (", cache_steps,
+                     ") must be >= ntokens_mtp (", ntokens_mtp,
+                     ") when retrieve_parent_token is provided");
+
+    auto const& istates = intermediate_states_buffer.value();
+    CHECK_DIM(5, istates);
+    FLASHINFER_CHECK(istates.size(0) > 0,
+                     "intermediate_states_buffer must have at least one cache entry");
+    FLASHINFER_CHECK(istates.size(1) >= cache_steps,
+                     "intermediate_states_buffer.size(1) must be >= cache_steps");
+    FLASHINFER_CHECK(istates.size(2) == nheads,
+                     "intermediate_states_buffer.size(2) must equal nheads");
+    FLASHINFER_CHECK(istates.size(3) == dim, "intermediate_states_buffer.size(3) must equal dim");
+    FLASHINFER_CHECK(istates.size(4) == dstate,
+                     "intermediate_states_buffer.size(4) must equal dstate");
+    if (!intermediate_state_indices.has_value()) {
+      auto const required_cache_entries =
+          state_batch_indices.has_value() ? state_cache_size : batch;
+      FLASHINFER_CHECK(istates.size(0) >= required_cache_entries,
+                       "intermediate_states_buffer.size(0) must be >= ", required_cache_entries,
+                       " when intermediate_state_indices is not provided");
+    }
+  }
+
   // Validate that index tensors have consistent dtypes
   if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
     DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
@@ -491,6 +533,19 @@ void run_selective_state_update_mtp(
     FLASHINFER_CHECK(state_batch_idx_dtype.code == dst_state_batch_idx_dtype.code &&
                          state_batch_idx_dtype.bits == dst_state_batch_idx_dtype.bits,
                      "state_batch_indices and dst_state_batch_indices must have the same dtype");
+  }
+  if (retrieve_parent_token.has_value()) {
+    auto const parent_dtype = retrieve_parent_token.value().dtype();
+    auto check_parent_dtype = [&](Optional<TensorView> const& indices, char const* name) {
+      if (!indices.has_value()) return;
+      auto const index_dtype = indices.value().dtype();
+      FLASHINFER_CHECK(
+          index_dtype.code == parent_dtype.code && index_dtype.bits == parent_dtype.bits, name,
+          " and retrieve_parent_token must have the same dtype");
+    };
+    check_parent_dtype(state_batch_indices, "state_batch_indices");
+    check_parent_dtype(dst_state_batch_indices, "dst_state_batch_indices");
+    check_parent_dtype(intermediate_state_indices, "intermediate_state_indices");
   }
 
   // Validate cache_steps is non-negative
@@ -578,6 +633,12 @@ void run_selective_state_update_mtp(
                      "state_batch_indices is required when num_accepted_tokens is provided");
     p.num_accepted_tokens = const_cast<void*>(nat.data_ptr());
   }
+  if (retrieve_parent_token.has_value()) {
+    auto const& parents = retrieve_parent_token.value();
+    p.retrieve_parent_token = const_cast<void*>(parents.data_ptr());
+    p.retrieve_parent_token_stride_batch = parents.stride(0);
+    p.retrieve_parent_token_stride_T = parents.stride(1);
+  }
   FLASHINFER_CHECK(!(dst_state_batch_indices.has_value() && intermediate_states_buffer.has_value()),
                    "dst_state_batch_indices and intermediate_states_buffer are mutually exclusive");
   if (state_scale.has_value()) {
@@ -588,6 +649,7 @@ void run_selective_state_update_mtp(
   if (intermediate_states_buffer.has_value()) {
     p.intermediate_states = const_cast<void*>(intermediate_states_buffer.value().data_ptr());
     p.intermediate_state_stride_batch = intermediate_states_buffer.value().stride(0);
+    p.intermediate_state_steps = intermediate_states_buffer.value().size(1);
   }
 
   if (intermediate_state_indices.has_value()) {
@@ -598,11 +660,20 @@ void run_selective_state_update_mtp(
     auto const& iscales = intermediate_state_scales.value();
     CHECK_CUDA(iscales);
     CHECK_CONTIGUOUS(iscales);
-    CHECK_DIM(4, iscales);  // (batch, cache_steps, nheads, dim)
-    FLASHINFER_CHECK(iscales.size(0) == batch,
-                     "intermediate_state_scales.size(0) must equal batch");
-    FLASHINFER_CHECK(iscales.size(1) == cache_steps,
-                     "intermediate_state_scales.size(1) must equal cache_steps");
+    CHECK_DIM(4, iscales);  // (cache_entries, buffer_steps, nheads, dim)
+    FLASHINFER_CHECK(iscales.dtype().code == kDLFloat && iscales.dtype().bits == 32,
+                     "intermediate_state_scales must have dtype float32");
+    FLASHINFER_CHECK(intermediate_states_buffer.has_value(),
+                     "intermediate_states_buffer is required when "
+                     "intermediate_state_scales is provided");
+    auto const& istates = intermediate_states_buffer.value();
+    CHECK_DIM(5, istates);
+    FLASHINFER_CHECK(
+        iscales.size(0) == istates.size(0),
+        "intermediate_state_scales.size(0) must match intermediate_states_buffer.size(0)");
+    FLASHINFER_CHECK(
+        iscales.size(1) == istates.size(1),
+        "intermediate_state_scales.size(1) must match intermediate_states_buffer.size(1)");
     FLASHINFER_CHECK(iscales.size(2) == nheads,
                      "intermediate_state_scales.size(2) must equal nheads");
     FLASHINFER_CHECK(iscales.size(3) == dim, "intermediate_state_scales.size(3) must equal dim");
@@ -660,7 +731,10 @@ void selective_state_update(
     bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
     Optional<TensorView> rand_seed, int64_t cache_steps, Optional<TensorView> cu_seqlens,
-    Optional<TensorView> num_accepted_tokens, int64_t algorithm) {
+    Optional<TensorView> num_accepted_tokens, Optional<TensorView> retrieve_parent_token,
+    int64_t algorithm) {
+  FLASHINFER_CHECK(!retrieve_parent_token.has_value() || x.dim() == 4,
+                   "retrieve_parent_token requires multi-token input");
   bool const has_cu_seqlens = cu_seqlens.has_value();
   if (x.dim() == 3 && !has_cu_seqlens) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
@@ -671,7 +745,7 @@ void selective_state_update(
         state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
         dst_state_batch_indices, state_scale, pad_slot_id, output, disable_state_update,
         intermediate_states_buffer, intermediate_state_indices, intermediate_state_scales,
-        rand_seed, cache_steps, cu_seqlens, num_accepted_tokens, algorithm);
+        rand_seed, cache_steps, cu_seqlens, num_accepted_tokens, retrieve_parent_token, algorithm);
   } else {
     FLASHINFER_CHECK(false,
                      "x must have 3 dimensions (single-token) or 4 dimensions (multi-token), got ",

@@ -91,16 +91,19 @@ namespace mtp {
 struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   uint32_t ntokens_mtp{1};
   uint64_t cache_steps{0};
+  int64_t intermediate_state_steps{0};
 
   // MTP-specific strides for the token dimension
   int64_t x_stride_mtp{}, dt_stride_mtp{}, B_stride_mtp{}, C_stride_mtp{}, out_stride_mtp{},
       z_stride_mtp{};
   int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
   void* __restrict__ intermediate_states{
-      nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
+      nullptr};  // state_t: (icache_size, buffer_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
-  void* __restrict__ intermediate_state_scales{
-      nullptr};  // float: (batch, cache_steps, nheads, dim)
+  void* __restrict__ intermediate_state_scales{nullptr};   // float: matching intermediate_states
+  void* __restrict__ retrieve_parent_token{nullptr};       // stateIndex_t: (batch, ntokens_mtp)
+  int64_t retrieve_parent_token_stride_batch{};
+  int64_t retrieve_parent_token_stride_T{};
 
   void* __restrict__ cu_seqlens{nullptr};           // (n_sequences + 1,)
   void* __restrict__ num_accepted_tokens{nullptr};  // (n_sequences,)
