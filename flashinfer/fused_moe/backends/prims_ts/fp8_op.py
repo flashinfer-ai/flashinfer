@@ -22,7 +22,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
-from flashinfer.fused_moe.factorized import MoeTactic
+from flashinfer.fused_moe.tactic_search import MoeTactic
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,

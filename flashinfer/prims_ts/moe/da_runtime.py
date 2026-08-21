@@ -9,7 +9,7 @@ import torch
 
 from flashinfer.autotuner import TuningConfig
 from flashinfer.fused_moe.core import TrtllmDaRuntime
-from flashinfer.fused_moe.factorized import FactorizedTacticSpace, MoeTactic
+from flashinfer.fused_moe.tactic_search import FactorizedTacticSpace, MoeTactic
 
 from .da_body import PrimsTsDaBodyRunner
 
