@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashinfer.moe_ep import (
-    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
-    Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_config import (
+    Sm100_Bf16_Cutedsl_MegaMoeConfigBase,
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
@@ -72,7 +72,7 @@ def test_mixed_config_inherits_bf16_options():
         gate_up_clamp=1.5,
         in_kernel_fc2_reduce=True,
     )
-    assert isinstance(config, Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig)
+    assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
     assert config.in_kernel_fc2_reduce
 
