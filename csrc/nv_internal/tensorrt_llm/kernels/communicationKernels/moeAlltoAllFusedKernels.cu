@@ -48,7 +48,7 @@ extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine(
     unsigned long long, int, int, int, int, int, int, int, int, bool, bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(
-    float*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, float, int, int, bool);
+    float*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, float, int, int, bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_sanitize_expert_ids(
     int*, int*, int, int, int, int, int);
@@ -79,6 +79,14 @@ uint64_t byteOffset(void const* pointer, uint8_t const* base) {
   auto const base_address = reinterpret_cast<uintptr_t>(base);
   FLASHINFER_CHECK(address >= base_address, "workspace pointer precedes allocation base");
   return static_cast<uint64_t>(address - base_address);
+}
+
+template <typename KernelFn>
+void preloadKernel(char const* name, KernelFn kernel_fn) {
+  cudaFuncAttributes attributes{};
+  cudaError_t const error = cudaFuncGetAttributes(&attributes, kernel_fn);
+  FLASHINFER_CHECK(error == cudaSuccess, "cudaFuncGetAttributes (", name,
+                   ") failed: ", cudaGetErrorString(error));
 }
 
 int dtypeBytes(nvinfer1::DataType dtype) {
@@ -183,6 +191,17 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   FLASHINFER_CHECK(params.workspace != nullptr, "workspace must be defined");
+  // CUDA lazy module loading may synchronize the device. Load every downstream
+  // function before publication can enter its cross-rank wait.
+  preloadKernel("mnnvl_moe_alltoall_stage_combine",
+                kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
+  preloadKernel("mnnvl_moe_alltoall_publish_combine",
+                kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
+  preloadKernel("mnnvl_moe_alltoall_combine", kernel_flashinfer_mnnvl_moe_alltoall_combine);
+  if (params.quant_mode != MoeA2ACombineQuantMode::NONE) {
+    preloadKernel("mnnvl_moe_alltoall_quantize_combine",
+                  kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
+  }
   auto* rank_workspace =
       localWorkspace(params.workspace, params.workspace_stride_bytes, params.ep_rank);
   uint64_t const payload_bytes =
@@ -261,7 +280,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
       kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid, kQuantThreads, 0,
       params.stream, static_cast<float*>(params.accumulation_data),
       output_bytes, output_bytes, scale_bytes, scale_bytes, params.elements_per_token,
-      quant_mode, static_cast<int>(params.swizzle_mode), params.output_scalar_scale,
+      dtypeCode(params.dtype), quant_mode, static_cast<int>(params.swizzle_mode),
+      params.output_scalar_scale,
       blocks_per_row, padded_scale_cols, params.enable_pdl);
 }
 
