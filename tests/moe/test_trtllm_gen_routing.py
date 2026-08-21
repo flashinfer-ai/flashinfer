@@ -407,6 +407,37 @@ def test_invalid_group_args_rejected():
         )
 
 
+@pytest.mark.parametrize(
+    "routing_method,n_group,topk_group",
+    [
+        # Only the grouped DeepSeek kernel populates the fused shared-expert
+        # slots. Every other method dispatches to routingCustom, which leaves
+        # them untouched, so they must reject num_fused_shared_experts > 0
+        # rather than hand back uninitialized slots.
+        pytest.param(RoutingMethodType.DeepSeekV3, 1, 1, id="DeepSeekV3_no_groups"),
+        pytest.param(RoutingMethodType.MiniMax2, 0, 0, id="MiniMax2"),
+        pytest.param(RoutingMethodType.Renormalize, 0, 0, id="Renormalize"),
+        pytest.param(RoutingMethodType.Llama4, 0, 0, id="Llama4"),
+    ],
+)
+def test_unsupported_fused_shared_experts_rejected(routing_method, n_group, topk_group):
+    """Methods whose kernel cannot fill the shared-expert slots must error."""
+    num_experts = 16
+    logits = make_logits(4, num_experts, torch.float32, 0)
+    bias = make_bias(num_experts, torch.bfloat16, 1)
+    top_k = 1 if routing_method == RoutingMethodType.Llama4 else 4
+    with pytest.raises(Exception, match="fusing shared expert"):
+        trtllm_gen_routing(
+            logits,
+            bias,
+            routing_method,
+            top_k,
+            num_fused_shared_experts=1,
+            n_group=n_group,
+            topk_group=topk_group,
+        )
+
+
 def test_invalid_args_rejected():
     logits = make_logits(4, 16, torch.float32, 0)
     with pytest.raises(ValueError):

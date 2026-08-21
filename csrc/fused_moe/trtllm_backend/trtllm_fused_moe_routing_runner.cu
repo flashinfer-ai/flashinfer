@@ -63,6 +63,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
                  bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
+    // Only the grouped DeepSeek kernel below populates the fused shared-expert
+    // slots; routingCustom leaves them untouched, so reject rather than return
+    // uninitialized slots (same guard as the Llama4 and generic branches).
+    FLASHINFER_CHECK(numFusedSharedExpert == 0,
+                     "DeepSeek no-groups routing path does not support fusing shared expert");
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
     // kernel because it uses the warp-level routingTopKExperts flow.
@@ -109,6 +114,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::MiniMax2) {
+    FLASHINFER_CHECK(numFusedSharedExpert == 0,
+                     "MiniMax2 routing method does not support fusing shared expert");
     // MiniMaxM2: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
     // Similar to DeepSeek no-groups but with routeScale = 1.0 and epsilon = 1e-20
     // to match the Python reference: weight / (sum + 1e-20).
