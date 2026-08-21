@@ -22,16 +22,27 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
-For `BlockSparsePagedTSWrapper`, `plan` freezes the logical fixed-Q geometry
-and copies the paged-KV row offsets and optional per-request K/V lengths into
-plan-owned storage. When lengths are provided, the scalar K/V length is the
-static maximum; each page-table row may contain spare entries beyond its live
-length. `run` consumes live physical page IDs and per-KV-head sparse routes,
-and every selected BSR block must start before that request's frozen live K
-length. A violating sorted row fails closed. Eager
-launches retain all launch tensors on the run stream; CUDA Graph users must
-keep the wrapper and Q/cache/output/runtime-metadata tensors alive and
-unmodified until replay completes.
+For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
+geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
+request metadata. Every `run` reads live paged-KV row offsets, physical page
+IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
+bits from device tensors. The physical-page ID tensor is capacity: its live
+prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
+The caller owns the live length value contract: dense K/V lengths must be in
+`[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
+Attention reads those lengths directly; out-of-range values are unsupported
+instead of guaranteed to fail closed. Given valid lengths, invalid page-table
+or route metadata fails the affected request or row closed to finite zero
+without a host synchronization.
+
+The one-shot `block_sparse_attention_with_paged_kv_cache` API takes
+`max_seq_len_kv` as the static capacity and requires `seq_lens_kv` with the
+live per-request logical lengths. Paged PrimTS does not support packed or
+mixed/variable Q lengths.
+Eager launches retain all launch tensors on the run stream; CUDA Graph users
+must keep the wrapper and Q/cache/output/runtime-metadata tensors alive and
+unmodified until replay completes. Values may change between completed replays
+while tensor addresses, shapes, dtypes, and strides remain stable.
 
 Qualified Q64/coarse-KV profiles retain KV256 routes for page sizes 64 and
 128. Optional `kv_valid_bits` is a `torch.uint32` per-request bitset with shape

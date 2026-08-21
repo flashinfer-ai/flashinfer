@@ -175,7 +175,7 @@ def assert_template_axes_covered(
     )
 
 
-_ALLOWED_CONSTRAINT_BUILTINS = {"max"}
+_ALLOWED_CONSTRAINT_BUILTINS = {"max", "min"}
 
 
 def assert_template_constraints_valid(
@@ -512,7 +512,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "q",
         "paged_kv_indptr",
         "paged_kv_indices",
-        "seq_len_kv",
+        "max_seq_len_kv",
         "seq_lens_kv",
         "block_indptr",
         "block_indices",
@@ -525,6 +525,20 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     for template in (tuple_trace, combined_trace):
         assert common_inputs <= template.inputs.keys()
         assert "paged KV" in template.description
+        assert "max_seq_len_kv" in template.axes
+        assert "seq_len_kv" not in template.axes
+        assert template.inputs["max_seq_len_kv"].param is None
+        assert not template.inputs["seq_lens_kv"].optional
+        assert "paged_kv_indptr[-1].item() <= num_page_indices" in template.constraints
+        assert (
+            "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)"
+            in template.constraints
+        )
+        assert (
+            "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)"
+            in template.constraints
+        )
+        assert "max(seq_lens_kv) <= max_seq_len_kv" in template.constraints
 
     assert tuple_trace.inputs["k_cache"].param == "paged_kv_cache"
     assert tuple_trace.inputs["k_cache"].tuple_idx == 0
