@@ -2995,6 +2995,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # for head_dim_qk != head_dim_vo. When the direct path is unsupported it
             # falls back to the identical element-offset graph.
             elements_per_token = self._num_qo_heads * q.shape[-1]
+            if self._qo_indptr_last % elements_per_token != 0:
+                raise ValueError(
+                    "cuDNN prefill expects an element-unit qo_indptr "
+                    "(tokens * num_qo_heads * head_dim_qk); qo_indptr[-1] "
+                    f"({self._qo_indptr_last}) is not a multiple of "
+                    f"{elements_per_token}."
+                )
             qo_indptr_tokens = self._qo_indptr_buf // elements_per_token
 
             cudnn_batch_prefill_with_kv_cache(
@@ -3642,6 +3649,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_host = kv_indptr.to("cpu")
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
+        self._kv_indptr_last = int(kv_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
 
         if self.is_cuda_graph_enabled:
@@ -4297,8 +4305,24 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # share Q's and K's token boundaries, so we let the low level re-derive
             # their element offsets with the correct per-tensor multipliers
             # (batch_offsets_o/v default to q/k under batch_offsets_units="tokens").
-            qo_indptr_tokens = self._qo_indptr_buf // (q.shape[-2] * q.shape[-1])
-            kv_indptr_tokens = self._kv_indptr_buf // (k.shape[-2] * k.shape[-1])
+            qo_elements_per_token = q.shape[-2] * q.shape[-1]
+            kv_elements_per_token = k.shape[-2] * k.shape[-1]
+            if self._qo_indptr_last % qo_elements_per_token != 0:
+                raise ValueError(
+                    "cuDNN prefill expects an element-unit qo_indptr "
+                    "(tokens * num_qo_heads * head_dim_qk); qo_indptr[-1] "
+                    f"({self._qo_indptr_last}) is not a multiple of "
+                    f"{qo_elements_per_token}."
+                )
+            if self._kv_indptr_last % kv_elements_per_token != 0:
+                raise ValueError(
+                    "cuDNN prefill expects an element-unit kv_indptr "
+                    "(tokens * num_kv_heads * head_dim_qk); kv_indptr[-1] "
+                    f"({self._kv_indptr_last}) is not a multiple of "
+                    f"{kv_elements_per_token}."
+                )
+            qo_indptr_tokens = self._qo_indptr_buf // qo_elements_per_token
+            kv_indptr_tokens = self._kv_indptr_buf // kv_elements_per_token
 
             cudnn_batch_prefill_with_kv_cache(
                 q,

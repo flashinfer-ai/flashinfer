@@ -11,6 +11,17 @@ import torch
 
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.cudnn import prefill as cudnn_prefill
+from flashinfer.utils import get_compute_capability
+
+
+def _skip_if_cudnn_prefill_unsupported():
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    # cuDNN fused SDPA prefill requires Ampere or newer.
+    if get_compute_capability(torch.device("cuda:0"))[0] < 8:
+        pytest.skip("cuDNN SDPA prefill requires compute capability >= 8.0")
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -219,8 +230,7 @@ def test_cudnn_prefill_lse_is_base2(num_kv_heads):
     """cuDNN returns base-2 LSE (log2 sum exp scores), matching every other
     FlashInfer backend. cuDNN's frontend emits natural-log stats, so the prefill
     path folds them to base-2; verify against a float reference."""
-    if not cudnn_prefill.CUDNN_AVAILABLE:
-        pytest.skip("cudnn-frontend python package not available")
+    _skip_if_cudnn_prefill_unsupported()
 
     from flashinfer.utils import log2e
 
@@ -266,8 +276,7 @@ def test_cudnn_prefill_direct_build_unsupported_falls_back(monkeypatch):
     """If cuDNN reports the direct/mixed graph as NOT_SUPPORTED at build time, the
     call falls back to the legacy element-conversion path instead of failing --
     and produces the same result as forcing the legacy path outright."""
-    if not cudnn_prefill.CUDNN_AVAILABLE:
-        pytest.skip("cudnn-frontend python package not available")
+    _skip_if_cudnn_prefill_unsupported()
     if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
         pytest.skip("cuDNN backend/frontend too old for the direct path")
 
