@@ -725,6 +725,25 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
     assert bf16q_route is not None
     assert bf16q_route.component == "decode_quant_bf16q"
+    bf16q_group7 = select(
+        torch.empty((2, 14, 128), dtype=torch.bfloat16),
+        torch.empty((4, 2, 16, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((2, 14, 128), dtype=torch.bfloat16),
+        kv_layout="HND",
+        shared=True,
+    )
+    assert bf16q_group7 is not None
+    assert bf16q_group7.component == "decode_quant_bf16q"
+    assert (
+        select(
+            torch.empty((2, 16, 128), dtype=torch.bfloat16),
+            torch.empty((4, 2, 16, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((2, 16, 128), dtype=torch.bfloat16),
+            kv_layout="HND",
+            shared=True,
+        )
+        is None
+    )
     assert (
         select(
             bf16_q,

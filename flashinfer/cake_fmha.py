@@ -745,6 +745,8 @@ def select_cake_fmha_decode_route(
         and query.shape[2] == 128
         and page_size in (16, 32)
         and kv_layout in ("HND", "NHD")
+        and num_q_heads % num_kv_heads == 0
+        and 1 <= num_q_heads // num_kv_heads < 8
         and no_block_scales
         and quant_extensions_absent
         and _tma_paged_kv_strides_supported(key_cache)
