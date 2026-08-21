@@ -75,6 +75,8 @@ class PagedMQALogitsScheduleKernel:
         SPLIT_KV = cutlass.const_expr(self.split_kv)
         kNumSMs = cutlass.const_expr(self.num_sms)
         kNumChunks = cutlass.const_expr(kAligned // 32)
+        # Halvings needed for the phase-3 partition search to converge.
+        kLog2Aligned = cutlass.const_expr(int(kAligned).bit_length() + 1)
         # Cover sm_idx ∈ [0, kNumSMs] (inclusive) in 32-lane strips.
         kMaxSmChunks = cutlass.const_expr((kNumSMs + 32) // 32)
 
@@ -129,18 +131,41 @@ class PagedMQALogitsScheduleKernel:
                 else:
                     seg_starts = seg_starts + r_mod
 
-                # Linear scan to find q_idx_out = number of fully-assigned sequences.
-                # prefix_sum is non-decreasing → predicate is monotone; bounded for-scan
-                # replaces CUDA while-loop.
-                q_idx_out = cutlass.Int32(0)
-                for j in cutlass.range_constexpr(kAligned):
-                    in_range = cutlass.Int32(j) < batch_size
-                    advance = cutlass.Boolean(False)
-                    if in_range:
-                        if prefix_sum[j] <= seg_starts:
-                            advance = cutlass.Boolean(True)
-                    if advance:
-                        q_idx_out = cutlass.Int32(j + 1)
+                # q_idx_out = number of fully-assigned sequences =
+                # count{ j < batch_size : prefix_sum[j] <= seg_starts }.
+                # prefix_sum is non-decreasing, so the predicate is monotone and
+                # this is an upper_bound -- binary search it.
+                #
+                # A linear scan here (as in the kernel this was adapted from) is
+                # O(kAligned) twice over: every lane walks the whole array at
+                # runtime, and because range_constexpr pastes the body once per
+                # iteration inside the kMaxSmChunks strip loop, the emitted IR
+                # grows by ~kMaxSmChunks * kAligned instructions. Compile time
+                # then grows faster than linearly, since the passes over the
+                # resulting single large basic block are superlinear. Measured on
+                # sm_100a at B=2048: 138.6s -> 0.8s to compile, 0.144ms -> 0.014ms
+                # per launch.
+                #
+                # The trip count stays a compile-time constant, so constexpr
+                # unrolling remains the right choice: 13 iterations at B=2048.
+                # Ties matter -- a zero-length row contributes no segments, so
+                # prefix_sum repeats and every duplicate must be counted; that is
+                # why the predicate is <= and not <.
+                lo = cutlass.Int32(0)
+                cnt = cutlass.Int32(batch_size)
+                for _ in cutlass.range_constexpr(kLog2Aligned):
+                    half = cnt // 2
+                    mid = lo + half
+                    take = cutlass.Boolean(False)
+                    if cnt > 0:
+                        if prefix_sum[mid] <= seg_starts:
+                            take = cutlass.Boolean(True)
+                    if take:
+                        lo = mid + 1
+                        cnt = cnt - half - 1
+                    else:
+                        cnt = half
+                q_idx_out = lo
 
                 kv_split_idx = seg_starts
                 if q_idx_out > 0:
