@@ -1433,6 +1433,7 @@ def fp4_paged_mqa_logits(
 def precompile_paged_mqa_logits(
     device: torch.device = None,
     variants: Tuple[str, ...] = ("fp8", "fp4"),
+    output_dtypes: Tuple[torch.dtype, ...] = None,
 ) -> None:
     """Pre-compile paged MQA logits kernels for common static configs.
 
@@ -1443,15 +1444,23 @@ def precompile_paged_mqa_logits(
 
     Only the configs listed below are covered; anything else (fp16 epilogue,
     other head_dim / num_heads, num_epi_subtiles != 1) still compiles on first
-    use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s for the 9 fp4.
+    use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s per output dtype
+    for the 9 fp4.
 
     Args:
-        device:   CUDA device to target.  Defaults to the current CUDA
-                  device, so a worker that has set its per-rank device gets
-                  kernels for that device without passing anything.
-        variants: Which precisions to build.  A deployment normally runs one
-                  indexer precision, so pass e.g. ``("fp8",)`` to avoid
-                  compiling kernels that will never be called.
+        device:        CUDA device to target.  Defaults to the current CUDA
+                       device, so a worker that has set its per-rank device
+                       gets kernels for that device without passing anything.
+        variants:      Which precisions to build.  A deployment normally runs
+                       one indexer precision, so pass e.g. ``("fp8",)`` to
+                       avoid compiling kernels that will never be called.
+        output_dtypes: Which output dtypes to warm.  ``output_dtype`` is part
+                       of the compile cache key, so a dtype not warmed here
+                       still compiles on first use.  Defaults to each
+                       variant's common set: float32 for FP8, and both
+                       bfloat16 and float32 for FP4 -- the API default plus
+                       the dtype consumers with a float logits ABI require.
+                       Pass an explicit tuple to build only what you run.
     """
     if not _CUTE_DSL_AVAILABLE:
         return
@@ -1461,6 +1470,19 @@ def precompile_paged_mqa_logits(
             f"precompile_paged_mqa_logits: unknown variants {sorted(unknown)}; "
             f"supported values are 'fp8' and 'fp4'."
         )
+    # Validate here rather than letting an unsupported dtype surface from
+    # inside a compile: the caller asked for a build that cannot happen.
+    if output_dtypes is not None:
+        for name, allowed in (("fp8", _FP8_DTYPES), ("fp4", _FP4_DTYPES)):
+            if name not in variants:
+                continue
+            bad = [d for d in output_dtypes if d not in allowed]
+            if bad:
+                raise ValueError(
+                    f"precompile_paged_mqa_logits: {name} does not support "
+                    f"output dtype(s) {bad}; supported are "
+                    f"{sorted(str(d) for d in allowed)}."
+                )
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     device = torch.device(device)
@@ -1476,35 +1498,41 @@ def precompile_paged_mqa_logits(
     # requested arch would be filed under a different one.
     with torch.cuda.device(device_index):
         if "fp8" in variants:
-            # block_size × next_n, fp32 acc/epi/out
+            # block_size × next_n × output dtype, fp32 acc/epi
+            fp8_outs = output_dtypes or (torch.float32,)
             for block_size in (64, 128):
                 for nn in (1, 2, 3, 4):
-                    _cached_compile_fp8_kernel(
-                        block_size,
-                        num_heads,
-                        head_dim,
-                        nn,
-                        num_sms,
-                        _to_cutlass(torch.float32),
-                        _to_cutlass(torch.float32),
-                        _to_cutlass(torch.float32),
-                        1,
-                        arch,
-                    )
+                    for out_dtype in fp8_outs:
+                        _cached_compile_fp8_kernel(
+                            block_size,
+                            num_heads,
+                            head_dim,
+                            nn,
+                            num_sms,
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(out_dtype),
+                            1,
+                            arch,
+                        )
 
         if "fp4" in variants:
-            # block_size × next_n, fp32 epi, bf16 out
+            # block_size × next_n × output dtype, fp32 epi. bfloat16 is the API
+            # default; float32 is what a consumer binding logits as C float
+            # needs, and without it that deployment still JITs on first request.
+            fp4_outs = output_dtypes or (torch.bfloat16, torch.float32)
             for block_size in (32, 64, 128):
                 for nn in (1, 2, 3):
-                    _cached_compile_fp4_kernel(
-                        block_size,
-                        num_heads,
-                        head_dim,
-                        nn,
-                        num_sms,
-                        _to_cutlass(torch.float32),
-                        _to_cutlass(torch.bfloat16),
-                        1,
-                        False,
-                        arch,
-                    )
+                    for out_dtype in fp4_outs:
+                        _cached_compile_fp4_kernel(
+                            block_size,
+                            num_heads,
+                            head_dim,
+                            nn,
+                            num_sms,
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(out_dtype),
+                            1,
+                            False,
+                            arch,
+                        )
