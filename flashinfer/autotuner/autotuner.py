@@ -1604,8 +1604,8 @@ class AutoTuner:
         """
         use_cuda_graph = (
             tuning_config.use_cuda_graph
-            if policy.cuda_graph is None
-            else policy.cuda_graph
+            if policy.use_cuda_graph is None
+            else policy.use_cuda_graph
         )
         use_cold_l2 = (
             tuning_config.use_cold_l2_cache

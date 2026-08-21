@@ -51,7 +51,7 @@ unusable entries as work to rebuild).
 v2 is a standalone context manager, deliberately disjoint from `autotune()`:
 
 ```python
-with flashinfer.autotune_v2(measure=MeasurementPolicy(execution_mode="cuda_graph")):
+with flashinfer.autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="cuda_graph")):
     model(dummy_inputs)      # warmup: tune misses, publish each winner atomically
 model(inputs)                # serving: reuses entries, no context needed
 

@@ -68,7 +68,7 @@ class MeasurementPolicy:
     The policy is part of the store's environment identity (manifest):
     entries tuned under different policies never overwrite each other,
     and a consuming process must attach with the same policy
-    (``autotune_v2(mode="replay", measure=...)``).
+    (``autotune_v2(mode="replay", measurement_policy=...)``).
 
     Attributes:
         execution_mode:
@@ -115,7 +115,7 @@ class MeasurementPolicy:
             )
 
     @property
-    def cuda_graph(self) -> Optional[bool]:
+    def use_cuda_graph(self) -> Optional[bool]:
         """Derived from ``execution_mode``; ``None`` (mode ``"auto"``)
         inherits each op's ``TuningConfig.use_cuda_graph``."""
         if self.execution_mode == "cuda_graph":
@@ -361,10 +361,11 @@ def autotune_v2(
     mode: str = "tune",
     persistent_cache: bool = True,
     cache_root: Union[str, os.PathLike, None] = None,
+    measurement_policy: Optional[MeasurementPolicy] = None,
+    *,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
-    measure: Optional[MeasurementPolicy] = None,
 ):
     """Autotune with FlashInfer-managed on-disk persistence (experimental v2).
 
@@ -426,8 +427,8 @@ def autotune_v2(
         skip_ops: Forwarded to :func:`flashinfer.autotune`; quarantines
             specific ``custom_op`` names (e.g. an op whose tuning
             crashes) without losing autotune for everything else.
-        measure: Optional :class:`MeasurementPolicy` -- measure tactics
-            the way the deployment runs:
+        measurement_policy: Optional :class:`MeasurementPolicy` -- measure
+            tactics the way the deployment runs:
             ``MeasurementPolicy(execution_mode="cuda_graph")`` or
             ``MeasurementPolicy(execution_mode="eager")``.  Part of the
             store identity; consumers must attach with the same policy.
@@ -481,9 +482,9 @@ def autotune_v2(
     ):
         if persistent_cache:
             manifest = _collect_metadata()
-            if measure is not None:
+            if measurement_policy is not None:
                 # The policy is part of the environment identity.
-                manifest.update(measure.manifest_fields())
+                manifest.update(measurement_policy.manifest_fields())
             # A persistent context always attaches its store as the process
             # ambient (last-wins), so bare serving after it exits resolves
             # to it.
@@ -502,7 +503,7 @@ def autotune_v2(
         local = tuner._v2_local
         local.active = True
         local.store = store
-        local.measure = measure
+        local.measure = measurement_policy
         try:
             yield
         finally:

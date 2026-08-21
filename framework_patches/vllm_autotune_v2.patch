@@ -12,9 +12,12 @@ Behavior changes (all improvements over status quo):
   concurrently into one shared store — per-entry atomic publish makes this
   safe, and restarts reuse it.
 - single-node consistency after restart: all ranks read the same store.
-  In-session cross-rank divergence is unchanged vs today's multi-rank path;
-  the flashinfer-side finalize step (tune -> barrier -> reload, tracked in
-  flashinfer#3186/#3187) removes it once available.
+  In-session cross-rank convergence: the finalize step below
+  (barrier -> autotune_v2_reload -> barrier) drops each rank's
+  locally-measured winners and re-reads the shared store, so all ranks
+  serve identical tactics.  The process-group cardinality sync for
+  collective-bearing ops *during* tuning is tracked separately in
+  flashinfer#3186/#3187 and composes with this.
 - VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR maps onto cache_root= (placement only;
   environment isolation is flashinfer's job now).
 
@@ -111,10 +114,10 @@ Behavior changes (all improvements over status quo):
 +    # #3719 mismatch open).
 +    from flashinfer import MeasurementPolicy
 +
-+    measure = MeasurementPolicy(execution_mode="auto")  # -> "cuda_graph" when suite-validated
++    measurement_policy = MeasurementPolicy(execution_mode="auto")  # -> "cuda_graph" when suite-validated
 +
 +    with torch.inference_mode(), autotune_v2(
-+        cache_root=cache_dir, measure=measure, **autotune_kwargs
++        cache_root=cache_dir, measurement_policy=measurement_policy, **autotune_kwargs
 +    ):
 +        runner._dummy_run(
 +            num_tokens=runner.scheduler_config.max_num_batched_tokens,
@@ -137,3 +140,14 @@ Behavior changes (all improvements over status quo):
 (delete the whole file: flashinfer_autotune_cache_hash,
  resolve_flashinfer_autotune_file, write_flashinfer_autotune_cache —
  hashing, placement, and atomic publication are owned by flashinfer now)
+
+SECOND CALL SITE (must migrate together, else ImportError):
+ flashinfer_sparse_mla_warmup.py (SM120 sparse-MLA decode, vllm#43477) opens
+ its own `autotune(True, cache=resolve_flashinfer_autotune_file(runner))` and
+ imports resolve_flashinfer_autotune_file / write_flashinfer_autotune_cache
+ from the deleted module.  It follows the identical one-shot-warmup ->
+ cache=<path> -> broadcast pattern, so it migrates the same way: drop the
+ helper import and wrap its warmup in `autotune_v2(cache_root=...,
+ measurement_policy=...)`.  The two v1 passes were only ever distinct because
+ filename-as-identity + save_configs merge hid it; under the managed store
+ they share op-granular entries.  Migrate both sites in one change.
