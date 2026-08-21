@@ -668,6 +668,80 @@ def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     assert _calc_cosine_diff(out_clean, ref_clean) < 0.02
 
 
+# (num_heads, next_n): the epilogue weight cache holds NUM_W_IN_REG * next_n
+# elements. The per-slot cap stops binding once num_heads <= it, so these small
+# num_heads shapes are the ones whose footprint is limited by the register
+# budget instead. (32, 4) is the control -- it stays under the budget and keeps
+# the unclamped value.
+@pytest.mark.parametrize("num_heads,next_n", [(32, 6), (32, 8), (32, 4)])
+def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
+    """num_heads below the per-slot weight-cache cap, where the budget binds."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(5)
+    device = "cuda"
+    head_dim, block_size, batch_size, avg_ctx = 128, 64, 4, 2048
+    max_model_len = max(avg_ctx * 2, 2048)
+
+    context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    block_table, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, context_lens, device
+    )
+
+    q_fp8 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        context_lens,
+        block_table,
+        max_model_len,
+        block_size,
+        out_dtype=torch.float32,
+    )
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        max_model_len,
+    )
+
+    positions = (
+        torch.arange(max_model_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (context_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+    valid = (~neginf_mask) & finite
+    assert valid.any(), "no valid positions to compare"
+    torch.testing.assert_close(out_clean[valid], ref_clean[valid], atol=5e-5, rtol=1e-5)
+    assert _calc_cosine_diff(out_clean, ref_clean) < 0.02
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FP4 tests
 # ──────────────────────────────────────────────────────────────────────────────
