@@ -18,7 +18,6 @@ This module keeps its FlashInfer-facing validation, allocation, stream, and
 state semantics separate from the kernel source.
 """
 
-import functools
 import math
 from typing import Optional
 
@@ -36,7 +35,6 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _HEAD_DIM = 128
 
 
-@functools.cache
 def _is_cute_dsl_kda_runtime_available() -> bool:
     """Whether the BT=16 kernel can be imported at all.
 
@@ -45,7 +43,7 @@ def _is_cute_dsl_kda_runtime_available() -> bool:
     """
     try:
         from .cute_dsl.utils import is_cute_dsl_experimental_available
-    except ImportError:
+    except (ImportError, RuntimeError):
         return False
     return is_cute_dsl_experimental_available()
 
@@ -76,7 +74,10 @@ def _is_cute_dsl_kda_prefill_eligible(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
 ) -> bool:
-    """Return whether the call matches the ported BT=16 kernel contract."""
+    """Return whether the ported BT=16 kernel can serve this call.
+
+    Covers both the kernel contract and whether the installed CuTe DSL provides it.
+    """
 
     if not isinstance(q, torch.Tensor) or q.ndim != 4 or q.shape[1] <= 1:
         return False

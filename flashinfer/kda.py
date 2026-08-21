@@ -212,6 +212,8 @@ def recurrent_kda(
             including state checkpoints, and otherwise falls back to an
             exported frozen Cake specialization.
             ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
+            The CuTe DSL kernel needs ``nvidia-cutlass-dsl>=4.7``; below that
+            ``"auto"`` uses Cake and ``"cute-dsl"`` raises :class:`ImportError`.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
