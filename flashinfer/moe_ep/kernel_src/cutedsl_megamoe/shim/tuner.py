@@ -164,6 +164,18 @@ _BF16_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "static",
 }
 
+_BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 128, 128),
+    "transform_buffer": "tmem",
+    "accumulator_overlap": False,
+    "transform_k_tile": 128,
+    "cluster_shape_mnk": (2, 1, 1),
+    "flag_batch": 1,
+    "epi_flag_batch": (1, 1),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "static",
+}
+
 
 def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
@@ -195,6 +207,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """
     if dtype == "bf16":
         return dict(_BF16_TOKEN_KNOBS)
+    if dtype == "bf16_mxfp8":
+        return dict(_BF16_MXFP8_TOKEN_KNOBS)
     if dtype == "mxfp8":
         if num_tokens >= 2048:
             return dict(_MXFP8_LARGE_TOKEN_KNOBS)
