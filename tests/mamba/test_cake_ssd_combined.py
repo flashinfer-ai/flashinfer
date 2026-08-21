@@ -477,7 +477,8 @@ def test_cake_ssd_preprocess_host_rejects_invalid_extents(invalid, match):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
-def test_cake_ssd_combined_program_cache_is_cuda_context_scoped():
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen_metadata"))
+def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
     if any(
         torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3))
         for index in (0, 1)
@@ -489,7 +490,11 @@ def test_cake_ssd_combined_program_cache_is_cuda_context_scoped():
     expected = []
     for device_index in (0, 1):
         with torch.cuda.device(device_index):
-            constructor, tensors, arguments = _case(nheads=1, ngroups=1)
+            constructor, tensors, arguments = _case(
+                nheads=1,
+                ngroups=1,
+                varlen=varlen,
+            )
             expected.append(
                 SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
             )
@@ -497,13 +502,13 @@ def test_cake_ssd_combined_program_cache_is_cuda_context_scoped():
             cases.append((tensors, arguments))
 
     torch.cuda.set_device(0)
-    for device_index, (runner, case, reference) in enumerate(
-        zip(runners, cases, expected, strict=True)
-    ):
-        tensors, arguments = case
-        actual = runner.run(*tensors, **arguments)
+    for device_index in (0, 1, 0, 1):
+        assert torch.cuda.current_device() == 0
+        tensors, arguments = cases[device_index]
+        actual = runners[device_index].run(*tensors, **arguments)
         assert actual[0].device.index == device_index
-        _assert_cute_parity(actual, reference, nheads=1, ngroups=1)
+        _assert_cute_parity(actual, expected[device_index], nheads=1, ngroups=1)
+        assert torch.cuda.current_device() == 0
 
 
 def test_cake_ssd_combined_public_seq_chunk_cumsum_helpers():
@@ -1777,14 +1782,14 @@ def test_source_generated_program_rejects_unresolved_launch_abi(monkeypatch):
         )
 
 
-def test_source_generated_catalog_is_sealed_and_inactive():
+def test_source_generated_catalog_is_terminal_and_active():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     module._source_catalog.cache_clear()
 
     catalog = module._source_catalog()
 
-    assert catalog["source_status"] == "prepared_nonterminal"
-    assert catalog["prefix_route_selected"] is False
+    assert catalog["source_status"] == "terminal"
+    assert catalog["prefix_route_selected"] is True
     assert set(catalog["programs"]) == {
         "prefix_bf16_varlen",
         "prefix_f16_varlen",
@@ -1800,12 +1805,78 @@ def test_source_generated_catalog_is_sealed_and_inactive():
                 path = module._source_dir() / "generated" / source["path"]
                 assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
 
+    expected_inventory_paths = (
+        "device/sm_100a/factorized_persistent_segment_preprocess_dd1a781b6b.cu",
+        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cu",
+        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
+        "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+        "device/sm_103a/factorized_persistent_segment_preprocess_dd1a781b6b.cu",
+        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cu",
+        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
+        "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+        "host/sm_100a/factorized_persistent_segment_preprocess_dd1a781b6b.cpp",
+        "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
+        "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
+        "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cpp",
+        "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cpp",
+        "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cpp",
+        "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cpp",
+        "host/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cpp",
+        "host/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cpp",
+        "host/sm_103a/factorized_persistent_segment_preprocess_dd1a781b6b.cpp",
+        "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
+        "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
+        "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cpp",
+        "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cpp",
+        "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cpp",
+        "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cpp",
+        "host/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cpp",
+        "host/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cpp",
+    )
+    source_inventory = catalog["source_inventory"]
+    assert len(source_inventory) == 38
+    assert [source["path"] for source in source_inventory] == list(
+        expected_inventory_paths
+    )
+    assert all(set(source) == {"path", "sha256"} for source in source_inventory)
+    for source in source_inventory:
+        path = module._source_dir() / "generated" / source["path"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
+
 
 def test_active_f16_source_package_declares_cuda_half_types_explicitly():
     source_root = Path(__file__).parents[2] / "csrc" / "cake_mamba_ssd_combined"
     f16_sources = (
         source_root / "cake_mamba_ssd_f16_batched_device.cu",
         source_root / "cake_mamba_ssd_f16_varlen_device.cu",
+        source_root
+        / "generated/device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+        source_root
+        / "generated/device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+        source_root
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+        source_root
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
+        source_root
+        / "generated/device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+        source_root
+        / "generated/device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+        source_root
+        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+        source_root
+        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
     )
     for source_path in f16_sources:
         source = source_path.read_text(encoding="utf-8")

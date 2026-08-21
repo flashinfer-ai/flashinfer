@@ -1,30 +1,10 @@
 {
-  "schema_version": 1,
-  "source_status": "prepared_nonterminal",
-  "prefix_route_selected": false,
-  "source_archive_sha256": "8a65b20a4042fc5c2ff5bce5651bc823b659ff9f365cf6d8790616ed54e6ee39",
+  "prefix_route_selected": true,
   "programs": {
     "prefix_bf16_varlen": {
       "sm_100a": {
-        "entry": "run",
-        "launch_count": 2,
-        "stage_order": [
-          "preprocess",
-          "main"
-        ],
-        "stages": {
-          "preprocess": {
-            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
+        "device_sources": [
+          {
             "arg_plan": [
               [
                 "buffer",
@@ -102,22 +82,20 @@
                 "grid",
                 "grid_z"
               ]
-            ]
-          },
-          "main": {
-            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb.cu",
-            "sha256": "a06715f8679a977c4d07bf7d4e669071946d432002d59e0425c17b3ff5eb2e19",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
             ],
-            "tma_abi": "grid_constant",
             "block": [
-              512,
+              32,
               1,
               1
             ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          },
+          {
             "arg_plan": [
               [
                 "tma_buffer",
@@ -303,421 +281,34 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92",
+            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+            "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c",
+            "tma_abi": "grid_constant"
           }
-        },
+        ],
+        "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "c8123ffcf2b1d704008ad13746f55f2d014533cd683bc6d16c02d8634a3f2c78"
+          "sha256": "a135dc209e9bdf566b7111df7c73205c7e98bdabca74a840308f6769b726cdbf"
         },
-        "device_sources": [
-          {
-            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          },
-          {
-            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb.cu",
-            "sha256": "a06715f8679a977c4d07bf7d4e669071946d432002d59e0425c17b3ff5eb2e19",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
-            ],
-            "tma_abi": "grid_constant",
-            "block": [
-              512,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "tma_buffer",
-                "x_map"
-              ],
-              [
-                "tma_buffer",
-                "b_map"
-              ],
-              [
-                "tma_buffer",
-                "c_map"
-              ],
-              [
-                "tma_buffer",
-                "out_map"
-              ],
-              [
-                "buffer",
-                "x"
-              ],
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "delta_precomputed"
-              ],
-              [
-                "buffer",
-                "cumsum_precomputed"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "B_tensor"
-              ],
-              [
-                "buffer",
-                "C"
-              ],
-              [
-                "buffer",
-                "D"
-              ],
-              [
-                "buffer",
-                "z"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "initial_states"
-              ],
-              [
-                "buffer",
-                "final_states"
-              ],
-              [
-                "buffer",
-                "checkpoint_states"
-              ],
-              [
-                "buffer",
-                "checkpoint_token_indices"
-              ],
-              [
-                "buffer",
-                "checkpoint_state_slots"
-              ],
-              [
-                "buffer",
-                "seq_idx_i32"
-              ],
-              [
-                "buffer",
-                "seq_idx_i64"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "seq_chunk_cumsum"
-              ],
-              [
-                "buffer",
-                "out_native"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "ngroups"
-              ],
-              [
-                "parameter",
-                "batch"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "nchunks"
-              ],
-              [
-                "parameter",
-                "sequence_count"
-              ],
-              [
-                "parameter",
-                "num_logical_chunks"
-              ],
-              [
-                "parameter",
-                "mode_varlen"
-              ],
-              [
-                "parameter",
-                "has_seq_chunk_cumsum"
-              ],
-              [
-                "parameter",
-                "seq_idx_int64"
-              ],
-              [
-                "parameter",
-                "D_mode"
-              ],
-              [
-                "parameter",
-                "has_z"
-              ],
-              [
-                "parameter",
-                "has_initial"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "parameter",
-                "write_final_states"
-              ],
-              [
-                "parameter",
-                "checkpoint_state_count"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          }
-        ]
-      },
-      "sm_103a": {
-        "entry": "run",
         "launch_count": 2,
         "stage_order": [
           "preprocess",
           "main"
         ],
         "stages": {
-          "preprocess": {
-            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          },
           "main": {
-            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb.cu",
-            "sha256": "a06715f8679a977c4d07bf7d4e669071946d432002d59e0425c17b3ff5eb2e19",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
-            ],
-            "tma_abi": "grid_constant",
-            "block": [
-              512,
-              1,
-              1
-            ],
             "arg_plan": [
               [
                 "tma_buffer",
@@ -903,26 +494,117 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92",
+            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+            "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c",
+            "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
           }
-        },
-        "host_source": {
-          "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "c8123ffcf2b1d704008ad13746f55f2d014533cd683bc6d16c02d8634a3f2c78"
-        },
+        }
+      },
+      "sm_103a": {
         "device_sources": [
           {
-            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
             "arg_plan": [
               [
                 "buffer",
@@ -1000,22 +682,20 @@
                 "grid",
                 "grid_z"
               ]
-            ]
-          },
-          {
-            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb.cu",
-            "sha256": "a06715f8679a977c4d07bf7d4e669071946d432002d59e0425c17b3ff5eb2e19",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_f5f582f1cb",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
             ],
-            "tma_abi": "grid_constant",
             "block": [
-              512,
+              32,
               1,
               1
             ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          },
+          {
             "arg_plan": [
               [
                 "tma_buffer",
@@ -1201,32 +881,332 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92",
+            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+            "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c",
+            "tma_abi": "grid_constant"
           }
-        ]
+        ],
+        "entry": "run",
+        "host_source": {
+          "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
+          "sha256": "a135dc209e9bdf566b7111df7c73205c7e98bdabca74a840308f6769b726cdbf"
+        },
+        "launch_count": 2,
+        "stage_order": [
+          "preprocess",
+          "main"
+        ],
+        "stages": {
+          "main": {
+            "arg_plan": [
+              [
+                "tma_buffer",
+                "x_map"
+              ],
+              [
+                "tma_buffer",
+                "b_map"
+              ],
+              [
+                "tma_buffer",
+                "c_map"
+              ],
+              [
+                "tma_buffer",
+                "out_map"
+              ],
+              [
+                "buffer",
+                "x"
+              ],
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "delta_precomputed"
+              ],
+              [
+                "buffer",
+                "cumsum_precomputed"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "B_tensor"
+              ],
+              [
+                "buffer",
+                "C"
+              ],
+              [
+                "buffer",
+                "D"
+              ],
+              [
+                "buffer",
+                "z"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "initial_states"
+              ],
+              [
+                "buffer",
+                "final_states"
+              ],
+              [
+                "buffer",
+                "checkpoint_states"
+              ],
+              [
+                "buffer",
+                "checkpoint_token_indices"
+              ],
+              [
+                "buffer",
+                "checkpoint_state_slots"
+              ],
+              [
+                "buffer",
+                "seq_idx_i32"
+              ],
+              [
+                "buffer",
+                "seq_idx_i64"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "seq_chunk_cumsum"
+              ],
+              [
+                "buffer",
+                "out_native"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "ngroups"
+              ],
+              [
+                "parameter",
+                "batch"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "nchunks"
+              ],
+              [
+                "parameter",
+                "sequence_count"
+              ],
+              [
+                "parameter",
+                "num_logical_chunks"
+              ],
+              [
+                "parameter",
+                "mode_varlen"
+              ],
+              [
+                "parameter",
+                "has_seq_chunk_cumsum"
+              ],
+              [
+                "parameter",
+                "seq_idx_int64"
+              ],
+              [
+                "parameter",
+                "D_mode"
+              ],
+              [
+                "parameter",
+                "has_z"
+              ],
+              [
+                "parameter",
+                "has_initial"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "parameter",
+                "write_final_states"
+              ],
+              [
+                "parameter",
+                "checkpoint_state_count"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92",
+            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+            "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c",
+            "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          }
+        }
       }
     },
     "prefix_f16_varlen": {
       "sm_100a": {
-        "entry": "run",
-        "launch_count": 2,
-        "stage_order": [
-          "preprocess",
-          "main"
-        ],
-        "stages": {
-          "preprocess": {
-            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
+        "device_sources": [
+          {
             "arg_plan": [
               [
                 "buffer",
@@ -1304,22 +1284,20 @@
                 "grid",
                 "grid_z"
               ]
-            ]
-          },
-          "main": {
-            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63.cu",
-            "sha256": "9064d8d7689216d74eb6326e16693c7f9703b76a9d6f1eb1602b55e9ecd916be",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
             ],
-            "tma_abi": "grid_constant",
             "block": [
-              512,
+              32,
               1,
               1
             ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          },
+          {
             "arg_plan": [
               [
                 "tma_buffer",
@@ -1505,421 +1483,34 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186",
+            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+            "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3",
+            "tma_abi": "grid_constant"
           }
-        },
+        ],
+        "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "913e0119a7ac8bc63c15a8f6ce5acddb9ae84663971d99694122cf444c9a8440"
+          "sha256": "6562c1bb0d92dcd41e2d163ea5550007ca53b6901f0ab3a0bbbfb4ab652116c1"
         },
-        "device_sources": [
-          {
-            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          },
-          {
-            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63.cu",
-            "sha256": "9064d8d7689216d74eb6326e16693c7f9703b76a9d6f1eb1602b55e9ecd916be",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
-            ],
-            "tma_abi": "grid_constant",
-            "block": [
-              512,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "tma_buffer",
-                "x_map"
-              ],
-              [
-                "tma_buffer",
-                "b_map"
-              ],
-              [
-                "tma_buffer",
-                "c_map"
-              ],
-              [
-                "tma_buffer",
-                "out_map"
-              ],
-              [
-                "buffer",
-                "x"
-              ],
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "delta_precomputed"
-              ],
-              [
-                "buffer",
-                "cumsum_precomputed"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "B_tensor"
-              ],
-              [
-                "buffer",
-                "C"
-              ],
-              [
-                "buffer",
-                "D"
-              ],
-              [
-                "buffer",
-                "z"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "initial_states"
-              ],
-              [
-                "buffer",
-                "final_states"
-              ],
-              [
-                "buffer",
-                "checkpoint_states"
-              ],
-              [
-                "buffer",
-                "checkpoint_token_indices"
-              ],
-              [
-                "buffer",
-                "checkpoint_state_slots"
-              ],
-              [
-                "buffer",
-                "seq_idx_i32"
-              ],
-              [
-                "buffer",
-                "seq_idx_i64"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "seq_chunk_cumsum"
-              ],
-              [
-                "buffer",
-                "out_native"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "ngroups"
-              ],
-              [
-                "parameter",
-                "batch"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "nchunks"
-              ],
-              [
-                "parameter",
-                "sequence_count"
-              ],
-              [
-                "parameter",
-                "num_logical_chunks"
-              ],
-              [
-                "parameter",
-                "mode_varlen"
-              ],
-              [
-                "parameter",
-                "has_seq_chunk_cumsum"
-              ],
-              [
-                "parameter",
-                "seq_idx_int64"
-              ],
-              [
-                "parameter",
-                "D_mode"
-              ],
-              [
-                "parameter",
-                "has_z"
-              ],
-              [
-                "parameter",
-                "has_initial"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "parameter",
-                "write_final_states"
-              ],
-              [
-                "parameter",
-                "checkpoint_state_count"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          }
-        ]
-      },
-      "sm_103a": {
-        "entry": "run",
         "launch_count": 2,
         "stage_order": [
           "preprocess",
           "main"
         ],
         "stages": {
-          "preprocess": {
-            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ]
-          },
           "main": {
-            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63.cu",
-            "sha256": "9064d8d7689216d74eb6326e16693c7f9703b76a9d6f1eb1602b55e9ecd916be",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
-            ],
-            "tma_abi": "grid_constant",
-            "block": [
-              512,
-              1,
-              1
-            ],
             "arg_plan": [
               [
                 "tma_buffer",
@@ -2105,26 +1696,117 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186",
+            "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+            "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3",
+            "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
           }
-        },
-        "host_source": {
-          "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "913e0119a7ac8bc63c15a8f6ce5acddb9ae84663971d99694122cf444c9a8440"
-        },
+        }
+      },
+      "sm_103a": {
         "device_sources": [
           {
-            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_39eeac31a7.cu",
-            "sha256": "97b17ee1f13755ad56f6238a3ed443198d3d7b6bcea810dfd7c7d36dfaf80c9f",
-            "module_ident": "prefix_factorized_segment_preprocess_onewarp_39eeac31a7",
-            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
-            "compile_flags": [],
-            "tma_abi": "pointer",
-            "block": [
-              32,
-              1,
-              1
-            ],
             "arg_plan": [
               [
                 "buffer",
@@ -2202,22 +1884,20 @@
                 "grid",
                 "grid_z"
               ]
-            ]
-          },
-          {
-            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63.cu",
-            "sha256": "9064d8d7689216d74eb6326e16693c7f9703b76a9d6f1eb1602b55e9ecd916be",
-            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_c155096d63",
-            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
-            "compile_flags": [
-              "--use_fast_math"
             ],
-            "tma_abi": "grid_constant",
             "block": [
-              512,
+              32,
               1,
               1
             ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          },
+          {
             "arg_plan": [
               [
                 "tma_buffer",
@@ -2403,10 +2083,484 @@
                 "grid",
                 "grid_z"
               ]
-            ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186",
+            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+            "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3",
+            "tma_abi": "grid_constant"
           }
-        ]
+        ],
+        "entry": "run",
+        "host_source": {
+          "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
+          "sha256": "6562c1bb0d92dcd41e2d163ea5550007ca53b6901f0ab3a0bbbfb4ab652116c1"
+        },
+        "launch_count": 2,
+        "stage_order": [
+          "preprocess",
+          "main"
+        ],
+        "stages": {
+          "main": {
+            "arg_plan": [
+              [
+                "tma_buffer",
+                "x_map"
+              ],
+              [
+                "tma_buffer",
+                "b_map"
+              ],
+              [
+                "tma_buffer",
+                "c_map"
+              ],
+              [
+                "tma_buffer",
+                "out_map"
+              ],
+              [
+                "buffer",
+                "x"
+              ],
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "delta_precomputed"
+              ],
+              [
+                "buffer",
+                "cumsum_precomputed"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "B_tensor"
+              ],
+              [
+                "buffer",
+                "C"
+              ],
+              [
+                "buffer",
+                "D"
+              ],
+              [
+                "buffer",
+                "z"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "initial_states"
+              ],
+              [
+                "buffer",
+                "final_states"
+              ],
+              [
+                "buffer",
+                "checkpoint_states"
+              ],
+              [
+                "buffer",
+                "checkpoint_token_indices"
+              ],
+              [
+                "buffer",
+                "checkpoint_state_slots"
+              ],
+              [
+                "buffer",
+                "seq_idx_i32"
+              ],
+              [
+                "buffer",
+                "seq_idx_i64"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "seq_chunk_cumsum"
+              ],
+              [
+                "buffer",
+                "out_native"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "ngroups"
+              ],
+              [
+                "parameter",
+                "batch"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "nchunks"
+              ],
+              [
+                "parameter",
+                "sequence_count"
+              ],
+              [
+                "parameter",
+                "num_logical_chunks"
+              ],
+              [
+                "parameter",
+                "mode_varlen"
+              ],
+              [
+                "parameter",
+                "has_seq_chunk_cumsum"
+              ],
+              [
+                "parameter",
+                "seq_idx_int64"
+              ],
+              [
+                "parameter",
+                "D_mode"
+              ],
+              [
+                "parameter",
+                "has_z"
+              ],
+              [
+                "parameter",
+                "has_initial"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "parameter",
+                "write_final_states"
+              ],
+              [
+                "parameter",
+                "checkpoint_state_count"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "compile_flags": [
+              "--use_fast_math"
+            ],
+            "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
+            "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186",
+            "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+            "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3",
+            "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
+            "module_ident": "prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3",
+            "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "tma_abi": "pointer"
+          }
+        }
       }
     }
-  }
+  },
+  "schema_version": 1,
+  "source_archive_sha256": "960bcfa94c34917047e400939938202c0802dabb212a9cf37a6783e2c2913056",
+  "source_inventory": [
+    {
+      "path": "device/sm_100a/factorized_persistent_segment_preprocess_dd1a781b6b.cu",
+      "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cu",
+      "sha256": "a4fd871dbdf37dfb91e932e25907a8a08aee5e38ea1ec9127a1c42a4e01b7b7f"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+      "sha256": "fd97d4b7a2c5d8fba9db17961bbbf68f88e4686a616aadacfc8fe703b2bff677"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+      "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+      "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cu",
+      "sha256": "d6fa75af8802a455e3b92f260d964dc67308f4ef96ff131bb770f6a5d3786d0f"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cu",
+      "sha256": "37b9ba7c7b3c6724be9ce313fc05f725f85df8bd97bd8cd82f1eaf456c45013b"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+      "sha256": "9e9842af57abf5ccb833d0d9ba5001176da41b486e794b77211f2a80b4c6d613"
+    },
+    {
+      "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
+      "sha256": "8609316f508928c0d1051a3ee9a4537aa46610cb902f46e0ef43affd5d381410"
+    },
+    {
+      "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+      "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861"
+    },
+    {
+      "path": "device/sm_103a/factorized_persistent_segment_preprocess_dd1a781b6b.cu",
+      "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cu",
+      "sha256": "a4fd871dbdf37dfb91e932e25907a8a08aee5e38ea1ec9127a1c42a4e01b7b7f"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cu",
+      "sha256": "fd97d4b7a2c5d8fba9db17961bbbf68f88e4686a616aadacfc8fe703b2bff677"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a73b7aed92.cu",
+      "sha256": "ba3724f5aec3f109cc23dd1d2fcc93a51ce038395edbbd6f4e0d8f990087d73c"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186.cu",
+      "sha256": "bcfa493d333c6bb4e17b58a8c346bb65b86bfcde4057ce9421398bfb3afe01f3"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cu",
+      "sha256": "d6fa75af8802a455e3b92f260d964dc67308f4ef96ff131bb770f6a5d3786d0f"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cu",
+      "sha256": "37b9ba7c7b3c6724be9ce313fc05f725f85df8bd97bd8cd82f1eaf456c45013b"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cu",
+      "sha256": "9e9842af57abf5ccb833d0d9ba5001176da41b486e794b77211f2a80b4c6d613"
+    },
+    {
+      "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cu",
+      "sha256": "8609316f508928c0d1051a3ee9a4537aa46610cb902f46e0ef43affd5d381410"
+    },
+    {
+      "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3.cu",
+      "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861"
+    },
+    {
+      "path": "host/sm_100a/factorized_persistent_segment_preprocess_dd1a781b6b.cpp",
+      "sha256": "ca85c6e8ba360870e80091b2b95d271116453b618a2958da3d0579bade0e3c44"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
+      "sha256": "a135dc209e9bdf566b7111df7c73205c7e98bdabca74a840308f6769b726cdbf"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
+      "sha256": "6562c1bb0d92dcd41e2d163ea5550007ca53b6901f0ab3a0bbbfb4ab652116c1"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cpp",
+      "sha256": "0bcf05062274d762b76bb10036fdf4b86e7222396e1eee2ebcd6763b21330e19"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cpp",
+      "sha256": "6c3cc4f79cdd7947d0480184bce8911a601a6ca3b303d1ffa2e34524177aad75"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cpp",
+      "sha256": "65fc7a8bd3c4e2acef169829e38d5f6d309cdf7fe0befcdd5f98eed220bd497b"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cpp",
+      "sha256": "be79c64ab1df176d038848dcec937b94ea87b94bbab44cd98f40ebff9953d0b1"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cpp",
+      "sha256": "08e687ded06aabed4f9e847f57a409b89120981741bc57335bc3d6e1b08939d0"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cpp",
+      "sha256": "df176918376ddd2b841d51355cb44f883b4ebd7bf8f50844826457a5e0561243"
+    },
+    {
+      "path": "host/sm_103a/factorized_persistent_segment_preprocess_dd1a781b6b.cpp",
+      "sha256": "ca85c6e8ba360870e80091b2b95d271116453b618a2958da3d0579bade0e3c44"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
+      "sha256": "a135dc209e9bdf566b7111df7c73205c7e98bdabca74a840308f6769b726cdbf"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
+      "sha256": "6562c1bb0d92dcd41e2d163ea5550007ca53b6901f0ab3a0bbbfb4ab652116c1"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_e46a0dda77.cpp",
+      "sha256": "0bcf05062274d762b76bb10036fdf4b86e7222396e1eee2ebcd6763b21330e19"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_c6c52bb3bc.cpp",
+      "sha256": "6c3cc4f79cdd7947d0480184bce8911a601a6ca3b303d1ffa2e34524177aad75"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec.cpp",
+      "sha256": "65fc7a8bd3c4e2acef169829e38d5f6d309cdf7fe0befcdd5f98eed220bd497b"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_537b667d89.cpp",
+      "sha256": "be79c64ab1df176d038848dcec937b94ea87b94bbab44cd98f40ebff9953d0b1"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_69dc571ad7.cpp",
+      "sha256": "08e687ded06aabed4f9e847f57a409b89120981741bc57335bc3d6e1b08939d0"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_f5b8c3e975.cpp",
+      "sha256": "df176918376ddd2b841d51355cb44f883b4ebd7bf8f50844826457a5e0561243"
+    }
+  ],
+  "source_status": "terminal"
 }
