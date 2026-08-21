@@ -96,7 +96,7 @@ def main() -> None:
     if not mm_bf16_swiglu.is_compute_capability_supported(cc):
         raise RuntimeError(f"mm_bf16_swiglu does not support SM{cc}")
     if any(m < 1 or m > 128 for m in args.m):
-        raise ValueError("every M must be in mm_bf16_swiglu's range [1, 128]")
+        raise ValueError("every M must be in mm_bf16_swiglu's range [1, 64]")
     shapes = [(args.n, args.k)] if args.n and args.k else list(DEFAULT_SHAPES)
     if any(n <= 0 or n % 64 or k <= 0 or k % 128 for n, k in shapes):
         raise ValueError("N must be divisible by 64 and K by 128")

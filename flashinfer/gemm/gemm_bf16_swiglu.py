@@ -20,7 +20,7 @@ from ..utils import (
 _GATE_UP_PAIR_ROWS = 16
 _OUTPUT_ALIGNMENT = 64
 _K_ALIGNMENT = 128
-_MAX_M = 128
+_MAX_M = 64
 
 
 def _dense_tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -232,7 +232,7 @@ def mm_bf16_swiglu(
     ----------
     a:
         Contiguous row-major BF16 tensor with shape ``(M, K)``.  ``M`` must
-        be in ``[1, 128]``.
+        be in ``[1, 64]``.
     b:
         Prepared column-major BF16 tensor with shape ``(K, 2 * N)``.  Obtain
         it from :func:`prepare_bf16_swiglu_weight`; ``N`` must be divisible

@@ -342,7 +342,7 @@ mm_bf16_swiglu_trace = TraceTemplate(
     constraints=[
         "gate_up_size == 2 * N",
         "M >= 1",
-        "M <= 128",
+        "M <= 64",
         "N % 64 == 0",
         "K % 128 == 0",
     ],

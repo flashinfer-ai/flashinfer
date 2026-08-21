@@ -68,10 +68,12 @@ _LOG2_E = 1.4426950408889634
 #: Largest M this kernel serves. Deliberately above the dense split-K
 #: module's ``_MAX_M``: that bound makes ``mm_bf16``'s cute-dsl backend
 #: decline large-M problems so ``auto`` routes elsewhere, whereas this op
-#: has no other backend to route to. The bound here is what has been
-#: measured, not a hardware limit -- the kernel is correct well beyond it,
-#: but the tactic selector is only calibrated this far.
-_MAX_M = 128
+#: has no other backend to route to. Not a hardware limit -- the kernel is
+#: correct well beyond it. Past this point a wide N can leave no tactic
+#: satisfying either the wave or the L2 bound, and ``_select_swiglu_tactic``
+#: then ranks an unfiltered space by a cost model with no traffic term,
+#: choosing the narrowest and so highest-traffic tile.
+_MAX_M = 64
 
 #: Fixed per-K-tile cost in the tactic ranking model, expressed in the same
 #: units as ``mma_n`` so one K tile costs ``_K_TILE_FIXED_COST + mma_n``. Only

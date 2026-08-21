@@ -266,7 +266,7 @@ def test_mm_bf16_swiglu_default_tactic_occupancy_does_not_collapse(n: int, k: in
     )
 
 
-@pytest.mark.parametrize("m", [1, 3, 8, 16, 32, 33, 64, 128])
+@pytest.mark.parametrize("m", [1, 3, 8, 16, 32, 33, 64])
 def test_mm_bf16_swiglu_decode_m_values_and_pdl(m: int):
     """Exercise dynamic-M tails and both PDL launch variants."""
     _require_bf16_swiglu_gpu()
@@ -407,7 +407,7 @@ def test_mm_bf16_swiglu_accepts_non_current_cuda_device():
         ("dtype", TypeError, "both be bfloat16"),
         ("a_layout", ValueError, "a must be contiguous"),
         ("b_layout", ValueError, "b must be column-major"),
-        ("m_range", ValueError, "1 <= M <= 128"),
+        ("m_range", ValueError, "1 <= M <= 64"),
         ("shape", ValueError, "incompatible shapes"),
         ("n_alignment", ValueError, "N must be divisible by 64"),
         ("k_alignment", ValueError, "K must be a positive multiple of 128"),
@@ -437,7 +437,7 @@ def test_mm_bf16_swiglu_rejects_invalid_cuda_contract(
     elif case == "b_layout":
         b = b.contiguous()
     elif case == "m_range":
-        a = a.expand(129, -1).clone()
+        a = a.expand(65, -1).clone()
     elif case == "shape":
         b = torch.empty((128, 256), device="cuda", dtype=torch.bfloat16).T
     elif case == "n_alignment":
