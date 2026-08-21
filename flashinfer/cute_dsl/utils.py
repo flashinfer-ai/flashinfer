@@ -83,6 +83,27 @@ def is_rubin_cute_dsl_available() -> bool:
 
 
 @functools.cache
+def is_cute_dsl_experimental_available() -> bool:
+    r"""Return ``True`` when the installed CuTe DSL exposes ``cutlass.experimental``.
+
+    The whole namespace -- ``experimental.cuda``, ``experimental.primitives`` and
+    ``experimental.task_scheduling`` -- landed in CuTe DSL 4.7, while FlashInfer's
+    dependency floor is 4.6.2. Kernels built on it are therefore imported lazily
+    and callers probe first, so an older DSL loses only those kernels instead of
+    failing with a bare ``ModuleNotFoundError``.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``cutlass.experimental`` is importable.
+    """
+    return (
+        is_cute_dsl_available()
+        and importlib.util.find_spec("cutlass.experimental") is not None
+    )
+
+
+@functools.cache
 def is_cute_dsl_arch_supported(
     major: int, minor: int, native_only: bool = False
 ) -> bool:

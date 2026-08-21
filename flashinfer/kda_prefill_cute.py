@@ -18,6 +18,7 @@ This module keeps its FlashInfer-facing validation, allocation, stream, and
 state semantics separate from the kernel source.
 """
 
+import functools
 import math
 from typing import Optional
 
@@ -33,6 +34,20 @@ from .utils import get_compute_capability
 
 _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _HEAD_DIM = 128
+
+
+@functools.cache
+def _is_cute_dsl_kda_runtime_available() -> bool:
+    """Whether the BT=16 kernel can be imported at all.
+
+    It is built on ``cutlass.experimental``, which needs CuTe DSL >= 4.7; the probe
+    itself lives in a module that imports ``cutlass`` eagerly, hence the guard.
+    """
+    try:
+        from .cute_dsl.utils import is_cute_dsl_experimental_available
+    except ImportError:
+        return False
+    return is_cute_dsl_experimental_available()
 
 
 def _is_cute_dsl_kda_prefill_eligible(
@@ -63,6 +78,8 @@ def _is_cute_dsl_kda_prefill_eligible(
 ) -> bool:
     """Return whether the call matches the ported BT=16 kernel contract."""
 
+    if not _is_cute_dsl_kda_runtime_available():
+        return False
     if not isinstance(q, torch.Tensor) or q.ndim != 4 or q.shape[1] <= 1:
         return False
     if num_spec_tokens is not None:
@@ -460,5 +477,6 @@ def _run_cute_dsl_kda_prefill(
 
 __all__ = [
     "_is_cute_dsl_kda_prefill_eligible",
+    "_is_cute_dsl_kda_runtime_available",
     "_run_cute_dsl_kda_prefill",
 ]
