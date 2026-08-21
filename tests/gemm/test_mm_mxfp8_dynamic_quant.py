@@ -374,6 +374,7 @@ def test_mm_mxfp8_dynamic_quant_uses_tensor_device_context(
     _, b, b_sf = _prepare_trtllm_weight(2688, 4096, target_device)
 
     actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
+    torch.cuda.synchronize(target_device)
 
     assert actual.device == target_device
     assert torch.cuda.current_device() == original_device
