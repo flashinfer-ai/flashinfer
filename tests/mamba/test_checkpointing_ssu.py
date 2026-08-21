@@ -12,7 +12,15 @@ import torch.nn.functional as F
 import triton
 from einops import repeat
 
-from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
+from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.mamba.checkpointing_ssu import (
+    CheckpointingSSURunner,
+    _checkpointing_ssu_tuning_config,
+    _get_checkpointing_ssu_runner,
+    _make_tactics,
+    allocate_checkpointing_ssu_scratch,
+    checkpointing_ssu,
+)
 from flashinfer.utils import is_cvt_rs_supported
 
 # Triton reference: the standalone TMA persistent kernel only (the old 4D
@@ -107,30 +115,36 @@ def _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x_tok, B_tok, dt_pr
 # old 4D kernel, 2026-07-10).
 _TRITON_IMPLS = ["tma_pd", "tma_pm"]
 
-# fragA-native cb_scaled layout for the two-kernel CUDA path (.plans/ssu_split.md):
-# per (batch, head), one PackedAligned<bf16> per lane = WARP_SIZE lanes ×
-# MMA_FRAG_SIZE bf16 (the mma.m16n8k16 A fragment, 16 B/lane).
-WARP_SIZE = 32
-MMA_FRAG_SIZE = 8
 
-
-def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
+def _two_kernel_scratch(batch, nheads, num_predicted_tokens, max_window, dtype, device):
     """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
 
     Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
     Forces algorithm="two-kernel": test batches sit below the wrapper's auto
     threshold (batch*nheads >= sm_count) and would silently run the monolith."""
-    k_old = ((max_window + 7) // 8) * 8
+    cb_scaled, cumAdt_vec, cb_old = allocate_checkpointing_ssu_scratch(
+        batch, nheads, num_predicted_tokens, max_window, dtype, device
+    )
     return dict(
-        cb_scaled=torch.empty(
-            batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-        ),
-        cumAdt_vec=torch.empty(batch, nheads, 16, device=device, dtype=torch.float32),
-        cb_old=torch.empty(
-            batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-        ),
+        cb_scaled=cb_scaled,
+        cumAdt_vec=cumAdt_vec,
+        cb_old=cb_old,
         algorithm="two-kernel",
     )
+
+
+def test_allocate_checkpointing_ssu_scratch():
+    scratch = allocate_checkpointing_ssu_scratch(4, 16, 1, 13, torch.bfloat16, "cpu")
+    assert [tensor.shape for tensor in scratch] == [
+        (4, 16, 32, 8),
+        (4, 16, 16),
+        (4, 16, 32, 8),
+    ]
+    assert [tensor.dtype for tensor in scratch] == [
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+    ]
 
 
 def _make_replay_work_items(
@@ -478,7 +492,7 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-def test_two_kernel_matches_monolithic():
+def test_two_kernel_matches_monolithic(tmp_path, request):
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
     the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
@@ -487,7 +501,7 @@ def test_two_kernel_matches_monolithic():
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
     batch = 2
-    cache_size = batch  # non-paged
+    cache_size = batch + 15  # Exercise cache capacity > active batch during tuning.
     # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
     # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
     # nowrite(prev_k>0 — exercises the dt-ring tail scan), k=T=6 write.
@@ -513,7 +527,7 @@ def test_two_kernel_matches_monolithic():
     x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
         cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
     )
-    for slot in range(cache_size):
+    for slot in range(batch):
         _seed_ring(
             x_cache,
             B_cache,
@@ -525,7 +539,7 @@ def test_two_kernel_matches_monolithic():
             dt1_proc[slot],
         )
 
-    def _run(k, *, two_kernel, enable_pdl=False):
+    def _run(k, *, algorithm=None, enable_pdl=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -539,24 +553,9 @@ def test_two_kernel_matches_monolithic():
         out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
-        if two_kernel:
-            # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
-            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; cumAdt_vec is
-            # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
-            T_pad = 16  # next_multiple_of<MMA::M=16>(T) for T <= 16
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            # cb_old (C6, no-write): m16n8k{K_old} fragA, K_old =
-            # next_multiple_of<MMA::K_SMALL=8>(max_window); REGS = K_old/2.
-            k_old = ((max_window + 7) // 8) * 8
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["algorithm"] = "two-kernel"
+        if algorithm is not None:
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
+            kw["algorithm"] = algorithm
         checkpointing_ssu(
             st,
             xc,
@@ -580,8 +579,8 @@ def test_two_kernel_matches_monolithic():
 
     names = ("out", "state", "x_cache", "B_cache", "dt_cache")
     for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
-        ref = _run(k, two_kernel=False)
-        test = _run(k, two_kernel=True)
+        ref = _run(k)
+        test = _run(k, algorithm="two-kernel")
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
@@ -591,11 +590,172 @@ def test_two_kernel_matches_monolithic():
         # gdc_waits).  Exercises the trigger's memory-ordering contract — the
         # main must still see every cb_scaled/cumAdt_vec/cb_old the precompute
         # wrote.  Must match the monolithic ref bit-for-bit.
-        test_pdl = _run(k, two_kernel=True, enable_pdl=True)
+        test_pdl = _run(k, algorithm="two-kernel", enable_pdl=True)
         for name, r, t in zip(names, ref, test_pdl, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
             )
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    request.addfinalizer(tuner.clear_cache)
+    cache_path = tmp_path / "checkpointing_ssu_autotune.json"
+    with autotune(True, cache=str(cache_path)):
+        tuned = _run(2, algorithm="auto")
+        warm = _run(2, algorithm="auto")
+
+    profiled_configs = {
+        cache_key.file_key: tactic
+        for cache_key, (tactic, _) in tuner.profiling_cache.items()
+        if cache_key.runner_class_name == "CheckpointingSSURunner"
+    }
+    assert profiled_configs
+    assert all(
+        isinstance(tactic, tuple) and len(tactic) == 4
+        for tactic in profiled_configs.values()
+    )
+    for tuned_tensor, warm_tensor in zip(tuned, warm, strict=True):
+        torch.testing.assert_close(tuned_tensor, warm_tensor, rtol=0, atol=0)
+
+    tuner.clear_cache()
+    with autotune(False, cache=str(cache_path)):
+        cached = _run(2, algorithm="auto")
+    cached_configs = {
+        file_key: tactic
+        for file_key, (runner_name, tactic) in tuner._file_configs.items()
+        if runner_name == "CheckpointingSSURunner"
+    }
+    assert cached_configs == profiled_configs
+    for tuned_tensor, cached_tensor in zip(tuned, cached, strict=True):
+        torch.testing.assert_close(tuned_tensor, cached_tensor, rtol=0, atol=0)
+
+
+def _make_autotune_key_inputs():
+    inputs = [None] * 22
+    dynamic_inputs = (
+        0,  # state
+        1,  # x
+        2,  # dt
+        4,  # B
+        5,  # C
+        6,  # out
+        7,  # x_cache
+        8,  # B_cache
+        9,  # dt_cache
+        10,  # ring_start
+        11,  # prev_num_accepted_tokens
+        13,  # z
+        15,  # state_batch_indices
+        16,  # state_scale
+        19,  # cb_scaled
+        20,  # cumAdt_vec
+        21,  # cb_old
+    )
+    for index in dynamic_inputs:
+        inputs[index] = torch.empty(4, 3, 2)
+    return inputs, dynamic_inputs
+
+
+def _make_autotune_runner(inputs):
+    optional_input_indices = (
+        12,  # D
+        13,  # z
+        14,  # dt_bias
+        15,  # state_batch_indices
+        16,  # state_scale
+        17,  # rand_seed
+        18,  # cu_seqlens
+    )
+    return CheckpointingSSURunner(
+        (torch.float32,),
+        dt_softplus=True,
+        pad_slot_id=0,
+        requested_algorithm=0,
+        requested_d_split=0,
+        precompute_heads_per_cta=0,
+        heads_per_group=16,
+        optional_tensor_presence=tuple(
+            inputs[index] is not None for index in optional_input_indices
+        ),
+    )
+
+
+def test_autotune_runner_key_is_synthesis_invariant():
+    inputs, dynamic_inputs = _make_autotune_key_inputs()
+    padded_inputs = list(inputs)
+    for index in dynamic_inputs:
+        tensor = inputs[index]
+        stride = tensor.stride()
+        padded_inputs[index] = torch.empty_strided(
+            tensor.shape,
+            (stride[0] + 17, *stride[1:]),
+            dtype=tensor.dtype,
+        )
+
+    runner = _make_autotune_runner(inputs)
+    padded_runner = _make_autotune_runner(padded_inputs)
+    assert hash(runner) == hash(padded_runner)
+    assert runner.get_cache_key_extras(inputs) == padded_runner.get_cache_key_extras(
+        padded_inputs
+    )
+
+    strided_inputs = list(inputs)
+    strided_inputs[2] = torch.empty_strided(  # dt
+        (4, 3, 2), (30, 5, 1)
+    )
+    strided_runner = _make_autotune_runner(strided_inputs)
+    assert strided_runner.get_cache_key_extras(strided_inputs) == (
+        strided_runner.get_cache_key_extras(inputs)
+    )
+    assert hash(strided_runner) == hash(runner)
+
+
+def test_autotune_max_batch_populates_dynamic_buckets():
+    inputs, _ = _make_autotune_key_inputs()
+    config = _checkpointing_ssu_tuning_config(inputs)
+    profiles = AutoTuner.get()._generate_optimization_profiles(config, inputs)
+    profile_shapes = [profile.get_opt_shapes() for profile in profiles]
+    batches = {shapes[1][0] for shapes in profile_shapes}  # x.shape[0]
+
+    assert {1, 2, 4}.issubset(batches)
+    assert all(
+        shapes[0][0] == shapes[1][0] + 1  # state.shape[0] == x.shape[0] + 1
+        for shapes in profile_shapes
+    )
+    runner = _make_autotune_runner(inputs)
+    assert runner.get_tuning_config(inputs) is runner.get_tuning_config(inputs)
+    runner_args = ((torch.float16,), True, 0, 0, 0, 0, 16, (False,) * 7)
+    assert _get_checkpointing_ssu_runner(*runner_args) is _get_checkpointing_ssu_runner(
+        *runner_args
+    )
+
+
+def test_autotune_tactics_deduplicate_identical_small_batch_grids():
+    tactics = _make_tactics(16, 2, 16, 148, 1, 1)
+    assert tactics[0] == (0, 0, 0, 1)
+    assert len(tactics) == 11
+    assert {tactic[1] for tactic in tactics[1:]} == {1}
+
+    non_power_of_two_tactics = _make_tactics(14, 32, 14, 148, 1, 1)
+    assert {tactic[2] for tactic in non_power_of_two_tactics[1:]} == {14, 7, 1}
+
+
+def test_autotune_tactic_carries_profile_d_split(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    monkeypatch.setattr(module, "_sm_count", lambda _device: 148)
+    inputs = [None] * 22
+    inputs[0] = torch.empty(1, 16, 64, 1, dtype=torch.float32)  # state
+    inputs[1] = torch.empty(128, 1, 16, 64, dtype=torch.bfloat16)  # x
+    inputs[19] = torch.empty(1, dtype=torch.bfloat16)  # cb_scaled
+    inputs[20] = torch.empty(1)  # cumAdt_vec
+    inputs[21] = torch.empty(1, dtype=torch.bfloat16)  # cb_old
+    runner = _make_autotune_runner(inputs)
+
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics[0] == (0, 0, 0, 1)
+    assert all(tactic[-1] == 1 for tactic in tactics)
 
 
 def test_two_kernel_d_split2():
@@ -643,9 +803,6 @@ def test_two_kernel_d_split2():
             dt1_proc[slot],
         )
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(k, *, d_split):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -676,16 +833,7 @@ def test_two_kernel_d_split2():
             dt_bias=dt_bias,
             dt_softplus=True,
             d_split=d_split,
-            cb_scaled=torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            ),
-            cumAdt_vec=torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            ),
-            cb_old=torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            ),
-            algorithm="two-kernel",
+            **_two_kernel_scratch(batch, nheads, T, max_window, dtype, device),
         )
         return out, st, xc, bc, dtc
 
@@ -737,9 +885,6 @@ def test_persistent_main_matches_monolithic(monkeypatch):
         cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
     )
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(k, *, two_kernel):
         torch.manual_seed(k + 300)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -755,16 +900,7 @@ def test_persistent_main_matches_monolithic(monkeypatch):
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["algorithm"] = "two-kernel"
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
         checkpointing_ssu(
             st,
             xc,
@@ -840,9 +976,6 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
     )
     assert (prev_mixed + T > max_window).any() and (prev_mixed + T <= max_window).any()
 
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
-
     def _run(*, two_kernel):
         torch.manual_seed(300)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -858,16 +991,7 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
         kw = {}
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
-            )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
-            )
-            kw["algorithm"] = "two-kernel"
+            kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
         checkpointing_ssu(
             st,
             xc,
@@ -953,8 +1077,6 @@ def _run_two_kernel_state_dtype_case(
         )
 
     rand_seed = torch.tensor([1234], device=device, dtype=torch.int64)
-    T_pad = 16
-    k_old = ((max_window + 7) // 8) * 8
 
     def _run(k, *, two_kernel):
         torch.manual_seed((int(k.sum().item()) if torch.is_tensor(k) else k) + 100)
@@ -974,16 +1096,9 @@ def _run_two_kernel_state_dtype_case(
             kw["philox_rounds"] = philox_rounds
             kw["rand_seed"] = rand_seed
         if two_kernel:
-            kw["cb_scaled"] = torch.empty(
-                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=act_dtype
+            kw.update(
+                _two_kernel_scratch(batch, nheads, T, max_window, act_dtype, device)
             )
-            kw["cumAdt_vec"] = torch.empty(
-                batch, nheads, T_pad, device=device, dtype=torch.float32
-            )
-            kw["cb_old"] = torch.empty(
-                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
-            )
-            kw["algorithm"] = "two-kernel"
         checkpointing_ssu(
             st,
             xc,
@@ -1662,7 +1777,9 @@ def test_checkpointing_ssu_philox_no_checkpoint(
             rand_seed=rand_seed,
             philox_rounds=10,
             **(
-                _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+                _two_kernel_scratch(
+                    batch, nheads, npredicted, max_window, dtype, device
+                )
                 if two_kernel
                 else {}
             ),
@@ -1906,7 +2023,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         rand_seed=rand_seed,
         philox_rounds=10,
         **(
-            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
             if two_kernel
             else {}
         ),
@@ -2834,7 +2951,7 @@ def test_checkpointing_ssu_philox(
     )
     if two_kernel:
         # Window == T in this test; the scratch reroutes both runs to the split.
-        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, dtype, device))
+        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, T, dtype, device))
 
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
@@ -4601,7 +4718,7 @@ def _run_varlen_and_compare(
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted,
         **(
-            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
             if two_kernel
             else {}
         ),
