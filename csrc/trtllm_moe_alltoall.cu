@@ -270,6 +270,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   params.local_num_tokens = localNumTokens;
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
   params.enable_eplb = enableEplb;
   params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
   params.eplb_local_stats =
@@ -447,6 +449,8 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   params.local_num_tokens = static_cast<int>(localNumTokens);
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
   params.use_low_precision = useLowPrecision;
   params.prepare_payload = payloadInWorkspace ? nullptr : payload.data_ptr();
   params.output_data = output.data_ptr();
@@ -454,6 +458,10 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   params.dtype = toNvDataType(payload.dtype());
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
   params.output_scalar_scale = static_cast<float>(outputScalarScale);
+
+  // Keep the intermediate alive until both the accumulation and quantization
+  // launches have been enqueued on the caller's current stream.
+  Tensor accumulationStorage;
 
   // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
@@ -464,6 +472,9 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
         << "Quantization only supports for fp16 or bf16 inputs";
     params.output_scales = outputScales.value().data_ptr();
+    accumulationStorage =
+        alloc_tensor({localNumTokens, elementsPerToken}, dl_float32, payload.device());
+    params.accumulation_data = accumulationStorage.data_ptr();
 
     if (output.dtype() == dl_float8_e4m3fn) {
       // TODO(siyuan): currently only support MXFP8 quantization
