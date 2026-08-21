@@ -4010,6 +4010,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        return_lse_base_on_e: bool = False,
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4045,6 +4046,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        return_lse_base_on_e : bool
+            Controls the base of the returned LSE values when ``return_lse=True``.
+            If ``False`` (default), the LSE is returned in base-2
+            (``log2(sum(exp2(...)))``) to match the kernel's internal log-base.
+            If ``True``, the LSE is converted to natural-log base
+            (``log(sum(exp(...)))``) for compatibility with merge/cascade APIs
+            that expect base-e LSEs.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -4271,6 +4279,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
+            if return_lse and return_lse_base_on_e:
+                # Kernels return base-2 LSE; convert to natural-log base.
+                lse = lse * 0.6931471805599453  # log2(e)
             return (out, lse) if return_lse else out
         elif self._backend == "cudnn":
             if self._seq_lens_q.dim() == 1:
@@ -4305,6 +4316,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 lse=lse,
             )
 
+            if return_lse and return_lse_base_on_e:
+                # Kernels return base-2 LSE; convert to natural-log base.
+                lse = lse * 0.6931471805599453  # log2(e)
             return (out, lse) if return_lse else out
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
@@ -4384,6 +4398,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_cache_sf is not None and v_scale is not None and not is_float_one:
             out *= v_scale
 
+        if return_lse and return_lse_base_on_e:
+            # Kernels return base-2 LSE; convert to natural-log base.
+            lse = lse * 0.6931471805599453  # log2(e)
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -4401,6 +4418,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        return_lse_base_on_e: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         self._causal = causal
@@ -4411,7 +4429,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, k, v)
+        return self.run_return_lse(q, k, v, return_lse_base_on_e=return_lse_base_on_e)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
