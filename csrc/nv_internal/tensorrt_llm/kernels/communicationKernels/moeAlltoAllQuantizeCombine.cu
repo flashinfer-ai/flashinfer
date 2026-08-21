@@ -46,6 +46,12 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
     return c;
 }
 
+__device__ __forceinline__ float reciprocal_approximate_ftz(float value) {
+    float result;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+    return result;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(32) void
@@ -83,9 +89,6 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
         }
     }
     float scaled_value = value;
-    if (quant_mode == 3) {
-        scaled_value = value * output_scalar_scale;
-    }
     float _fabs_0 = fabsf(scaled_value);
     float block_max = _fabs_0;
     float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
@@ -109,22 +112,25 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
     float actual_scale = 0.0f;
     float fp8_scale = 0.0f;
     if (quant_mode == 3) {
+        float sf_value = output_scalar_scale * (block_max * reciprocal_approximate_ftz(6.0f));
         float _fp8_rt_0;
         uint16_t _e4m3x2_0;
         uint32_t _f16x2_0;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_0) : "f"(0.0f), "f"(block_max * 0.16666666666666666f));
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_0) : "f"(0.0f), "f"(sf_value));
         asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
         uint16_t _fp8_h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_0));
         fp8_scale = _fp8_rt_0;
-        float _max_5 = max_noftz(fp8_scale, 1e-12f);
-        actual_scale = _max_5;
+        actual_scale = block_max != 0.0f
+            ? reciprocal_approximate_ftz(
+                  fp8_scale * reciprocal_approximate_ftz(output_scalar_scale))
+            : 0.0f;
     } else {
         float denominator = 6.0f;
         if (quant_mode == 1) {
             denominator = 448.0f;
         }
-        float raw_scale = block_max / denominator;
+        float raw_scale = block_max * reciprocal_approximate_ftz(denominator);
         int raw_bits = 0;
         raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
         int exponent = raw_bits >> 23 & 255;
@@ -143,10 +149,15 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
                 scale_byte = 254;
             }
         }
-        int scale_bits = scale_byte << 23;
-        actual_scale = reinterpret_cast<float*>(&scale_bits)[0];
-        if (scale_byte == 0) {
-            actual_scale = 1e-12f;
+        if (quant_mode == 1) {
+            int scale_bits = scale_byte << 23;
+            if (scale_byte == 0) {
+                scale_bits = 0x00400000;
+            }
+            float decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+            actual_scale = reciprocal_approximate_ftz(decoded_scale);
+        } else if (block_max != 0.0f) {
+            actual_scale = scale_byte == 0 ? 1.0f : exp2f(127.0f - scale_byte);
         }
     }
     int scale_index = token * blocks_per_row + block_column;
@@ -168,7 +179,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
             scales_u8[scale_index] = scale_byte;
         }
     }
-    float normalized = scaled_value / actual_scale;
+    float normalized = value * actual_scale;
     if (quant_mode == 1) {
         if (active_lane != 0) {
             {
@@ -178,28 +189,18 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(float* __restrict__ accumu
             }
         }
     } else {
-        int bits = 0;
-        bits = reinterpret_cast<int*>(&normalized)[0];
-        int absolute_bits = bits & 2147483647;
-        int sign = bits >> 28 & 8;
-        if (absolute_bits == 0) {
-            sign = 0;
-        }
-        int magnitude = 0;
-        if (sign == 0) {
-            magnitude = ((absolute_bits > 1048576000) ? 1 : 0) + ((absolute_bits > 1061158912) ? 1 : 0) + ((absolute_bits > 1067450368) ? 1 : 0) + ((absolute_bits > 1071644672) ? 1 : 0) + ((absolute_bits > 1075838976) ? 1 : 0) + ((absolute_bits > 1080033280) ? 1 : 0) + ((absolute_bits > 1084227584) ? 1 : 0);
-        } else {
-            magnitude = ((absolute_bits >= 1048576000) ? 1 : 0) + ((absolute_bits >= 1061158912) ? 1 : 0) + ((absolute_bits >= 1067450368) ? 1 : 0) + ((absolute_bits >= 1071644672) ? 1 : 0) + ((absolute_bits >= 1075838976) ? 1 : 0) + ((absolute_bits >= 1080033280) ? 1 : 0) + ((absolute_bits >= 1084227584) ? 1 : 0);
-        }
-        if (magnitude == 0) {
-            sign = 0;
-        }
-        int code = magnitude + sign;
-        int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, code, 1);
-        int partner = _shfl_xor_5;
+        float partner = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
         if (active_lane != 0) {
             if ((lane & 1) == 0 && column + 1 < elements_per_token) {
-                int packed = code | partner << 4;
+                uint32_t packed;
+                asm volatile(
+                    "{\n"
+                    ".reg .b8 byte0;\n"
+                    "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+                    "mov.b32 %0, {byte0, 0, 0, 0};\n"
+                    "}"
+                    : "=r"(packed)
+                    : "f"(normalized), "f"(partner));
                 int packed_column = block_column * (block_size / 2) + lane / 2;
                 quantized_packed[token * (elements_per_token / 2) + packed_column] = packed;
             }

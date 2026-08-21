@@ -38,20 +38,99 @@ __device__ __forceinline__ uint32_t elect_sync() {
     return pred;
 }
 
-extern "C" {
+template <int TOP_K>
+__device__ __forceinline__ float reduce_contributions(float (&contributions)[TOP_K]) {
+    if constexpr (TOP_K == 22) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[4] += contributions[5];
+        contributions[6] += contributions[7];
+        contributions[8] += contributions[9];
+        contributions[10] += contributions[11];
+        contributions[12] += contributions[13];
+        contributions[14] += contributions[15];
+        contributions[16] += contributions[17];
+        contributions[18] += contributions[19];
+        contributions[20] += contributions[21];
+        contributions[0] += contributions[2];
+        contributions[4] += contributions[6];
+        contributions[8] += contributions[10];
+        contributions[12] += contributions[14];
+        contributions[16] += contributions[18];
+        contributions[0] += contributions[4];
+        contributions[8] += contributions[12];
+        contributions[16] += contributions[20];
+        contributions[0] += contributions[8];
+        contributions[0] += contributions[16];
+    } else if constexpr (TOP_K == 16) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[4] += contributions[5];
+        contributions[6] += contributions[7];
+        contributions[8] += contributions[9];
+        contributions[10] += contributions[11];
+        contributions[12] += contributions[13];
+        contributions[14] += contributions[15];
+        contributions[0] += contributions[2];
+        contributions[4] += contributions[6];
+        contributions[8] += contributions[10];
+        contributions[12] += contributions[14];
+        contributions[0] += contributions[4];
+        contributions[8] += contributions[12];
+        contributions[0] += contributions[8];
+    } else if constexpr (TOP_K == 10) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[4] += contributions[5];
+        contributions[6] += contributions[7];
+        contributions[8] += contributions[9];
+        contributions[0] += contributions[2];
+        contributions[4] += contributions[6];
+        contributions[0] += contributions[4];
+        contributions[0] += contributions[8];
+    } else if constexpr (TOP_K == 8) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[4] += contributions[5];
+        contributions[6] += contributions[7];
+        contributions[0] += contributions[2];
+        contributions[4] += contributions[6];
+        contributions[0] += contributions[4];
+    } else if constexpr (TOP_K == 6) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[4] += contributions[5];
+        contributions[0] += contributions[2];
+        contributions[0] += contributions[4];
+    } else if constexpr (TOP_K == 4) {
+        contributions[0] += contributions[1];
+        contributions[2] += contributions[3];
+        contributions[0] += contributions[2];
+    } else if constexpr (TOP_K == 2) {
+        contributions[0] += contributions[1];
+    } else if constexpr (TOP_K != 1) {
+#pragma unroll
+        for (int route = 1; route < TOP_K; ++route) {
+            contributions[0] += contributions[route];
+        }
+    }
+    return contributions[0];
+}
 
-__global__ __launch_bounds__(256) void
-kernel_flashinfer_mnnvl_moe_alltoall_combine(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, int top_k, bool use_low_precision, bool enable_pdl)
-{
+template <int TOP_K>
+__device__ __forceinline__ void combine_top_k(
+    uint8_t* __restrict__ workspace, uint8_t* __restrict__ output,
+    unsigned long long workspace_stride_bytes,
+    unsigned long long topk_target_ranks_offset,
+    unsigned long long topk_send_indices_offset,
+    unsigned long long combine_payload_offset, int max_tokens_per_rank,
+    int local_num_tokens, int elements_per_token, int payload_element_bytes,
+    int payload_dtype_code, int output_dtype_code, int ep_rank,
+    bool use_low_precision, bool enable_pdl) {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-
-
     const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
 
-    // === Task calls (dependency order) ===
     if (enable_pdl) {
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
@@ -59,13 +138,17 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine(uint8_t* __restrict__ workspace, ui
     unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
     int token = bid;
     if (token < local_num_tokens) {
-        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)top_k;
-        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)top_k;
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
-            float result = 0.0f;
-            #pragma unroll 1
-            for (int route = 0; route < top_k; route++) {
+            float contributions[TOP_K];
+#pragma unroll
+            for (int route = 0; route < TOP_K; ++route) {
+                contributions[route] = 0.0f;
+            }
+#pragma unroll
+            for (int route = 0; route < TOP_K; ++route) {
                 int target_rank = workspace_i32[target_base + (unsigned long long)route];
                 int send_index = workspace_i32[send_base + (unsigned long long)route];
                 if (target_rank >= 0 && send_index >= 0) {
@@ -108,9 +191,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine(uint8_t* __restrict__ workspace, ui
                         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
-                    result = result + contribution;
+                    contributions[route] = contribution;
                 }
             }
+            float result = reduce_contributions(contributions);
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
             if (output_dtype_code == 0) {
                 __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
@@ -143,4 +227,35 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine(uint8_t* __restrict__ workspace, ui
     }
 }
 
-} // extern "C"
+#define DEFINE_COMBINE_TOP_K(TOP_K)                                                        \
+    extern "C" __global__ __launch_bounds__(256) void                                    \
+    kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K(                           \
+        uint8_t* __restrict__ workspace, uint8_t* __restrict__ output,                    \
+        unsigned long long workspace_stride_bytes,                                        \
+        unsigned long long topk_target_ranks_offset,                                      \
+        unsigned long long topk_send_indices_offset,                                      \
+        unsigned long long combine_payload_offset, int max_tokens_per_rank,               \
+        int local_num_tokens, int elements_per_token, int payload_element_bytes,          \
+        int payload_dtype_code, int output_dtype_code, int ep_rank,                       \
+        bool use_low_precision, bool enable_pdl) {                                         \
+        combine_top_k<TOP_K>(workspace, output, workspace_stride_bytes,                   \
+                             topk_target_ranks_offset, topk_send_indices_offset,           \
+                             combine_payload_offset, max_tokens_per_rank,                  \
+                             local_num_tokens, elements_per_token,                        \
+                             payload_element_bytes, payload_dtype_code,                   \
+                             output_dtype_code, ep_rank, use_low_precision, enable_pdl);   \
+    }
+
+DEFINE_COMBINE_TOP_K(1)
+DEFINE_COMBINE_TOP_K(2)
+DEFINE_COMBINE_TOP_K(4)
+DEFINE_COMBINE_TOP_K(6)
+DEFINE_COMBINE_TOP_K(8)
+DEFINE_COMBINE_TOP_K(10)
+DEFINE_COMBINE_TOP_K(12)
+DEFINE_COMBINE_TOP_K(14)
+DEFINE_COMBINE_TOP_K(16)
+DEFINE_COMBINE_TOP_K(18)
+DEFINE_COMBINE_TOP_K(22)
+
+#undef DEFINE_COMBINE_TOP_K

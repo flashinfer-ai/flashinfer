@@ -82,7 +82,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 } else {
                     target_rank = ep_remainder + (expert_id - split) / ep_base;
                 }
-                unsigned long long target_bit = 1 << (unsigned long long)target_rank;
+                unsigned long long target_bit = 1ULL << (unsigned long long)target_rank;
                 int first_for_rank = (((seen_ranks & target_bit) == 0) ? 1 : 0);
                 seen_ranks = seen_ranks | target_bit;
                 int rank_is_active = 1;
@@ -224,7 +224,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
             for (int target_rank_6 = lane; target_rank_6 < ep_size; target_rank_6 += 32) {
                 int rank_is_active_1 = 1;
                 if (enable_rank_mask) {
-                    unsigned long long target_bit_1 = 1 << (unsigned long long)target_rank_6;
+                    unsigned long long target_bit_1 = 1ULL << (unsigned long long)target_rank_6;
                     rank_is_active_1 = (((active_rank_mask & target_bit_1) != 0) ? 1 : 0);
                 }
                 if (rank_is_active_1 != 0) {
@@ -238,7 +238,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int target_rank_eplb = 0; target_rank_eplb < ep_size; target_rank_eplb++) {
                     int rank_is_active_eplb = 1;
                     if (enable_rank_mask) {
-                        unsigned long long target_bit_eplb = 1 << (unsigned long long)target_rank_eplb;
+                        unsigned long long target_bit_eplb = 1ULL << (unsigned long long)target_rank_eplb;
                         rank_is_active_eplb = (((active_rank_mask & target_bit_eplb) != 0) ? 1 : 0);
                     }
                     if (rank_is_active_eplb != 0) {
@@ -257,7 +257,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
             for (int target_rank_flag = lane; target_rank_flag < ep_size; target_rank_flag += 32) {
                 int rank_is_active_flag = 1;
                 if (enable_rank_mask) {
-                    unsigned long long target_bit_flag = 1 << (unsigned long long)target_rank_flag;
+                    unsigned long long target_bit_flag = 1ULL << (unsigned long long)target_rank_flag;
                     rank_is_active_flag = (((active_rank_mask & target_bit_flag) != 0) ? 1 : 0);
                 }
                 if (rank_is_active_flag != 0) {
@@ -269,7 +269,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
             for (int peer_rank = lane; peer_rank < ep_size; peer_rank += 32) {
                 int peer_is_active = 1;
                 if (enable_rank_mask) {
-                    unsigned long long peer_bit = 1 << (unsigned long long)peer_rank;
+                    unsigned long long peer_bit = 1ULL << (unsigned long long)peer_rank;
                     peer_is_active = (((active_rank_mask & peer_bit) != 0) ? 1 : 0);
                 }
                 if (peer_is_active != 0) {
