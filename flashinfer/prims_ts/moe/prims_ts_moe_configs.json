@@ -771,9 +771,9 @@
                 [256, 32, 32, 32, 256, 2, 4, 4, 4, 4, 4, 4],
                 [256, 32, 32, 32, 256, 2, 5, 5, 5, 5, 5, 5]
             ],
-            "tile_scheduler,num_stages_tmem_acc": [
-                ["static", 1],
-                ["persistent", 2]
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle": [
+                ["static", 1, false],
+                ["persistent", 2, true]
             ]
         },
         {
@@ -811,6 +811,7 @@
             "num_stages_tmem_sfb": 4,
             "num_stages_tmem_acc": 2,
             "use_unroll_loop_2x_for_mma": true,
+            "use_clc_fast_drain": true,
             "tile_scheduler": "persistent"
         },
         {
