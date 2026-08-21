@@ -408,9 +408,6 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   FLASHINFER_CHECK(
       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
-  // transposeMmaOutput=true swaps the caller's A/B into the kernel's B/A, so a per-channel
-  // weight scale (along the weight's output-channel dim) becomes a per-row scale of kernel A,
-  // while the per-token activation scale becomes a per-row scale of kernel B.
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.
