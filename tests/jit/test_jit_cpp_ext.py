@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -148,6 +149,28 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def test_asan_interface_header_is_only_included_under_asan():
+    """``<sanitizer/asan_interface.h>`` is shipped by the sanitizer runtime rather than
+    by the compiler on some distros, so the JIT sources must not include it unless
+    AddressSanitizer is actually enabled. See #4470."""
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (
+        repo_root / "csrc" / "nv_internal" / "cpp" / "common" / "memoryUtils.cu"
+    ).read_text()
+
+    lines = [line.strip() for line in source.splitlines() if line.strip()]
+    include_idx = [
+        i
+        for i, line in enumerate(lines)
+        if line == "#include <sanitizer/asan_interface.h>"
+    ]
+
+    assert include_idx, "expected memoryUtils.cu to still reference the ASan interface"
+    for i in include_idx:
+        assert lines[i - 1] == "#if defined(TLLM_HAS_ASAN)"
+        assert lines[i + 1] == "#endif"
 
 
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
