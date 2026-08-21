@@ -31,8 +31,8 @@ Supported architectures:
 
 import importlib.util
 
-# Probed here rather than imported from cute_dsl.utils, which has a top-level
-# `import cutlass` and so is unimportable in the wheel build envs (#4651).
+# cute_dsl.utils has a top-level `import cutlass`, so the guard cannot be
+# imported without the thing it guards (#4651).
 _CUTE_DSL_AVAILABLE = (
     importlib.util.find_spec("cutlass") is not None
     and importlib.util.find_spec("cutlass.cute") is not None
