@@ -19,10 +19,15 @@ These describe the schema of :func:`flashinfer.fp8_paged_mqa_logits` and
 system.  Both compute, for each batch element b, speculative slot t, and KV
 position pos::
 
-    logits[b*next_n+t, pos] = relu(Σ_h w[b*next_n+t,h] · Q[b,t,h,:]@K[pos,:]ᵀ) · scale[pos]
+    logits[b*next_n+t, pos] = Σ_h w[b*next_n+t,h] · relu(Q[b,t,h,:]@K[pos,:]ᵀ)
 
-where K is paged via ``block_table``.  Both kernels are Blackwell (SM100/SM103)
-only.
+where K is paged via ``block_table``.  ReLU is applied per head, *before*
+weighting and reduction -- not to the sum, so the output is not clamped to be
+non-negative.  FP8 multiplies the result by the per-token KV scale
+(``· scale[pos]``); FP4 folds its per-(token, K-group) UE8M0 scales into
+dequantizing Q and K, so it has no trailing scale factor.
+
+Both kernels are Blackwell (SM100/SM103) only.
 """
 
 import torch
