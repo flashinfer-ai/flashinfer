@@ -427,8 +427,15 @@ def get_symm_buffer_for_bf16_mega_moe(
         gate_up_clamp=clamp,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
-        **(knobs or {}),
     )
+    if knobs:
+        from .tuner import is_valid_bf16, with_knobs
+
+        if not is_valid_bf16(knobs):
+            raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
+        cfg = with_knobs(cfg, knobs)
+        if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+            cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)

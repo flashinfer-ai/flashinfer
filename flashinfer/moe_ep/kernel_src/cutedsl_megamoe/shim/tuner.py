@@ -176,6 +176,13 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "static",
 }
 
+# Mirrors ``Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs``.
+_BF16_MXFP8_IMPLS = {
+    ((256, 128, 128), "tmem", False, 128),
+    ((256, 256, 128), "smem", False, 128),
+    ((256, 256, 128), "tmem", True, 64),
+}
+
 
 def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
@@ -194,6 +201,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     ``mma_tiler (M, N) = (256, 256)``.
 
     ``dtype="bf16"`` -> one validated fixed MMA/cluster geometry.
+    ``dtype="bf16_mxfp8"`` -> the default mixed implementation tuple
+    (``is_valid_bf16_mxfp8``).
 
     NVFP4 profiles were re-validated 2026-07-15 on the corrected K-major
     weight layout: the online autotuner confirmed all four non-ikr defaults
@@ -272,6 +281,25 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
     )
 
 
+def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
+    """Validate the implementation tuples accepted by mixed MXFP8/BF16 MegaMoE."""
+    impl = (
+        knobs.get("mma_tiler_mnk", (256, 128, 128)),
+        knobs.get("transform_buffer", "tmem"),
+        knobs.get("accumulator_overlap", False),
+        knobs.get("transform_k_tile", 128),
+    )
+    return (
+        impl in _BF16_MXFP8_IMPLS
+        and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
+        and knobs.get("use_2cta_instrs", True)
+        and knobs.get("token_back_mode", "epi_warps")
+        in ("epi_warps", "reuse_dispatch_warps")
+        and knobs.get("clc_bundle_size") is None
+        and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
+    )
+
+
 def iter_candidates(
     *,
     include_correctness: bool = False,
@@ -326,6 +354,7 @@ __all__ = [
     "default_knobs",
     "is_valid",
     "is_valid_bf16",
+    "is_valid_bf16_mxfp8",
     "iter_candidates",
     "with_knobs",
 ]
