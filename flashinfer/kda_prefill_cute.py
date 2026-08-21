@@ -38,8 +38,8 @@ _HEAD_DIM = 128
 def _is_cute_dsl_kda_runtime_available() -> bool:
     """Whether the BT=16 kernel can be imported at all.
 
-    It is built on ``cutlass.experimental``, which needs CuTe DSL >= 4.7; the probe
-    itself lives in a module that imports ``cutlass`` eagerly, hence the guard.
+    It is built on ``cutlass.experimental``, which needs CuTe DSL >= 4.7. The import
+    is guarded because a broken DSL install can fail on load.
     """
     try:
         from .cute_dsl.utils import is_cute_dsl_experimental_available
