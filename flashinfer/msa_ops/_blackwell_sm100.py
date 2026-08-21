@@ -918,21 +918,12 @@ def _run_long_prefill_modules(
         device=q.device,
     )
     scale_shape: tuple[int, ...]
-    if paged and group_size == 16:
+    if paged:
         scale_shape = (
             _ATTENTION_TOPK,
             total_q,
             num_q_heads,
             _LONG_PARTIAL_SEGMENT_COUNT,
-        )
-        scale_dtype = torch.bfloat16
-    elif paged:
-        scale_shape = (
-            _ATTENTION_TOPK,
-            total_q,
-            num_q_heads,
-            _LONG_PARTIAL_SEGMENT_COUNT,
-            2,
         )
         scale_dtype = torch.bfloat16
     else:

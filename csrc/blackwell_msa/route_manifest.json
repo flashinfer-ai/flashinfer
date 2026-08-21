@@ -397,14 +397,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_bf16_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "4e65a7d7ab7fe7a215deb347428475f8061814a7d449bbfa9adfcede6cd8f3db",
-        "vendored_sha256": "d7076c910ecc15c58efdbfca77cb869eaa923acc67ec8c01e4116247f6824cd7",
-        "binding_sha256": "ea20db9a090b41eae4c69b96fcafc1d0ed252be0615887416e3ae51d395d481d",
+        "generated_input_sha256": "a0311fe39ac48d0c48548d2d4ed4b42495e3cbb72499c5aee186c506dbc68e20",
+        "vendored_sha256": "6a10dd35ec11ed9959c02935a2d3db786172a88f3897cc1b7db5180d3ca7d340",
+        "binding_sha256": "481307c83b33938871378993f59934576abce8577c056e747c539c8a3ba40841",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -412,14 +412,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_bf16_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "e999c36572e661f8e804da0ecd1b41c5c9c8379cfda8c346fe53d9a728a420a3",
-        "vendored_sha256": "378cad3f75bf841bb3a1e1af4108e3fe0a09e900d9b2a4dcad348cceeff4d1eb",
-        "binding_sha256": "496c91d8d558786f26781c12d1abf1bbce8fe29d7856bde73ceb05291c20aaf0",
+        "generated_input_sha256": "744f25b028a166186a7cc4d6c0eaaac732654a4b9725bcf39f8121f823572e65",
+        "vendored_sha256": "a86ed303d2573c796a4cb23c0c88f4a0d7b677a20a7af4948c24d991191768f1",
+        "binding_sha256": "aa68486e5e1e549effd38cfb3ffce0f7b010cf4cdb06b681e4ecf047913e5e6e",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -427,14 +427,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_bf16_query_fp8_kv_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "491c487f1ae439337b64895982c81aaa795bef075c9d64615dd26af2c077db4b",
-        "vendored_sha256": "3f5d175795b39015356d9e2790d1fe05aba285b524b1e7361c0f821ea80ae896",
-        "binding_sha256": "6cee6c0c77b0e58f032829c7d2b4b7c1f740bcd7fdaa28b858626657f0600f33",
+        "generated_input_sha256": "4e14374c296bacc134d4a335515b4d944e507814bbc76e1047ce3c8b5cde77ca",
+        "vendored_sha256": "df5695b9e81391ac39bee58a0dc3579ce59aead3cc9384f27421b8482f8d1b10",
+        "binding_sha256": "bffbb83aad0f7787a102dbb151128a73390e265592adaa5352474eef6dc53b8a",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -442,14 +442,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_bf16_query_fp8_kv_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "ee517d810a95996ff86be9e7dde6902eff8b50585cdd2aa9f88786b045271b99",
-        "vendored_sha256": "d3a7ff7f4cd2978ea4ea48ad6daa24152624a44854be1f599e0ef0d7a9d4d235",
-        "binding_sha256": "22f4e780fb04ea642b1bb8c9ea04fb53285b4f2bc1ffc918f9c8697b8277590c",
+        "generated_input_sha256": "03ee6a8a9115584e7109c3b51d7119b341bb8c90cf357eb56148b02324025171",
+        "vendored_sha256": "cdd7408977ead0d06e809e843a1cebcd342527f34763b7dd427967dd0dc53ecf",
+        "binding_sha256": "9853dda1a3abe55d4b7aa88668cf2e12b1f06c27637906717636fe318f8c711c",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp8_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -457,14 +457,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_fp16_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "ed334ad8ee6908d215445236cc6fd15efa7d273f19173e729175330cad4e6868",
-        "vendored_sha256": "432a71c687b1351bdd93d3f764e6811a1c4e7fc16f38027ab795e60b62d142fc",
-        "binding_sha256": "a722c2334a1af5ba2d783b0a4d85749af2f3b8fccc9f63680cbc374b0f7a4b69",
+        "generated_input_sha256": "c1da9a8bb94b2ead248a67a32155ad5c1b61d1d67897929c334b53c7347bedab",
+        "vendored_sha256": "37377f8b66906547613479af0785e265ac8529e2d9ac2f2c53752ee0b54f75d9",
+        "binding_sha256": "85d7b4b2ef6763532671bbf9d8c809e1298e493b2f3e8206d13ff6317dc9062b",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -472,14 +472,14 @@
         "target": "sm100a",
         "source_unit": "decode_m16_fp16_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "9003673789aa90e1860f1a60fc916769bd85852e7d79ee54654d634f6bd48c06",
-        "vendored_sha256": "101be2d9be277596a1c22a49a18c56bffcab2be33971d1d3bcb0a295866af417",
-        "binding_sha256": "09d0b6c25d6486b32f1e78b497714564c674658c3ec51f5c28ff207107047035",
+        "generated_input_sha256": "e39fb2bd74022ab628ca531e992e2eb748675624700bce1457a14938883af025",
+        "vendored_sha256": "ebf0678d531e98305b6fc8bdda0cff3bad87ce37a29c2b259eac50eade8d44fe",
+        "binding_sha256": "7a1bed177e6c93d169c8689b22ef99a9979b0012f8b99f4faf5f92090a1d808e",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp16_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -607,8 +607,8 @@
         "target": "sm100a",
         "source_unit": "long_prefill_paged_bf16_gqa8_sm100",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "22d79b2860c0f24388a65d8949d97c8c343fbadd8627f54fe47abd757932cc66",
-        "vendored_sha256": "e0b8d302eeafa67ae5019436ff06064cd584f246197d0388b5e5e4a2b1242a16",
+        "generated_input_sha256": "0d5c6f11ce8d9e3ef4bf98183e2e0728f296c2c545d2c91919eed640616827d0",
+        "vendored_sha256": "d7f28be3d28919b772ed5ccf8dedb2301d443d4736c109ce768848b612245599",
         "binding_sha256": "8b3d50c82c7366d2a1524a3b44ba510f92b7afcca8d9a214a456f5e35c7fb511",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
@@ -652,8 +652,8 @@
         "target": "sm100a",
         "source_unit": "long_prefill_reduce_paged_bf16_gqa8",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "10dfd16aaea799ae42ba07ced4f065e5cabcab14a86b6fdaba94503efec7914c",
-        "vendored_sha256": "3cf059a1da5185811ea6d3f6c7402cb047bca14b83c218371580dcefb8a8cdba",
+        "generated_input_sha256": "4314789b57f29343c001db2e17d89a300953dded46f53f034b59008b22095c50",
+        "vendored_sha256": "66773b8e1a6010925a4829de7fc9718bf539d81f3108555b9db9312bb7b90e50",
         "binding_sha256": "554f4a190f78a13a70413454eefeb69f5cc7f5099e76285d0e3618178d81f13f",
         "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
@@ -877,14 +877,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_bf16_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "4e65a7d7ab7fe7a215deb347428475f8061814a7d449bbfa9adfcede6cd8f3db",
-        "vendored_sha256": "d7076c910ecc15c58efdbfca77cb869eaa923acc67ec8c01e4116247f6824cd7",
-        "binding_sha256": "ea20db9a090b41eae4c69b96fcafc1d0ed252be0615887416e3ae51d395d481d",
+        "generated_input_sha256": "a0311fe39ac48d0c48548d2d4ed4b42495e3cbb72499c5aee186c506dbc68e20",
+        "vendored_sha256": "6a10dd35ec11ed9959c02935a2d3db786172a88f3897cc1b7db5180d3ca7d340",
+        "binding_sha256": "481307c83b33938871378993f59934576abce8577c056e747c539c8a3ba40841",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -892,14 +892,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_bf16_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "e999c36572e661f8e804da0ecd1b41c5c9c8379cfda8c346fe53d9a728a420a3",
-        "vendored_sha256": "378cad3f75bf841bb3a1e1af4108e3fe0a09e900d9b2a4dcad348cceeff4d1eb",
-        "binding_sha256": "496c91d8d558786f26781c12d1abf1bbce8fe29d7856bde73ceb05291c20aaf0",
+        "generated_input_sha256": "744f25b028a166186a7cc4d6c0eaaac732654a4b9725bcf39f8121f823572e65",
+        "vendored_sha256": "a86ed303d2573c796a4cb23c0c88f4a0d7b677a20a7af4948c24d991191768f1",
+        "binding_sha256": "aa68486e5e1e549effd38cfb3ffce0f7b010cf4cdb06b681e4ecf047913e5e6e",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -907,14 +907,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_bf16_query_fp8_kv_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "491c487f1ae439337b64895982c81aaa795bef075c9d64615dd26af2c077db4b",
-        "vendored_sha256": "3f5d175795b39015356d9e2790d1fe05aba285b524b1e7361c0f821ea80ae896",
-        "binding_sha256": "6cee6c0c77b0e58f032829c7d2b4b7c1f740bcd7fdaa28b858626657f0600f33",
+        "generated_input_sha256": "4e14374c296bacc134d4a335515b4d944e507814bbc76e1047ce3c8b5cde77ca",
+        "vendored_sha256": "df5695b9e81391ac39bee58a0dc3579ce59aead3cc9384f27421b8482f8d1b10",
+        "binding_sha256": "bffbb83aad0f7787a102dbb151128a73390e265592adaa5352474eef6dc53b8a",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -922,14 +922,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_bf16_query_fp8_kv_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "ee517d810a95996ff86be9e7dde6902eff8b50585cdd2aa9f88786b045271b99",
-        "vendored_sha256": "d3a7ff7f4cd2978ea4ea48ad6daa24152624a44854be1f599e0ef0d7a9d4d235",
-        "binding_sha256": "22f4e780fb04ea642b1bb8c9ea04fb53285b4f2bc1ffc918f9c8697b8277590c",
+        "generated_input_sha256": "03ee6a8a9115584e7109c3b51d7119b341bb8c90cf357eb56148b02324025171",
+        "vendored_sha256": "cdd7408977ead0d06e809e843a1cebcd342527f34763b7dd427967dd0dc53ecf",
+        "binding_sha256": "9853dda1a3abe55d4b7aa88668cf2e12b1f06c27637906717636fe318f8c711c",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp8_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -937,14 +937,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_fp16_flat",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "ed334ad8ee6908d215445236cc6fd15efa7d273f19173e729175330cad4e6868",
-        "vendored_sha256": "432a71c687b1351bdd93d3f764e6811a1c4e7fc16f38027ab795e60b62d142fc",
-        "binding_sha256": "a722c2334a1af5ba2d783b0a4d85749af2f3b8fccc9f63680cbc374b0f7a4b69",
+        "generated_input_sha256": "c1da9a8bb94b2ead248a67a32155ad5c1b61d1d67897929c334b53c7347bedab",
+        "vendored_sha256": "37377f8b66906547613479af0785e265ac8529e2d9ac2f2c53752ee0b54f75d9",
+        "binding_sha256": "85d7b4b2ef6763532671bbf9d8c809e1298e493b2f3e8206d13ff6317dc9062b",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -952,14 +952,14 @@
         "target": "sm103a",
         "source_unit": "decode_m16_fp16_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "9003673789aa90e1860f1a60fc916769bd85852e7d79ee54654d634f6bd48c06",
-        "vendored_sha256": "101be2d9be277596a1c22a49a18c56bffcab2be33971d1d3bcb0a295866af417",
-        "binding_sha256": "09d0b6c25d6486b32f1e78b497714564c674658c3ec51f5c28ff207107047035",
+        "generated_input_sha256": "e39fb2bd74022ab628ca531e992e2eb748675624700bce1457a14938883af025",
+        "vendored_sha256": "ebf0678d531e98305b6fc8bdda0cff3bad87ce37a29c2b259eac50eade8d44fe",
+        "binding_sha256": "7a1bed177e6c93d169c8689b22ef99a9979b0012f8b99f4faf5f92090a1d808e",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp16_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
-          "infinity_identifier": 9
+          "infinity_identifier": 27
         },
         "programmatic_stream_serialization": false
       },
@@ -1072,8 +1072,8 @@
         "target": "sm103a",
         "source_unit": "long_prefill_paged_bf16_gqa8_sm103",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "0e1c70670e571559f2fa69e5d35123f870d75a9e9961c626c7cc9aab273bf700",
-        "vendored_sha256": "7f325f789c439e675000ae7c37875dc2b3680b858649f265f98df2e4bc304f36",
+        "generated_input_sha256": "805e274e6e690f2ec085cfbd5275fa3e1a2cb9676e3f36e4061fe82ab14e7bb5",
+        "vendored_sha256": "0e25540e06cf48e043e6b64d599f290b90395de115b1fc40bd342507945c4073",
         "binding_sha256": "595ec876a0abbc37fd253d7b9bc27f840f27717264cfdb458d51954124f21757",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
@@ -1117,8 +1117,8 @@
         "target": "sm103a",
         "source_unit": "long_prefill_reduce_paged_bf16_gqa8",
         "normalization_schema": "blackwell-msa-identifiers-v1",
-        "generated_input_sha256": "10dfd16aaea799ae42ba07ced4f065e5cabcab14a86b6fdaba94503efec7914c",
-        "vendored_sha256": "3cf059a1da5185811ea6d3f6c7402cb047bca14b83c218371580dcefb8a8cdba",
+        "generated_input_sha256": "4314789b57f29343c001db2e17d89a300953dded46f53f034b59008b22095c50",
+        "vendored_sha256": "66773b8e1a6010925a4829de7fc9718bf539d81f3108555b9db9312bb7b90e50",
         "binding_sha256": "554f4a190f78a13a70413454eefeb69f5cc7f5099e76285d0e3618178d81f13f",
         "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",

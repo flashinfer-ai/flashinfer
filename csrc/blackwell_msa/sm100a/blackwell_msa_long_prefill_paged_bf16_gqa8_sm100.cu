@@ -937,13 +937,17 @@ kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100(const _
                                             quant_scale = 448.0f / residual_abs_max;
                                         }
                                         if (output_valid != 0) {
-                                            float metadata_values[2];
-                                            metadata_values[0] = dequant_scale;
-                                            metadata_values[1] = 0.0f;
-                                            long long metadata_base_0 = (partial_row * 4 + (long long)output_segment) * 2;
-                                            {
-                                                __nv_bfloat162 _pk = __floats2bfloat162_rn(metadata_values[0 + 0], metadata_values[0 + 1]);
-                                                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(partial_scale + metadata_base_0))[0]) = _pk;
+                                            if ((output_segment & 1) == 0) {
+                                                pending_scale = dequant_scale;
+                                            } else {
+                                                float metadata_values[2];
+                                                metadata_values[0] = pending_scale;
+                                                metadata_values[1] = dequant_scale;
+                                                long long metadata_base_0 = partial_row * 4 + (long long)output_segment - 1;
+                                                {
+                                                    __nv_bfloat162 _pk = __floats2bfloat162_rn(metadata_values[0 + 0], metadata_values[0 + 1]);
+                                                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(partial_scale + metadata_base_0))[0]) = _pk;
+                                                }
                                             }
                                         }
                                         if (output_valid != 0) {
@@ -1331,13 +1335,17 @@ kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100(const _
                                             quant_scale_1 = 448.0f / residual_abs_max_1;
                                         }
                                         if (output_valid_1 != 0) {
-                                            float metadata_values_1[2];
-                                            metadata_values_1[0] = dequant_scale_1;
-                                            metadata_values_1[1] = 0.0f;
-                                            long long metadata_base_0_1 = (partial_row_1 * 4 + (long long)output_segment_1) * 2;
-                                            {
-                                                __nv_bfloat162 _pk = __floats2bfloat162_rn(metadata_values_1[0 + 0], metadata_values_1[0 + 1]);
-                                                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(partial_scale + metadata_base_0_1))[0]) = _pk;
+                                            if ((output_segment_1 & 1) == 0) {
+                                                pending_scale_1 = dequant_scale_1;
+                                            } else {
+                                                float metadata_values_1[2];
+                                                metadata_values_1[0] = pending_scale_1;
+                                                metadata_values_1[1] = dequant_scale_1;
+                                                long long metadata_base_0_1 = partial_row_1 * 4 + (long long)output_segment_1 - 1;
+                                                {
+                                                    __nv_bfloat162 _pk = __floats2bfloat162_rn(metadata_values_1[0 + 0], metadata_values_1[0 + 1]);
+                                                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(partial_scale + metadata_base_0_1))[0]) = _pk;
+                                                }
                                             }
                                         }
                                         if (output_valid_1 != 0) {

@@ -139,7 +139,7 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'Q' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 16u <= global_dim[1] && 2u <= global_dim[2], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2], ValueError)
       << "TMA box (64, 16, 2) exceeds resolved global dims for 'Q'";
   uint64_t global_strides[2] = {
       (uint64_t)((s2 * 16) / 8),
@@ -592,11 +592,11 @@ void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_ra
   dim3 block(512u, 1u, 1u);
 
   cudaError_t status = cudaFuncSetAttribute(
-      kernel_minimax_sparse_decode_m16_paged_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 151168);
+      kernel_minimax_sparse_decode_m16_paged_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 150144);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaFuncSetAttribute(kernel_minimax_sparse_decode_m16_paged_sm100) failed: " << cudaGetErrorString(status);
   status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_minimax_sparse_decode_m16_paged_sm100), grid, block, kargs,
-                            151168u, stream);
+                            150144u, stream);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "kernel_minimax_sparse_decode_m16_paged_sm100 launch failed: " << cudaGetErrorString(status);
 }

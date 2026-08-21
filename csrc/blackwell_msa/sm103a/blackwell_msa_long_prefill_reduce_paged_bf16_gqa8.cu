@@ -285,7 +285,7 @@ kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100(uint8
                         "setp.ne.b32 p, %0, 0;\n\t"
                         "@p cp.async.cg.shared::cta.global.L2::128B [%1], [%2], 16;\n\t"
                         "}"
-                        :: "r"((lane_in_row == 0 && split_count > preload_split) ? 1 : 0), "r"(partial_meta_stage_addr + (unsigned int)(preload_split * 512) + (unsigned int)(row_group * 4 * 4)), "l"(partial_scale + ((preload_split_row * 4 + (long long)lane_in_row) * 2)));
+                        :: "r"((lane_in_row == 0 && (row_group & 1) == 0 && split_count > preload_split) ? 1 : 0), "r"(partial_meta_stage_addr + (unsigned int)(preload_split * 512) + (unsigned int)(row_group * 4 * 2)), "l"(partial_scale + (preload_split_row * 4)));
                 }
             }
             asm volatile("cp.async.commit_group;");
@@ -369,7 +369,7 @@ kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100(uint8
                     {
                         unsigned int packed_metadata_lo[1];
                         {
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&packed_metadata_lo[0])) : "r"(partial_meta_stage_addr + (unsigned int)(split % 8 * 512) + (unsigned int)(row_group * 4 * 4) + (unsigned int)(segment_lo * 4)));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&packed_metadata_lo[0])) : "r"(partial_meta_stage_addr + (unsigned int)(split % 8 * 512) + (unsigned int)(row_group * 4 * 2) + (unsigned int)(segment_lo / 2 * 4)));
                             float packed_metadata_lo_f32[2];
                             #pragma unroll
                             for (int _pair = 0; _pair < 1; _pair++) {
@@ -381,8 +381,7 @@ kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100(uint8
                                     : "=f"((&packed_metadata_lo_f32[_pair * 2])[0]), "=f"((&packed_metadata_lo_f32[_pair * 2])[1])
                                     : "r"(packed_metadata_lo[_pair]));
                             }
-                            scale_lo = packed_metadata_lo_f32[0];
-                            center_lo = packed_metadata_lo_f32[1];
+                            scale_lo = (((segment_lo & 1) == 0) ? packed_metadata_lo_f32[0] : packed_metadata_lo_f32[1]);
                         }
                     }
                     float residual_weight_lo = split_weight * scale_lo;
@@ -419,7 +418,7 @@ kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100(uint8
                         "setp.ne.b32 p, %0, 0;\n\t"
                         "@p cp.async.cg.shared::cta.global.L2::128B [%1], [%2], 16;\n\t"
                         "}"
-                        :: "r"((lane_in_row == 0 && (next_split < 16 && next_split < split_count)) ? 1 : 0), "r"(partial_meta_stage_addr + (unsigned int)(split % 8 * 512) + (unsigned int)(row_group * 4 * 4)), "l"(partial_scale + ((next_split_row * 4 + (long long)lane_in_row) * 2)));
+                        :: "r"((lane_in_row == 0 && (row_group & 1) == 0 && (next_split < 16 && next_split < split_count)) ? 1 : 0), "r"(partial_meta_stage_addr + (unsigned int)(split % 8 * 512) + (unsigned int)(row_group * 4 * 2)), "l"(partial_scale + (next_split_row * 4)));
                 }
             }
             asm volatile("cp.async.commit_group;");
