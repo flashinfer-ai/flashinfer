@@ -1009,6 +1009,24 @@ class FP8MQALogitsKernel:
                 if q_idx != q_idx_old:
                     kv_blk_ptr = cutlass.Int32(32)  # force re-prefetch
                     prefetch_next = q_idx + 1
+                    # The task-advance blocks below skip zero-length rows, so
+                    # this lookahead must land on the SAME row the consumers
+                    # will visit next. Prefetching a raw q_idx+1 that the
+                    # iterators skip pushes the skipped row's Q/W into the
+                    # pipeline, and the row after the gap then consumes it --
+                    # silently wrong logits. Stage counts still match, so it
+                    # does not hang, which is why only an interspersed-zero
+                    # case exposes it (a trailing zero is masked by the
+                    # prefetch_next < end_q_idx guard below).
+                    peek_ctx = cutlass.Int32(1)  # nonzero => do not skip
+                    if prefetch_next < end_q_idx:
+                        peek_ctx = mContextLens[prefetch_next]
+                    while (peek_ctx == 0) & (prefetch_next < end_q_idx):
+                        prefetch_next = prefetch_next + 1
+                        if prefetch_next < end_q_idx:
+                            peek_ctx = mContextLens[prefetch_next]
+                        else:
+                            peek_ctx = cutlass.Int32(1)
                     if prefetch_next < end_q_idx:
                         q_pipeline.producer_acquire(q_prod_state)
                         q_bar = q_pipeline.producer_get_barrier(q_prod_state)
