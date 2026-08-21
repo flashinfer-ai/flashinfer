@@ -5,13 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from ..bf16_bf16_bf16_cutedsl.config import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+from ..common.bf16_config import Sm100_Bf16_Cutedsl_MegaMoeConfigBase
 
 
 @dataclass
-class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
-):
+class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConfigBase):
     """Parameters for the mixed SwapAB SM100 CuTeDSL MegaMoE kernel.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.
