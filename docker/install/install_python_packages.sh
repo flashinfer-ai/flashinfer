@@ -83,7 +83,7 @@ pip3 install \
 # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
 # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.
 # Override only the backend package, last, so no later resolver pass undoes it.
-# docker/test_ci_image.sh verifies the installed package and loaded backend.
+# docker/test_ci_image.py verifies the installed package and loaded backend.
 pip3 install --upgrade --no-deps "${CUDNN_PACKAGE}==${CUDNN_VERSION}"
 
 # Fail the build if torch or cuda-python drifts off the requested CUDA release.

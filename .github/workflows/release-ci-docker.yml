@@ -93,8 +93,8 @@ jobs:
           docker image inspect "${IMAGE_TAG}" >/dev/null
           docker run --rm --pull=never --platform "linux/${{ matrix.arch }}" -i \
             "${IMAGE_TAG}" \
-            bash -s -- "${{ matrix.cuda.version }}" "${{ matrix.arch }}" \
-            < docker/test_ci_image.sh
+            python3 - "${{ matrix.cuda.version }}" "${{ matrix.arch }}" \
+            < docker/test_ci_image.py
 
       - name: Push tested image
         if: github.event_name != 'pull_request'
