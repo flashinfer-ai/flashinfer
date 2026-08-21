@@ -38,9 +38,68 @@ from tests.utils_fp8 import to_float8
 
 def _clean_flashinfer_modules():
     """Remove flashinfer modules from sys.modules."""
+    api_logging = sys.modules.get("flashinfer.api_logging")
+    if api_logging is not None and hasattr(api_logging, "_restore_cuda_graph_hooks"):
+        api_logging._restore_cuda_graph_hooks()
+
     modules_to_delete = [k for k in sys.modules.keys() if k.startswith("flashinfer")]
     for module in modules_to_delete:
         del sys.modules[module]
+
+
+def _restore_flashinfer_modules(original_modules):
+    _clean_flashinfer_modules()
+    sys.modules.update(original_modules)
+
+    api_logging = original_modules.get("flashinfer.api_logging")
+    if api_logging is not None:
+        api_logging._install_cuda_graph_dump_autoflush()
+        api_logging._install_cuda_graph_hooks()
+
+
+@pytest.fixture(autouse=True)
+def preserve_flashinfer_modules():
+    """Keep logging reimports from changing module identities for other tests.
+
+    Pytest imports test modules during collection, so other tests may retain
+    classes and enum members from the initially imported FlashInfer modules.
+    The logging tests intentionally reimport FlashInfer to exercise
+    environment-controlled decorators. Restore the exact module objects that
+    existed before each test so those collected references remain coherent.
+    """
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith("flashinfer")
+    }
+
+    yield
+
+    _restore_flashinfer_modules(original_modules)
+
+
+def test_flashinfer_module_restore_preserves_collected_enum_identity():
+    """A logging reimport must not invalidate classes retained at collection."""
+    from flashinfer.logits_processor.types import TensorType
+
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith("flashinfer")
+    }
+    original_tensor_type = TensorType
+
+    _clean_flashinfer_modules()
+    from flashinfer.logits_processor.types import TensorType as reloaded_tensor_type
+
+    assert reloaded_tensor_type is not original_tensor_type
+
+    _restore_flashinfer_modules(original_modules)
+
+    assert (
+        sys.modules["flashinfer.logits_processor.types"].TensorType
+        is original_tensor_type
+    )
 
 
 @pytest.fixture
