@@ -89,6 +89,18 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
 
+# Epilogue FMA unroll. NUM_W_IN_REG is the split point between the register
+# and SMEM weight paths, both unrolled this wide, so it must stay a multiple
+# of it -- otherwise the two paths stop tiling the subtile and the epilogue
+# reads past it. Mirrors _EPI_SUBTILE_UNROLL in attn_scores.py, which applies
+# the same granularity to num_heads // num_epi_subtiles.
+_EPI_UNROLL = 4
+# Max registers per thread for the epilogue weight cache. 160 is the largest
+# footprint the per-slot policy below already requests at the shape it was
+# tuned for (num_heads=64, next_n=4), so bounding here leaves every
+# num_heads=64 configuration unchanged.
+_MAX_W_CACHE_REGS = 160
+
 
 @dsl_user_op
 def pack_f16x2(
@@ -1400,9 +1412,28 @@ class FP8MQALogitsKernel:
                 # all heads for next_n <= 3.
                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
+                    # FP16 weights pack two per register.
+                    MAX_W_CACHE_ELEMS = 2 * _MAX_W_CACHE_REGS
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                    MAX_W_CACHE_ELEMS = _MAX_W_CACHE_REGS
+                # MAX_NUM_W_IN_REG caps the per-slot count, but the register
+                # footprint is the product NUM_W_IN_REG * next_n. Whenever
+                # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
+                # and the footprint grows to num_heads * next_n == N, which the
+                # API admits up to 256 -- past the register file. Bound the
+                # product too. Must stay a single constexpr expression: a
+                # staged `if` here makes NUM_W_IN_REG a runtime value and the
+                # range_constexpr loops below fail to compile.
+                NUM_W_IN_REG = max(
+                    _EPI_UNROLL,
+                    min(
+                        MAX_NUM_W_IN_REG,
+                        num_heads,
+                        ((MAX_W_CACHE_ELEMS // next_n) // _EPI_UNROLL) * _EPI_UNROLL,
+                    ),
+                )
+                assert NUM_W_IN_REG % _EPI_UNROLL == 0
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
@@ -1681,9 +1712,28 @@ class FP8MQALogitsKernel:
                 # all heads for next_n <= 3.
                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
+                    # FP16 weights pack two per register.
+                    MAX_W_CACHE_ELEMS = 2 * _MAX_W_CACHE_REGS
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                    MAX_W_CACHE_ELEMS = _MAX_W_CACHE_REGS
+                # MAX_NUM_W_IN_REG caps the per-slot count, but the register
+                # footprint is the product NUM_W_IN_REG * next_n. Whenever
+                # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
+                # and the footprint grows to num_heads * next_n == N, which the
+                # API admits up to 256 -- past the register file. Bound the
+                # product too. Must stay a single constexpr expression: a
+                # staged `if` here makes NUM_W_IN_REG a runtime value and the
+                # range_constexpr loops below fail to compile.
+                NUM_W_IN_REG = max(
+                    _EPI_UNROLL,
+                    min(
+                        MAX_NUM_W_IN_REG,
+                        num_heads,
+                        ((MAX_W_CACHE_ELEMS // next_n) // _EPI_UNROLL) * _EPI_UNROLL,
+                    ),
+                )
+                assert NUM_W_IN_REG % _EPI_UNROLL == 0
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
