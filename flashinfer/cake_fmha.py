@@ -1,7 +1,7 @@
 """Public Cake FMHA product entrypoints.
 
-The conventional decode/context APIs are complete-domain Cake routes.  Issue
-#4323 DCP metadata selects an authenticated additive profile through the same
+The conventional decode/context APIs are complete-domain Cake routes.  DCP
+metadata selects an authenticated additive profile through the same
 decode entrypoint and does not change ordinary-call behavior.
 """
 
