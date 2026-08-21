@@ -1093,9 +1093,6 @@ def fp8_paged_mqa_logits(
     else:
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
         _validate_schedule_meta_fresh(
-            schedule_meta, context_lens, "fp4_paged_mqa_logits"
-        )
-        _validate_schedule_meta_fresh(
             schedule_meta, context_lens, "fp8_paged_mqa_logits"
         )
 
@@ -1405,6 +1402,9 @@ def fp4_paged_mqa_logits(
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
     else:
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
+        _validate_schedule_meta_fresh(
+            schedule_meta, context_lens, "fp4_paged_mqa_logits"
+        )
 
     compiled = _cached_compile_fp4_kernel(
         block_size,
