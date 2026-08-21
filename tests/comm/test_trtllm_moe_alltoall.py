@@ -459,37 +459,54 @@ def combine_from_single_rank(
     use_low_precision=False,
     enable_pdl=True,
 ):
-    combine_results = []
-
     torch.cuda.synchronize()
 
+    result_dtype = (
+        output_dtype
+        if output_dtype is not None
+        else (torch.bfloat16 if use_low_precision else combine_payload[0].dtype)
+    )
+    result_width = combine_payload[0].shape[-1]
+    if result_dtype == torch.uint8:
+        result_width //= 2
+    # A single-GPU multi-rank simulation must complete every allocation before
+    # the first rank enters the peer publication wait.  Otherwise a cold
+    # allocator can synchronize after rank 0 launches but before rank 1 does.
+    combine_results = [
+        torch.empty(
+            (num_tokens, result_width),
+            dtype=result_dtype,
+            device=rank_payload.device,
+        )
+        for rank_payload in combine_payload
+    ]
     cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
     for rank in range(world_size):
         with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            combine_results.append(
-                trtllm_moe_alltoall.moe_a2a_combine(
-                    combine_payload[rank],
-                    num_tokens,
-                    all_workspaces,
-                    metainfo[rank],
-                    num_tokens,
-                    ep_rank=rank,
-                    ep_size=world_size,
-                    top_k=top_k,
-                    combine_payload_offset=combine_payload_offsets[rank],
-                    payload_in_workspace=payload_in_workspace,
-                    output_dtype=output_dtype,
-                    output_scales=(
-                        output_scales_list[rank]
-                        if output_scales_list is not None
-                        else None
-                    ),
-                    output_scalar_scale=output_scalar_scale,
-                    sf_layout=sf_layout,
-                    use_low_precision=use_low_precision,
-                    enable_pdl=enable_pdl,
-                )
+            result = trtllm_moe_alltoall.moe_a2a_combine(
+                combine_payload[rank],
+                num_tokens,
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=top_k,
+                combine_payload_offset=combine_payload_offsets[rank],
+                payload_in_workspace=payload_in_workspace,
+                output_dtype=output_dtype,
+                output_scales=(
+                    output_scales_list[rank]
+                    if output_scales_list is not None
+                    else None
+                ),
+                output_scalar_scale=output_scalar_scale,
+                sf_layout=sf_layout,
+                output=combine_results[rank],
+                use_low_precision=use_low_precision,
+                enable_pdl=enable_pdl,
             )
+            assert result is combine_results[rank]
 
     for rank in range(world_size):
         cuda_streams_all_ranks[rank].synchronize()
