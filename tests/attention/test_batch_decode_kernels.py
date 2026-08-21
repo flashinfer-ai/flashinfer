@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 from tests.test_helpers.jit_utils import (
@@ -1482,3 +1484,52 @@ def test_batch_decode_group_size_7(use_tensor_cores):
         ).to(dtype)
         o_ref_i = flashinfer.decode.single_decode_with_kv_cache(q[i], ki, vi)
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-2, atol=1e-2)
+
+
+# Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
+# masked logits are IEEE -inf, so any finite logit must win over masked positions
+# and fully masked rows must yield zero output with LSE = -inf.
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_decode_extreme_negative_logits(dtype):
+    # Deterministic #4450 fixture: classic (non-tensor-core) decode with two
+    # valid keys whose raw scores (-524288) sit far below the historical -5e4
+    # sentinel.
+    num_qo_heads, num_kv_heads, head_dim = 32, 4, 128
+    page_size, num_pages = 1, 17
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.full((1, num_qo_heads, head_dim), 64.0, dtype=dtype, device="cuda")
+    k_cache = torch.full(
+        (num_pages, page_size, num_kv_heads, head_dim),
+        -64.0,
+        dtype=dtype,
+        device="cuda",
+    )
+    v_cache = torch.ones_like(k_cache)
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", use_tensor_cores=False
+    )
+    wrapper.plan(
+        indptr=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        indices=torch.tensor([15, 16], dtype=torch.int32, device="cuda"),
+        last_page_len=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pos_encoding_mode="NONE",
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
+
+    k_gqa = k_cache[[15, 16], 0].repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    logits = torch.einsum("hd,khd->hk", q[0].float(), k_gqa.float()) * sm_scale
+    ref_lse = (torch.logsumexp(logits, dim=-1) / math.log(2.0)).unsqueeze(0)
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(o, torch.ones_like(o), rtol=0, atol=0)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=1e-3)
