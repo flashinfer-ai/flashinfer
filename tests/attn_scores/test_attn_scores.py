@@ -1656,6 +1656,47 @@ def test_empty_batch_still_validates_out():
         fp8_paged_mqa_logits(q, kv, w, context_lens, block_table, ctx, out=too_narrow)
 
 
+def test_schedule_meta_device_must_match():
+    """A schedule_meta on another GPU must be rejected here, not by the FFI layer.
+
+    is_cuda only asserts "some CUDA device", so before this check a cuda:1
+    schedule passed to a cuda:0 call reached the generated TVM-FFI binding and
+    failed there with a much less actionable error. Regression for PR #4365
+    review r3824973386.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two visible CUDA devices")
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_num_sms
+
+    H, D, block_size, ctx = 64, 128, 64, 256
+    B = 2
+    dev0, dev1 = torch.device("cuda", 0), torch.device("cuda", 1)
+
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=dev0)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, dev0)
+    q = torch.zeros(B, 1, H, D, device=dev0).to(torch.float8_e4m3fn)
+    kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=dev0)
+    w = torch.zeros(B, H, device=dev0, dtype=torch.float32)
+
+    # correctly shaped for device 0, but living on device 1
+    n0 = _cached_num_sms(0)
+    wrong_dev = torch.zeros((n0 + 1, 2), dtype=torch.int32, device=dev1)
+    with pytest.raises(ValueError, match=r"schedule_meta.device .* must match"):
+        fp8_paged_mqa_logits(
+            q, kv, w, context_lens, block_table, ctx, schedule_meta=wrong_dev
+        )
+
+    # the matching device is still accepted
+    right_dev = compute_paged_mqa_logits_schedule(context_lens, device=dev0)
+    fp8_paged_mqa_logits(
+        q, kv, w, context_lens, block_table, ctx, schedule_meta=right_dev
+    )
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):

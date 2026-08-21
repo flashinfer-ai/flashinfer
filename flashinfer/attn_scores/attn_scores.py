@@ -252,6 +252,13 @@ def _validate_schedule_meta(schedule_meta: torch.Tensor, num_sms: int, device) -
             f"schedule_meta must have shape ({num_sms + 1}, 2) for this device; "
             f"got {tuple(schedule_meta.shape)}. Use compute_paged_mqa_logits_schedule()."
         )
+    # is_cuda above only says "some CUDA device"; without this a schedule built
+    # on another GPU reaches the FFI binding before anything complains.
+    if schedule_meta.device != torch.device(device):
+        raise ValueError(
+            f"schedule_meta.device ({schedule_meta.device}) must match "
+            f"q.device ({device})"
+        )
 
 
 def _validate_out(
