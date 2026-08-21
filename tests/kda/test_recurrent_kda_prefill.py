@@ -3926,9 +3926,21 @@ def test_cute_dsl_padded_indexed_state_matches_cake(
             cute_value.float(), cake_value.float(), atol=1e-2, rtol=1e-2
         )
 
-@pytest.mark.parametrize("num_heads", [1, 2, 4, 8, 16, 32])
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens"),
+    [
+        (1, 64),
+        (2, 64),
+        (4, 32),
+        (4, 64),
+        (8, 64),
+        (16, 64),
+        (32, 64),
+    ],
+)
 def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
-    flash_kda_device, num_heads
+    flash_kda_device, num_heads, checkpoint_every_n_tokens
 ):
     inputs = _make_inputs(
         seq_lens=[65, 131],
@@ -3948,7 +3960,7 @@ def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
     expected_output, expected_state, expected_checkpoints = _reference(
         {**inputs, "initial_state": compact_initial_state},
         lower_bound=None,
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
     )
 
     state_slot_numel = num_heads * 128 * 128
@@ -3966,11 +3978,19 @@ def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
     state_pool[state_indices_i64] = compact_initial_state
     untouched_before = state_pool[[0, 2, 4]].clone()
     inputs["initial_state"] = state_pool
+    checkpoint_counts = [
+        (seq_len + checkpoint_every_n_tokens - 1) // checkpoint_every_n_tokens
+        for seq_len in (65, 131)
+    ]
     checkpoint_cu_starts = torch.tensor(
-        [0, 2, 5], dtype=torch.int64, device=flash_kda_device
+        [0, checkpoint_counts[0], sum(checkpoint_counts)],
+        dtype=torch.int64,
+        device=flash_kda_device,
     )
     state_checkpoints = torch.empty(
-        (5, num_heads, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+        (sum(checkpoint_counts), num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
     )
 
     actual_output, actual_state, actual_checkpoints = recurrent_kda(
@@ -3980,7 +4000,7 @@ def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
         ssm_state_indices=state_indices,
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
     )
 
     assert actual_state is state_pool
