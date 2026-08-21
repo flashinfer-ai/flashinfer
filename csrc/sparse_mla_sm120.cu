@@ -49,10 +49,11 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  int topk_extra, int extra_page_block_size, const bf16* Q,
                                  const uint8_t* KV_cache, const int32_t* indices,
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
-                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
-                                 size_t stride_kv_block, size_t extra_stride_kv_block,
-                                 const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, cudaStream_t stream);
+                                 bf16* output, float* out_lse, float lse_scale, float sm_scale,
+                                 int num_tokens, size_t stride_kv_block,
+                                 size_t extra_stride_kv_block, const float* attn_sink,
+                                 const int* topk_length, const int* extra_topk_length,
+                                 cudaStream_t stream);
 
 namespace {
 
@@ -148,7 +149,7 @@ void SparseMlaSm120PagedAttention(
     TensorView indices,   // [num_tokens, topk] or [num_tokens, 1, topk] int32 (-1 = skip)
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
     TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
-    double sm_scale, int64_t model_type,
+    double lse_scale, double sm_scale, int64_t model_type,
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
@@ -265,7 +266,7 @@ void SparseMlaSm120PagedAttention(
 
   const bool ok = sparse_mla_prefill_dispatch(
       mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
-      idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
+      idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, lse_scale, static_cast<float>(sm_scale),
       num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block, attn_sink_ptr, tl_ptr, etl_ptr,
       stream);
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "

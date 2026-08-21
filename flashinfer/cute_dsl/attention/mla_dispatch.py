@@ -227,7 +227,9 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
         kwargs = {
             k: v
             for k, v in kwargs.items()
-            if k not in MONOLITHIC_ONLY_KWARGS and k not in DCP_KWARGS
+            if k not in MONOLITHIC_ONLY_KWARGS
+            and k not in DCP_KWARGS
+            and k != "lse_scale"
         }
         from .wrappers.batch_mla import cute_dsl_mla_decode as _modular_impl
 

@@ -61,6 +61,7 @@
 // ============================================================================
 
 struct PrefillColdParams {
+  float lse_scale;
   float sm_scale;
   int num_tokens;
   size_t stride_kv_block;
@@ -82,6 +83,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                               const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                               bf16* __restrict__ output, float* __restrict__ out_lse,
                               __grid_constant__ const PrefillColdParams cold) {
+  const float lse_scale = cold.lse_scale;
   const float sm_scale = cold.sm_scale;
   const int num_tokens = cold.num_tokens;
   constexpr int page_block_size = PAGE_BLOCK_SIZE;
@@ -616,7 +618,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
           lse = sink_log2;
       }
       size_t lse_idx = (size_t)s_i * NUM_HEADS + h_start + h;
-      out_lse[lse_idx] = lse;
+      out_lse[lse_idx] = (lse != -1e30f) ? lse_scale * lse : lse;
     }
   }
 }
@@ -665,6 +667,7 @@ __device__ __forceinline__ void prefill_mg_impl(
   constexpr int MG_N_HG = MG_N_HG_T;
   constexpr int MG_HEADS_PER_CTA = MG_N_HG_T * HPB;
 
+  const float lse_scale = cold.lse_scale;
   const float sm_scale = cold.sm_scale;
   const int num_tokens = cold.num_tokens;
   const size_t stride_kv_block = cold.stride_kv_block;
@@ -1631,7 +1634,7 @@ __device__ __forceinline__ void prefill_mg_impl(
             lse = sink_log2;
         }
         size_t lse_idx = (size_t)s_i * NUM_HEADS + (h_start + g * HPB + h);
-        out_lse[lse_idx] = lse;
+        out_lse[lse_idx] = (lse != -1e30f) ? lse_scale * lse : lse;
       }
 
       if (g < MG_N_HG - 1) bar_sync_t<2, MATH_THREADS>();
