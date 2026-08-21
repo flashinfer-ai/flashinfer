@@ -202,6 +202,7 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
@@ -992,6 +993,13 @@ _EP_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if runner_cls.supports_expert_parallelism
 }
+# Backend config classes whose runner returns unfinalized intermediates. No
+# declared capability flag exists, so key off the TRTLLM runner base.
+_UNFINALIZED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if issubclass(runner_cls, _TrtllmRunnerBase)
+}
 _UNPACKED_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -1566,6 +1574,33 @@ _CURATED = [
             ("fp32", seed_base + 1),
         )
     ],
+    # PackedPrecomputed + unfinalized coverage. Packed ids encode BF16 routing
+    # weights, but FP4 borrows topk_weights instead of allocating its own buffer.
+    # The value assertion below guards the returned weights across all TRTLLM
+    # variants and catches an invalid FP4 buffer.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.RenormalizeNaive,
+            routing_input_mode="prerouted",
+            do_finalize=False,
+        )
+        for variant, seed in (
+            ("bf16", 900_070),
+            ("fp8pertensor", 900_071),
+            ("deepseekfp8", 900_072),
+            ("mxint4", 900_073),
+            ("nvfp4", 900_074),
+            ("mxfp8", 900_075),
+        )
+    ],
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:
@@ -1898,6 +1933,10 @@ def test_unified_moe_fuzz(cfg):
         # Backends that accept separate tensors through their own ABI are not
         # implementations of RoutingInputMode.UnpackedPrecomputed.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
+    if not cfg.do_finalize:
+        # Only TRTLLM returns unfinalized intermediates; like the EP filter
+        # below, this keeps an unsupported arch on the precise skip path.
+        wired_backends = [B for B in wired_backends if B in _UNFINALIZED_BACKENDS]
     if cfg.is_ep:
         # An EP shard needs the runner to map global ids onto a local expert subset;
         # backends without that capability (CUTLASS, b12x) would fail MoELayer's

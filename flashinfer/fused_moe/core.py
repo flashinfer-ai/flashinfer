@@ -3765,6 +3765,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     device=hidden_states.device,
                 )
             if topk_weights is None:
+                # FP4BlockScaleLauncher borrows this buffer instead of allocating
+                # FusedMoeLauncher::expert_weights. Keep it non-empty so
+                # do_finalize=False can return valid weights; the routing kernel
+                # fills it for both FromLogits and PackedPrecomputed.
                 topk_weights = torch.empty(
                     num_tokens,
                     top_k + num_fused_shared_experts,

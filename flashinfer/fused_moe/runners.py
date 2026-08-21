@@ -1448,12 +1448,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
-            # the raw op declares it non-Optional.  The high-level wrapper allocates
-            # an empty bf16 placeholder here; we mirror that since we bypass it.
-            expert_weights = act.topk_weights.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # FP4 borrows this buffer but leaves its returned FFI slot undefined.
+            # Supply the packed weights so _unpack_trtllm_moe_output() can return
+            # them directly for do_finalize=False. Use BF16 to match the weights
+            # encoded in topk_ids.
+            expert_weights = act.topk_weights.to(torch.bfloat16).contiguous()
         elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
             # UnpackedPrecomputed: both routing tensors are caller-owned kernel
             # inputs. Keep global ids intact; the launcher applies
