@@ -268,7 +268,7 @@ _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 
 
 def enumerate_grouped_q_mma_candidates(
-    *, heads_q_per_kv: int, seq_len_q: int
+    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
 ) -> tuple[GroupedQMmaCandidate, ...]:
     """Return grouped-Q candidates without applying launch policy.
 
@@ -276,7 +276,8 @@ def enumerate_grouped_q_mma_candidates(
     leave structural padding rows and the final CTA may own fewer tokens than
     its capacity; the common Q geometry and row masks already represent both
     cases.  This helper deliberately does not inspect dtypes, reduction modes,
-    scheduler state, or mutate ``FmhaDecodeConfig``.
+    scheduler state, or mutate ``FmhaDecodeConfig``. ``swaps_only`` excludes
+    KeepsMmaAb tiles for profiles such as transformed mixed-precision K/V.
     """
     if heads_q_per_kv <= 0:
         raise ValueError("heads_q_per_kv must be positive")
@@ -285,6 +286,8 @@ def enumerate_grouped_q_mma_candidates(
 
     candidates = []
     for variant, tile_size_q in _GROUPED_Q_MMA_TILES:
+        if swaps_only and variant != "swaps_mma_ab":
+            continue
         if tile_size_q < heads_q_per_kv:
             continue
         q_tokens_per_cta = tile_size_q // heads_q_per_kv
@@ -2710,7 +2713,18 @@ def _apply_auto_grouped_q_mma_config(
     SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
     caller-provided MMA fields retain the existing path. Explicit fanout
     controls bypass this selector together with explicit launch and MMA fields.
+    The compact H64 paged mixed-precision profile shares this selection path,
+    but considers only SwapsMmaAb because transform-KV does not support Keeps.
     """
+    is_h64_paged_mixed_q_len = (
+        cfg.headdim == 64
+        and seq_len_q > 1
+        and cfg.use_transform_kv
+        and cfg.use_paged_kv
+    )
+    is_default_grouped_q_profile = (
+        cfg.use_paged_kv and cfg.num_tokens_per_page == 32 and cfg.mask_type == CAUSAL
+    )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
@@ -2718,8 +2732,7 @@ def _apply_auto_grouped_q_mma_config(
         or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
-        or cfg.mask_type != CAUSAL
+        or not (is_default_grouped_q_profile or is_h64_paged_mixed_q_len)
         or cfg.use_sliding_window_causal
         or cfg.use_attention_sinks
         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
@@ -2732,6 +2745,7 @@ def _apply_auto_grouped_q_mma_config(
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
+        swaps_only=cfg.use_transform_kv,
     )
     if not candidates:
         return None
@@ -3660,43 +3674,19 @@ def make_decode_config(
             "fixed-Q max_seq_len_q must equal seq_len_q; use "
             "use_variable_seqlens_q for a runtime-varying Q length"
         )
-    is_h64_paged_mixed_q_len = _is_h64_paged_mixed_q_len(
-        cfg=cfg,
+    grouped_q_launch = _apply_auto_grouped_q_mma_config(
+        cfg,
+        explicit_fields=explicit_fields,
+        auto_tuner=auto_tuner,
+        split_kv_mode=split_kv_mode,
         seq_len_q=seq_len_q,
-        qkv_layout=qkv_layout,
+        seq_len_kv=seq_len_kv,
+        batch_size=batch_size,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        splits_kv=splits_kv,
+        max_splits_kv=max_splits_kv,
     )
-    grouped_q_launch = None
-    if auto_tuner and is_h64_paged_mixed_q_len:
-        tile_fields = _swaps_tile_fields_for_heads(
-            num_heads_q * seq_len_q,
-            num_heads_kv,
-            groups_tokens_heads_q=True,
-        )
-        # The measured batch-4 point uses Q16 to reduce correction pressure.
-        if batch_size == 4:
-            tile_fields = {
-                "tile_size_q": 16,
-                "tmem_s_cols": 16,
-                "tmem_o_cols": 16,
-                "mma_tile_n_bmm1": 16,
-                "mma_tile_n_bmm2": 16,
-            }
-        for field_name, value in tile_fields.items():
-            _set_if_implicit(cfg, field_name, value, explicit_fields)
-    else:
-        grouped_q_launch = _apply_auto_grouped_q_mma_config(
-            cfg,
-            explicit_fields=explicit_fields,
-            auto_tuner=auto_tuner,
-            split_kv_mode=split_kv_mode,
-            seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
-            batch_size=batch_size,
-            num_heads_q=num_heads_q,
-            num_heads_kv=num_heads_kv,
-            splits_kv=splits_kv,
-            max_splits_kv=max_splits_kv,
-        )
     _finalize_static_decode_config(cfg, explicit_fields)
     if not cfg.use_variable_seqlens_q:
         validate_causal_decode_lengths(
