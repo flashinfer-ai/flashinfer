@@ -987,6 +987,10 @@ def fp8_paged_mqa_logits(
                          >= max_context_len and is a multiple of SPLIT_KV=256.
                          If None, allocated each call.  Use padded_context_len()
                          to size it.  Required for CUDA graph capture.
+                         May have more rows than batch_size*next_n, so one
+                         address-stable max-batch buffer can be shared across
+                         captures; only the first batch_size*next_n rows are
+                         written and returned.
 
     Returns:
         logits: [batch_size*next_n, max_context_len]  output_dtype
@@ -1032,7 +1036,7 @@ def fp8_paged_mqa_logits(
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
-        logits = out[:, :max_context_len]
+        logits = out[: B * next_n, :max_context_len]
     else:
         logits_full = torch.empty(
             (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
@@ -1283,7 +1287,10 @@ def fp4_paged_mqa_logits(
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len].  Use
                          padded_context_len() to size it.  Required for CUDA
-                         graph capture.
+                         graph capture.  May have more rows than
+                         batch_size*next_n, so one address-stable max-batch
+                         buffer can be shared across captures; only the first
+                         batch_size*next_n rows are written and returned.
 
     Returns:
         logits: [batch_size*next_n, max_context_len]  output_dtype
@@ -1335,7 +1342,7 @@ def fp4_paged_mqa_logits(
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
-        logits = out[:, :max_context_len]
+        logits = out[: B * next_n, :max_context_len]
     else:
         logits_full = torch.empty(
             (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
