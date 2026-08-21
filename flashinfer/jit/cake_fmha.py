@@ -19,6 +19,7 @@ from .core import (
 )
 
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
+CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
     "64ef68043bedb06e7984401c8cffbe1b2a24f42bc86bdcd8c05563d8fdb0cc2e"
@@ -325,6 +326,7 @@ def _validate_context_specialization(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
+    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> dict[str, int]:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
@@ -344,11 +346,58 @@ def _validate_context_specialization(
         raise ValueError("l2_swizzle must be 1 or 8")
     if enable_sink and return_lse:
         raise ValueError("the pinned context contract excludes sink plus LSE")
-    return {
+    selector = {
         "ENABLE_SINK": int(enable_sink),
         "IS_CAUSAL": int(is_causal),
         "RETURN_LSE": int(return_lse),
     }
+    if exact_profile is None:
+        return selector
+    exact = {
+        "q511": {
+            "expected": (11, 10, 2, 5, 32, 1),
+            "selector": {
+                "HEADS_PER_GROUP": 5,
+                "L2_SWIZZLE": 1,
+                "NUM_M_BLOCKS": 11,
+                "NUM_Q_HEADS": 10,
+                "PACK_G": 5,
+                "PAGE_SIZE": 32,
+                "SINGLE_MASK_LOOP": 1,
+                "TOK_PER_STAGE": 25,
+            },
+        },
+        "q257": {
+            "expected": (6, 10, 2, 5, 1024, 8),
+            "selector": {
+                "HEADS_PER_GROUP": 5,
+                "L2_SWIZZLE": 8,
+                "NUM_M_BLOCKS": 6,
+                "NUM_Q_HEADS": 10,
+                "PACK_G": 5,
+                "PAGE_SIZE": 1024,
+                "SINGLE_MASK_LOOP": 1,
+                "TOK_PER_STAGE": 25,
+            },
+        },
+    }[exact_profile]
+    actual = (
+        num_m_blocks,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        page_size,
+        l2_swizzle,
+    )
+    if actual != exact["expected"] or selector != {
+        "ENABLE_SINK": 0,
+        "IS_CAUSAL": 1,
+        "RETURN_LSE": 0,
+    }:
+        raise ValueError(
+            f"context BF16 exact profile {exact_profile} does not match its fixed selector"
+        )
+    return {**selector, **exact["selector"]}
 
 
 def get_cake_fmha_context_bf16_uri(
@@ -363,6 +412,7 @@ def get_cake_fmha_context_bf16_uri(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
+    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> str:
     selector = _validate_context_specialization(
         target,
@@ -375,6 +425,7 @@ def get_cake_fmha_context_bf16_uri(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
+        exact_profile=exact_profile,
     )
     return (
         f"cake_fmha_context_bf16_{target}"
@@ -382,6 +433,7 @@ def get_cake_fmha_context_bf16_uri(
         f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
         f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
         f"_sink{selector['ENABLE_SINK']}"
+        f"_exact{exact_profile or 'generic'}"
         f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
         f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
     )
@@ -400,6 +452,7 @@ def gen_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
+    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> JitSpec:
     """Build one authenticated context BF16 specialization."""
 
@@ -414,6 +467,7 @@ def gen_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
+        exact_profile=exact_profile,
     )
     sources = _get_component_sources(
         "context_bf16", target, selector, _CONTEXT_BF16_JIT_BINDING
@@ -432,6 +486,7 @@ def gen_cake_fmha_context_bf16_module(
             is_causal=is_causal,
             return_lse=return_lse,
             enable_sink=enable_sink,
+            exact_profile=exact_profile,
         ),
         sources=list(sources),
         extra_cuda_cflags=[
@@ -467,6 +522,7 @@ def load_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
+    exact_profile: CakeFmhaContextExactProfile | None = None,
 ):
     module = gen_cake_fmha_context_bf16_module(
         target,
@@ -479,6 +535,7 @@ def load_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
+        exact_profile=exact_profile,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context BF16 module: %s", module)
     return module

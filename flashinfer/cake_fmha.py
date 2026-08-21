@@ -79,6 +79,7 @@ class CakeFmhaContextRoute:
     is_causal: bool
     return_lse: bool
     enable_sink: bool
+    exact_profile: Literal["q511", "q257"] | None = None
 
 
 # These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
@@ -955,6 +956,77 @@ def _context_nvfp4_workspace_supported(
     return workspace_buffer.numel() * workspace_buffer.element_size() >= required
 
 
+def _context_bf16_exact_profile(
+    query: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    *,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    uses_shared_paged_kv_idx: bool,
+    is_causal: bool,
+    return_lse: bool,
+    enable_sink: bool,
+    kv_layout: str,
+) -> Literal["q511", "q257"] | None:
+    """Resolve the two measured mask-loop bodies from exact runtime lengths."""
+
+    common = (
+        batch_size == 4
+        and num_q_heads == 10
+        and num_kv_heads == 2
+        and is_causal
+        and not return_lse
+        and not enable_sink
+        and kv_layout == "HND"
+        and seq_lens.device == query.device
+        and cum_seq_lens_q.device == query.device
+    )
+    if not common:
+        return None
+    profile: Literal["q511", "q257"]
+    if (
+        max_q_len == 511
+        and max_kv_len == 2047
+        and page_size == 32
+        and uses_shared_paged_kv_idx
+        and query.shape[0] == 4 * 511
+    ):
+        profile = "q511"
+        expected_q_len = 511
+        expected_kv_len = 2047
+    elif (
+        max_q_len == 257
+        and max_kv_len == 1024
+        and page_size == 1024
+        and not uses_shared_paged_kv_idx
+        and query.shape[0] == 4 * 257
+    ):
+        profile = "q257"
+        expected_q_len = 257
+        expected_kv_len = 1024
+    else:
+        return None
+    if query.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return None
+    try:
+        kv_lengths = [int(value) for value in seq_lens.detach().cpu().tolist()]
+        q_indptr = [
+            int(value) for value in cum_seq_lens_q.detach().cpu().tolist()
+        ]
+    except RuntimeError:
+        return None
+    if kv_lengths != [expected_kv_len] * batch_size:
+        return None
+    if q_indptr != [index * expected_q_len for index in range(batch_size + 1)]:
+        return None
+    return profile
+
+
 def select_cake_fmha_context_route(
     device: torch.device,
     *,
@@ -1147,6 +1219,24 @@ def select_cake_fmha_context_route(
     if component is None:
         return None
 
+    exact_profile = None
+    if component == "context_bf16":
+        exact_profile = _context_bf16_exact_profile(
+            query,
+            seq_lens,
+            cum_seq_lens_q,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=page_size,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            is_causal=is_causal,
+            return_lse=lse is not None,
+            enable_sink=sinks is not None,
+            kv_layout=kv_layout,
+        )
     if component in ("context_fp16_hd256", "context_fp8_hd256"):
         pack_g = 1
         num_m_blocks = (max_q_len + 127) // 128
@@ -1157,6 +1247,8 @@ def select_cake_fmha_context_route(
         num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
         total_bh = batch_size * (num_q_heads // pack_g)
         l2_swizzle = 8 if total_bh % 8 == 0 else 1
+    if exact_profile == "q511":
+        l2_swizzle = 1
     if component == "context_nvfp4" and not _context_nvfp4_workspace_supported(
         workspace_buffer,
         key_cache,
@@ -1177,6 +1269,7 @@ def select_cake_fmha_context_route(
         is_causal=is_causal,
         return_lse=lse is not None,
         enable_sink=sinks is not None,
+        exact_profile=exact_profile,
     )
 
 
@@ -1240,6 +1333,7 @@ def get_cake_fmha_context_module(
         is_causal=route.is_causal,
         return_lse=route.return_lse,
         enable_sink=route.enable_sink,
+        exact_profile=route.exact_profile,
     )
 
 

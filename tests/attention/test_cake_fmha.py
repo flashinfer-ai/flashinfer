@@ -401,6 +401,68 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
     assert "-DTOK_PER_STAGE=64" in spec.extra_cuda_cflags
 
 
+@pytest.mark.parametrize(
+    ("profile", "args", "expected"),
+    [
+        (
+            "q511",
+            ("sm100a", 11, 10, 2, 5, 32, 1),
+            {
+                "ENABLE_SINK": 0,
+                "HEADS_PER_GROUP": 5,
+                "IS_CAUSAL": 1,
+                "L2_SWIZZLE": 1,
+                "NUM_M_BLOCKS": 11,
+                "NUM_Q_HEADS": 10,
+                "PACK_G": 5,
+                "PAGE_SIZE": 32,
+                "RETURN_LSE": 0,
+                "SINGLE_MASK_LOOP": 1,
+                "TOK_PER_STAGE": 25,
+            },
+        ),
+        (
+            "q257",
+            ("sm103a", 6, 10, 2, 5, 1024, 8),
+            {
+                "ENABLE_SINK": 0,
+                "HEADS_PER_GROUP": 5,
+                "IS_CAUSAL": 1,
+                "L2_SWIZZLE": 8,
+                "NUM_M_BLOCKS": 6,
+                "NUM_Q_HEADS": 10,
+                "PACK_G": 5,
+                "PAGE_SIZE": 1024,
+                "RETURN_LSE": 0,
+                "SINGLE_MASK_LOOP": 1,
+                "TOK_PER_STAGE": 25,
+            },
+        ),
+    ],
+)
+def test_cake_fmha_context_bf16_exact_profile_selector(
+    profile, args, expected
+) -> None:
+    from flashinfer.jit import cake_fmha as cake_jit
+
+    assert cake_jit._validate_context_specialization(
+        *args,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+        exact_profile=profile,
+    ) == expected
+    with pytest.raises(ValueError, match="does not match its fixed selector"):
+        cake_jit._validate_context_specialization(
+            *args[:-1],
+            8 if args[-1] == 1 else 1,
+            is_causal=True,
+            return_lse=False,
+            enable_sink=False,
+            exact_profile=profile,
+        )
+
+
 def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> None:
     import flashinfer.jit.core as jit_core
 
@@ -1201,6 +1263,43 @@ def test_cake_fmha_context_candidate_selection_for_adapter_families(monkeypatch)
     assert cake_api.cake_fmha_route_is_optimized(nvfp4_route)
 
 
+def test_cake_fmha_context_bf16_exact_route_loads_exact_member(monkeypatch) -> None:
+    sentinel = object()
+    observed = {}
+
+    def load(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", load)
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_bf16",
+        num_m_blocks=11,
+        num_q_heads=10,
+        num_kv_heads=2,
+        pack_g=5,
+        page_size=32,
+        l2_swizzle=1,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+        exact_profile="q511",
+    )
+    assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
+    assert observed == {
+        "args": ("sm103a", 11, 10, 2, 5, 32, 1),
+        "kwargs": {
+            "is_causal": True,
+            "return_lse": False,
+            "enable_sink": False,
+            "exact_profile": "q511",
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("component", "loader_name"),
     [
@@ -1576,6 +1675,97 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         lse=None,
     ) == fp8_route
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
+
+
+@pytest.mark.parametrize(
+    (
+        "profile",
+        "q_len",
+        "kv_len",
+        "page_size",
+        "uses_shared",
+        "num_m_blocks",
+        "l2_swizzle",
+    ),
+    [
+        ("q511", 511, 2047, 32, True, 11, 1),
+        ("q257", 257, 1024, 1024, False, 6, 8),
+    ],
+)
+def test_cake_context_exact_mask_profile_requires_uniform_runtime_lengths(
+    monkeypatch,
+    profile,
+    q_len,
+    kv_len,
+    page_size,
+    uses_shared,
+    num_m_blocks,
+    l2_swizzle,
+) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    batch_size = 4
+    query = torch.empty((batch_size * q_len, 10, 128), dtype=torch.bfloat16)
+    pages_per_sequence = (kv_len + page_size - 1) // page_size
+    key = torch.empty(
+        (batch_size * 2 * pages_per_sequence, 2, page_size, 128),
+        dtype=torch.bfloat16,
+    )
+    block_tables = (
+        torch.zeros((batch_size, pages_per_sequence), dtype=torch.int32)
+        if uses_shared
+        else torch.zeros((batch_size, 2, pages_per_sequence), dtype=torch.int32)
+    )
+    kwargs = dict(
+        query=query,
+        key_cache=key,
+        value_cache=torch.empty_like(key),
+        out=torch.empty_like(query),
+        block_tables=block_tables,
+        seq_lens=torch.full((batch_size,), kv_len, dtype=torch.int32),
+        batch_size=batch_size,
+        max_q_len=q_len,
+        max_kv_len=kv_len,
+        window_left=-1,
+        bmm1_scale=0.125,
+        bmm2_scale=1.0,
+        sinks=None,
+        uses_shared_paged_kv_idx=uses_shared,
+        cum_seq_lens_q=torch.arange(
+            0, (batch_size + 1) * q_len, q_len, dtype=torch.int32
+        ),
+        cum_seq_lens_kv=torch.arange(
+            0, (batch_size + 1) * kv_len, kv_len, dtype=torch.int32
+        ),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        is_causal=True,
+        lse=None,
+        kv_layout="HND",
+    )
+    route = cake_api.select_cake_fmha_context_route(query.device, **kwargs)
+    assert route == cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_bf16",
+        num_m_blocks=num_m_blocks,
+        num_q_heads=10,
+        num_kv_heads=2,
+        pack_g=5,
+        page_size=page_size,
+        l2_swizzle=l2_swizzle,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+        exact_profile=profile,
+    )
+
+    nonuniform = kwargs["seq_lens"].clone()
+    nonuniform[-1] -= 1
+    generic = cake_api.select_cake_fmha_context_route(
+        query.device, **{**kwargs, "seq_lens": nonuniform}
+    )
+    assert generic is not None
+    assert generic.exact_profile is None
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:
