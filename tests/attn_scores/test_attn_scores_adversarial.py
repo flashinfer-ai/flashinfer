@@ -593,3 +593,128 @@ def test_adv_zero_length_row_not_executed(variant):
         f"the ctx=0 row had {n_written}/{empty.numel()} elements written: the "
         "zero-length row was executed instead of skipped"
     )
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_adv_interspersed_zero_row_uses_correct_q(variant):
+    """A row FOLLOWING a skipped zero-length row must use its own Q/W.
+
+    The six task-advance blocks skip ctx==0 rows, but TMA warp 0's producer
+    lookahead prefetches the next row for Q/SF_Q/W. If that lookahead is a raw
+    ``q_idx + 1`` it stages the skipped row's tensors, and the row after the gap
+    consumes them -- wrong logits with no hang, because the stage counts still
+    balance.
+
+    A *trailing* zero cannot expose this (the ``prefetch_next < end_q_idx`` guard
+    suppresses the bad fetch), which is why the shape here is interspersed and
+    sized so one CTA's range spans the gap: with ctx=[128, 0, S*256] and
+    S=num_sms the schedule gives CTA 0 two segments covering rows 0 -> 2.
+
+    Per-row weights differ, so consuming the wrong row's W is unmissable.
+    Regression for PR #4365 review r3824800923 / r3824808841.
+    """
+    _skip_if_not_sm100()
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_num_sms
+    from flashinfer.utils import get_device_index
+
+    from tests.attn_scores.test_attn_scores import (
+        _cast_back_from_fp4,
+        _ceil_to_ue8m0_fp,
+        _kv_cache_cast_to_fp4,
+        _make_fused_kv_fp8,
+        _per_token_cast_to_fp4,
+        _ref_fp4_paged_mqa_logits,
+        _ref_fp8_paged_mqa_logits,
+    )
+
+    torch.manual_seed(11)
+    S = _cached_num_sms(get_device_index(torch.device(DEVICE)))
+    H, D, block_size, next_n = 64, 128, 64, 1
+    ctx = [128, 0, S * 256]
+    B = len(ctx)
+    max_ml = max(ctx)
+
+    cl = torch.tensor(ctx, dtype=torch.int32, device=DEVICE)
+    nblk = [-(-c // block_size) for c in ctx]
+    bt = torch.zeros((B, max(nblk)), dtype=torch.int32, device=DEVICE)
+    run = 0
+    for b, n in enumerate(nblk):
+        for j in range(n):
+            bt[b, j] = run
+            run += 1
+    ntb = max(run, 1)
+
+    # distinct per row: reducing with a neighbour's weights changes the result
+    weights = torch.empty(B * next_n, H, device=DEVICE, dtype=torch.float32)
+    for b in range(B):
+        weights[b] = float(b + 1)
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=DEVICE).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(ntb, block_size, D, device=DEVICE)
+        kv_scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        ref = _ref_fp8_paged_mqa_logits(
+            q,
+            kv_fp8,
+            kv_scale,
+            weights,
+            cl,
+            bt,
+            max_ml,
+            block_size,
+            out_dtype=torch.float32,
+        )
+        out = fp8_paged_mqa_logits(
+            q,
+            _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, D),
+            weights,
+            cl,
+            bt,
+            max_ml,
+        )
+    else:
+        q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
+        q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+        q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+        sf_q = sf_q_packed.view(torch.int32).view(B, next_n, H)
+        q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(
+            B, next_n, H, D
+        )
+        kv_cache = torch.randn(
+            ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16
+        )
+        kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+        ref = _ref_fp4_paged_mqa_logits(
+            q_sim.float(), kv_sim.float(), weights, cl, bt, max_ml
+        )
+        out = fp4_paged_mqa_logits(
+            q_fp4,
+            sf_q,
+            kv_fused,
+            weights,
+            cl,
+            bt,
+            max_ml,
+            output_dtype=torch.float32,
+        )
+    torch.cuda.synchronize()
+
+    # Row 2 is the one after the gap. Compare it on its own valid positions.
+    for b, n in enumerate(ctx):
+        if n == 0:
+            continue
+        a = out[b, :n].float()
+        r = ref[b, :n].float()
+        finite = torch.isfinite(a) & torch.isfinite(r)
+        assert finite.any(), f"row {b} produced no finite logits"
+        scale = float(r[finite].abs().max()) or 1.0
+        rel = float((a[finite] - r[finite]).abs().max()) / scale
+        assert rel < 1e-3, (
+            f"{variant} row {b} (ctx={n}) differs from the reference by "
+            f"{rel:.2e} relative: the row after a skipped zero-length row is "
+            "consuming the skipped row's Q/weights"
+        )
