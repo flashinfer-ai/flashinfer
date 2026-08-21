@@ -126,6 +126,14 @@ def _prepare_trtllm_weight(
     return weight, weight_q, weight_sf
 
 
+def test_prepare_mxfp8_trtllm_weights_rejects_cpu_tensors() -> None:
+    weight = torch.empty((128, 256), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((128 * 8,), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="must be CUDA tensors"):
+        prepare_mxfp8_trtllm_weights(weight, weight_scale)
+
+
 def test_prepare_mxfp8_trtllm_weights_pads_non_128_aligned_n(
     blackwell_cuda: None,
 ) -> None:

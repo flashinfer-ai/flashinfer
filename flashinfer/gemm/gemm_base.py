@@ -5756,6 +5756,8 @@ def prepare_mxfp8_trtllm_weights(
     n, k = weight.shape
     if weight.dtype != torch.float8_e4m3fn or weight_scale.dtype != torch.uint8:
         raise ValueError("weight and weight_scale must use MXFP8 storage")
+    if weight.device.type != "cuda":
+        raise ValueError("weight and weight_scale must be CUDA tensors")
     if weight.device != weight_scale.device:
         raise ValueError("weight and weight_scale must be on the same CUDA device")
     if not weight.is_contiguous() or not weight_scale.is_contiguous():
@@ -5770,24 +5772,25 @@ def prepare_mxfp8_trtllm_weights(
             f"expected {n * (k // 32)}, got {weight_scale.numel()}"
         )
 
-    linear_scale = weight_scale.reshape(n, k // 32)
-    padded_n = _pad_up(n, 128)
-    if padded_n != n:
-        padding = torch.full(
-            (padded_n - n, k // 32),
-            127,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        )
-        linear_scale = torch.cat((linear_scale, padding), dim=0)
+    with torch.cuda.device(weight.device):
+        linear_scale = weight_scale.reshape(n, k // 32)
+        padded_n = _pad_up(n, 128)
+        if padded_n != n:
+            padding = torch.full(
+                (padded_n - n, k // 32),
+                127,
+                dtype=weight_scale.dtype,
+                device=weight_scale.device,
+            )
+            linear_scale = torch.cat((linear_scale, padding), dim=0)
 
-    prepared_weight = shuffle_matrix_a(weight, 128).reshape(n, k).T
-    prepared_scale = shuffle_matrix_sf_a(
-        linear_scale,
-        128,
-        num_elts_per_sf=32,
-    ).reshape(-1)
-    return prepared_weight, prepared_scale
+        prepared_weight = shuffle_matrix_a(weight, 128).reshape(n, k).T
+        prepared_scale = shuffle_matrix_sf_a(
+            linear_scale,
+            128,
+            num_elts_per_sf=32,
+        ).reshape(-1)
+        return prepared_weight, prepared_scale
 
 
 class _TrtllmDynamicQuantMxfp8Runner(TunableRunner):
