@@ -166,6 +166,31 @@ def test_long_prefill_predicate_covers_flat_and_paged_boundaries() -> None:
     )
 
 
+def test_long_prefill_temperature_lse_requires_unit_scale() -> None:
+    logits = torch.tensor([-2.5, -0.25, 1.5], dtype=torch.float32)
+    ordinary_lse = torch.logsumexp(logits, dim=0)
+    unit_temperature_lse = torch.logsumexp(logits * 1.0, dim=0)
+    torch.testing.assert_close(unit_temperature_lse, ordinary_lse, rtol=0, atol=0)
+
+    common = dict(
+        requested_schedule="",
+        batch_size=1,
+        total_q=8192,
+        paged=False,
+        group_size=16,
+        max_pages=0,
+        k_outer_dim=8192,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
+        causal=True,
+        q_offset_is_none=True,
+        return_temperature_lse=True,
+    )
+    assert _should_use_long_prefill(**common, lse_temperature_scale=1.0)
+    assert not _should_use_long_prefill(**common, lse_temperature_scale=0.7)
+
+
 def test_uniform_fp8_grid_uses_full_even_wave_when_available() -> None:
     assert (
         _uniform_fp8_decode_grid(total_work_items=256, num_sms=148, seqlen_q=4) == 128

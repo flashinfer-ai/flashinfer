@@ -856,6 +856,7 @@ def _verify_public_outputs(
         return {
             "status": "failed",
             "passed": False,
+            "reference": "pinned_public_fmha_sm100_sparse_atten_func",
             "candidate_public_api": candidate_api,
             "baseline_public_api": baseline_api,
             "same_q_k_v_tensor_objects": True,
@@ -870,6 +871,8 @@ def _verify_public_outputs(
             **tolerance,
             "max_abs_error": None,
             "mismatch_count": None,
+            "candidate_nonfinite_count": None,
+            "baseline_nonfinite_count": None,
         }
 
     candidate_float = candidate_output.float()
@@ -1038,6 +1041,9 @@ def _verify_candidate_reference(
             "passed": False,
             "reference": "independent_torch_fp32_masked_attention",
             "candidate_public_api": candidate_api,
+            "same_q_k_v_tensor_objects": True,
+            "same_sequence_metadata_tensor_objects": True,
+            "same_page_table_argument": True,
             "expected_shape": list(expected_shape),
             "candidate_shape": list(candidate_output.shape),
             "reference_shape": list(reference_output.shape),
@@ -1046,6 +1052,8 @@ def _verify_candidate_reference(
             **tolerance,
             "max_abs_error": None,
             "mismatch_count": None,
+            "candidate_nonfinite_count": None,
+            "reference_nonfinite_count": None,
         }
 
     candidate_float = candidate_output.float()
@@ -1438,6 +1446,7 @@ def _run_parent(args: argparse.Namespace) -> None:
     expected_measurements: list[tuple[str, str]] = []
     with tempfile.TemporaryDirectory(prefix="flashinfer-msa-bench-") as temp_dir:
         temp_root = Path(temp_dir)
+        comparable_index = 0
         for index, shape in enumerate(selected_shapes):
             comparable = shape.baseline_comparable
             reference_kind = (
@@ -1459,12 +1468,14 @@ def _run_parent(args: argparse.Namespace) -> None:
                     f"{correctness_worker['correctness']}"
                 )
             correctness = correctness_worker["correctness"]
-            if comparable and index % 2 == 0:
+            if comparable and comparable_index % 2 == 0:
                 process_order = ("minimax", "flashinfer")
             elif comparable:
                 process_order = ("flashinfer", "minimax")
             else:
                 process_order = ("flashinfer",)
+            if comparable:
+                comparable_index += 1
             print(
                 f"Measuring {shape.stable_id} ({', '.join(process_order)})",
                 flush=True,

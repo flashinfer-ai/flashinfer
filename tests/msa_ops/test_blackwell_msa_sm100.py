@@ -550,21 +550,22 @@ CASES = [
 
 
 def _require_supported_gpu() -> torch.device:
+    from flashinfer.utils import get_compute_capability, version_at_least
+
     if not torch.cuda.is_available():
         pytest.skip("requires an SM100 or SM103 CUDA device")
     device = torch.device("cuda")
-    capability = torch.cuda.get_device_capability(device)
-    minimum_cuda = {(10, 0): (12, 8), (10, 3): (12, 9)}.get(capability)
+    capability = get_compute_capability(device)
+    minimum_cuda = {(10, 0): "12.8", (10, 3): "12.9"}.get(capability)
     if minimum_cuda is None:
         pytest.skip("requires compute capability 10.0 or 10.3")
     cuda_version = torch.version.cuda
     if cuda_version is None:
         pytest.skip("requires a CUDA-enabled PyTorch build")
-    version = tuple(int(part) for part in cuda_version.split(".")[:2])
-    if version < minimum_cuda:
+    if not version_at_least(cuda_version, minimum_cuda):
         pytest.skip(
             f"compute capability {capability[0]}.{capability[1]} requires "
-            f"CUDA {minimum_cuda[0]}.{minimum_cuda[1]} or newer"
+            f"CUDA {minimum_cuda} or newer"
         )
     return device
 

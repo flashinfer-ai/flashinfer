@@ -55,6 +55,15 @@ requires a caller-owned
 :class:`flashinfer.msa_ops.MSASparseAttentionWorkspace`. Warm the workspace
 eagerly with the exact tensors, options, and capture stream before capture.
 
+Normal callers should leave the Blackwell schedule environment variables
+unset. For advanced diagnostics and benchmarking,
+``FLASHINFER_MSA_PREFILL_SCHEDULE=m64`` forces the eligible M64 prefill
+schedule. ``FLASHINFER_MSA_FP8_Q1_SCHEDULE`` can select
+``batch_attention``, ``q1_exact``, ``q1_flat_xform2``,
+``q1_paged_xform2``, or ``paged_uniform_fp8`` for an eligible FP8 Q1 route.
+Unsupported values, or a schedule incompatible with the input layout and
+dtypes, raise :class:`ValueError`.
+
 .. currentmodule:: flashinfer.msa_ops
 
 .. autosummary::
