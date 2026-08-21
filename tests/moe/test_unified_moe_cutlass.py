@@ -374,6 +374,35 @@ def test_cutlass_activation_params_derived_when_build_did_not_cache_them():
     assert step_resolved["swiglu_beta"] is None
 
 
+def test_cutlass_derived_activation_params_are_cached():
+    # Repeated packing must reuse the same tensors: reallocating them would
+    # invalidate the raw pointers captured by an existing CUDA graph.
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0))
+    runner.device = torch.device("cpu")
+
+    first = runner._resolve_activation_params({})
+    assert runner._config_activation_params is not None
+    second = runner._resolve_activation_params({})
+    for name in ("swiglu_alpha", "swiglu_beta", "swiglu_limit"):
+        assert first[name] is second[name]
+
+
+def test_cutlass_incomplete_activation_param_cache_is_rederived():
+    # An empty or partial mapping is uninitialized state, not a request for
+    # kernel defaults; resolving it must re-derive rather than drop the scalars.
+    for stale in ({}, {"swiglu_alpha": torch.full((4,), 9.0)}):
+        runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+        runner.config = _config(activation=SwiGLU(alpha=2.0, beta=1.0, limit=7.0))
+        runner.device = torch.device("cpu")
+        runner._config_activation_params = stale
+
+        resolved = runner._resolve_activation_params({})
+        torch.testing.assert_close(resolved["swiglu_alpha"], torch.full((4,), 2.0))
+        torch.testing.assert_close(resolved["swiglu_beta"], torch.full((4,), 1.0))
+        torch.testing.assert_close(resolved["swiglu_limit"], torch.full((4,), 7.0))
+
+
 def test_cutlass_per_expert_activation_overrides():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner.config = _config(activation=SwiGLU(alpha=2.0))

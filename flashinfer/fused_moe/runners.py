@@ -270,6 +270,14 @@ def _validate_prepared_activation_params(
         )
 
 
+# Canonical keys every _cutlass_activation_params() result carries. A cached
+# mapping missing any of them is treated as uninitialized rather than as a
+# request for kernel defaults.
+_CUTLASS_ACTIVATION_PARAM_KEYS = frozenset(
+    ("swiglu_alpha", "swiglu_beta", "swiglu_limit")
+)
+
+
 def _cutlass_activation_params(
     activation: ActivationConfig,
     num_experts: int,
@@ -574,15 +582,23 @@ class _CutlassRunnerBase(MoERunner):
         # _build() caches the config-derived scalars. Derive them on demand when
         # it has not run (or a subclass overrode it without calling super) so
         # resolution never raises, and never silently drops non-default typed
-        # activation semantics such as SwiGLU(alpha=1.7) by falling back to an
-        # empty mapping.
+        # activation semantics such as SwiGLU(alpha=1.7).
+        #
+        # Treat any mapping missing a canonical key as uninitialized, not just a
+        # missing attribute: an empty or partial cache would otherwise resolve to
+        # kernel defaults just as silently. Cache the result so repeated packing
+        # reuses the same tensors -- reallocating them would invalidate the raw
+        # pointers captured by an existing CUDA graph.
         config_params = getattr(self, "_config_activation_params", None)
-        if config_params is None:
+        if config_params is None or not set(config_params).issuperset(
+            _CUTLASS_ACTIVATION_PARAM_KEYS
+        ):
             config_params = _cutlass_activation_params(
                 self.config.activation,
                 self.config.routing.num_experts,
                 self.device,
             )
+            self._config_activation_params = config_params
         params = dict(config_params)
         aliases = {
             "gemm1_alpha": "swiglu_alpha",
