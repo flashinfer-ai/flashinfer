@@ -171,6 +171,40 @@ def _dsl_captured_arch() -> Optional[str]:
         return None
 
 
+def cute_dsl_compile_arch(major: int, minor: int) -> str:
+    r"""Return the arch name to pass to ``cute.GPUArch`` for a device.
+
+    Prefers the device's own arch (e.g. ``sm_107a``). When the installed DSL
+    predates the device but is targeting the family-conditional arch because
+    the user exported ``CUTE_DSL_ARCH=sm_100f``, returns that instead --
+    handing it ``sm_107a`` would raise ``KeyError`` from inside the DSL's
+    ``Arch`` enum, which is the failure this exists to prevent.
+
+    Raises :class:`NotImplementedError` when neither is available, so callers
+    fail with an actionable message instead of a bare ``KeyError``.
+    """
+    from cutlass.base_dsl.arch import Arch
+
+    for name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+        try:
+            Arch[name]
+            return name
+        except KeyError:
+            continue
+    # Native arch absent. is_cute_dsl_arch_supported returns True here only
+    # when the DSL is already targeting the family arch, which is exactly when
+    # compiling for it is valid.
+    if is_cute_dsl_arch_supported(major, minor):
+        family = _family_fallback_arch(major, minor)
+        if family is not None:
+            return family
+    raise NotImplementedError(
+        f"the installed CuTe DSL cannot target sm_{major}{minor}; export "
+        f"CUTE_DSL_ARCH=sm_{major}0f before starting the process to build "
+        f"family-portable kernels on this device"
+    )
+
+
 def require_cute_dsl_arch(device, native_only: bool = False) -> None:
     r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
     target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
