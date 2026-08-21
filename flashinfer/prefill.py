@@ -4292,6 +4292,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cudnn":
+            # The cuDNN path is NHD-only: the low level reads k.shape[1] as the
+            # kv head count, and the element->token indptr conversion below relies
+            # on k being [kv_tokens, num_kv_heads, head_dim]. Reject HND loudly
+            # rather than silently mis-scaling the offsets.
+            if self._kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cuDNN ragged prefill backend requires kv_layout='NHD'"
+                )
             if self._seq_lens_q.dim() == 1:
                 batch_size = self._seq_lens_q.shape[0]
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
