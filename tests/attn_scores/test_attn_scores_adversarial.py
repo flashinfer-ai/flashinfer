@@ -98,8 +98,19 @@ def _cmp_fp8(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("batch_size", [1, 7, 31, 32, 33, 63, 64, 65, 127, 128, 256])
-@pytest.mark.parametrize("dist", ["uniform", "skewed", "minimal", "twotier", "random"])
+# 2048 and 12288 cover the large-batch regime. The phase-3 partition search is
+# O(log kAligned), so these cost ~0.8s and ~7s to compile; with the linear scan
+# they were 139s and effectively unreachable.
+@pytest.mark.parametrize(
+    "batch_size", [1, 7, 31, 32, 33, 63, 64, 65, 127, 128, 256, 2048, 12288]
+)
+# "zeros"/"halfzeros" are the tie cases: a zero-length row contributes no
+# segments, which is the only way prefix_sum repeats a value. A partition
+# search that advanced on < rather than <= would undercount the duplicates.
+@pytest.mark.parametrize(
+    "dist",
+    ["uniform", "skewed", "minimal", "twotier", "random", "zeros", "halfzeros"],
+)
 def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     """The on-GPU schedule kernel must be BIT-EXACT vs the CPU reference for every
     batch size (incl. non-multiples of 32) and adversarial context distributions."""
@@ -124,6 +135,14 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
             torch.arange(batch_size, device=DEVICE) % 2 == 0,
             torch.tensor(131072, device=DEVICE),
             torch.tensor(128, device=DEVICE),
+        ).to(torch.int32)
+    elif dist == "zeros":
+        cl = torch.zeros(batch_size, dtype=torch.int32, device=DEVICE)
+    elif dist == "halfzeros":
+        cl = torch.where(
+            torch.arange(batch_size, device=DEVICE) % 2 == 0,
+            torch.tensor(0, device=DEVICE),
+            torch.tensor(4096, device=DEVICE),
         ).to(torch.int32)
     else:
         cl = torch.randint(1, 200000, (batch_size,), dtype=torch.int32, device=DEVICE)
