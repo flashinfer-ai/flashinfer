@@ -168,6 +168,76 @@ def _compute_sf_size(
         raise ValueError(f"Unsupported sf_layout: {sf_layout}")
 
 
+@pytest.mark.parametrize(
+    "invalid_kind,error_match",
+    [
+        ("cpu", "CUDA tensor"),
+        ("noncontiguous", "contiguous"),
+        ("dtype", "Tensor type"),
+        ("packed_dtype", "packed fp4"),
+        ("extent", "extent"),
+    ],
+)
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
+    num_tokens = 8
+    hidden_size = 64
+    payload = make_payload(num_tokens, hidden_size, torch.bfloat16)
+    routes = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
+    received, workspaces, metainfo, combine_offsets = dispatch_from_single_rank(
+        [payload], routes, 1, 1, num_tokens, hidden_state_index=0
+    )
+    combine_payload = received[0][0].clone()
+    scale_extent = _compute_sf_size(
+        CombineQuantMode.MXFP8,
+        num_tokens,
+        hidden_size,
+        SfLayout.layout_linear,
+    )
+    output_scales = torch.empty(scale_extent, dtype=torch.uint8, device="cuda")
+    sf_layout = SfLayout.layout_linear
+    output_dtype = torch.float8_e4m3fn
+    output_width = hidden_size
+    if invalid_kind == "cpu":
+        output_scales = output_scales.cpu()
+    elif invalid_kind == "noncontiguous":
+        output_scales = torch.empty(
+            scale_extent * 2, dtype=torch.uint8, device="cuda"
+        )[::2]
+    elif invalid_kind == "dtype":
+        output_scales = output_scales.to(torch.float32)
+    elif invalid_kind == "packed_dtype":
+        output_scales = output_scales.to(torch.float16)
+        output_dtype = torch.uint8
+        output_width //= 2
+    elif invalid_kind == "extent":
+        output_scales = torch.empty(
+            scale_extent + 1, dtype=torch.uint8, device="cuda"
+        )
+    output = torch.empty(
+        (num_tokens, output_width), dtype=output_dtype, device="cuda"
+    )
+    with pytest.raises(Exception, match=error_match):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            combine_payload,
+            num_tokens,
+            workspaces,
+            metainfo[0],
+            num_tokens,
+            ep_rank=0,
+            ep_size=1,
+            top_k=1,
+            combine_payload_offset=combine_offsets[0],
+            output_dtype=output_dtype,
+            output_scales=output_scales,
+            sf_layout=sf_layout,
+            output=output,
+        )
+
+
 # This is a hack to ensure we get forward progress when running multiple kernels on a single GPU
 def check_sufficient_sm_count(num_tokens, world_size):
     if (
@@ -514,6 +584,124 @@ def combine_from_single_rank(
     torch.cuda.synchronize()
 
     return combine_results
+
+
+@pytest.mark.parametrize(
+    "dtype,scalar_values",
+    (
+        (
+            torch.bfloat16,
+            (2.6423308e-14, 0.0046081543, -5.2354346e16, 5.2354346e16),
+        ),
+        (torch.float16, (-0.0001411438, -1310.0, -836.0, 609.5)),
+    ),
+)
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_k4_matches_source_reduction_tree(dtype, scalar_values):
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 1
+    vector_dim = 8
+    top_k = 4
+    token_selected_experts = torch.arange(
+        top_k, dtype=torch.int32, device="cuda"
+    ).repeat(world_size, 1)
+    hidden_states = torch.zeros(
+        (world_size * num_tokens, vector_dim), dtype=dtype, device="cuda"
+    )
+    _, all_workspaces, metainfo, combine_payload_offsets = dispatch_from_single_rank(
+        [hidden_states],
+        token_selected_experts,
+        world_size,
+        world_size,
+        num_tokens,
+        hidden_state_index=0,
+        enable_pdl=False,
+    )
+
+    physical = torch.tensor(scalar_values, dtype=dtype, device="cuda")
+    combine_payload = []
+    for rank in range(world_size):
+        payload = trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+            all_workspaces[rank, :],
+            [world_size, num_tokens],
+            combine_payload_offsets[rank],
+            combine_payload_offsets[rank]
+            + world_size * num_tokens * vector_dim * dtype.itemsize,
+            dtype,
+        )
+        payload.fill_(physical[rank])
+        combine_payload.append(payload)
+
+    expected = (
+        (physical[0].float() + physical[1].float())
+        + (physical[2].float() + physical[3].float())
+    ).to(dtype)
+    sequential = (
+        (
+            (physical[0].float() + physical[1].float())
+            + physical[2].float()
+        )
+        + physical[3].float()
+    ).to(dtype)
+    assert not torch.equal(expected, sequential)
+
+    outputs = combine_from_single_rank(
+        combine_payload,
+        num_tokens,
+        top_k,
+        all_workspaces,
+        metainfo,
+        world_size,
+        combine_payload_offsets,
+        payload_in_workspace=True,
+        output_dtype=dtype,
+        enable_pdl=False,
+    )
+    for output in outputs:
+        torch.testing.assert_close(
+            output,
+            expected.expand_as(output),
+            atol=0,
+            rtol=0,
+        )
+
+
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_rejects_unsupported_top_k():
+    torch.cuda.set_device(0)
+    num_tokens = 1
+    top_k = 3
+    hidden_states = torch.zeros((num_tokens, 8), dtype=torch.bfloat16, device="cuda")
+    routes = torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda")
+    received, workspace, metainfo, combine_offsets = dispatch_from_single_rank(
+        [hidden_states],
+        routes,
+        world_size=1,
+        num_experts=1,
+        num_tokens=num_tokens,
+        hidden_state_index=0,
+        enable_pdl=False,
+    )
+    with pytest.raises(Exception, match="unsupported top_k for moe_a2a_combine"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            received[0][0].clone(),
+            num_tokens,
+            workspace,
+            metainfo[0],
+            num_tokens,
+            ep_rank=0,
+            ep_size=1,
+            top_k=top_k,
+            combine_payload_offset=combine_offsets[0],
+            enable_pdl=False,
+        )
 
 
 @pytest.mark.parametrize("world_size,num_tokens,vector_dim", MULTI_RANK_PARAMS)

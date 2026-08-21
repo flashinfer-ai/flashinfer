@@ -631,8 +631,10 @@ def moe_a2a_combine(
         Optional output data type.  Currently supports ``torch.bfloat16``,
         ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
     output_scales : Optional[torch.Tensor]
-        Optional output scale tensor for quantized outputs.  Currently
-        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        Contiguous CUDA scale tensor for quantized outputs.  MXFP8 and MXFP4 use
+        UE8M0 scales packed in ``torch.uint8`` with vector size 32; NVFP4 uses
+        UE4M3 scales in ``torch.float8_e4m3fn`` with vector size 16.  Its extent
+        must exactly match ``sf_layout``, including layout padding.
     output_scalar_scale : float
         Per-tensor global scale applied before FP4 block scaling
         (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
@@ -833,6 +835,11 @@ class MoeAlltoAll:
                 max_num_tokens,
                 eplb_stats_num_experts,
             )
+            # ``moe_a2a_initialize`` synchronizes this rank's workspace memset.
+            # Do not let a peer publish into that workspace until every rank has
+            # completed the same initialization, or a late memset can erase the
+            # peer's first completion epoch.
+            MnnvlMemory.allocated_map[mnnvl_mem.ptr].comm.barrier()
             cls._WORKSPACE_CACHE[key] = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": max_num_tokens,
@@ -1395,6 +1402,7 @@ class MoeAlltoAll:
 
 __all__ = [
     "MoeAlltoAll",
+    "moe_a2a_active_rank_mask",
     "moe_a2a_combine",
     "moe_a2a_dispatch",
     "moe_a2a_get_workspace_size_per_rank",

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 from mpi4py import MPI
@@ -19,6 +20,7 @@ from .conftest import mnnvl_available
 def test_fused_module_keeps_the_public_python_contract():
     import flashinfer.comm.trtllm_moe_alltoall as api
 
+    assert "moe_a2a_active_rank_mask" in api.__all__
     assert tuple(inspect.signature(api.moe_a2a_dispatch).parameters) == (
         "token_selected_experts",
         "input_payloads",
@@ -59,6 +61,20 @@ def test_fused_module_keeps_the_public_python_contract():
     assert combine.parameters["sf_layout"].default is SfLayout.layout_linear
     assert combine.parameters["output"].default is None
     assert combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_active_rank_mask_preserves_upper_u64_bits_in_dispatch():
+    mask = moe_a2a_active_rank_mask((0, 31, 32, 63), 64)
+    assert mask.dtype is torch.uint64
+    assert mask.device.type == "cpu"
+    assert mask.tolist() == [0x8000000180000001]
+
+    dispatch_source = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllDispatch.cu"
+    ).read_text()
+    assert "1 << (unsigned long long)" not in dispatch_source
+    assert dispatch_source.count("1ULL << (unsigned long long)") == 5
 
 
 def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
@@ -132,6 +148,69 @@ def test_fused_jit_inventory_is_self_contained(monkeypatch):
         "moeAlltoAllSanitize.cu",
     } <= names
     assert all(path.is_file() for path in captured["sources"])
+
+
+def test_combine_inventory_is_specialized_and_fail_closed():
+    source_root = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels"
+    )
+    combine_source = (source_root / "moeAlltoAllCombine.cu").read_text()
+    launcher_source = (source_root / "moeAlltoAllFusedKernels.cu").read_text()
+    supported_top_k = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 22)
+
+    for top_k in supported_top_k:
+        assert f"DEFINE_COMBINE_TOP_K({top_k})" in combine_source
+        assert f"PRELOAD_COMBINE_TOP_K({top_k})" in launcher_source
+        assert f"LAUNCH_COMBINE_TOP_K({top_k})" in launcher_source
+    assert "unsupported top_k for moe_a2a_combine" in launcher_source
+    assert "int ep_rank, int top_k" not in combine_source
+
+
+def test_workspace_initialization_rendezvous_is_ordered_and_cached(monkeypatch):
+    import flashinfer.comm.trtllm_moe_alltoall as api
+
+    events = []
+    workspace = object()
+    metainfo = object()
+
+    class FakeComm:
+        def barrier(self):
+            events.append("barrier")
+
+    class FakeMnnvlMemory:
+        allocated_map = {}
+
+        def __init__(self, mapping, size):
+            assert mapping is fake_mapping
+            assert size == 4096
+            events.append("allocate")
+            self.ptr = 17
+            self.allocated_map[self.ptr] = SimpleNamespace(comm=FakeComm())
+
+        def as_torch_strided_tensor(self, dtype):
+            assert dtype is torch.uint8
+            events.append("view")
+            return workspace
+
+    def initialize(actual_workspace, ep_rank, ep_size, max_num_tokens, eplb_width):
+        assert actual_workspace is workspace
+        assert (ep_rank, ep_size, max_num_tokens, eplb_width) == (0, 2, 16, 5)
+        events.append("initialize")
+        return metainfo
+
+    fake_mapping = object()
+    monkeypatch.setattr(api, "MnnvlMemory", FakeMnnvlMemory)
+    monkeypatch.setattr(api, "moe_a2a_initialize", initialize)
+    monkeypatch.setattr(api.MoeAlltoAll, "_WORKSPACE_CACHE", {})
+
+    first = api.MoeAlltoAll.get_workspace(4096, 0, 2, 16, fake_mapping, 5)
+    second = api.MoeAlltoAll.get_workspace(4096, 0, 2, 16, fake_mapping, 5)
+
+    assert first is second
+    assert first["workspace"] is workspace
+    assert first["metainfo"] is metainfo
+    assert events == ["allocate", "view", "initialize", "barrier"]
 
 
 def _payloads(rank, experts):
