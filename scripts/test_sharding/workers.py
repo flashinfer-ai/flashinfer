@@ -31,6 +31,7 @@ class BatchExecution:
 @dataclass(frozen=True)
 class BatchExecutionRequest:
     repo_root: Path
+    pytest_root: Path
     junit_dir: Path
     unit: Unit
     batch: Batch
@@ -339,6 +340,7 @@ def _pytest_command(
         sys.executable,
         "-m",
         "pytest",
+        f"--rootdir={request.pytest_root}",
         "--continue-on-collection-errors",
         "-p",
         "scripts.test_sharding.pytest_plugin",
@@ -383,7 +385,7 @@ def _run_pytest(
         log.flush()
         process = subprocess.Popen(
             command,
-            cwd=request.repo_root,
+            cwd=request.pytest_root,
             env=_pytest_environment(request),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

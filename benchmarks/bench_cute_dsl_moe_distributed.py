@@ -424,6 +424,7 @@ def _distributed_moe_config(
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
+        MoEFinalizeConfig,
         QuantConfig,
         QuantVariant,
         RoutingConfig,
@@ -450,8 +451,8 @@ def _distributed_moe_config(
         execution=ExecutionConfig(
             enable_pdl=args.enable_pdl,
             tune_max_num_tokens=tune_max_num_tokens,
-            use_fused_finalize=args.use_fused_finalize,
         ),
+        finalize=MoEFinalizeConfig(use_fused_finalize=args.use_fused_finalize),
     )
 
 

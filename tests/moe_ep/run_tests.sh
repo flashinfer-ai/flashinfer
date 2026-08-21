@@ -120,6 +120,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
@@ -167,7 +168,7 @@ run_sm90_fp8_nvfp4_bf16_push_cuda() {
 }
 
 run_multirank() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   local rc=0
 
@@ -199,7 +200,7 @@ run_multirank() {
 }
 
 run_split_path_correctness_bf16() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -209,7 +210,7 @@ run_split_path_correctness_bf16() {
 }
 
 run_split_path_correctness_nvfp4() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -219,7 +220,7 @@ run_split_path_correctness_nvfp4() {
 }
 
 run_split_path_correctness_ht() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -245,6 +246,7 @@ run_oracle() {
   MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
 
@@ -286,12 +288,14 @@ run_mega() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
 
@@ -360,7 +364,7 @@ run_ft() {
 }
 
 run_smoke() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   local rc=0
 

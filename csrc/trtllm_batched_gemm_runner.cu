@@ -197,9 +197,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
       if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
-        // Skip cubins with clusterZ > 1 due to correctness issues described in
-        // https://github.com/flashinfer-ai/flashinfer/issues/3197
-        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }

@@ -18,6 +18,7 @@ import pytest
 from packaging.version import Version
 
 from flashinfer.jit import core as jit_core
+from flashinfer.jit import cake_kda_packed_t1
 from flashinfer.jit import cake_flash_kda_packed_t1 as flash_kda_packed_t1
 
 
@@ -237,25 +238,14 @@ def test_aot_detects_flash_kda_packed_t1_targets(
 @pytest.mark.parametrize(
     ("capabilities", "expected_targets"),
     [
-        (
-            {"flash_kda_packed_t1_sm100a": True},
-            [(variant, "sm100a") for variant in ("tile8", "tile16")],
-        ),
-        (
-            {"flash_kda_packed_t1_sm100f": True},
-            [(variant, "sm100f") for variant in ("tile8", "tile16")],
-        ),
+        ({"flash_kda_packed_t1_sm100a": True}, ["sm100a"]),
+        ({"flash_kda_packed_t1_sm100f": True}, ["sm100f"]),
         (
             {
                 "flash_kda_packed_t1_sm100a": True,
                 "flash_kda_packed_t1_sm100f": True,
             },
-            [
-                ("tile8", "sm100a"),
-                ("tile16", "sm100a"),
-                ("tile8", "sm100f"),
-                ("tile16", "sm100f"),
-            ],
+            ["sm100a", "sm100f"],
         ),
         ({"sm103": True}, []),
     ],
@@ -265,16 +255,26 @@ def test_aot_registers_flash_kda_packed_t1_portfolio(
 ):
     from flashinfer import aot
 
-    calls = []
+    legacy_calls = []
+    cake_calls = []
 
     def fake_flash_kda_packed_t1(variant, target):
-        calls.append((variant, target))
+        legacy_calls.append((variant, target))
         return SimpleNamespace(name=f"flash_kda_packed_t1_{variant}_{target}")
+
+    def fake_cake_kda_packed_t1(variant, target):
+        cake_calls.append((variant, target))
+        return SimpleNamespace(name=f"cake_kda_packed_t1_{variant}_{target}")
 
     monkeypatch.setattr(
         aot,
         "gen_flash_kda_packed_t1_module",
         fake_flash_kda_packed_t1,
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_cake_kda_packed_t1_module",
+        fake_cake_kda_packed_t1,
     )
     monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
@@ -301,12 +301,33 @@ def test_aot_registers_flash_kda_packed_t1_portfolio(
         False,
     )
 
-    assert calls == expected_targets
+    expected_legacy_calls = [
+        (variant, target)
+        for target in expected_targets
+        for variant in flash_kda_packed_t1.FLASH_KDA_PACKED_T1_VARIANTS
+    ]
+    expected_cake_calls = [
+        (variant, target)
+        for target in expected_targets
+        for variant in cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANTS
+    ]
+    assert legacy_calls == expected_legacy_calls
+    assert cake_calls == expected_cake_calls
     assert [spec.name for spec in specs] == [
         "spdlog",
-        *(
-            f"flash_kda_packed_t1_{variant}_{target}"
-            for variant, target in expected_targets
-        ),
+        *[
+            name
+            for target in expected_targets
+            for name in [
+                *(
+                    f"flash_kda_packed_t1_{variant}_{target}"
+                    for variant in flash_kda_packed_t1.FLASH_KDA_PACKED_T1_VARIANTS
+                ),
+                *(
+                    f"cake_kda_packed_t1_{variant}_{target}"
+                    for variant in cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANTS
+                ),
+            ]
+        ],
         "cudnn",
     ]

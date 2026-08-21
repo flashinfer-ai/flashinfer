@@ -109,6 +109,19 @@ with contextlib.suppress(ImportError):
         B12xMoEWrapper as B12xMoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+# The fused GDN decode step is surfaced here like the other GDN APIs; the
+# code lives under flashinfer/gdn_kernels/experimental/ (see its README),
+# but "experimental" describes the file location, not the import path.
+# Unconditional on purpose: the module imports torch and nothing else, and a
+# consumer's capability check is `getattr(flashinfer, "gdn_fused_decode_step",
+# None)` — it must be present whenever the library is new enough, and absent
+# on an older one, with no third "present but broken" state.  Everything
+# heavy (the registry, the kernels, the JIT and CuTe-DSL dependencies) is
+# imported lazily on the first probe or call.
+from .gdn_kernels.experimental import (
+    gdn_fused_decode_step as gdn_fused_decode_step,
+    gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
@@ -130,6 +143,7 @@ from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
+from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode

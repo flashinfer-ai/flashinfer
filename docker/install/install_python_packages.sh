@@ -53,7 +53,9 @@ fi
 
 pip3 install --upgrade "$CUDA_PYTHON"
 pip3 install -r /install/requirements.txt
-pip3 install responses pytest scipy build "$NVSHMEM4PY"
+# wheel: imported by flashinfer-jit-cache's build backend, which CI builds with
+# --no-isolation.
+pip3 install responses pytest scipy build wheel "$NVSHMEM4PY"
 pip3 install --upgrade "$CUDA_PYTHON"
 
 # Install cudnn package based on CUDA version

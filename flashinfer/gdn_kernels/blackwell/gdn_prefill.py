@@ -58,6 +58,11 @@ def _get_compiled_cache(
     store_final_state: bool,
     enable_checkpoints: bool,
     use_state_indices: bool,
+    cu_seqlens_dtype_str: str,
+    state_indices_dtype_str: str,
+    cu_checkpoints_dtype_str: str,
+    initial_state_inner_strides: tuple[int, ...] | None,
+    output_state_inner_strides: tuple[int, ...] | None,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -198,6 +203,19 @@ def chunk_gated_delta_rule_sm100(
         store_final_state,
         enable_checkpoints,
         use_state_indices,
+        str(cu_seqlens.dtype),
+        str(state_indices.dtype) if state_indices is not None else "none",
+        str(cu_checkpoints.dtype) if cu_checkpoints is not None else "none",
+        (
+            tuple(initial_state.stride()[1:])
+            if use_state_indices and initial_state is not None
+            else None
+        ),
+        (
+            tuple(output_state.stride()[1:])
+            if use_state_indices and output_state is not None
+            else None
+        ),
     )
 
     if "compiled" not in cache:
