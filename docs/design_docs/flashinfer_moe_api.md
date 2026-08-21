@@ -94,7 +94,8 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
 | BackendOptions | ordered candidate set via \| operator |
-| ExecutionConfig | do_finalize, enable_pdl, tune_max_num_tokens, output tensor |
+| ExecutionConfig | enable_pdl, tune_max_num_tokens |
+| MoEFinalizeConfig | do_finalize, use_fused_finalize |
 | MoEConfig | assembles all above; supports \*\*unpacking protocol |
 
 ### 3.1 RoutingConfig
@@ -824,8 +825,9 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 > `MoETensors` cluster drop ("Two packs, two lifetimes" + the pack rationale in
 > `api.py`). The Reviewer 14 `_select_winner` thread remains tracked under Post-MVP
 > Carryover (a deferred design decision, not part of this pass). The *open* MoE
-> work is now the two fuzzer-filed bugs — gh #3547 / #3548 — described under
-> "Test Harness" above.
+> work includes the remaining fuzzer-filed global-scale gap, gh #3548,
+> described under "Test Harness" above. The earlier gh #3547 EP-offset bug is
+> fixed and retained as regression coverage.
 
 
 ### Test Harness — Forward-Compatible Fuzzer (PR #6, merged 2026-06-09)
@@ -869,32 +871,22 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (`_KNOWN_FAILURES`): a filed-and-tracked bug is `xfail`ed
-by `(backend_key, predicate)` — the case is **still run**, so the suite stays
-green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
-A crash is never tolerated, only a wrong answer.
+**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+wrong-answer findings still run and report `xfail` after healthy backends;
+crash-class findings are quarantined before launch. Unexpected passes fail
+strictly so stale waivers are removed.
 
-**CI-safety gate (waived, opt-in).** The ledger tolerates a *wrong answer* but
-cannot absorb a *process abort*, and a single-process run of this suite on SM100
-hit `CUDA error: device-side assert triggered` → `Fatal Python error: Aborted`
-(triage 2026-06-09) — which would block B200 CI. Per-config isolation passes
-68/86 incl. EP `offset>0`, so the abort is **not** cleanly attributable to one
-config (the #3547 EP case returns tolerated zeros under `synchronize`, no
-assert); it surfaces only in the accumulated single-process run CI uses, and
-`--forked` can't isolate it (CUDA inits at collection). So the suite is gated
-behind `FLASHINFER_UMOE_FUZZ` (`pytestmark` skip): **unset (CI default) →
-collected-and-skipped, launches no kernel, cannot abort the job**; set → runs
-(developer / nightly). The follow-up PR fixes #3547, root-causes the abort, and
-removes the gate.
+**CI gate (default-on).** The accumulated fuzzer runs by default and uses a
+`shard_group` marker to keep all configurations in one pytest process.
+`FLASHINFER_UMOE_FUZZ=0` remains an emergency waiver.
 
 **Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
 exercised end-to-end):
-- **gh #3547** — `trtllm_fp4_routed` returns all-zeros for EP shards
-  (`local_expert_offset > 0`): the offset is applied twice (pre-subtracted in
-  `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` is correct
-  (passes global ids + offset, kernel localizes once). Encoded as the current
-  `_KNOWN_FAILURES` entry. Fix = stop pre-subtracting (pass global ids), then
-  delete the ledger entry so the case flips to passing.
+- **gh #3547 (fixed)** — `trtllm_fp4_routed` returned all-zeros for EP shards
+  (`local_expert_offset > 0`) because the offset was applied twice
+  (pre-subtracted in `pack_inputs` and forwarded to the kernel). The fix passes
+  global IDs and lets the kernel localize once. Its ledger entry has been
+  removed; the EP-offset cases remain as regression coverage.
 - **gh #3548** — activation **global-scale** gap: `prepare_*_weights` hardcodes
   `gs=1.0`/`fc2_input_scale=1.0`/`alpha=ones` and `MoEActivationPack` has no
   global-scale field, so calibrated-checkpoint scales are silently dropped

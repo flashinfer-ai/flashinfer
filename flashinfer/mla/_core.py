@@ -42,6 +42,7 @@ from ..utils import (
     MaskMode,
     _check_block_tables_shape,
     check_shape_dtype_device,
+    check_trtllm_gen_sm107_only_feature,
     determine_mla_backend,
     device_support_pdl,
     get_compute_capability,
@@ -116,7 +117,18 @@ smaller_mla_dimensions = MLAHeadDimensions(
     kv_lora_rank=256,
 )
 
-supported_mla_head_dimensions = [deepseek_mla_dimensions, smaller_mla_dimensions]
+nope_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=256,
+    qk_rope_head_dim=0,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+supported_mla_head_dimensions = [
+    deepseek_mla_dimensions,
+    smaller_mla_dimensions,
+    nope_mla_dimensions,
+]
 
 
 @dataclass(frozen=True)
@@ -667,7 +679,13 @@ def _check_trtllm_gen_mla_shape(
         kv_lora_rank == smaller_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == smaller_mla_dimensions.qk_rope_head_dim
     )
-    if not (is_deepseek_dimensions or is_smaller_mla_dimensions):
+    is_nope_mla_dimensions = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if not (
+        is_deepseek_dimensions or is_smaller_mla_dimensions or is_nope_mla_dimensions
+    ):
         raise ValueError(
             f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
         )
@@ -1018,16 +1036,34 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-def _resolve_dsv4_sparse_mla_backend(device: torch.device) -> str:
+def _resolve_dsv4_sparse_mla_backend(
+    device: torch.device,
+    requested_backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+) -> Literal["trtllm-gen", "cute-dsl", "sparse"]:
     cc = get_compute_capability(device)
-    if cc[0] == 12:
-        return "sparse"
-    if cc[0] == 10:
-        return "trtllm-gen"
-    raise ValueError(
-        "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
-        f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
-    )
+    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm120_family = cc in ((12, 0), (12, 1))
+    if requested_backend == "auto":
+        if is_sm120_family:
+            return "sparse"
+        if is_sm100_family:
+            return "trtllm-gen"
+        raise ValueError(
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse"):
+        raise ValueError(
+            "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', or "
+            f"'sparse', got {requested_backend!r}"
+        )
+    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+        raise ValueError(
+            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend == "sparse" and not is_sm120_family:
+        raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
+    return cast(Literal["trtllm-gen", "cute-dsl", "sparse"], requested_backend)
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1148,11 +1184,312 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     return result
 
 
+_DSV4_HCA_WINDOW_CAPACITY = 128
+
+
+@dataclass(frozen=True)
+class DSV4HCAMetadata:
+    """Reusable metadata for the CuTe DSL causal HCA backend.
+
+    ``hca_swa_indices`` contains absolute rows into the flattened SWA cache;
+    ``hca_compressed_block_tables`` contains physical compressed-cache page
+    IDs. Both are ordered by flattened query row (``B * Q``).
+    ``hca_seq_lens`` describes the backing HCA footprint scheduled by TMA and
+    may exceed the effective per-row ``sparse_topk_lens``.
+    """
+
+    hca_swa_indices: torch.Tensor
+    hca_compressed_block_tables: torch.Tensor
+    hca_seq_lens: torch.Tensor
+    swa_topk_lens: torch.Tensor
+    hca_is_causal: bool = True
+
+
+def _check_hca_page_size(page_size: int, name: str) -> None:
+    if page_size <= 1 or _DSV4_HCA_WINDOW_CAPACITY % page_size != 0:
+        raise ValueError(
+            f"{name} must be greater than 1 and divide "
+            f"{_DSV4_HCA_WINDOW_CAPACITY}, got {page_size}"
+        )
+
+
+def _reject_hca_conversion_during_capture(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "compressed-page-aligned HCA metadata conversion is not CUDA Graph "
+                "capture safe; precompute HCA metadata before capture"
+            )
+
+
+_DSV4_HCA_CANONICAL_CHECK_MAX_ELEMENTS = 4 * 1024 * 1024
+
+
+def _recover_hca_page_ids(
+    segment: torch.Tensor,
+    active_lens: torch.Tensor,
+    *,
+    max_active_len: int,
+    page_size: int,
+    num_pages: int,
+    name: str,
+) -> torch.Tensor:
+    """Recover active page IDs while bounding strict-validation temporaries."""
+    rows = segment.shape[0]
+    if max_active_len == 0:
+        return torch.empty((rows, 0), dtype=torch.int32, device=segment.device)
+    if max_active_len > segment.shape[1]:
+        raise ValueError(
+            f"sparse_indices capacity is too small for the active {name} segment"
+        )
+
+    page_offsets = torch.arange(
+        0,
+        max_active_len,
+        page_size,
+        dtype=torch.int64,
+        device=segment.device,
+    )
+    page_starts = segment.index_select(1, page_offsets)
+    page_ids = torch.div(page_starts, page_size, rounding_mode="floor")
+    active_pages = page_offsets.unsqueeze(0) < active_lens.unsqueeze(1)
+    invalid = (
+        active_pages
+        & (
+            (torch.remainder(page_starts, page_size) != 0)
+            | (page_ids < 0)
+            | (page_ids >= num_pages)
+        )
+    ).any()
+
+    chunk_size = max(
+        1,
+        min(
+            max_active_len,
+            _DSV4_HCA_CANONICAL_CHECK_MAX_ELEMENTS // max(rows, 1),
+        ),
+    )
+    for start in range(0, max_active_len, chunk_size):
+        stop = min(start + chunk_size, max_active_len)
+        positions = torch.arange(start, stop, dtype=torch.int64, device=segment.device)
+        values = segment[:, start:stop]
+        expected_page_ids = page_ids.index_select(
+            1, torch.div(positions, page_size, rounding_mode="floor")
+        )
+        expected_offsets = torch.remainder(positions, page_size).to(segment.dtype)
+        active = positions.unsqueeze(0) < active_lens.unsqueeze(1)
+        canonical = (
+            torch.div(values, page_size, rounding_mode="floor") == expected_page_ids
+        ) & (torch.remainder(values, page_size) == expected_offsets.unsqueeze(0))
+        invalid = invalid | (active & ~canonical).any()
+
+    if invalid.item():
+        raise ValueError(
+            f"active {name} sparse_indices are not a canonical {name}-page "
+            "expansion with valid physical page IDs"
+        )
+    return torch.where(active_pages, page_ids, torch.zeros_like(page_ids)).to(
+        torch.int32
+    )
+
+
+def _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    q_len: int,
+    compressed_page_size: int,
+    num_swa_rows: int,
+    num_compressed_pages: int,
+) -> DSV4HCAMetadata:
+    """Build HCA gather indices and a compressed page table from token rows."""
+    _reject_hca_conversion_during_capture(sparse_indices.device)
+    if q_len <= 0:
+        raise ValueError(f"q_len must be positive, got {q_len}")
+    _check_hca_page_size(compressed_page_size, "compressed page size")
+    if num_swa_rows <= 0 or num_compressed_pages <= 0:
+        raise ValueError("SWA and compressed KV caches must each contain data")
+
+    for tensor, name in (
+        (sparse_indices, "sparse_indices"),
+        (sparse_topk_lens, "sparse_topk_lens"),
+        (seq_lens, "seq_lens"),
+    ):
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tensor.device != sparse_indices.device:
+            raise ValueError(
+                f"{name} must be on {sparse_indices.device}, got {tensor.device}"
+            )
+    if sparse_indices.ndim != 2:
+        raise ValueError(
+            f"sparse_indices must be 2D, got shape {tuple(sparse_indices.shape)}"
+        )
+    if seq_lens.ndim != 1 or seq_lens.numel() == 0:
+        raise ValueError(
+            f"seq_lens must be non-empty and 1D, got {tuple(seq_lens.shape)}"
+        )
+    batch_size = seq_lens.numel()
+    rows = batch_size * q_len
+    if sparse_indices.shape[0] != rows:
+        raise ValueError(
+            f"sparse_indices must have B * Q = {rows} rows, got "
+            f"{sparse_indices.shape[0]}"
+        )
+    if sparse_topk_lens.shape != (rows,):
+        raise ValueError(
+            f"sparse_topk_lens must have shape ({rows},), got "
+            f"{tuple(sparse_topk_lens.shape)}"
+        )
+    sparse_capacity = sparse_indices.shape[1]
+    if sparse_capacity < _DSV4_HCA_WINDOW_CAPACITY or sparse_capacity % 4 != 0:
+        raise ValueError(
+            "sparse_indices capacity must include 128 SWA entries and be a "
+            f"multiple of 4, got {sparse_capacity}"
+        )
+
+    query_positions = torch.arange(
+        q_len, dtype=torch.int32, device=sparse_indices.device
+    )
+    visible_raw_lens = seq_lens.unsqueeze(1) - q_len + query_positions.unsqueeze(0) + 1
+    if (visible_raw_lens <= 0).any().item():
+        raise ValueError("seq_lens must be at least q_len for causal dense queries")
+    swa_topk_lens = visible_raw_lens.clamp(max=_DSV4_HCA_WINDOW_CAPACITY).reshape(-1)
+    expected_sparse_topk_lens = (
+        _DSV4_HCA_WINDOW_CAPACITY
+        + torch.div(
+            visible_raw_lens,
+            _DSV4_HCA_WINDOW_CAPACITY,
+            rounding_mode="floor",
+        )
+    ).reshape(-1)
+    if (expected_sparse_topk_lens > sparse_capacity).any().item():
+        raise ValueError(
+            "sparse_indices capacity is too small for the HCA lengths derived "
+            "from seq_lens"
+        )
+    if (sparse_topk_lens != expected_sparse_topk_lens).any().item():
+        raise ValueError(
+            "hca_sparse_indices_format='compressed-page-aligned' requires "
+            "sparse_topk_lens == 128 + floor(visible_raw_len / 128)"
+        )
+    hca_seq_lens = (
+        _DSV4_HCA_WINDOW_CAPACITY
+        + torch.div(seq_lens, _DSV4_HCA_WINDOW_CAPACITY, rounding_mode="floor")
+    ).contiguous()
+
+    window_indices = sparse_indices[:, :_DSV4_HCA_WINDOW_CAPACITY]
+    window_columns = torch.arange(
+        _DSV4_HCA_WINDOW_CAPACITY,
+        dtype=torch.int32,
+        device=sparse_indices.device,
+    )
+    active_window = window_columns.unsqueeze(0) < swa_topk_lens.unsqueeze(1)
+    invalid_window = active_window & (
+        (window_indices < 0) | (window_indices >= num_swa_rows)
+    )
+    if invalid_window.any().item():
+        raise ValueError(
+            "active SWA sparse_indices must be absolute token rows in "
+            f"[0, {num_swa_rows})"
+        )
+    # Gather4 reads every coordinate before applying window_valid_lens. Replace
+    # conventional -1/INT_MAX padding with a legal row for masked positions.
+    hca_swa_indices = torch.where(
+        active_window, window_indices, torch.zeros_like(window_indices)
+    ).contiguous()
+
+    compressed_indices = sparse_indices[:, _DSV4_HCA_WINDOW_CAPACITY:]
+    max_compressed_slots = int((hca_seq_lens.max() - _DSV4_HCA_WINDOW_CAPACITY).item())
+    compressed_tiles = (
+        max_compressed_slots + _DSV4_HCA_WINDOW_CAPACITY - 1
+    ) // _DSV4_HCA_WINDOW_CAPACITY
+    compressed_pages_per_tile = _DSV4_HCA_WINDOW_CAPACITY // compressed_page_size
+    compressed_table_columns = max(1, compressed_tiles * compressed_pages_per_tile)
+    hca_compressed_block_tables = torch.zeros(
+        (rows, compressed_table_columns),
+        dtype=torch.int32,
+        device=sparse_indices.device,
+    )
+    active_compressed_lens = expected_sparse_topk_lens - _DSV4_HCA_WINDOW_CAPACITY
+    recovered_compressed_page_ids = _recover_hca_page_ids(
+        compressed_indices,
+        active_compressed_lens,
+        max_active_len=max_compressed_slots,
+        page_size=compressed_page_size,
+        num_pages=num_compressed_pages,
+        name="compressed",
+    )
+    hca_compressed_block_tables[:, : recovered_compressed_page_ids.shape[1]] = (
+        recovered_compressed_page_ids
+    )
+
+    return DSV4HCAMetadata(
+        hca_swa_indices=hca_swa_indices,
+        hca_compressed_block_tables=hca_compressed_block_tables.contiguous(),
+        hca_seq_lens=hca_seq_lens,
+        swa_topk_lens=swa_topk_lens.contiguous(),
+    )
+
+
+def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    *,
+    q_len: int,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+) -> DSV4HCAMetadata:
+    r"""Convert combined sparse indices into reusable HCA metadata.
+
+    Active SWA entries remain arbitrary absolute token-row indices and may
+    express ring-buffer rotation or wraparound. The compressed segment must be
+    the canonical expansion ``page_id * page_size + page_offset``. For a dense
+    causal query, this conversion requires
+    ``visible_raw_len = seq_len - q_len + query_position + 1`` and
+    ``sparse_topk_len = 128 + floor(visible_raw_len / 128)``.
+
+    The conversion validates tensor values, allocates metadata, and
+    synchronizes the device. It is not CUDA Graph capture safe and must not be
+    repeated in a latency-sensitive decode loop. Run it during setup, then
+    reuse the returned indices and compressed block table with
+    ``backend="cute-dsl"``.
+    """
+    normalized_swa_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        swa_kv_cache, kv_layout, "swa_kv_cache"
+    )
+    normalized_compressed_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        compressed_kv_cache, kv_layout, "compressed_kv_cache"
+    )
+    for cache, name in (
+        (normalized_swa_cache, "swa_kv_cache"),
+        (normalized_compressed_cache, "compressed_kv_cache"),
+    ):
+        if cache.device != sparse_indices.device:
+            raise ValueError(
+                f"{name} must be on {sparse_indices.device}, got {cache.device}"
+            )
+    return _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
+        sparse_indices,
+        sparse_topk_lens,
+        seq_lens,
+        q_len=q_len,
+        compressed_page_size=normalized_compressed_cache.shape[2],
+        num_swa_rows=normalized_swa_cache.shape[0] * normalized_swa_cache.shape[2],
+        num_compressed_pages=normalized_compressed_cache.shape[0],
+    )
+
+
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    sparse_indices: torch.Tensor,
+    sparse_indices: Optional[torch.Tensor] = None,
     compressed_kv_cache: Optional[torch.Tensor] = None,
     sparse_topk_lens: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
@@ -1167,6 +1504,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
+    hca_swa_indices: Optional[torch.Tensor] = None,
+    hca_compressed_block_tables: Optional[torch.Tensor] = None,
+    hca_seq_lens: Optional[torch.Tensor] = None,
+    hca_is_causal: bool = True,
+    hca_use_persistent: bool = False,
+    hca_sparse_indices_format: Optional[Literal["compressed-page-aligned"]] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1188,6 +1532,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
     path accepts BF16 query tensors and produces BF16 output.
 
+    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
+    matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
+    stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
+    query/KV tensors and produces BF16 output.
+
     Parameters
     ----------
     query : torch.Tensor
@@ -1199,26 +1549,36 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        TRTLLM-GEN workspace buffer. The multi-CTA KV counters are managed in a
-        separate internal buffer.
-    sparse_indices : torch.Tensor
+        Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
+        TRTLLM-GEN multi-CTA KV counters are managed in a separate internal
+        buffer.
+    sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
+        Pass ``None`` for the explicit ``backend="cute-dsl"`` metadata path.
+        Combined HCA tables whose compressed segment is a canonical page
+        expansion may instead be converted by setting
+        ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
+        remain arbitrary absolute token rows in this mode.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
-        ``swa_kv_cache``. Required by ``trtllm-gen`` and by SM120 ``sparse``
-        when ``extra_sparse_indices`` is provided.
+        ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, and by SM120
+        ``sparse`` when ``extra_sparse_indices`` is provided.
     sparse_topk_lens : Optional[torch.Tensor]
         Flattened total sparse MLA top-k lengths in query-token order, shape
         ``[sum_q]``. Values must already include the fixed 128 SWA entries,
-        matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
-        ``sparse_indices.shape[-1]``. Required only by ``trtllm-gen``.
+        matching TRTLLM-GEN ``sparseMlaTopkLengths``. For TRTLLM-GEN they must
+        not exceed ``sparse_indices.shape[-1]``. HCA also requires this tensor;
+        there it describes the visible window-plus-compressed slot count.
     seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
-        only by ``trtllm-gen``.
+        by ``trtllm-gen`` and by compressed-page-aligned HCA metadata
+        conversion.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for VO. Tensor form must be FP32.
+        HCA currently accepts only a Python float.
     sinks : Optional[torch.Tensor]
         Optional attention sink logits, shape ``[num_heads]`` FP32.
     kv_layout : Literal["HND", "NHD"]
@@ -1234,15 +1594,214 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Whether to enable Programmatic Dependent Launch. Used by the
         TRTLLM-GEN path.
     swa_topk_lens : Optional[torch.Tensor]
-        Active SWA segment lengths for SM120/SM121, shape ``[sum_q]`` INT32.
+        Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
+        these are sparse-segment lengths. HCA requires them as its per-row
+        visible sliding-window lengths in the range 0 through 128.
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32.
+    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse"}
+        Backend selection. ``"auto"`` preserves the architecture-based default:
+        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        only when ``"cute-dsl"`` is requested explicitly.
+    hca_swa_indices : Optional[torch.Tensor]
+        Absolute SWA token-row indices, shape ``[B * Q, 128]`` INT32. Ring
+        rotation and wraparound are supported. Every entry, including masked
+        padding, must name a legal row of the flattened SWA cache.
+    hca_compressed_block_tables : Optional[torch.Tensor]
+        HCA compressed-pool page IDs, shape ``[B * Q, max_pages]`` INT32.
+        For each query row, the valid page-ID prefix must cover the compressed
+        footprint implied by ``hca_seq_lens``, rounded up to 128-slot tiles.
+        Those page IDs must be legal even when ``sparse_topk_lens`` masks the
+        corresponding slots.
+    hca_seq_lens : Optional[torch.Tensor]
+        Per-request backing HCA slot counts ``[B]`` INT32 used to schedule TMA
+        loads. Each value counts the 128 window slots plus compressed slots,
+        not original raw KV tokens, and may exceed an effective per-row
+        ``sparse_topk_lens``.
+    hca_is_causal : bool
+        Must currently be ``True``. HCA index/page-table rows and valid-length
+        tensors are per query token (``B * Q`` rows).
+    hca_use_persistent : bool
+        Select the CuTe DSL persistent tile scheduler. This removes the
+        non-persistent ``B * Q <= 65535`` launch-grid restriction.
+    hca_sparse_indices_format : Optional[Literal["compressed-page-aligned"]]
+        Opt-in compatibility mode for legacy TRTLLM-GEN metadata. With
+        ``"compressed-page-aligned"``, active SWA entries remain arbitrary
+        absolute token rows, while the active compressed segment must be the
+        canonical expansion ``page_id * page_size + page_offset``. The
+        dispatcher validates and converts them into HCA gather indices, a
+        compressed block table, ``hca_seq_lens``, and ``swa_topk_lens``. This
+        tagged path is a one-shot compatibility path: it allocates,
+        synchronizes the device, immediately launches the decode, and is not
+        CUDA Graph capture safe. Performance-sensitive callers must precompute
+        with
+        :func:`convert_compressed_page_aligned_sparse_indices_to_hca_metadata`
+        and reuse the returned metadata through the explicit HCA arguments.
     """
-    backend = _resolve_dsv4_sparse_mla_backend(query.device)
+    backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+
+    if backend == "cute-dsl":
+        if not hca_is_causal:
+            raise ValueError("backend='cute-dsl' currently supports causal HCA only")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError(
+                "backend='cute-dsl' currently supports dense [B, Q, H, D] "
+                "queries only; cum_seq_lens_q and max_q_len must be None"
+            )
+        if extra_sparse_indices is not None or extra_sparse_topk_lens is not None:
+            raise ValueError(
+                "backend='cute-dsl' uses HCA metadata and does not accept "
+                "extra_sparse_indices or extra_sparse_topk_lens"
+            )
+        if enable_pdl:
+            raise ValueError("backend='cute-dsl' HCA does not support enable_pdl")
+        if hca_sparse_indices_format not in (None, "compressed-page-aligned"):
+            raise ValueError(
+                "hca_sparse_indices_format must be None or "
+                "'compressed-page-aligned', got "
+                f"{hca_sparse_indices_format!r}"
+            )
+
+        normalized_swa_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            swa_kv_cache, kv_layout, "swa_kv_cache"
+        ).squeeze(1)
+        flattened_swa_cache = normalized_swa_cache.reshape(
+            -1, normalized_swa_cache.shape[-1]
+        )
+        if compressed_kv_cache is None:
+            raise ValueError("backend='cute-dsl' requires compressed_kv_cache")
+        normalized_compressed_cache = _normalize_dsv4_sparse_mla_kv_cache(
+            compressed_kv_cache, kv_layout, "compressed_kv_cache"
+        ).squeeze(1)
+
+        if hca_sparse_indices_format == "compressed-page-aligned":
+            generated_inputs = {
+                "hca_swa_indices": hca_swa_indices,
+                "hca_compressed_block_tables": hca_compressed_block_tables,
+                "hca_seq_lens": hca_seq_lens,
+                "swa_topk_lens": swa_topk_lens,
+            }
+            conflicts = [
+                name for name, value in generated_inputs.items() if value is not None
+            ]
+            if conflicts:
+                raise ValueError(
+                    "hca_sparse_indices_format='compressed-page-aligned' generates "
+                    + ", ".join(conflicts)
+                    + "; do not pass them explicitly"
+                )
+            if sparse_indices is None or sparse_topk_lens is None or seq_lens is None:
+                raise ValueError(
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
+                    "sparse_indices, sparse_topk_lens, and seq_lens"
+                )
+            if query.ndim != 4:
+                raise ValueError(
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
+                    "dense query shape [B, Q, H, D]"
+                )
+            if seq_lens.numel() != query.shape[0]:
+                raise ValueError(
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
+                    f"seq_lens with {query.shape[0]} entries, got {seq_lens.numel()}"
+                )
+            for tensor, name in (
+                (sparse_indices, "sparse_indices"),
+                (sparse_topk_lens, "sparse_topk_lens"),
+                (seq_lens, "seq_lens"),
+                (normalized_swa_cache, "swa_kv_cache"),
+                (normalized_compressed_cache, "compressed_kv_cache"),
+            ):
+                if tensor.device != query.device:
+                    raise ValueError(
+                        f"{name} must be on {query.device}, got {tensor.device}"
+                    )
+            _reject_hca_conversion_during_capture(query.device)
+            metadata = _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
+                sparse_indices,
+                sparse_topk_lens,
+                seq_lens,
+                q_len=query.shape[1],
+                compressed_page_size=normalized_compressed_cache.shape[1],
+                num_swa_rows=flattened_swa_cache.shape[0],
+                num_compressed_pages=normalized_compressed_cache.shape[0],
+            )
+            hca_swa_indices = metadata.hca_swa_indices
+            hca_compressed_block_tables = metadata.hca_compressed_block_tables
+            hca_seq_lens = metadata.hca_seq_lens
+            swa_topk_lens = metadata.swa_topk_lens
+        else:
+            if sparse_indices is not None:
+                raise ValueError(
+                    "backend='cute-dsl' consumes explicit HCA metadata, so "
+                    "sparse_indices must be None unless "
+                    "hca_sparse_indices_format='compressed-page-aligned'"
+                )
+            if seq_lens is not None:
+                raise ValueError(
+                    "backend='cute-dsl' uses hca_seq_lens, so seq_lens must be "
+                    "None unless "
+                    "hca_sparse_indices_format='compressed-page-aligned'"
+                )
+
+        required_hca_inputs = {
+            "compressed_kv_cache": compressed_kv_cache,
+            "sparse_topk_lens": sparse_topk_lens,
+            "swa_topk_lens": swa_topk_lens,
+            "hca_swa_indices": hca_swa_indices,
+            "hca_compressed_block_tables": hca_compressed_block_tables,
+            "hca_seq_lens": hca_seq_lens,
+        }
+        missing = [name for name, value in required_hca_inputs.items() if value is None]
+        if missing:
+            raise ValueError("backend='cute-dsl' requires " + ", ".join(missing))
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise TypeError(
+                "backend='cute-dsl' HCA currently requires Python float "
+                "bmm1_scale and bmm2_scale"
+            )
+
+        from ..cute_dsl.attention.wrappers.batch_hca import cute_dsl_hca_decode
+
+        return cute_dsl_hca_decode(
+            query=query,
+            window_kv_cache=flattened_swa_cache,
+            compressed_kv_cache=normalized_compressed_cache,
+            workspace_buffer=workspace_buffer,
+            window_indices=hca_swa_indices,
+            compressed_block_tables=hca_compressed_block_tables,
+            hca_seq_lens=hca_seq_lens,
+            sparse_topk_lens=sparse_topk_lens,
+            window_valid_lens=swa_topk_lens,
+            softmax_scale=float(bmm1_scale),
+            output_scale=float(bmm2_scale),
+            sinks=sinks,
+            out=out,
+            is_causal=hca_is_causal,
+            is_persistent=hca_use_persistent,
+        )
+
+    unexpected_hca_inputs = {
+        "hca_swa_indices": hca_swa_indices,
+        "hca_compressed_block_tables": hca_compressed_block_tables,
+        "hca_seq_lens": hca_seq_lens,
+        "hca_is_causal": hca_is_causal if not hca_is_causal else None,
+        "hca_use_persistent": hca_use_persistent if hca_use_persistent else None,
+        "hca_sparse_indices_format": hca_sparse_indices_format,
+    }
+    unexpected_hca_input_names = [
+        name for name, value in unexpected_hca_inputs.items() if value is not None
+    ]
+    if unexpected_hca_input_names:
+        raise ValueError(
+            f"backend={backend!r} does not accept "
+            + ", ".join(unexpected_hca_input_names)
+        )
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -1262,6 +1821,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
     if backend == "sparse":
+        if sparse_indices is None:
+            raise ValueError("backend='sparse' requires sparse_indices")
         return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             query=query,
             swa_kv_cache=swa_kv_cache,
@@ -1292,6 +1853,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             "backend='trtllm-gen' requires compressed_kv_cache, sparse_topk_lens, "
             "and seq_lens"
         )
+    if sparse_indices is None:
+        raise ValueError("backend='trtllm-gen' requires sparse_indices")
 
     (
         swa_kv_cache,
@@ -1373,6 +1936,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     return out
 
 
+# Keep the backend-neutral spelling as a compatibility alias, while the
+# existing TRTLLM-prefixed API remains the canonical public callable.
+batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 
@@ -1600,7 +2166,7 @@ class BatchMLAPagedAttentionWrapper:
         head_dim_ckv : int
             The head dimension of compressed-kv.
         head_dim_kpe : int
-            The head dimension for rope k-cache.
+            The head dimension for rope k-cache. Zero is supported for NoPE MLA.
         page_size : int
             The page size of the paged kv-cache.
         causal : bool
@@ -1623,32 +2189,30 @@ class BatchMLAPagedAttentionWrapper:
                 f"MLA kv_data_type {kv_data_type} is not supported. "
                 f"Supported dtypes: {list(_SUPPORTED_MLA_KV_DTYPES)}."
             )
+        if head_dim_kpe < 0:
+            raise ValueError(f"head_dim_kpe must be >= 0, got {head_dim_kpe}.")
+
         if kv_data_type == torch.float8_e4m3fn:
-            if self._backend != "fa3":
+            if self._backend not in ("fa2", "fa3"):
                 raise ValueError(
-                    "FP8 kv_data_type for MLA is only supported with the fa3 "
+                    "FP8 kv_data_type for MLA is only supported with the fa2 or fa3 "
                     f"backend on SM90, got backend={self._backend!r}."
                 )
-            # Backend selection is independent of the runtime device; FP8 MLA
-            # requires SM90 specifically.
             major, minor = get_compute_capability(self.device)
             if major != 9:
                 raise ValueError(
                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                     f"got SM{major}{minor}."
                 )
-            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
-            # exists but is untested for MLA — silent wrong output.
             if q_data_type != torch.bfloat16:
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
                     f"q_data_type=torch.bfloat16, got {q_data_type}."
                 )
-            # Also enforced by static_assert in mla_hopper.cuh.
-            if head_dim_ckv != 512 or head_dim_kpe != 64:
+            if head_dim_ckv != 512 or head_dim_kpe not in (0, 64):
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
-                    "head_dim_ckv=512 and head_dim_kpe=64 (DeepSeek MLA), got "
+                    "head_dim_ckv=512 and head_dim_kpe in (0, 64), got "
                     f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
                 )
 
@@ -1679,6 +2243,7 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        self._head_dim_ckv = head_dim_ckv
         # Used by run() to reject dtype mismatches; the C++ launcher
         # reinterprets storage by the JIT-template type chosen at plan(),
         # so a mismatch produces silent wrong output.
@@ -1715,6 +2280,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
@@ -1735,6 +2301,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -1755,6 +2322,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: Optional[float] = None,
         *,
         ckv_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
@@ -1770,7 +2338,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_ckv`` is 512 in DeepSeek v2/v3 models.
         kpe_cache : torch.Tensor
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
-            ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
+            ``head_dim_kpe`` can be zero for NoPE MLA.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
             When ``o_scale`` is provided, this should be an FP8 tensor.
@@ -1796,14 +2364,19 @@ class BatchMLAPagedAttentionWrapper:
             the ``cutlass`` backend.
         ckv_scale : Optional[float]
             Per-tensor dequantization scale for the compressed-KV cache when
-            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
-            (together with ``kpe_scale``) for the FP8 KV cache path on the
-            ``fa3`` backend. Must be a finite positive value. Must not be
-            provided when ``kv_data_type`` is BF16/FP16.
+            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Exactly
+            one of ``ckv_scale`` or ``ckv_scale_arr`` is required for the FP8 KV
+            cache path. Must be a finite positive value. Must not be provided
+            when ``kv_data_type`` is BF16/FP16.
+        ckv_scale_arr : Optional[torch.Tensor]
+            Per-token, per-128-channel CKV dequantization scales. The expected
+            shape is ``ckv_cache.shape[:-1] + (head_dim_ckv // 128,)`` and the
+            dtype must be contiguous float32. Exactly one of ``ckv_scale`` or
+            ``ckv_scale_arr`` is required for the FP8 KV cache path.
         kpe_scale : Optional[float]
             Per-tensor dequantization scale for the rope-K cache when
-            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
-            usage rules as ``ckv_scale``.
+            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Required
+            with either CKV scale representation.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -1812,10 +2385,14 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     "profiler_buffer does not support cutlass backend for now."
                 )
-            if ckv_scale is not None or kpe_scale is not None:
+            if (
+                ckv_scale is not None
+                or kpe_scale is not None
+                or ckv_scale_arr is not None
+            ):
                 raise ValueError(
-                    "ckv_scale / kpe_scale are only supported with the fa3 backend "
-                    "and FP8 kv_data_type."
+                    "ckv_scale / kpe_scale / ckv_scale_arr are only supported with "
+                    "an fa2/fa3 backend and FP8 kv_data_type."
                 )
             self._cached_module = get_mla_module()
             output_scale = 1.0
@@ -1891,13 +2468,18 @@ class BatchMLAPagedAttentionWrapper:
         # e4m3fn is the only FP8 dtype reachable here (plan() rejects others).
         kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
         if kv_is_fp8:
-            if ckv_scale is None or kpe_scale is None:
+            if (ckv_scale is None) == (ckv_scale_arr is None):
                 raise ValueError(
-                    "ckv_scale and kpe_scale are required when kv_data_type is FP8."
+                    "Exactly one of ckv_scale or ckv_scale_arr is required when "
+                    "kv_data_type is FP8."
                 )
-            ckv_scale_f = float(ckv_scale)
+            if kpe_scale is None:
+                raise ValueError("kpe_scale is required when kv_data_type is FP8.")
+            ckv_scale_f = 1.0 if ckv_scale is None else float(ckv_scale)
             kpe_scale_f = float(kpe_scale)
-            if not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0:
+            if ckv_scale is not None and (
+                not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0
+            ):
                 raise ValueError(
                     f"ckv_scale must be a finite positive value, got {ckv_scale}"
                 )
@@ -1906,9 +2488,14 @@ class BatchMLAPagedAttentionWrapper:
                     f"kpe_scale must be a finite positive value, got {kpe_scale}"
                 )
         else:
-            if ckv_scale is not None or kpe_scale is not None:
+            if (
+                ckv_scale is not None
+                or ckv_scale_arr is not None
+                or kpe_scale is not None
+            ):
                 raise ValueError(
-                    "ckv_scale / kpe_scale are only valid when kv_data_type is FP8."
+                    "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
+                    "kv_data_type is FP8."
                 )
             ckv_scale_f = 1.0
             kpe_scale_f = 1.0
@@ -1939,7 +2526,25 @@ class BatchMLAPagedAttentionWrapper:
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
-        self._cached_module.run(
+        if ckv_scale_arr is not None:
+            if not kv_is_fp8:
+                raise ValueError(
+                    "ckv_scale_arr is only valid when kv_data_type is FP8."
+                )
+            expected_scale_shape = (
+                *ckv_cache.shape[:-1],
+                self._head_dim_ckv // 128,
+            )
+            check_shape_dtype_device(
+                ckv_scale_arr,
+                expected_scale_shape,
+                torch.float32,
+                ckv_cache.device,
+                "ckv_scale_arr",
+            )
+            if not ckv_scale_arr.is_contiguous():
+                raise ValueError("ckv_scale_arr must be contiguous.")
+        run_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
@@ -1957,8 +2562,9 @@ class BatchMLAPagedAttentionWrapper:
             return_lse_base_on_e,
             ckv_scale_f,
             kpe_scale_f,
-            *profiler_args,
+            ckv_scale_arr,
         )
+        self._cached_module.run(*run_args, *profiler_args)
 
         return (out, lse) if return_lse else out
 
@@ -1983,13 +2589,69 @@ def _round_to_seq_len_bucket(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+def _resolve_cute_dsl_workspace_sizer(
+    cute_dsl_impl: str,
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    enable_dcp: bool = False,
+):
+    """Resolve the selected CuTeDSL implementation and its workspace policy."""
+    from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+
+    resolved_impl = _resolve_impl(
+        requested=cute_dsl_impl,
+        kwargs={"sinks": sinks, "enable_dcp": enable_dcp},
+    )
+    if resolved_impl == "monolithic":
+        from ..cute_dsl.attention.monolithic.mla_decode import (
+            _get_split_kv_and_workspace_size as monolithic_workspace_sizer,
+        )
+
+        return monolithic_workspace_sizer, resolved_impl
+
+    from ..cute_dsl.attention.wrappers.batch_mla import (
+        _get_split_kv_and_workspace_size as modular_workspace_sizer,
+    )
+
+    return modular_workspace_sizer, resolved_impl
+
+
+def _get_cute_dsl_workspace_sizer(
+    cute_dsl_impl: str,
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    enable_dcp: bool = False,
+):
+    """Return the workspace policy owned by the selected CuTeDSL implementation."""
+    return _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)[0]
+
+
+def _call_cute_dsl_workspace_sizer(
+    workspace_sizer,
+    resolved_impl: str,
+    batch_size: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_active_blocks: int,
+    max_seq_len: int,
+):
+    """Call an implementation's workspace policy with its supported arguments."""
+    args = (batch_size, q_len, num_heads, kv_lora_rank, max_active_blocks)
+    if resolved_impl == "monolithic":
+        return workspace_sizer(*args, max_seq_len)
+    return workspace_sizer(*args)
+
+
 def _cute_dsl_max_supported_batch(
     workspace_bytes: int,
     q_len: int,
     num_heads: int,
     kv_lora_rank: int,
     max_active_blocks: int,
+    max_seq_len: int,
     candidate_max: int,
+    cute_dsl_impl: str,
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    enable_dcp: bool = False,
 ) -> int:
     """Largest batch the caller's workspace can support for cute-dsl MLA decode.
 
@@ -1997,15 +2659,22 @@ def _cute_dsl_max_supported_batch(
     split-K state. Binary-search for the largest ``B <= candidate_max`` whose
     ``get_workspace_size(...)`` fits in ``workspace_bytes``.
     """
-    from ..cute_dsl.attention.wrappers.batch_mla import (
-        _get_split_kv_and_workspace_size,
+    workspace_sizer, resolved_impl = _resolve_cute_dsl_workspace_sizer(
+        cute_dsl_impl, sinks, enable_dcp
     )
 
     lo, hi = 1, max(1, candidate_max)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        _, ws = _get_split_kv_and_workspace_size(
-            mid, q_len, num_heads, kv_lora_rank, max_active_blocks
+        _, ws = _call_cute_dsl_workspace_sizer(
+            workspace_sizer,
+            resolved_impl,
+            mid,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            max_active_blocks,
+            max_seq_len,
         )
         if ws <= workspace_bytes:
             lo = mid
@@ -2020,7 +2689,11 @@ def _compute_mla_decode_buckets(
     q_len: int,
     num_heads: int,
     kv_lora_rank: int,
+    max_seq_len: int,
     device: torch.device,
+    cute_dsl_impl: str,
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    enable_dcp: bool = False,
 ) -> Tuple[int, ...]:
     """Compute the autotune bucket list from kernel/workspace limits only.
 
@@ -2048,11 +2721,108 @@ def _compute_mla_decode_buckets(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             max_active_blocks=get_num_sm(device),
+            max_seq_len=max_seq_len,
             candidate_max=_TRTLLM_GEN_MLA_MAX_BATCH,
+            cute_dsl_impl=cute_dsl_impl,
+            sinks=sinks,
+            enable_dcp=enable_dcp,
         )
         cap = max(cap, cute_dsl_cap)
 
     return get_hybrid_num_tokens_buckets(max(1, cap))
+
+
+def _validate_mla_dcp_args(
+    *,
+    query: torch.Tensor,
+    backend: str,
+    sinks: Optional[List[torch.Tensor]],
+    cum_seq_lens_q: Optional[torch.Tensor],
+    max_q_len: Optional[int],
+    return_lse: bool,
+    enable_dcp: bool,
+    cp_world: int,
+    cp_rank: int,
+    causal_seqlens_kv_global: Optional[torch.Tensor],
+) -> str:
+    """Validate the public DCP contract and return the effective backend."""
+    if not isinstance(enable_dcp, bool):
+        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
+    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
+        raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
+    if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
+        raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+
+    if not enable_dcp:
+        nondefault = []
+        if cp_world != 1:
+            nondefault.append(f"cp_world={cp_world}")
+        if cp_rank != 0:
+            nondefault.append(f"cp_rank={cp_rank}")
+        if causal_seqlens_kv_global is not None:
+            nondefault.append("causal_seqlens_kv_global")
+        if nondefault:
+            raise ValueError(
+                "DCP arguments require enable_dcp=True; got " + ", ".join(nondefault)
+            )
+        return backend
+
+    if query.ndim != 4:
+        raise ValueError(
+            "DCP requires a dense query with shape "
+            "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
+        )
+    if not 0 <= cp_rank < cp_world:
+        raise ValueError(
+            f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
+            f"cp_rank={cp_rank}, cp_world={cp_world}"
+        )
+    if backend not in ("auto", "cute-dsl"):
+        raise ValueError(
+            f"enable_dcp=True is only supported by backend='cute-dsl', got "
+            f"backend={backend!r}"
+        )
+    if not return_lse:
+        raise ValueError(
+            "enable_dcp=True requires return_lse=True so rank-local "
+            "attention states can be merged"
+        )
+    if sinks is not None:
+        raise ValueError(
+            "DCP cannot be combined with sinks: DCP requires monolithic "
+            "CuTeDSL MLA, while sinks require the modular implementation"
+        )
+    if cum_seq_lens_q is not None or max_q_len is not None:
+        raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
+    if causal_seqlens_kv_global is None:
+        raise ValueError("causal_seqlens_kv_global is required when enable_dcp=True")
+    if not isinstance(causal_seqlens_kv_global, torch.Tensor):
+        raise TypeError(
+            "causal_seqlens_kv_global must be a torch.Tensor, got "
+            f"{type(causal_seqlens_kv_global).__name__}"
+        )
+    if causal_seqlens_kv_global.dtype != torch.int32:
+        raise ValueError(
+            "causal_seqlens_kv_global must have dtype torch.int32, got "
+            f"{causal_seqlens_kv_global.dtype}"
+        )
+    if not causal_seqlens_kv_global.is_cuda:
+        raise ValueError("causal_seqlens_kv_global must be a CUDA tensor")
+    if causal_seqlens_kv_global.device != query.device:
+        raise ValueError(
+            "causal_seqlens_kv_global must be on the query device "
+            f"{query.device}, got {causal_seqlens_kv_global.device}"
+        )
+    if tuple(causal_seqlens_kv_global.shape) != (query.shape[0],):
+        raise ValueError(
+            "causal_seqlens_kv_global must have shape "
+            f"({query.shape[0]},), got {tuple(causal_seqlens_kv_global.shape)}"
+        )
+    if not causal_seqlens_kv_global.is_contiguous():
+        raise ValueError("causal_seqlens_kv_global must be contiguous")
+
+    # DCP masking exists only in the monolithic CuTeDSL implementation.
+    return "cute-dsl"
 
 
 def _cute_dsl_incompatibility_reason(
@@ -2068,9 +2838,12 @@ def _cute_dsl_incompatibility_reason(
     kv_lora_rank: int,
     page_size: int,
     is_var_seq: bool,
-    return_lse: bool,
-    lse: Optional[torch.Tensor],
+    use_fp16_softmax: Optional[bool] = None,
     cute_dsl_impl: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
@@ -2081,6 +2854,13 @@ def _cute_dsl_incompatibility_reason(
     cc = get_compute_capability(query.device)
     if cc[0] < 10:
         return f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
+    from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+    if not is_cute_dsl_arch_supported(*cc):
+        return (
+            "cute-dsl backend (MLA decode kernel): the installed CuTe DSL "
+            f"does not support sm_{cc[0]}{cc[1]}"
+        )
     if isinstance(bmm1_scale, torch.Tensor):
         return (
             "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
@@ -2113,27 +2893,55 @@ def _cute_dsl_incompatibility_reason(
             "cute-dsl backend (MLA decode kernel) does not support separate KV "
             "page indices (uses_shared_paged_kv_idx=False)"
         )
+    if use_fp16_softmax:
+        return "cute-dsl backend (MLA decode kernel) does not support use_fp16_softmax"
     # LSE is supported on the monolithic path; the modular path raises a
     # clear NotImplementedError in wrappers/batch_mla.py if it gets picked
     # for an LSE request (e.g. when ``sinks`` forces the modular dispatch).
     # We don't pre-reject here so that the common case
     # (cute_dsl_impl="auto" + LSE + no sinks → monolithic) goes through.
 
-    _, q_len, num_heads, _ = query.shape
+    is_var_q = cum_seq_lens_q is not None
+    if is_var_q:
+        if query.ndim != 3 or max_q_len is None:
+            return (
+                "cute-dsl backend (MLA decode kernel) requires compact "
+                "query [total_q, H, D] and max_q_len for variable Q"
+            )
+        q_len = max_q_len
+        num_heads = query.shape[1]
+    else:
+        if query.ndim != 4:
+            return (
+                "cute-dsl backend (MLA decode kernel) requires query rank 4 for fixed Q"
+            )
+        _, q_len, num_heads, _ = query.shape
     try:
         from ..cute_dsl.attention.mla_dispatch import _resolve_impl
 
-        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
-    except (ValueError, ImportError) as e:
+        resolved_impl = _resolve_impl(
+            requested=cute_dsl_impl,
+            kwargs={
+                "sinks": sinks,
+                "cum_seq_lens_q": cum_seq_lens_q,
+                "max_q_len": max_q_len,
+                "enable_dcp": enable_dcp,
+            },
+        )
+    except (TypeError, ValueError, ImportError) as e:
         return f"cute-dsl backend (MLA decode kernel): {e}"
 
     try:
         if resolved_impl == "monolithic":
-            from ..cute_dsl.attention.monolithic.mla_decode import _check_can_implement
+            from ..cute_dsl.attention.monolithic.mla_decode import (
+                _check_can_implement as check_monolithic_can_implement,
+            )
         else:
-            from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
+            from ..cute_dsl.attention.wrappers.batch_mla import (
+                _check_can_implement as check_modular_can_implement,
+            )
 
-        _check_can_implement(
+        check_kwargs = dict(
             torch_dtype=query.dtype,
             torch_out_dtype=out_dtype,
             page_size=page_size,
@@ -2145,7 +2953,12 @@ def _cute_dsl_incompatibility_reason(
             is_var_seq=is_var_seq,
             is_var_split_kv=False,
         )
-    except (ValueError, ImportError) as e:
+        if resolved_impl == "monolithic":
+            check_kwargs.update(enable_dcp=enable_dcp, cp_world=cp_world)
+            check_monolithic_can_implement(**check_kwargs)
+        else:
+            check_modular_can_implement(**check_kwargs)
+    except (TypeError, ValueError, ImportError) as e:
         return f"cute-dsl backend (MLA decode kernel) cannot implement this configuration: {e}"
     return None
 
@@ -2155,21 +2968,29 @@ def _mla_decode_tuning_config(
     buckets: tuple[int, ...],
     num_pages: int,
     profile_seq_len: int,
+    has_sparse_mla_top_k_lens: bool = False,
+    sparse_top_k_width: int = 0,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ) -> TuningConfig:
-    """One TuningConfig (and one pair of initializer closures) per key.
+    """One TuningConfig and stable initializer set per key.
 
-    Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
-    ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
-    its hash with all previous ones (``DynamicTensorSpec.__hash__`` skips
-    ``tensor_initializers``) but never compares equal (closures compare by
-    identity), so would result in a leak.
+    Memoized so equivalent dispatcher calls reuse a single config object (and
+    its initializer closures) instead of rebuilding them every call. The
+    initializer closures no longer participate in ``AutoTuner``'s nearest-profile
+    cache key (it keys only on the dynamic-tensor specs and constraints), so this
+    memoization is a host-overhead optimization rather than a leak guard.
 
-    The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
-    (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
+    The DynamicTensorSpec sweeps batch dim across ``query``, ``block_tables``,
+    ``seq_lens``, ``out``, plus one optional fifth tensor — the sparse top-k
+    lengths tensor (native ``qk_rope_head_dim=0`` MLA) or, for DCP,
+    ``causal_seqlens_kv_global``. ``block_tables`` is initialized via
     ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
     profiling because MLA decode reads kv_cache and never writes it, so aliased
-    page reads give correct timing measurements. ``seq_lens`` is filled
-    homogeneously with ``profile_seq_len``.
+    page reads give correct timing measurements. ``seq_lens`` is filled with
+    ``profile_seq_len``; the synthetic DCP global bound preserves that exact
+    rank-local length.
     """
 
     def init_block_tables(shapes, dtype, device):
@@ -2182,16 +3003,43 @@ def _mla_decode_tuning_config(
         tensor.fill_(profile_seq_len)
         return tensor
 
+    def init_sparse_top_k_lens(shapes, dtype, device):
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        tensor.fill_(sparse_top_k_width)
+        return tensor
+
+    def init_causal_seqlens_kv_global(shapes, dtype, device):
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        tensor.fill_(profile_seq_len * cp_world + cp_rank)
+        return tensor
+
+    # At most one optional fifth batch-swept tensor: native qk_rope_head_dim=0
+    # sparse top-k lengths and DCP's global causal bound are mutually exclusive.
+    if has_sparse_mla_top_k_lens:
+        fifth_init = init_sparse_top_k_lens
+    elif enable_dcp:
+        fifth_init = init_causal_seqlens_kv_global
+    else:
+        fifth_init = None
+
+    input_idx = (0, 1, 2, 3, 4) if fifth_init is not None else (0, 1, 2, 3)
+    tensor_initializers = [
+        (1, init_block_tables),
+        (2, init_seq_lens),
+    ]
+    if fifth_init is not None:
+        tensor_initializers.append((4, fifth_init))
+
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
+                input_idx=input_idx,
+                dim_idx=(0,) * len(input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
             ),
         ),
+        tensor_initializers=tuple(tensor_initializers),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )
@@ -2207,6 +3055,14 @@ def _build_mla_decode_tuning_config(
     kv_lora_rank: int,
     max_seq_len: int,
     device: torch.device,
+    has_sparse_mla_top_k_lens: bool = False,
+    cute_dsl_impl: str = "auto",
+    sinks: Optional[
+        Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]
+    ] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ) -> TuningConfig:
     """Reduce call args to the memoization key of ``_mla_decode_tuning_config``.
 
@@ -2229,10 +3085,23 @@ def _build_mla_decode_tuning_config(
         q_len,
         num_heads,
         kv_lora_rank,
+        max_seq_len,
         device,
+        cute_dsl_impl,
+        sinks,
+        enable_dcp,
     )
 
-    return _mla_decode_tuning_config(buckets, num_pages, profile_seq_len)
+    return _mla_decode_tuning_config(
+        buckets,
+        num_pages,
+        profile_seq_len,
+        has_sparse_mla_top_k_lens,
+        block_tables.shape[-1],
+        enable_dcp,
+        cp_world,
+        cp_rank,
+    )
 
 
 class TrtllmGenMlaDecodeRunner(TunableRunner):
@@ -2269,6 +3138,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         uses_shared_paged_kv_idx: bool,
         return_lse: bool,
         lse: Optional[torch.Tensor],
+        use_fp16_softmax: Optional[bool] = None,
     ):
         self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         self.kv_cache = kv_cache
@@ -2296,6 +3166,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
+        self.use_fp16_softmax = use_fp16_softmax
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -2310,7 +3181,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         return [-1]
 
     def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs
+        q, _, _, out = inputs[:4]
         sinks_key = (
             None
             if self.sinks is None
@@ -2338,6 +3209,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
             self.return_lse,
+            len(inputs) == 5,
         )
 
     def forward(
@@ -2348,7 +3220,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        query, block_tables, seq_lens, out = inputs
+        query, block_tables, seq_lens, out = inputs[:4]
+        sparse_mla_top_k_lens = inputs[4] if len(inputs) == 5 else None
         batch_size = query.size(0)
         max_q_len = query.size(1)
         num_qo_heads = query.size(2)
@@ -2423,6 +3296,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
+            0,  # bf16q_fp8kv_transform_mode
+            self.use_fp16_softmax,
         )
         return out
 
@@ -2458,6 +3334,9 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
+        enable_dcp: bool = False,
+        cp_world: int = 1,
+        cp_rank: int = 0,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
@@ -2482,6 +3361,13 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.return_lse = return_lse
         self.sinks = sinks
         self.cute_dsl_impl = cute_dsl_impl
+        self.enable_dcp = enable_dcp
+        self.cp_world = cp_world
+        self.cp_rank = cp_rank
+        self._profile_lse: Optional[torch.Tensor] = None
+        self._workspace_sizer, self._resolved_cute_dsl_impl = (
+            _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)
+        )
 
     def __hash__(self):
         # See TrtllmGenMlaDecodeRunner.__hash__ — tactic-determining state is
@@ -2495,15 +3381,19 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         # If the caller's workspace can't fit batch=B for this profile, opt
         # out so the autotuner skips us (no JIT cost) and trtllm-gen wins by
         # default for that bucket.
-        from ..cute_dsl.attention.wrappers.batch_mla import (
-            _get_split_kv_and_workspace_size,
-        )
         from ..cute_dsl.utils import get_num_sm
 
         q = inputs[0]
         B, q_len, num_heads, _ = q.shape
-        _, ws = _get_split_kv_and_workspace_size(
-            B, q_len, num_heads, self.kv_lora_rank, get_num_sm(q.device)
+        _, ws = _call_cute_dsl_workspace_sizer(
+            self._workspace_sizer,
+            self._resolved_cute_dsl_impl,
+            B,
+            q_len,
+            num_heads,
+            self.kv_lora_rank,
+            get_num_sm(q.device),
+            self.max_seq_len,
         )
         workspace_bytes = (
             self.workspace_buffer.numel() * self.workspace_buffer.element_size()
@@ -2513,13 +3403,23 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return [-1]
 
     def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs
+        q, _, _, out = inputs[:4]
         # Cute-dsl rejects sparse/skip-softmax/tensor-scales upstream, so
         # those are omitted from extras as constants for this runner.
         # ``sinks`` and ``cute_dsl_impl`` are included because they flip the
-        # impl (modular vs monolithic) inside ``cute_dsl_mla_decode``.
+        # impl (modular vs monolithic) inside ``cute_dsl_mla_decode``.  The
+        # monolithic K-tile count and workspace capacity keep cache hits from
+        # bypassing a different split-workspace validity decision.
         sinks_key = (
             None if self.sinks is None else (tuple(self.sinks.shape), self.sinks.dtype)
+        )
+        workspace_bytes = (
+            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+        )
+        seq_len_workspace_key = (
+            (self.max_seq_len + 127) // 128
+            if self._resolved_cute_dsl_impl == "monolithic"
+            else _round_to_seq_len_bucket(self.max_seq_len)
         )
         return (
             q.dtype,
@@ -2529,12 +3429,15 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             self.page_size,
-            _round_to_seq_len_bucket(self.max_seq_len),
+            seq_len_workspace_key,
+            workspace_bytes,
             self.is_var_seq,
             self.uses_shared_paged_kv_idx,
             self.enable_pdl,
             sinks_key,
             self.cute_dsl_impl,
+            getattr(self, "enable_dcp", False),
+            getattr(self, "cp_world", 1),
         )
 
     def forward(
@@ -2544,7 +3447,31 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         do_preparation: bool = False,
         **kwargs,
     ):
-        query, block_tables, seq_lens, out = inputs
+        query, block_tables, seq_lens, out = inputs[:4]
+        causal_seqlens_kv_global = inputs[4] if self.enable_dcp else None
+
+        # LSE is not a tuning input because it does not influence tactic
+        # selection. When a synthetic batch differs from the caller batch,
+        # provide matching temporary storage while retaining the caller's LSE
+        # for the final invocation.
+        lse = self.lse
+        if self.return_lse:
+            expected_numel = query.shape[0] * query.shape[1] * query.shape[2]
+            if lse is None or lse.numel() != expected_numel:
+                expected_shape = (
+                    query.shape[0] * query.shape[1],
+                    query.shape[2],
+                )
+                if (
+                    self._profile_lse is None
+                    or tuple(self._profile_lse.shape) != expected_shape
+                ):
+                    self._profile_lse = torch.empty(
+                        expected_shape,
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                lse = self._profile_lse
         return self._run(
             query=query,
             kv_cache=self.kv_cache,
@@ -2560,10 +3487,14 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             out_dtype=self.out_dtype,
             is_var_seq=self.is_var_seq,
             enable_pdl=self.enable_pdl,
-            lse=self.lse,
+            lse=lse,
             return_lse=self.return_lse,
             sinks=self.sinks,
             cute_dsl_impl=self.cute_dsl_impl,
+            enable_dcp=self.enable_dcp,
+            cp_world=self.cp_world,
+            cp_rank=self.cp_rank,
+            causal_seqlens_kv_global=causal_seqlens_kv_global,
         )
 
 
@@ -2595,6 +3526,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    use_fp16_softmax: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -2607,8 +3544,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     query : torch.Tensor
         Query tensor with shape
         ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
-        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. For the SM120/SM121
-        v32/GLM sparse backend, this must be BF16 with ``head_dim_qk == 576``.
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. When
+        ``cum_seq_lens_q`` is provided, TRTLLM-GEN and monolithic CuTeDSL
+        instead accept compact ``[total_q, num_heads, head_dim_qk]`` input.
+        For the SM120/SM121 v32/GLM sparse backend, this must be BF16 with
+        ``head_dim_qk == 576``.
     kv_cache : torch.Tensor
         For TRTLLM-GEN, CuteDSL, and XQA, the paged KV cache is
         ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or
@@ -2626,7 +3566,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
-        RoPE head dimension. Sparse MLA paths use ``64``.
+        RoPE head dimension. Sparse MLA paths use ``64``; the native
+        no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
@@ -2639,12 +3580,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
         With ``backend="trtllm-gen"``, the final dimension may use its native
         width and does not need padding to a multiple of ``128 / page_size``.
     seq_lens : Optional[torch.Tensor]
-        Per-request KV sequence lengths for dense and TRTLLM-GEN paths. For
+        Per-request physical KV sequence lengths for dense and TRTLLM-GEN
+        paths. With DCP these are rank-local lengths and continue to control
+        paging, memory bounds, and split-KV. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
     max_seq_len : int
-        Maximum KV sequence length used for dense/TRTLLM-GEN scheduling.
+        Maximum physical KV sequence length used for dense/TRTLLM-GEN
+        scheduling. With DCP this is the maximum rank-local length.
         Ignored by the SM120/SM121 sparse v32/GLM backend.
     sparse_mla_top_k : int
         Enables sparse MLA when greater than zero. On SM100/SM103 this selects
@@ -2683,9 +3627,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
         chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
         ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
         SM120/SM121 dense decode uses ``"xqa"``.
-        The ``cute-dsl`` backend has two interchangeable implementations
-        (``monolithic`` and ``modular``) on the same shape/dtype envelope;
-        which one runs is controlled by the ``cute_dsl_impl`` kwarg below.
+        For compact variable Q on SM100/SM103, ``"auto"`` keeps TRTLLM-GEN
+        when it supports the call and uses monolithic CuTeDSL for TRT gaps or
+        LSE output.
+        The ``cute-dsl`` backend has monolithic and modular implementations
+        with a common fixed-Q shape/dtype envelope. Compact variable Q is
+        monolithic-only, while features such as ``sinks`` are modular-only;
+        selection is controlled by the ``cute_dsl_impl`` kwarg below.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -2694,7 +3642,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Whether K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
-        False is only supported by TRTLLM-GEN.
+        False is only supported for trtllm-gen backend.
+    use_fp16_softmax : Optional[bool]
+        Select the trtllm-gen ``Fp16Softmax`` cubin variant. MLA decode is the
+        primary consumer of this flag — `Fp16Softmax` generation cubins are
+        only shipped for MLA head dims (``head_dim_qk/v ∈ {576/512, 320/256}``).
+        When ``None`` (default) or ``False`` the standard FP32-accumulator
+        softmax cubin is used. Only supported by ``backend="trtllm-gen"``;
+        passing ``True`` to other backends raises ``ValueError``.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
         ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
@@ -2703,14 +3658,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
         * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
           native; accepted by sparse), or
         * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
-          also accepted by cute-dsl).
+          also accepted by cute-dsl), or
+        * ``[total_q, num_qo_heads]`` for compact variable Q with monolithic
+          CuTeDSL.
 
         If ``return_lse`` is True and this is None, a buffer will be
         allocated by the backend.
     return_lse : bool = False
         Whether to return LSE values. Supported by ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
-        returns ``(out, lse)``.
+        returns ``(out, lse)``. With compact variable Q, LSE is currently
+        supported only by monolithic CuTeDSL.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use. Honored when
         ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
@@ -2718,7 +3676,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         * ``"auto"`` (default) — picks monolithic by default, automatically
           promoted to modular when the call uses a feature monolithic
-          doesn't support (currently ``sinks``).
+          doesn't support (currently ``sinks``), and keeps compact variable Q
+          on monolithic.
         * ``"modular"`` — strict.  Always run the modular kernels.
         * ``"monolithic"`` — strict.  Always run the monolithic kernels;
           raise :class:`ValueError` if the call uses any modular-only
@@ -2733,9 +3692,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         shape ``[batch_size + 1]``, dtype ``torch.int32``. Must be a 1D tensor
         with at least two entries. When ``max_q_len`` is not provided, this
         function validates that it starts with 0, ends at ``query.size(0)``,
-        and is monotonically non-decreasing. Only supported by the
-        ``trtllm-gen`` backend. When provided, ``query`` must have shape
-        ``[total_q, num_heads, head_dim_qk]``.
+        and is monotonically non-decreasing. Supported by TRTLLM-GEN and the
+        monolithic CuTeDSL implementation. When provided, ``query`` must have
+        shape ``[total_q, num_heads, head_dim_qk]``.
         For best performance, provide ``max_q_len`` together with
         ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
@@ -2756,6 +3715,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
         for each concurrently executing CUDA stream or graph. Autotune profiling
         uses runner-owned internal storage; the caller buffer is used only for the
         final request.
+    sparse_mla_top_k_lens : Optional[torch.Tensor] = None
+        Flattened active sparse top-k lengths, one INT32 value per query token.
+        Required by the native ``kv_lora_rank=512, qk_rope_head_dim=0``
+        TRTLLM-GEN kernel. Sparse indices must be packed before any ``-1``
+        padding. Zero-length rows are unsupported; padded query rows should
+        contain one valid dummy index and use length 1.
+    enable_dcp : bool = False
+        Statically enable cyclic decode context parallelism in the monolithic
+        CuTeDSL MLA kernel. DCP returns a rank-local output/LSE state, so
+        ``return_lse=True`` is required and the caller must merge rank states.
+    cp_world : int = 1
+        Compile-time context-parallel world size. Rank ``r`` stores global KV
+        positions whose token index modulo ``cp_world`` equals ``r``.
+    cp_rank : int = 0
+        Runtime-uniform context-parallel rank.
+    causal_seqlens_kv_global : Optional[torch.Tensor] = None
+        Contiguous CUDA int32 tensor ``[batch_size]`` containing the global
+        exclusive causal bound for the newest query token. Required with DCP.
 
     Note
     ----
@@ -2779,11 +3756,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     Autotune
     --------
     On SM100/SM103 dense MLA, calling under ``flashinfer.autotune(True)`` with
-    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` across a
-    bucketed batch sweep up to each runner's kernel/workspace cap and caches the
-    winning runner per shape signature. Subsequent calls under
-    ``autotune(False)`` dispatch to the cached choice; any batch outside the
-    tuned range falls back to a default runner with a one-time warning.
+    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` when DCP
+    is disabled. DCP profiles only its required monolithic CuTeDSL runner.
+    Both modes use a bucketed batch sweep up to each runner's kernel/workspace
+    cap and cache the winning tactic per shape signature. Subsequent calls under
+    ``autotune(False)`` use the cached choice; any batch outside the tuned range
+    falls back to the runner's default tactic with a one-time warning.
 
     The autotune bucket range and cache key do **not** depend on
     ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
@@ -2805,6 +3783,53 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
 
+    is_nope_mla = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if is_nope_mla and sparse_mla_top_k <= 0:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+        )
+    if is_nope_mla and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
+
+    backend = _validate_mla_dcp_args(
+        query=query,
+        backend=backend,
+        sinks=sinks,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        return_lse=return_lse,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+    )
+
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
+    )
+
     if backend == "auto":
         cc = get_compute_capability(query.device)
         if cc[0] == 12 and sparse_mla_top_k > 0:
@@ -2825,7 +3850,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
         if not is_sm12x_supported(query.device):
             raise ValueError(
-                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
             )
         fp8_ok = (
             query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
@@ -2846,6 +3871,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
+        if use_fp16_softmax:
+            raise ValueError(
+                "use_fp16_softmax is only supported by backend='trtllm-gen'"
             )
         if return_lse or lse is not None:
             raise NotImplementedError(
@@ -2913,8 +3942,16 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
+    num_heads_q = query.size(-2)
     trtllm_gen_not_supported_reason: Optional[str] = None
-    if block_size != 32 and block_size != 64:
+    if 64 < num_heads_q < 128:
+        trtllm_gen_not_supported_reason = (
+            "trtllm-gen MLA decode does not support "
+            f"64 < num_heads_q < 128; got num_heads_q={num_heads_q}. "
+            "Use backend='cute-dsl' instead when the remaining configuration "
+            "is CuTeDSL-compatible."
+        )
+    elif block_size != 32 and block_size != 64:
         trtllm_gen_not_supported_reason = (
             f"trtllm-gen requires block_size in (32, 64), got {block_size}"
         )
@@ -2924,12 +3961,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     has_var_q = cum_seq_lens_q is not None
     if has_var_q:
-        if backend == "cute-dsl":
-            raise ValueError("cute-dsl MLA does not support cum_seq_lens_q")
-        if return_lse or lse is not None:
-            raise NotImplementedError(
-                "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
-            )
         if query.ndim != 3:
             raise ValueError(
                 "query must have shape [total_q, num_heads, head_dim_qk] "
@@ -2972,8 +4003,60 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 )
         elif max_q_len <= 0:
             raise ValueError("max_q_len must be greater than 0")
-        elif max_q_len > query.size(0):
-            raise ValueError("max_q_len cannot exceed the flattened query length")
+
+        trt_var_q_reason = trtllm_gen_not_supported_reason
+        if return_lse or lse is not None:
+            trt_var_q_reason = (
+                "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
+            )
+
+        # Explicit TRT and auto calls that TRT supports do not need to import
+        # or validate CuTeDSL. Evaluate the fallback only when it can run.
+        cute_dsl_reason: Optional[str] = None
+        if backend == "cute-dsl" or (
+            backend == "auto" and trt_var_q_reason is not None
+        ):
+            cute_dsl_reason = _cute_dsl_incompatibility_reason(
+                query,
+                torch.bfloat16,
+                bmm1_scale,
+                bmm2_scale,
+                sinks,
+                sparse_mla_top_k,
+                skip_softmax_threshold_scale_factor,
+                uses_shared_paged_kv_idx,
+                qk_rope_head_dim,
+                kv_lora_rank,
+                kv_cache.shape[-2],
+                is_var_seq,
+                cute_dsl_impl=cute_dsl_impl,
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=max_q_len,
+            )
+
+        selected_var_q_backend: str
+        if backend == "cute-dsl":
+            if cute_dsl_reason is not None:
+                raise ValueError(cute_dsl_reason)
+            selected_var_q_backend = "cute-dsl"
+        elif backend == "trtllm-gen":
+            if trt_var_q_reason is not None:
+                if return_lse or lse is not None:
+                    raise NotImplementedError(trt_var_q_reason)
+                raise ValueError(trt_var_q_reason)
+            selected_var_q_backend = "trtllm-gen"
+        else:
+            # CuTeDSL fills TRT capability gaps and is the ragged-Q LSE path.
+            if trt_var_q_reason is None:
+                selected_var_q_backend = "trtllm-gen"
+            elif cute_dsl_reason is None:
+                selected_var_q_backend = "cute-dsl"
+            else:
+                raise ValueError(
+                    "auto: no backend supports this variable-Q configuration "
+                    f"(trtllm-gen: {trt_var_q_reason}; "
+                    f"cute-dsl: {cute_dsl_reason})"
+                )
 
         kv_cache = _check_trtllm_gen_mla_shape(
             query,
@@ -2986,7 +4069,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             uses_shared_paged_kv_idx,
             batch_size=batch_size,
             max_q_len=max_q_len,
-            require_aligned_block_table=False,
+            require_aligned_block_table=selected_var_q_backend == "cute-dsl",
         )
 
         expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
@@ -3001,6 +4084,52 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 torch.bfloat16,
                 query.device,
                 "out",
+            )
+
+        if return_lse:
+            expected_lse_shape = (query.size(0), query.size(1))
+            if lse is None:
+                lse = torch.empty(
+                    expected_lse_shape,
+                    dtype=torch.float32,
+                    device=query.device,
+                )
+            else:
+                check_shape_dtype_device(
+                    lse,
+                    expected_lse_shape,
+                    torch.float32,
+                    query.device,
+                    "lse",
+                )
+
+        if selected_var_q_backend == "cute-dsl":
+            if multi_ctas_kv_counter_buffer is not None:
+                raise ValueError(
+                    "multi_ctas_kv_counter_buffer is only supported by the "
+                    "trtllm-gen backend"
+                )
+            from ..cute_dsl.attention import cute_dsl_mla_decode
+
+            return cute_dsl_mla_decode(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                softmax_scale=bmm1_scale,
+                output_scale=bmm2_scale,
+                out=out,
+                is_var_seq=is_var_seq,
+                enable_pdl=enable_pdl,
+                lse=lse,
+                return_lse=return_lse,
+                cute_dsl_impl=cute_dsl_impl,
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=max_q_len,
             )
 
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
@@ -3043,6 +4172,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             0,  # lse_stride_tokens
             0,  # lse_stride_heads
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
+            0,  # bf16q_fp8kv_transform_mode
+            use_fp16_softmax,
         )
         return out
 
@@ -3116,9 +4248,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank,
         page_size,
         is_var_seq,
-        return_lse,
-        lse,
-        cute_dsl_impl,
+        use_fp16_softmax=use_fp16_softmax,
+        cute_dsl_impl=cute_dsl_impl,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
@@ -3175,6 +4308,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 return_lse=return_lse,
                 lse=lse,
+                use_fp16_softmax=use_fp16_softmax,
             )
         )
     if "cute-dsl" in runner_names:
@@ -3203,6 +4337,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
             )
         )
 
@@ -3217,8 +4354,20 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank=kv_lora_rank,
         max_seq_len=max_seq_len,
         device=query.device,
+        has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
+        cute_dsl_impl=cute_dsl_impl,
+        sinks=sinks,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
     )
     inputs = [query, block_tables, seq_lens, out]
+    if sparse_mla_top_k_lens is not None:
+        inputs.append(sparse_mla_top_k_lens)
+    elif enable_dcp:
+        # The global causal bound varies with batch and must be synthesized
+        # alongside the other batch-shaped tensors during autotuning.
+        inputs.append(causal_seqlens_kv_global)
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm_batch_decode_mla",
         runners,
@@ -3339,7 +4488,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         )
     if not is_sm12x_supported(query.device):
         raise ValueError(
-            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
         )
     fp8_ok = (
         query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn

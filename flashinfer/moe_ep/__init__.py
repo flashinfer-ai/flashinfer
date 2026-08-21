@@ -11,6 +11,25 @@ Package layout::
         mega/
           kernel/           fused comm + local MoE kernels
       modes/                split and mega orchestration layers
+      kernel_src/           vendored kernel drops (verbatim src/ + shim/)
+
+Import layering (strict, one direction)::
+
+    layer / modes / core  -->  backends  -->  kernel_src.<drop> shim  -->  src/
+
+- Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
+  nothing else imports ``src/``, ever.
+- Only ``backends/`` may import a drop's shim, and only through the drop's
+  package ``__init__`` (``kernel_src.<drop>``), never shim submodules.
+- The layer, ``modes/``, ``core/``, and everything above use backend APIs
+  only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
+  no shim.
+- Sole exception: kernel-oracle *tests* may import a drop's package
+  ``__init__`` to validate the drop below the backend — still never ``src/``
+  internals or shim submodules.
+
+Keeping upper layers off ``kernel_src`` is what makes a drop swappable (see
+``kernel_src/README.md``) without touching user-facing APIs.
 """
 
 from __future__ import annotations
@@ -18,10 +37,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .errors import MoEEpNotBuiltError
+from .errors import (
+    MoEEpFaultToleranceUnsupportedError,
+    MoEEpNotBuiltError,
+    MoEEpRankEvictedError,
+    MoEEpTransportError,
+)
 from .algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
+    FleetAlgoKnobFaultTolerance,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -32,18 +57,44 @@ from .algo_knobs import (
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
 )
-from .backends.mega.kernel.deep_gemm_mega import (
-    DeepGemmMegaMoeConfig,
+from .backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm import (
+    Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
     preprocess_mega_weights,
 )
-from .backends.mega.kernel.mxfp8_cutedsl import (
-    Mxfp8CutedslMegaMoeConfig,
+from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl import (
+    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_bf16_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
-from .backends.mega.kernel.nvfp4_cutedsl import (
-    Nvfp4CutedslMegaMoeConfig,
+from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
+    Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
+    Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
+
+# Deprecated aliases (pre-taxonomy names, kept for external callers such as
+# the vLLM integration patch). New code should use the Sm<arch>... names.
+# These WILL BE REMOVED in a future release, together with the matching
+# deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
+# "mxfp8_cutedsl", "bf16_cutedsl", "sm90_pull_fp8", "sm90_push_fp8" — see
+# core/kernel/registry.py).
+Bf16CutedslMegaMoeConfig = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+DeepGemmMegaMoeConfig = Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
+Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
+
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -92,26 +143,41 @@ from .modes import (
     NCCLEPConfig,
     NcclEpConfig,
     NvepConfig,
+    Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig,
     SplitConfig,
     SplitKernelContext,
     kernel_requires_weights,
     run_split_kernel,
 )
 from .tensors import MoEEpTensors
-from .weights import MoEWeightPack, dummy_moe_weights
+from .weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+    UnquantizedMoEWeights,
+    dummy_moe_weights,
+)
 
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "Bf16CutedslMegaMoeConfig",
+    "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
     "CombineInputParams",
     "CombineOutput",
+    "Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig",
     "DeepGemmMegaMoeConfig",
+    "Mxfp8CutedslMegaMoeConfig",
+    "Nvfp4CutedslMegaMoeConfig",
+    "Sm90PullFp8MegaMoeConfig",
+    "Sm90PushFp8MegaMoeConfig",
+    "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
     "EpLayout",
     "Fleet",
     "FleetAlgoKnobAllocator",
+    "FleetAlgoKnobFaultTolerance",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",
@@ -129,18 +195,25 @@ __all__ = [
     "MegaConfig",
     "MoEEpArchError",
     "MoEEpConfigError",
+    "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
     "MoEEpNotBuiltError",
+    "MoEEpRankEvictedError",
     "MoEEpSplitLayer",
+    "MoEEpTransportError",
     "MoEEpTensors",
     "MoEWeightPack",
-    "Mxfp8CutedslMegaMoeConfig",
+    "PrequantizedMoEWeights",
+    "UnquantizedMoEWeights",
+    "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
-    "Nvfp4CutedslMegaMoeConfig",
+    "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
@@ -157,9 +230,13 @@ __all__ = [
     "have_nixl_ep",
     "kernel_requires_weights",
     "preprocess_mega_weights",
+    "preprocess_bf16_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm90_pull_fp8_mega_weights",
+    "preprocess_sm90_push_fp8_mega_weights",
     "run_split_kernel",
+    "supports_fault_tolerance",
     "validate_arch_for_backend",
     "validate_bootstrap_process_group_ready",
     "validate_bootstrap_world_size",
@@ -220,6 +297,40 @@ def available_backends() -> list[str]:
     if have_nixl_ep():
         out.append("nixl_ep")
     return out
+
+
+def supports_fault_tolerance(backend: str) -> bool:
+    """True when ``backend`` is built AND can serve the Fleet FT API here.
+
+    Rank masking needs more than the backend being present:
+
+    * ``nccl_ep`` also needs an nccl4py whose ``GroupConfig`` carries
+      ``enable_mask`` and a libnccl exporting the ``ncclEpMask*`` symbols.
+      Both are feature-detected, never version-pinned.
+    * ``nixl_ep``'s mask buffer is allocated unconditionally by
+      ``update_memory_buffers``, so a staged backend always supports it.
+
+    Never raises — safe to call on a host with no transport at all.
+    """
+    if backend == "nccl_ep":
+        if not have_nccl_ep():
+            return False
+        try:
+            import dataclasses
+
+            import nccl.ep
+
+            from .backends.split.comm.nccl_ep._mask_ffi import mask_ffi
+
+            has_field = "enable_mask" in {
+                f.name for f in dataclasses.fields(nccl.ep.GroupConfig)
+            }
+            return has_field and mask_ffi().available
+        except Exception:
+            return False
+    if backend == "nixl_ep":
+        return have_nixl_ep()
+    return False
 
 
 def _require_built(backend: str) -> None:

@@ -82,6 +82,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
+    trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
@@ -95,9 +96,17 @@ The CuteDSL backends are conditionally available when the
     :toctree: ../generated
 
     cute_dsl_fused_moe_nvfp4
+    cute_dsl_fused_moe_mxfp8_mxfp4
     b12x_fused_moe
 
 .. autoclass:: CuteDslMoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: CuteDslMxfp8Mxfp4MoEWrapper
     :members:
     :inherited-members:
     :show-inheritance:

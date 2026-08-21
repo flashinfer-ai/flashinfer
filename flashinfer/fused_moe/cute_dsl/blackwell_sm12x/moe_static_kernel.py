@@ -1,5 +1,5 @@
 """
-MoEStaticKernel — static-scheduled routed NVFP4 MoE kernel for SM120/SM121 (Blackwell).
+MoEStaticKernel — static-scheduled routed W4A4 MoE kernel for SM120/SM121.
 
 Ported from the b12x kernel library to FlashInfer.
 
@@ -112,13 +112,15 @@ from flashinfer.cute_dsl.fp4_common import (
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
+    quantize_block_mxfp4,
     get_ptr_as_int64,
+    ld_shared_i32_relaxed,
     st_global_f32,
     st_global_i32,
     shared_ptr_to_u32,
     st_shared_u8,
     st_global_u64,
-    scatter_add_bf16x2,
+    scatter_add_v4_bf16x2,
 )
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
@@ -357,13 +359,17 @@ class MoEStaticKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
-        tile_k = sf_vec_size * 8
+        # The fused epilogue feeds one 128-wide FC1 slice directly to FC2.
+        # MXFP4 therefore keeps K=128 (four block-32 scales) instead of using
+        # the dense GEMM default of 32*8=256.
+        tile_k = 128 if sf_vec_size == 32 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
         self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
@@ -495,12 +501,20 @@ class MoEStaticKernel:
 
         self._hidden_size = hidden_size
 
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
-        atom_layout = cute.make_layout((2, 2, 1))
+        if self.sf_vec_size == 32:
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -513,8 +527,8 @@ class MoEStaticKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
         sfa_smem = sm120_make_smem_layout_sfa(
@@ -741,6 +755,9 @@ class MoEStaticKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -794,7 +811,7 @@ class MoEStaticKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)
@@ -968,7 +985,7 @@ class MoEStaticKernel:
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
         num_experts = Int32(row_counts.shape[0])
-        sf_blocks_per_row = cols // Int32(16)
+        sf_blocks_per_row = cols // Int32(self.sf_vec_size)
         output_bytes_per_row = cols // Int32(2)
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
@@ -977,7 +994,8 @@ class MoEStaticKernel:
         num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
-        num_k_tiles = (cols + Int32(63)) // Int32(64)
+        sf_k_tile = Int32(self.sf_vec_size * 4)
+        num_k_tiles = (cols + sf_k_tile - Int32(1)) // sf_k_tile
 
         # Phase 0: cooperative init — zero row_counts and scatter_output
         i = flat_tid
@@ -1053,7 +1071,7 @@ class MoEStaticKernel:
             row = _ld_shared_i32(ctrl_base_addr + Int32(4))
 
             # Distribute quantization across ALL CTA threads, not just leader.
-            # Each FP4 block (16 elements) is independent — perfect parallelism.
+            # Each scale vector can be quantized and packed independently.
             gs_value = input_global_scale[expert_id].to(cutlass.Float32)
             if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
                 if self.fast_math:
@@ -1062,34 +1080,45 @@ class MoEStaticKernel:
                     gs_value = cutlass.Float32(1.0) / gs_value
             sf_idx = Int32(tidx)
             while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(16)
-                values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                block_start = sf_idx * Int32(self.sf_vec_size)
+                values = cute.make_rmem_tensor((self.sf_vec_size,), cutlass.Float32)
                 block_max = cutlass.Float32(0.0)
-                for elem_idx in cutlass.range_constexpr(16):
+                for elem_idx in cutlass.range_constexpr(self.sf_vec_size):
                     value = cutlass.Float32(
                         a_input[token_idx, block_start + Int32(elem_idx)]
                     )
                     values[elem_idx] = value
                     block_max = fmax_f32(block_max, fabs_f32(value))
-                packed64 = Uint64(0)
                 scale_byte = Uint8(0)
-                if self.fast_math:
-                    packed64, scale_byte = quantize_block_fp4_fast(
-                        values, block_max, gs_value
+                if cutlass.const_expr(self.sf_vec_size == 32):
+                    packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                        values, block_max
                     )
                 else:
-                    packed64, scale_byte = quantize_block_fp4(
-                        values, block_max, gs_value
-                    )
+                    packed_lo = Uint64(0)
+                    packed_hi = Uint64(0)
+                    if self.fast_math:
+                        packed_lo, scale_byte = quantize_block_fp4_fast(
+                            values, block_max, gs_value
+                        )
+                    else:
+                        packed_lo, scale_byte = quantize_block_fp4(
+                            values, block_max, gs_value
+                        )
 
                 output_offset = (
                     local_expert_id * max_rows * output_bytes_per_row
                     + row * output_bytes_per_row
-                    + sf_idx * Int32(8)
+                    + sf_idx * Int32(self.sf_vec_size // 2)
                 )
                 st_global_u64(
-                    get_ptr_as_int64(packed_a_storage, output_offset), packed64
+                    get_ptr_as_int64(packed_a_storage, output_offset), packed_lo
                 )
+                if cutlass.const_expr(self.sf_vec_size == 32):
+                    st_global_u64(
+                        get_ptr_as_int64(packed_a_storage, output_offset + Int32(8)),
+                        packed_hi,
+                    )
 
                 m_tile_idx = row // Int32(32 * 4)
                 k_tile_idx = sf_idx // Int32(4)
@@ -1757,7 +1786,7 @@ class MoEStaticKernel:
                 # Activation + quant into sA
                 sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
                 packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // self.sf_vec_size)
                 gs_value = global_scale[weight_expert_idx].to(cutlass.Float32)
                 if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
                     0.0
@@ -1829,38 +1858,52 @@ class MoEStaticKernel:
                         local_row = quant_idx // sf_blocks_per_row
                         row = sa_row_base + rows_offset + local_row
                         sf_block = quant_idx - local_row * sf_blocks_per_row
-                        block_start = sf_block * Int32(16)
+                        block_start = sf_block * Int32(self.sf_vec_size)
 
-                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                        values = cute.make_rmem_tensor(
+                            (self.sf_vec_size,), cutlass.Float32
+                        )
                         block_max = cutlass.Float32(0.0)
-                        for elem_idx in cutlass.range_constexpr(16):
+                        for elem_idx in cutlass.range_constexpr(self.sf_vec_size):
                             value = cutlass.Float32(
                                 sC[local_row, block_start + elem_idx, silu_epi_buffer]
                             )
                             values[elem_idx] = value
                             block_max = fmax_f32(block_max, fabs_f32(value))
 
-                        packed64 = Uint64(0)
                         scale_byte = Uint8(0)
-                        if self.fast_math:
-                            packed64, scale_byte = quantize_block_fp4_fast(
-                                values, block_max, gs_value
+                        if cutlass.const_expr(self.sf_vec_size == 32):
+                            packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                                values, block_max
                             )
                         else:
-                            packed64, scale_byte = quantize_block_fp4(
-                                values, block_max, gs_value
-                            )
-                        packed_base = sf_block << Int32(3)
+                            packed_lo = Uint64(0)
+                            packed_hi = Uint64(0)
+                            if self.fast_math:
+                                packed_lo, scale_byte = quantize_block_fp4_fast(
+                                    values, block_max, gs_value
+                                )
+                            else:
+                                packed_lo, scale_byte = quantize_block_fp4(
+                                    values, block_max, gs_value
+                                )
+                        packed_base = sf_block * Int32(self.sf_vec_size // 2)
                         dst_pcol = row & Int32(63)
                         xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
                         row_high = row >> Int32(6)
-                        for byte_idx in cutlass.range_constexpr(8):
+                        for byte_idx in cutlass.range_constexpr(self.sf_vec_size // 2):
                             src_pcol = packed_base + Int32(byte_idx)
                             dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
                             dst_flat = dst_row * packed_cols + dst_pcol
-                            byte_val = Uint8(
-                                (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
-                            )
+                            if cutlass.const_expr(byte_idx < 8):
+                                byte_val = Uint8(
+                                    (packed_lo >> Uint64(byte_idx * 8)) & Uint64(0xFF)
+                                )
+                            else:
+                                byte_val = Uint8(
+                                    (packed_hi >> Uint64((byte_idx - 8) * 8))
+                                    & Uint64(0xFF)
+                                )
                             sA_u8[dst_flat] = byte_val
 
                         outer_m_idx = row % Int32(32)
@@ -2032,15 +2075,14 @@ class MoEStaticKernel:
                             tRS_sD[(None, None, None, epi_buffer)],
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        # No cross-warp barrier needed before scatter:
-                        # StMatrix is warp-local, and each warp only reads
-                        # its own 64×64 quadrant of sC below.
+                        # The 8-wide reads from sC can cross another warp's
+                        # stores, so wait for all MMA warps.
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
                         # Per-warp scatter: each warp scatters its own quadrant
-                        # of sC (64 M-rows × 64 N-cols). No cross-warp read
-                        # dependencies, so no pre-scatter barrier is needed.
+                        # of sC (64 M-rows × 64 N-cols).
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
                         )
@@ -2049,50 +2091,90 @@ class MoEStaticKernel:
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
-                        pair_idx = lane_id
-                        while pair_idx < warp_epi_rows * Int32(32):
-                            local_row = pair_idx >> Int32(5)  # / 32
-                            local_pair_col = pair_idx & Int32(31)  # % 32
-                            global_col = (
-                                tile_n_base_cur
-                                + warp_n_base
-                                + local_pair_col * Int32(2)
-                            )
+                        tile_vec_cols = Int32(64) // Int32(8)
+                        vec_idx = lane_id
+                        while vec_idx < warp_epi_rows * tile_vec_cols:
+                            local_row = vec_idx // tile_vec_cols
+                            local_vec_col = vec_idx - local_row * tile_vec_cols
+                            local_col = warp_n_base + local_vec_col * Int32(8)
+                            global_col = tile_n_base_cur + local_col
                             cached_row = rows_offset + warp_m_base + local_row
-                            # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
-                            tok = Int32(0)
-                            wv = cutlass.Float32(0.0)
-                            if lane_id == Int32(0):
-                                tok = _ld_shared_i32(
-                                    scatter_tok_base_addr + cached_row * Int32(4)
-                                )
-                                wv = _ld_shared_f32(
-                                    scatter_weight_base_addr + cached_row * Int32(4)
-                                )
-                            tok = cute.arch.shuffle_sync(tok, Int32(0))
-                            wv = cute.arch.shuffle_sync(wv, Int32(0))
+                            tok = ld_shared_i32_relaxed(
+                                scatter_tok_base_addr + cached_row * Int32(4)
+                            )
+                            wv = _ld_shared_f32(
+                                scatter_weight_base_addr + cached_row * Int32(4)
+                            )
                             sc_v0 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2),
+                                    local_col,
                                     epi_buffer,
                                 ]
                             )
                             sc_v1 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2) + Int32(1),
+                                    local_col + Int32(1),
                                     epi_buffer,
                                 ]
                             )
-                            scatter_add_bf16x2(
+                            sc_v2 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(2),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v3 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(3),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v4 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(4),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v5 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(5),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v6 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(6),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v7 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(7),
+                                    epi_buffer,
+                                ]
+                            )
+                            scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),
                                 wv * sc_v0,
                                 wv * sc_v1,
+                                wv * sc_v2,
+                                wv * sc_v3,
+                                wv * sc_v4,
+                                wv * sc_v5,
+                                wv * sc_v6,
+                                wv * sc_v7,
                             )
-                            pair_idx += Int32(self.num_threads_per_warp)
+                            vec_idx += Int32(self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
                         # finish scatter before next output tile's pipeline ops

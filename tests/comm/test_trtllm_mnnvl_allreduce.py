@@ -391,6 +391,7 @@ def run_mnnvl_ar_full(
     legacy_explicit_workspace_bytes: Optional[int] = None,
     legacy_api: bool = False,
     inject_sentinel_patterns: bool = False,
+    workspace_max_num_tokens: Optional[int] = None,
 ):
     """Core test logic for MNNVL AllReduce operations.
 
@@ -401,6 +402,7 @@ def run_mnnvl_ar_full(
         dtype: Data type for tensors
         hidden_size: Hidden dimension size
         explicit_workspace_bytes: If provided, use this workspace size instead of default
+        workspace_max_num_tokens: Workspace capacity override
     """
 
     gpus_per_node = torch.cuda.device_count()
@@ -463,7 +465,7 @@ def run_mnnvl_ar_full(
         else:
             workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
                 mapping,
-                max_num_tokens=max(seq_lens),
+                max_num_tokens=workspace_max_num_tokens or max(seq_lens),
                 hidden_dim=hidden_size,
                 dtype=dtype,
                 comm_backend=comm_backend,
@@ -988,6 +990,18 @@ def test_mnnvl_allreduce_refactored(
     """Test MNNVL AllReduce with refactored API."""
     run_mnnvl_ar_full(
         monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=False
+    )
+
+
+def test_mnnvl_twoshot_large_workspace_alignment(monkeypatch):
+    """Two-shot stages remain aligned with a large workspace."""
+    run_mnnvl_ar_full(
+        monkeypatch,
+        [64],
+        False,
+        torch.bfloat16,
+        7168,
+        workspace_max_num_tokens=16384,
     )
 
 

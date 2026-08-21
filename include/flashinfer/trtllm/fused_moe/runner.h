@@ -58,8 +58,10 @@ enum class RoutingMethodType : int64_t {
   MiniMax2 = 7,
   // Sigmoid: Sigmoid -> TopK (no renormalization)
   Sigmoid = 8,
+  // TopKSigmoid: TopK -> Sigmoid (no renormalization)
+  TopKSigmoid = 9,
   // Unspecified
-  Unspecified = 9,
+  Unspecified = 10,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -89,6 +91,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "MiniMax2";
     case RoutingMethodType::Sigmoid:
       return "Sigmoid";
+    case RoutingMethodType::TopKSigmoid:
+      return "TopKSigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -168,7 +172,8 @@ enum class ActivationType : int64_t {
   SwigluStep = 7,
   GegluTanh = 8,
   Identity = 9,
-  InvalidType = 10,  // Must be last
+  Situ = 10,
+  InvalidType = 11,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -193,6 +198,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "SwigluStep";
     case ActivationType::GegluTanh:
       return "GegluTanh";
+    case ActivationType::Situ:
+      return "Situ";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -202,7 +209,7 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
 }
 
 }  // namespace MoE
@@ -442,6 +449,12 @@ class Runner {
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
                                                            int32_t numTokens) const;
+
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
+
+  [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numLocalExperts,
+                                        int32_t numTokens) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,

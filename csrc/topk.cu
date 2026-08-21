@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
 
@@ -38,15 +39,18 @@ inline sampling::TopKTieBreak ParseTopKTieBreak(int64_t tie_break) {
   }
 }
 
-void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
+void radix_topk(TensorView input, TensorView output_indices,
+                Optional<TensorView> maybe_output_values,
                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k, bool sorted_output,
                 bool deterministic, int64_t tie_break, bool dsa_graph_safe) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
-  CHECK_INPUT(output_values);
   CHECK_DIM(2, input);           // input: (batch_size, d)
   CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
-  CHECK_DIM(2, output_values);   // output_values: (batch_size, top_k)
+  if (maybe_output_values.has_value()) {
+    CHECK_INPUT(maybe_output_values.value());
+    CHECK_DIM(2, maybe_output_values.value());  // output_values: (batch_size, top_k)
+  }
 
   unsigned int batch_size = input.size(0);
   unsigned int d = input.size(1);
@@ -57,9 +61,6 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
   cudaError_t status;
   auto dtype = input.dtype();
   sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
-  if (tie_break_mode != sampling::TopKTieBreak::None) {
-    deterministic = true;
-  }
   // Get row_states_buffer if provided (for multi-CTA path)
   sampling::RadixRowState* row_states_ptr = nullptr;
   if (maybe_row_states_buffer.has_value()) {
@@ -69,10 +70,13 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    c_type* output_values_ptr = maybe_output_values.has_value()
+                                    ? static_cast<c_type*>(maybe_output_values.value().data_ptr())
+                                    : nullptr;
     status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
-        static_cast<c_type*>(output_values.data_ptr()), batch_size, static_cast<uint32_t>(top_k), d,
-        row_states_ptr, sorted_output, deterministic, tie_break_mode, stream, dsa_graph_safe);
+        output_values_ptr, batch_size, static_cast<uint32_t>(top_k), d, row_states_ptr,
+        sorted_output, deterministic, tie_break_mode, stream, dsa_graph_safe);
     return true;
   });
 
@@ -84,24 +88,68 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe,
-                                     Optional<TensorView> maybe_row_starts) {
-  CHECK_INPUT(input);
-  CHECK_INPUT(output_page_table);
-  CHECK_INPUT(src_page_table);
-  CHECK_INPUT(lengths);
+                                     bool deterministic, int64_t tie_break, int64_t page_size,
+                                     bool dsa_graph_safe, Optional<TensorView> maybe_row_starts,
+                                     Optional<TensorView> maybe_page_table_row_starts,
+                                     Optional<TensorView> maybe_output_raw_indices) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT_AND_TYPE(output_page_table, dl_int32);
+  CHECK_INPUT_AND_TYPE(src_page_table, dl_int32);
+  CHECK_INPUT_AND_TYPE(lengths, dl_int32);
+  CHECK_DEVICE(output_page_table, input);
+  CHECK_DEVICE(src_page_table, input);
+  CHECK_DEVICE(lengths, input);
   CHECK_DIM(2, input);              // input: (num_rows, max_len)
   CHECK_DIM(2, output_page_table);  // output_page_table: (num_rows, top_k)
-  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_len)
+  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_page_table_length)
   CHECK_DIM(1, lengths);            // lengths: (num_rows,)
+  TVM_FFI_ICHECK_EQ(output_page_table.size(0), input.size(0))
+      << "output_page_table must have shape (num_rows, top_k)";
+  TVM_FFI_ICHECK_EQ(output_page_table.size(1), top_k)
+      << "output_page_table must have shape (num_rows, top_k)";
+  TVM_FFI_ICHECK_EQ(lengths.size(0), input.size(0)) << "lengths must have shape (num_rows,)";
+  TVM_FFI_ICHECK_GE(input.stride(0), input.size(1)) << "input rows must not overlap";
+  TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
+  TVM_FFI_ICHECK_EQ(page_size & (page_size - 1), 0) << "page_size must be a power of two";
+  TVM_FFI_ICHECK_LE(page_size, static_cast<int64_t>(1) << 30) << "page_size must not exceed 2^30";
+  TVM_FFI_ICHECK(
+      !(page_size > 1 && maybe_row_starts.has_value() && !maybe_page_table_row_starts.has_value()))
+      << "page_table_row_starts is required with page_size > 1 and row_starts";
   if (maybe_row_starts.has_value()) {
-    CHECK_INPUT(maybe_row_starts.value());
+    CHECK_INPUT_AND_TYPE(maybe_row_starts.value(), dl_int32);
+    CHECK_DEVICE(maybe_row_starts.value(), input);
     CHECK_DIM(1, maybe_row_starts.value());
+  }
+  if (maybe_page_table_row_starts.has_value()) {
+    CHECK_INPUT_AND_TYPE(maybe_page_table_row_starts.value(), dl_int32);
+    CHECK_DEVICE(maybe_page_table_row_starts.value(), input);
+    CHECK_DIM(1, maybe_page_table_row_starts.value());
+  }
+  if (maybe_row_to_batch.has_value()) {
+    CHECK_INPUT_AND_TYPE(maybe_row_to_batch.value(), dl_int32);
+    CHECK_DEVICE(maybe_row_to_batch.value(), input);
+    CHECK_DIM(1, maybe_row_to_batch.value());
+    TVM_FFI_ICHECK_EQ(maybe_row_to_batch.value().size(0), input.size(0))
+        << "row_to_batch must have shape (num_rows,)";
+  }
+  if (maybe_output_raw_indices.has_value()) {
+    CHECK_INPUT_AND_TYPE(maybe_output_raw_indices.value(), dl_int32);
+    CHECK_DEVICE(maybe_output_raw_indices.value(), input);
+    CHECK_DIM(2, maybe_output_raw_indices.value());
+    CHECK_SHAPE(maybe_output_raw_indices.value(), output_page_table);
+  }
+  if (maybe_row_states_buffer.has_value()) {
+    CHECK_DEVICE(maybe_row_states_buffer.value(), input);
   }
 
   unsigned int num_rows = input.size(0);
   unsigned int max_len = input.size(1);
+  int64_t input_stride = input.stride(0);
   int64_t src_stride = src_page_table.stride(0);
+  uint32_t page_bits = 0;
+  for (int64_t size = page_size; size > 1; size >>= 1) {
+    ++page_bits;
+  }
 
   cudaSetDevice(input.device().device_id);
   auto stream = get_stream(input.device());
@@ -109,9 +157,6 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   cudaError_t status;
   auto dtype = input.dtype();
   sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
-  if (tie_break_mode != sampling::TopKTieBreak::None) {
-    deterministic = true;
-  }
 
   sampling::RadixRowState* row_states_ptr = nullptr;
   if (maybe_row_states_buffer.has_value()) {
@@ -129,17 +174,44 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
         << "row_starts must have shape (num_rows,)";
     row_starts_ptr = static_cast<int32_t*>(maybe_row_starts.value().data_ptr());
   }
+  int32_t* page_table_row_starts_ptr = nullptr;
+  if (maybe_page_table_row_starts.has_value()) {
+    TVM_FFI_ICHECK(static_cast<unsigned int>(maybe_page_table_row_starts.value().size(0)) ==
+                   num_rows)
+        << "page_table_row_starts must have shape (num_rows,)";
+    page_table_row_starts_ptr =
+        static_cast<int32_t*>(maybe_page_table_row_starts.value().data_ptr());
+  }
+  int32_t* output_raw_indices_ptr = nullptr;
+  if (maybe_output_raw_indices.has_value()) {
+    output_raw_indices_ptr = static_cast<int32_t*>(maybe_output_raw_indices.value().data_ptr());
+  }
+  const bool use_configurable_page_table_policy =
+      page_bits != 0 || output_raw_indices_ptr != nullptr ||
+      input_stride != static_cast<int64_t>(max_len) ||
+      (row_starts_ptr == nullptr && !dsa_graph_safe &&
+       reinterpret_cast<std::uintptr_t>(input.data_ptr()) % sampling::TOPK_MAX_VECTOR_BYTES != 0);
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    status = sampling::TopKPageTableTransformDispatch<c_type, int32_t>(
-        static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
-        static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
-        static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
-        static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
-        stream, dsa_graph_safe);
-    return true;
-  });
+  auto dispatch_with_page_table_policy = [&](auto page_table_policy) {
+    using PageTablePolicy = decltype(page_table_policy);
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+      status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy>(
+          static_cast<c_type*>(input.data_ptr()),
+          static_cast<int32_t*>(output_page_table.data_ptr()),
+          static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
+          static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
+          static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
+          stream, dsa_graph_safe, page_table_row_starts_ptr, page_table_policy);
+      return true;
+    });
+  };
+  if (use_configurable_page_table_policy) {
+    dispatch_with_page_table_policy(sampling::ConfigurablePageTableKernelPolicy<int32_t>{
+        output_raw_indices_ptr, input_stride, page_bits});
+  } else {
+    dispatch_with_page_table_policy(sampling::DirectPageTableKernelPolicy<int32_t>{});
+  }
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKPageTableTransform failed with error code " << cudaGetErrorString(status);
@@ -171,9 +243,6 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
   cudaError_t status;
   auto dtype = input.dtype();
   sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
-  if (tie_break_mode != sampling::TopKTieBreak::None) {
-    deterministic = true;
-  }
 
   sampling::RadixRowState* row_states_ptr = nullptr;
   if (maybe_row_states_buffer.has_value()) {

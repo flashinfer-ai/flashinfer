@@ -21,7 +21,7 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
     fused_topk_deepseek,
 )
-from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -74,19 +74,6 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
             )
         return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    """Whether the activation splits FC1 output into gate/up halves (FC1 weight has 2*intermediate
-    rows). SwigluStep's clamp limit defaults to 7.0 (the Step-3 model value) in the kernel, so no
-    swiglu_limit tensor needs to be passed.
-    """
-    return activation_type in (
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-        ActivationType.SwigluStep,
-    )
 
 
 def run_moe_test(args):
@@ -266,6 +253,18 @@ def parse_moe_args(line, parser):
             "cute_dsl_fp4_block_scale_moe, and b12x_fused_moe vs B12xMoEWrapper for "
             "b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
             "eliminates per-call allocation overhead."
+        ),
+    )
+    parser.add_argument(
+        "--b12x_quant_mode",
+        type=str,
+        required=False,
+        default="nvfp4",
+        choices=["nvfp4", "w4a16"],
+        help=(
+            "Quantization mode for b12x_fused_moe: nvfp4 (W4A4, FP4 weights + "
+            "FP4 activations) or w4a16 (FP4 weights + BF16 activations). "
+            "Default: nvfp4"
         ),
     )
 
@@ -1642,11 +1641,13 @@ def testCuteDslFp4BlockScaleMoe(args):
 
 def testB12xFusedMoe(args):
     """
-    Test b12x_fused_moe (SM120/SM121 CuTe DSL NVFP4 MoE).
+    Test b12x_fused_moe (SM120/SM121 CuTe DSL FP4-weight MoE).
 
-    The b12x MoE takes **bf16** hidden states (the kernel fuses the
-    quantization internally) and NVFP4-quantized weights. Supports both
-    SwiGLU (gated) and ReLU2 (non-gated) activations.
+    The b12x MoE takes **bf16** hidden states and NVFP4-quantized weights.
+    ``--b12x_quant_mode`` selects the activation precision: ``nvfp4``
+    (W4A4, the kernel fuses activation quantization internally) or
+    ``w4a16`` (BF16 activations). Supports both SwiGLU (gated) and ReLU2
+    (non-gated) activations.
 
     This test:
     1. Creates NVFP4-quantized weights and bf16 inputs for b12x kernels
@@ -1697,16 +1698,21 @@ def testB12xFusedMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
-    # b12x supports SwiGLU (gated) and ReLU2 (non-gated)
+    # b12x supports SwiGLU / GeGLU (gated) and ReLU2 (non-gated)
     activation_type = args.activation_type
-    _ACT_STR = {ActivationType.Swiglu: "silu", ActivationType.Relu2: "relu2"}
+    _ACT_STR = {
+        ActivationType.Swiglu: "silu",
+        ActivationType.Geglu: "gelu_tanh",
+        ActivationType.GegluTanh: "gelu_tanh",
+        ActivationType.Relu2: "relu2",
+    }
     if activation_type not in _ACT_STR:
         raise ValueError(
-            f"b12x_fused_moe only supports Swiglu and Relu2 activations, "
-            f"got {activation_type.name}"
+            f"b12x_fused_moe only supports Swiglu, Geglu, GegluTanh, and Relu2 "
+            f"activations, got {activation_type.name}"
         )
     activation_str = _ACT_STR[activation_type]
-    is_gated = activation_type == ActivationType.Swiglu
+    is_gated = activation_type.is_gated
 
     # Create b12x-specific NVFP4 test data (weights quantized, input stays bf16)
     tensors = _create_nvfp4_moe_test_data(
@@ -1727,6 +1733,7 @@ def testB12xFusedMoe(args):
         print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
 
     use_functional = getattr(args, "use_functional_api", False)
+    quant_mode = getattr(args, "b12x_quant_mode", "nvfp4")
     x_input = tensors["x_bf16"]
 
     if use_functional:
@@ -1747,6 +1754,7 @@ def testB12xFusedMoe(args):
             num_local_experts=local_num_experts,
             output=moe_output,
             activation=activation_str,
+            quant_mode=quant_mode,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1772,6 +1780,7 @@ def testB12xFusedMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             activation=activation_str,
+            quant_mode=quant_mode,
         )
         runner = moe.run
 
@@ -1835,6 +1844,16 @@ def testB12xFusedMoe(args):
                 run_b12x_moe(*autotune_args)
         del autotune_args
 
+    # Cold-L2 rotation clones the weights inside CUDA-graph capture, but
+    # W4A16 packs weights on first use and cannot pack during capture.
+    # Keep L2 warm for that combination.
+    cold_l2_cache = not (quant_mode == "w4a16" and is_cuda_graph_compatible)
+    if not cold_l2_cache and args.verbose >= 1:
+        print(
+            "[INFO] w4a16 + CUDA graph: cold-L2 buffer rotation disabled "
+            "(W4A16 packed-weight cache cannot be populated during capture)"
+        )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_b12x_moe,
@@ -1843,7 +1862,7 @@ def testB12xFusedMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
-        cold_l2_cache=True,
+        cold_l2_cache=cold_l2_cache,
         input_args=input_args,
     )
 
@@ -1895,7 +1914,8 @@ def testB12xFusedMoe(args):
         cur_res["local_num_experts"] = local_num_experts
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
-        cur_res["fp4_mode"] = "nvfp4"
+        cur_res["fp4_mode"] = quant_mode
+        cur_res["cold_l2_cache"] = cold_l2_cache
         cur_res["activation_type"] = activation_type.name
         res.append(cur_res)
 

@@ -27,7 +27,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
-from ._common import _compile_cache, _cutlass_dtype, _fake
+from ._common import _compile_cache, _cutlass_dtype, _fake, _resolve_packed_kv
 
 
 def _get_compiled_combine(
@@ -206,6 +206,9 @@ def msa_sparse_decode_attention(
         Paged: ``(num_pages, num_kv_heads, 128, 128)`` with ``page_table``
         and ``seqused_k``; or flat varlen ``(total_k, num_kv_heads, 128)``
         with ``cu_seqlens_k``. May be fp8 E4M3 (upconverted in-kernel).
+        On the paged path, ``k``/``v`` may also be views split from a cache
+        that packs K and V in one ``2 * head_dim`` content dim per token
+        (see ``SUPPORTS_PACKED_KV``).
     q2k_indices : torch.Tensor
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
@@ -213,8 +216,18 @@ def msa_sparse_decode_attention(
     seqlen_q : int
         Uniform query length per request (e.g. 1, or >1 for speculative
         decoding).
+    page_table : torch.Tensor, optional
+        Page-table mapping for paged KV layout.
+    seqused_k : torch.Tensor, optional
+        Per-sequence valid KV-token counts for paged KV layout.
+    cu_seqlens_k : torch.Tensor, optional
+        ``(batch_size + 1,)`` int32 cumulative KV lengths for ragged KV layout.
     causal : bool
         Right-aligned causal masking (default True for decode).
+    softmax_scale : float, optional
+        Overrides the default attention scaling factor.
+    return_softmax_lse : bool
+        If ``True``, also return per-query log-sum-exp values.
     k_scale, v_scale : torch.Tensor, optional
         NVFP4 only: e4m3 block scales as uint8 bytes in the swizzled 128x4
         layout produced by :func:`flashinfer.nvfp4_quantize` (one scale per
@@ -222,8 +235,13 @@ def msa_sparse_decode_attention(
         cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
         token)`` for paged.
     k_global_scale, v_global_scale : float, optional
-        NVFP4 global dequant scales; folded into the softmax scale and the
-        output scale respectively, so the kernel applies only block scales.
+        Global dequant scales. ``k_global_scale`` folds into the softmax
+        scale (NVFP4 K only); ``v_global_scale`` scales the output for any
+        KV dtype (e.g. an fp8 per-tensor V descale).
+    q_offset : int or torch.Tensor, optional
+        Optional query-position offset used by causal alignment.
+    partial_dtype : torch.dtype, optional
+        Accumulator / partial-result dtype override for supported kernels.
     force_fused : bool, optional
         Override the adaptive split-K decision. By default each token's selected
         list is split into chunks (one CTA per chunk online-softmaxes its blocks
@@ -323,8 +341,13 @@ def msa_sparse_decode_attention(
             raise ValueError(
                 f"paged k/v must be (num_pages, num_kv_heads, 128, {kv_last})"
             )
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
-        cu_k[1:] = seqused_k.to(dev).cumsum(0)
+        # Paged addressing comes entirely from page_table, so the kernel never
+        # needs a KV base offset -- only each request's length. Hand it
+        # seqused_k directly instead of building a prefix sum (a zeros + cumsum
+        # + slice-copy on every decode call) just for the kernel to difference
+        # it back apart. The kernel reads this as lengths when `paged`.
+        k_len_or_cu = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        k_len_or_cu = k_len_or_cu.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
@@ -335,7 +358,7 @@ def msa_sparse_decode_attention(
             raise ValueError("cu_seqlens_k must have batch_size + 1 entries")
         if k.ndim != 3:
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
-        cu_k = cu_seqlens_k.to(dev)
+        k_len_or_cu = cu_seqlens_k.to(dev)
         pt_dev = _dummy_tensors(dev.index)[0]
 
     # v mirrors k (same layout/dtype for bf16/fp16, fp8, and packed NVFP4); the
@@ -343,6 +366,8 @@ def msa_sparse_decode_attention(
     # out of bounds.
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
+
+    packed_kv = _resolve_packed_kv(k, v, head_dim, paged=paged, kv_nvfp4=kv_nvfp4)
 
     if kv_nvfp4:
         # The kernel walks the swizzled 128x4 scale layout (rows padded to a
@@ -415,10 +440,13 @@ def msa_sparse_decode_attention(
         ksf_dev = k_scale.reshape(-1).contiguous()
         vsf_dev = v_scale.reshape(-1).contiguous()
     else:
-        k_pass, v_pass = k, v
+        # Packed K/V views: the kernel gets the whole packed 5-D cache as
+        # both arguments and picks the K/V plane itself.
+        k_pass, v_pass = (k, v) if packed_kv is None else (packed_kv[0], packed_kv[0])
         ksf_dev = _dummy_tensors(dev.index)[1]
         vsf_dev = ksf_dev
 
+    kv_stride_order = None if packed_kv is None else packed_kv[1]
     key = (
         "decode",
         str(q.dtype),
@@ -432,6 +460,7 @@ def msa_sparse_decode_attention(
         str(partial_dtype),
         fused,
         qoff_default,
+        kv_stride_order,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -448,7 +477,13 @@ def msa_sparse_decode_attention(
         s_ptq, s_phq = cute.sym_int(), cute.sym_int()  # mOp/mLse (split partials)
         s_sc0, s_sc1 = cute.sym_int(), cute.sym_int()  # mSplitCounts
         s_otq, s_ohq = cute.sym_int(), cute.sym_int()  # mOut/mLseOut (fused)
-        kv_shape = (s_tk, s_hkv, 128, kv_word) if paged else (s_tk, s_hkv, kv_word)
+        kv_shape: tuple
+        if kv_stride_order is not None:
+            kv_shape = (s_tk, s_hkv, 128, 2, kv_word)
+        elif paged:
+            kv_shape = (s_tk, s_hkv, 128, kv_word)
+        else:
+            kv_shape = (s_tk, s_hkv, kv_word)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj = SparseDecodeForwardSm12x(
             head_dim=head_dim,
@@ -462,12 +497,13 @@ def msa_sparse_decode_attention(
             q_fp8=q_fp8,
             fused=fused,
             qoff_default=qoff_default,
+            kv_packed=kv_stride_order is not None,
         )
         compiled = cute.compile(
             kernel_obj,
             _fake(q_in_cdt, (s_tq, s_hq, head_dim)),
-            _fake(kv_cdt, kv_shape),
-            _fake(kv_cdt, kv_shape),
+            _fake(kv_cdt, kv_shape, stride_order=kv_stride_order),
+            _fake(kv_cdt, kv_shape, stride_order=kv_stride_order),
             _fake(i32, (s_pb, s_pm), align=4),
             _fake(u8, (s_ksf,), align=4),
             _fake(u8, (s_vsf,), align=4),
@@ -503,7 +539,7 @@ def msa_sparse_decode_attention(
         split_counts,
         out_buf,
         lse_buf,
-        cu_k,
+        k_len_or_cu,
         qoff_dev,
         float(softmax_scale),
         float(v_global_scale) if v_global_scale is not None else 1.0,

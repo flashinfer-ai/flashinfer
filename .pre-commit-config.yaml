@@ -14,10 +14,13 @@
 # Note the pre-commit hooks shoule only be used for formatting, but not for linting.
 # For linting consider using CI.
 
-# cutedsl_megamoe/src is an upstream kernel drop that is re-synced periodically;
+# The kernel_src */src trees are upstream kernel drops that are re-synced
+# periodically (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs.
-# The shim/ layer next to it is ours and stays checked.
-exclude: ^flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
+# The shim/ layers next to them are ours and stay checked.
+# The Cake selective-state CUDA/host trees are byte-faithful generated exports;
+# their SHA-256 digests are checked by the JIT manifest and must not be rewritten.
+exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
@@ -55,7 +58,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/))
+          exclude: ^(flashinfer-cubin/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py))
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

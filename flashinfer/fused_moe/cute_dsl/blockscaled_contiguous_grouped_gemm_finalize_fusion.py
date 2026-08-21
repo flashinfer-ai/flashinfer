@@ -20,15 +20,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Contiguous Grouped GEMM kernel for MoE GEMM2 workloads on Blackwell GPUs.
+Contiguous Grouped GEMM kernel with Finalize Fusion for MoE workloads.
 
-This module wraps the TensorRT-LLM CuteDSL grouped GEMM kernel for MoE GEMM2:
+This module provides a FlashInfer-style API wrapper around the CuteDSL
+grouped GEMM kernel with fused finalize operation designed for MoE GEMM2 layers:
 - Input A: (permuted_m, k) - permuted activations from GEMM1
 - Input B: (num_experts, n, k) - expert down projection weights
 - Output C: finalized token rows or unfinalized expanded token/top-k rows
 
 Key features:
-- NVFP4 x NVFP4 grouped GEMM with FP8 scale factors
+- NVFP4 x NVFP4 or MXFP8 x MXFP4 grouped GEMM with FP8 scale factors
 - Optional fused finalize operation in epilogue:
   a) Map permuted rows to (token_idx, topk_idx) using permuted_idx_to_expanded_idx
   b) Apply router scale: scaled_output = gemm_output * token_final_scales[token_idx, topk_idx]
@@ -36,9 +37,10 @@ Key features:
 - Deterministic mode writes unique expanded rows for a fixed-order moe_unpermute
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
-- Support for SM100 (Blackwell) architecture
+- Support for SM100 (Blackwell) and SM107 (Rubin) architectures
 """
 
+import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
@@ -52,15 +54,34 @@ from flashinfer.cute_dsl.utils import (
     cutlass_to_torch_dtype,
     get_num_sm,
     get_max_active_clusters,
+    is_rubin_cute_dsl_available,
     make_ptr,
 )
 
-# Import the TRT-LLM kernel implementation
+# Import the Blackwell (SM100) kernel implementation
 from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
 
-# Re-export the kernel class
+
+@functools.cache
+def _sm107_finalize_kernel_cls():
+    """Import the SM107 kernel lazily.
+
+    It requires CuTe DSL >= 4.8 (``cutlass.utils.rubin_helpers``); importing at
+    module scope would break FlashInfer on older DSL releases.
+    """
+    if not is_rubin_cute_dsl_available():
+        raise NotImplementedError(
+            "The SM107 (Rubin) CuTe DSL finalize-fusion grouped GEMM requires "
+            "CuTe DSL >= 4.8, which provides cutlass.utils.rubin_helpers; the "
+            "installed CuTe DSL does not have it."
+        )
+    from .rubin.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    return Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
 
 
 def create_finalize_fusion_tensors(
@@ -184,16 +205,29 @@ def _get_compiled_finalize_kernel(
     # Tactic parameters (compile-time - IN cache key)
     sf_vec_size: int,
     tile_size: int,
-    mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
+    a_dtype: type,
+    b_dtype: type,
+    sf_dtype: type,
+    out_dtype: type,
+    final_scale_dtype: type,
+    # Blackwell-specific
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    # Rubin-specific
+    mma_tiler: Optional[Tuple[int, int, int]] = None,
+    mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    # PDL control
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    Supports both Blackwell (SM100, via mma_tiler_mn) and Rubin (SM107,
+    via mma_tiler + mma_inst_shape) architectures.
+
+    This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
@@ -202,40 +236,93 @@ def _get_compiled_finalize_kernel(
     """
     global _finalize_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
+    is_rubin = mma_tiler is not None and mma_inst_shape is not None
+
+    # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
     cache_key = (
+        "sm107" if is_rubin else "sm100",
         sf_vec_size,
         tile_size,
-        mma_tiler_mn,
+        topk,
+        mma_tiler if is_rubin else mma_tiler_mn,
+        mma_inst_shape if is_rubin else None,
         cluster_shape_mn,
         raster_along_m,
+        a_dtype,
+        b_dtype,
+        sf_dtype,
+        out_dtype,
+        final_scale_dtype,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
     )
 
     if cache_key not in _finalize_kernel_cache:
-        # Create kernel instance
-        gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            raster_along_m=raster_along_m,
-            enable_pdl=enable_pdl,
-            use_a_per_token_scale=use_a_per_token_scale,
-            use_fused_finalize=use_fused_finalize,
-        )
+        if is_rubin:
+            if use_a_per_token_scale:
+                raise NotImplementedError(
+                    "use_a_per_token_scale (per-token activation scale) is "
+                    "not supported by the Rubin (SM107) finalize grouped "
+                    "GEMM kernel yet: its wrapper has no "
+                    "a_per_token_scale_ptr parameter."
+                )
+            if not use_fused_finalize:
+                # The Rubin kernel takes no use_fused_finalize parameter: it
+                # always does the atomic scatter-add into token rows.  The
+                # caller allocates `out` with torch.empty (not torch.zeros)
+                # and shape (seq_len * topk, n) in the unfused case, so
+                # silently ignoring this would accumulate into uninitialized
+                # memory at the wrong shape.
+                raise NotImplementedError(
+                    "use_fused_finalize=False is not supported by the Rubin "
+                    "(SM107) finalize grouped GEMM kernel: it always performs "
+                    "the fused atomic scatter-add."
+                )
+            if final_scale_dtype is not cutlass.Float32:
+                # The Rubin kernel hardcodes self.final_scale_dtype =
+                # cutlass.Float32; its can_implement never sees this dtype.
+                raise NotImplementedError(
+                    "The Rubin (SM107) finalize grouped GEMM kernel supports "
+                    "only Float32 router scales, got "
+                    f"{final_scale_dtype}."
+                )
+            gemm_rubin = _sm107_finalize_kernel_cls()(
+                sf_vec_size=sf_vec_size,
+                mma_inst_shape=mma_inst_shape,
+                mma_tiler=mma_tiler,
+                cluster_shape_mn=cluster_shape_mn,
+                raster_along_m=raster_along_m,
+                topK=topk,
+                enable_pdl=enable_pdl,
+            )
+            wrapper_fn = gemm_rubin.wrapper  # type: ignore[attr-defined]
+        else:
+            gemm_bw = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+                sf_vec_size=sf_vec_size,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                raster_along_m=raster_along_m,
+                enable_pdl=enable_pdl,
+                use_a_per_token_scale=use_a_per_token_scale,
+                use_fused_finalize=use_fused_finalize,
+            )
+            wrapper_fn = gemm_bw.wrapper
 
-        # Compile with runtime parameters - they can vary across calls
-        # Order must match wrapper signature:
+        # Compile with runtime parameters - they can vary across calls.
+        # Order must match the wrapper signature, and the two wrappers have
+        # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
+        # (12 pointers), the Rubin SM107 wrapper does not (11 pointers).
+        # Passing the extra pointer to the SM107 wrapper shifts every argument
+        # one slot ("multiple values for argument 'tile_size'").
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-        #  token_final_scales_ptr, a_per_token_scale_ptr,
+        #  token_final_scales_ptr, [a_per_token_scale_ptr],
         #  m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
         compiled_gemm = cute.compile(
-            gemm.wrapper,
+            wrapper_fn,
             a_ptr,
             b_ptr,
             a_sf_ptr,
@@ -247,7 +334,7 @@ def _get_compiled_finalize_kernel(
             permuted_idx_ptr,
             num_tiles_ptr,
             token_scales_ptr,
-            a_per_token_scale_ptr,
+            *([] if is_rubin else [a_per_token_scale_ptr]),
             permuted_m,
             n,
             k,
@@ -265,7 +352,7 @@ def _get_compiled_finalize_kernel(
     return _finalize_kernel_cache[cache_key]
 
 
-def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -279,7 +366,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     out: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
-    ab_dtype: str = "float4_e2m1fn",
+    a_dtype: str,
+    b_dtype: str,
     sf_dtype: str = "float8_e4m3fn",
     out_dtype: str = "bfloat16",
     sf_vec_size: int = 16,
@@ -287,6 +375,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    # Rubin-specific parameters (optional; when set, use SM107 kernel)
+    mma_tiler: Optional[Tuple[int, int, int]] = None,
+    mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
 ) -> torch.Tensor:
@@ -314,7 +405,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              NVFP4 quantizer instead of the fused GEMM1 epilogue.
-        ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
+        a_dtype: Data type for the A matrix.
+        b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
         sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
@@ -375,8 +467,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     num_experts = b.shape[0]
     n = b.shape[1]
     k = a.shape[1]
-    if ab_dtype == "float4_e2m1fn":
+    if a_dtype == "float4_e2m1fn":
         k = k * 2  # FP4 is packed 2 elements per byte
+    b_k = b.shape[2]
+    if b_dtype == "float4_e2m1fn":
+        b_k = b_k * 2
+    if b_k != k:
+        raise ValueError(
+            f"A and B logical K dimensions must match, got A K={k} and B K={b_k}"
+        )
 
     seq_len = token_final_scales.shape[0]
     topk = token_final_scales.shape[1]
@@ -397,14 +496,27 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
+    is_rubin = mma_tiler is not None and mma_inst_shape is not None
     if major != 10:
         raise ValueError(
-            f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM100 family (Blackwell: SM100, SM103). "
+            f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM10x family. "
             f"Got SM{major}{minor}."
+        )
+    # See the matching check in the gather/act-fusion entry point: is_rubin is
+    # inferred from the tactic parameters and can disagree with the device.
+    if is_rubin and minor != 7:
+        raise ValueError(
+            f"mma_tiler/mma_inst_shape select the Rubin (SM107) finalize "
+            f"kernel, but the device is SM{major}{minor}."
+        )
+    if not is_rubin and minor == 7:
+        raise ValueError(
+            "SM107 requires the Rubin tactic parameters mma_tiler and mma_inst_shape."
         )
 
     # Validate configuration
-    ab_dtype_cutlass = get_cutlass_dtype(ab_dtype)
+    a_dtype_cutlass = get_cutlass_dtype(a_dtype)
+    b_dtype_cutlass = get_cutlass_dtype(b_dtype)
     sf_dtype_cutlass = get_cutlass_dtype(sf_dtype)
     out_dtype_cutlass = get_cutlass_dtype(out_dtype)
     # Token final scales - determine dtype
@@ -415,27 +527,52 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     else:
         token_scales_dtype = cutlass.Float16
 
-    if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-        ab_dtype_cutlass,
-        sf_dtype_cutlass,
-        sf_vec_size,
-        out_dtype_cutlass,
-        token_scales_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        permuted_m,
-        n,
-        k,
-        num_experts,
-        a_major="k",
-        b_major="k",
-        out_major="n",
-    ):
+    if is_rubin:
+        can_impl = _sm107_finalize_kernel_cls().can_implement(
+            a_dtype=a_dtype_cutlass,
+            b_dtype=b_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            c_dtype=out_dtype_cutlass,
+            mma_inst_shape=mma_inst_shape,
+            mma_tiler=mma_tiler,
+            cluster_shape_mn=cluster_shape_mn,
+            m=permuted_m,
+            n=n,
+            k=k,
+            l=num_experts,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+        )
+    else:
+        can_impl = (
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+                a_dtype_cutlass,
+                b_dtype_cutlass,
+                sf_dtype_cutlass,
+                sf_vec_size,
+                out_dtype_cutlass,
+                token_scales_dtype,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                permuted_m,
+                n,
+                k,
+                num_experts,
+                a_major="k",
+                b_major="k",
+                out_major="n",
+            )
+        )
+    if not can_impl:
         raise ValueError(
-            f"Unsupported configuration: ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
+            f"Unsupported configuration: a_dtype={a_dtype}, b_dtype={b_dtype}, "
+            f"sf_dtype={sf_dtype}, "
             f"sf_vec_size={sf_vec_size}, out_dtype={out_dtype}, "
             f"final_scale_dtype={token_final_scales.dtype}, "
-            f"mma_tiler_mn={mma_tiler_mn}, cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
+            f"mma_tiler_mn={mma_tiler_mn}, mma_tiler={mma_tiler}, mma_inst_shape={mma_inst_shape}, "
+            f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
@@ -448,10 +585,16 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
         )
-    elif out.shape != (output_rows, n):
-        raise ValueError(
-            f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
-        )
+    else:
+        expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
+        if out.shape != (output_rows, n):
+            raise ValueError(
+                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+            )
+        if out.dtype != expected_out_dtype:
+            raise TypeError(
+                f"out must have dtype {expected_out_dtype}, got {out.dtype}"
+            )
 
     # Get SM count
     if sm_count is None:
@@ -462,15 +605,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    # Get tile_size from mma_tiler_mn
-    tile_size = mma_tiler_mn[0]
+    tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
-        ab_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        a_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     b_ptr = make_ptr(
-        ab_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        b_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
     a_sf_ptr = make_ptr(
         sf_dtype_cutlass, a_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -516,16 +658,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # Get or compile the kernel (cached by tactic parameters only)
     compiled_gemm = _get_compiled_finalize_kernel(
-        # Runtime parameters (problem dimensions)
         seq_len=seq_len,
         permuted_m=permuted_m,
         n=n,
         k=k,
         num_experts=num_experts,
         topk=topk,
-        # Tensor pointers (order must match wrapper signature)
         a_ptr=a_ptr,
         b_ptr=b_ptr,
         a_sf_ptr=a_sf_ptr,
@@ -540,22 +679,30 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
-        mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
+        a_dtype=a_dtype_cutlass,
+        b_dtype=b_dtype_cutlass,
+        sf_dtype=sf_dtype_cutlass,
+        out_dtype=out_dtype_cutlass,
+        final_scale_dtype=token_scales_dtype,
+        mma_tiler_mn=mma_tiler_mn if not is_rubin else None,
+        mma_tiler=mma_tiler if is_rubin else None,
+        mma_inst_shape=mma_inst_shape if is_rubin else None,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
     )
 
-    # Execute kernel with runtime parameters
-    # Order must match wrapper signature:
+    # Execute kernel with runtime parameters.
+    # Order must match the wrapper signature; the Rubin SM107 wrapper has no
+    # a_per_token_scale_ptr parameter (see the arity note at the compile site),
+    # so on Rubin the extra pointer must be omitted here too.
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  a_per_token_scale_ptr, m, n, k, l, num_tokens, top_k, stream)
+    #  [a_per_token_scale_ptr], m, n, k, l, num_tokens, top_k, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -568,7 +715,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         permuted_idx_ptr,
         num_tiles_ptr,
         token_scales_ptr,
-        a_per_token_scale_ptr,
+        *([] if is_rubin else [a_per_token_scale_ptr]),
         permuted_m,
         n,
         k,
@@ -579,3 +726,162 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     )
 
     return out
+
+
+def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
+    ab_dtype: str = "float4_e2m1fn",
+    sf_dtype: str = "float8_e4m3fn",
+    out_dtype: str = "bfloat16",
+    sf_vec_size: int = 16,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    # Rubin (SM107) tactics carry a 3D tiler plus an MMA instruction shape;
+    # left as None on Blackwell, which uses mma_tiler_mn above.
+    mma_tiler: Optional[Tuple[int, int, int]] = None,
+    mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+    use_fused_finalize: bool = True,
+) -> torch.Tensor:
+    """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
+    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        token_final_scales,
+        out,
+        a_per_token_scale=a_per_token_scale,
+        a_dtype=ab_dtype,
+        b_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        mma_tiler=mma_tiler,
+        mma_inst_shape=mma_inst_shape,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+        use_fused_finalize=use_fused_finalize,
+    )
+
+
+def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    mma_tiler_mn: Tuple[int, int] = (256, 128),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
+) -> torch.Tensor:
+    """Run GEMM2 finalize with MXFP8 activations and packed MXFP4 weights.
+
+    ``a`` contains E4M3 values, while ``b`` contains two packed E2M1 values
+    per byte. Both scale tensors use the MMA-compatible E8M0 block-32 layout.
+    The finalized scatter-reduced output is BF16. The problem N dimension must
+    be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
+    epilogue does not predicate a partial N tile.
+    """
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
+    if a.dtype is not torch.float8_e4m3fn:
+        raise TypeError(f"MXFP8 A must have dtype torch.float8_e4m3fn, got {a.dtype}")
+    if b.dtype is not torch.uint8:
+        raise TypeError(f"Packed MXFP4 B must have dtype torch.uint8, got {b.dtype}")
+    if a_scale.dtype is not torch.uint8 or b_scale.dtype is not torch.uint8:
+        raise TypeError("MXFP8/MXFP4 E8M0 scale tensors must have dtype torch.uint8")
+    if alpha.dtype is not torch.float32:
+        raise TypeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+    if token_final_scales.dtype is not torch.float32:
+        raise TypeError("MXFP8/MXFP4 token_final_scales must have dtype torch.float32")
+    int32_tensors = {
+        "tile_idx_to_expert_idx": tile_idx_to_expert_idx,
+        "num_non_exiting_tiles": num_non_exiting_tiles,
+        "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+        "permuted_idx_to_expanded_idx": permuted_idx_to_expanded_idx,
+    }
+    for name, tensor in int32_tensors.items():
+        if tensor.dtype is not torch.int32:
+            raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+    contiguous_tensors = {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "alpha": alpha,
+        "token_final_scales": token_final_scales,
+        **int32_tensors,
+    }
+    for name, tensor in contiguous_tensors.items():
+        if tensor.device != a.device:
+            raise ValueError(f"{name} must be on {a.device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    # b_scale is the standard non-contiguous logical view returned by
+    # convert_sf_to_mma_layout; its underlying physical storage is canonical.
+    if b_scale.device != a.device:
+        raise ValueError(f"b_scale must be on {a.device}, got {b_scale.device}")
+    if out is not None and out.dtype is not torch.bfloat16:
+        raise TypeError(
+            f"MXFP8/MXFP4 GEMM2 output must have dtype torch.bfloat16, got {out.dtype}"
+        )
+    if out is not None:
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        alpha,
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        token_final_scales,
+        out,
+        a_dtype="float8_e4m3fn",
+        b_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        out_dtype="bfloat16",
+        sf_vec_size=32,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+    )

@@ -4,6 +4,91 @@ FlashInfer Attention Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
+Experimental Task-Scheduled Attention
+=====================================
+
+The experimental Blackwell task-scheduled FMHA context, FMHA decode,
+block-sparse FMHA, and MLA decode APIs are imported from
+``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
+reduction are automatic implementation details; there are no public tuning
+knobs.
+
+See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
+for the public entry points, supported contracts, and examples. Current accuracy
+and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
+but not yet signoff-qualified.
+
+.. currentmodule:: flashinfer.attention.prims_ts
+
+FMHA Context/Prefill
+--------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    batch_prefill
+    batch_prefill_with_paged_kv_cache
+
+.. autoclass:: BatchPrefillTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchPrefillPagedTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+FMHA Decode
+-----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    batch_decode_with_paged_kv_cache
+    get_prims_ts_batch_decode_workspace_size
+    prims_ts_batch_decode_with_kv_cache
+
+.. autoclass:: BatchDecodePagedTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+Block-Sparse FMHA
+-----------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    block_sparse_attention
+    block_sparse_attention_with_paged_kv_cache
+
+.. autoclass:: BlockSparseTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BlockSparsePagedTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+MLA Decode
+----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    batch_decode_mla_with_paged_kv_cache
+    get_prims_ts_batch_decode_mla_workspace_size
+    prims_ts_batch_decode_with_kv_cache_mla
+
+.. autoclass:: BatchMLADecodePagedTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+
 flashinfer.decode
 =================
 
@@ -85,6 +170,7 @@ Batch Prefill/Append Attention
     trtllm_ragged_attention_deepseek
     fmha_v2_prefill_deepseek
     trtllm_fmha_v2_prefill
+    fmha_v2_prefill_sm120
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
@@ -148,7 +234,21 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    trtllm_batch_decode_sparse_mla_dsv4
+    convert_compressed_page_aligned_sparse_indices_to_hca_metadata
+    DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
+
+.. note::
+
+    With ``backend="cute-dsl"``, pass ``hca_swa_indices`` as absolute rows into
+    the flattened SWA cache and ``hca_compressed_block_tables`` as physical
+    compressed-cache page IDs. The SWA table has shape ``[B * Q, 128]`` and may
+    express ring rotation or wraparound. Combined tables whose compressed
+    segment is a canonical page expansion can opt into compatibility conversion
+    with ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
+    remain arbitrary absolute rows. Precompute that conversion before a CUDA
+    Graph or a latency-sensitive loop.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

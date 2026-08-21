@@ -278,10 +278,33 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
 
 
 @functools.cache
+def get_device_properties(device: torch.device):
+    return torch.cuda.get_device_properties(device)
+
+
+@functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
-    return torch.cuda.get_device_capability(device.index)
+    properties = get_device_properties(device)
+    return properties.major, properties.minor
+
+
+# trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
+# public FMHA packs contain zero of either for sm100a/sm100f/sm103a. Requesting one on another
+# architecture cannot be served, and without this check it surfaces late as a "Missing
+# TRTLLM-GEN kernel" from the launcher rather than as a clear error at the call site.
+def check_trtllm_gen_sm107_only_feature(
+    enabled: Optional[bool], feature_name: str, device: torch.device
+) -> None:
+    if not enabled:
+        return
+    major, minor = get_compute_capability(device)
+    if (major, minor) != (10, 7):
+        raise ValueError(
+            f"{feature_name} is only supported on SM107 (Rubin); the current device is "
+            f"sm{major}{minor}. trtllm-gen exports those cubin variants for SM107 only."
+        )
 
 
 @functools.cache
@@ -326,7 +349,7 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
 
 @functools.cache
 def get_shared_bytes_per_block_optin(device: torch.device) -> int:
-    cap = torch.cuda.get_device_properties(device.index)
+    cap = get_device_properties(device)
     return cap.shared_memory_per_block_optin
 
 
@@ -663,14 +686,20 @@ def is_sm12x_supported(device: torch.device) -> bool:
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
-    In particular, SM120 (Blackwell lite) does NOT support it.
+    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
+    Blackwell) — both must return False, else the kernels silently compile the
+    ~12-instruction software-emulation fallback and stochastic rounding runs
+    ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
+    Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
+    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
     """
     if device is None:
         device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
-    # SM100a and SM110a support cvt.rs; SM120 does not.
-    return major in (10, 11)
+    # Match the CUDA guard exactly: only the arches where cvt.rs actually
+    # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
+    # (major 11) has no `.rs` feature.
+    return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -824,7 +853,17 @@ def round_up(x: int, y: int) -> int:
 
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return get_device_properties(device).multi_processor_count
+
+
+@functools.cache
+def get_device_name(device: torch.device) -> str:
+    return get_device_properties(device).name
+
+
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(

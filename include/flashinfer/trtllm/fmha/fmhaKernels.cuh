@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,8 +57,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
-  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103)) ||
-      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103))) {
+  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107)) ||
+      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107))) {
     return true;
   }
   return false;
@@ -67,6 +67,8 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
 constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
   if (gpuSM == kSM_103) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_107) {
+    return kernelSM == kSM_100f || kernelSM == kSM_107;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
@@ -117,12 +119,72 @@ class TllmGenFmhaKernel {
         mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
-        mSM(smArch) {}
+        mSM(smArch),
+        mMaxDeviceSmemSize(queryMaxDeviceSmemSize(smArch)) {}
+
+  static constexpr unsigned int kSmemOptInThreshold = 48 * 1024;
+  static constexpr unsigned int kRubinLegacySmemCap = 228 * 1024;
+  static constexpr unsigned int kStaticSmemReserve = 1024;
+
+  static bool isRubinOversized(unsigned int sm, unsigned int sharedMemBytes) {
+    return sm == kSM_107 && (sharedMemBytes + kStaticSmemReserve > kRubinLegacySmemCap);
+  }
+
+  void setupKernelSmem(CUfunction func, KernelMeta const& kernelMeta) const {
+    // CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE and the ALLOW_OVERSIZED enum value require
+    // CUDA >= 13.4; CUDA 13.3 only ships the launch-attribute half of this API.
+#if CUDA_VERSION >= 13040
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
+                                    CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+      return;
+    }
+#endif
+    if (kernelMeta.mSharedMemBytes >= kSmemOptInThreshold) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                    kernelMeta.mSharedMemBytes));
+    }
+  }
+
+  void appendOversizedSmemLaunchAttr(CUlaunchAttribute* launch_attribute,
+                                     CUlaunchConfig& launch_config,
+                                     KernelMeta const& kernelMeta) const {
+#if CUDA_VERSION >= 13040
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      IKL_LOG_DEBUG(
+          "TRTLLM-Gen launch info: using oversized shared memory for kernel %s (smem=%u bytes)",
+          kernelMeta.mFuncName, kernelMeta.mSharedMemBytes);
+      launch_attribute[launch_config.numAttrs].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+      launch_attribute[launch_config.numAttrs].value.sharedMemoryMode =
+          CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+      launch_config.numAttrs += 1;
+    }
+#endif
+  }
+
+  static unsigned int queryMaxDeviceSmemSize(unsigned int smArch) {
+    CUdevice device;
+    cuErrCheck(cuCtxGetDevice(&device));
+    int smem_bytes = 0;
+#if CUDA_VERSION >= 13040
+    if (smArch == kSM_107) {
+      cuErrCheck(cuDeviceGetAttribute(
+          &smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
+      return static_cast<unsigned int>(smem_bytes);
+    }
+#endif
+    cuErrCheck(cuDeviceGetAttribute(&smem_bytes,
+                                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
+    return static_cast<unsigned int>(smem_bytes);
+  }
 
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      if (kernelMeta.mSharedMemBytes + kStaticSmemReserve > mMaxDeviceSmemSize) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -137,7 +199,6 @@ class TllmGenFmhaKernel {
         if (mKernelMetaMap.find(hash) != mKernelMetaMap.end()) {
           // The kernelMeta of the existing kernel.
           auto const& existingKernelMeta = mKernelMeta[mKernelMetaMap.at(hash)];
-          // Allow conflicts only if they are family/specific versions of the same architecture.
           FLASHINFER_CHECK(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
                            "Hash conflicts exist between %s and %s.", existingKernelMeta.mFuncName,
                            kernelMeta.mFuncName);
@@ -155,11 +216,37 @@ class TllmGenFmhaKernel {
 
   size_t getNumLoadedKernels() const { return mKernelMetaMap.size(); }
 
+  inline int getBf16QFp8KvTransformMode(bool enablesKOnlyTransform,
+                                        bool separateTransformedKv) const {
+    FLASHINFER_CHECK(!(enablesKOnlyTransform && separateTransformedKv),
+                     "BF16Q FP8KV transform mode cannot be both K-only and separate K/V.");
+    if (enablesKOnlyTransform) {
+      return static_cast<int>(Bf16QFp8KvTransformMode::KOnly);
+    }
+    if (separateTransformedKv) {
+      return static_cast<int>(Bf16QFp8KvTransformMode::SeparateKv);
+    }
+    return static_cast<int>(Bf16QFp8KvTransformMode::Full);
+  }
+
+  inline bool isBf16QFp8KvGeneration() const {
+    return mDtypeQ == DATA_TYPE_BF16 && mDtypeK == DATA_TYPE_E4M3 && mDtypeV == DATA_TYPE_E4M3 &&
+           mDtypeOut == DATA_TYPE_BF16;
+  }
+
+  inline bool supportsGqaGroupingTokensHeadsQ(SelectKernelParams const& selectKernelParams) const {
+    return mDtypeQ == mDtypeK ||
+           (isBf16QFp8KvGeneration() &&
+            selectKernelParams.mBf16QFp8KvTransformMode != Bf16QFp8KvTransformMode::Full);
+  }
+
   inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler,
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
-                         int sparseMlaType, bool skipsSoftmax) const {
+                         bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
+                         int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel,
+                         bool fp16Softmax, bool usesSpcompress) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -175,38 +262,71 @@ class TllmGenFmhaKernel {
     FLASHINFER_CHECK(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
     FLASHINFER_CHECK(sparseMlaType >= 0 && sparseMlaType <= 3,
                      "The sparse MLA type must fit in 2 bits.");
-    // Format of the hash key:
-    // Bit 0  - 3 : qkvLayout.
-    // Bit 4  - 7 : maskType.
-    // Bit 8  - 11: kernelType.
-    // Bit 12 - 15: tileScheduler.
-    // Bit 16 - 17: multiCtasKvMode.
-    // Bit 18 - 25: (headDimPerCtaV >> 3).
-    // Bit 26 - 33: (headDimQk >> 3).
-    // Bit 34 - 41: (headDimV >> 3).
-    // Bit 42 - 43: (tileSizeKv >> 6).
-    // Bit 44 - 48: (log2(numTokensPerPage)).
-    // Bit 49 - 52: (log2(tileSizeQ)).
-    // Bit 53 - 53: reuseSmemKForV.
-    // Bit 54 - 54: uses2CtaMma.
-    // Bit 55 - 56: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
-    // Bit 57 - 57: skipsSoftmax.
-    // Bit 58 - 58: dynamicNumTokensPerPage.
+    FLASHINFER_CHECK(bf16QFp8KvTransformMode >= 0 && bf16QFp8KvTransformMode <= 2,
+                     "The BF16Q FP8KV transform mode must fit in 2 bits.");
+    // The enum fields are packed tightly, so an out-of-range value would alias onto its neighbour
+    // instead of producing a distinct key. Check them rather than trusting the exporter.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
-    return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
-           (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12) |
-           (static_cast<uint64_t>(multiCtasKvMode) << 16) |
-           (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18) |
-           (static_cast<uint64_t>(headDimQk >> 3) << 26) |
-           (static_cast<uint64_t>(headDimV >> 3) << 34) |
-           (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (numTokensPerPageLog2 << 44) |
-           (static_cast<uint64_t>(log2(tileSizeQ)) << 49) |
-           (static_cast<uint64_t>(reuseSmemKForV) << 53) |
-           (static_cast<uint64_t>(uses2CtaMma) << 54) |
-           (static_cast<uint64_t>(sparseMlaType) << 55) |
-           (static_cast<uint64_t>(skipsSoftmax) << 57) |
-           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58);
+    FLASHINFER_CHECK(qkvLayout >= 0 && qkvLayout < 4 && maskType >= 0 && maskType < 8 &&
+                         kernelType >= 0 && kernelType < 8 && scheduler >= 0 && scheduler < 4 &&
+                         multiCtasKvMode >= 0 && multiCtasKvMode < 4 &&
+                         bf16QFp8KvTransformMode >= 0 && bf16QFp8KvTransformMode < 4 &&
+                         numTokensPerPageLog2 < 16,
+                     "Kernel attribute out of range for the hash key: qkvLayout=%d, maskType=%d, "
+                     "kernelType=%d, tileScheduler=%d, multiCtasKvMode=%d, "
+                     "bf16QFp8KvTransformMode=%d, numTokensPerPage=%d",
+                     qkvLayout, maskType, kernelType, scheduler, multiCtasKvMode,
+                     bf16QFp8KvTransformMode, numTokensPerPage);
+    // Format of the hash key. The enum fields are packed to their actual width rather than a
+    // round 4 bits, which is what makes room for fp16Softmax and usesSpcompress; the key is a
+    // private lookup key (nothing persists it), so the layout can move as long as
+    // hashID(KernelMeta) and hashFromRunnerParams() move with it.
+    // Bit 0  - 1 : qkvLayout.
+    // Bit 2  - 4 : maskType.
+    // Bit 5  - 7 : kernelType.
+    // Bit 8  - 9 : tileScheduler.
+    // Bit 10 - 11: multiCtasKvMode.
+    // Bit 12 - 19: (headDimPerCtaV >> 3).
+    // Bit 20 - 27: (headDimQk >> 3).
+    // Bit 28 - 35: (headDimV >> 3).
+    // Bit 36 - 37: (tileSizeKv >> 6).
+    // Bit 38 - 41: (log2(numTokensPerPage)).
+    // Bit 42 - 44: (log2(tileSizeQ)).
+    // Bit 45 - 45: reuseSmemKForV.
+    // Bit 46 - 46: uses2CtaMma.
+    // Bit 47 - 48: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
+    // Bit 49 - 49: skipsSoftmax.
+    // Bit 50 - 50: dynamicNumTokensPerPage.
+    // Bit 51 - 52: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
+    // Bit 53 - 53: groupsTokensHeadsQ.
+    // Bit 54 - 54: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
+    // Bit 55 - 55: fp16Softmax.
+    // Bit 56 - 56: usesSpcompress.
+    // Bit 57 - 63: unused.
+    return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 2) |
+           (static_cast<uint64_t>(kernelType) << 5) | (static_cast<uint64_t>(scheduler) << 8) |
+           (static_cast<uint64_t>(multiCtasKvMode) << 10) |
+           (static_cast<uint64_t>(headDimPerCtaV >> 3) << 12) |
+           (static_cast<uint64_t>(headDimQk >> 3) << 20) |
+           (static_cast<uint64_t>(headDimV >> 3) << 28) |
+           (static_cast<uint64_t>(tileSizeKv >> 6) << 36) | (numTokensPerPageLog2 << 38) |
+           (static_cast<uint64_t>(log2(tileSizeQ)) << 42) |
+           (static_cast<uint64_t>(reuseSmemKForV) << 45) |
+           (static_cast<uint64_t>(uses2CtaMma) << 46) |
+           (static_cast<uint64_t>(sparseMlaType) << 47) |
+           (static_cast<uint64_t>(skipsSoftmax) << 49) |
+           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 50) |
+           (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 51) |
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 53) |
+           (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 54) |
+           (static_cast<uint64_t>(fp16Softmax) << 55) |
+           (static_cast<uint64_t>(usesSpcompress) << 56);
+  }
+
+  inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
+    return kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::KeepsMmaAbForGeneration) &&
+           kernelMeta.mGroupsTokensHeadsQ && kernelMeta.mStepQ == 2 * kernelMeta.mTileSizeQ;
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -215,13 +335,16 @@ class TllmGenFmhaKernel {
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
-    return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
-                  kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
-                  kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
-                  kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
-                  isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
-                  kernelMeta.m2CtaMma, kernelMeta.mSparseAttn,
-                  kernelMeta.mSkipsSoftmaxWhenPossible);
+    return hashID(
+        kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
+        kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV,
+        kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV, kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv,
+        kernelMeta.mNumTokensPerPage, isDynamicNumTokensPerPageKernel(kernelMeta),
+        kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ,
+        kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+        getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
+                                   kernelMeta.mSeparateTransformedKv),
+        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -278,7 +401,7 @@ class TllmGenFmhaKernel {
     kernelParams.mLogNumEltsPerSageAttnBlkV = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkV);
 
     void* kernelParamsList[] = {&kernelParams};
-    CUlaunchAttribute launch_attribute[3];
+    CUlaunchAttribute launch_attribute[4] = {};
     CUlaunchConfig launch_config;
     buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
 
@@ -332,9 +455,9 @@ class TllmGenFmhaKernel {
                                             params.enable_pdl, params.stream);
 
     if (params.lsePtr != nullptr) {
-      flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
-                                   params.mNumHeadsQ, params.lseStrideTokens, params.lseStrideHeads,
-                                   params.enable_pdl, params.stream);
+      FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
+          params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ, params.mNumHeadsQ,
+          params.lseStrideTokens, params.lseStrideHeads, params.enable_pdl, params.stream));
     }
   }
 
@@ -365,6 +488,7 @@ class TllmGenFmhaKernel {
     launch_attribute[2].value.programmaticStreamSerializationAllowed = params.enable_pdl;
     launch_config.attrs = launch_attribute;
     launch_config.numAttrs = 3;
+    appendOversizedSmemLaunchAttr(launch_attribute, launch_config, kernelMeta);
   }
 
   // Enable non-portable cluster sizes when clusterDimX exceeds the portable limit of 8.
@@ -387,7 +511,7 @@ class TllmGenFmhaKernel {
 
   inline bool useDynamicNumTokensPerPage(RunnerParams const& params) const {
     return isPagedKv(params.mQkvLayout) && !isSparseMla(params.mSparseMlaType) &&
-           params.mNumHeadsQPerKv > 1 && params.mHeadDimQk == params.mHeadDimV &&
+           params.mHeadDimQk == params.mHeadDimV &&
            params.mNumTokensPerPage >= kDynamicNumTokensPerPageThreshold;
   }
 
@@ -492,9 +616,38 @@ class TllmGenFmhaKernel {
       // benefits of a shorter mainloop.
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
+      int tunedMaxNumCtasPerSeqKv = maxNumCtasPerSeqKv;
+      // Cap BF16Q+FP8KV separate-transform splits so the runtime key selects
+      // CGA reduction when the smaller split is expected.
+      if (isBf16QFp8KvGeneration() &&
+          selectKernelParams.mBf16QFp8KvTransformMode == Bf16QFp8KvTransformMode::SeparateKv &&
+          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
+          !isGmemReductionWithSeparateKernel(selectKernelParams.mMultiCtasKvMode) &&
+          params.mHeadDimV < 512) {
+        int const clusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
+        int const maxKvSplitsPerCgaCluster = 16 / clusterDimX;
+        if (maxNumCtasPerSeqKv <= numCtasForAllHeadsQ * maxKvSplitsPerCgaCluster) {
+          int const launchedClusters =
+              flashinfer::ceil_div(numCtasX, clusterDimX) * numCtasY * numCtasZ;
+          int const residentSplitBudget = std::max(
+              4, flashinfer::ceil_div(params.mMultiProcessorCount * 13 / 20, launchedClusters));
+          int const targetMaxNumCtasPerSeqKv =
+              std::min(maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
+          if (targetMaxNumCtasPerSeqKv > 1 && targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
+            int const targetTileSizePerCtaKv =
+                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)
+                    ? flashinfer::ceil_div(params.mAttentionWindowSize,
+                                           targetMaxNumCtasPerSeqKv - 1)
+                    : flashinfer::ceil_div(maxAttentionWindow, targetMaxNumCtasPerSeqKv);
+            if (targetTileSizePerCtaKv <= 1024) {
+              tunedMaxNumCtasPerSeqKv = targetMaxNumCtasPerSeqKv;
+            }
+          }
+        }
+      }
       // Compute numCtasPerSeqKv.
       numCtasPerSeqKv = std::min(
-          maxNumCtasPerSeqKv,
+          tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
@@ -554,8 +707,9 @@ class TllmGenFmhaKernel {
     int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
     // Then split the headDimV into multiple CTAs if there are still unused SMs.
-    if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV &&
-        !selectKernelParams.mSelectNewKernel && !selectKernelParams.mUses2CtaMma) {
+    if (isMlaGenKernel(params) && !selectKernelParams.mGroupsTokensHeadsQ &&
+        !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel &&
+        !selectKernelParams.mUses2CtaMma) {
       // Split the headDimV into multiple CTAs if the utilization is not full.
       // It doesn't work with reuseSmemKForV currently.
       // TODO: find better heuristic of splitting headDimV across multiple CTAs.
@@ -605,17 +759,31 @@ class TllmGenFmhaKernel {
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
+  // Return the smallest shipped MLA head tile that contains a non-power-of-two head group below
+  // 64 heads. Power-of-two groups and groups with at least 128 heads return zero so callers
+  // preserve their existing heuristics; the unsupported 65-127 gap has no Q128 MLA cubin.
+  static int getPaddedMlaTileSizeQ(int numHeadsQPerKv) {
+    FLASHINFER_CHECK(numHeadsQPerKv > 0, "The numHeadsQPerKv must be positive, got %d.",
+                     numHeadsQPerKv);
+    if (numHeadsQPerKv >= 128 || (numHeadsQPerKv & (numHeadsQPerKv - 1)) == 0) {
+      return 0;
+    }
+    FLASHINFER_CHECK(numHeadsQPerKv <= 64,
+                     "Non-power-of-two MLA numHeadsQPerKv must be <= 64, got %d.", numHeadsQPerKv);
+    return std::max(8, flashinfer::UpPowerOfTwo(numHeadsQPerKv));
+  }
+
   // Select the sparse MLA generation kernel.
   // Heuristics benchmarked on B200 (SM=148, sparseMlaTopK=2048).
   void selectSparseMlaGenerationKernel(RunnerParams const& params,
                                        SelectKernelParams& selectKernelParams) const {
     // numHeadsQ <= 32 : SwapsMmaAbForGeneration
-    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 (GPU under-utilized with full tile; halving creates
-    //               2x more head-splitting CTAs), or numHeadsQPerKv at batch>=2.
+    //   Non-power-of-two head counts use one padded Q8/Q16/Q32 tile. Power-of-two head counts use
+    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 or numHeadsQPerKv at batch>=2.
     //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
     //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
     //     full tileSizeQ wins by 2-11% at batch>=2.
-    // numHeadsQ >= 64 : KeepsMmaAbForGeneration, tileSizeQ = 64
+    // numHeadsQ > 32 : KeepsMmaAbForGeneration, tileSizeQ = 64
     //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
     //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
     //   Note: at small batch e4m3 prefers SwapsMmaAb tileSizeQ=32 (+10%), but fp16 prefers
@@ -645,7 +813,7 @@ class TllmGenFmhaKernel {
                                                               params.mMultiProcessorCount / 8;
       tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
     } else {
-      // numHeadsQ >= 64: use KeepsMmaAbForGeneration.
+      // numHeadsQ > 32: use KeepsMmaAbForGeneration.
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       tileSizeQ = 64;
       selectKernelParams.mTileSizeKv = 128;
@@ -674,11 +842,68 @@ class TllmGenFmhaKernel {
         selectKernelParams.mHeadDimPerCtaV = 256;
       }
     }
+    // Preserve the legacy heuristic above for power-of-two groups. A non-power-of-two group must
+    // fit in one padded tile because the final head CTA cannot process a partial tile.
+    if (int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
+        paddedTileSizeQ != 0) {
+      tileSizeQ = paddedTileSizeQ;
+    }
+  }
+
+  inline bool usesGroupedMlaGenerationKernel(RunnerParams const& params) const {
+    bool const usesSupportedDtypes = (mDtypeQ == DATA_TYPE_BF16 && mDtypeK == DATA_TYPE_BF16 &&
+                                      mDtypeV == DATA_TYPE_BF16 && mDtypeOut == DATA_TYPE_BF16) ||
+                                     (mDtypeQ == DATA_TYPE_E4M3 && mDtypeK == DATA_TYPE_E4M3 &&
+                                      mDtypeV == DATA_TYPE_E4M3 && mDtypeOut == DATA_TYPE_BF16);
+    bool const usesSupportedHeadRatio =
+        params.mNumHeadsQPerKv == 8 || params.mNumHeadsQPerKv == 16 || params.mNumHeadsQPerKv == 32;
+
+    return !isSparseMla(params.mSparseMlaType) && params.mMaxSeqLenQ > 1 &&
+           usesSupportedHeadRatio && params.mBatchSize >= 1 && params.mBatchSize <= 16 &&
+           params.mNumTokensPerPage == 32 && params.mHeadDimQk == 576 && params.mHeadDimV == 512 &&
+           usesSupportedDtypes;
+  }
+
+  // Grouped MLA generation packs query tokens and local Q heads into Q64 CTAs.
+  void selectGroupedMlaGenerationKernel(RunnerParams const& params,
+                                        SelectKernelParams& selectKernelParams) const {
+    selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+    selectKernelParams.mTileSizeQ = 64;
+    selectKernelParams.mTileSizeKv = 128;
+    // Preserve Disabled/Persistent selected by an earlier low-KV pass.
+    if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
+      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+      selectKernelParams.mTileScheduler = TileScheduler::Static;
+    }
+    selectKernelParams.mForceGmemReduction = true;
+    selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+    selectKernelParams.mReuseSmemKForV = false;
+    selectKernelParams.mGroupsTokensHeadsQ = true;
+    selectKernelParams.mUses2CtaMma = false;
+
+    int const groupedRows = params.mMaxSeqLenQ * params.mNumHeadsQPerKv;
+    int const baseNumCtas =
+        params.mBatchSize * params.mNumHeadsKv * flashinfer::ceil_div(groupedRows, 64);
+    if (baseNumCtas <= 1) {
+      selectKernelParams.mHeadDimPerCtaV = 128;
+    } else if (baseNumCtas <= 4) {
+      selectKernelParams.mHeadDimPerCtaV = 256;
+    } else {
+      selectKernelParams.mHeadDimPerCtaV = 512;
+    }
+    selectKernelParams.mHeadDimPerCtaV =
+        std::min(selectKernelParams.mHeadDimPerCtaV, params.mHeadDimV);
   }
 
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel(RunnerParams const& params,
                                  SelectKernelParams& selectKernelParams) const {
+    if (usesGroupedMlaGenerationKernel(params)) {
+      selectGroupedMlaGenerationKernel(params, selectKernelParams);
+      return;
+    }
+    selectKernelParams.mGroupsTokensHeadsQ = false;
+
     // The kernel type.
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
@@ -687,13 +912,16 @@ class TllmGenFmhaKernel {
     if (isSparseMla(params.mSparseMlaType)) {
       selectSparseMlaGenerationKernel(params, selectKernelParams);
     } else {
+      int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
       // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
-      bool const useSwapsMmaAb = params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
+      // Padded Q64 must use KeepsMmaAb so split-KV also follows its standalone-reducer path.
+      bool const useSwapsMmaAb =
+          paddedTileSizeQ != 0 ? paddedTileSizeQ <= 32
+                               : params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
 
       if (useSwapsMmaAb) {
         kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        // Non-sparse MLA (legacy): tileSizeQ capped at 16.
-        tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+        tileSizeQ = paddedTileSizeQ != 0 ? paddedTileSizeQ : (params.mNumHeadsQPerKv <= 8 ? 8 : 16);
       } else {
         kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
         tileSizeQ = 64;
@@ -712,6 +940,9 @@ class TllmGenFmhaKernel {
 
   void syncGqaGenerationTraitsForKernelHash(RunnerParams const& params,
                                             SelectKernelParams& selectKernelParams) const {
+    // Same-dtype GQA generation cubins export this trait for every tile size, including runtime
+    // shapes where the resulting CTA covers only one query token.
+    selectKernelParams.mGroupsTokensHeadsQ = true;
     bool const multiCtasKvEnabled = isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode);
     if (selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
         params.mHeadDimV > 256) {
@@ -744,6 +975,10 @@ class TllmGenFmhaKernel {
         {8, 1.0}     // Cost factor when tileSizeQ = 8
     };
 
+    bool const isBf16QFp8KvFullTransform =
+        isBf16QFp8KvGeneration() &&
+        selectKernelParams.mBf16QFp8KvTransformMode == Bf16QFp8KvTransformMode::SeparateKv;
+
     // Define the per-tile reduction cost model for different tileSizeQ choices.
     std::unordered_map<int, float> kernelReductionCost = {
         {128, 1.32},  // Reduction cost factor when tileSizeQ = 128
@@ -753,6 +988,9 @@ class TllmGenFmhaKernel {
         {8, 1.0}      // Reduction cost factor when tileSizeQ = 8
     };
 
+    // Full-transform kernels pay conversion work in the KV mainloop, so bias the model toward
+    // keeping enough KV parallelism without changing the reduction model.
+    float const kernelMainloopCostFactor = isBf16QFp8KvFullTransform ? 2.0f : 1.0f;
     // The reduction cost emulated as a sequence length factor.
     float const kernelReductionSeqLenFactor = 128.0f;
 
@@ -816,9 +1054,10 @@ class TllmGenFmhaKernel {
           kernelMeta.mStepKv;
 
       // Compute the modeling kernel time = mainloop cost + reduction cost.
-      float modelingKernelTime = kernelMainloopCost.at(tileSizeQ) * seqLenPerCtaKv +
-                                 kernelReductionCost.at(tileSizeQ) * kernelReductionSeqLenFactor *
-                                     ctaLaunchParams.mMaxNumCtasKv;
+      float modelingKernelTime =
+          kernelMainloopCostFactor * kernelMainloopCost.at(tileSizeQ) * seqLenPerCtaKv +
+          kernelReductionCost.at(tileSizeQ) * kernelReductionSeqLenFactor *
+              ctaLaunchParams.mMaxNumCtasKv;
 
       // Compute the total number of CTAs.
       int32_t numCtas =
@@ -854,13 +1093,17 @@ class TllmGenFmhaKernel {
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
+    selectKernelParams.mGroupsTokensHeadsQ = false;
 
-    // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeK || mDtypeQ != mDtypeV) {
+    // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
+    // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
+    if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
+      selectKernelParams.mGroupsTokensHeadsQ = false;
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
     }
+    selectKernelParams.mGroupsTokensHeadsQ = true;
 
     // The number of tokensQ and headsQ that can be grouped into one CTA.
     int numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
@@ -959,8 +1202,13 @@ class TllmGenFmhaKernel {
         ", dynamicNumTokensPerPage=" + std::to_string(selectKernelParams.mDynamicNumTokensPerPage) +
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
+        ", groupsTokensHeadsQ=" + std::to_string(selectKernelParams.mGroupsTokensHeadsQ) +
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
-        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
+        ", bf16QFp8KvTransformMode=" +
+        std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
+        ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -975,8 +1223,11 @@ class TllmGenFmhaKernel {
                selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                selectKernelParams.mNumTokensPerPage, selectKernelParams.mDynamicNumTokensPerPage,
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
-               static_cast<int>(params.mSparseMlaType),
-               selectKernelParams.mSkipsSoftmaxWhenPossible),
+               selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
+               selectKernelParams.mSkipsSoftmaxWhenPossible,
+               static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
+               /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
+               selectKernelParams.mUsesSpcompress),
         info);
   }
 
@@ -1026,11 +1277,7 @@ class TllmGenFmhaKernel {
       funcInfo.mMetaInfoIndex = metaIndex;
       cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
 
-      if (kernelMeta.mSharedMemBytes >= 48 * 1024) {
-        cuErrCheck(cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                      kernelMeta.mSharedMemBytes));
-      }
+      setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
 
       // Cache the loaded function.
       mFunctions[hashId] = funcInfo;
@@ -1051,6 +1298,7 @@ class TllmGenFmhaKernel {
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
+  unsigned int mMaxDeviceSmemSize;
   mutable std::unordered_map<std::string, CUmodule> mModules;
 
   mutable std::unordered_map<uint64_t, unsigned int> mKernelMetaMap;

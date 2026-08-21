@@ -14,10 +14,19 @@ from flashinfer.fused_moe.utils import (
     make_hybrid_bucket_mapper,
 )
 from flashinfer.mla._core import (
+    CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
-from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+from flashinfer.mla._sparse_mla_sm120 import (
+    _decode_dsv3_2_tuning_config,
+    _decode_dsv4_tuning_config,
+)
+from flashinfer.tllm_enums import (
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    RoutingInputMode,
+)
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -245,9 +254,68 @@ def test_search_cache_hit_and_miss():
     assert miss == (False, 0, -1, None)
 
     key = AutoTuner._get_cache_key("dummy", runner, shapes, config)
-    tuner.profiling_cache[key] = (0, 1, None)
+    tuner.profiling_cache[key] = (1, None)
     hit = tuner.search_cache("dummy", [runner], shapes, config)
     assert hit == (True, 0, 1, None)
+
+
+def test_search_cache_hit_resolves_runner_id_against_current_list():
+    """A cache hit must dispatch to the runner matching its key, not to a
+    position recorded at tuning time (issue #3999 regression test)."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    winner = DummyRunner()
+    other = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+    tuple_tactic = (7, ((1, 2),))  # non-int tactic, like cuDNN engine/knobs
+
+    # Entry recorded when `winner` was tuned alone (position 0 at tuning time).
+    key = AutoTuner._get_cache_key("dummy", winner, shapes, config)
+    tuner.profiling_cache[key] = (tuple_tactic, None)
+
+    # A later call sees a longer runner list where `winner` sits at position 1.
+    hit = tuner.search_cache("dummy", [other, winner], shapes, config)
+    assert hit == (True, 1, tuple_tactic, None)
+
+    inputs = [torch.zeros(8, 16)]
+    chosen_runner, tactic = tuner.choose_one("dummy", [other, winner], config, inputs)
+    assert chosen_runner is winner
+    assert tactic == tuple_tactic
+
+
+def test_search_cache_in_memory_beats_file_config_across_runners():
+    """An in-memory tuning result must win over a file config that matches an
+    earlier-listed runner: sources are searched in priority order across all
+    runners, not per-runner."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner()
+    b = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+
+    # File config matches runner `a` (position 0); fresher in-memory result
+    # matches runner `b` (position 1).
+    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
+    tuner._file_configs[key_a.file_key] = ("DummyRunner", 3)
+    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
+    tuner.profiling_cache[key_b] = (5, None)
+
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 1, 5, None)
+
+    # Without the in-memory entry, the file config is used and resolves to
+    # `a`'s position in the current list.
+    tuner.profiling_cache.clear()
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 0, 3, None)
 
 
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
@@ -320,7 +388,7 @@ def test_choose_one_inference_uses_cache_or_fallback():
 
     # Seed cache -> cache hit.
     key = AutoTuner._get_cache_key("dummy", runner, (inputs[0].shape,), config)
-    tuner.profiling_cache[key] = (0, 2, None)
+    tuner.profiling_cache[key] = (2, None)
     chosen_runner, tactic = tuner.choose_one("dummy", [runner], config, inputs)
     assert chosen_runner is runner
     assert tactic == 2
@@ -347,6 +415,128 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert len(tuner.profiling_cache) >= 1
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
+
+
+def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
+    """rank_tactics should return best-first shortlist and cache the winner."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=2)
+        cached_ranking = tuner.rank_tactics("dummy_rank", [runner], config, inputs, k=3)
+
+    assert ranked == [1, 2]
+    assert cached_ranking == [1, 2, 0]
+    assert profile_calls == [0, 1, 2]
+    _, tactic = tuner.choose_one("dummy_rank", [runner], config, inputs)
+    assert tactic == 1
+
+
+def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_winner_only", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (0, None)
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_winner_only", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+
+
+def test_rank_tactics_rebuilds_shortlist_from_file_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_file_cache", runner, (inputs[0].shape,), config
+    )
+    tuner._file_configs[key.file_key] = ("DummyRunner", 0)
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics(
+            "dummy_rank_file_cache", [runner], config, inputs, k=2
+        )
+
+    assert ranked == [1, 2]
+    assert profile_calls == [0, 1, 2]
+
+
+def test_rank_tactics_uses_mapped_dynamic_profile(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((12, 4), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=lambda x: 8 if x <= 8 else 16,
+            ),
+        )
+    )
+    profiled_shapes = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profiled_shapes.append(tuple(prof_inputs[0].shape))
+        return float(tactic)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        ranked = tuner.rank_tactics("dummy_rank_dynamic", [runner], config, inputs, k=2)
+
+    assert ranked == [0, 1]
+    assert profiled_shapes == [(16, 4), (16, 4)]
+
+
+def test_rank_tactics_outside_tuning_returns_single_cached_or_fallback():
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [-1]
+
+    key = AutoTuner._get_cache_key(
+        "dummy_rank_infer", runner, (inputs[0].shape,), config
+    )
+    tuner.profiling_cache[key] = (2, None)
+    assert tuner.rank_tactics("dummy_rank_infer", [runner], config, inputs, k=3) == [2]
 
 
 def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
@@ -383,6 +573,40 @@ def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     assert tuple(prepared[0].shape) == (8, 4)
     assert prepared[0] is not inputs[0]
     assert prepared[1] is inputs[1]
+
+
+def test_tuning_config_tensor_initializers_apply_by_input_index():
+    """Top-level initializers apply by index while unspecified inputs use defaults."""
+
+    def fill_sevens(shapes, dtype, device):
+        return torch.full(shapes, 7, dtype=dtype, device=device)
+
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 2),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _: 8,
+            ),
+        ),
+        tensor_initializers=((2, fill_sevens),),
+    )
+    inputs = [
+        torch.empty((4, 2), dtype=torch.float32),
+        torch.empty((3, 3), dtype=torch.float32),
+        torch.empty((4, 1), dtype=torch.float32),
+    ]
+
+    (profile,) = tuner._generate_optimization_profiles(config, inputs)
+    assert profile.tensor_initializers == [None, None, fill_sevens]
+
+    prepared = tuner._prepare_input_tensors(profile, inputs)
+    assert tuple(prepared[0].shape) == (8, 2)
+    assert prepared[1] is inputs[1]
+    assert tuple(prepared[2].shape) == (8, 1)
+    assert torch.all(prepared[2] == 7)
 
 
 class TileTacticDummyRunner(TunableRunner):
@@ -660,6 +884,31 @@ def test_autotune_context_custom_buckets(monkeypatch):
     assert unique_shapes == [100, 200, 500]
 
 
+def test_tuning_overrides_preserve_tensor_initializers():
+    """Bucket overrides must retain the per-input initializer mapping."""
+
+    def initializer(shapes, dtype, device):
+        return torch.zeros(shapes, dtype=dtype, device=device)
+
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128, 256),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        tensor_initializers=((0, initializer),),
+    )
+
+    with autotune(tune_mode=False, tuning_buckets=(100, 200)):
+        overridden = tuner._apply_tuning_overrides(config)
+
+    assert overridden.tensor_initializers == config.tensor_initializers
+
+
 def test_autotune_context_round_up(monkeypatch):
     """autotune(round_up=True) uses ceil rounding for cache lookup."""
     tuner = reset_autotuner()
@@ -805,6 +1054,264 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests for value-aware profiling usage
+# ---------------------------------------------------------------------------
+
+
+class ValueAwareCudaRunner(TunableRunner):
+    """CUDA operation used by value-aware expected-usage tests."""
+
+    def get_valid_tactics(self, inputs, profile):
+        """Expose two bodies so tests can compare them on one prepared schedule."""
+        del inputs, profile
+        return [0, 1]
+
+    def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
+        """Write a result that depends on both declared value-aware inputs."""
+        del tactic, do_preparation, kwargs
+        hidden, expert_ids, expert_weights, output, model_bias = inputs
+        output.copy_(
+            hidden + expert_ids.float().mean() + expert_weights.mean() + model_bias
+        )
+        return output
+
+
+def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
+    """Automatic tuning must stage one value sample fairly across candidate tactics."""
+    if not torch.cuda.is_available():
+        pytest.skip("value-aware profiling arenas require CUDA")
+
+    tuner = reset_autotuner()
+    runner = ValueAwareCudaRunner()
+    monkeypatch.setattr(tuner, "repeat", 4)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    num_tokens = 128
+    top_k = 4
+    num_experts = 32
+    inputs = [
+        torch.ones((num_tokens, 4), device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.bfloat16, device="cuda"),
+        torch.zeros((num_tokens, 4), device="cuda"),
+        torch.full((num_tokens, 4), 3.0, device="cuda"),
+    ]
+
+    sampled_expert_ids = (
+        torch.arange(num_tokens).unsqueeze(1) * top_k + torch.arange(top_k)
+    ) % num_experts
+    sampled_routing_weights = torch.full(
+        (num_tokens, top_k), 1.0 / top_k, dtype=torch.bfloat16
+    )
+
+    def stage_routing_distribution(profile_inputs):
+        """Stage one expert distribution without mutating caller-owned tensors."""
+        staged = list(profile_inputs)
+        staged[1] = sampled_expert_ids.to(profile_inputs[1].device, torch.int32)
+        staged[2] = sampled_routing_weights.to(profile_inputs[2].device, torch.bfloat16)
+        return staged
+
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        value_aware_input_indices=(1, 2),
+        profile_arena_input_indices=(0, 1, 2, 3),
+        inputs_pre_hook=stage_routing_distribution,
+    )
+    observed_schedules = []
+
+    def profile_from_staged_batches(
+        self,
+        runner_obj,
+        profile_inputs,
+        tactic,
+        tuning_config=None,
+        input_tensor_batches=None,
+        **kwargs,
+    ):
+        """Record the public profiling schedule and return deterministic tactic timing."""
+        del self, runner_obj, profile_inputs, tuning_config, kwargs
+        assert input_tensor_batches is not None
+        observed_schedules.append(input_tensor_batches)
+        return {0: 2.0, 1: 1.0}[tactic]
+
+    # Exercise the normal choose_one API: the hook runs once, then every tactic receives the
+    # same A/B-alternating ring schedule populated from that realization.
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", profile_from_staged_batches
+    )
+    with autotune(tune_mode=True):
+        selected_runner, selected_tactic = tuner.choose_one(
+            "value_aware_routing", [runner], config, inputs
+        )
+
+    assert selected_runner is runner
+    assert selected_tactic == 1
+    assert len(observed_schedules) == 2
+    assert observed_schedules[0] is observed_schedules[1]
+
+    # Arena-backed call tensors get stable lane views, while the omitted read-only model tensor
+    # keeps its original pointer across all tactic measurements.
+    schedule = observed_schedules[0]
+    assert len(schedule) == tuner.repeat
+    expected_ids = sampled_expert_ids.to(schedule[0][1].device, torch.int32)
+    expected_weights = sampled_routing_weights.to(schedule[0][2].device, torch.bfloat16)
+    for batch in schedule:
+        assert torch.equal(batch[1], expected_ids)
+        assert torch.equal(batch[2], expected_weights)
+        assert batch[4] is inputs[4]
+        for input_index in (0, 1, 2, 3):
+            assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
+    for input_index in (0, 1, 2, 3):
+        assert (
+            len({batch[input_index].data_ptr() for batch in schedule}) == tuner.repeat
+        )
+    assert torch.count_nonzero(inputs[1]).item() == 0
+    assert torch.count_nonzero(inputs[2]).item() == 0
+    sorted_ids = schedule[0][1].sort(dim=1).values
+    assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
+
+
+def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatch):
+    """One tuning transaction must restage distributions into one stable schedule."""
+    if not torch.cuda.is_available():
+        pytest.skip("value-aware profiling arenas require CUDA")
+
+    tuner = reset_autotuner()
+    runner = ValueAwareCudaRunner()
+    monkeypatch.setattr(tuner, "repeat", 4)
+    monkeypatch.setattr(tuner, "warmup", 0)
+    monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    operation_key = "value_aware_moe_distribution"
+    num_tokens = 1024
+    top_k = 4
+    num_experts = 32
+    inputs = [
+        torch.ones((num_tokens, 4), device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda"),
+        torch.zeros((num_tokens, top_k), dtype=torch.bfloat16, device="cuda"),
+        torch.zeros((num_tokens, 4), device="cuda"),
+        torch.full((num_tokens, 4), 2.0, device="cuda"),
+    ]
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        value_aware_input_indices=(1, 2),
+        profile_arena_input_indices=(0, 1, 2, 3),
+    )
+
+    # Allocate one A/B arena pair for the operation, then retain its lane addresses for every
+    # distribution and every tactic in this single tuning transaction.
+    input_shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+    profile_records = []
+    observed_histograms = {}
+    # TODO: Let AutoTuner orchestrate multiple same-shaped value samples within one tuning transaction.
+    with autotune(tune_mode=True):
+        effective_config, shared_schedule = tuner.prepare_tactic_profile(inputs, config)
+        pointer_order = tuple(
+            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
+            for batch in shared_schedule
+        )
+
+        for distribution_index, distribution_name in enumerate(
+            ("uniform", "gaussian", "dirichlet")
+        ):
+            # Keep all three generators deterministic and inline so this expected-usage test
+            # does not acquire a production distribution dependency.
+            expert_positions = torch.arange(num_experts, dtype=torch.float64)
+            if distribution_name == "uniform":
+                expert_probabilities = torch.full(
+                    (num_experts,), 1.0 / num_experts, dtype=torch.float64
+                )
+            elif distribution_name == "gaussian":
+                deviations = (expert_positions - (num_experts - 1) / 2) / 4.0
+                expert_probabilities = torch.exp(-0.5 * deviations.square())
+                expert_probabilities /= expert_probabilities.sum()
+            else:
+                with torch.random.fork_rng():
+                    torch.manual_seed(17)
+                    expert_probabilities = torch.distributions.Dirichlet(
+                        torch.full((num_experts,), 0.15, dtype=torch.float64)
+                    ).sample()
+            sample_generator = torch.Generator().manual_seed(101 + distribution_index)
+            expert_ids = torch.multinomial(
+                expert_probabilities.expand(num_tokens, -1),
+                top_k,
+                replacement=False,
+                generator=sample_generator,
+            )
+            selected_probabilities = expert_probabilities[expert_ids]
+            # Probability-normalized weights are intentionally simple and coupled for brevity.
+            routing_weights = selected_probabilities / selected_probabilities.sum(
+                dim=1, keepdim=True
+            )
+
+            # Restage only values. Every tactic sees the same A/B lane order, and the next
+            # distribution overwrites those exact graph-stable addresses rather than reallocating.
+            inputs[1].copy_(expert_ids.to(inputs[1].device, torch.int32))
+            inputs[2].copy_(routing_weights.to(inputs[2].device, torch.bfloat16))
+            for batch in shared_schedule:
+                batch[1].copy_(inputs[1])
+                batch[2].copy_(inputs[2])
+            for tactic in (0, 1):
+                time_ms = tuner.profile_tactic(
+                    runner,
+                    inputs,
+                    tactic,
+                    effective_config,
+                    shared_schedule,
+                )
+                profile_records.append(
+                    (
+                        operation_key,
+                        input_shapes,
+                        distribution_name,
+                        tactic,
+                        time_ms,
+                        tuple(
+                            tuple(batch[index].data_ptr() for index in (0, 1, 2, 3))
+                            for batch in shared_schedule
+                        ),
+                    )
+                )
+
+            # Each row models top-k routing rather than independent categorical draws, and the
+            # complete operation observes the newly staged IDs and coupled weights.
+            sorted_ids = expert_ids.sort(dim=1).values
+            assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
+            histogram = torch.bincount(
+                expert_ids.flatten(), minlength=num_experts
+            ).double()
+            observed_histograms[distribution_name] = histogram / histogram.sum()
+            expected_output = (
+                inputs[0] + inputs[1].float().mean() + inputs[2].mean() + inputs[4]
+            )
+            for batch in shared_schedule:
+                torch.testing.assert_close(batch[3], expected_output)
+                assert batch[4] is inputs[4]
+
+    assert len(profile_records) == 6
+    assert {record[0] for record in profile_records} == {operation_key}
+    assert {record[1] for record in profile_records} == {input_shapes}
+    assert [record[2:4] for record in profile_records] == [
+        (distribution_name, tactic)
+        for distribution_name in ("uniform", "gaussian", "dirichlet")
+        for tactic in (0, 1)
+    ]
+    assert all(record[4] >= 0 for record in profile_records)
+    assert all(record[5] == pointer_order for record in profile_records)
+    assert not torch.equal(
+        observed_histograms["uniform"], observed_histograms["gaussian"]
+    )
+    assert not torch.equal(
+        observed_histograms["gaussian"], observed_histograms["dirichlet"]
+    )
+    assert (
+        observed_histograms["gaussian"][num_experts // 2]
+        > observed_histograms["gaussian"][0]
+    )
+    assert observed_histograms["dirichlet"].max() > 2.0 / num_experts
+
+
+# ---------------------------------------------------------------------------
 # Tests for None / optional input tensors
 # ---------------------------------------------------------------------------
 
@@ -900,6 +1407,7 @@ def test_skip_ops_prevents_profiling(monkeypatch):
         return 1.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with autotune(tune_mode=True, skip_ops={"skip_me"}):
         chosen_runner, tactic = tuner.choose_one("skip_me", [runner], config, inputs)
@@ -907,6 +1415,46 @@ def test_skip_ops_prevents_profiling(monkeypatch):
     assert chosen_runner is runner
     assert tactic == -1
     assert len(profile_calls) == 0
+
+
+def test_active_capture_allows_warm_tuning_cache_hits(monkeypatch):
+    """A public tuning context may read a warm cache during capture but may not profile."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    capture_active = False
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        """Record the only profiling pass used to seed the public cache."""
+        profile_calls.append(tactic)
+        return {0: 2.0, 1: 1.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capture_active
+    )
+
+    # Seed the ordinary cache outside capture, then prove a tuning-mode hit performs no work.
+    with autotune(tune_mode=True):
+        _, seeded_tactic = tuner.choose_one("warm_capture_op", [runner], config, inputs)
+    assert seeded_tactic == 1
+    seeded_call_count = len(profile_calls)
+    capture_active = True
+    with autotune(tune_mode=True):
+        _, cached_tactic = tuner.choose_one("warm_capture_op", [runner], config, inputs)
+    assert cached_tactic == 1
+    assert len(profile_calls) == seeded_call_count
+
+    # A distinct cache miss still fails before input synthesis or kernel profiling.
+    with (
+        autotune(tune_mode=True),
+        pytest.raises(RuntimeError, match="active outer CUDA Graph capture"),
+    ):
+        tuner.choose_one("cold_capture_op", [runner], config, inputs)
 
 
 def test_skip_ops_does_not_affect_other_ops(monkeypatch):
@@ -1077,23 +1625,18 @@ def _build_num_tokens_tuning_config(mapper):
 
 
 def test_find_nearest_profile_cache_dedups_equivalent_configs():
-    """Regression test for the _find_nearest_profile lru_cache memory leak.
+    """Regression test for the nearest-profile LRU cache key.
 
-    ``_find_nearest_profile`` is ``@lru_cache(maxsize=None)`` keyed on
-    ``(shapes, tuning_config)``.  ``TuningConfig`` hashes and compares its
-    ``DynamicTensorSpec`` via the *identity* of the ``map_to_tuning_buckets``
-    callable.  Production callers (e.g. fused MoE) rebuild a ``TuningConfig`` on
-    every inference call; as long as ``map_to_tuning_buckets`` is a *stable*
-    callable, every rebuilt-but-equivalent config collapses to the same cache
-    key and the cache stays bounded.
+    The cached helper is keyed only on fields that affect profile selection.
+    In particular, mapper equality remains significant while tensor
+    initializers are excluded.
 
     This test holds the input shape FIXED and rebuilds an equivalent config on
     every iteration, then asserts the cache does NOT grow.  Contrast with
     ``test_find_nearest_profile_cache_grows_with_fresh_callable`` below, which
-    shows the unbounded growth when the callable identity changes per call —
-    the exact bug this guards against.
+    shows the growth when the profile mapper itself changes on every call.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     shapes = ((1024, 128),)
 
@@ -1101,7 +1644,7 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
     AutoTuner._find_nearest_profile(
         shapes, _build_num_tokens_tuning_config(last_positive_power_of_2)
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     # Rebuild an *equivalent* config on every call, same shape every time.
     # With a stable callable these all map to one cache key -> no growth.
@@ -1110,8 +1653,10 @@ def test_find_nearest_profile_cache_dedups_equivalent_configs():
         config = _build_num_tokens_tuning_config(last_positive_power_of_2)
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == 0, (
         f"Cache grew by {cache_growth} entries across {N} calls with equivalent "
@@ -1131,7 +1676,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     though the shape and bucketing logic are identical, so the cache grows by
     exactly N — the original memory leak.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     shapes = ((1024, 128),)
 
@@ -1139,7 +1684,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     AutoTuner._find_nearest_profile(
         shapes, _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     tracemalloc.start()
     snapshot_before = tracemalloc.take_snapshot()
@@ -1153,10 +1698,12 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     snapshot_after = tracemalloc.take_snapshot()
     tracemalloc.stop()
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
     stats = snapshot_after.compare_to(snapshot_before, "lineno")
     allocated_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == N, (
         f"Expected {N} new cache entries (one per fresh callable), got {cache_growth}."
@@ -1170,6 +1717,36 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     )
 
 
+def test_find_nearest_profile_cache_dedups_recreated_bound_method():
+    """Equivalent bound-method objects should use their native equality."""
+
+    class BucketMapper:
+        def map(self, value):
+            return last_positive_power_of_2(value)
+
+    mapper = BucketMapper()
+    assert mapper.map is not mapper.map
+    assert mapper.map == mapper.map
+
+    AutoTuner._find_nearest_profile_cached.cache_clear()
+    shapes = ((1024, 128),)
+    AutoTuner._find_nearest_profile(shapes, _build_num_tokens_tuning_config(mapper.map))
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info()
+
+    N = 1_000
+    for _ in range(N):
+        AutoTuner._find_nearest_profile(
+            shapes, _build_num_tokens_tuning_config(mapper.map)
+        )
+
+    cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
+
+    assert cache_after.currsize == cache_before.currsize
+    assert cache_after.misses == cache_before.misses
+    assert cache_after.hits - cache_before.hits == N
+
+
 def _build_moe_style_tuning_config(topk_ids_initializer):
     """Build a config with tensor_initializers present, MoE-style.
     Mimics ``_make_tuning_config`` in fused_moe/core.py.
@@ -1181,11 +1758,11 @@ def _build_moe_style_tuning_config(topk_ids_initializer):
                 dim_idx=(0, 0),
                 gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
                 map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
-                tensor_initializers=[
-                    autotuner_initializer_randn,
-                    topk_ids_initializer,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, autotuner_initializer_randn),
+            (1, topk_ids_initializer),
         ),
     )
 
@@ -1197,21 +1774,23 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     # The factory must return the identical object for the same expert count.
     assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
 
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     AutoTuner._find_nearest_profile(
         shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
     )
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     N = 1_000
     for _ in range(N):
         config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_growth = (
+        AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
+    )
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
     assert cache_growth == 0, (
         f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
@@ -1219,11 +1798,18 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     )
 
 
-def test_make_tuning_config_reuses_topk_ids_initializer():
+@pytest.mark.parametrize(
+    ("routing_input_mode", "packed"),
+    [
+        (RoutingInputMode.PackedPrecomputed, True),
+        (RoutingInputMode.UnpackedPrecomputed, False),
+    ],
+)
+def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
     """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls for the same num_experts.
+    same object across calls and matches the launcher's routing representation.
     """
-    fn = core_mod.get_trtllm_moe_sm100_module
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
         mock_module = MagicMock()
@@ -1236,7 +1822,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             ),
             patch.object(core_mod, "setup_cubin_loader"),
         ):
-            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+            MoERunner = fn(enable_rubin=False).MoERunner
 
         runner = MoERunner(
             top_k=8,
@@ -1259,30 +1845,45 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             per_token_scale=None,
         )
 
-        config_a = runner._make_tuning_config(moe_inputs)
-        config_b = runner._make_tuning_config(moe_inputs)
+        config_a = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
+        config_b = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
 
-        spec_a = config_a.dynamic_tensor_specs[0]
-        spec_b = config_b.dynamic_tensor_specs[0]
         topk_idx = MoeRunnerInputs.idx("topk_ids")
-        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
-        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+        init_a = dict(config_a.tensor_initializers)[topk_idx]
+        init_b = dict(config_b.tensor_initializers)[topk_idx]
 
         assert init_a is init_b, (
             "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
-            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
-            "lru_cache key — a per-call closure reintroduces the memory leak."
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so an "
+            "equivalent config reuses one initializer object instead of allocating "
+            "a fresh closure on every call."
         )
+        assert init_a is _moe_topk_ids_init(128, packed=packed)
+
+        initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        if packed:
+            # Packed routing stores the expert ID in the high 16 bits and a
+            # deterministic BF16 routing weight of 1.0 in the low 16 bits.
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            assert torch.all((initialized >> 16) < 128)
+            assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
+        else:
+            # Unpacked routing contains plain expert IDs, not packed bitfields.
+            assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()
 
 
-def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
-    """Negative control: a fresh initializer closure per call leaks one
-    entry per call DESPITE equal hashes.
-    """
-    AutoTuner._find_nearest_profile.cache_clear()
+def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):
+    """Initializers do not affect profile selection or its cache key."""
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     def make_fresh_closure():
@@ -1293,26 +1894,38 @@ def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
 
     ref_config = _build_moe_style_tuning_config(make_fresh_closure())
     other_config = _build_moe_style_tuning_config(make_fresh_closure())
-    assert hash(ref_config) == hash(other_config), "hashes should match"
     assert ref_config != other_config, "equality should fail on fresh closures"
 
     AutoTuner._find_nearest_profile(shapes, ref_config)
-    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_before = AutoTuner._find_nearest_profile_cached.cache_info()
+
+    original_eq = TuningConfig.__eq__
+    eq_calls = 0
+
+    def counted_eq(self, other):
+        nonlocal eq_calls
+        eq_calls += 1
+        return original_eq(self, other)
+
+    monkeypatch.setattr(TuningConfig, "__eq__", counted_eq)
 
     N = 1_000
     for _ in range(N):
         config = _build_moe_style_tuning_config(make_fresh_closure())
         AutoTuner._find_nearest_profile(shapes, config)
 
-    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
-    AutoTuner._find_nearest_profile.cache_clear()
+    cache_after = AutoTuner._find_nearest_profile_cached.cache_info()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
 
-    assert cache_growth == N, (
-        f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
-    )
+    assert cache_after.currsize == cache_before.currsize
+    assert cache_after.misses == cache_before.misses
+    assert cache_after.hits - cache_before.hits == N
+    assert eq_calls == 0
 
 
-def _call_build_mla_decode_tuning_config():
+def _call_build_mla_decode_tuning_config(
+    enable_dcp: bool = False, has_sparse_mla_top_k_lens: bool = False
+):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
     runner_names is restricted to trtllm-gen so bucket computation stays
@@ -1329,46 +1942,93 @@ def _call_build_mla_decode_tuning_config():
         kv_lora_rank=512,
         max_seq_len=1024,
         device=torch.device("cpu"),
+        has_sparse_mla_top_k_lens=has_sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=4,
+        cp_rank=1,
     )
 
 
-def test_mla_decode_tuning_config_is_memoized():
+@pytest.mark.parametrize(
+    (
+        "enable_dcp",
+        "has_sparse_mla_top_k_lens",
+        "expected_input_idx",
+        "expected_initializer_indices",
+        "expected_fifth_value",
+    ),
+    [
+        (False, False, (0, 1, 2, 3), {1, 2}, None),
+        (True, False, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
+        (False, True, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
+    ],
+    ids=("default", "dcp", "sparse-top-k"),
+)
+def test_mla_decode_tuning_config_is_memoized(
+    enable_dcp,
+    has_sparse_mla_top_k_lens,
+    expected_input_idx,
+    expected_initializer_indices,
+    expected_fifth_value,
+):
     """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
 
-    A fresh config per call embeds two fresh initializer closures; those hash
-    identically to but never compare equal with previous ones, so each call
-    would leak one _find_nearest_profile cache entry and lookups would scan the
-    whole collision chain (observed as GC gen-2 pause growth and decaying
-    decode throughput in serving).
+    Memoizing equivalent arguments keeps a single config object and its
+    initializer closures alive across dispatcher calls, avoiding a per-call
+    rebuild on the decode hot path.
     """
     _mla_decode_tuning_config.cache_clear()
     try:
-        config_a = _call_build_mla_decode_tuning_config()
-        config_b = _call_build_mla_decode_tuning_config()
+        config_a = _call_build_mla_decode_tuning_config(
+            enable_dcp, has_sparse_mla_top_k_lens
+        )
+        config_b = _call_build_mla_decode_tuning_config(
+            enable_dcp, has_sparse_mla_top_k_lens
+        )
 
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "
-            "object for equivalent arguments. It must memoize on "
-            "(buckets, num_pages, profile_seq_len) so rebuilt configs collapse to "
-            "the same _find_nearest_profile lru_cache key — a per-call config "
-            "reintroduces the memory leak."
+            "object for equivalent arguments. Equivalent dispatcher calls must "
+            "reuse one config object instead of rebuilding it each call."
         )
+        assert config_a.dynamic_tensor_specs[0].input_idx == expected_input_idx
+        initializers = dict(config_a.tensor_initializers)
+        assert set(initializers) == expected_initializer_indices
+        if expected_fifth_value is not None:
+            fifth_tensor = initializers[4]((8,), torch.int32, torch.device("cpu"))
+            torch.testing.assert_close(
+                fifth_tensor,
+                torch.full((8,), expected_fifth_value, dtype=torch.int32),
+            )
     finally:
         _mla_decode_tuning_config.cache_clear()
+
+
+def test_sparse_mla_tuning_config_initializer_indices():
+    """Sparse MLA configs retain each initializer's original input index."""
+
+    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
+        0,
+        1,
+        6,
+        8,
+        9,
+    }
+    assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():
     """Regression test: rebuilt MLA-decode configs must collapse to a single
     _find_nearest_profile cache entry.
     """
-    AutoTuner._find_nearest_profile.cache_clear()
+    AutoTuner._find_nearest_profile_cached.cache_clear()
     _mla_decode_tuning_config.cache_clear()
     try:
         # [query, block_tables, seq_lens, out] as passed by the MLA dispatcher.
         shapes = ((8, 4, 128, 576), (8, 64), (8,), (8, 4, 128, 512))
 
         AutoTuner._find_nearest_profile(shapes, _call_build_mla_decode_tuning_config())
-        cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+        cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
         N = 1_000
         for _ in range(N):
@@ -1377,7 +2037,7 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
             )
 
         cache_growth = (
-            AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+            AutoTuner._find_nearest_profile_cached.cache_info().currsize - cache_before
         )
 
         assert cache_growth == 0, (
@@ -1385,5 +2045,36 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
             "equivalent MLA-decode tuning config with a fixed shape."
         )
     finally:
-        AutoTuner._find_nearest_profile.cache_clear()
+        AutoTuner._find_nearest_profile_cached.cache_clear()
         _mla_decode_tuning_config.cache_clear()
+
+
+def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(CuteDslMlaDecodeRunner)
+    runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
+    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner.qk_nope_head_dim = 512
+    runner.kv_lora_rank = 512
+    runner.qk_rope_head_dim = 64
+    runner.page_size = 32
+    runner.max_seq_len = max_seq_len
+    runner.is_var_seq = True
+    runner.uses_shared_paged_kv_idx = True
+    runner.enable_pdl = False
+    runner.sinks = None
+    runner.cute_dsl_impl = "auto"
+    runner._resolved_cute_dsl_impl = "monolithic"
+
+    query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
+    return runner.get_cache_key_extras([query, None, None, out])
+
+
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
+    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
+    assert key_257 != key_385
+
+    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    assert key_257 != key_small_workspace

@@ -77,11 +77,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeBias = dtypeBias;
     routingData.mRouteScale = routedScalingFactor;
     // Floor the renorm denominator. ScaledSumNormalizePostprocess computes
-    // sigmoid * routeScale / (sum + mSumEpsilon). If a token's top-K selected experts all have
-    // strongly negative pre-bias logits, their sigmoids underflow to exactly 0.0 (bf16) so sum ==
-    // 0, and mSumEpsilon's 0.0f default makes this 0/0 = NaN across the token's whole output row.
-    // 1e-20f matches DeepSeek-V3's reference gate (modeling_deepseek.py: sum + 1e-20) and the
-    // MiniMax2 branch.
+    // sigmoid(raw) * routeScale / (sum + mSumEpsilon). If every selected
+    // expert contributes a zero sigmoid after underflow, the 0.0f default
+    // makes this 0/0 = NaN across the token's output row. 1e-20f matches the
+    // adjacent MiniMax2 path and prevents that zero-denominator case.
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
@@ -193,6 +192,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
     routingData.mUseRoutingSoftmax = false;
 
     int32_t const numDevices = (localNumExperts > 0) ? numExperts / localNumExperts : 1;
@@ -255,8 +255,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                     RoutingMethodType::RenormalizeNaive      /* Softmax -> TopK -> Renormalize */
              || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */
              || routingMethodType ==
-                    RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */
-             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */) {
+                    RoutingMethodType::SigmoidRenorm            /* Sigmoid -> TopK -> Renormalize */
+             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */
+             || routingMethodType == RoutingMethodType::TopKSigmoid /* TopK -> Sigmoid */) {
     FLASHINFER_CHECK(numFusedSharedExpert == 0,
                      "routingCustom method does not support fusing shared expert");
     using namespace moe::dev::routing;
@@ -289,6 +290,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
       routingData.mPreprocessType = RoutingPreprocessType::Sigmoid;
       routingData.mPostprocessType = RoutingPostprocessType::SumNormalize;
       routingData.mNormTopkProb = false;
+    } else if (routingMethodType == RoutingMethodType::TopKSigmoid) {
+      // TopK -> Sigmoid (select on the raw logits, then squash the survivors)
+      routingData.mPreprocessType = RoutingPreprocessType::None;
+      routingData.mPostprocessType = RoutingPostprocessType::Sigmoid;
     } else if (routingMethodType == RoutingMethodType::Renormalize ||
                routingMethodType == RoutingMethodType::RenormalizeNaive) {
       // TopK -> Softmax (also used for RenormalizeNaive, see comment above)

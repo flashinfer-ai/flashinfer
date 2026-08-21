@@ -26,8 +26,10 @@ class RoutingMethodType(IntEnum):
     MiniMax2 = (7,)
     # Sigmoid: Sigmoid -> TopK (no renormalization)
     Sigmoid = (8,)
+    # TopKSigmoid: TopK -> Sigmoid (no renormalization)
+    TopKSigmoid = (9,)
     # Unspecified
-    Unspecified = (9,)
+    Unspecified = (10,)
 
     # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
     # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
@@ -74,7 +76,8 @@ class ActivationType(IntEnum):
     SwigluStep = 7
     GegluTanh = 8
     Identity = 9
-    InvalidType = 10
+    Situ = 10
+    InvalidType = 11
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
@@ -92,12 +95,18 @@ _GATED_ACTIVATION_TYPES = (
     ActivationType.SwigluBias,
     ActivationType.SwigluStep,
     ActivationType.GegluTanh,
+    ActivationType.Situ,
 )
 
 
 DEFAULT_SWIGLU_ALPHA = 1.0
 DEFAULT_SWIGLU_BETA = 0.0
 DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
+
+# SiTU-GLU tanh scales. Must match the SituAdaptor defaults in
+# csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
+DEFAULT_SITU_BETA = 4.0
+DEFAULT_SITU_LINEAR_BETA = 25.0
 
 
 def normalize_activation_type(
@@ -128,7 +137,7 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     -------
     bool
         ``True`` if ``activation_type`` belongs to the gated activation family
-        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``);
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``);
         ``False`` otherwise.
 
     Examples

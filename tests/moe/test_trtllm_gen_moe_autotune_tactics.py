@@ -19,10 +19,12 @@ from typing import Literal
 
 import pytest
 import torch
+import flashinfer.autotuner as autotuner_module
 
 from flashinfer import (
     RoutingMethodType,
     ActivationType,
+    autotune,
     fp4_quantize,
     mxfp8_quantize,
     reorder_rows_for_gated_act_gemm,
@@ -31,17 +33,27 @@ from flashinfer import (
 )
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
-from flashinfer.fused_moe.core import Fp8QuantizationType, MoEInputs
+from flashinfer.fused_moe.core import (
+    Fp8QuantizationType,
+    MoEInputs,
+    get_trtllm_moe_sm100_module,
+)
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import (
     device_support_pdl,
     get_compute_capability,
     last_positive_power_of_2,
+)
+
+from . import utils as moe_utils
+from .test_trtllm_gen_per_token_moe import (
+    test_routed_fused_moe as _run_per_token_nvfp4_accuracy_case,
 )
 
 from .trtllm_gen_fused_moe_utils import (
@@ -308,6 +320,7 @@ def _enumerate_valid_tactics(
     intermediate_size: int,
     num_experts: int,
     num_tokens: int,
+    use_per_token_scaling: bool = False,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given problem shape."""
@@ -326,10 +339,156 @@ def _enumerate_valid_tactics(
             ActivationType.Swiglu.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
-            False,  # use_per_token_scaling
+            use_per_token_scaling,
             num_tokens,
             False,  # has_gemm1_lora_delta
         )
+    )
+
+
+def test_nvfp4_per_token_all_tactics_are_correct(monkeypatch: pytest.MonkeyPatch):
+    """Every advertised per-token NVFP4 tactic must be numerically correct."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    torch.manual_seed(42)
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k=8,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=128,
+        num_tokens=4096,
+        use_per_token_scaling=True,
+    )
+    assert valid_tactics
+
+    moe_module = get_trtllm_moe_sm100_module()
+    real_autotune = autotuner_module.autotune
+    monkeypatch.setattr(
+        autotuner_module, "autotune", lambda _enabled: real_autotune(True)
+    )
+    tuner = AutoTuner.get()
+
+    for tactic in valid_tactics:
+        tactic = list(tactic)
+        monkeypatch.setattr(
+            moe_module.MoERunner,
+            "get_valid_tactics",
+            lambda self, inputs, profile, tactic=tactic: [tactic],
+        )
+        tuner.profiling_cache.clear()
+        tuner._file_configs.clear()
+        try:
+            with moe_utils.nvfp4_4over6_env(True):
+                _run_per_token_nvfp4_accuracy_case(
+                    num_tokens=4096,
+                    hidden_size=2048,
+                    intermediate_size=768,
+                    num_experts=128,
+                    top_k=8,
+                    use_4over6=True,
+                    weights_use_4over6=True,
+                )
+        except Exception as err:
+            raise AssertionError(
+                f"Per-token NVFP4 tactic {tactic} failed accuracy"
+            ) from err
+        torch.cuda.empty_cache()
+
+
+def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
+    """Every advertised small-shape tactic must honor the output-SF contract."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    num_tokens = 32
+    hidden_size = intermediate_size = 1024
+    num_experts = 16
+    top_k = 2
+    inputs = _build_fp4_routed_moe_inputs(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        quant_mode="NvFP4xNvFP4",
+        routing_method_type=RoutingMethodType.Renormalize,
+        device=device,
+    )
+    profile_shapes = _moe_profile_shapes(inputs, num_tokens, num_tokens)
+
+    def _run(tactic: list[int] | None) -> torch.Tensor:
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        output = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=inputs["packed_topk"],
+            routing_bias=None,
+            hidden_states=inputs["hidden_states"],
+            hidden_states_scale=inputs["hidden_states_scale"],
+            gemm1_weights=inputs["w13"],
+            gemm1_weights_scale=inputs["w13_scale"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=inputs["w2"],
+            gemm2_weights_scale=inputs["w2_scale"],
+            gemm2_bias=None,
+            output1_scale_scalar=inputs["output1_scale_scalar"],
+            output1_scale_gate_scalar=inputs["output1_scale_gate_scalar"],
+            output2_scale_scalar=inputs["output2_scale_scalar"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            do_finalize=True,
+            enable_pdl=device_support_pdl(device),
+            activation_type=ActivationType.Swiglu.value,
+            tune_max_num_tokens=num_tokens,
+        )[0]
+        torch.cuda.synchronize()
+        return output
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
+    )
+    assert valid_tactics
+    assert any(tactic[0] == 8 for tactic in valid_tactics), (
+        "the regression shape no longer exercises tile-N 8 tactics"
+    )
+    reference = _run(None).float()
+    ref_max = reference.abs().max().item()
+    assert torch.isfinite(reference).all(), "heuristic reference output is not finite"
+
+    failures = []
+    for tactic in valid_tactics:
+        failure = _check_tactic(_run, tactic, reference, ref_max, n_iters=2)
+        if failure is not None:
+            failures.append(failure)
+    assert not failures, (
+        f"{len(failures)} per-tensor NVFP4 tactics failed correctness; "
+        f"first failures: {failures[:10]}"
+    )
+    assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+        "the forced regression tactic was not dispatched through the autotuner cache"
     )
 
 
@@ -816,4 +975,103 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         raise AssertionError(
             f"[{quant_mode}] {len(failures)} of {len(valid_tactics)} tactics "
             f"failed correctness. First few:\n  " + "\n  ".join(failures[:20])
+        )
+
+
+@pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
+def test_fp4_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_experts):
+    """FP4 fused shared experts must agree with the autotuner on the fused dimensions.
+
+    ``get_valid_tactics`` must query ``trtllm_get_valid_moe_configs`` with the
+    fused (routed + shared) ``top_k`` / ``local_num_experts`` so the chosen
+    tactic passes ``prepare_moe()``'s ``effectiveTopK`` / ``effectiveLocalExperts``
+    validation. Weight contents are uninitialized (numerics are irrelevant) —
+    smoke test: must not crash during autotuning.
+    """
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.reset_statistics()
+    tuner.is_tuning_mode = False
+    device = torch.device("cuda:0")
+
+    num_experts = 256  # routed experts
+    top_k = 8
+    n_group = 8
+    topk_group = 4
+    hidden_size = 1024
+    intermediate_size = 512
+    num_tokens = 8
+    # Weight tensors carry the routed + fused shared experts in the expert dim.
+    total_experts = num_experts + num_fused_shared_experts
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    gemm1_weights = torch.empty(
+        total_experts,
+        intermediate_size * 2,
+        hidden_size // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    gemm1_weights_scale = torch.ones(
+        total_experts,
+        intermediate_size * 2,
+        hidden_size // 2 // 16,
+        dtype=torch.float32,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.empty(
+        total_experts,
+        hidden_size,
+        intermediate_size // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    gemm2_weights_scale = torch.ones(
+        total_experts,
+        hidden_size,
+        intermediate_size // 2 // 16,
+        dtype=torch.float32,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    with autotune(tune_mode=True):
+        trtllm_fp4_block_scale_moe(
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            gemm2_bias=None,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=2.5,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            do_finalize=True,
+            output=output,
+            tune_max_num_tokens=8,
+            num_fused_shared_experts=num_fused_shared_experts,
         )

@@ -1,5 +1,5 @@
 """
-Copyright (c) 2023 by FlashInfer team.
+Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -119,6 +119,15 @@ def _in_isolated_build_env() -> bool:
     return any(m in p for m in markers for p in paths)
 
 
+def _no_pip_installs() -> bool:
+    """True when the environment is preprovisioned and the hooks must not install.
+
+    Set by the CI scripts: they build with --no-build-isolation, which would
+    otherwise turn hook installs that isolation always swallowed into downloads.
+    """
+    return os.environ.get("FLASHINFER_BUILD_NO_PIP") == "1"
+
+
 def _detect_cuda_major() -> int:
     """Best-effort detection of the CUDA major version on the host."""
     try:
@@ -163,6 +172,15 @@ def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
             check=True,
         )
         print(f"[BUILD_NVEP] applied patch: {patch.name}")
+
+
+# NIXL wheel version for the non-hermetic EP build. Pin EXACTLY to the
+# 3rdparty/nixl submodule tag: nixl_ep_cpp.so is compiled from the submodule's
+# device kernels but loads the wheel's libnixl.so at runtime, and a version
+# skew (e.g. a 1.4.x wheel against the v1.3.1 kernels) fails at runtime with
+# device asserts (nixlPut != NIXL_IN_PROG -> illegal memory access). Bump this
+# and the submodule gitlink together.
+_NIXL_WHEEL_VERSION = "1.3.1"
 
 
 def _find_nixl_wheel_lib_dir() -> Path | None:
@@ -231,6 +249,11 @@ def _build_nixl_ep() -> None:
         str(build),
         str(src),
         "-Dbuild_nixl_ep=true",
+        # H100 + B200 + B300 native SASS; upstream also emits PTX for the
+        # highest listed arch (compute_103) for forward-compat. Option exists
+        # since NIXL v1.2.0 (ai-dynamo/nixl#1639) — replaces the former
+        # 0001-meson-add-blackwell-arches.patch overlay.
+        "-Dnixl_cuda_arch_list=90,100,103",
         f"-Dprefix={prefix}",
         "--buildtype=release",
     ]
@@ -243,7 +266,7 @@ def _build_nixl_ep() -> None:
             raise RuntimeError(
                 "The NIXL-EP build requires the nixl-cu13 wheel (the build "
                 "hook normally pre-installs it; see _ensure_nixl_wheel).\n"
-                "Run: uv pip install --no-deps 'nixl-cu13>=1.0.1'\n"
+                "Run: uv pip install --no-deps 'nixl-cu13==1.3.1'\n"
                 "Or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree."
             )
         setup_args += [
@@ -287,15 +310,24 @@ def _build_nixl_ep() -> None:
         shutil.copy(cand, dst / cand.name)
         print(f"[BUILD_NVEP] staged: {cand.name}")
 
-    # Vendor the python wrapper sources so we can import from
-    # flashinfer.moe_ep.backends.split.comm.nixl_ep._vendored.
+    # Vendor the python wrapper as an importable `nixl_ep` package under
+    # _vendored/ (the runtime loader puts _vendored on sys.path and does
+    # `import nixl_ep`), and stage the extension INSIDE the package —
+    # buffer.py binds it with a relative `from . import nixl_ep_cpp`.
     vendored_src = src / "examples/device/ep/nixl_ep"
     if vendored_src.exists():
-        shutil.copytree(
-            vendored_src,
-            _moe_ep_pkg / "backends" / "split" / "comm" / "nixl_ep" / "_vendored",
-            dirs_exist_ok=True,
+        vendored_pkg = (
+            _moe_ep_pkg
+            / "backends"
+            / "split"
+            / "comm"
+            / "nixl_ep"
+            / "_vendored"
+            / "nixl_ep"
         )
+        shutil.copytree(vendored_src, vendored_pkg, dirs_exist_ok=True)
+        for cand in (build / "examples/device/ep").glob("nixl_ep_cpp*.so"):
+            shutil.copy(cand, vendored_pkg / cand.name)
 
 
 def _find_nccl_wheel_root() -> Path | None:
@@ -521,9 +553,37 @@ def _ensure_nixl_wheel() -> None:
     missing wheel and the backend is gated as usual (skip or hard error).
     """
     if _find_nixl_wheel_lib_dir() is not None:
+        # A wheel is present — but only the pinned version is safe (see
+        # _NIXL_WHEEL_VERSION). Warn on skew instead of silently linking
+        # against a mismatched libnixl; --no-deps reinstalls are cheap, but
+        # downgrading behind the user's back would be surprising.
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            for pkg in ("nixl-cu13", "nixl-cu12", "nixl"):
+                try:
+                    found = version(pkg)
+                except PackageNotFoundError:
+                    continue
+                if found != _NIXL_WHEEL_VERSION:
+                    print(
+                        f"[BUILD_NVEP] WARNING: {pkg} {found} is installed but "
+                        f"the 3rdparty/nixl kernels are v{_NIXL_WHEEL_VERSION}; "
+                        "a version skew fails at runtime with device asserts. "
+                        f"Run: pip install --no-deps '{pkg}=={_NIXL_WHEEL_VERSION}'"
+                    )
+                break
+        except Exception:
+            pass
+        return
+    if _no_pip_installs():
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; no NIXL wheel to "
+            "pre-install, so the pre-flight probe will skip NIXL-EP"
+        )
         return
     cuda_major = _detect_cuda_major()
-    wheel = f"nixl-cu{cuda_major}>=1.0.1"
+    wheel = f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}"
     print(f"[BUILD_NVEP] pre-installing NIXL wheel --no-deps: {wheel}")
 
     uv_bin = shutil.which("uv")
@@ -557,6 +617,9 @@ def _ensure_nccl_floor() -> None:
     cuda_major = _detect_cuda_major()
     if cuda_major < 13:
         return  # EP is CUDA-13-only; nothing to upgrade on cu12 hosts.
+    if _no_pip_installs():
+        print("[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; leaving NCCL as installed")
+        return
     wheel = "nvidia-nccl-cu13>=2.30.7"
     print(f"[BUILD_NVEP] ensuring NCCL-EP floor --no-deps: {wheel}")
 
@@ -614,7 +677,7 @@ def _nixl_buildable() -> tuple[bool, str]:
         if _find_nixl_wheel_lib_dir() is None:
             return False, (
                 "nixl pip wheel not importable (or libnixl.so missing); install with "
-                "`uv pip install --no-deps 'nixl-cu13>=1.0.1'` "
+                "`uv pip install --no-deps 'nixl-cu13==1.3.1'` "
                 "or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree"
             )
     return True, ""
@@ -650,8 +713,15 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
     cuda_major = _detect_cuda_major()
     wheels: list[str] = []
     if built_nixl:
-        wheels.append(f"nixl-cu{cuda_major}>=1.0.1")
+        wheels.append(f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}")
     if not wheels:
+        return
+    if _no_pip_installs():
+        # Reachable only if the wheel was already present, since the pre-flight
+        # probe needs it to import before anything is built.
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; runtime wheels left as installed"
+        )
         return
 
     print(f"[BUILD_NVEP] installing runtime wheels --no-deps: {' '.join(wheels)}")
@@ -685,6 +755,26 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
             "it has a pip module. The wheels we tried to install: "
             f"{wheels}"
         ) from e
+
+
+def _compile_deps_installed(specs) -> bool:
+    """True when every spec is already satisfied. False on any doubt, so that an
+    unreadable environment still reaches the install below."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.version import InvalidVersion
+    except ImportError:
+        return False
+
+    for spec in specs:
+        try:
+            req = Requirement(spec)
+            if not req.specifier.contains(version(req.name), prereleases=True):
+                return False
+        except (PackageNotFoundError, InvalidRequirement, InvalidVersion):
+            return False
+    return True
 
 
 def _install_cuda_tile_compile_deps() -> None:
@@ -730,6 +820,18 @@ def _install_cuda_tile_compile_deps() -> None:
         "nvidia-nvjitlink<14,>=13.3",
         "nvidia-cuda-crt<13.4,>=13.2",
     ]
+
+    if _compile_deps_installed(wheels):
+        print("[BUILD] cuda-tile compile deps already installed; skipping", flush=True)
+        return
+
+    if _no_pip_installs():
+        print(
+            "[BUILD] FLASHINFER_BUILD_NO_PIP=1; not installing cuda-tile compile deps",
+            flush=True,
+        )
+        return
+
     print(f"[BUILD] cuda-tile compile deps (--no-deps): {' '.join(wheels)}", flush=True)
 
     uv_bin = shutil.which("uv")
@@ -821,7 +923,7 @@ def _build_nvep_if_enabled() -> None:
             "source, disable isolation:\n"
             "    pip install --no-build-isolation .\n"
             "If NIXL-EP libs were still staged, install the runtime wheel "
-            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.0.1'.",
+            "manually afterwards: pip install --no-deps 'nixl-cu13==1.3.1'.",
             flush=True,
         )
 
@@ -943,7 +1045,7 @@ def _create_build_metadata():
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer package."""\n')
         f.write(f'__version__ = "{version}"\n')
-        f.write(f'__git_version__ = "{git_version}"\n')
+        f.write(f'__git_commit__ = "{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
     return version

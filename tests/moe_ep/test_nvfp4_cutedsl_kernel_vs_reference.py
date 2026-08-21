@@ -1,7 +1,7 @@
 """Single-GPU checks: NVFP4 ``nvfp4_mega_moe`` vs a pure-torch oracle.
 
 NVFP4 counterpart of ``test_mxfp8_cutedsl_preprocess_vs_reference.py``: validates
-that ``nvfp4_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
+that ``sm100_nvfp4_nvfp4_bf16_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
 with an independent plain quant, and that a single-rank ``nvfp4_mega_moe``
 launch matches a pure-torch dequant reference (fp32 GEMMs + SwiGLU + fc1-out
 NVFP4 round-trip) after the in-kernel top-k reduction.
@@ -39,15 +39,11 @@ def _require_cuda():
         pytest.skip("needs CUDA")
 
 
-def _single_rank_problem():
+def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=4):
     import torch
 
-    hidden = 2048
-    intermediate = 1024
     num_tokens = 32
     max_tokens = 64
-    num_experts = 4
-    topk = 4
     num_local_experts = num_experts
     gate_up_clamp = 10.0
 
@@ -150,7 +146,7 @@ def _plain_nvfp4_from_bf16(problem: dict):
     """bf16 weights → kernel fp4 + plain e4m3 SF (pre-swizzle layout)."""
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         _interleave_gate_up_16,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
@@ -200,6 +196,7 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
@@ -207,6 +204,10 @@ def _torch_nvfp4_mega_reference(
     SwiGLU fold (+clamp) → per-token topk weight folded in BEFORE the fc1-out
     NVFP4 round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is
     bounded by NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
+
+    ``term_transform``, when set, is applied to each per-(token, topk) fc2
+    output term before the topk sum; the multirank oracle uses it to model the
+    quantized cross-rank combine wire (``combine_roundtrip_to_fp32``).
     """
     import torch
 
@@ -256,7 +257,10 @@ def _torch_nvfp4_mega_reference(
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        out[tokens, slots] = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        if term_transform is not None:
+            fc2_out = term_transform(fc2_out)
+        out[tokens, slots] = fc2_out
 
     return out.sum(dim=1).to(torch.bfloat16)
 
@@ -269,7 +273,7 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import to_blocked
@@ -329,7 +333,20 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 
 
 @pytest.mark.arch_blackwell
-def test_nvfp4_kernel_matches_torch_reference(monkeypatch):
+@pytest.mark.parametrize(
+    "hidden,intermediate,num_experts,topk",
+    [
+        pytest.param(2048, 1024, 4, 4, id="regular-e4"),
+        # 128-misaligned (hidden % 128 == 64): exercises the ceil-div K-tail
+        # and predicated epilogue paths the %64 validation relaxation opened
+        # up (gpt-oss-120b geometry class).
+        pytest.param(2880, 2880, 4, 4, id="tail-e4"),
+        pytest.param(2048, 1024, 1, 1, id="singleton-e1"),
+    ],
+)
+def test_nvfp4_kernel_matches_torch_reference(
+    monkeypatch, hidden, intermediate, num_experts, topk
+):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
 
@@ -343,10 +360,10 @@ def test_nvfp4_kernel_matches_torch_reference(monkeypatch):
     pytest.importorskip("triton")
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
@@ -357,7 +374,12 @@ def test_nvfp4_kernel_matches_torch_reference(monkeypatch):
     # monkeypatch (not os.environ): restored after the test, so it cannot
     # silently downgrade later nvshmem-path tests in the same process.
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    problem = _single_rank_problem()
+    problem = _single_rank_problem(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+    )
     rank = 0
     world_size = 1
     num_tokens = problem["num_tokens"]

@@ -17,8 +17,54 @@ from ._paths import bootstrap_paths
 
 bootstrap_paths()
 
+
+def _check_dsl_perf_floor() -> None:
+    """Warn once if the installed CuTe-DSL predates the 4.5.2 perf floor.
+
+    Every published version >=4.5.2 measures at full parity (TUNING.md
+    "CuTe-DSL runtime sensitivity" + 2026-07-22 follow-up): 4.5.2 via the
+    MR!27 mainloop WAR in kernel_fc12.py (const_expr-gated on ==4.5.2 —
+    the codegen regression existed only in 4.5.2, fixed upstream in
+    4.5.3), 4.5.3/4.6.0/4.6.1 verified natively fast; mxfp8 never
+    regressed. Below 4.5.2: 4.5.0 fails outright at cute.compile, 4.5.1
+    unmeasured/presumed slow. Results are CORRECT wherever compilation
+    succeeds — only slower — so this warns instead of raising. Silence
+    with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
+    """
+    import os as _os
+
+    if _os.environ.get("FLASHINFER_MOE_EP_SKIP_DSL_CHECK") == "1":
+        return
+    try:
+        from importlib.metadata import version as _version
+
+        ver = _version("nvidia-cutlass-dsl")
+    except Exception:
+        return  # unknown packaging (source checkout etc.) — nothing to claim
+    import re as _re
+
+    parts = tuple(int(p) for p in _re.findall(r"\d+", ver)[:3])
+    if parts and parts < (4, 5, 2):
+        import warnings as _warnings
+
+        _warnings.warn(
+            f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
+            "compile 34-54% slower on <4.5.2 (perf floor; results stay "
+            "correct where compilation succeeds; 4.5.0 fails to compile). "
+            "Install nvidia-cutlass-dsl[cu13]>=4.5.2 — see "
+            "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
+            "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
+_check_dsl_perf_floor()
+
 from .comm import (
     bootstrap_dist,
+    ensure_not_capturing,
+    finalize_dist,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -41,6 +87,7 @@ from .kernel_helpers import (
     to_blocked,
 )
 from .nvfp4 import (
+    COMBINE_FORMAT_NAMES,
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
     MegaMoENvfp4Inputs,
@@ -63,28 +110,67 @@ from .mxfp8 import (
     mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
 )
+from .bf16 import (
+    MegaMoEBf16Config,
+    MegaMoEBf16Frontend,
+    MegaMoEBf16Inputs,
+    MegaMoEBf16SymmBuffer,
+    bf16_mega_launch_thunk,
+    bf16_mega_moe,
+    get_symm_buffer_for_bf16_mega_moe,
+)
 
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
 from .tuner import (
     CORRECTNESS_KNOBS,
     PERF_KNOBS,
+    default_knobs,
     iter_candidates,
     with_knobs,
 )
 
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
+    autotune_bf16_mega_moe,
     autotune_knobs,
+    bf16_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
+    mxfp8_candidates,
+    nvfp4_candidates,
 )
+
+# Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
+from .quant_stage import (
+    forget_staged_tokens,
+    fused_quant_stage,
+    fused_quant_stage_supported,
+    note_staged_tokens,
+    staged_tokens,
+)
+
+# Persistent offline-tuning knob cache (pure-lookup hot path).
+from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
 __all__ = [
     # paths
     "bootstrap_paths",
+    # quant_stage
+    "forget_staged_tokens",
+    "fused_quant_stage",
+    "fused_quant_stage_supported",
+    "note_staged_tokens",
+    "staged_tokens",
+    # knob_cache
+    "knob_cache_path",
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
     # comm
     "bootstrap_dist",
+    "ensure_not_capturing",
+    "finalize_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
     "resolve_gate_up_clamp",
@@ -101,6 +187,7 @@ __all__ = [
     "round_up",
     "to_blocked",
     # nvfp4
+    "COMBINE_FORMAT_NAMES",
     "MegaMoENvfp4Config",
     "MegaMoENvfp4Frontend",
     "MegaMoENvfp4Inputs",
@@ -121,14 +208,27 @@ __all__ = [
     "get_symm_buffer_for_mxfp8_mega_moe",
     "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
+    # bf16
+    "MegaMoEBf16Config",
+    "MegaMoEBf16Frontend",
+    "MegaMoEBf16Inputs",
+    "MegaMoEBf16SymmBuffer",
+    "bf16_mega_launch_thunk",
+    "bf16_mega_moe",
+    "get_symm_buffer_for_bf16_mega_moe",
     # tuner
     "tuner",
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
+    "bf16_candidates",
+    "default_knobs",
     "iter_candidates",
     "with_knobs",
     # autotune
     "autotune_knobs",
+    "autotune_bf16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "mxfp8_candidates",
+    "nvfp4_candidates",
 ]
