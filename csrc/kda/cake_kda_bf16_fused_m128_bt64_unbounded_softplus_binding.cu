@@ -42,17 +42,15 @@ namespace cake_kda {
 static_assert(THREADS == 1024);
 static_assert(SMEM_TOTAL == 232448);
 
-void RunM128BT64UnboundedSoftplus(TensorView q, TensorView k, TensorView v, TensorView g,
-                                  TensorView beta, TensorView beta_tma, TensorView A_log,
-                                  TensorView dt_bias, TensorView cu_seqlens, TensorView seq_order,
-                                  TensorView state_indices, TensorView initial_state, TensorView out,
-                                  TensorView final_state, TensorView state_checkpoints,
-                                  TensorView checkpoint_cu_starts, TensorView descriptor_storage,
-                                  int64_t prepare_descriptors, int64_t num_heads,
-                                  int64_t beta_token_stride, int64_t state_slot_stride,
-                                  int64_t use_state_indices, int64_t use_initial_state,
-                                  int64_t store_final_state, int64_t checkpoint_every_n_tokens,
-                                  double scale, double lower_bound, int64_t cuda_stream) {
+void RunM128BT64UnboundedSoftplus(
+    TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta, TensorView beta_tma,
+    TensorView A_log, TensorView dt_bias, TensorView cu_seqlens, TensorView seq_order,
+    TensorView state_indices, TensorView initial_state, TensorView out, TensorView final_state,
+    TensorView state_checkpoints, TensorView checkpoint_cu_starts, TensorView descriptor_storage,
+    int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
+    int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
+    int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale, double lower_bound,
+    int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;

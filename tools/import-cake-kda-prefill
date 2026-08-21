@@ -108,18 +108,14 @@ PROFILES = {
     "sm100_bt64_unbounded_softplus": {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm100",
-        "profile_path": (
-            "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json"
-        ),
+        "profile_path": ("flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json"),
         "profile_sha256": "0dc5a6e40d9a959c71b43fa0c74bf317a170c511ff09195853aef012dab00bbd",
         "variant": "bt64_unbounded_softplus",
     },
     "sm103_bt64_unbounded_softplus": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm103",
-        "profile_path": (
-            "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json"
-        ),
+        "profile_path": ("flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json"),
         "profile_sha256": "a2696545a0979b180cf38cdf9defaee45152ef232e3fc754acfa553ab4e398d9",
         "variant": "bt64_unbounded_softplus",
     },
@@ -336,22 +332,14 @@ def main() -> int:
     paths = {
         "sm100_unbounded_softplus": args.sm100_unbounded_softplus_source,
         "sm103_unbounded_softplus": args.sm103_unbounded_softplus_source,
-        "sm100_bt64_unbounded_softplus": (
-            args.sm100_bt64_unbounded_softplus_source
-        ),
-        "sm103_bt64_unbounded_softplus": (
-            args.sm103_bt64_unbounded_softplus_source
-        ),
+        "sm100_bt64_unbounded_softplus": (args.sm100_bt64_unbounded_softplus_source),
+        "sm103_bt64_unbounded_softplus": (args.sm103_bt64_unbounded_softplus_source),
     }
     profile_paths = {
         "sm100_unbounded_softplus": args.sm100_unbounded_softplus_profile,
         "sm103_unbounded_softplus": args.sm103_unbounded_softplus_profile,
-        "sm100_bt64_unbounded_softplus": (
-            args.sm100_bt64_unbounded_softplus_profile
-        ),
-        "sm103_bt64_unbounded_softplus": (
-            args.sm103_bt64_unbounded_softplus_profile
-        ),
+        "sm100_bt64_unbounded_softplus": (args.sm100_bt64_unbounded_softplus_profile),
+        "sm103_bt64_unbounded_softplus": (args.sm103_bt64_unbounded_softplus_profile),
     }
     raw: dict[str, bytes] = {}
     for profile_key, path in paths.items():
@@ -363,10 +351,7 @@ def main() -> int:
         raise ValueError(
             "unbounded-softplus SM100 and SM103 generated source text differs"
         )
-    if (
-        raw["sm100_bt64_unbounded_softplus"]
-        != raw["sm103_bt64_unbounded_softplus"]
-    ):
+    if raw["sm100_bt64_unbounded_softplus"] != raw["sm103_bt64_unbounded_softplus"]:
         raise ValueError(
             "BT64 unbounded-softplus SM100 and SM103 generated source text differs"
         )

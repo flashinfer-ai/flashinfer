@@ -48,21 +48,16 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
         "m128_bt64_unbounded_softplus",
     )
     for target in ("sm100a", "sm103a"):
-        n32_uri = cake_kda_jit_api.get_cake_kda_uri(
-            "m128_unbounded_softplus", target
-        )
+        n32_uri = cake_kda_jit_api.get_cake_kda_uri("m128_unbounded_softplus", target)
         bt64_uri = cake_kda_jit_api.get_cake_kda_uri(
             "m128_bt64_unbounded_softplus", target
         )
         assert n32_uri != bt64_uri
-        assert bt64_uri.endswith(f"_d5674b35de_{target}")
+        assert bt64_uri.endswith(f"_102236bfbf_{target}")
     csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
     assert (
-        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu"
-    ).is_file()
-    assert (
-        csrc_dir
-        / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
+        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
     ).is_file()
 
 
@@ -2784,6 +2779,7 @@ def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
     resumed_output = torch.cat((prefix_output, suffix_output), dim=1)
     torch.testing.assert_close(resumed_output, full_output, atol=0, rtol=0)
     torch.testing.assert_close(returned_suffix_state, full_state, atol=0, rtol=0)
+
 
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     inputs = _make_inputs(
