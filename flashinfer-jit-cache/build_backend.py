@@ -24,7 +24,7 @@ from wheel.bdist_wheel import bdist_wheel
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from build_utils import get_cutlass_dsl_build_requirement, get_git_version
+from build_utils import get_build_dependency_requirements, get_git_version
 
 # Skip version check when building flashinfer-jit-cache package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
@@ -254,15 +254,15 @@ def prepare_metadata_for_build_editable(metadata_directory, config_settings=None
 
 
 def get_requires_for_build_wheel(config_settings=None):
-    """Install the CUDA-specific CuTe DSL package in the isolated build env."""
+    """Install configured dependencies in the isolated wheel build env."""
     return [
         *_orig.get_requires_for_build_wheel(config_settings),
-        get_cutlass_dsl_build_requirement(),
+        *get_build_dependency_requirements(),
     ]
 
 
 def get_requires_for_build_editable(config_settings=None):
-    """Install the CUDA-specific CuTe DSL package for editable builds."""
+    """Install configured dependencies in the isolated editable build env."""
     get_requires = getattr(_orig, "get_requires_for_build_editable", None)
     requirements = [] if get_requires is None else get_requires(config_settings)
-    return [*requirements, get_cutlass_dsl_build_requirement()]
+    return [*requirements, *get_build_dependency_requirements()]

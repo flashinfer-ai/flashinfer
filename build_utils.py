@@ -16,30 +16,34 @@ limitations under the License.
 
 """Shared build utilities for flashinfer packages."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 
-CUTLASS_DSL_BUILD_VERSION = "4.7.0"
+CI_CONFIG_FILE = Path(__file__).parent / "ci" / "cuda-versions.json"
 
 
-def get_cutlass_dsl_build_requirement(cuda_major: Optional[str] = None) -> str:
-    """Return the CUDA-specific CuTe DSL requirement for isolated builds.
-
-    CUDA 12 uses the base package while CUDA 13 requires the ``cu13`` extra.
-    Builds without a CUDA target, such as flashinfer-cubin, only need the base
-    package to make FlashInfer's build-time imports available.
-    """
+def get_build_dependency_requirements(
+    cuda_major: Optional[str] = None,
+) -> list[str]:
+    """Return exact build dependencies selected by the shared CI policy."""
     if cuda_major is None:
         cuda_major = os.environ.get("CUDA_MAJOR")
 
-    package = "nvidia-cutlass-dsl"
-    if cuda_major == "13":
-        package += "[cu13]"
+    with CI_CONFIG_FILE.open() as config_file:
+        config = json.load(config_file)
 
-    return f"{package}=={CUTLASS_DSL_BUILD_VERSION}"
+    requirements = []
+    for package, dependency in config["build_dependencies"].items():
+        extras = dependency.get("cuda_major_extras", {}).get(cuda_major, [])
+        package_spec = package
+        if extras:
+            package_spec += f"[{','.join(extras)}]"
+        requirements.append(f"{package_spec}=={dependency['version']}")
+    return requirements
 
 
 def get_git_version(cwd: Optional[Path] = None) -> str:

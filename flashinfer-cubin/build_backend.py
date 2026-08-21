@@ -10,7 +10,7 @@ from setuptools import build_meta as _orig
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from build_utils import get_cutlass_dsl_build_requirement, get_git_version
+from build_utils import get_build_dependency_requirements, get_git_version
 
 # Skip version check when building flashinfer-cubin package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
@@ -108,18 +108,18 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 
 def get_requires_for_build_wheel(config_settings=None):
-    """Install CuTe DSL in the isolated environment used to import FlashInfer."""
+    """Install configured dependencies in the isolated wheel build env."""
     return [
         *_orig.get_requires_for_build_wheel(config_settings),
-        get_cutlass_dsl_build_requirement(),
+        *get_build_dependency_requirements(),
     ]
 
 
 def get_requires_for_build_editable(config_settings=None):
-    """Install CuTe DSL in the editable build environment."""
+    """Install configured dependencies in the isolated editable build env."""
     get_requires = getattr(_orig, "get_requires_for_build_editable", None)
     requirements = [] if get_requires is None else get_requires(config_settings)
-    return [*requirements, get_cutlass_dsl_build_requirement()]
+    return [*requirements, *get_build_dependency_requirements()]
 
 
 # Pass through hooks that do not need additional build dependencies.

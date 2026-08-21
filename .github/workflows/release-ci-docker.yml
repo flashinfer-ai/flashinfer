@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - '.python-version'
+      - 'build_utils.py'
       - 'docker/**'
       - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
@@ -16,6 +17,7 @@ on:
       - main
     paths:
       - '.python-version'
+      - 'build_utils.py'
       - 'docker/**'
       - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
@@ -147,6 +149,7 @@ jobs:
           git fetch --no-tags --depth=1 origin main
           if git diff --quiet "${EXPECTED_SHA}" "$(git rev-parse FETCH_HEAD)" -- \
             .python-version \
+            build_utils.py \
             docker \
             ci/cuda-versions.json \
             .github/workflows/release-ci-docker.yml \

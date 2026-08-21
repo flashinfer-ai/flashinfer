@@ -11,6 +11,7 @@ on:
     paths:
       - '.python-version'
       - '.github/workflows/release.yml'
+      - 'build_utils.py'
       - 'ci/cuda-versions.json'
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
 

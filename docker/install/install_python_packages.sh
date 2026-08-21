@@ -37,6 +37,15 @@ CUDA_TAG="${PYTORCH_INDEX##*/}"  # nightly/cu134 -> cu134
 CUDA_MAJOR="${CUDA_TAG:2:2}"     # cu129 -> 12, cu134 -> 13
 CUDA_MINOR="${CUDA_TAG:4}"       # cu129 -> 9, cu134 -> 4
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
+BUILD_DEPENDENCY_OUTPUT="$(
+  PYTHONPATH=/install python3 -c \
+    'import sys; from build_utils import get_build_dependency_requirements; print(*get_build_dependency_requirements(sys.argv[1]), sep="\n")' \
+    "${CUDA_MAJOR}"
+)"
+BUILD_DEPENDENCIES=()
+if [[ -n "${BUILD_DEPENDENCY_OUTPUT}" ]]; then
+  mapfile -t BUILD_DEPENDENCIES <<< "${BUILD_DEPENDENCY_OUTPUT}"
+fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
 # This is to ensure that the torch version is compatible with the CUDA version.
@@ -61,14 +70,12 @@ CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
 if [[ "${CUDA_TAG}" == cu13* ]]; then
   NVSHMEM4PY="nvshmem4py-cu13"
   CUDNN_PACKAGE="nvidia-cudnn-cu13"
-  CUDA_EXTRAS=("nvidia-cutlass-dsl[cu13]==4.7.0")
 else
   # nvshmem4py-cu12 declares <=12.9. PEP 440 treats 12.9.7 as newer than
   # 12.9, so the former ==12.* constraint did not actually satisfy it. The
   # exact ==12.9 constraint resolves to the compatible 12.9.0 release.
   NVSHMEM4PY="nvshmem4py-cu12"
   CUDNN_PACKAGE="nvidia-cudnn-cu12"
-  CUDA_EXTRAS=()
 fi
 
 # wheel is imported by flashinfer-jit-cache's build backend, which CI builds
@@ -78,7 +85,7 @@ pip3 install \
   responses pytest scipy build wheel \
   "${CUDA_PYTHON}" \
   "${NVSHMEM4PY}" \
-  "${CUDA_EXTRAS[@]}"
+  "${BUILD_DEPENDENCIES[@]}"
 
 # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
 # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.
