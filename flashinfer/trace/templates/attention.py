@@ -1731,7 +1731,49 @@ def _mla_paged_decode_init(
     }
 
 
-mla_paged_decode_trace = TraceTemplate(
+class _MLAPagedDecodeTraceTemplate(TraceTemplate):
+    """Normalize planned MLA structural inputs into the stable split schema."""
+
+    def build_fi_trace_fn(self, fi_api):
+        base_fi_trace = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            from flashinfer.mla._batch_mla._contracts import (
+                _resolve_structural_mla_input,
+            )
+
+            contract = getattr(kwargs.get("self"), "_input_contract", None)
+            head_dim_ckv = kwargs.get("head_dim_ckv")
+            head_dim_kpe = kwargs.get("head_dim_kpe")
+            if head_dim_ckv is None and contract is not None:
+                head_dim_ckv = contract.head_dim_ckv
+            if head_dim_kpe is None and contract is not None:
+                head_dim_kpe = contract.head_dim_kpe
+            widths = (
+                None
+                if head_dim_ckv is None or head_dim_kpe is None
+                else (int(head_dim_ckv), int(head_dim_kpe))
+            )
+            query = kwargs.get("query")
+            if query is not None:
+                q_nope, q_pe = _resolve_structural_mla_input(
+                    query, desired="split", widths=widths, name="query"
+                )
+                kwargs["q_nope"] = q_nope
+                kwargs["q_pe"] = q_pe
+            kv_cache = kwargs.get("kv_cache")
+            if kv_cache is not None:
+                ckv_cache, kpe_cache = _resolve_structural_mla_input(
+                    kv_cache, desired="split", widths=widths, name="KV cache"
+                )
+                kwargs["ckv_cache"] = ckv_cache
+                kwargs["kpe_cache"] = kpe_cache
+            return base_fi_trace(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+mla_paged_decode_trace = _MLAPagedDecodeTraceTemplate(
     op_type="mla_paged",
     name_prefix="mla_paged_decode",
     description=(

@@ -324,20 +324,26 @@ def test_batch_mla_without_kpe(backend):
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        False,
-        sm_scale,
-        dtype,
-        dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
-    output, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    output, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
 
     key, value = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
     output_ref, lse_ref = attention_ref(batch_size, q_nope, key, value, False, sm_scale)
@@ -437,20 +443,26 @@ def test_batch_mla_varlen_page_attention(
     )
     kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
-    o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    o, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
 
     q_rows = (
         torch.arange(0, num_different_kv_len * qo_len)[None, :]
@@ -538,20 +550,26 @@ def test_batch_mla_oob_kv_nan(
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
-    o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    o, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
 
     k, v = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
 
@@ -642,18 +660,23 @@ def test_batch_mla_page_attention(
         )
         kv_lens_warmup = torch.full((batch_size,), 0, dtype=torch.int32, device=device)
         wrapper.plan(
-            q_indptr,
-            kv_indptr_warmup,
-            kv_indices_warmup,
-            kv_lens_warmup,
-            num_heads,
-            head_dim_ckv,
-            head_dim_kpe,
-            page_size,
-            causal,
-            sm_scale,
-            q_nope.dtype,
-            ckv.dtype,
+            metadata=flashinfer.mla.MLAPlanMetadata.csr(
+                q_indptr,
+                kv_indptr_warmup,
+                kv_indices_warmup,
+                kv_lens_warmup,
+            ),
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            causal=causal,
+            sm_scale=sm_scale,
+            q_data_type=q_nope.dtype,
+            kv_data_type=ckv.dtype,
+            query_layout="split",
+            kv_cache_layout="split",
+            lse_mode="base2",
         )
 
         # warmup
@@ -661,34 +684,48 @@ def test_batch_mla_page_attention(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+                o, lse = wrapper.run(
+                    query=(q_nope, q_pe),
+                    kv_cache=(ckv, kpe),
+                    return_lse=True,
+                )
         torch.cuda.current_stream().wait_stream(s)
 
         # capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+            o, lse = wrapper.run(
+                query=(q_nope, q_pe),
+                kv_cache=(ckv, kpe),
+                return_lse=True,
+            )
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
     if use_cuda_graph:
         o.fill_(0)
         lse.fill_(0)
         g.replay()
     else:
-        o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+        o, lse = wrapper.run(
+            query=(q_nope, q_pe),
+            kv_cache=(ckv, kpe),
+            return_lse=True,
+        )
 
     k, v = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
 
@@ -702,7 +739,12 @@ def test_batch_mla_page_attention(
     # test with pre-allocated output
     o_buffer = torch.empty_like(o)
     lse_buffer = torch.empty_like(lse)
-    wrapper.run(q_nope, q_pe, ckv, kpe, out=o_buffer, lse=lse_buffer)
+    wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        out=o_buffer,
+        lse=lse_buffer,
+    )
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
