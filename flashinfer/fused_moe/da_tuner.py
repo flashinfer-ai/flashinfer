@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 import torch
 
+from flashinfer.fused_moe.tactic_search import FactorizedTactic
 from flashinfer.fused_moe.da_moe import (
     DA_MAX_BODIES,
     DA_MAX_EXEMPLARS,
@@ -232,140 +233,6 @@ class RoutingRealizationFactory:
         return 1.0 / squared_mass
 
 
-@dataclass(frozen=True)
-class FactorizedTactic:
-    """One C++-enumerated legal complete MoE tactic and its factorization."""
-
-    # Opaque complete tactic passed unchanged to the ordinary runner.
-    tactic: Any
-    # Routing tile-N used by the metadata producer for this body.
-    tile_n: int
-    # Opaque FC1 component identity used only for coordinate grouping.
-    fc1: Any
-    # Opaque FC2 component identity used only for coordinate grouping.
-    fc2: Any
-    # Public runner tactic that resolves to this complete graph-body identity.
-    public_tactic: Any = field(default=None, compare=False, hash=False)
-
-    def to_body(self) -> DABody:
-        """Decode one concrete backend tactic into its graph-body description."""
-        identity = self.tactic
-        if (
-            not isinstance(identity, tuple)
-            or len(identity) != 2
-            or int(identity[0]) != self.tile_n
-            or int(identity[1]) < 0
-        ):
-            raise RuntimeError(
-                "A DA MoE body requires a concrete (tile_n, config_index) identity"
-            )
-        return DABody(tactic=int(identity[1]), tile_n=self.tile_n)
-
-
-class FactorizedTacticSpace:
-    """Index a complete legal tactic universe without inventing compositions."""
-
-    def __init__(
-        self,
-        tactics: Sequence[FactorizedTactic],
-        anchors: Mapping[int, Any],
-    ) -> None:
-        """Validate complete tactics and caller-declared deterministic anchors."""
-        if not tactics:
-            raise ValueError("Factorized tactic space cannot be empty")
-        # Tile index supports bounded coordinate sweeps without inventing configurations.
-        self._by_tile: dict[int, list[FactorizedTactic]] = {}
-        # Component index validates every composed FC1/FC2 point against the legal universe.
-        self._by_components: dict[tuple[int, Any, Any], FactorizedTactic] = {}
-        # Complete-identity index resolves deterministic anchors supplied by the runner.
-        self._by_identity: dict[Any, FactorizedTactic] = {}
-        # Public runner identities map scalar or paired ordinary tactics to exact DA bodies.
-        self._by_public_identity: dict[Any, FactorizedTactic] = {}
-        for tactic in tactics:
-            if tactic.tile_n <= 0:
-                raise ValueError("Every factorized tactic requires positive tile_n")
-            component_key = (tactic.tile_n, tactic.fc1, tactic.fc2)
-            if component_key in self._by_components:
-                raise ValueError(f"Duplicate tactic factorization {component_key!r}")
-            if tactic.tactic in self._by_identity:
-                raise ValueError(f"Duplicate complete tactic {tactic.tactic!r}")
-            self._by_tile.setdefault(tactic.tile_n, []).append(tactic)
-            self._by_components[component_key] = tactic
-            self._by_identity[tactic.tactic] = tactic
-            public_identity = (
-                tactic.tactic if tactic.public_tactic is None else tactic.public_tactic
-            )
-            public_key = self._public_identity_key(public_identity)
-            if public_key in self._by_public_identity:
-                raise ValueError(f"Duplicate public tactic {public_identity!r}")
-            self._by_public_identity[public_key] = tactic
-
-        # One legal anchor seeds factorized search independently for each routing tile.
-        self._anchors: dict[int, FactorizedTactic] = {}
-        for tile_n, tile_tactics in self._by_tile.items():
-            if tile_n not in anchors:
-                raise ValueError(f"Missing deterministic anchor for tile {tile_n}")
-            anchor_identity = anchors[tile_n]
-            anchor = self._by_identity.get(anchor_identity)
-            if anchor is None or anchor.tile_n != tile_n:
-                raise ValueError(
-                    f"Anchor {anchor_identity!r} is not legal for tile {tile_n}"
-                )
-            self._anchors[tile_n] = anchor
-            tile_tactics.sort(key=lambda item: repr(item.tactic))
-
-    @property
-    def tiles(self) -> tuple[int, ...]:
-        """Return sorted routing tiles represented by the legal universe."""
-        return tuple(sorted(self._by_tile))
-
-    def anchor(self, tile_n: int) -> FactorizedTactic:
-        """Return the runner-declared legal anchor for one tile."""
-        return self._anchors[tile_n]
-
-    def resolve_public_tactic(self, public_tactic: Any) -> FactorizedTactic:
-        """Resolve one ordinary runner tactic to its exact complete DA identity."""
-        try:
-            return self._by_public_identity[self._public_identity_key(public_tactic)]
-        except KeyError as error:
-            raise RuntimeError(
-                f"Ordinary tactic {public_tactic!r} is absent from the legal DA universe"
-            ) from error
-
-    @staticmethod
-    def _public_identity_key(public_tactic: Any) -> Any:
-        """Canonicalize public list tactics for stable identity lookup."""
-        if isinstance(public_tactic, list):
-            return tuple(public_tactic)
-        return public_tactic
-
-    def fc1_sweep(self, tile_n: int, fixed_fc2: Any) -> tuple[FactorizedTactic, ...]:
-        """Return legal complete tactics varying FC1 with FC2 held fixed."""
-        return tuple(
-            tactic for tactic in self._by_tile[tile_n] if tactic.fc2 == fixed_fc2
-        )
-
-    def fc2_sweep(self, tile_n: int, fixed_fc1: Any) -> tuple[FactorizedTactic, ...]:
-        """Return legal complete tactics varying FC2 with FC1 held fixed."""
-        return tuple(
-            tactic for tactic in self._by_tile[tile_n] if tactic.fc1 == fixed_fc1
-        )
-
-    def compose(self, tile_n: int, fc1: Any, fc2: Any) -> FactorizedTactic:
-        """Return an enumerated complete composition or fail loudly."""
-        try:
-            return self._by_components[(tile_n, fc1, fc2)]
-        except KeyError as error:
-            raise RuntimeError(
-                f"Illegal factorized MoE composition tile={tile_n}, "
-                f"fc1={fc1!r}, fc2={fc2!r}"
-            ) from error
-
-    def all_tactics(self) -> tuple[FactorizedTactic, ...]:
-        """Return every legal complete tactic for explicit exhaustive control."""
-        return tuple(tactic for tile in self.tiles for tactic in self._by_tile[tile])
-
-
 class FullOpMeasurementCache:
     """Retain finite full-operation timings under exact measurement identities."""
 
@@ -373,6 +240,11 @@ class FullOpMeasurementCache:
         """Create an empty exact-measurement cache."""
         # Best finite timing observed for each exact caller-defined key.
         self._timings: dict[tuple[Any, ...], float] = {}
+
+    @property
+    def count(self) -> int:
+        """Return the number of distinct full-operation timings retained."""
+        return len(self._timings)
 
     def measure(
         self,
@@ -390,61 +262,19 @@ class FullOpMeasurementCache:
         return observed
 
 
-class FactorizedSearch:
-    """Run bounded FC1/FC2 coordinate search using complete MoE timings."""
-
-    def __init__(self, max_sweeps: int = 2) -> None:
-        """Configure the confirmed one-or-two-sweep refinement budget."""
-        if max_sweeps not in (1, 2):
-            raise ValueError("max_sweeps must be one or two")
-        # Maximum number of FC1-then-FC2 coordinate sweeps per tile.
-        self._max_sweeps = max_sweeps
-
-    def search(
-        self,
-        space: FactorizedTacticSpace,
-        measure: Callable[[FactorizedTactic, bool], float],
-    ) -> FactorizedTactic:
-        """Return the best decisively timed complete tactic across all tiles."""
-        # Each tile starts from its legal anchor and alternately pins FC2 then FC1; every point is
-        # still a complete enumerated full-operation tactic.
-        decisive: list[tuple[float, str, FactorizedTactic]] = []
-        for tile_n in space.tiles:
-            current = space.anchor(tile_n)
-            for _ in range(self._max_sweeps):
-                before = current
-                current = self._best(space.fc1_sweep(tile_n, current.fc2), measure)
-                current = self._best(space.fc2_sweep(tile_n, current.fc1), measure)
-                current = space.compose(tile_n, current.fc1, current.fc2)
-                if current == before:
-                    break
-            # Re-measure the composed winner decisively before comparing winners across tiles.
-            final_time = float(measure(current, True))
-            if not math.isfinite(final_time):
-                raise RuntimeError(
-                    f"Non-finite decisive MoE timing for tile={tile_n}, "
-                    f"tactic={current.tactic!r}"
-                )
-            decisive.append((final_time, repr(current.tactic), current))
-        return min(decisive, key=lambda item: (item[0], item[1]))[2]
-
-    @staticmethod
-    def _best(
-        tactics: Sequence[FactorizedTactic],
-        measure: Callable[[FactorizedTactic, bool], float],
-    ) -> FactorizedTactic:
-        """Choose one finite group point using deterministic tactic ties."""
-        if not tactics:
-            raise RuntimeError("A factorized coordinate sweep has no legal tactics")
-        observations = []
-        for tactic in tactics:
-            timing = float(measure(tactic, False))
-            if not math.isfinite(timing):
-                raise RuntimeError(
-                    f"Non-finite factorized MoE timing for {tactic.tactic!r}"
-                )
-            observations.append((timing, repr(tactic.tactic), tactic))
-        return min(observations, key=lambda item: (item[0], item[1]))[2]
+def factorized_tactic_to_body(tactic: FactorizedTactic) -> DABody:
+    """Decode one backend-complete tactic into the native DA body identity."""
+    identity = tactic.tactic
+    if (
+        not isinstance(identity, tuple)
+        or len(identity) != 2
+        or int(identity[0]) != tactic.tile_n
+        or int(identity[1]) < 0
+    ):
+        raise RuntimeError(
+            "A DA MoE body requires a concrete (tile_n, config_index) identity"
+        )
+    return DABody(tactic=int(identity[1]), tile_n=tactic.tile_n)
 
 
 @dataclass(frozen=True)
@@ -698,7 +528,10 @@ def publish_compiled_plan(
         dispatcher.clear_plan()
         return None
 
-    bodies = [selection.selected_tactic.to_body() for selection in compiled.selections]
+    bodies = [
+        factorized_tactic_to_body(selection.selected_tactic)
+        for selection in compiled.selections
+    ]
     return dispatcher.publish_plan(
         [selection.expert_ids for selection in compiled.selections], bodies
     )

@@ -206,7 +206,7 @@ class MoERunner(TunableRunner):
         inputs: List[torch.Tensor],
     ):
         """Return C++-declared legal FC1/FC2 factors and tile-local anchors."""
-        from flashinfer.fused_moe.da_tuner import (
+        from flashinfer.fused_moe.tactic_search import (
             FactorizedTactic,
             FactorizedTacticSpace,
         )

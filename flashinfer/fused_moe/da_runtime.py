@@ -11,7 +11,12 @@ from typing import Any, TypeVar
 
 import torch
 
-from flashinfer.autotuner import AutoTuner, TuningConfig, TunableRunner
+from flashinfer.autotuner import (
+    AutoTuner,
+    TuningConfig,
+    TunableRunner,
+    _tactic_to_json_hashable,
+)
 from flashinfer.fused_moe.da_config import DaMoeConfig
 from flashinfer.fused_moe.da_moe import (
     DABody,
@@ -25,14 +30,14 @@ from flashinfer.fused_moe.da_tuner import (
     DAPlanCompiler,
     DAProfileSelection,
     DADistribution,
-    FactorizedSearch,
-    FactorizedTactic,
+    factorized_tactic_to_body,
     FullOpMeasurementCache,
     RoutingRealization,
     RoutingRealizationFactory,
     RoutingRealizationKey,
     publish_compiled_plan,
 )
+from flashinfer.fused_moe.tactic_search import FactorizedSearch, FactorizedTactic
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import RoutingInputMode
 
@@ -463,6 +468,8 @@ class DaMoeOperationState:
         self.dispatcher = DAMoEDispatcher(key.num_experts)
         # Exact full-operation timings reused within this domain.
         self._measurements = FullOpMeasurementCache()
+        # Number of ordinary per-tile finalists reused by PrimsTS DA planning.
+        self._ordinary_finalist_count = 0
         # Cached mutable routing realizations generated outside tactic timing.
         self._realizations = RoutingRealizationFactory()
         # Production typed runtime retained after successful tuning.
@@ -565,6 +572,35 @@ class DaMoeOperationState:
             factorized_space,
             baseline_tactic,
         )
+        ordinary_finalists: tuple[FactorizedTactic, ...] = ()
+        if getattr(runner, "use_factorized_moe_tactic_search", False):
+            ordinary_record = tuner.get_factorized_search_result(
+                self.key.custom_op,
+                runner,
+                tuning_config,
+                inputs,
+            )
+            if ordinary_record is not None:
+                search_result, ordinary_timings = ordinary_record
+                # Reuse ordinary full-op measurements to order the small per-tile finalist set.
+                # Each distribution still retimes every finalist after restaging routing values.
+                ordinary_finalists = tuple(
+                    sorted(
+                        (
+                            factorized_space.resolve_public_tactic(
+                                finalist.public_identity()
+                            )
+                            for finalist in search_result.finalists
+                        ),
+                        key=lambda finalist: (
+                            ordinary_timings[
+                                _tactic_to_json_hashable(finalist.public_identity())
+                            ],
+                            repr(finalist.tactic),
+                        ),
+                    )
+                )
+                self._ordinary_finalist_count = len(ordinary_finalists)
 
         # FromLogits bodies require the fused multi-tile preamble during candidate profiling.
         # Reject unsupported large-token shapes before staging any routing values or provisioning
@@ -708,7 +744,15 @@ class DaMoeOperationState:
                             (realization_key, "da", identity), profile_candidate
                         )
 
-                    if config.factorized_search:
+                    if ordinary_finalists:
+                        selected = min(
+                            ordinary_finalists,
+                            key=lambda tactic: (
+                                measure(tactic, True),
+                                repr(tactic.tactic),
+                            ),
+                        )
+                    elif config.factorized_search:
                         selected = FactorizedSearch(max_sweeps=2).search(
                             factorized_space, measure
                         )
@@ -794,7 +838,9 @@ class DaMoeOperationState:
         publish_compiled_plan(self.dispatcher, compiled)
         self._published_policy = compiled.policy.value
         self._eager_body = (
-            None if compiled.eager_tactic is None else compiled.eager_tactic.to_body()
+            None
+            if compiled.eager_tactic is None
+            else factorized_tactic_to_body(compiled.eager_tactic)
         )
         self._eager_distribution = compiled.eager_distribution
 
@@ -1134,6 +1180,8 @@ class DaMoeOperationState:
                 ]
             ),
             "selected_body": selected_body,
+            "profiled_tactic_count": self._measurements.count,
+            "ordinary_finalist_count": self._ordinary_finalist_count,
             "binding_record_count": self.dispatcher.prepared_binding_count,
             "prepared_workspace_lane_count": (
                 self.dispatcher.prepared_workspace_lane_count
