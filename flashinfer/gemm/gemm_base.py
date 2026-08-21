@@ -127,6 +127,27 @@ except ImportError:
     pass
 
 
+def _cute_dsl_targets_sm107() -> bool:
+    """Whether the installed CuTe DSL can generate code for sm_107 (Rubin).
+
+    True when the DSL knows ``sm_107a`` natively (4.8+), or when the user
+    exported ``CUTE_DSL_ARCH=sm_100f`` before the process started so the DSL
+    targets the family-conditional arch instead. See
+    :func:`flashinfer.cute_dsl.utils.is_cute_dsl_arch_supported`.
+
+    Deliberately returns False when it cannot tell: advertising sm_107 for a
+    DSL that cannot target it is what produces `KeyError: 'sm_107a'` from
+    inside cute.compile, with no flashinfer frame in the traceback.
+    """
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+        return is_cute_dsl_arch_supported(10, 7)
+    except Exception:
+        return False
+
+
+
 from ..jit.cubin_loader import setup_cubin_loader
 from ..utils import (
     _get_cache_buf,
@@ -5016,7 +5037,9 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability(
+    [100, 103], conditional_ccs={107: _cute_dsl_targets_sm107}
+)
 def _cute_dsl_gemm_mxfp8_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -6147,7 +6170,9 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability(
+    [100, 103], conditional_ccs={107: _cute_dsl_targets_sm107}
+)
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,
@@ -7251,7 +7276,7 @@ def _cutlass_bmm_fp8_requirement(
 # cute-dsl bmm_fp8 is Rubin (sm107) only; the heuristic below never offers it
 # on sm100/sm103, so advertising those here would let an explicit
 # backend="cute-dsl" through to an empty runner list and an assert.
-@supported_compute_capability([107])
+@supported_compute_capability([], conditional_ccs={107: _cute_dsl_targets_sm107})
 def _cute_dsl_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
