@@ -5,6 +5,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal, Tuple
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ..common.mxfp8_weight_utils import (
+    as_mxfp8_scale as _as_mxfp8_scale,
+    interleave_gate_up,
+    mxfp8_data_dtype as _mxfp8_data_dtype,
+    mxfp8_swizzled_flat_sf_size as _mxfp8_swizzled_flat_sf_size,
+    quantize_mxfp8_weight_k_major as _quantize_mxfp8_weight_k_major,
+    swizzle_expert_scales as _swizzle_expert_scales,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -15,20 +23,6 @@ TransformedMegaWeights = Tuple[
 ]
 
 Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
-
-
-def _mxfp8_data_dtype(kind: Mxfp8Kind) -> "torch.dtype":
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # package import also bootstraps sys.path for the kernel packages.
-    from ......kernel_src.cutedsl_megamoe import kind_data_dtype
-
-    return kind_data_dtype(kind)
-
-
-def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from ......kernel_src.cutedsl_megamoe import to_blocked
-
-    return to_blocked(raw_sf)
 
 
 def _fc1_weight_from_w13(
@@ -51,32 +45,14 @@ def _fc1_weight_from_w13(
 def _interleave_gate_up_32(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
     from ......kernel_src.cutedsl_megamoe import Mxfp8BlockSize
 
-    block = Mxfp8BlockSize
-    if intermediate_size % (2 * block) != 0:
-        raise ValueError(
-            "MXFP8 MegaMOE requires full FC1 width to be divisible by "
-            f"{2 * block}, got {intermediate_size}."
-        )
-    if tensor.shape[1] != intermediate_size:
-        raise ValueError(
-            f"expected FC1 tensor with shape (experts, {intermediate_size}, ...), "
-            f"got {tuple(tensor.shape)}"
-        )
-
-    half = intermediate_size // 2
-    gate = tensor[:, :half, :].contiguous()
-    up = tensor[:, half:, :].contiguous()
-    num_pairs = half // block
-    out = tensor.new_empty(tensor.shape)
-    out_view = out.view(tensor.shape[0], num_pairs, 2, block, tensor.shape[2])
-    gate_view = gate.view(tensor.shape[0], num_pairs, block, tensor.shape[2])
-    up_view = up.view(tensor.shape[0], num_pairs, block, tensor.shape[2])
-    out_view[:, :, 0].copy_(gate_view)
-    out_view[:, :, 1].copy_(up_view)
-    return out.contiguous()
+    return interleave_gate_up(
+        tensor,
+        intermediate_size=intermediate_size,
+        block_size=Mxfp8BlockSize,
+        kernel_name="MXFP8 MegaMOE",
+    )
 
 
 def _fc1_kernel_weight_from_canonical_mxfp8(
@@ -89,39 +65,8 @@ def _fc1_kernel_weight_from_canonical_mxfp8(
     )
 
 
-def _quantize_mxfp8_weight_k_major(
-    weight_k_major: "torch.Tensor",
-    *,
-    kind: Mxfp8Kind,
-) -> Tuple["torch.Tensor", "torch.Tensor"]:
-    """Quantize with K on the trailing dim; return K-major fp8 + plain E8M0 SF."""
-    import torch
-
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import mxfp8_quantize_per_block_32
-
-    data_dtype = _mxfp8_data_dtype(kind)
-    return mxfp8_quantize_per_block_32(weight_k_major.to(torch.float32), data_dtype)
-
-
 def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Mxfp8Kind) -> bool:
     return weight.dtype == _mxfp8_data_dtype(kind)
-
-
-def _as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
-    import torch
-
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype
-
-    if scale.dtype == Mxfp8ScaleDtype:
-        return scale
-    if scale.dtype == torch.uint8:
-        return scale.view(Mxfp8ScaleDtype)
-    raise ValueError(
-        f"MXFP8 weight scales must have dtype {Mxfp8ScaleDtype} or torch.uint8, "
-        f"got {scale.dtype}"
-    )
 
 
 def preprocess_mega_weights(
@@ -273,16 +218,6 @@ def preprocess_mega_weights(
     )
 
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
-
-
-def _mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
-    import torch
-
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
-
-    plain = torch.zeros(rows, cols, dtype=Mxfp8ScaleDtype)
-    return to_blocked(plain).numel()
 
 
 def validate_transformed_mega_weights(
