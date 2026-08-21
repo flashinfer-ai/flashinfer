@@ -1839,12 +1839,27 @@ _SKIP_SUBSTR = (
     "only support",
 )
 _CRASH_SUBSTR = ("cuda error", "illegal memory", "misaligned", "device-side assert")
+# _SKIP_SUBSTR keeps the broad shape-capability terms ("must be", "divisible",
+# "requires") because backends legitimately reject shapes that way. These terms
+# override them: an activation-plumbing complaint phrased as a shape or
+# validation error ("gemm1_alpha must have shape (E,)") is the regression this
+# fuzzer exists to catch, never an unsupported shape.
+_NEVER_SKIP_SUBSTR = (
+    "activation parameters",
+    "gemm1_alpha",
+    "gemm1_beta",
+    "gemm1_clamp_limit",
+    "swiglu",
+    "situ",
+)
 
 
 def _is_unsupported(e):
     msg = str(e).lower()
     if any(c in msg for c in _CRASH_SUBSTR):
         return False  # a crash is always a finding, never "unsupported"
+    if any(s in msg for s in _NEVER_SKIP_SUBSTR):
+        return False
     return isinstance(e, NotImplementedError) or any(s in msg for s in _SKIP_SUBSTR)
 
 

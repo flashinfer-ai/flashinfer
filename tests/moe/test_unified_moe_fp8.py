@@ -821,6 +821,19 @@ def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
+def _assert_per_tensor_fp8_discriminates(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Negative control for the percentage-based tolerance above.
+
+    ``check_accuracy`` passes when 99% of elements are within a generous
+    rtol=0.3, so a pass alone does not prove the comparison could detect a wrong
+    activation formula. Confirm a perturbed reference is actually rejected.
+    """
+    with pytest.raises(Exception, match="[Mm]ismatch"):
+        check_accuracy(
+            out.float(), ref.float() * 1.5, atol=0.05, rtol=0.3, percent=0.99
+        )
+
+
 @pytest.mark.parametrize(
     "routing_input_mode",
     [
@@ -849,7 +862,9 @@ def test_fp8_per_tensor_new_activation_matches_reference(activation):
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         activation=activation,
     )
-    _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
+    layer_out = MoELayer(config)(act, weights)
+    _assert_per_tensor_fp8_close(layer_out, ref)
+    _assert_per_tensor_fp8_discriminates(layer_out, ref)
 
     runner = _build_per_tensor_fp8_runner(config)
     direct = runner.forward(runner.pack_inputs(act, weights))

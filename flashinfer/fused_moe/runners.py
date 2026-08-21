@@ -251,8 +251,18 @@ def _validate_prepared_activation_params(
     activation whose scalar semantics require launcher tensors.
     """
     required: tuple[str, ...] = ()
-    if isinstance(activation, SwiGLU) and activation != SwiGLU():
-        required = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+    if isinstance(activation, SwiGLU):
+        # Require a tensor only for the parameters that actually differ from the
+        # kernel's neutral values. Demanding all three would reject a valid
+        # SwiGLU(alpha=1.7) view over beta/limit tensors carrying exactly the
+        # defaults the kernel already applies.
+        default = SwiGLU()
+        if activation.alpha != default.alpha:
+            required += ("gemm1_alpha",)
+        if activation.beta != default.beta:
+            required += ("gemm1_beta",)
+        if activation.limit != default.limit:
+            required += ("gemm1_clamp_limit",)
     elif isinstance(activation, SiTU):
         # linear_scale=None is the unclamped linear branch, which has no
         # per-expert tensor encoding; runners reaching here must have rejected it.

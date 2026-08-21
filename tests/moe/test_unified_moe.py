@@ -599,6 +599,22 @@ class TestTypedActivationConfig:
         _validate_prepared_activation_params(
             overrides, SiTU(clamp_limit=4.0), "TestRunner"
         )
+        # Only the parameters that actually differ from the defaults need a
+        # tensor: a view carrying just gemm1_alpha is valid for SwiGLU(alpha=..),
+        # whose beta/limit are exactly the kernel's neutral values.
+        _validate_prepared_activation_params(
+            {"gemm1_alpha": torch.ones(2)}, SwiGLU(alpha=1.5), "TestRunner"
+        )
+        _validate_prepared_activation_params(
+            {"gemm1_clamp_limit": torch.ones(2)}, SwiGLU(limit=7.0), "TestRunner"
+        )
+        with pytest.raises(ValueError, match=r"\['gemm1_beta'\]"):
+            _validate_prepared_activation_params(
+                {"gemm1_alpha": torch.ones(2)},
+                SwiGLU(alpha=1.5, beta=1.0),
+                "TestRunner",
+            )
+
         # linear_scale=None has no per-expert encoding, so gemm1_beta is not
         # required; gemm1_alpha still is.
         _validate_prepared_activation_params(
@@ -1665,6 +1681,46 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
     assert passed, (
         f"{activation!r}: {pct * 100:.2f}% within tolerance "
         f"(atol={atol:.4f}) vs flat reference"
+    )
+
+    # check_accuracy() is deliberately permissive (rtol=0.5 over 97% of
+    # elements) to absorb FP4 quantization noise, which leaves it unable to
+    # distinguish activation formulas: an output computed with
+    # SwiGLU(alpha=1.7, beta=1.0, limit=7.0) still matches a
+    # SwiGLU(alpha=0.25, beta=2.0, limit=0.5) reference at 99.4%. Add a
+    # discriminating check with a much tighter rtol, still percentage-based so
+    # genuine quantization outliers do not fail it, and assert it rejects a
+    # deliberately wrong reference so the bound is known to bite.
+    def _agreement(a: torch.Tensor, b: torch.Tensor) -> float:
+        a, b = a.float(), b.float()
+        atol = 0.05 + 0.5 * b.std().item()
+        close = (a - b).abs() < atol + 0.1 * b.abs()
+        return close.float().mean().item()
+
+    agreement = _agreement(actual, reference)
+    assert agreement >= 0.97, (
+        f"{activation!r}: only {agreement * 100:.2f}% of elements agree with the "
+        f"flat reference under the discriminating bound."
+    )
+
+    # Negative control: the bound above must reject a wrong activation formula,
+    # otherwise the assertion proves nothing. Keep the control's gating, since
+    # _compute_ref reuses weights whose layout depends on it.
+    control = {
+        ActivationType.Swiglu: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
+        ActivationType.Situ: SiTU(gate_scale=0.25, linear_scale=0.5),
+        ActivationType.GegluTanh: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
+    }.get(activation.type)
+    control_reference = (
+        reference * 4.0
+        if control is None
+        else _compute_ref(act_pack, tensors, shape, control)
+    )
+    control_agreement = _agreement(actual, control_reference)
+    assert control_agreement < 0.97, (
+        f"{activation!r}: output also agreed with a deliberately wrong reference "
+        f"at {control_agreement * 100:.2f}%; the bound cannot detect a "
+        f"wrong-formula regression."
     )
 
 
