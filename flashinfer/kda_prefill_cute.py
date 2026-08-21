@@ -78,8 +78,6 @@ def _is_cute_dsl_kda_prefill_eligible(
 ) -> bool:
     """Return whether the call matches the ported BT=16 kernel contract."""
 
-    if not _is_cute_dsl_kda_runtime_available():
-        return False
     if not isinstance(q, torch.Tensor) or q.ndim != 4 or q.shape[1] <= 1:
         return False
     if num_spec_tokens is not None:
@@ -239,7 +237,8 @@ def _is_cute_dsl_kda_prefill_eligible(
             return False
     elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         return False
-    return True
+    # Probed last so that calls rejected above reach Cake exactly as before.
+    return _is_cute_dsl_kda_runtime_available()
 
 
 def _get_compiled_cute_dsl_kda(
