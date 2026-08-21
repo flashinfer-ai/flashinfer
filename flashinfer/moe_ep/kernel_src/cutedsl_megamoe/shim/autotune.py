@@ -122,6 +122,11 @@ def bf16_candidates() -> List[Dict[str, Any]]:
     return [default_knobs(0, dtype="bf16")]
 
 
+def bf16_mxfp8_candidates() -> List[Dict[str, Any]]:
+    """Return the currently supported BF16×MXFP8 tuning candidate."""
+    return [default_knobs(0, dtype="bf16_mxfp8")]
+
+
 def autotune_knobs(
     frontend: Any,
     launch: Callable[[], None],
@@ -398,12 +403,50 @@ def autotune_bf16_mega_moe(
     )
 
 
+def autotune_bf16_mxfp8_mega_moe(
+    y: torch.Tensor,
+    transformed_l1: Any,
+    transformed_l2: Any,
+    symm_buffer: Any,
+    *,
+    num_tokens: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    warmup_iters: int = 3,
+    timed_iters: int = 10,
+) -> Dict[str, Any]:
+    """Autotune the BF16×MXFP8 MegaMoE session on staged inputs."""
+    from .bf16_mxfp8 import bf16_mxfp8_mega_moe
+
+    def launch() -> None:
+        bf16_mxfp8_mega_moe(
+            y,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=gate_up_clamp,
+            sync=True,
+        )
+
+    return autotune_knobs(
+        symm_buffer._frontend,
+        launch,
+        bf16_mxfp8_candidates() if candidates is None else candidates,
+        label="bf16_mxfp8_mega",
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+    )
+
+
 __all__ = [
     "autotune_knobs",
     "autotune_bf16_mega_moe",
+    "autotune_bf16_mxfp8_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "bf16_candidates",
+    "bf16_mxfp8_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
 ]
