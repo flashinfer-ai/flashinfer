@@ -414,12 +414,17 @@ def _fp4_paged_mqa_logits_reference(
     context_lens,
     block_table,
     max_context_len,
-    output_dtype=torch.float32,
+    output_dtype=torch.bfloat16,
 ):
     """Pure-torch reference for the packed FP4 API inputs.
 
     Dequantizes q (fp4 codes + UE8M0 scales) and kv_fused (fp4 codes + flat UE8M0
-    scales) back to float, then reproduces the kernel math."""
+    scales) back to float, then reproduces the kernel math.
+
+    ``output_dtype`` defaults to bfloat16 to match both fp4_paged_mqa_logits and
+    this template's output schema; the math is done in float regardless and only
+    the final cast follows it.  A caller wanting float32 logits passes it
+    explicitly on both sides."""
     num_blocks, block_size, _one, row_bytes = kv_fused.shape
     half_D = row_bytes - 4
     head_dim = half_D * 2

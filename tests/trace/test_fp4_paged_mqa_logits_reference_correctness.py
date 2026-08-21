@@ -29,7 +29,6 @@ def test_fp4_paged_mqa_logits_reference_correctness(shape_kwargs):
         inputs["context_lens"],
         inputs["block_table"],
         inputs["max_context_len"],
-        output_dtype=torch.float32,
     )
     ref = fp4_paged_mqa_logits_trace.reference(
         inputs["q"],
@@ -40,6 +39,14 @@ def test_fp4_paged_mqa_logits_reference_correctness(shape_kwargs):
         inputs["block_table"],
         inputs["max_context_len"],
     )
+    # The template declares bfloat16 logits and the API defaults to it; assert
+    # rather than assume, so a future divergence between the schema, the API and
+    # the reference is caught here instead of silently masked by forcing a dtype.
+    declared = fp4_paged_mqa_logits_trace.outputs["logits"].dtype
+    assert declared == "bfloat16"
+    assert out.dtype is torch.bfloat16, f"kernel returned {out.dtype}"
+    assert ref.dtype is torch.bfloat16, f"reference returned {ref.dtype}"
+
     _check(
         fp4_paged_mqa_logits_trace,
         ref,
