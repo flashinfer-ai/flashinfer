@@ -194,6 +194,51 @@ def _validate_paged_inputs(
         )
 
 
+def _validate_schedule_meta_fresh(
+    schedule_meta: torch.Tensor,
+    context_lens: torch.Tensor,
+    fn_name: str,
+) -> None:
+    """Debug-mode check that a caller-supplied ``schedule_meta`` is not stale.
+
+    The schedule is a pure function of ``(context_lens, num_sms)``, so it can be
+    recomputed and compared exactly.  Reuse is only valid while the whole
+    ``ceil(context_lens / _SPLIT_KV)`` vector is unchanged -- a single sequence
+    crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's split count
+    from 1 to 2 while every tensor shape stays identical.
+
+    A stale schedule does not merely give wrong numbers: the persistent kernel
+    terminates on exact equality with the stored end boundary, so an endpoint
+    that the runtime lengths can no longer produce makes the loop run forever.
+    e.g. a B=1 schedule built for length 257 ends CTA 0 at (q=0, kv_idx=2);
+    replayed at length 256 the iterator steps (0,0) -> (1,0), never hits (0,2),
+    and hangs.
+
+    Recomputing costs exactly the work ``schedule_meta`` exists to avoid, so this
+    is opt-in via ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph
+    capture.  Note that capture is where staleness is most likely, so this check
+    cannot see the case it most wants to catch -- it is a development aid, not a
+    guarantee.
+    """
+    if not _sync_input_validation_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    expected = compute_paged_mqa_logits_schedule(
+        context_lens, device=schedule_meta.device
+    )
+    if not torch.equal(expected, schedule_meta):
+        raise ValueError(
+            f"{fn_name}: schedule_meta does not match context_lens. It is a "
+            f"function of the whole ceil(context_lens / {_SPLIT_KV}) vector and "
+            f"the device SM count, so a single sequence crossing a "
+            f"{_SPLIT_KV}-token boundary invalidates it even when every shape is "
+            f"unchanged. Recompute it with compute_paged_mqa_logits_schedule("
+            f"context_lens, out=schedule_meta); reusing a stale schedule can hang "
+            f"the persistent kernel."
+        )
+
+
 def _validate_schedule_meta(schedule_meta: torch.Tensor, num_sms: int, device) -> None:
     """A caller-supplied schedule_meta must be an int32 CUDA [num_sms+1, 2] tensor;
     a smaller one causes an out-of-bounds schedule read in the kernel."""
@@ -746,6 +791,11 @@ def compute_paged_mqa_logits_schedule(
         out:            optional pre-allocated [num_sms+1, 2] int32 on CUDA.
                         Required for CUDA-graph capture (static buffer).
                         If None, a new tensor is allocated each call.
+                        This provides static storage, not static contents:
+                        the address stays stable, but the values must be
+                        recomputed into it whenever ceil(context_lens / 256)
+                        changes -- including on every graph replay where the
+                        lengths may have moved across a 256-token boundary.
 
     Returns:
         schedule_meta: [num_sms+1, 2] int32 on CUDA (``out`` if provided).
@@ -923,8 +973,14 @@ def fp8_paged_mqa_logits(
         num_epi_subtiles: epilogue subtile count (perf knob, default 1)
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on CUDA.  If None, computed from context_lens each call.
-                         Pass a pre-computed tensor to avoid the CPU overhead when
-                         the schedule is stable across calls (e.g. fixed batch).
+                         Reusable only while the entire
+                         ceil(context_lens / 256) vector and the target device's
+                         SM count are unchanged -- a fixed batch size is not
+                         sufficient, since one sequence crossing a 256-token
+                         boundary changes it with every shape identical.  Under
+                         CUDA-graph replay with changing lengths, recompute into
+                         the same buffer before launching.  A stale schedule can
+                         hang the kernel.
                          Use compute_paged_mqa_logits_schedule() to generate it.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len], where padded_ctx_len
@@ -987,6 +1043,12 @@ def fp8_paged_mqa_logits(
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
     else:
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
+        _validate_schedule_meta_fresh(
+            schedule_meta, context_lens, "fp4_paged_mqa_logits"
+        )
+        _validate_schedule_meta_fresh(
+            schedule_meta, context_lens, "fp8_paged_mqa_logits"
+        )
 
     compiled = _cached_compile_fp8_kernel(
         block_size,
@@ -1209,8 +1271,14 @@ def fp4_paged_mqa_logits(
                          faster.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on CUDA.  If None, computed from context_lens each call.
-                         Pass a pre-computed tensor to avoid the CPU overhead when
-                         the schedule is stable across calls.
+                         Reusable only while the entire
+                         ceil(context_lens / 256) vector and the target device's
+                         SM count are unchanged -- a fixed batch size is not
+                         sufficient, since one sequence crossing a 256-token
+                         boundary changes it with every shape identical.  Under
+                         CUDA-graph replay with changing lengths, recompute into
+                         the same buffer before launching.  A stale schedule can
+                         hang the kernel.
                          Use compute_paged_mqa_logits_schedule() to generate it.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len].  Use
