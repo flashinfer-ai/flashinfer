@@ -681,7 +681,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                       int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                       int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
-                      ActivationType activation_type) {
+                      ActivationType activation_type, int64_t max_num_rows) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
@@ -703,9 +703,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
 
     // Get specific profile configs according to the profile_id.
-    // Fallback tactic is set to be 0
+    // profile_id == -1 (the autotuner's do_preparation / fallback sentinel) must
+    // resolve to a profile valid for the GEMM being profiled: mAllProfiles is
+    // [gemm1 tactics | gemm2 tactics], and gemm1 tactics may carry gather_a
+    // (unsupported under GEMM_2 profiling).
     // TODO: use the best tactic id found offline for a better default inference perf
-    auto profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
+    int64_t const default_id =
+        (gemm_idx == 2 && static_cast<int64_t>(mAllProfiles.size()) > mGemm1TacticCount)
+            ? mGemm1TacticCount
+            : 0;
+    auto profile = profile_id == -1 ? mAllProfiles[default_id] : mAllProfiles[profile_id];
 
     auto stream = get_stream(input.device());
 
@@ -749,9 +756,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       /*use_mxfp8_act_scaling*/ false, mSm90Wfp4Afp8Mode);
 #endif
 
-      size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
-      mProfileWorkspace =
-          alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8, input.device());
+      // Allocate the profiling workspace ONCE, sized for the largest tuning
+      // bucket, and reuse it across every bucket and tactic. A freshly grown
+      // caching-allocator mapping (PyTorch expandable_segments, vLLM's default)
+      // penalizes the gather-A candidates' scattered input reads far more than
+      // the dense candidates' sequential reads of the just-written expand
+      // buffer (+52% vs +9% inflation measured in vLLM), inverting duels that
+      // steady-state serving memory decides the other way. One settled
+      // allocation keeps the duel memory state symmetric and representative.
+      size_t profile_workspace_size =
+          mProfiler->getWorkspaceSize(num_rows > max_num_rows ? num_rows : max_num_rows);
+      if (mProfileWorkspaceBytes < profile_workspace_size) {
+        mProfileWorkspace =
+            alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8, input.device());
+        mProfileWorkspaceBytes = profile_workspace_size;
+      }
 
       mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
                          expert_weights_ptr, enable_pdl, stream);
@@ -772,12 +791,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
-                 int64_t activation_type) {
+                 int64_t activation_type, int64_t max_num_rows) {
             runGemmProfile(input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                            fc2_expert_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
                            cluster_size, cluster_rank, enable_alltoall, min_latency_mode, gemm_idx,
                            profile_id, do_preparation, enable_pdl,
-                           static_cast<ActivationType>(activation_type));
+                           static_cast<ActivationType>(activation_type), max_num_rows);
           });
     } else if (name == "get_tactic_num") {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
@@ -796,6 +815,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         }
         return static_cast<int64_t>(
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
+      });
+    } else if (name == "get_tactic_is_gather_a") {
+      // Returns 1 if the tactic gathers its A operand rows through an index array
+      // (TMA-WS gather-A mainloop), 0 otherwise (or for out-of-range tactic ids).
+      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return 0;
+        }
+        return static_cast<int64_t>(mAllProfiles[tactic_id].gather_a);
       });
     } else if (name == "get_valid_tactics_for_shape") {
       return Function::FromTyped(
@@ -882,6 +911,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   // e.g. 16 nvfp4 elements are packed into a single int64 element
   int64_t mInnerDimMultiplier;
   Tensor mProfileWorkspace;
+  size_t mProfileWorkspaceBytes = 0;
 
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;

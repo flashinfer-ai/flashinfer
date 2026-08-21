@@ -1331,9 +1331,19 @@ __device__ void computeTmaWarpSpecializedInputPointers(
     int num_tokens_before_expert, int64_t expert, T const* in, WeightType const* weights,
     TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const* w4a8_weight_scale,
     ScaleBiasType const* bias, OutputType* output, float const* router_scales,
-    int const* permuted_row_to_unpermuted_row, int64_t const out_idx) {
-  // The input prior to this contains K elements per token, with `num_tokens_before_expert` tokens
-  layout_info.ptr_act[out_idx] = safe_inc_ptr(in, num_tokens_before_expert * gemm_k);
+    int const* permuted_row_to_unpermuted_row, int const* permuted_source_token_ids,
+    int64_t const out_idx) {
+  if (layout_info.use_gather_a) {
+    // Gather-A: every expert reads from the shared unpermuted activation base;
+    // the mainloop resolves each row through its slice of the gathered
+    // source-token indices.
+    layout_info.ptr_act[out_idx] = in;
+    layout_info.ptr_gather_a_index[out_idx] = permuted_source_token_ids + num_tokens_before_expert;
+  } else {
+    // The input prior to this contains K elements per token, with
+    // `num_tokens_before_expert` tokens
+    layout_info.ptr_act[out_idx] = safe_inc_ptr(in, num_tokens_before_expert * gemm_k);
+  }
 
   // Each expert's weight matrix is a constant size NxK, get the matrix at index `expert`
   layout_info.ptr_weight[out_idx] = safe_inc_ptr(weights, expert * (gemm_n * gemm_k));
@@ -1375,10 +1385,10 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
     WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
     float const* alpha_scale_flat2,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
-    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
-    OutputType* gemm2_output, float const* router_scales,
-    int const* permuted_row_to_unpermuted_row) {
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
+    int const* permuted_source_token_ids, QuantParams quant_params, ScaleBiasType const* bias1,
+    ScaleBiasType const* bias2, OutputType* gemm1_output, OutputType* gemm2_output,
+    float const* router_scales, int const* permuted_row_to_unpermuted_row) {
   // First, compute the global tid. We only need 1 thread per expert.
   int const expert = blockIdx.x * blockDim.x + threadIdx.x;
   if (expert >= num_experts_per_node) {
@@ -1499,10 +1509,11 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
 
   computeTmaWarpSpecializedInputPointers(
       layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert, gemm1_in, weights1,
-      fc1_weight_scale, bias1, gemm1_output, nullptr, nullptr, expert);
+      fc1_weight_scale, bias1, gemm1_output, nullptr, nullptr, permuted_source_token_ids, expert);
   computeTmaWarpSpecializedInputPointers(
       layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert, gemm2_in, weights2,
-      fc2_weight_scale, bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
+      fc2_weight_scale, bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row,
+      /*permuted_source_token_ids=*/nullptr, expert);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -1915,6 +1926,75 @@ void expandInputRowsKernelLauncher(
 // #ifdef ENABLE_BF16
 // INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 // #endif
+
+// ========================== Gather-A GEMM1 support ==========================
+
+// When a gather-A GEMM1 tactic is selected, GEMM1 gathers its A operand
+// directly from the unpermuted input: `expandInputRowsKernel` is skipped
+// entirely and this lightweight kernel provides the two side-effects the rest
+// of the pipeline still needs:
+//  1. permuted_source_token_ids[i] = source token index of permuted row i
+//     (consumed by the gather-A mainloop; rows beyond the valid count are
+//     zeroed only for deterministic buffer content — the mainloop's M
+//     predicate never reads them),
+//  2. the optional permuted_scales gather, replicating the side-effect
+//     `expandInputRowsKernel` performs for the GEMM2 FINALIZE epilogue.
+// Traffic is ~8 bytes per expanded row versus 2 x hidden_size for expand.
+__global__ void gatherGemm1SourceIdsAndScalesKernel(
+    int* permuted_source_token_ids, float* permuted_scales, float const* unpermuted_scales,
+    int const* permuted_row_to_unpermuted_row, int64_t const* expert_first_token_offset,
+    int64_t const num_tokens, int64_t const k, int64_t const num_experts_per_node,
+    int64_t const num_moe_inputs) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Wait for the routing kernels that produce the permuted map / offsets.
+  cudaGridDependencySynchronize();
+#endif
+  int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_moe_inputs;
+       i += int64_t{gridDim.x} * blockDim.x) {
+    if (i < num_valid_tokens) {
+      int64_t const unpermuted_row = permuted_row_to_unpermuted_row[i];
+      int64_t const source_row = unpermuted_row % num_tokens;
+      permuted_source_token_ids[i] = static_cast<int>(source_row);
+      if (permuted_scales) {
+        int64_t const source_k_rank = unpermuted_row / num_tokens;
+        int64_t const source_k_idx = source_row * k + source_k_rank;
+        permuted_scales[i] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+      }
+    } else {
+      permuted_source_token_ids[i] = 0;
+    }
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void gatherGemm1SourceIdsAndScalesLauncher(int* permuted_source_token_ids, float* permuted_scales,
+                                           float const* unpermuted_scales,
+                                           int const* permuted_row_to_unpermuted_row,
+                                           int64_t const* expert_first_token_offset,
+                                           int64_t num_tokens, int64_t k,
+                                           int64_t num_experts_per_node, int64_t num_moe_inputs,
+                                           bool enable_pdl, cudaStream_t stream) {
+  int64_t const threads = 256;
+  int64_t const blocks =
+      std::min<int64_t>(1024, tensorrt_llm::common::ceilDiv(num_moe_inputs, threads));
+  cudaLaunchConfig_t config;
+  config.gridDim = blocks;
+  config.blockDim = threads;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(&config, gatherGemm1SourceIdsAndScalesKernel, permuted_source_token_ids,
+                     permuted_scales, unpermuted_scales, permuted_row_to_unpermuted_row,
+                     expert_first_token_offset, num_tokens, k, num_experts_per_node,
+                     num_moe_inputs);
+}
 
 enum class ScaleMode : int {
   NO_SCALE = 0,
@@ -2916,6 +2996,37 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+                        Sm90Wfp4Afp8Mode,
+                        Enable>::runProfilerExpandInput(void const* unpermuted_input,
+                                                        void* permuted_output,
+                                                        float const* unpermuted_scales,
+                                                        int const* permuted_row_to_unpermuted_row,
+                                                        int64_t const* expert_first_token_offset,
+                                                        int64_t num_rows, int64_t hidden_size,
+                                                        int k, int num_experts_per_node,
+                                                        bool enable_pdl, cudaStream_t stream) {
+  // Only the unquantized 16-bit same-type runners are ever called here
+  // (GemmProfilerBackend::supportsGatherA gates the launch); the remaining
+  // instantiations only need this to compile. Scale/quant side outputs are
+  // disabled: the profiler only needs the row-copy cost, which dominates.
+  // expert_first_token_offset is read unconditionally by the expand kernel
+  // (per-row expert lookup), so the real per-sample offsets are required.
+  // permuted_token_selected_experts may be nullptr: the kernel only reads it
+  // when fp8_expert_residual_scale is non-null, and both are disabled here.
+  expandInputRowsKernelLauncher<InputType, T>(
+      static_cast<InputType const*>(unpermuted_input), static_cast<T*>(permuted_output),
+      unpermuted_scales, /*permuted_scales=*/nullptr, permuted_row_to_unpermuted_row,
+      /*permuted_token_selected_experts=*/nullptr, num_rows, hidden_size, k, num_experts_per_node,
+      QuantParams{}, /*use_per_expert_act_scale=*/false,
+      const_cast<int64_t*>(expert_first_token_offset), /*fc1_act_sf_flat=*/nullptr,
+      /*input_sf=*/nullptr, /*swizzled_input_sf=*/true, /*prequant_scales=*/nullptr,
+      /*fp8_token_dequant_scale=*/nullptr, /*fp8_expert_residual_scale=*/nullptr,
+      /*fp8_token_scale_ptr_array=*/nullptr, enable_pdl, stream);
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
 std::map<std::string, std::pair<size_t, size_t>>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
                    Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows,
@@ -2966,6 +3077,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   size_t const expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t);
   size_t const permuted_token_final_scales_size =
       mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
+  size_t const permuted_source_token_ids_size = num_moe_inputs * sizeof(int);
   size_t const glu_inter_size =
       glu_inter_elems * gemm_output_dtype;  // May be an intermediate type for quantization
   size_t const fc1_result_size =
@@ -3077,6 +3189,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   ADD(blocked_row_to_unpermuted_row);
   ADD(expert_first_token_offset);
   ADD(permuted_token_final_scales);
+  ADD(permuted_source_token_ids);
   ADD(overlapped_gemm1_gemm2_inputs);
   ADD(overlapped_gemm1_gemm2_outputs);
   ADD_NAME(alpha_scale_ptr_array_fc1, alpha_scale_ptr_array_size);
@@ -3166,6 +3279,7 @@ void CutlassMoeFCRunner<
       cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
   permuted_token_final_scales_ =
       gemm2_using_finalize_fusion ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
+  permuted_source_token_ids_ = getWsPtr(int{}, "permuted_source_token_ids");
 
   bool const is_gated_activation = isGatedActivation(activation_type);
   bool const gemm1_using_fused_moe = moe_gemm_runner_.isFusedGatedActivation(
@@ -4289,16 +4403,25 @@ void CutlassMoeFCRunner<
       humming_permuted_token_selected_experts = permuted_token_selected_experts_;
       act_fp8_token_scale_ptr_array = alpha_scale_ptr_array_fc1_;
     }
-    expandInputRowsKernelLauncher(
-        input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
-        permuted_token_final_scales_, permuted_row_to_unpermuted_row_,
-        humming_permuted_token_selected_experts, num_rows, hidden_size, experts_per_token,
-        num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
-        fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
-        (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
-        fp8_token_dequant_scale, fp8_expert_residual_scale, act_fp8_token_scale_ptr_array,
-        enable_pdl, stream);
-    auto const* gemm1_input = gemm1_input_expand;
+    bool const gemm1_gathers_a = supports_gather_a_input && gemm1_config_->gather_a && !use_awq;
+    if (gemm1_gathers_a) {
+      gatherGemm1SourceIdsAndScalesLauncher(
+          permuted_source_token_ids_, permuted_token_final_scales_, token_topk_unpermuted_scales,
+          permuted_row_to_unpermuted_row_, expert_first_token_offset_, num_rows, experts_per_token,
+          num_experts_per_node, expanded_num_rows, enable_pdl, stream);
+    } else {
+      expandInputRowsKernelLauncher(
+          input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
+          permuted_token_final_scales_, permuted_row_to_unpermuted_row_,
+          humming_permuted_token_selected_experts, num_rows, hidden_size, experts_per_token,
+          num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
+          fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+          (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
+          fp8_token_dequant_scale, fp8_expert_residual_scale, act_fp8_token_scale_ptr_array,
+          enable_pdl, stream);
+    }
+    auto const* gemm1_input =
+        gemm1_gathers_a ? reinterpret_cast<T const*>(input_activations) : gemm1_input_expand;
 
     sync_check_cuda_error(stream);
 
@@ -4326,9 +4449,11 @@ void CutlassMoeFCRunner<
     }
 
     if constexpr (!use_w4afp8) {
-      gemm1_input =
-          applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
-                             num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+      if (!gemm1_gathers_a) {
+        gemm1_input = applyPrequantScale(
+            smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
+            num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+      }
     }
     sync_check_cuda_error(stream);
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
@@ -4379,10 +4504,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         float const* fp8_dequant2,
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
-        QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
-        UnfusedGemmOutputType* gemm1_output, UnfusedGemmOutputType* gemm2_output,
-        float const* router_scales, int const* permuted_row_to_unpermuted_row, bool enable_pdl,
-        cudaStream_t stream) {
+        int const* permuted_source_token_ids, QuantParams quant_params, ScaleBiasType const* bias1,
+        ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
+        UnfusedGemmOutputType* gemm2_output, float const* router_scales,
+        int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream) {
   // Always nullptr
   layout_info1.ptr_c = nullptr;
   layout_info1.stride_c = nullptr;
@@ -4443,8 +4568,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
                      layout_info2, num_tokens, expanded_num_tokens, gemm1_n, gemm1_k, gemm2_n,
                      gemm2_k, num_experts_per_node, gemm1_in, gemm2_in, weights1, weights2,
                      alpha_scale_flat1, alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2,
-                     quant_params, bias1, bias2, gemm1_output, gemm2_output, router_scales,
-                     permuted_row_to_unpermuted_row);
+                     permuted_source_token_ids, quant_params, bias1, bias2, gemm1_output,
+                     gemm2_output, router_scales, permuted_row_to_unpermuted_row);
 
   return std::make_pair(layout_info1, layout_info2);
 }
@@ -4489,6 +4614,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
 
+  gemm1_tma_ws_input.use_gather_a = supports_gather_a_input && gemm1_config_->gather_a;
+
   // Set enable_pdl for both GEMM inputs
   gemm1_tma_ws_input.enable_pdl = enable_pdl;
   gemm2_tma_ws_input.enable_pdl = enable_pdl;
@@ -4529,7 +4656,15 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         min_latency_params.num_active_experts_per_node, min_latency_params.active_expert_global_ids,
         start_expert, enable_pdl, stream);
   } else {
-    auto gemm1_input = use_prequant_scale_kernel ? smoothed_act_ : permuted_data_;
+    void const* gemm1_input = use_prequant_scale_kernel ? static_cast<void const*>(smoothed_act_)
+                                                        : static_cast<void const*>(permuted_data_);
+    if (gemm1_tma_ws_input.use_gather_a) {
+      // Gather-A consumes rows straight from the UNPERMUTED input tensor
+      // (row selection happens in the mainloop via ptr_gather_a_index);
+      // permuted_data_ is never filled because expandInputRowsKernel is
+      // skipped in runMoe when the gather tactic is active.
+      gemm1_input = input_activations_void;
+    }
 
     gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
@@ -4566,7 +4701,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         expanded_num_rows, fc1_out_size, hidden_size, hidden_size, inter_size, num_experts_per_node,
         reinterpret_cast<T const*>(gemm1_input), reinterpret_cast<T const*>(gemm2_input),
         fc1_expert_weights, fc2_expert_weights, quant_params.fp8.dequant_fc1,
-        quant_params.fp8.dequant_fc2, fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params,
+        quant_params.fp8.dequant_fc2, fc1_fp4_act_scale_, fc2_fp4_act_scale_,
+        gemm1_tma_ws_input.use_gather_a ? permuted_source_token_ids_ : nullptr, quant_params,
         fc1_expert_biases, fc2_bias, reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
         reinterpret_cast<UnfusedGemmOutputType*>(fc2_result_), permuted_token_final_scales_,
         permuted_row_to_unpermuted_row_, enable_pdl, stream);
@@ -4878,9 +5014,15 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 
   size_t tma_ws_input_workspace_size = 0;
   if (is_tma_ws_input) {
+    // One input set per (fusion, swap_ab, sample) plus the shared dummy, and
+    // when gather-A tactics can be profiled an extra per-sample set prepared
+    // with use_gather_a (different ptr_act/ptr_gather_a_index contents).
+    int64_t const num_tma_ws_input_sets =
+        NUM_ROUTING_SAMPLES * (NUM_FUSION_TYPES * NUM_SWAP_AB_TYPES + (supportsGatherA() ? 1 : 0)) +
+        1;
     tma_ws_input_workspace_size =
         TmaWarpSpecializedGroupedGemmInput::workspaceSize(num_experts_per_node, mScalingType) *
-        (NUM_ROUTING_SAMPLES * NUM_FUSION_TYPES * NUM_SWAP_AB_TYPES + 1);
+        num_tma_ws_input_sets;
 
     if (is_w4afp8_quant || is_wfp4a16_quant) {
       quant_3_size = 0;
@@ -4917,6 +5059,9 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   size_t expert_first_token_offset_size =
       (num_experts_per_node + 1) * sizeof(int64_t) * NUM_ROUTING_SAMPLES;
   size_t map_size = mMinLatencyMode ? 0 : NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
+  size_t permuted_source_token_ids_size =
+      supportsGatherA() ? NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int) : 0;
+  size_t expand_dest_size = supportsGatherA() ? input_size1 : 0;
   size_t unpermuted_size =
       mMinLatencyMode ? 0 : NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
   size_t permuted_size = mMinLatencyMode ? 0 : num_expanded_tokens * sizeof(int);
@@ -4957,6 +5102,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   ADD(expert_first_token_offset);
   ADD_NAME(unpermuted_row_to_permuted_row, map_size);
   ADD_NAME(permuted_row_to_unpermuted_row, map_size);
+  ADD(permuted_source_token_ids);
   ADD_NAME(token_selected_experts, unpermuted_size);
   ADD_NAME(permuted_token_selected_experts, permuted_size);
   ADD(blocked_expert_counts);
@@ -4970,6 +5116,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   ADD(input);
   ADD(output);
   ADD(intermediate);
+  ADD(expand_dest);
   ADD(weights);
   ADD(bias);
   ADD(quant_1);
@@ -5009,6 +5156,7 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
   GET_WS_PTR_BASE(int64_t*, expert_first_token_offset);
   GET_WS_PTR_BASE(int*, unpermuted_row_to_permuted_row);
   GET_WS_PTR_BASE(int*, permuted_row_to_unpermuted_row);
+  GET_WS_PTR_BASE(int*, permuted_source_token_ids);
   GET_WS_PTR_BASE(int*, token_selected_experts);
   GET_WS_PTR(int*, permuted_token_selected_experts);
   GET_WS_PTR(int*, blocked_expert_counts);
@@ -5053,6 +5201,15 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
           blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
           mNumExpertsPerNode, mK, start_expert_id, enable_pdl, stream);
       sync_check_cuda_error(stream);
+
+      if (supportsGatherA()) {
+        gatherGemm1SourceIdsAndScalesLauncher(
+            permuted_source_token_ids_base + i * num_expanded_tokens, /*permuted_scales=*/nullptr,
+            /*unpermuted_scales=*/nullptr, permuted_row_to_unpermuted_row,
+            expert_first_token_offset, num_tokens, mK, mNumExpertsPerNode, num_expanded_tokens,
+            enable_pdl, stream);
+        sync_check_cuda_error(stream);
+      }
     }
   }
 }
@@ -5175,8 +5332,8 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
 
 void GemmProfilerBackend::prepareTmaWsInputs(
     int num_tokens, char* workspace_ptr_char, void const* expert_weights,
-    TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, bool swap_ab, bool enable_pdl,
-    cudaStream_t stream) {
+    TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, bool swap_ab, bool gather_a,
+    bool enable_pdl, cudaStream_t stream) {
   if (mSM < 90) {
     return;
   }
@@ -5195,6 +5352,12 @@ void GemmProfilerBackend::prepareTmaWsInputs(
     return;
   }
 
+  if (gather_a && !supportsGatherA()) {
+    return;
+  }
+  TLLM_CHECK_WITH_INFO(!gather_a || (!swap_ab && !use_finalize_fusion),
+                       "Gather-A TMA WS inputs are prepared without swap_ab or finalize fusion");
+
   auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 
 #define GET_WS_PTR(type, name)                                                                 \
@@ -5206,6 +5369,8 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   int64_t* expert_first_token_offset_base = expert_first_token_offset;
   GET_WS_PTR(int*, permuted_row_to_unpermuted_row);
   int* permuted_row_to_unpermuted_row_base = permuted_row_to_unpermuted_row;
+  GET_WS_PTR(int*, permuted_source_token_ids);
+  int* permuted_source_token_ids_base = permuted_source_token_ids;
   GET_WS_PTR(void*, input);
   GET_WS_PTR(void*, output);
   GET_WS_PTR(void*, intermediate);
@@ -5245,9 +5410,11 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   dummy_tma_ws_input.enable_pdl = enable_pdl;  // Set enable_pdl for dummy input
   tma_ws_input_workspace += tma_ws_size;
 
+  // Gather-A input sets live after the (fusion x swap_ab) blocks.
   int workspace_index =
-      static_cast<int>(use_finalize_fusion) * (NUM_SWAP_AB_TYPES * NUM_ROUTING_SAMPLES) +
-      static_cast<int>(swap_ab) * NUM_ROUTING_SAMPLES;
+      gather_a ? NUM_FUSION_TYPES * NUM_SWAP_AB_TYPES * NUM_ROUTING_SAMPLES
+               : static_cast<int>(use_finalize_fusion) * (NUM_SWAP_AB_TYPES * NUM_ROUTING_SAMPLES) +
+                     static_cast<int>(swap_ab) * NUM_ROUTING_SAMPLES;
   tma_ws_input_workspace += workspace_index * tma_ws_size;
 
   size_t num_expanded_tokens = num_tokens * mK;
@@ -5255,7 +5422,8 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++) {
     // Note: Even though we have separate TMA WS inputs for finalize fusion on/off we reuse the same
     // pointers to save space.
-    auto& cache_element = mTmaInputCache[use_finalize_fusion][swap_ab][i];
+    auto& cache_element =
+        gather_a ? mTmaInputCacheGatherA[i] : mTmaInputCache[use_finalize_fusion][swap_ab][i];
     cache_element.configureWorkspace(
         tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
         workspaces.at("gemm_workspace").first, precomputed_scheduler_workspace,
@@ -5284,6 +5452,8 @@ void GemmProfilerBackend::prepareTmaWsInputs(
       gemm1_tma_ws_input.swap_ab = swap_ab;
       gemm2_tma_ws_input.swap_ab = swap_ab;
 
+      gemm1_tma_ws_input.use_gather_a = gather_a;
+
       if (use_finalize_fusion) {
         assert(!mMinLatencyMode);
         gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
@@ -5307,7 +5477,9 @@ void GemmProfilerBackend::prepareTmaWsInputs(
                 num_tokens * mK, fc1_output_size, mExpertHiddenSize, mExpertHiddenSize,
                 mExpertInterSize, mNumExpertsPerNode, input, input, weights_sel, weights_sel,
                 mQuantParams.fp8.dequant_fc1, mQuantParams.fp8.dequant_fc2, fp4_act_scale_flat,
-                fp4_act_scale_flat, mQuantParams, nullptr, nullptr, intermediate, intermediate,
+                fp4_act_scale_flat,
+                gather_a ? permuted_source_token_ids_base + i * num_expanded_tokens : nullptr,
+                mQuantParams, nullptr, nullptr, intermediate, intermediate,
                 token_topk_unpermuted_scales, permuted_row_to_unpermuted_row, enable_pdl, stream);
       }
       sync_check_cuda_error(stream);
@@ -5342,9 +5514,13 @@ void GemmProfilerBackend::prepare(int num_tokens, char* workspace_ptr_char,
                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE}) {
     for (auto swap_ab : {false, true}) {
       prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights, fusion, swap_ab,
-                         enable_pdl, stream);
+                         /*gather_a=*/false, enable_pdl, stream);
     }
   }
+  // Extra pass for gather-A GEMM1 tactics (no-op unless supportsGatherA()).
+  prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights,
+                     TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, /*swap_ab=*/false,
+                     /*gather_a=*/true, enable_pdl, stream);
 }
 
 size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {
@@ -5383,6 +5559,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                     (mSampleIndex * expanded_num_tokens));
   GET_WS_PTR_OFFSET(int const*, permuted_row_to_unpermuted_row,
                     (mSampleIndex * expanded_num_tokens));
+  GET_WS_PTR_OFFSET(int*, permuted_source_token_ids, (mSampleIndex * expanded_num_tokens));
   GET_WS_PTR_OFFSET(int const*, token_selected_experts, (mSampleIndex * expanded_num_tokens));
 
   GET_WS_PTR(float const*, token_topk_unpermuted_scales);
@@ -5394,6 +5571,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
   GET_WS_PTR(void const*, input);
   GET_WS_PTR(void*, output);
   GET_WS_PTR(void*, intermediate);
+  GET_WS_PTR(void*, expand_dest);
   GET_WS_PTR(void const*, weights);
   TLLM_CHECK(mNeedWeights == (expert_weights == nullptr));
   void const* weights_sel = mNeedWeights ? weights : expert_weights;
@@ -5423,7 +5601,12 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                             cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     bool use_finalize_index = request_finalize && finalize_supported_this_gemm;
 
-    tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
+    if (tactic.gather_a) {
+      TLLM_CHECK_WITH_INFO(supportsGatherA(), "gather_a tactic profiled without gather-A support");
+      tma_ws_input_template = mTmaInputCacheGatherA[mSampleIndex];
+    } else {
+      tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
+    }
     TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(),
                          "TMA WS input template is not initialized");
   }
@@ -5434,6 +5617,19 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                                  : (mQuantParams.fp8_mxfp4.fc2.act_global_scale
                                         ? mQuantParams.fp8_mxfp4.fc2.act_global_scale
                                         : mQuantParams.fp8.quant_fc2);
+  if (mGemmToProfile == GemmToProfile::GEMM_1 && supportsGatherA()) {
+    if (tactic.gather_a) {
+      gatherGemm1SourceIdsAndScalesLauncher(
+          permuted_source_token_ids, /*permuted_scales=*/nullptr, /*unpermuted_scales=*/nullptr,
+          permuted_row_to_unpermuted_row, expert_first_token_offset, original_num_tokens, mK,
+          mNumExpertsPerNode, expanded_num_tokens, enable_pdl, stream);
+    } else {
+      mInterface->runProfilerExpandInput(input, expand_dest, token_topk_unpermuted_scales,
+                                         permuted_row_to_unpermuted_row, expert_first_token_offset,
+                                         original_num_tokens, mExpertHiddenSize, mK,
+                                         num_experts_per_node, enable_pdl, stream);
+    }
+  }
   if (mGemmToProfile == GemmToProfile::GEMM_1) {
     mInterface->gemm1(input,                                             //
                       output,                                            //
