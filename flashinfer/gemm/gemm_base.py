@@ -5831,10 +5831,10 @@ class _TrtllmDynamicQuantMxfp8Runner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         a, b, b_descale, out_dtype, out, workspace_buffer = inputs
-        if tactic == -1:
-            use_8x4_sf_layout, gemm_tactic = True, -1
-        else:
+        if isinstance(tactic, tuple):
             use_8x4_sf_layout, gemm_tactic = tactic
+        else:
+            use_8x4_sf_layout, gemm_tactic = True, tactic
         sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
         a_mxfp8, a_descale = mxfp8_quantize(a, sf_swizzle_layout=sf_layout)
         gemm_runner = (
