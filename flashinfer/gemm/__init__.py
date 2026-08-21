@@ -27,6 +27,10 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_swiglu import (
+    mm_bf16_swiglu as mm_bf16_swiglu,
+    prepare_bf16_swiglu_weight as prepare_bf16_swiglu_weight,
+)
 
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
@@ -130,6 +134,8 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "mm_bf16_swiglu",
+        "prepare_bf16_swiglu_weight",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
