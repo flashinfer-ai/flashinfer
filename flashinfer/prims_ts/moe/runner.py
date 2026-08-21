@@ -31,7 +31,7 @@ from flashinfer.autotuner import (
     TuningConfig,
 )
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
-from flashinfer.fused_moe.factorized import FactorizedTacticSpace, MoeTactic
+from flashinfer.fused_moe.tactic_search import FactorizedTacticSpace, MoeTactic
 from flashinfer.fused_moe.shared.tuning import (
     MoeTensorInitializer,
     make_moe_tuning_config,
@@ -615,7 +615,7 @@ class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
         resolve_pair: Callable[[MoeTactic], PrimsTsGemmPair],
     ) -> FactorizedTacticSpace:
         """Build legal fused-MoE coordinates from complete PrimsTS config rows."""
-        from flashinfer.fused_moe.factorized import (
+        from flashinfer.fused_moe.tactic_search import (
             FactorizedTactic,
             FactorizedTacticSpace,
         )
@@ -1133,7 +1133,7 @@ class PrimsTsNvfp4MoERunner(
         self, inputs: List[torch.Tensor]
     ) -> FactorizedTacticSpace:
         """Return legal NVFP4 FC1/FC2 factors and deterministic tile anchors."""
-        from flashinfer.fused_moe.factorized import (
+        from flashinfer.fused_moe.tactic_search import (
             FactorizedTactic,
             FactorizedTacticSpace,
         )
