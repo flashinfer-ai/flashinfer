@@ -182,10 +182,10 @@ def _validate_paged_inputs(
             f"block_table must be an int32 CUDA tensor, got "
             f"dtype={block_table.dtype}, device={block_table.device}"
         )
-    if context_lens.shape[0] != batch_size:
+    if context_lens.dim() != 1 or context_lens.shape[0] != batch_size:
         raise ValueError(
-            f"context_lens.shape[0] ({context_lens.shape[0]}) must equal "
-            f"batch_size ({batch_size}) inferred from q.shape[0]"
+            f"context_lens must be 1-D with shape[0] == batch_size ({batch_size}) "
+            f"inferred from q.shape[0]; got shape {tuple(context_lens.shape)}"
         )
     if block_table.dim() != 2 or block_table.shape[0] != batch_size:
         raise ValueError(
