@@ -187,6 +187,79 @@ cast(Any, _mm_mxfp8_reference)._trace_reference_dependencies = (
 )
 
 
+def _unshuffle_trtllm_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
+    """Undo TRT-LLM's 32-row ``shuffleMatrixA`` permutation."""
+    rows = x.shape[0]
+    row_map = torch.tensor(
+        [
+            0,
+            8,
+            16,
+            24,
+            1,
+            9,
+            17,
+            25,
+            2,
+            10,
+            18,
+            26,
+            3,
+            11,
+            19,
+            27,
+            4,
+            12,
+            20,
+            28,
+            5,
+            13,
+            21,
+            29,
+            6,
+            14,
+            22,
+            30,
+            7,
+            15,
+            23,
+            31,
+        ],
+        dtype=torch.long,
+        device=x.device,
+    )
+    old_rows = torch.arange(rows, dtype=torch.long, device=x.device)
+    new_rows = (old_rows // 32) * 32 + row_map[old_rows % 32]
+    row_indices = torch.empty_like(old_rows)
+    row_indices[new_rows] = old_rows
+    unshuffled = torch.empty_like(x)
+    unshuffled[row_indices] = x
+    return unshuffled
+
+
+def _mm_mxfp8_dynamic_quant_reference(A, B, b_descale):
+    """Reference BF16 activation times a TRT-LLM-shuffled MXFP8 weight."""
+    _, K = A.shape
+    N = B.shape[1]
+    block_size = 32
+    weight = _unshuffle_trtllm_mxfp8_rows(B.T)
+    weight_scale = _e8m0_to_float(
+        _unshuffle_trtllm_mxfp8_rows(_unswizzle_sf_128x4(b_descale, N, K // block_size))
+    )
+    weight = weight.to(torch.float32) * weight_scale.repeat_interleave(
+        block_size, dim=1
+    )
+    return torch.matmul(A.to(torch.float32), weight.T).to(torch.bfloat16)
+
+
+cast(Any, _mm_mxfp8_dynamic_quant_reference)._trace_reference_dependencies = (
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+    _unshuffle_trtllm_mxfp8_rows,
+)
+
+
 def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
     """Dequantize FP4 inputs and compute C = A @ B."""
 
@@ -397,6 +470,73 @@ mm_mxfp8_trace = TraceTemplate(
     reference=_mm_mxfp8_reference,
     check=_mxfp8_gemm_check,
     init=_mm_mxfp8_init,
+)
+
+
+def _mm_mxfp8_dynamic_quant_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build BF16 activations and TRT-LLM-shuffled MXFP8 weights."""
+    from flashinfer import (  # noqa: PLC0415
+        SfLayout,
+        mxfp8_quantize,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    weight_q, weight_scale = mxfp8_quantize(
+        weight,
+        sf_swizzle_layout=SfLayout.layout_linear,
+    )
+    b = shuffle_matrix_a(weight_q, 128).reshape(N, K).T
+    b_descale = shuffle_matrix_sf_a(
+        weight_scale.reshape(N, K // 32),
+        128,
+        num_elts_per_sf=32,
+    ).reshape(-1)
+    return {"a": a, "b": b, "b_descale": b_descale}
+
+
+mm_mxfp8_dynamic_quant_trace = TraceTemplate(
+    op_type="gemm_mxfp8_dynamic_quant",
+    description=(
+        "BF16 activation quantization followed by MXFP8 GEMM with "
+        "TRT-LLM-shuffled weights."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "B_scale_size": Const(
+            abbrev="",
+            description="Padded 128x4 weight-scale buffer length.",
+        ),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="BF16 activation."),
+        "B": Tensor(
+            ["K", "N"],
+            param="b",
+            description="TRT-LLM row-shuffled MXFP8 weight, column-major.",
+        ),
+        "b_descale": Tensor(
+            ["B_scale_size"],
+            description="TRT-LLM row-shuffled 128x4 E8M0 weight scales.",
+        ),
+    },
+    outputs={"C": Tensor(["M", "N"], dtype="bfloat16")},
+    tags=["status:verified", "quantization:mxfp8", "dynamic_quantization"],
+    reference=_mm_mxfp8_dynamic_quant_reference,
+    check=_mxfp8_gemm_check,
+    init=_mm_mxfp8_dynamic_quant_init,
 )
 
 # ── FP4 GEMM ─────────────────────────────────────────────────────────────────
