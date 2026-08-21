@@ -5152,34 +5152,26 @@ _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
 def _check_cute_dsl_arch(device: torch.device) -> None:
     """Reject the CuTe-DSL backend when the installed DSL cannot emit for ``device``.
 
-    This is an *availability* check, not a capability one. The kernels exist for
-    sm_107, so ``@supported_compute_capability`` rightly keeps listing it and
-    ``is_backend_supported("cute-dsl", 107)`` still answers True. What varies is
-    whether the installed DSL can generate code for that arch: true on 4.8+, or
-    on an older DSL when the user exported ``CUTE_DSL_ARCH=sm_100f`` before the
-    process started. Same axis as ``CUDNN_AVAILABLE`` and
-    ``_is_cudnn_override_shape_available``.
+    Availability, not capability: the kernels exist for sm_107, so the static
+    ``@supported_compute_capability`` list rightly still contains it. What
+    varies is whether the installed DSL can generate code for that arch. Same
+    axis as ``CUDNN_AVAILABLE`` / ``_is_cudnn_override_shape_available``.
 
-    Raises ``ValueError`` rather than returning False on purpose:
-    ``suitable_auto_backends`` catches ValueError to mean "backend not suitable"
-    and keeps searching, while on the explicit-backend path it propagates this
-    message. Returning False there would surface as the misleading
-    "Problem size is not supported".
+    Delegates to :func:`require_cute_dsl_arch`, which owns the predicate and the
+    message (including the exact ``CUTE_DSL_ARCH`` value to export). Only the
+    exception type is adapted: ``suitable_auto_backends`` treats ``ValueError``
+    as "backend not suitable" and keeps searching, whereas the
+    ``NotImplementedError`` it raises would propagate and fail the call.
     """
     try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
-
-        major, minor = torch.cuda.get_device_capability(device)
-        supported = is_cute_dsl_arch_supported(major, minor)
+        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
     except Exception:
-        # Never let the probe itself deselect an otherwise working backend.
+        # Probe unavailable; never deselect an otherwise working backend.
         return
-    if not supported:
-        raise ValueError(
-            f"the installed CuTe DSL cannot target sm_{major}{minor}; install "
-            f"CuTe DSL 4.8+, or export CUTE_DSL_ARCH=sm_{major}0f before starting "
-            f"the process to build family-portable kernels"
-        )
+    try:
+        require_cute_dsl_arch(device)
+    except NotImplementedError as err:
+        raise ValueError(str(err)) from err
 
 
 def _check_cute_dsl_availability():
