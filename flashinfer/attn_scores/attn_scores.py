@@ -1043,6 +1043,12 @@ def fp8_paged_mqa_logits(
         )
         logits = logits_full[:, :max_context_len]
 
+    # Not just an optimization: the persistent kernel launches num_sms CTAs
+    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
+    # here. After the out= branch so a bad buffer still raises.
+    if B == 0:
+        return logits
+
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
     else:
@@ -1348,6 +1354,12 @@ def fp4_paged_mqa_logits(
             (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
         )
         logits = logits_full[:, :max_context_len]
+
+    # Not just an optimization: the persistent kernel launches num_sms CTAs
+    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
+    # here. After the out= branch so a bad buffer still raises.
+    if B == 0:
+        return logits
 
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
