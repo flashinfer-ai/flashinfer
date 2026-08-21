@@ -59,6 +59,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.hash_topk",
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
+    "flashinfer.fused_moe.trtllm_gen_routing",
     "flashinfer.gdn_decode",
     "flashinfer.gdn_kernels.experimental.gdn_fused_decode",
     "flashinfer.gdn_prefill",

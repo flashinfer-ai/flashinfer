@@ -23,6 +23,7 @@ import torch
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.jit.fused_moe import gen_trtllm_gen_routing_module
 from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.trace.templates.moe import trtllm_gen_routing_trace
 from flashinfer.utils import (
     backend_requirement,
     device_support_pdl,
@@ -203,7 +204,7 @@ def get_trtllm_gen_routing_module():
 
 
 @backend_requirement({}, common_check=_check_trtllm_gen_routing_supported)
-@flashinfer_api
+@flashinfer_api(trace=trtllm_gen_routing_trace)
 def trtllm_gen_routing(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],

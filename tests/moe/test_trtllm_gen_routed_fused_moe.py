@@ -309,7 +309,7 @@ def test_trtllm_gen_routed_fused_moe_format_parity(
 # covers directly against the same oracles, and the routed entry-point plumbing
 # for every method/format is smoke-checked by
 # test_trtllm_gen_routed_fused_moe_format_parity above.
-# (See docs/moe_routing_test_decomposition.md.)
+# (See docs/design_docs/moe_routing_test_decomposition.md.)
 @pytest.mark.parametrize("num_tokens", [1, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 4096])
 @pytest.mark.parametrize("intermediate_size", [3072])

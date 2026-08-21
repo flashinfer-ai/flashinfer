@@ -87,6 +87,35 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
                  routing_method_type < static_cast<int64_t>(RoutingMethodType::Unspecified))
       << "invalid routing_method_type " << routing_method_type;
 
+  // Expert-group validation. This is a public FFI entry point, so mirror the
+  // checks FusedMoeLauncher::check_routing() applies before it reaches the same
+  // Routing::Runner dispatcher (csrc/trtllm_fused_moe_kernel_launcher.cu). The
+  // dispatcher itself only guards top_k <= 22 and topk_group <= 4, so without
+  // these a bad group combination is a device-side fault rather than an error.
+  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK(n_group != 0) << "n_group should not be zero for DeepSeekV3 routing";
+    TVM_FFI_ICHECK(topk_group != 0) << "if n_group is given, topk_group must be given";
+    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+    // DeepSeekV3 routing supports top_k up to:
+    // - 8  when num_experts <= 384 (NumKimiK2Experts)
+    // - 22 when num_experts > 384 (NumNemotronExperts path)
+    // Keep this in sync with LAUNCH_ROUTING_DEEPSEEK in trtllm_fused_moe_routing_deepseek.cu.
+    constexpr int64_t kNumKimiK2Experts = 384;
+    int64_t const max_supported_top_k = num_experts <= kNumKimiK2Experts ? 8 : 22;
+    TVM_FFI_ICHECK(top_k <= max_supported_top_k)
+        << "Current routing kernel (with groups) only supports top_k<=" << max_supported_top_k
+        << " for num_experts=" << num_experts << ".";
+    TVM_FFI_ICHECK(topk_group > 0 && topk_group <= 4)
+        << "Current routing kernel (with groups) only supports 0 < topk_group <= 4.";
+    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
+    TVM_FFI_ICHECK_LT(top_k, topk_group * num_experts / n_group)
+        << "top_k must be less than total number of experts in selected groups";
+  } else {
+    TVM_FFI_ICHECK(n_group <= 1) << "Current routing kernel (no groups) only supports n_group <= 1";
+    TVM_FFI_ICHECK(topk_group <= 1)
+        << "Current routing kernel (no groups) only supports topk_group <= 1";
+  }
+
   btg::Dtype const dtype_logits =
       routing_logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
   btg::Dtype dtype_bias = btg::Dtype::Bfloat16;

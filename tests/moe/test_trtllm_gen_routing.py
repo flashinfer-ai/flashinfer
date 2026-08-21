@@ -19,7 +19,7 @@ Routing correctness used to be covered only transitively, by multiplying every
 routing method against the full fused-MoE quant/shape matrix. This file tests
 the routing kernels directly against the host oracles in
 trtllm_gen_fused_moe_utils.py, so the fused tests can pin routing to one or two
-representative methods (see docs/moe_routing_test_decomposition.md).
+representative methods (see docs/design_docs/moe_routing_test_decomposition.md).
 
 Notes on test construction:
 - Logits are positive and tie-free by construction (per-row randperm / 32,
@@ -376,6 +376,37 @@ def test_large_batch_smoke(routing_method, num_experts, top_k):
         )
 
 
+def test_invalid_group_args_rejected():
+    """Grouped-routing argument validation at the FFI boundary.
+
+    These combinations are rejected by the binding (mirroring
+    FusedMoeLauncher::check_routing) rather than by the Python wrapper, so the
+    exception is whatever TVM-FFI raises for a failed ICHECK; match on the
+    message instead of the type.
+    """
+    logits = make_logits(4, 16, torch.float32, 0)
+    bias = make_bias(16, torch.bfloat16, 1)
+
+    def expect(message, top_k=4, **kwargs):
+        with pytest.raises(Exception, match=message):
+            trtllm_gen_routing(
+                logits, bias, RoutingMethodType.DeepSeekV3, top_k, **kwargs
+            )
+
+    expect("n_group should not be zero")  # DeepSeekV3 defaults n_group=0
+    expect("must be divisible by n_group", n_group=3, topk_group=1)
+    expect("topk_group must be given", n_group=4, topk_group=0)
+    expect("not be smaller than topk_group", n_group=2, topk_group=4)
+    expect("less than total number of experts", n_group=4, topk_group=1, top_k=4)
+    expect("topk_group <= 4", n_group=8, topk_group=5, top_k=2)
+
+    # Non-grouped methods must not carry group parameters.
+    with pytest.raises(Exception, match="only supports n_group <= 1"):
+        trtllm_gen_routing(
+            logits, None, RoutingMethodType.Renormalize, 4, n_group=2, topk_group=1
+        )
+
+
 def test_invalid_args_rejected():
     logits = make_logits(4, 16, torch.float32, 0)
     with pytest.raises(ValueError):
@@ -386,3 +417,225 @@ def test_invalid_args_rejected():
         )  # not a power of two
     with pytest.raises(ValueError):
         trtllm_gen_routing(logits, None, RoutingMethodType.Unspecified, 4)
+
+
+# ---------------------------------------------------------------------------
+# Expert-parallel shards
+#
+# Under EP the kernels still *select* over all `num_experts` — only the
+# permutation is restricted to the local shard. So the global host oracle stays
+# valid for selection, and the expected permutation is its per-expert histogram
+# re-padded over the local experts alone. These cases are the only coverage of
+# the `+ local_expert_offset` id reconstruction and the `-1` masking of
+# out-of-shard slots in flashinfer/fused_moe/trtllm_gen_routing.py.
+# ---------------------------------------------------------------------------
+
+
+def check_ep_shard(
+    result,
+    permute_info,
+    num_tokens,
+    top_k,
+    tile_tokens_dim,
+    local_expert_offset,
+    local_num_experts,
+):
+    """Shard-aware counterpart to check_selection/check_permutation."""
+    device = result.topk_ids.device
+    ref_ids = permute_info["topKIndices"].to(device).long()
+    in_shard = (ref_ids >= local_expert_offset) & (
+        ref_ids < local_expert_offset + local_num_experts
+    )
+    # A shard that happens to own every routed expert would make the masking
+    # assertions vacuous.
+    assert (~in_shard).any(), (
+        "test case is not a partial shard: every selected expert is local"
+    )
+
+    # Selection: in-shard slots keep their *global* expert id, out-of-shard
+    # slots are masked to -1. Intra-row order is not contractual, and -1 sorts
+    # below every real id, so compare row-sorted.
+    got_ids = result.topk_ids.long()
+    want_ids = torch.where(in_shard, ref_ids, torch.full_like(ref_ids, -1))
+    got_sorted, _ = torch.sort(got_ids, dim=1)
+    want_sorted, _ = torch.sort(want_ids, dim=1)
+    mismatched = (got_sorted != want_sorted).any(dim=1)
+    assert not mismatched.any(), (
+        f"sharded expert selection mismatch on {int(mismatched.sum())}/{num_tokens} "
+        f"tokens; first bad token {int(mismatched.nonzero()[0])}: "
+        f"got {got_sorted[mismatched][0].tolist()}, "
+        f"want {want_sorted[mismatched][0].tolist()}"
+    )
+
+    active = got_ids >= 0
+    assert (active.sum(dim=1) == in_shard.sum(dim=1)).all(), (
+        "number of unmasked slots per token disagrees with the oracle"
+    )
+
+    # Expected padded layout: the oracle's global histogram, re-padded over the
+    # local experts only.
+    ref_counts = permute_info["numTokensPerExpert"].to(device).long()
+    local_counts = ref_counts[
+        local_expert_offset : local_expert_offset + local_num_experts
+    ]
+    padded = ((local_counts + tile_tokens_dim - 1) // tile_tokens_dim) * tile_tokens_dim
+    prefix = torch.cat(
+        [torch.zeros(1, dtype=torch.long, device=device), padded.cumsum(0)]
+    )
+    padded_size = int(result.total_num_padded_tokens.item())
+    assert padded_size == int(prefix[-1]), (
+        f"sharded padded token count {padded_size} != reference {int(prefix[-1])}"
+    )
+
+    e2p = result.expanded_idx_to_permuted_idx.long()
+    assert (e2p >= 0).eq(active).all(), (
+        "expanded_idx_to_permuted_idx masking disagrees with topk_ids masking"
+    )
+
+    live = e2p[active]
+    assert ((live >= 0) & (live < padded_size)).all(), "permuted idx out of range"
+    assert live.unique().numel() == live.numel(), "permuted idx not unique"
+
+    # Each live slot lands in its *local* expert's padded segment.
+    local_expert = got_ids[active] - local_expert_offset
+    assert ((local_expert >= 0) & (local_expert < local_num_experts)).all(), (
+        "reconstructed id outside the local shard"
+    )
+    in_segment = (live >= prefix[local_expert]) & (live < prefix[local_expert + 1])
+    assert in_segment.all(), "permuted idx outside its local expert's padded segment"
+
+    # Round-trip: the permuted slot maps back to the owning token.
+    p2t = result.permuted_idx_to_token_idx.long()
+    tokens = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(e2p)[active]
+    assert (p2t[live] == tokens).all(), "permuted->token round trip failed"
+
+    counts = torch.bincount(local_expert, minlength=local_num_experts)
+    assert (counts == local_counts).all(), "per-local-expert token counts mismatch"
+
+
+def run_and_check_ep_shard(
+    routing_method,
+    reference,
+    logits,
+    top_k,
+    tile_tokens_dim,
+    local_expert_offset,
+    local_num_experts,
+    routing_bias=None,
+    **kwargs,
+):
+    permute_info, _ = reference()
+    result = trtllm_gen_routing(
+        logits,
+        routing_bias,
+        routing_method,
+        top_k,
+        tile_tokens_dim=tile_tokens_dim,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        **kwargs,
+    )
+    check_ep_shard(
+        result,
+        permute_info,
+        logits.shape[0],
+        top_k,
+        tile_tokens_dim,
+        local_expert_offset,
+        local_num_experts,
+    )
+
+
+# (num_experts, top_k, local_expert_offset, local_num_experts). Every case is a
+# partial shard, including a first shard (offset 0) and a last shard.
+EP_SHARD_CASES = [
+    pytest.param(16, 4, 0, 8, id="E16_k4_rank0"),
+    pytest.param(16, 4, 8, 8, id="E16_k4_rank1"),
+    pytest.param(16, 4, 4, 4, id="E16_k4_ep4_mid"),
+    pytest.param(256, 8, 64, 64, id="E256_k8_rank1"),
+    pytest.param(256, 8, 192, 64, id="E256_k8_last"),
+    pytest.param(96, 8, 32, 32, id="E96_k8_mid"),
+]
+
+
+@pytest.mark.parametrize("num_tokens", [8, 150])
+@pytest.mark.parametrize("tile_tokens_dim", [8, 32])
+@pytest.mark.parametrize(
+    "num_experts,top_k,local_expert_offset,local_num_experts", EP_SHARD_CASES
+)
+def test_ep_shard_renormalize(
+    num_experts,
+    top_k,
+    local_expert_offset,
+    local_num_experts,
+    num_tokens,
+    tile_tokens_dim,
+):
+    """EP shards through the routingCustom kernel family."""
+    seed = stable_seed("ep", num_experts, top_k, local_expert_offset, num_tokens)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed)
+    run_and_check_ep_shard(
+        RoutingMethodType.Renormalize,
+        lambda: routing_reference_renormalize(
+            logits, top_k, num_experts, tile_tokens_dim
+        ),
+        logits,
+        top_k,
+        tile_tokens_dim,
+        local_expert_offset,
+        local_num_experts,
+    )
+
+
+# (num_experts, n_group, topk_group, top_k, local_expert_offset,
+# local_num_experts) — n_group > 1 so these land on the grouped DeepSeek kernel
+# rather than the routingCustom SigmoidBias fast path.
+DEEPSEEK_EP_SHARD_CASES = [
+    pytest.param(256, 8, 4, 8, 0, 64, id="E256_rank0"),
+    pytest.param(256, 8, 4, 8, 192, 64, id="E256_last"),
+    pytest.param(128, 4, 2, 4, 32, 32, id="E128_mid"),
+]
+
+
+@pytest.mark.parametrize("num_tokens", [8, 150])
+@pytest.mark.parametrize("tile_tokens_dim", [8, 32])
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,top_k,local_expert_offset,local_num_experts",
+    DEEPSEEK_EP_SHARD_CASES,
+)
+def test_ep_shard_deepseekv3(
+    num_experts,
+    n_group,
+    topk_group,
+    top_k,
+    local_expert_offset,
+    local_num_experts,
+    num_tokens,
+    tile_tokens_dim,
+):
+    """EP shards through the grouped DeepSeekV3 kernel family."""
+    seed = stable_seed("ep_ds", num_experts, top_k, local_expert_offset, num_tokens)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed)
+    bias = make_bias(num_experts, torch.bfloat16, seed + 1)
+    routed_scaling_factor = 2.5
+    run_and_check_ep_shard(
+        RoutingMethodType.DeepSeekV3,
+        lambda: routing_reference_no_aux(
+            logits,
+            bias,
+            top_k,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+            tile_tokens_dim,
+        ),
+        logits,
+        top_k,
+        tile_tokens_dim,
+        local_expert_offset,
+        local_num_experts,
+        routing_bias=bias,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+    )

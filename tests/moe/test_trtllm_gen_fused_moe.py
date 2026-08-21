@@ -252,7 +252,7 @@ def test_sigmoid_routing(
         # test_deepseekv3_routing; multiplying those configs against the full
         # quant x layout x activation grid added no GEMM coverage beyond the
         # DSv3 and nemotron_3_super representatives kept here. See
-        # docs/moe_routing_test_decomposition.md.
+        # docs/design_docs/moe_routing_test_decomposition.md.
         pytest.param(
             {
                 "num_experts": 256,

@@ -3448,7 +3448,7 @@ RENORMALIZE_ROUTING_CONFIGS = [
     # tests/moe/test_trtllm_gen_routing.py against the same host oracles, and
     # their from-logits launcher plumbing keeps smoke coverage via
     # test_trtllm_gen_fused_moe.py::test_routing_dtype_flexibility. See
-    # docs/moe_routing_test_decomposition.md.
+    # docs/design_docs/moe_routing_test_decomposition.md.
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [
