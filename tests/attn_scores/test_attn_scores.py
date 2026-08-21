@@ -1264,6 +1264,190 @@ def test_max_context_len_bound(monkeypatch):
         fp8_paged_mqa_logits(q8b, kv8, wb, ragged, bt2, max_ml)
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_schedule_meta_graph_replay_across_split_boundary(variant):
+    """A captured graph must recompute schedule_meta when lengths cross 256.
+
+    The schedule is a function of the whole ceil(context_lens/256) vector, so a
+    sequence moving 256 <-> 257 changes it while every shape stays identical.
+    Capture the recomputation into the same static buffer ahead of the kernel,
+    then replay in both directions and compare against a freshly scheduled
+    reference. Regression for PR #4365 review r3824580059.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_context_len,
+    )
+
+    device = "cuda"
+    torch.manual_seed(11)
+    B, next_n, H, D, block_size = 2, 1, 64, 128, 64
+    max_ml = 1024
+
+    # static buffers: addresses fixed for the lifetime of the graph
+    context_lens = torch.full((B,), 256, dtype=torch.int32, device=device)
+    sched = compute_paged_mqa_logits_schedule(context_lens, device=device)
+    block_table, ntb = _make_paged_kv(
+        B,
+        block_size,
+        torch.full((B,), max_ml, dtype=torch.int32, device=device),
+        device,
+    )
+    out = torch.empty(
+        (B * next_n, padded_context_len(max_ml)),
+        device=device,
+        dtype=torch.float32 if variant == "fp8" else torch.bfloat16,
+    )
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(ntb, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv = _make_fused_kv_fp8(
+            (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+        )
+
+        def launch():
+            compute_paged_mqa_logits_schedule(context_lens, device=device, out=sched)
+            return fp8_paged_mqa_logits(
+                q,
+                kv,
+                w,
+                context_lens,
+                block_table,
+                max_ml,
+                schedule_meta=sched,
+                out=out,
+            )
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        sf_q = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+
+        def launch():
+            compute_paged_mqa_logits_schedule(context_lens, device=device, out=sched)
+            return fp4_paged_mqa_logits(
+                q,
+                sf_q,
+                kv,
+                w,
+                context_lens,
+                block_table,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=sched,
+                out=out,
+            )
+
+    # capture with the schedule recomputation INSIDE the graph
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        for _ in range(3):
+            launch()
+    torch.cuda.current_stream().wait_stream(st)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        launch()
+    torch.cuda.synchronize()
+
+    # 256 -> 257 (grow across the boundary) and 257 -> 256 (shrink back)
+    for new_len in (257, 256, 257, 256):
+        context_lens.fill_(new_len)
+        g.replay()
+        torch.cuda.synchronize()
+        replayed = out[:, :new_len].clone()
+
+        ref_sched = compute_paged_mqa_logits_schedule(context_lens, device=device)
+        ref_out = torch.empty_like(out)
+        if variant == "fp8":
+            fp8_paged_mqa_logits(
+                q,
+                kv,
+                w,
+                context_lens,
+                block_table,
+                max_ml,
+                schedule_meta=ref_sched,
+                out=ref_out,
+            )
+        else:
+            fp4_paged_mqa_logits(
+                q,
+                sf_q,
+                kv,
+                w,
+                context_lens,
+                block_table,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=ref_sched,
+                out=ref_out,
+            )
+        torch.cuda.synchronize()
+        assert torch.equal(replayed, ref_out[:, :new_len]), (
+            f"{variant}: replay at ctx={new_len} disagrees with a fresh schedule"
+        )
+
+
+def test_stale_schedule_meta_detected(monkeypatch):
+    """A stale schedule_meta is reported instead of hanging the kernel.
+
+    Reusing a schedule built for a different ceil(context_lens/256) vector makes
+    the persistent kernel's exact-equality termination unreachable. Under
+    FLASHINFER_VALIDATE_INPUTS the mismatch is caught before launch. Regression
+    for PR #4365 review r3824550881.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, H, D, block_size, max_ml = 1, 64, 128, 64, 1024
+    width = -(-max_ml // 128) * (128 // block_size)
+    block_table = torch.zeros((B, width), dtype=torch.int32, device=device)
+    ntb = B * width
+    q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+
+    cl_257 = torch.full((B,), 257, dtype=torch.int32, device=device)
+    cl_256 = torch.full((B,), 256, dtype=torch.int32, device=device)
+    stale = compute_paged_mqa_logits_schedule(cl_257, device=device)
+    assert not torch.equal(
+        stale, compute_paged_mqa_logits_schedule(cl_256, device=device)
+    ), "test premise: 256 and 257 must schedule differently"
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    with pytest.raises(ValueError, match="schedule_meta does not match context_lens"):
+        fp8_paged_mqa_logits(q, kv, w, cl_256, block_table, max_ml, schedule_meta=stale)
+
+    # the matching schedule is accepted
+    fp8_paged_mqa_logits(
+        q,
+        kv,
+        w,
+        cl_256,
+        block_table,
+        max_ml,
+        schedule_meta=compute_paged_mqa_logits_schedule(cl_256, device=device),
+    )
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
