@@ -135,10 +135,17 @@ def _fp8_paged_mqa_logits_reference(
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
             qk = torch.relu(qk).to(output_dtype)
             weighted = (w.T[:, :, None] * qk).sum(dim=0) * sc[None, :]
-            s, e = blk * block_size, blk * block_size + block_size
+            # max_context_len is a free axis and need not be page-aligned, so
+            # the last physical page can extend past the output width. Clip
+            # both the destination and the right-hand side to it.
+            s = blk * block_size
+            e = min(s + block_size, max_context_len)
+            if s >= max_context_len:
+                break
+            width = e - s
             logits[b * next_n : (b + 1) * next_n, s:e] = torch.where(
-                mask,
-                weighted,
+                mask[:, :width],
+                weighted[:, :width],
                 torch.tensor(float("-inf"), device=device, dtype=output_dtype),
             )
     return logits
@@ -478,8 +485,11 @@ def _fp4_paged_mqa_logits_reference(
         s = torch.where(mask[None, :, :], s, float("-inf"))
         s = torch.relu(s) * w[..., None]
         s = s.sum(dim=0)
-        logits[b * next_n : (b + 1) * next_n, :total_len] = torch.where(
-            kpos[None, :] <= q_pos[:, None], s, float("-inf")
+        # max_context_len is a free axis and need not be page-aligned, so
+        # total_len (a whole number of pages) can exceed the output width.
+        end = min(total_len, max_context_len)
+        logits[b * next_n : (b + 1) * next_n, :end] = torch.where(
+            (kpos[None, :] <= q_pos[:, None])[:, :end], s[:, :end], float("-inf")
         )
     return logits.to(output_dtype)
 
