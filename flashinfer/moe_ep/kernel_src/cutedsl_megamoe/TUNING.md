@@ -319,6 +319,8 @@ misses) — both are the right behavior as long as internal drops carry the
   BF16 has ONE profile: `dtype="bf16"` returns the single validated fixed
   MMA/cluster geometry regardless of token count (candidate validity via
   `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.
+  Mixed BF16×MXFP8 has ONE default profile (`dtype="bf16_mxfp8"`); additional
+  implementation tuples are gated by `is_valid_bf16_mxfp8`.
 - Backend configs (`Nvfp4/Mxfp8/Bf16 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
@@ -643,9 +645,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    # CuTe-DSL upgrades can leave a stale package path; reinstall it cleanly.
-    python -m pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
-    python -m pip install "nvidia-cutlass-dsl[cu13]>=4.6.0"
+    python -m pip install "nvidia-cutlass-dsl[cu13]"
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
