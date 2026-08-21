@@ -128,6 +128,15 @@ class MegaMoEBf16Mxfp8Frontend:
         self._mega = None
         self._mega_key = None
 
+    def apply_knobs(self, knobs: dict) -> None:
+        """Apply mixed MegaMoE tuning knobs and invalidate the compiled kernel."""
+        from .tuner import with_knobs
+
+        new_config = with_knobs(self._config, knobs)
+        if new_config != self._config:
+            self.release()
+            self._config = new_config
+
     @staticmethod
     def _to_cute(tensor: torch.Tensor, *, static_layout: bool = False):
         import cutlass.torch as cutlass_torch

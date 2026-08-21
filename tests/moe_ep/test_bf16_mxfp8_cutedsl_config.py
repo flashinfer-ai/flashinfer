@@ -77,6 +77,31 @@ def test_mixed_config_inherits_bf16_options():
     assert config.in_kernel_fc2_reduce
 
 
+def test_mixed_autotune_candidate_matches_default_config():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import bf16_mxfp8_candidates
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16_mxfp8 import (
+        MegaMoEBf16Mxfp8Frontend,
+    )
+
+    config = _config()
+    frontend = MegaMoEBf16Mxfp8Frontend(config)
+    assert bf16_mxfp8_candidates() == [
+        {
+            "mma_tiler_mnk": (256, 128, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": False,
+            "transform_k_tile": 128,
+            "cluster_shape_mnk": (2, 1, 1),
+            "flag_batch": 1,
+            "epi_flag_batch": (1, 1),
+            "token_back_mode": "epi_warps",
+            "load_balance_mode": "static",
+        }
+    ]
+    frontend.apply_knobs(bf16_mxfp8_candidates()[0])
+    assert frontend.config == config
+
+
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("kind", "weight_dtype"),
@@ -109,6 +134,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
+        autotune_bf16_mxfp8_mega_moe,
         compute_megamoe_reference_bf16_mxfp8,
         get_symm_buffer_for_bf16_mxfp8_mega_moe,
         bf16_mxfp8_mega_moe,
@@ -166,6 +192,15 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
             symm_buffer.x,
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
+        )
+        autotune_bf16_mxfp8_mega_moe(
+            torch.empty_like(hidden_states),
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            warmup_iters=0,
+            timed_iters=1,
         )
         combine_ref = compute_megamoe_reference_bf16_mxfp8(
             input_activation=symm_buffer.x[:num_tokens].unsqueeze(0),
