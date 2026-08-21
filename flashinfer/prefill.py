@@ -58,6 +58,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_head_dim,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1342,6 +1343,18 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
+    # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
+    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO. Gate on the packed
+    # (uint8) storage, not just kv_cache_sf, so a stray scale-factor tensor on a
+    # non-uint8 cache cannot silently double the output width.
+    out_head_dim = (
+        v.shape[-1] * 2
+        if kv_cache_sf is not None and v.dtype == torch.uint8
+        else v.shape[-1]
+    )
+    _check_head_dim(q.shape[-1], out_head_dim)
+
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1382,17 +1395,6 @@ def single_prefill_with_kv_cache(
             scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
-
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
-    # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
-    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO. Gate on the packed
-    # (uint8) storage, not just kv_cache_sf, so a stray scale-factor tensor on a
-    # non-uint8 cache cannot silently double the output width.
-    out_head_dim = (
-        v.shape[-1] * 2
-        if kv_cache_sf is not None and v.dtype == torch.uint8
-        else v.shape[-1]
-    )
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -2015,6 +2017,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -2067,6 +2070,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
@@ -2293,6 +2298,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -3602,6 +3608,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
         if logits_soft_cap is None:
