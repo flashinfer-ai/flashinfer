@@ -187,7 +187,8 @@ def _cuda_flags(
     stage_k: int,
     knobs: _ExperimentKnobs,
 ) -> tuple[str, ...]:
-    return tuple(sm90a_nvcc_flags) + (
+    return (
+        *sm90a_nvcc_flags,
         "--ftz=false",
         "--prec-div=true",
         "--prec-sqrt=true",

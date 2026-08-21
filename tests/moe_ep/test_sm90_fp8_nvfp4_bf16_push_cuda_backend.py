@@ -328,12 +328,17 @@ def _cosine(output: torch.Tensor, reference: torch.Tensor) -> float:
 
 def _assert_close(mode: str, output: torch.Tensor, reference: torch.Tensor) -> None:
     assert torch.isfinite(output.float()).all()
+    normalized_l2 = _normalized_l2(output, reference)
+    cosine = _cosine(output, reference)
     if mode == "w4a8":
-        assert _normalized_l2(output, reference) <= 0.35
-        assert _cosine(output, reference) >= 0.95
+        # This end-to-end gate includes routing, two quantized GEMMs, activation
+        # quantization, and combine. Direct W4A8 tests enforce tighter byte and
+        # numerical oracles for the individual GEMM path.
+        assert normalized_l2 <= 0.35, f"W4A8 normalized L2={normalized_l2:.6f}"
+        assert cosine >= 0.95, f"W4A8 cosine={cosine:.6f}"
     else:
-        assert _normalized_l2(output, reference) <= 0.12
-        assert _cosine(output, reference) >= 0.99
+        assert normalized_l2 <= 0.12
+        assert cosine >= 0.99
 
 
 @requires_sm90

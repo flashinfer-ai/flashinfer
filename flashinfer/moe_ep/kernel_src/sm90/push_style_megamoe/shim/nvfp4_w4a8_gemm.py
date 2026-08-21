@@ -312,18 +312,16 @@ def _cuda_flags(knobs: _OptimizationKnobs | None = None) -> tuple[str, ...]:
     if knobs is None:
         knobs = _optimization_knobs()
     return (
-        tuple(sm90a_nvcc_flags)
-        + (
-            "--ftz=false",
-            "--prec-div=true",
-            "--prec-sqrt=true",
-            f"-DSM90_W4A8_GEMM_VERSION={KERNEL_VERSION}",
-        )
-        + tuple(
+        *sm90a_nvcc_flags,
+        "--ftz=false",
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        f"-DSM90_W4A8_GEMM_VERSION={KERNEL_VERSION}",
+        *(
             f"-D{macro}={getattr(knobs, name)}"
             for name, _tag, macro, _default in _KNOB_SPECS
-        )
-        + (f"-DW4A8_PAYLOAD_V4={int(knobs.payload_layout == 4)}",)
+        ),
+        f"-DW4A8_PAYLOAD_V4={int(knobs.payload_layout == 4)}",
     )
 
 

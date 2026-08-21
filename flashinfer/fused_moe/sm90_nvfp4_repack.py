@@ -1447,16 +1447,31 @@ def build_w4a8_v4_views(
     else:
         view.validate_layout()
     experts, padded_n, padded_k = view.manifest.padded_shape
-    k_stages = padded_k // 128
-    n_tiles = padded_n // 64
+    k_stages = padded_k // NVFP4_SM90_K_ALIGNMENT
+    n_tiles = padded_n // NVFP4_SM90_TILE_N
+    k_tiles_per_stage = NVFP4_SM90_K_ALIGNMENT // NVFP4_SM90_TILE_K
     payload = (
-        view.packed_e2m1.view(experts, k_stages, 4, n_tiles, 64, 16)
+        view.packed_e2m1.view(
+            experts,
+            k_stages,
+            k_tiles_per_stage,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            NVFP4_SM90_TILE_K // 2,
+        )
         .permute(0, 1, 3, 4, 2, 5)
         .contiguous()
         .view(experts, k_stages, padded_n, NVFP4_SM90_STAGE_PACKED_BYTES)
     )
     residual = (
-        view.promotion_residual.view(experts, k_stages, 4, n_tiles, 64, 2)
+        view.promotion_residual.view(
+            experts,
+            k_stages,
+            k_tiles_per_stage,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            NVFP4_SM90_TILE_K // 16,
+        )
         .permute(0, 1, 3, 4, 2, 5)
         .contiguous()
         .view(experts, k_stages, padded_n, NVFP4_SM90_STAGE_RESIDUAL_ELEMENTS)
@@ -1497,19 +1512,46 @@ def _build_w4a8_v3_legacy_oracle(
     else:
         view.validate_layout()
     experts, padded_n, padded_k = view.manifest.padded_shape
-    k_stages = padded_k // 128
-    n_tiles = padded_n // 64
+    k_stages = padded_k // NVFP4_SM90_K_ALIGNMENT
+    n_tiles = padded_n // NVFP4_SM90_TILE_N
+    k_tiles_per_stage = NVFP4_SM90_K_ALIGNMENT // NVFP4_SM90_TILE_K
     payload = (
-        view.packed_e2m1.view(experts, k_stages, n_tiles, 64, 4, 16)
+        view.packed_e2m1.view(
+            experts,
+            k_stages,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            k_tiles_per_stage,
+            NVFP4_SM90_TILE_K // 2,
+        )
         .permute(0, 1, 4, 2, 3, 5)
         .contiguous()
-        .view(experts, padded_k // 32, n_tiles, 64, 16)
+        .view(
+            experts,
+            padded_k // NVFP4_SM90_TILE_K,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            NVFP4_SM90_TILE_K // 2,
+        )
     )
     residual = (
-        view.promotion_residual.view(experts, k_stages, n_tiles, 64, 4, 2)
+        view.promotion_residual.view(
+            experts,
+            k_stages,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            k_tiles_per_stage,
+            NVFP4_SM90_TILE_K // 16,
+        )
         .permute(0, 1, 4, 2, 3, 5)
         .contiguous()
-        .view(experts, padded_k // 32, n_tiles, 64, 2)
+        .view(
+            experts,
+            padded_k // NVFP4_SM90_TILE_K,
+            n_tiles,
+            NVFP4_SM90_TILE_N,
+            NVFP4_SM90_TILE_K // 16,
+        )
     )
     manifest = view.manifest.source_manifest
     checksums = _v3_checksums(

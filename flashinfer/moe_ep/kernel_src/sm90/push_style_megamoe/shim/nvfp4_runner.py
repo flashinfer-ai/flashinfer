@@ -137,7 +137,7 @@ class _W4A8LayerRunner:
 
 
 class _W4A8PairEngine(Protocol):
-    I: int
+    I: int  # noqa: E741 - matches the engine intermediate-size attribute
     execution_identity: tuple[object, ...]
 
     def validate_weights(self, weights: object) -> None: ...

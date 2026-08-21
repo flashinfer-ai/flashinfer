@@ -236,7 +236,7 @@ def test_sm90_w4a8_optimization_flags_are_content_addressed():
         assert w4a8_gemm._source_digest(knobs=variant) != baseline_digest
         assert w4a8_gemm._optimization_knobs(**overrides) == variant
 
-    with pytest.raises(ValueError, match="generic_decode_lut.*decode_vector"):
+    with pytest.raises(ValueError, match=r"generic_decode_lut.*decode_vector"):
         w4a8_gemm._optimization_knobs(
             decode_vector=False,
             generic_decode_lut=True,

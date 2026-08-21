@@ -35,6 +35,17 @@ requires_sm90 = pytest.mark.skipif(
     reason="requires SM90 and CUDA Toolkit 12.0+",
 )
 
+_RS_EXPERIMENT_ENVIRONMENT = (
+    "FLASHINFER_SM90_PUSH_NVFP4_RS_WGMMA_GROUP",
+    "FLASHINFER_SM90_PUSH_NVFP4_RS_STATIC_SCHED",
+    "FLASHINFER_SM90_PUSH_NVFP4_RS_NO_UNION",
+)
+
+
+def _clear_rs_experiment_environment(monkeypatch) -> None:
+    for name in _RS_EXPERIMENT_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+
 
 def _grouped_reference(
     activation: torch.Tensor,
@@ -71,11 +82,12 @@ def _dequantize_nvfp4_streams(
     return reference_dequantize_nvfp4(checkpoint)
 
 
-def test_sm90_nvfp4_rs_uri_is_explicit():
+def test_sm90_nvfp4_rs_uri_is_explicit(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
         get_sm90_push_nvfp4_rs_gemm_uri,
     )
 
+    _clear_rs_experiment_environment(monkeypatch)
     uri = get_sm90_push_nvfp4_rs_gemm_uri("rs_wgmma", 64, 3, 64)
     assert uri.startswith("sm90_push_nvfp4_rs_gemm_v5_")
     assert "_rs_wgmma_n64_s3_k64_" in uri
@@ -269,6 +281,7 @@ def test_sm90_nvfp4_rs_loaded_module_cache_tracks_source_digest(monkeypatch, tmp
         nvfp4_rs_gemm as rs_gemm,
     )
 
+    _clear_rs_experiment_environment(monkeypatch)
     source_directory = tmp_path / "csrc" / "fused_moe" / "sm90_nvfp4_rs_gemm"
     source_directory.mkdir(parents=True)
     kernel = source_directory / "kernel.cuh"
@@ -321,6 +334,7 @@ def test_sm90_nvfp4_rs_boolean_build_knobs_are_strict(monkeypatch, name):
         get_sm90_push_nvfp4_rs_gemm_uri,
     )
 
+    _clear_rs_experiment_environment(monkeypatch)
     monkeypatch.setenv(name, "true")
     with pytest.raises(ValueError, match=f"{name} must be 0 or 1"):
         get_sm90_push_nvfp4_rs_gemm_uri()
@@ -331,12 +345,7 @@ def test_sm90_nvfp4_rs_environment_uses_final_names_only(monkeypatch):
         get_sm90_push_nvfp4_rs_gemm_uri,
     )
 
-    for name in (
-        "FLASHINFER_SM90_PUSH_NVFP4_RS_WGMMA_GROUP",
-        "FLASHINFER_SM90_PUSH_NVFP4_RS_STATIC_SCHED",
-        "FLASHINFER_SM90_PUSH_NVFP4_RS_NO_UNION",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    _clear_rs_experiment_environment(monkeypatch)
     baseline = get_sm90_push_nvfp4_rs_gemm_uri()
     monkeypatch.setenv("FI_RS_WGMMA_GROUP", "4")
     monkeypatch.setenv("FI_RS_STATIC_SCHED", "1")

@@ -518,11 +518,11 @@ def test_sm90_push_nvfp4_gemm_requires_cuda_12_0(module_name, tmp_path, monkeypa
     module = getattr(shim, module_name)
     monkeypatch.setattr(module, "is_cuda_version_at_least", lambda _version: False)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
-    generator = (
-        module.gen_sm90_push_nvfp4_w4a8_gemm_module
-        if module_name == "nvfp4_w4a8_gemm"
-        else module.gen_sm90_push_nvfp4_rs_gemm_module
-    )
+
+    def generator():
+        if module_name == "nvfp4_w4a8_gemm":
+            return module.gen_sm90_push_nvfp4_w4a8_gemm_module()
+        return module.gen_sm90_push_nvfp4_rs_gemm_module(use_environment=False)
 
     with pytest.raises(RuntimeError, match=r"requires CUDA 12\.0"):
         generator()
@@ -554,12 +554,20 @@ def test_sm90_push_nvfp4_uri_covers_sources_dependencies_and_cuda_flags(
     module = getattr(shim, module_name)
     snapshot = module._capture_source_snapshot()
     if module_name == "nvfp4_w4a8_gemm":
-        digest = lambda value: module._source_digest(value)
+
+        def w4a8_digest(value):
+            return module._source_digest(value)
+
+        digest = w4a8_digest
         original_flags = module._cuda_flags()
     else:
-        knobs = module._experiment_knobs()
+        knobs = module._experiment_knobs(use_environment=False)
         arguments = ("rs_wgmma", 64, 3, 64, knobs)
-        digest = lambda value: module._source_digest(*arguments, snapshot=value)
+
+        def rs_digest(value):
+            return module._source_digest(*arguments, snapshot=value)
+
+        digest = rs_digest
         original_flags = module._cuda_flags(*arguments)
 
     source_digest = digest(snapshot)
@@ -569,7 +577,7 @@ def test_sm90_push_nvfp4_uri_covers_sources_dependencies_and_cuda_flags(
     monkeypatch.setattr(
         module,
         "_cuda_flags",
-        lambda *_args: original_flags + ("-lineinfo",),
+        lambda *_args: (*original_flags, "-lineinfo"),
     )
     assert digest(snapshot) != source_digest
 
