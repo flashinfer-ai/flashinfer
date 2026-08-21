@@ -1089,58 +1089,7 @@ def get_native_fp4_dtype():
         return torch.uint8
 
 
-class _ConditionalComputeCapabilities:
-    """Set-like view of compute capabilities where some entries are decided lazily.
-
-    Needed because a capability can depend on state that is not knowable at
-    import time -- e.g. a cute-dsl backend supports sm_107 only when the
-    installed CuTe DSL can target it, and probing that imports ``cutlass``,
-    which must not become a hard dependency of ``import flashinfer``.
-
-    Predicates are evaluated on every membership test (they are cheap and the
-    underlying answer can change between processes). A predicate that raises is
-    treated as "not supported": advertising a capability we could not verify is
-    what leads to a crash deep inside kernel compilation.
-    """
-
-    def __init__(self, static_ccs, conditional_ccs):
-        self._static = frozenset(static_ccs)
-        self._conditional = dict(conditional_ccs)
-
-    def _resolved(self):
-        active = set(self._static)
-        for cc, predicate in self._conditional.items():
-            try:
-                if predicate():
-                    active.add(cc)
-            except Exception:
-                pass
-        return active
-
-    def __contains__(self, cc):
-        return cc in self._resolved()
-
-    def __iter__(self):
-        return iter(sorted(self._resolved()))
-
-    def __len__(self):
-        return len(self._resolved())
-
-    def __eq__(self, other):
-        if isinstance(other, (set, frozenset)):
-            return self._resolved() == set(other)
-        if isinstance(other, _ConditionalComputeCapabilities):
-            return self._resolved() == other._resolved()
-        return NotImplemented
-
-    def __repr__(self):
-        return f"{sorted(self._resolved())!r} (conditional: {sorted(self._conditional)})"
-
-
-def supported_compute_capability(
-    supported_ccs: Iterable[int],
-    conditional_ccs: Optional[Dict[int, Callable[[], bool]]] = None,
-) -> Callable:
+def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
     """
     Decorator to mark functions with their supported CUDA compute capabilities.
 
@@ -1211,26 +1160,8 @@ def supported_compute_capability(
             )
         validated_ccs.append(cc)
 
-    validated_conditional = {}
-    for cc, predicate in (conditional_ccs or {}).items():
-        if isinstance(cc, bool) or not isinstance(cc, int):
-            raise TypeError(
-                f"conditional_ccs keys must be integers, got {type(cc).__name__}: {cc}"
-            )
-        if not callable(predicate):
-            raise TypeError(
-                f"conditional_ccs[{cc}] must be callable, got {type(predicate).__name__}"
-            )
-        validated_conditional[cc] = predicate
-
     def decorator(func):
-        # Stay a plain set when nothing is conditional, so the common case keeps
-        # exact set semantics for callers that compare or iterate it.
-        func._supported_ccs = (
-            set(validated_ccs)
-            if not validated_conditional
-            else _ConditionalComputeCapabilities(validated_ccs, validated_conditional)
-        )
+        func._supported_ccs = set(validated_ccs)
 
         def is_cc_supported(cc):
             return cc in func._supported_ccs

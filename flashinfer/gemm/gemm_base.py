@@ -127,27 +127,6 @@ except ImportError:
     pass
 
 
-def _cute_dsl_targets_sm107() -> bool:
-    """Whether the installed CuTe DSL can generate code for sm_107 (Rubin).
-
-    True when the DSL knows ``sm_107a`` natively (4.8+), or when the user
-    exported ``CUTE_DSL_ARCH=sm_100f`` before the process started so the DSL
-    targets the family-conditional arch instead. See
-    :func:`flashinfer.cute_dsl.utils.is_cute_dsl_arch_supported`.
-
-    Deliberately returns False when it cannot tell: advertising sm_107 for a
-    DSL that cannot target it is what produces `KeyError: 'sm_107a'` from
-    inside cute.compile, with no flashinfer frame in the traceback.
-    """
-    try:
-        from ..cute_dsl.utils import is_cute_dsl_arch_supported
-
-        return is_cute_dsl_arch_supported(10, 7)
-    except Exception:
-        return False
-
-
-
 from ..jit.cubin_loader import setup_cubin_loader
 from ..utils import (
     _get_cache_buf,
@@ -5037,9 +5016,7 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability(
-    [100, 103], conditional_ccs={107: _cute_dsl_targets_sm107}
-)
+@supported_compute_capability([100, 103, 107])
 def _cute_dsl_gemm_mxfp8_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -5057,6 +5034,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
             "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
         )
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -5169,6 +5147,39 @@ def _get_sm100_block_scaled_tactics(
 
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _check_cute_dsl_arch(device: torch.device) -> None:
+    """Reject the CuTe-DSL backend when the installed DSL cannot emit for ``device``.
+
+    This is an *availability* check, not a capability one. The kernels exist for
+    sm_107, so ``@supported_compute_capability`` rightly keeps listing it and
+    ``is_backend_supported("cute-dsl", 107)`` still answers True. What varies is
+    whether the installed DSL can generate code for that arch: true on 4.8+, or
+    on an older DSL when the user exported ``CUTE_DSL_ARCH=sm_100f`` before the
+    process started. Same axis as ``CUDNN_AVAILABLE`` and
+    ``_is_cudnn_override_shape_available``.
+
+    Raises ``ValueError`` rather than returning False on purpose:
+    ``suitable_auto_backends`` catches ValueError to mean "backend not suitable"
+    and keeps searching, while on the explicit-backend path it propagates this
+    message. Returning False there would surface as the misleading
+    "Problem size is not supported".
+    """
+    try:
+        from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+        major, minor = torch.cuda.get_device_capability(device)
+        supported = is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the probe itself deselect an otherwise working backend.
+        return
+    if not supported:
+        raise ValueError(
+            f"the installed CuTe DSL cannot target sm_{major}{minor}; install "
+            f"CuTe DSL 4.8+, or export CUTE_DSL_ARCH=sm_{major}0f before starting "
+            f"the process to build family-portable kernels"
+        )
 
 
 def _check_cute_dsl_availability():
@@ -6170,9 +6181,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability(
-    [100, 103], conditional_ccs={107: _cute_dsl_targets_sm107}
-)
+@supported_compute_capability([100, 103, 107])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,
@@ -6199,6 +6208,7 @@ def _cute_dsl_gemm_fp4_requirement(
             return False
         raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -7276,7 +7286,7 @@ def _cutlass_bmm_fp8_requirement(
 # cute-dsl bmm_fp8 is Rubin (sm107) only; the heuristic below never offers it
 # on sm100/sm103, so advertising those here would let an explicit
 # backend="cute-dsl" through to an empty runner list and an assert.
-@supported_compute_capability([], conditional_ccs={107: _cute_dsl_targets_sm107})
+@supported_compute_capability([107])
 def _cute_dsl_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -7291,6 +7301,7 @@ def _cute_dsl_bmm_fp8_requirement(
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
         )
+    _check_cute_dsl_arch(A.device)
 
     # Check dimensions are 3D (batch, m, k) and (batch, k, n)
     if A.dim() != 3 or B.dim() != 3:
