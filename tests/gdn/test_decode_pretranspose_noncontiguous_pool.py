@@ -159,11 +159,22 @@ def test_decode_pretranspose_pool_reuses_compile_across_outer_layouts(
     pool_compile_calls = 0
     original_compile = pretranspose_module.cute.compile
 
-    def counted_compile(*args, **kwargs):
-        nonlocal pool_compile_calls
-        if kwargs.get("use_pool_indexing", False):
-            pool_compile_calls += 1
-        return original_compile(*args, **kwargs)
+    class CountedCompile:
+        """Stand-in for ``cute.compile``, which is used in its subscripted form."""
+
+        def __init__(self, compile_fn):
+            self._compile_fn = compile_fn
+
+        def __getitem__(self, options):
+            return CountedCompile(original_compile[options])
+
+        def __call__(self, *args, **kwargs):
+            nonlocal pool_compile_calls
+            if kwargs.get("use_pool_indexing", False):
+                pool_compile_calls += 1
+            return self._compile_fn(*args, **kwargs)
+
+    counted_compile = CountedCompile(original_compile)
 
     pretranspose_module._get_compiled_decode_kernel.cache_clear()
     monkeypatch.setattr(pretranspose_module.cute, "compile", counted_compile)
@@ -225,6 +236,7 @@ def test_decode_pretranspose_pool_cache_keeps_inner_strides_static() -> None:
     """Layouts with different inner strides must keep separate cache entries."""
     pretranspose_module = _load_pretranspose_module()
     common = dict(
+        target_key=(0, "sm_90a"),
         T=1,
         H=16,
         HV=32,
