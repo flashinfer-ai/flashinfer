@@ -77,6 +77,73 @@ def test_mixed_config_inherits_bf16_options():
     assert config.in_kernel_fc2_reduce
 
 
+def test_mixed_knobs_only_expose_valid_implementation_tuples():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+        bf16_mxfp8_candidates,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+        default_knobs,
+        is_valid_bf16_mxfp8,
+    )
+
+    knobs = default_knobs(256, dtype="bf16_mxfp8")
+    assert is_valid_bf16_mxfp8(knobs)
+    assert is_valid_bf16_mxfp8(
+        {
+            **knobs,
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "smem",
+            "accumulator_overlap": False,
+            "transform_k_tile": 128,
+        }
+    )
+    assert not is_valid_bf16_mxfp8({**knobs, "mma_tiler_mnk": (256, 256, 128)})
+    assert not is_valid_bf16_mxfp8({**knobs, "token_back_mode": "standalone_warps"})
+    assert not is_valid_bf16_mxfp8({**knobs, "clc_bundle_size": 1})
+    assert bf16_mxfp8_candidates() == [knobs]
+
+
+def test_mixed_factory_accepts_pinned_default_knobs(monkeypatch):
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import default_knobs
+
+    def fake_zeros(shape, dtype):
+        tensor = torch.zeros(shape, dtype=dtype)
+        tensor._mega_plain_alloc = True
+        return tensor
+
+    monkeypatch.setattr(bf16_mxfp8, "sym_zeros", fake_zeros)
+    knobs = default_knobs(8, dtype="bf16_mxfp8")
+    knobs["token_back_mode"] = "reuse_dispatch_warps"
+    knobs["in_kernel_fc2_reduce"] = True
+    buf = bf16_mxfp8.get_symm_buffer_for_bf16_mxfp8_mega_moe(
+        4,
+        8,
+        2,
+        128,
+        128,
+        0,
+        1,
+        token_back_mode="epi_warps",
+        knobs=knobs,
+    )
+    try:
+        assert buf._frontend.config.token_back_mode == "reuse_dispatch_warps"
+        assert buf._frontend.config.in_kernel_fc2_reduce is False
+    finally:
+        buf.destroy()
+
+
+def test_mixed_frontend_rejects_unsupported_knobs():
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16_mxfp8 import (
+        MegaMoEBf16Mxfp8Frontend,
+    )
+
+    frontend = MegaMoEBf16Mxfp8Frontend(_config())
+    with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
+        frontend.apply_knobs({"mma_tiler_mnk": (256, 256, 128)})
+
+
 def test_mixed_autotune_candidate_matches_default_config():
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import bf16_mxfp8_candidates
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16_mxfp8 import (
