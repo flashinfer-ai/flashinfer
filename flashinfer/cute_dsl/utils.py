@@ -100,9 +100,13 @@ def is_cute_dsl_arch_supported(
     When the device's own architecture is missing but the DSL has the
     family-conditional target for its major line (e.g. ``sm_100f`` for an
     sm_107 device), kernels restricted to family-portable features still
-    compile and run correctly; this probe then pins the DSL's default target
-    via the ``CUTE_DSL_ARCH`` environment variable and reports the arch
-    supported. Pass ``native_only=True`` for kernels that require
+    compile and run correctly. This probe does **not** arrange that: it only
+    *observes* whether the DSL is already targeting the family arch, and
+    reports the arch supported when it is. Retargeting the DSL is the
+    caller's responsibility and must happen before ``cutlass`` is first
+    imported -- normally by exporting ``CUTE_DSL_ARCH=sm_100f`` in the
+    environment, since setting it later does not retarget an already
+    imported DSL. Pass ``native_only=True`` for kernels that require
     architecture-specific instructions (e.g. block-scaled ``tcgen05.mma``
     kinds, which the DSL only accepts for ``sm_100a``/``sm_103a`` targets).
     """
