@@ -1082,6 +1082,22 @@ class FP8MQALogitsKernel:
                         next_num_kv = (
                             mContextLens[next_q_idx] + block_kv_val - 1
                         ) // block_kv_val
+                    # Zero-length rows get no scheduled work, but the exact-
+                    # coordinate termination below would still step onto them and
+                    # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                    # stopping at this CTA's end boundary so that boundary stays
+                    # reachable -- overshooting it would make the loop unable to
+                    # terminate. Every warp role runs this identical traversal.
+                    while (
+                        (next_num_kv == 0)
+                        & (next_q_idx < batch_size)
+                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                    ):
+                        next_q_idx = next_q_idx + 1
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1153,6 +1169,22 @@ class FP8MQALogitsKernel:
                         next_num_kv = (
                             mContextLens[next_q_idx] + block_kv_val - 1
                         ) // block_kv_val
+                    # Zero-length rows get no scheduled work, but the exact-
+                    # coordinate termination below would still step onto them and
+                    # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                    # stopping at this CTA's end boundary so that boundary stays
+                    # reachable -- overshooting it would make the loop unable to
+                    # terminate. Every warp role runs this identical traversal.
+                    while (
+                        (next_num_kv == 0)
+                        & (next_q_idx < batch_size)
+                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                    ):
+                        next_q_idx = next_q_idx + 1
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1226,6 +1258,22 @@ class FP8MQALogitsKernel:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
                             ) // block_kv_val
+                        # Zero-length rows get no scheduled work, but the exact-
+                        # coordinate termination below would still step onto them and
+                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                        # stopping at this CTA's end boundary so that boundary stays
+                        # reachable -- overshooting it would make the loop unable to
+                        # terminate. Every warp role runs this identical traversal.
+                        while (
+                            (next_num_kv == 0)
+                            & (next_q_idx < batch_size)
+                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                        ):
+                            next_q_idx = next_q_idx + 1
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1296,6 +1344,22 @@ class FP8MQALogitsKernel:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
                             ) // block_kv_val
+                        # Zero-length rows get no scheduled work, but the exact-
+                        # coordinate termination below would still step onto them and
+                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                        # stopping at this CTA's end boundary so that boundary stays
+                        # reachable -- overshooting it would make the loop unable to
+                        # terminate. Every warp role runs this identical traversal.
+                        while (
+                            (next_num_kv == 0)
+                            & (next_q_idx < batch_size)
+                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                        ):
+                            next_q_idx = next_q_idx + 1
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1574,6 +1638,22 @@ class FP8MQALogitsKernel:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
                             ) // block_kv_val
+                        # Zero-length rows get no scheduled work, but the exact-
+                        # coordinate termination below would still step onto them and
+                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                        # stopping at this CTA's end boundary so that boundary stays
+                        # reachable -- overshooting it would make the loop unable to
+                        # terminate. Every warp role runs this identical traversal.
+                        while (
+                            (next_num_kv == 0)
+                            & (next_q_idx < batch_size)
+                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                        ):
+                            next_q_idx = next_q_idx + 1
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1820,6 +1900,22 @@ class FP8MQALogitsKernel:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
                             ) // block_kv_val
+                        # Zero-length rows get no scheduled work, but the exact-
+                        # coordinate termination below would still step onto them and
+                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
+                        # stopping at this CTA's end boundary so that boundary stays
+                        # reachable -- overshooting it would make the loop unable to
+                        # terminate. Every warp role runs this identical traversal.
+                        while (
+                            (next_num_kv == 0)
+                            & (next_q_idx < batch_size)
+                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                        ):
+                            next_q_idx = next_q_idx + 1
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 

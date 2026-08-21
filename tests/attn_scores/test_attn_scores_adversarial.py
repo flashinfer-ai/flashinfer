@@ -496,3 +496,81 @@ def test_adv_new_guards_raise():
         fp4_paged_mqa_logits(
             q_fp4, sf_q[..., :-1].contiguous(), kv_fused4, w, cl, bt, max_ml
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I) Zero-length rows mixed with active ones (task-iterator zero-work path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_adv_zero_length_row_not_executed(variant):
+    """A zero-length row must not be executed at all.
+
+    The scheduler gives a ctx=0 row no work, but the task iterator terminates on
+    exact coordinate equality with the CTA's end boundary, so after finishing the
+    active row it advances to the empty one, loads next_num_kv=0, ignores it, and
+    takes a full pipeline iteration -- TMA, MMA and epilogue stores included.
+
+    Detected without timing: prefill the whole out= backing buffer with a
+    sentinel, drive zero Q/K with unit weights, and check that the active row is
+    written (to zero) while the empty row's entire backing row is untouched.
+
+    An all-zero batch cannot show this: its schedule has start == end, so the
+    iterator is never entered. Regression for PR #4365 review r3824813393.
+    """
+    _skip_if_not_sm100()
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_context_len,
+    )
+
+    B, next_n, block_size, H, D = 2, 1, 128, 64, 128
+    max_ml = 128
+    SENTINEL = -98765.0
+
+    cl = torch.tensor([128, 0], dtype=torch.int32, device=DEVICE)
+    width = max(-(-int(c) // 128) for c in cl.tolist()) * (128 // block_size)
+    block_table = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
+    ntb = 4
+    w = torch.ones(B * next_n, H, device=DEVICE, dtype=torch.float32)
+    dtype = torch.float32 if variant == "fp8" else torch.bfloat16
+
+    out = torch.full(
+        (B * next_n, padded_context_len(max_ml)),
+        SENTINEL,
+        device=DEVICE,
+        dtype=dtype,
+    )
+
+    if variant == "fp8":
+        q = torch.zeros(B, next_n, H, D, device=DEVICE).to(torch.float8_e4m3fn)
+        kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=DEVICE)
+        fp8_paged_mqa_logits(q, kv, w, cl, block_table, max_ml, out=out)
+    else:
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=DEVICE)
+        sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=DEVICE)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=DEVICE
+        )
+        fp4_paged_mqa_logits(
+            q,
+            sf_q,
+            kv,
+            w,
+            cl,
+            block_table,
+            max_ml,
+            output_dtype=torch.bfloat16,
+            out=out,
+        )
+    torch.cuda.synchronize()
+
+    active, empty = out[0], out[1]
+    assert (active != SENTINEL).any(), "the active row was never written"
+    n_written = int((empty != SENTINEL).sum())
+    assert n_written == 0, (
+        f"the ctx=0 row had {n_written}/{empty.numel()} elements written: the "
+        "zero-length row was executed instead of skipped"
+    )
