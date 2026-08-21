@@ -281,16 +281,25 @@ def gen_ulysses_a2a_module() -> JitSpec:
 
 
 def gen_moe_alltoall_module() -> JitSpec:
+    communication_kernels = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "tensorrt_llm"
+        / "kernels"
+        / "communicationKernels"
+    )
     return gen_jit_spec(
         "mnnvl_moe_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "communicationKernels"
-            / "moeAlltoAllKernels.cu",
+            communication_kernels / "moeAlltoAllFusedKernels.cu",
+            communication_kernels / "moeAlltoAllPrepareDispatch.cu",
+            communication_kernels / "moeAlltoAllDispatch.cu",
+            communication_kernels / "moeAlltoAllStageCombine.cu",
+            communication_kernels / "moeAlltoAllPublishCombine.cu",
+            communication_kernels / "moeAlltoAllCombine.cu",
+            communication_kernels / "moeAlltoAllQuantizeCombine.cu",
+            communication_kernels / "moeAlltoAllSanitize.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "cpp"

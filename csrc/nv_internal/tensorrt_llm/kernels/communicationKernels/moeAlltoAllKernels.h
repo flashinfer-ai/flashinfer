@@ -108,6 +108,12 @@ struct MoeA2ADispatchParams {
                             // runtime_max_tokens_per_rank
   int top_k;                // Number of experts per token
 
+  // Symmetric workspace storage. The fused source kernels receive the
+  // allocation base and physical rank pitch directly so every peer address is
+  // derived from the same graph-visible mapping.
+  uint8_t* workspace;
+  uint64_t workspace_stride_bytes;
+
   // Expert routing information
   int32_t const* token_selected_experts;  // [local_num_tokens, top_k]
 
@@ -187,6 +193,11 @@ struct MoeA2ACombineParams {
                             // runtime_max_tokens_per_rank
   int top_k;                // Number of experts per token
 
+  // Symmetric workspace storage. Offsets are derived from the public
+  // workspace-backed pointers below at launch time.
+  uint8_t* workspace;
+  uint64_t workspace_stride_bytes;
+
   // If true, recv buffers contain FP8 data (either pre-staged or quantized in-place by prepare).
   // The combine kernel reads FP8 and writes BF16 output.
   bool use_low_precision;
@@ -199,6 +210,7 @@ struct MoeA2ACombineParams {
   MoeA2ACombineSwizzleSFMode swizzle_mode{
       MoeA2ACombineSwizzleSFMode::LINEAR};  // Output swizzle mode
   void* output_data;                        // Output buffer [local_num_tokens, elements_per_token]
+  void* accumulation_data;                  // Optional float32 intermediate for quantized output
   void* output_scales;                      // Optional output scales for quantized outputs
   float output_scalar_scale{1.0f};  // Per-tensor global scale applied before FP4 block scaling
                                     // (SFScaleVal); ignored by MXFP8/MXFP4 paths
