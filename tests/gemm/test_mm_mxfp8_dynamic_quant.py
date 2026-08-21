@@ -1,3 +1,4 @@
+import ast
 import json
 from collections.abc import Generator
 from pathlib import Path
@@ -242,8 +243,8 @@ def test_mm_mxfp8_dynamic_quant_matches_bf16(
 
 
 class _RecordingTuner:
-    def __init__(self, selected_tactic: tuple[bool, int]) -> None:
-        self.selected_tactic = selected_tactic
+    def __init__(self, selected_use_8x4: bool) -> None:
+        self.selected_use_8x4 = selected_use_8x4
         self.extras: list[tuple[Any, ...]] = []
         self.tactics: list[list[Any]] = []
 
@@ -265,24 +266,27 @@ class _RecordingTuner:
         )
         self.extras = [runner.get_cache_key_extras(inputs) for runner in runners]
         self.tactics = [runner.get_valid_tactics(inputs, profile) for runner in runners]
-        return runners[0], self.selected_tactic
+        selected_tactic = next(
+            tactic for tactic in self.tactics[0] if tactic[0] == self.selected_use_8x4
+        )
+        return runners[0], selected_tactic
 
 
 @pytest.mark.parametrize(
-    "m, selected_tactic, selected_layout",
+    "m, selected_use_8x4, selected_layout",
     [
-        (4, (True, 0), SfLayout.layout_8x4),
-        (33, (False, 0), SfLayout.layout_128x4),
+        (4, True, SfLayout.layout_8x4),
+        (33, False, SfLayout.layout_128x4),
     ],
 )
 def test_mm_mxfp8_dynamic_quant_offers_both_layouts(
     m: int,
-    selected_tactic: tuple[bool, int],
+    selected_use_8x4: bool,
     selected_layout: SfLayout,
     monkeypatch: pytest.MonkeyPatch,
     blackwell_cuda: None,
 ) -> None:
-    recorder = _RecordingTuner(selected_tactic)
+    recorder = _RecordingTuner(selected_use_8x4)
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: recorder))
 
     a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16)
@@ -350,7 +354,10 @@ def test_mm_mxfp8_dynamic_quant_cache_round_trip(
 
     payload = json.loads(cache_path.read_text())
     dynamic_keys = [key for key in payload if "mxfp8_dynamic_quant_gemm" in key]
-    assert len(dynamic_keys) == 1
+    parsed_keys = [ast.literal_eval(key) for key in dynamic_keys]
+    assert len(parsed_keys) == 4
+    assert {key[2][0][0] for key in parsed_keys} == {1, 2, 3, 4}
+    assert all(key[3] == (get_compute_capability(a.device),) for key in parsed_keys)
     assert cache_hits == [True]
     torch.testing.assert_close(cached, tuned, rtol=0, atol=0)
 
