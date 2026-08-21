@@ -1697,6 +1697,58 @@ def test_schedule_meta_device_must_match():
     )
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_context_lens_must_be_rank_1(variant):
+    """A [B,1] context_lens must be rejected here, not by the FFI binding.
+
+    [B] and [B,1] have the same shape[0], so the old shape-only check accepted
+    both and the rank-2 tensor failed later against the rank-1 compiled fake --
+    after JIT compilation, with a message that never mentions rank. [B,1] is a
+    real shape: SGLang's DeepGEMM path produces it.
+
+    Matches on the message text on purpose: the old path also raised ValueError,
+    so asserting the exception type alone would pass against unfixed code.
+    Regression for PR #4365 review r3825144972.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 256
+    good = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, good, device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+        call = lambda cl: fp8_paged_mqa_logits(  # noqa: E731
+            q, kv, w, cl, block_table, ctx
+        )
+    else:
+        q = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+        sf_q = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+        call = lambda cl: fp4_paged_mqa_logits(  # noqa: E731
+            q, sf_q, kv, w, cl, block_table, ctx, output_dtype=torch.bfloat16
+        )
+
+    for bad in (
+        torch.full((B, 1), ctx, dtype=torch.int32, device=device),  # [B,1]
+        torch.full((B, 1, 1), ctx, dtype=torch.int32, device=device),  # [B,1,1]
+    ):
+        with pytest.raises(ValueError, match="context_lens must be 1-D"):
+            call(bad)
+
+    # rank 1 still works
+    call(good)
+    torch.cuda.synchronize()
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
