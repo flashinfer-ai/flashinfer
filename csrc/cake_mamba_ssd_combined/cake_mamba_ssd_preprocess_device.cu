@@ -42,7 +42,7 @@ __global__ __launch_bounds__(128) void kernel_factorized_persistent_segment_prep
     float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias,
     int* __restrict__ segment_starts, int* __restrict__ segment_lengths,
     __nv_bfloat16* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads,
-    float dt_min, float dt_max) {
+    int dt_softplus, float dt_min, float dt_max) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -80,7 +80,7 @@ __global__ __launch_bounds__(128) void kernel_factorized_persistent_segment_prep
           int physical_token = group_start + local;
           float biased = dt[(physical_start + physical_token) * nheads + head] + dt_bias[head];
           float transformed = biased;
-          if (biased <= 20.0f) {
+          if (dt_softplus != 0 && biased <= 20.0f) {
             float _exp2_0 = approx_exp2(biased * 1.4426950408889634f);
             float _log_0 = logf(_exp2_0 + 1.0f);
             transformed = _log_0;
@@ -157,7 +157,7 @@ __global__ __launch_bounds__(128) void kernel_factorized_persistent_segment_prep
           int physical_token_2 = group_start_1 + local_6;
           float biased_1 = dt[(physical_start + physical_token_2) * nheads + head] + dt_bias[head];
           float transformed_1 = biased_1;
-          if (biased_1 <= 20.0f) {
+          if (dt_softplus != 0 && biased_1 <= 20.0f) {
             float _exp2_1 = approx_exp2(biased_1 * 1.4426950408889634f);
             float _log_1 = logf(_exp2_1 + 1.0f);
             transformed_1 = _log_1;

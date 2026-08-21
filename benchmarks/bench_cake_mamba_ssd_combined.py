@@ -46,6 +46,15 @@ def _diagnostic(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     }
 
 
+def _validate_report(report: dict, *, require_qualified_row: bool) -> None:
+    if not report["out"]["tolerance_passed"]:
+        raise AssertionError("Cake output failed BF16 parity")
+    if not report["final_states"]["tolerance_passed"]:
+        raise AssertionError("Cake final state failed BF16 parity")
+    if require_qualified_row and report["speedup"] <= 1.0:
+        raise AssertionError("Cake must be faster than CuTe for a reported row")
+
+
 def _packed_varlen_metadata(sequence_lengths: list[int]):
     total_seqlen = sum(sequence_lengths)
     if total_seqlen % 128 != 0:
@@ -226,13 +235,7 @@ def main() -> None:
         "timing_backend": "cupti",
     }
     print(json.dumps(report, sort_keys=True))
-    if args.require_qualified_row:
-        if not report["out"]["tolerance_passed"]:
-            raise AssertionError("Cake output failed BF16 parity")
-        if not report["final_states"]["tolerance_passed"]:
-            raise AssertionError("Cake final state failed BF16 parity")
-        if report["speedup"] <= 1.0:
-            raise AssertionError("Cake must be faster than CuTe for a reported row")
+    _validate_report(report, require_qualified_row=args.require_qualified_row)
 
 
 if __name__ == "__main__":

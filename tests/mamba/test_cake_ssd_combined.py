@@ -16,14 +16,27 @@ limitations under the License.
 
 import hashlib
 import importlib
+import importlib.util
 import inspect
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.mamba import SSDCombined
+
+
+def _load_cake_benchmark_module():
+    path = (
+        Path(__file__).parents[2] / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
+    )
+    spec = importlib.util.spec_from_file_location("bench_cake_mamba_ssd_combined", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _assert_cute_parity(actual, expected, *, nheads, ngroups):
@@ -117,6 +130,26 @@ def _case(
         return_final_states=True,
     )
     return constructor, (x, dt, A, B, C), arguments
+
+
+def test_cake_benchmark_validation_policy():
+    module = _load_cake_benchmark_module()
+
+    def report(*, out=True, final_states=True, speedup=1.01):
+        return {
+            "out": {"tolerance_passed": out},
+            "final_states": {"tolerance_passed": final_states},
+            "speedup": speedup,
+        }
+
+    module._validate_report(report(), require_qualified_row=False)
+    module._validate_report(report(speedup=0.99), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="output failed BF16 parity"):
+        module._validate_report(report(out=False), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="final state failed BF16 parity"):
+        module._validate_report(report(final_states=False), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="must be faster than CuTe"):
+        module._validate_report(report(speedup=0.99), require_qualified_row=True)
 
 
 def _strided_last_dim(value):
@@ -365,21 +398,92 @@ def test_cake_ssd_combined_allocation_output_lifetime():
     assert without_final[1] is None
 
 
-def test_cake_ssd_combined_supports_disabled_softplus():
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("dt_softplus", (False, True))
+def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
-    constructor, tensors, arguments = _case()
-    arguments["dt_softplus"] = False
+    constructor, tensors, arguments = _case(state_dtype=state_dtype)
+    arguments["dt_softplus"] = dt_softplus
 
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
     _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
 
 
+@pytest.mark.parametrize(
+    "invalid,match",
+    (
+        ("num_segments", "num_segments must be positive"),
+        ("nheads", "nheads must be positive"),
+        ("segment_starts", "segment_starts must hold"),
+        ("segment_lengths", "segment_lengths must hold"),
+        ("delta", "delta is smaller"),
+        ("cumsum", "cumsum is smaller"),
+    ),
+)
+def test_cake_ssd_preprocess_host_rejects_invalid_extents(invalid, match):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = module._target_arch(device)
+    program = module._load_program("preprocess", arch, device.index)
+    num_segments = 2
+    nheads = 2
+    dt = torch.zeros((256, nheads), dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros_like(A)
+    segment_starts = torch.tensor([0, 128], dtype=torch.int32, device=device)
+    segment_lengths = torch.full((2,), 128, dtype=torch.int32, device=device)
+    delta = torch.empty((4, 128), dtype=torch.bfloat16, device=device)
+    cumsum = torch.empty((4, 128), dtype=torch.float32, device=device)
+
+    if invalid == "num_segments":
+        num_segments = 0
+    elif invalid == "nheads":
+        nheads = 0
+    elif invalid == "segment_starts":
+        segment_starts = segment_starts[:1]
+    elif invalid == "segment_lengths":
+        segment_lengths = segment_lengths[:1]
+    elif invalid == "delta":
+        delta = delta[:3]
+    elif invalid == "cumsum":
+        cumsum = cumsum[:3]
+
+    with pytest.raises(ValueError, match=match):
+        program.run(
+            dt,
+            A,
+            dt_bias,
+            segment_starts,
+            segment_lengths,
+            delta,
+            cumsum,
+            num_segments,
+            nheads,
+            1,
+            0.0,
+            float("inf"),
+            1,
+            1,
+            1,
+        )
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_cake_ssd_combined_program_cache_is_cuda_context_scoped():
+    if any(
+        torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3))
+        for index in (0, 1)
+    ):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
     runners = []
     cases = []
     expected = []

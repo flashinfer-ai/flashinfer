@@ -74,8 +74,8 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
 
 void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView arg_segment_starts,
          TensorView arg_segment_lengths, TensorView arg_delta, TensorView arg_cumsum,
-         int64_t arg_num_segments, int64_t arg_nheads, double arg_dt_min, double arg_dt_max,
-         int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+         int64_t arg_num_segments, int64_t arg_nheads, int64_t arg_dt_softplus, double arg_dt_min,
+         double arg_dt_max, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_dt, "dt");
   CheckDtype(arg_dt, "dt", 2, 32, 1);
   CheckContiguous(arg_dt, "dt");
@@ -103,6 +103,20 @@ void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView
   TVM_FFI_CHECK(arg_nheads >= -2147483648LL && arg_nheads <= 2147483647LL, ValueError)
       << "scalar 'nheads' value " << arg_nheads
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_dt_softplus >= -2147483648LL && arg_dt_softplus <= 2147483647LL, ValueError)
+      << "scalar 'dt_softplus' value " << arg_dt_softplus
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_num_segments > 0, ValueError)
+      << "num_segments must be positive, got " << arg_num_segments;
+  TVM_FFI_CHECK(arg_nheads > 0, ValueError) << "nheads must be positive, got " << arg_nheads;
+  TVM_FFI_CHECK(arg_segment_starts.numel() >= arg_num_segments, ValueError)
+      << "segment_starts must hold at least num_segments elements";
+  TVM_FFI_CHECK(arg_segment_lengths.numel() >= arg_num_segments, ValueError)
+      << "segment_lengths must hold at least num_segments elements";
+  TVM_FFI_CHECK(arg_delta.numel() / 128 / arg_nheads >= arg_num_segments, ValueError)
+      << "delta is smaller than num_segments * nheads * 128";
+  TVM_FFI_CHECK(arg_cumsum.numel() / 128 / arg_nheads >= arg_num_segments, ValueError)
+      << "cumsum is smaller than num_segments * nheads * 128";
   CheckSameCudaDevice(arg_A, arg_dt, "A", "dt");
   CheckSameCudaDevice(arg_dt_bias, arg_dt, "dt_bias", "dt");
   CheckSameCudaDevice(arg_segment_starts, arg_dt, "segment_starts", "dt");
@@ -124,11 +138,12 @@ void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView
   void* p_cumsum = arg_cumsum.data_ptr();
   int32_t v_num_segments = (int32_t)arg_num_segments;
   int32_t v_nheads = (int32_t)arg_nheads;
+  int32_t v_dt_softplus = (int32_t)arg_dt_softplus;
   float v_dt_min = (float)arg_dt_min;
   float v_dt_max = (float)arg_dt_max;
   void* kargs[] = {&p_dt,    &p_A,      &p_dt_bias,      &p_segment_starts, &p_segment_lengths,
-                   &p_delta, &p_cumsum, &v_num_segments, &v_nheads,         &v_dt_min,
-                   &v_dt_max};
+                   &p_delta, &p_cumsum, &v_num_segments, &v_nheads,         &v_dt_softplus,
+                   &v_dt_min, &v_dt_max};
 
   static auto kernel =
       TVM_FFI_EMBED_CUBIN_GET_KERNEL(factorized_persistent_segment_preprocess_c87a05c3ab,
