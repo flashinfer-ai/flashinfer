@@ -70,6 +70,12 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+# Workload registry of the experimental fused GDN decode backends, loaded at
+# runtime via importlib.resources.
+"flashinfer.gdn_kernels.experimental" = ["*.json"]
+# Their in-package JIT kernel source, compiled on demand by
+# flashinfer/jit/gdn_fused_decode.py, like the sm100_blk64 sources below.
+"flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # JIT sources for the sm100_blk64 BSA kernel extension (compiled on-demand via
 # torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/sm100_blk64/loader.py).
 # These live inside the package tree rather than csrc/, so they must be

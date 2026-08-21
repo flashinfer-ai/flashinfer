@@ -29,6 +29,7 @@ from scripts.test_sharding.runner import (
     ExecutionSettings,
     ManifestPreparation,
     SelectionSettings,
+    collapse_test_paths,
     execute_shard,
     finalize_latest,
     plan_description,
@@ -75,6 +76,11 @@ def _pytest_command_prefix() -> tuple[str, ...]:
         return tuple(shlex.split(os.environ.get("PYTEST_COMMAND_PREFIX", "")))
     except ValueError as error:
         raise RunnerStateError(f"invalid PYTEST_COMMAND_PREFIX: {error}") from error
+
+
+def _default_test_paths() -> list[Path]:
+    parts = (os.environ.get("TEST_PATH") or "").split()
+    return [Path(part) for part in parts] if parts else [Path("tests/")]
 
 
 def _configure_output() -> None:
@@ -222,9 +228,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--test-path",
+        nargs="+",
         type=Path,
-        default=Path(os.environ.get("TEST_PATH") or "tests/"),
-        help="pytest collection scope (TEST_PATH)",
+        default=_default_test_paths(),
+        help="pytest collection scope (TEST_PATH; space-separated)",
     )
     parser.add_argument(
         "--sanity-test",
@@ -322,7 +329,7 @@ def _shell_settings(argv: list[str]) -> int:
     except (RunnerStateError, ValueError) as error:
         parser.error(str(error))
     print(operation)
-    print(args.test_path)
+    print(" ".join(str(path) for path in args.test_path))
     return 0
 
 
@@ -363,7 +370,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
     sample_rate = _env_int("SAMPLE_RATE", 5)
     sample_offset = _env_int("SAMPLE_OFFSET", 0)
     selection = SelectionSettings(
-        test_path=args.test_path.resolve(),
+        test_paths=collapse_test_paths(args.test_path),
         sanity_test=args.sanity_test,
         sample_rate=sample_rate,
         sample_offset=sample_offset,
@@ -381,7 +388,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
     )
     print(
         f"RUNNER STATUS: state=collecting command={args.command} "
-        f"test_path={selection.test_path}",
+        f"test_path={selection.display_test_path()}",
         flush=True,
     )
     _, plan, created = prepare_manifest(
@@ -464,7 +471,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         plan=plan,
         execution=execution,
         operation_started_at=operation_started_at,
-        test_path=selection.test_path,
+        test_path=selection.test_paths,
     )
 
 

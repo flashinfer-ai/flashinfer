@@ -1366,7 +1366,7 @@ def test_fp8_block_scale_moe_routing_replay(
 
 # Each (num_tokens, num_experts) entry is chosen to land in exactly one of the
 # five top-K kernels in `routing_custom.cu`. See the dispatch logic comment in
-# `trtllm_fused_moe_routing_custom.cu` (around the `useSplitTopKPath` block):
+# `trtllm_fused_moe_routing_custom.cuh` (around the `useSplitTopKPath` block):
 #
 #   * BlockKernel             : num_tokens <= 4
 #   * DynBlockKernel          : 5 <= num_tokens <= 16  (num_experts <= 512)

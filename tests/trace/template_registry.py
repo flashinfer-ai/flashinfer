@@ -60,6 +60,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
     "flashinfer.gdn_decode",
+    "flashinfer.gdn_kernels.experimental.gdn_fused_decode",
     "flashinfer.gdn_prefill",
     "flashinfer.gemm.gemm_base",
     "flashinfer.gemm.gemm_bf16_fp4",

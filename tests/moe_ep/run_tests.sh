@@ -139,7 +139,7 @@ run_unit() {
 }
 
 run_multirank() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   local rc=0
 
@@ -171,7 +171,7 @@ run_multirank() {
 }
 
 run_split_path_correctness_bf16() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -181,7 +181,7 @@ run_split_path_correctness_bf16() {
 }
 
 run_split_path_correctness_nvfp4() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -191,7 +191,7 @@ run_split_path_correctness_nvfp4() {
 }
 
 run_split_path_correctness_ht() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
@@ -335,7 +335,7 @@ run_ft() {
 }
 
 run_smoke() {
-  require_nccl_ep
+  require_nccl_ep || return 1
 
   local rc=0
 

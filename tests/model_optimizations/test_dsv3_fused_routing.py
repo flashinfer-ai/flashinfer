@@ -202,12 +202,14 @@ class DSv3RoutingGroundTruth:
 
         for token_idx in range(self.num_tokens):
             # Create mask for selected groups
-            group_mask = torch.zeros(n_group, dtype=torch.float32, device=self.device)
-            group_mask[self.ref_group_indices[token_idx]] = 1.0
+            group_mask = torch.zeros(n_group, dtype=torch.bool, device=self.device)
+            group_mask[self.ref_group_indices[token_idx]] = True
             expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
             # Mask and select top-k experts
-            masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+            masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+                ~expert_mask, float("-inf")
+            )
             _, topk_idx = torch.topk(
                 masked_biased_scores, k=topk, dim=-1, largest=True, sorted=True
             )
@@ -318,18 +320,42 @@ class DSv3RoutingGroundTruth:
         This computes what experts SHOULD be selected if these groups were chosen.
         """
         # Create mask for specified groups
-        group_mask = torch.zeros(self.n_group, dtype=torch.float32, device=self.device)
+        group_mask = torch.zeros(self.n_group, dtype=torch.bool, device=self.device)
         for g in groups:
-            group_mask[g] = 1.0
+            group_mask[g] = True
         expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
         # Mask and select top-k experts
-        masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+        masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+            ~expert_mask, float("-inf")
+        )
         _, topk_idx = torch.topk(
             masked_biased_scores, k=self.topk, dim=-1, largest=True, sorted=True
         )
 
         return set(topk_idx.tolist())
+
+
+def test_ground_truth_excludes_unselected_groups_with_negative_scores():
+    scores = torch.zeros((1, 8), dtype=torch.float32)
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group=2,
+        topk_group=1,
+        topk=4,
+        routed_scaling_factor=1.0,
+        data_type=torch.float32,
+    )
+
+    expected = {0, 1, 2, 3}
+    assert set(ground_truth.ref_expert_indices[0].tolist()) == expected
+    assert ground_truth._get_topk_experts_from_groups(0, [0]) == expected
 
 
 def validate_expert_selection(ground_truth, topk_indices_kernel, topk_values_kernel):

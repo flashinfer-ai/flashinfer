@@ -89,6 +89,30 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     compute_reference_moe_fp4,
     create_moe_tensors,
 )
+
+
+def test_noaux_tc_ref_excludes_unselected_groups_with_negative_scores():
+    from tests.moe.trtllm_gen_fused_moe_utils import noaux_tc_ref
+
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    scores = noaux_tc_ref(
+        logits,
+        bias,
+        n_group=2,
+        topk_group=1,
+        top_k=4,
+        routed_scaling_factor=1.0,
+    )
+
+    selected = torch.where(scores[0] != 0)[0]
+    assert set(selected.tolist()) == {0, 1, 2, 3}
+
+
 # ---------------------------------------------------------------------------
 # Enum repr round-trip
 # ---------------------------------------------------------------------------

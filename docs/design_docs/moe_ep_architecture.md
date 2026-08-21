@@ -15,14 +15,178 @@ Expert-Parallel MoE with two execution modes:
 
 Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
 
+## Available backends
+
+Backends resolve by name from the config object's `kernel_name` /
+`backend_name` field (three registries: mega kernels, split kernels, split
+comm fleets; deprecated aliases still resolve but warn).
+
+### Mega (fused comm + MoE kernel)
+
+Selected via `MegaConfig(megakernel=<config>)`. One symmetric-memory kernel
+owns dispatch, expert compute, and combine; output is always BF16
+`[num_tokens, hidden]`.
+
+| Backend (alias) | Activation | Weight | Output | Arch | Tuning |
+|---|---|---|---|---|---|
+| `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
+| `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
+| `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
+| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
+| `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
+
+The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
+tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
+by default (the backend quantizes at `preprocess_weights`); kernel-ready
+pre-quantized weights can be supplied instead.
+
+### Split (dispatch → inner kernel → combine)
+
+Composed via `SplitConfig(comm=..., kernel=...)`; any comm backend pairs with
+any kernel backend. The comm layer moves tokens (BF16 unless the kernel
+backend packs them); the kernel backend computes on this rank's expert shard.
+
+#### Comm backends (dispatch/combine transports)
+
+| Backend | Config | Transport | Modes | Constraints |
+|---|---|---|---|---|
+| `nccl_ep` | `NcclEpConfig` | NCCL (nccl4py wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
+| `nixl_ep` | `NvepConfig` | NIXL over UCX device API (GPU-initiated RDMA) | LL `EXPERT_MAJOR` only | needs `BUILD_NIXL_EP=1` (UCX v1.21+ device headers) and `BootstrapConfig.tcp_store`; `max_tokens_per_rank ≤ 1024`; hidden ∈ {2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}; handles top-k > 8 |
+
+#### Kernel backends (post-dispatch inner compute)
+
+| Backend | Activation | Weight | Output | Arch | Tuning |
+|---|---|---|---|---|---|
+| `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
+| `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
+| `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
+| `fused_moe` with `CuteDslConfig` | NVFP4 (block-16) or BF16 (W4A16) | NVFP4 or 4-bit (W4A16) | BF16 | SM100/SM103 | same `MoELayer` AutoTuner |
+| `sm100_mxfp8_mxfp4_bf16_cutedsl` (`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig`) | MXFP8 (block-32 UE8M0; quantized post-dispatch, or pre-dispatch packed payload with `mxfp8_dispatch=True`, nccl_ep only, bit-identical) | MXFP4 (block-32 UE8M0) | BF16 | SM100/SM103 | `tactic=` pins a kernel tactic; unpinned runs the AutoTuner default tactic (tactic sweep only under an autotune context — not tuned in the shipped benchmarks) |
+
+`fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
+views are prepared for the first match only). The W4A8 split kernel requires
+hidden and intermediate sizes to be multiples of 128.
+
+## How tuning works
+
+Two independent tuning systems, matching the two execution modes:
+
+- **Split** kernels tune through the generic FlashInfer `AutoTuner`: each
+  `fused_moe` runner enumerates kernel *tactics*, the tuner times them per
+  token bucket (up to `ExecutionConfig.tune_max_num_tokens`), and `MoELayer`
+  additionally picks a cross-backend winner per bucket. Nothing moe_ep-specific
+  — see the fused_moe docs.
+- **Mega** CuTeDSL kernels tune through the moe_ep-owned **knob** system
+  described below. The knob space is larger than a tactic id (tile, cluster,
+  warp-role, and scheduling choices that must be fixed at `cute.compile` time)
+  and every measurement is a **collective** — the fused kernel spans all EP
+  ranks, so candidates must compile and launch in lockstep on every rank.
+
+### Knob resolution (mega CuTeDSL)
+
+`Sm100_*_Cutedsl_MegaMoeConfig.knobs` accepts three values; resolution happens
+when the symmetric-memory session is created (and, for `"auto"`, at the first
+`compute()`):
+
+```mermaid
+flowchart TD
+    A["MegaConfig(megakernel=cfg)"] --> B{"cfg.knobs?"}
+    B -- "dict" --> C["validate via tuner.is_valid<br/>→ pin exactly these knobs"]
+    B -- "None (default)" --> D{"knob cache hit?<br/>FLASHINFER_MOE_EP_KNOB_CACHE<br/>key: device, dtype, world_size,<br/>geometry, combine_dtype + max_tokens bucket"}
+    D -- "hit" --> E["use recorded winner<br/>(pure dict lookup — no compiles,<br/>no collectives)"]
+    D -- "miss" --> F["tuner.default_knobs(max_tokens)<br/>measured token-count profiles<br/>(NVFP4: 4 profiles, MXFP8: 2)"]
+    B -- "auto" --> G["defer to first compute()"]
+    G --> H["COLLECTIVE candidate sweep<br/>(shim/autotune.py)"]
+    H --> I["per candidate, on every rank in lockstep:<br/>cute.compile → barrier →<br/>timed launches → barrier"]
+    I --> J["all-reduce per-candidate time with MAX<br/>(slowest rank = real collective latency)<br/>→ argmin winner identical on all ranks"]
+    J --> K["apply winner to the session"]
+    K --> L["rank 0 records winner into the knob cache<br/>→ later sessions with knobs=None hit E"]
+    C --> M["cute.compile session<br/>(memoized per knobs+geometry)"]
+    E --> M
+    F --> M
+```
+
+The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
+
+- **correctness knobs** change a code path or the output and must be kept at
+  the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
+  `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
+  `in_kernel_fc2_reduce` (ikr — makes the accumulation order
+  nondeterministic; pin `False` for bit-reproducibility);
+- **perf knobs** are output-neutral and free to sweep: `group_hint`,
+  `flag_batch`, `epi_flag_batch`.
+
+A validity predicate (`tuner.is_valid`) mirrors the kernel team's
+`inference_solver.filter_invalid` rules, so sweeps only enumerate
+compilable combinations.
+
+### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
+
+**1. Default (`knobs=None`).** The session resolves the knob cache first;
+on a miss it falls back to four measured token-count profiles keyed on the
+compile-time buffer capacity (`max_tokens_per_rank * world`):
+
+| bucket | profile |
+|---|---|
+| < 512 | small-batch latency: 128-wide N tile, `token_back_mode="epi_warps"` |
+| 512–1023 | mid: `reuse_dispatch_warps` |
+| 1024–2047 | mid-large: 256-wide N tile, `standalone_warps` |
+| ≥ 2048 | large throughput: `flag_batch=8`, `reuse_dispatch_warps` |
+
+**2. Pinned (`knobs=dict`).** E.g. a winner from the kernel team's tester
+sweep:
+
+```python
+Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    intermediate_size=2048, top_k=8,
+    knobs={"mma_tiler_mnk": (256, 128, 256), "cluster_shape_mnk": (2, 1, 1),
+           "token_back_mode": "reuse_dispatch_warps", "flag_batch": 8,
+           "group_hint": 512, "epi_flag_batch": (2, 4),
+           "load_balance_mode": "atomic_counter",
+           "in_kernel_fc2_reduce": False},
+)
+```
+
+**3. Online (`knobs="auto"`).** At the first `compute()` every rank runs the
+same ~24-candidate sweep (`nvfp4_candidates()`: tile {256×128, 256×256} ×
+`flag_batch` {4, 8} × three `token_back_mode` values × ikr {off, on}, over a
+fixed base of `cluster (2,1,1)`, `group_hint 512`, `epi_flag_batch (2,4)`,
+`atomic_counter`). Each candidate costs one `cute.compile` (minutes), so the
+sweep is a multi-minute, collective, once-per-session event — **never run it
+inside a serving engine**. The winner is applied and rank 0 records it in the
+knob cache.
+
+**4. Offline CLI (the intended production flow).** Run the same sweep outside
+the engine, with the production EP world size, GPU model, and geometry:
+
+```shell
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+    --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+    --num-experts 256 --topk 8 --max-tokens 8 512 2048
+```
+
+Winners land in the JSON knob cache (default
+`~/.cache/flashinfer/moe_ep_knob_cache.json`; override or disable with
+`FLASHINFER_MOE_EP_KNOB_CACHE`), keyed by (device, dtype, world_size, hidden,
+intermediate, num_experts, topk, combine_dtype) plus a `max_tokens` bucket
+(exact bucket when present, else the smallest recorded bucket ≥ the request,
+else the largest below). The engine then constructs the layer with the
+default `knobs=None` and gets the tuned winner as a pure lookup — no
+compiles, no collectives, no timing on the hot path. Nondeterministic ikr
+candidates are excluded from the CLI sweep unless
+`--allow-nondeterministic` is passed.
+
+Measured results, methodology, and the full knob reference live in
+[kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+
 ## Layout
 
-```
+```text
 moe_ep/
   config.py, tensors.py, weights.py, layer.py, algo_knobs.py, errors.py
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
-  backends/split/kernel/{identity,fused_moe}
+  backends/split/kernel/{identity,fused_moe,sm100/mxfp8_mxfp4_bf16_cutedsl}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
@@ -75,7 +239,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 - LL **EXPERT_MAJOR** — `[num_local_experts, cap, hidden]` (`cap = max_tokens_per_rank * world`), each row pre-assigned to one expert; the bridge synthesizes `top_k=1` / `final_scales=1` and **combine owns the real top-k reweight**.
 - LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
 
-Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). Correctness is currently validated for bf16 only (see **Tests**).
+Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). W4A8 (MXFP8 activations × MXFP4 weights) is a separate dedicated split kernel backend, `sm100_mxfp8_mxfp4_bf16_cutedsl`, with its own routing synthesis mirroring this bridge and an optional MXFP8-packed dispatch payload (see **Available backends**).
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 

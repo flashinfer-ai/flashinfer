@@ -517,7 +517,9 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
     for (uint32_t j = 0; j < 2; ++j) {
       m[j] = max(smem_storage->m_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4],
                  smem_storage->m_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4]);
-      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m[j] * sm_scale);
+      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh).
+      const float m_scaled = max(m[j] * sm_scale, -cuda::std::numeric_limits<float>::max());
+      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m_scaled);
       d[j] *= o_scale;
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 2; ++mma_d) {
@@ -528,14 +530,10 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
       }
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV / 2; ++mma_kv) {
-        s_frag[mma_kv][j * 2 + 0] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 1] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 4] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 5] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m[j] * sm_scale);
+        s_frag[mma_kv][j * 2 + 0] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 1] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 4] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 5] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m_scaled);
       }
     }
   } else {
@@ -554,7 +552,9 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
 
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m[j] * sm_scale);
+      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh).
+      const float m_scaled = max(m[j] * sm_scale, -cuda::std::numeric_limits<float>::max());
+      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m_scaled);
       d[j] *= o_scale;
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 2; ++mma_d) {
@@ -565,14 +565,10 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
       }
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-        s_frag[mma_kv][j * 2 + 0] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 1] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 4] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m[j] * sm_scale);
-        s_frag[mma_kv][j * 2 + 5] =
-            math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m[j] * sm_scale);
+        s_frag[mma_kv][j * 2 + 0] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 1] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 4] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m_scaled);
+        s_frag[mma_kv][j * 2 + 5] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m_scaled);
       }
     }
   }

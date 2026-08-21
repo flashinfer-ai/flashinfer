@@ -5,6 +5,7 @@ import torch
 
 import flashinfer
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.test_helpers.test_helpers import ref_single_prefill
 
 
 def head_dim_512_supported() -> bool:
@@ -224,3 +225,59 @@ def test_single_prefill_with_kv_cache_nvfp4_rope_large_head():
         q_dtype=torch.float16,
         pos_encoding_mode="ROPE_LLAMA",
     )
+
+
+# Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
+# masked logits are IEEE -inf, so any finite logit must win over masked positions
+# and fully masked rows must yield zero output with LSE = -inf.
+
+
+def _fill_with_max_logit(target_logit, dtype, kv_len, head_dim):
+    """Q/K whose raw QK dot product is target_logit for every position.
+
+    K[0] produces a slightly larger logit so the row maximum is unique.
+    """
+    q = torch.ones(1, 1, head_dim, dtype=dtype, device="cuda")
+    k = torch.full(
+        (kv_len, 1, head_dim), target_logit / head_dim, dtype=dtype, device="cuda"
+    )
+    k[0] = (target_logit + 1024.0) / head_dim
+    return q, k
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "target_logit", [-1e4, -5e4, -5.5e4, -6e4, -1e5, -2e5, -2.45e5]
+)
+def test_single_prefill_extreme_negative_logits(dtype, target_logit):
+    torch.manual_seed(0)
+    num_heads, head_dim, kv_len = 16, 128, 64
+    q, k = _fill_with_max_logit(target_logit, dtype, kv_len, head_dim)
+    q = q.repeat(1, num_heads, 1)
+    v = torch.randn(kv_len, 1, head_dim, dtype=dtype, device="cuda")
+
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, backend="fa2")
+    o_ref, _ = ref_single_prefill(q, k, v)
+
+    # The pre-fix bug produced an all-zero output once every logit fell below
+    # the -5e4 sentinel; guard against that in addition to the value check.
+    assert o.float().norm() > 0
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_masked_key_never_dominates(dtype):
+    torch.manual_seed(0)
+    qo_len, num_heads, head_dim = 32, 4, 128
+    # Every valid key yields a mildly negative logit; masked (future) keys are
+    # given a much larger logit so a leaking mask would change the output.
+    q = torch.ones(qo_len, num_heads, head_dim, dtype=dtype, device="cuda") * (
+        8.0 / head_dim
+    )
+    k = torch.full((qo_len, 1, head_dim), -8.0, dtype=dtype, device="cuda")
+    k[qo_len // 2 :] = 64.0
+    v = torch.randn(qo_len, 1, head_dim, dtype=dtype, device="cuda")
+
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, backend="fa2")
+    o_ref, _ = ref_single_prefill(q, k, v, causal=True)
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)

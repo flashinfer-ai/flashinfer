@@ -155,6 +155,12 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
     atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
+    # Check whether the caller provided out and returned out match
+    out_buf = torch.empty_like(o)
+    o_explicit = w.run(q, k, v, out=out_buf)
+    assert o_explicit.dtype == o.dtype
+    torch.testing.assert_close(o_explicit, o, rtol=0, atol=0)
+
     # LSE is now supported for standard attention.
     o2, lse = w.run(q, k, v, return_lse=True)
     torch.testing.assert_close(o2.float(), o.float(), atol=1e-2, rtol=1e-2)

@@ -147,7 +147,7 @@ def test_empty_test_path_environment_uses_default_suite(
 
     args = unit_test_runner._parser().parse_args(["run"])
 
-    assert args.test_path == Path("tests/")
+    assert args.test_path == [Path("tests/")]
 
 
 @pytest.mark.parametrize(
@@ -1719,3 +1719,75 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
     )
     assert summary["complete"] is True
     assert summary["synthetic"] == 1
+
+
+def test_test_path_environment_splits_multiple_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_PATH", "tests/moe tests/gdn")
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.test_path == [Path("tests/moe"), Path("tests/gdn")]
+
+
+def test_shell_settings_prints_space_separated_paths(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TEST_PATH", "tests/moe tests/gdn")
+
+    assert unit_test_runner._shell_settings([]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == ["run", "tests/moe tests/gdn"]
+
+
+def test_cli_test_path_accepts_multiple_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TEST_PATH", raising=False)
+
+    args = unit_test_runner._parser().parse_args(
+        ["run", "--test-path", "tests/moe", "tests/gdn"]
+    )
+
+    assert args.test_path == [Path("tests/moe"), Path("tests/gdn")]
+
+
+def test_collapse_drops_nested_file(tmp_path: Path) -> None:
+    parent = tmp_path / "suite"
+    parent.mkdir()
+    child = parent / "test_sample.py"
+    child.write_text("def test_case(): pass\n", encoding="utf-8")
+
+    assert runner.collapse_test_paths([parent, child]) == (parent.resolve(),)
+    assert runner.collapse_test_paths([child, parent]) == (parent.resolve(),)
+
+
+def test_missing_test_path_fails_closed(tmp_path: Path) -> None:
+    present = tmp_path / "suite"
+    present.mkdir()
+    missing = tmp_path / "missing"
+    selection = runner.SelectionSettings(
+        test_paths=(present, missing),
+        sanity_test=False,
+        sample_rate=5,
+        sample_offset=0,
+    )
+
+    with pytest.raises(runner.RunnerStateError, match="missing"):
+        runner._validate_selection(selection)
+
+
+def test_collect_nodes_unions_multiple_directories(tmp_path: Path) -> None:
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    (first / "test_a.py").write_text("def test_a(): pass\n", encoding="utf-8")
+    (second / "test_b.py").write_text("def test_b(): pass\n", encoding="utf-8")
+
+    nodes = runner._collect_nodes(REPO_ROOT, (first, second), 15, 0)
+    nodeids = {node["nodeid"] for node in nodes}
+
+    assert "test_a.py::test_a" in nodeids
+    assert "test_b.py::test_b" in nodeids

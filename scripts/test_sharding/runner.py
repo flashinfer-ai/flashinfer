@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .estimates import EstimateBook
 from .io import atomic_write_json
@@ -64,6 +64,7 @@ from .workers import BatchExecutionRequest, execute_batch, write_console
 
 
 _COLLECTION_HEARTBEAT_SECONDS = 30.0
+MAX_TEST_PATHS = 16
 _LEASE_HEARTBEAT_SECONDS = 10.0
 _LEASE_CLOSE_SECONDS = 2.0
 _CONTROLLER_PROGRESS_SECONDS = 60.0
@@ -131,10 +132,17 @@ class CollectionTimeoutError(RunnerStateError):
 
 @dataclass(frozen=True)
 class SelectionSettings:
-    test_path: Path
+    test_paths: tuple[Path, ...]
     sanity_test: bool
     sample_rate: int
     sample_offset: int
+
+    @property
+    def test_path(self) -> Path:
+        return self.test_paths[0]
+
+    def display_test_path(self) -> str:
+        return " ".join(str(path) for path in self.test_paths)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -223,10 +231,47 @@ def _estimate_checksums(
     }
 
 
+def _as_test_paths(test_path: Path | Sequence[Path]) -> tuple[Path, ...]:
+    if isinstance(test_path, Path):
+        return (test_path,)
+    return tuple(test_path)
+
+
+def _path_is_under(child: Path, parent: Path) -> bool:
+    if not parent.is_dir():
+        return False
+    try:
+        child.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return child.resolve() != parent.resolve()
+
+
+def collapse_test_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    if len(unique) > MAX_TEST_PATHS:
+        raise RunnerStateError(
+            f"too many test paths ({len(unique)}); maximum is {MAX_TEST_PATHS}"
+        )
+    kept = [
+        path
+        for path in unique
+        if not any(_path_is_under(path, other) for other in unique)
+    ]
+    return tuple(kept)
+
+
 def _wait_for_collection(
     process: subprocess.Popen[Any],
     *,
-    test_path: Path,
+    test_path: Path | str,
     timeout_seconds: float | None,
     grace_seconds: float,
 ) -> None:
@@ -258,18 +303,21 @@ def _wait_for_collection(
             )
 
 
-def _isolated_collection_groups(test_path: Path) -> list[tuple[str, list[Path]]]:
+def _isolated_collection_groups(
+    test_paths: Sequence[Path],
+) -> list[tuple[str, list[Path]]]:
     groups = []
     for name, patterns in _COLLECTION_ISOLATION_GROUPS:
         matches: set[Path] = set()
-        for pattern in patterns:
-            if test_path.is_file():
-                if test_path.match(pattern):
-                    matches.add(test_path)
-            else:
-                matches.update(
-                    path for path in test_path.rglob(pattern) if path.is_file()
-                )
+        for test_path in test_paths:
+            for pattern in patterns:
+                if test_path.is_file():
+                    if test_path.match(pattern):
+                        matches.add(test_path)
+                else:
+                    matches.update(
+                        path for path in test_path.rglob(pattern) if path.is_file()
+                    )
         if matches:
             groups.append(
                 (name, sorted(matches, key=lambda path: str(path).encode("utf-8")))
@@ -277,20 +325,21 @@ def _isolated_collection_groups(test_path: Path) -> list[tuple[str, list[Path]]]
     return groups
 
 
-def _pytest_root(repo_root: Path, test_path: Path) -> Path:
+def _pytest_root(repo_root: Path, test_path: Path | Sequence[Path]) -> Path:
     """Return the stable pytest root used for collection and execution."""
     resolved_repo = repo_root.resolve()
-    resolved_test = test_path.resolve()
-    try:
-        resolved_test.relative_to(resolved_repo)
-    except ValueError:
-        return resolved_test if resolved_test.is_dir() else resolved_test.parent
+    for path in _as_test_paths(test_path):
+        resolved_test = path.resolve()
+        try:
+            resolved_test.relative_to(resolved_repo)
+        except ValueError:
+            return resolved_test if resolved_test.is_dir() else resolved_test.parent
     return resolved_repo
 
 
 def _collect_partition(
     repo_root: Path,
-    test_path: Path,
+    test_paths: Sequence[Path],
     targets: list[Path],
     ignored_paths: list[Path],
     timeout_seconds: float | None,
@@ -303,7 +352,7 @@ def _collect_partition(
 ) -> list[dict[str, Any]]:
     output = directory / f"collection-{partition_index:02d}.json"
     log_path = directory / f"collection-{partition_index:02d}.log"
-    pytest_root = _pytest_root(repo_root, test_path)
+    pytest_root = _pytest_root(repo_root, test_paths)
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -335,7 +384,7 @@ def _collect_partition(
         )
         _wait_for_collection(
             process,
-            test_path=test_path,
+            test_path=" ".join(str(path) for path in test_paths),
             timeout_seconds=timeout_seconds,
             grace_seconds=grace_seconds,
         )
@@ -361,13 +410,16 @@ def _collect_partition(
 
 def _collect_nodes(
     repo_root: Path,
-    test_path: Path,
+    test_path: Path | Sequence[Path],
     timeout_seconds: float | None,
     grace_seconds: float,
 ) -> list[dict[str, Any]]:
     started_at = time.monotonic()
-    isolated_groups = _isolated_collection_groups(test_path)
+    test_paths = _as_test_paths(test_path)
+    display_test_path = " ".join(str(path) for path in test_paths)
+    isolated_groups = _isolated_collection_groups(test_paths)
     isolated_paths = [path for _, paths in isolated_groups for path in paths]
+    primary_targets = [path for path in test_paths if path not in isolated_paths]
 
     def remaining_timeout() -> float | None:
         if timeout_seconds is None:
@@ -380,12 +432,12 @@ def _collect_nodes(
         ) as temporary_directory:
             directory = Path(temporary_directory)
             partitions = []
-            if test_path not in isolated_paths:
+            if primary_targets:
                 partitions.append(
                     _collect_partition(
                         repo_root,
-                        test_path,
-                        [test_path],
+                        test_paths,
+                        primary_targets,
                         isolated_paths,
                         remaining_timeout(),
                         grace_seconds,
@@ -399,7 +451,7 @@ def _collect_nodes(
                 partitions.append(
                     _collect_partition(
                         repo_root,
-                        test_path,
+                        test_paths,
                         paths,
                         [],
                         remaining_timeout(),
@@ -428,13 +480,16 @@ def _collect_nodes(
             merged["order"] = len(nodes)
             nodes.append(merged)
     if not nodes:
-        raise RunnerStateError(f"pytest collected no tests below {test_path}")
+        raise RunnerStateError(f"pytest collected no tests below {display_test_path}")
     return nodes
 
 
 def _validate_selection(selection: SelectionSettings) -> None:
-    if not selection.test_path.exists():
-        raise RunnerStateError(f"test path does not exist: {selection.test_path}")
+    missing = [path for path in selection.test_paths if not path.exists()]
+    if missing:
+        raise RunnerStateError(
+            "test path does not exist: " + ", ".join(str(path) for path in missing)
+        )
     if selection.sample_rate <= 0:
         raise RunnerStateError("SAMPLE_RATE must be positive")
     if not 0 <= selection.sample_offset < selection.sample_rate:
@@ -492,6 +547,7 @@ def _write_new_manifest(
                 concurrent,
                 source_git_sha=source_git_sha,
                 test_path=request.selection.test_path,
+                test_paths=request.selection.test_paths,
                 selection=request.selection.to_dict(),
                 planning_options=request.planning.to_dict(),
                 pytest_command_prefix=request.pytest_command_prefix,
@@ -519,7 +575,7 @@ def prepare_manifest(
     collection_timeout_seconds = request.collection_timeout_seconds
     attempt_settings = request.attempt_settings
     operation_started_at = request.operation_started_at
-    test_path = selection.test_path
+    test_paths = selection.test_paths
     _validate_selection(selection)
     junit_dir.mkdir(parents=True, exist_ok=True)
     source_git_sha = source_git_sha_from_env()
@@ -533,7 +589,8 @@ def prepare_manifest(
         verify_manifest(
             existing,
             source_git_sha=source_git_sha,
-            test_path=test_path,
+            test_path=test_paths[0],
+            test_paths=test_paths,
             selection=selection_value,
             planning_options=planning.to_dict(),
             pytest_command_prefix=request.pytest_command_prefix,
@@ -584,7 +641,7 @@ def prepare_manifest(
     try:
         raw_nodes = _collect_nodes(
             repo_root,
-            test_path,
+            test_paths,
             collection_timeout_seconds,
             request.collection_grace_seconds,
         )
@@ -603,7 +660,8 @@ def prepare_manifest(
     manifest = build_manifest(
         ManifestBuild(
             repo_root=repo_root,
-            test_path=test_path,
+            test_path=test_paths[0],
+            test_paths=test_paths,
             source_git_sha=source_git_sha,
             plan=plan,
             selection=selection_value,
@@ -1531,7 +1589,7 @@ def execute_shard(
     plan: Plan,
     execution: ExecutionSettings,
     operation_started_at: float,
-    test_path: Path,
+    test_path: Path | Sequence[Path],
 ) -> int:
     if not 0 <= execution.shard_index < plan.options.shard_count:
         raise RunnerStateError(

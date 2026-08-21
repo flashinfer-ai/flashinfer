@@ -53,10 +53,13 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   float s_a_val = s_a[pos * num_heads + head_idx];
   float s_b_val = s_b[pos * num_heads + head_idx];
   float s_max = max(s_a_val, s_b_val);
-  s_a_val = math::ptx_exp2(s_a_val - s_max);
-  s_b_val = math::ptx_exp2(s_b_val - s_max);
-  float a_scale = s_a_val / (s_a_val + s_b_val);
-  float b_scale = s_b_val / (s_a_val + s_b_val);
+  // max() drops the NaN from merging two empty states ((-inf) - (-inf)); the
+  // d_sum guard keeps their merged output zero instead of 0/0 = NaN.
+  s_a_val = math::ptx_exp2(max(s_a_val - s_max, -math::inf));
+  s_b_val = math::ptx_exp2(max(s_b_val - s_max, -math::inf));
+  float d_sum = s_a_val + s_b_val;
+  float a_scale = (d_sum > 0.f) ? s_a_val / d_sum : 0.f;
+  float b_scale = (d_sum > 0.f) ? s_b_val / d_sum : 0.f;
   vec_t<float, vec_size> v_a_vec, v_b_vec, v_merged_vec;
   v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -66,7 +69,7 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   }
   v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   if (s_merged != nullptr) {
-    s_merged[pos * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
+    s_merged[pos * num_heads + head_idx] = math::ptx_log2(d_sum) + s_max;
   }
 }
 
@@ -98,10 +101,13 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
   float s_val = s[pos * num_heads + head_idx];
   float s_other_val = s_other[pos * num_heads + head_idx];
   float s_max = max(s_val, s_other_val);
-  s_val = math::ptx_exp2(s_val - s_max);
-  s_other_val = math::ptx_exp2(s_other_val - s_max);
-  float scale = s_val / (s_val + s_other_val);
-  float other_scale = s_other_val / (s_val + s_other_val);
+  // max() drops the NaN from merging two empty states ((-inf) - (-inf)); the
+  // d_sum guard keeps their merged output zero instead of 0/0 = NaN.
+  s_val = math::ptx_exp2(max(s_val - s_max, -math::inf));
+  s_other_val = math::ptx_exp2(max(s_other_val - s_max, -math::inf));
+  float d_sum = s_val + s_other_val;
+  float scale = (d_sum > 0.f) ? s_val / d_sum : 0.f;
+  float other_scale = (d_sum > 0.f) ? s_other_val / d_sum : 0.f;
   vec_t<float, vec_size> v_vec, v_other_vec;
   v_vec.cast_load(v + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   v_other_vec.cast_load(v_other + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -111,7 +117,7 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
   }
   v_vec.cast_store(v + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   if (s != nullptr) {
-    s[pos * num_heads + head_idx] = math::ptx_log2(s_val + s_other_val) + s_max;
+    s[pos * num_heads + head_idx] = math::ptx_log2(d_sum) + s_max;
   }
 }
 
