@@ -743,7 +743,7 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             # Select the tensors that arent all zeros
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
-            ref = ref[token_selected_experts_indices].squeeze()
+            ref = ref[token_selected_experts_indices].squeeze(1)
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
@@ -812,7 +812,7 @@ def test_moe_alltoall_non_divisible_ep_single_gpu(
             # Select the tensors that arent all zeros
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
-            ref = ref[token_indices].squeeze()
+            ref = ref[token_indices].squeeze(1)
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
@@ -1227,7 +1227,7 @@ def test_moe_alltoall_dispatch_larger_payloads_single_gpu(
         for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
-            ref = ref[token_selected_experts_indices].squeeze()
+            ref = ref[token_selected_experts_indices].squeeze(1)
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
