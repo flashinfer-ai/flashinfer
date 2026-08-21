@@ -148,6 +148,23 @@ def _validate_sf_vec_size(sf_vec_size: int, head_dim: int, fn_name: str) -> int:
 
 
 @functools.cache
+def _cached_gpu_arch(device_index: int) -> str:
+    """The CuTe-DSL codegen target for a device, e.g. ``"sm_100a"``.
+
+    Resolved from the *requested* device, not the process-wide current one.
+    CUTLASS's own probe queries ordinal 0 unconditionally, so on a
+    heterogeneous system it would otherwise emit code for the wrong GPU while
+    num_sms came from this one.  Uses the same normalization as
+    ``CompilationContext`` so the string matches the arch names used elsewhere.
+    """
+    from ..compilation_context import CompilationContext
+
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda", device_index))
+    _, minor_str = CompilationContext._normalize_cuda_arch(major, minor)
+    return f"sm_{major}{minor_str}"
+
+
+@functools.cache
 def _cached_num_sms(device_index: int) -> int:
     """Cache SM count per device — get_device_sm_count has non-trivial overhead."""
     return get_device_sm_count(torch.device("cuda", device_index))
@@ -533,6 +550,7 @@ def _cached_compile_fp8_kernel(
     acc_dtype,  # cutlass dtype object
     output_dtype,  # cutlass dtype object
     num_epi_subtiles: int,
+    arch: str,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP8MQALogitsKernel
@@ -608,13 +626,13 @@ def _cached_compile_fp8_kernel(
             cutlass.Int32(1),
             cutlass.Int32(1),
             fake_stream,
-            options="--enable-tvm-ffi",
+            options=f"--gpu-arch {arch} --enable-tvm-ffi",
         )
 
     tag = (
         f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}"
+        f"_sub{num_epi_subtiles}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp8",
@@ -647,6 +665,7 @@ def _cached_compile_fp4_kernel(
     output_dtype,  # cutlass dtype object
     num_epi_subtiles: int,
     is_kv_sf_interleaved: bool,
+    arch: str,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP4MQALogitsKernel
@@ -721,13 +740,13 @@ def _cached_compile_fp4_kernel(
             cutlass.Int32(1),
             cutlass.Int32(1),
             fake_stream,
-            options="--enable-tvm-ffi",
+            options=f"--gpu-arch {arch} --enable-tvm-ffi",
         )
 
     tag = (
         f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}"
+        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp4",
@@ -758,7 +777,12 @@ def _gpu_schedule(
 
     batch_size = int(context_lens.shape[0])
     aligned_b = max(((batch_size + 31) // 32) * 32, 32)
-    compiled = _compile_schedule_kernel(aligned_b, _SPLIT_KV, num_sms)
+    compiled = _compile_schedule_kernel(
+        aligned_b,
+        _SPLIT_KV,
+        num_sms,
+        _cached_gpu_arch(get_device_index(schedule_meta.device)),
+    )
     compiled(context_lens, schedule_meta, batch_size)
 
 
@@ -1077,6 +1101,7 @@ def fp8_paged_mqa_logits(
         cutlass_acc,
         cutlass_out,
         num_epi_subtiles,
+        _cached_gpu_arch(get_device_index(q.device)),
     )
 
     # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
@@ -1383,6 +1408,7 @@ def fp4_paged_mqa_logits(
         cutlass_out,
         num_epi_subtiles,
         is_kv_sf_interleaved,
+        _cached_gpu_arch(get_device_index(q.device)),
     )
     compiled(
         kv_flat,
@@ -1420,7 +1446,9 @@ def precompile_paged_mqa_logits(
     use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s for the 9 fp4.
 
     Args:
-        device:   CUDA device to target.  Defaults to cuda:0.
+        device:   CUDA device to target.  Defaults to the current CUDA
+                  device, so a worker that has set its per-rank device gets
+                  kernels for that device without passing anything.
         variants: Which precisions to build.  A deployment normally runs one
                   indexer precision, so pass e.g. ``("fp8",)`` to avoid
                   compiling kernels that will never be called.
@@ -1434,38 +1462,49 @@ def precompile_paged_mqa_logits(
             f"supported values are 'fp8' and 'fp4'."
         )
     if device is None:
-        device = torch.device("cuda", 0)
-    num_sms = _cached_num_sms(get_device_index(torch.device(device)))
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device_index = get_device_index(device)
+    num_sms = _cached_num_sms(device_index)
+    arch = _cached_gpu_arch(device_index)
     num_heads, head_dim = 64, 128
 
-    if "fp8" in variants:
-        # block_size × next_n, fp32 acc/epi/out
-        for block_size in (64, 128):
-            for nn in (1, 2, 3, 4):
-                _cached_compile_fp8_kernel(
-                    block_size,
-                    num_heads,
-                    head_dim,
-                    nn,
-                    num_sms,
-                    _to_cutlass(torch.float32),
-                    _to_cutlass(torch.float32),
-                    _to_cutlass(torch.float32),
-                    1,
-                )
+    # JitSpecCuteDsl tags its on-disk cache from the *current* torch device, so
+    # the whole build runs under the target: otherwise a kernel compiled for the
+    # requested arch would be filed under a different one.
+    with torch.cuda.device(device_index):
+        if "fp8" in variants:
+            # block_size × next_n, fp32 acc/epi/out
+            for block_size in (64, 128):
+                for nn in (1, 2, 3, 4):
+                    _cached_compile_fp8_kernel(
+                        block_size,
+                        num_heads,
+                        head_dim,
+                        nn,
+                        num_sms,
+                        _to_cutlass(torch.float32),
+                        _to_cutlass(torch.float32),
+                        _to_cutlass(torch.float32),
+                        1,
+                        arch,
+                    )
 
-    if "fp4" in variants:
-        # block_size × next_n, fp32 epi, bf16 out
-        for block_size in (32, 64, 128):
-            for nn in (1, 2, 3):
-                _cached_compile_fp4_kernel(
-                    block_size,
-                    num_heads,
-                    head_dim,
-                    nn,
-                    num_sms,
-                    _to_cutlass(torch.float32),
-                    _to_cutlass(torch.bfloat16),
-                    1,
-                    False,
-                )
+        if "fp4" in variants:
+            # block_size × next_n, fp32 epi, bf16 out
+            for block_size in (32, 64, 128):
+                for nn in (1, 2, 3):
+                    _cached_compile_fp4_kernel(
+                        block_size,
+                        num_heads,
+                        head_dim,
+                        nn,
+                        num_sms,
+                        _to_cutlass(torch.float32),
+                        _to_cutlass(torch.bfloat16),
+                        1,
+                        False,
+                        arch,
+                    )

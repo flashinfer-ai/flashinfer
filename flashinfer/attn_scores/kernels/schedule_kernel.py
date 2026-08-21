@@ -151,8 +151,12 @@ class PagedMQALogitsScheduleKernel:
 
 
 @functools.cache
-def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int):
-    """Compile GPU schedule kernel; cached by (aligned_b, split_kv, num_sms)."""
+def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: str):
+    """Compile GPU schedule kernel; cached by (aligned_b, split_kv, num_sms, arch).
+
+    ``arch`` pins codegen to the target device rather than to CUTLASS's
+    default probe, which queries ordinal 0 unconditionally.
+    """
     sym_B = cute.sym_int()
     cl_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (sym_B,), stride_order=(0,)
@@ -169,5 +173,5 @@ def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int):
         sm_fake,
         cutlass.Int32(1),
         fake_stream,
-        options="--enable-tvm-ffi",
+        options=f"--gpu-arch {arch} --enable-tvm-ffi",
     )

@@ -17,6 +17,8 @@ Reference implementations are adapted from TRT-LLM test scripts.
 """
 
 import pytest
+import contextlib
+
 import torch
 
 from flashinfer.utils import is_sm100a_supported
@@ -1747,6 +1749,132 @@ def test_context_lens_must_be_rank_1(variant):
     # rank 1 still works
     call(good)
     torch.cuda.synchronize()
+
+
+def _to_cutlass_for_test(dtype):
+    from flashinfer.attn_scores.attn_scores import _to_cutlass
+
+    return _to_cutlass(dtype)
+
+
+def test_gpu_arch_resolves_from_requested_device():
+    """The compile arch must follow the requested device, not the current one.
+
+    CUTLASS's own probe queries ordinal 0 unconditionally and PyTorch's
+    no-argument get_device_capability() follows the process-wide current device,
+    so before this change num_sms came from the device= argument while the
+    codegen target and cache tag came from elsewhere. Regression for PR #4365
+    review r3824968121.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer.attn_scores.attn_scores import _cached_gpu_arch
+
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        got = _cached_gpu_arch(i)
+        assert got.startswith(f"sm_{p.major}"), (
+            f"cuda:{i} is sm_{p.major}{p.minor} but arch resolved to {got}"
+        )
+
+    # ...and it must not drift with the process-wide current device.
+    if torch.cuda.device_count() > 1:
+        before = [_cached_gpu_arch(i) for i in range(torch.cuda.device_count())]
+        cur = torch.cuda.current_device()
+        try:
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_device(i)
+                after = [_cached_gpu_arch(j) for j in range(torch.cuda.device_count())]
+                assert after == before, (
+                    f"arch resolution changed when current device was {i}: "
+                    f"{before} -> {after}"
+                )
+        finally:
+            torch.cuda.set_device(cur)
+
+
+def test_arch_is_part_of_the_compile_cache_key():
+    """Two architectures must not share a compiled-kernel cache entry.
+
+    Without arch in the key, a kernel built for one device could be handed to
+    another with the same SM count. The annotation check also guards against
+    keying on cute.GPUArch, whose equality is identity-based (GPUArch(x) ==
+    GPUArch(x) is False) and would silently miss every lookup.
+    """
+    import inspect
+
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_compile_fp8_kernel,
+    )
+    from flashinfer.attn_scores.kernels.schedule_kernel import _compile_schedule_kernel
+
+    for fn in (
+        _cached_compile_fp8_kernel,
+        _cached_compile_fp4_kernel,
+        _compile_schedule_kernel,
+    ):
+        inner = getattr(fn, "__wrapped__", fn)
+        sig = inspect.signature(inner)
+        assert "arch" in sig.parameters, (
+            f"{inner.__name__} cache key omits arch: {list(sig.parameters)}"
+        )
+        assert sig.parameters["arch"].annotation is str, (
+            f"{inner.__name__} must key on the arch string, not a cute.GPUArch"
+        )
+
+
+def test_precompile_targets_the_requested_device():
+    """precompile(device=...) builds entries keyed on that device's arch/SM count.
+
+    Verified by a cache *hit*: after precompiling, asking for the same config
+    with the target's (num_sms, arch) must not recompile. A different arch must
+    miss, which is what proves arch is really in the key.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp8_kernel,
+        _cached_gpu_arch,
+        _cached_num_sms,
+    )
+
+    # Pick the highest-numbered device that can actually run this kernel: on a
+    # heterogeneous box the last device may be another architecture entirely,
+    # and precompiling an sm100a kernel for it correctly raises.
+    capable = [
+        i
+        for i in range(torch.cuda.device_count())
+        if is_sm100a_supported(torch.device("cuda", i))
+    ]
+    assert capable, "no sm100a-capable device"
+    target = capable[-1]
+    arch = _cached_gpu_arch(target)
+    sms = _cached_num_sms(target)
+    f32 = _to_cutlass_for_test(torch.float32)
+
+    precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
+
+    hits = _cached_compile_fp8_kernel.cache_info().hits
+    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, arch)
+    assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
+        f"precompile(device=cuda:{target}) produced no entry for "
+        f"(num_sms={sms}, arch={arch})"
+    )
+
+    # A different arch must be a distinct key, not a silent reuse.
+    misses = _cached_compile_fp8_kernel.cache_info().misses
+    # Compiling this kernel for sm_80 legitimately fails (no tcgen05); the cache
+    # miss is what we are asserting, not the compile result.
+    with contextlib.suppress(Exception):
+        other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
+        _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, other_arch)
+    assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
+        "a different arch reused the cache entry -- arch is not in the key"
+    )
 
 
 def test_precompile_variants():
