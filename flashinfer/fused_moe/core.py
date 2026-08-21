@@ -1191,8 +1191,6 @@ def cutlass_fused_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
-    situ_beta: Optional[torch.Tensor] = None,
-    situ_linear_beta: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -1214,6 +1212,9 @@ def cutlass_fused_moe(
     use_fused_finalize: bool = True,
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    *,
+    situ_beta: Optional[torch.Tensor] = None,
+    situ_linear_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
