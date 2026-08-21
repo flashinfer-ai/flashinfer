@@ -136,6 +136,7 @@ from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import mm_mxfp8_dynamic_quant as mm_mxfp8_dynamic_quant
+from .gemm import prepare_mxfp8_trtllm_weights as prepare_mxfp8_trtllm_weights
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8

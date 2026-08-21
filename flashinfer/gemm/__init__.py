@@ -7,6 +7,9 @@ from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
 from .gemm_base import mm_mxfp8_dynamic_quant as mm_mxfp8_dynamic_quant
+from .gemm_base import (
+    prepare_mxfp8_trtllm_weights as prepare_mxfp8_trtllm_weights,
+)
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
 from .gemm_base import group_gemm_mxfp4_nt_groupwise as group_gemm_mxfp4_nt_groupwise
 from .gemm_base import (
@@ -120,6 +123,7 @@ __all__ = (
         "mm_fp8",
         "mm_mxfp8",
         "mm_mxfp8_dynamic_quant",
+        "prepare_mxfp8_trtllm_weights",
         "tgv_gemm_sm100",
         "group_gemm_mxfp4_nt_groupwise",
         "group_gemm_mxfp8_mxfp4_nt_groupwise",

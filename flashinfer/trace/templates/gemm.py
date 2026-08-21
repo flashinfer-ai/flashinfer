@@ -485,8 +485,7 @@ def _mm_mxfp8_dynamic_quant_init(
     from flashinfer import (  # noqa: PLC0415
         SfLayout,
         mxfp8_quantize,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
+        prepare_mxfp8_trtllm_weights,
     )
 
     torch.manual_seed(seed)
@@ -496,12 +495,7 @@ def _mm_mxfp8_dynamic_quant_init(
         weight,
         sf_swizzle_layout=SfLayout.layout_linear,
     )
-    b = shuffle_matrix_a(weight_q, 128).reshape(N, K).T
-    b_descale = shuffle_matrix_sf_a(
-        weight_scale.reshape(N, K // 32),
-        128,
-        num_elts_per_sf=32,
-    ).reshape(-1)
+    b, b_descale = prepare_mxfp8_trtllm_weights(weight_q, weight_scale)
     return {"a": a, "b": b, "b_descale": b_descale}
 
 

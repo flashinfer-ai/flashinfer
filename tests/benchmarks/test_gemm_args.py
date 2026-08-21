@@ -15,6 +15,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--routine")
     parser.add_argument("--verbose", action="count", default=0)
+    parser.add_argument("--autotune_cache")
     return parser
 
 
@@ -34,6 +35,7 @@ def test_mm_mxfp8_dynamic_quant_defaults_to_trtllm() -> None:
         _parser(),
     )
     assert args.backends == ["trtllm"]
+    assert args.dynamic_quant_layout == "8x4"
 
 
 @pytest.mark.parametrize(
@@ -49,6 +51,7 @@ def test_mm_mxfp8_accepts_supported_dynamic_quant_layout_backend_pair(
     dynamic_quant_layout: str,
     backend: str,
 ) -> None:
+    extra_args = ["--autotune"] if dynamic_quant_layout == "auto" else []
     args = parse_gemm_args(
         [
             "--routine",
@@ -64,12 +67,33 @@ def test_mm_mxfp8_accepts_supported_dynamic_quant_layout_backend_pair(
             "--dynamic_quant",
             "--dynamic_quant_layout",
             dynamic_quant_layout,
+            *extra_args,
         ],
         _parser(),
     )
     assert args.dynamic_quant is True
     assert args.dynamic_quant_layout == dynamic_quant_layout
     assert args.backends == [backend]
+
+
+def test_mm_mxfp8_rejects_adaptive_layout_without_tuning_or_cache() -> None:
+    with pytest.raises(ValueError, match="requires --autotune or --autotune_cache"):
+        parse_gemm_args(
+            [
+                "--routine",
+                "mm_mxfp8",
+                "--m",
+                "4",
+                "--n",
+                "2688",
+                "--k",
+                "4096",
+                "--dynamic_quant",
+                "--dynamic_quant_layout",
+                "auto",
+            ],
+            _parser(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -104,7 +128,7 @@ def test_mm_mxfp8_rejects_dynamic_quant_layout_backend_mismatch(
         )
 
 
-def test_dynamic_mxfp8_problem_bytes_includes_quantization_traffic() -> None:
+def test_dynamic_mxfp8_problem_bytes_reports_logical_quantization_traffic() -> None:
     assert _dynamic_mxfp8_problem_bytes(4, 128, 256, out_itemsize=2) == 38_976
 
 

@@ -91,6 +91,12 @@ def _dynamic_mxfp8_problem_bytes(
     k: int,
     out_itemsize: int,
 ) -> int:
+    """Return logical traffic for comparing equivalent dynamic-quant workloads.
+
+    Physical scale buffers include backend-specific padding. This metric uses
+    logical scale counts so 8x4, 128x4, and adaptive runs report the same useful
+    work for a given ``(M, N, K)``.
+    """
     activation_values = m * k * torch.float8_e4m3fn.itemsize
     activation_scales = m * (k // 32) * torch.uint8.itemsize
     weight_values = n * k * torch.float8_e4m3fn.itemsize
@@ -221,7 +227,7 @@ def parse_gemm_args(line, parser):
     parser.add_argument(
         "--dynamic_quant_layout",
         type=str,
-        default="auto",
+        default="8x4",
         choices=["auto", "8x4", "128x4"],
         help="Activation scale layout for --dynamic_quant.",
     )
@@ -284,6 +290,16 @@ def parse_gemm_args(line, parser):
             args.dynamic_quant_layout,
             args.backends,
         )
+        if (
+            args.dynamic_quant
+            and args.dynamic_quant_layout == "auto"
+            and not (args.autotune or getattr(args, "autotune_cache", None))
+        ):
+            raise ValueError(
+                "--dynamic_quant_layout auto requires --autotune or "
+                "--autotune_cache; without a tuned selection the API uses its "
+                "fixed 8x4 fallback"
+            )
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -1977,22 +1993,18 @@ def testMmMxfp8(args):
                 input_bf16, sf_swizzle_layout=sf_layout_input
             )
 
-        # when using trtllm, the shuffle_matrix_sf_a will swizzle the layout.
+        # TRTLLM consumes row-shuffled weights and padded 128x4 weight scales.
         mat2_mxfp8, mat2_scale = mxfp8_quantize(
             mat2,
             is_sf_swizzled_layout=backend != "trtllm",
         )
 
         if backend == "trtllm":
-            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
-
-            mat2_mxfp8 = shuffle_matrix_a(mat2_mxfp8, 128).reshape(n, k)
-            mat2_scale = shuffle_matrix_sf_a(
-                mat2_scale.reshape(n, k // 32),
-                128,
-                num_elts_per_sf=32,
+            prepared_weight, mat2_scale = flashinfer.prepare_mxfp8_trtllm_weights(
+                mat2_mxfp8,
+                mat2_scale,
             )
-            mat2_scale = mat2_scale.t()
+            mat2_mxfp8 = prepared_weight.T
 
         if dynamic_quant:
             out = torch.empty((m, n), device=device, dtype=res_dtype)

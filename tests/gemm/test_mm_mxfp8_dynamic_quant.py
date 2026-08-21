@@ -11,8 +11,8 @@ from flashinfer import (
     autotune,
     mm_mxfp8_dynamic_quant,
     mxfp8_quantize,
+    prepare_mxfp8_trtllm_weights,
     shuffle_matrix_a,
-    shuffle_matrix_sf_a,
 )
 from flashinfer.autotuner import (
     AutoTuner,
@@ -59,11 +59,10 @@ def test_trtllm_dynamic_quant_buckets_match_lookup_mapping() -> None:
     assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(3) == 3
     assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(32) == 32
     assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(33) == 64
-    fixed_spec = gemm_base._MM_MXFP8_TRTLLM_TUNING_CONFIG.dynamic_tensor_specs[0]
     dynamic_spec = gemm_base._MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG.dynamic_tensor_specs[
         0
     ]
-    assert fixed_spec is dynamic_spec
+    assert dynamic_spec.map_to_tuning_buckets(3) == 3
 
 
 def test_trtllm_dynamic_quant_buckets_keep_low_m_exact() -> None:
@@ -100,10 +99,12 @@ def test_dynamic_quant_runner_selects_module_for_tensor_device(
         return FakeModule()
 
     monkeypatch.setattr(gemm_base, "get_trtllm_gemm_module", get_module)
+    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: (10, 3))
 
-    gemm_base._TrtllmDynamicQuantMxfp8Runner(torch.device("cuda:1"), True)
+    runner = gemm_base._TrtllmDynamicQuantMxfp8Runner(torch.device("cuda:1"))
 
     assert requested_devices == [torch.device("cuda:1")]
+    assert runner.get_cache_key_extras([]) == ((10, 3),)
 
 
 def test_dynamic_quant_trace_unshuffles_trtllm_rows() -> None:
@@ -113,20 +114,35 @@ def test_dynamic_quant_trace_unshuffles_trtllm_rows() -> None:
 
 
 def _prepare_trtllm_weight(
-    n: int, k: int
+    n: int, k: int, device: torch.device | str = "cuda"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    weight = torch.randn((n, k), device=device, dtype=torch.bfloat16)
+    weight_q, weight_sf = mxfp8_quantize(
+        weight,
+        sf_swizzle_layout=SfLayout.layout_linear,
+    )
+    weight_q, weight_sf = prepare_mxfp8_trtllm_weights(weight_q, weight_sf)
+    return weight, weight_q, weight_sf
+
+
+def test_prepare_mxfp8_trtllm_weights_pads_non_128_aligned_n(
+    blackwell_cuda: None,
+) -> None:
+    n, k = 160, 256
     weight = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
     weight_q, weight_sf = mxfp8_quantize(
         weight,
         sf_swizzle_layout=SfLayout.layout_linear,
     )
-    weight_q = shuffle_matrix_a(weight_q, 128).reshape(n, k)
-    weight_sf = shuffle_matrix_sf_a(
-        weight_sf.reshape(n, k // 32),
-        128,
-        num_elts_per_sf=32,
-    ).reshape(-1)
-    return weight, weight_q.T, weight_sf
+
+    b, b_sf = prepare_mxfp8_trtllm_weights(weight_q, weight_sf)
+
+    assert b.shape == (k, n)
+    assert b.stride() == (1, k)
+    assert b_sf.shape == (256 * (k // 32),)
+    a = torch.randn((3, k), device="cuda", dtype=torch.bfloat16)
+    actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
+    assert _cosine_similarity(a @ weight.T, actual) > _MIN_COSINE_SIMILARITY
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -226,10 +242,10 @@ def test_mm_mxfp8_dynamic_quant_matches_bf16(
 
 
 class _RecordingTuner:
-    def __init__(self, selected_runner: int) -> None:
-        self.selected_runner = selected_runner
-        self.extras: list[tuple[bool]] = []
-        self.tactics: list[list[int]] = []
+    def __init__(self, selected_tactic: tuple[bool, int]) -> None:
+        self.selected_tactic = selected_tactic
+        self.extras: list[tuple[Any, ...]] = []
+        self.tactics: list[list[Any]] = []
 
     def choose_one(
         self,
@@ -249,25 +265,24 @@ class _RecordingTuner:
         )
         self.extras = [runner.get_cache_key_extras(inputs) for runner in runners]
         self.tactics = [runner.get_valid_tactics(inputs, profile) for runner in runners]
-        return runners[self.selected_runner], -1
+        return runners[0], self.selected_tactic
 
 
 @pytest.mark.parametrize(
-    "m, selected_runner, expected_extras, selected_layout",
+    "m, selected_tactic, selected_layout",
     [
-        (4, 0, [(True,), (False,)], SfLayout.layout_8x4),
-        (33, 1, [(True,), (False,)], SfLayout.layout_128x4),
+        (4, (True, 0), SfLayout.layout_8x4),
+        (33, (False, 0), SfLayout.layout_128x4),
     ],
 )
 def test_mm_mxfp8_dynamic_quant_offers_both_layouts(
     m: int,
-    selected_runner: int,
-    expected_extras: list[tuple[bool]],
+    selected_tactic: tuple[bool, int],
     selected_layout: SfLayout,
     monkeypatch: pytest.MonkeyPatch,
     blackwell_cuda: None,
 ) -> None:
-    recorder = _RecordingTuner(selected_runner)
+    recorder = _RecordingTuner(selected_tactic)
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: recorder))
 
     a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16)
@@ -286,8 +301,9 @@ def test_mm_mxfp8_dynamic_quant_offers_both_layouts(
 
     mm_mxfp8_dynamic_quant(a, b, b_sf)
 
-    assert recorder.extras == expected_extras
-    assert all(recorder.tactics)
+    assert recorder.extras == [(get_compute_capability(a.device),)]
+    assert len(recorder.tactics) == 1
+    assert {use_8x4 for use_8x4, _ in recorder.tactics[0]} == {True, False}
     assert quantized_layouts == [selected_layout]
 
 
@@ -333,9 +349,27 @@ def test_mm_mxfp8_dynamic_quant_cache_round_trip(
         cached = mm_mxfp8_dynamic_quant(a, b, b_sf)
 
     payload = json.loads(cache_path.read_text())
-    assert any("mxfp8_dynamic_quant_gemm" in key for key in payload)
+    dynamic_keys = [key for key in payload if "mxfp8_dynamic_quant_gemm" in key]
+    assert len(dynamic_keys) == 1
     assert cache_hits == [True]
     torch.testing.assert_close(cached, tuned, rtol=0, atol=0)
+
+
+def test_mm_mxfp8_dynamic_quant_uses_tensor_device_context(
+    blackwell_cuda: None,
+) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+
+    original_device = torch.cuda.current_device()
+    target_device = torch.device("cuda:1" if original_device == 0 else "cuda:0")
+    a = torch.randn((3, 4096), device=target_device, dtype=torch.bfloat16)
+    _, b, b_sf = _prepare_trtllm_weight(2688, 4096, target_device)
+
+    actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
+
+    assert actual.device == target_device
+    assert torch.cuda.current_device() == original_device
 
 
 def test_mm_mxfp8_dynamic_quant_cuda_graph_replay(blackwell_cuda: None) -> None:
