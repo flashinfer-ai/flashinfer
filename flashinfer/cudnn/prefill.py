@@ -6,15 +6,24 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
+from ..utils import log2e
 from .utils import get_cudnn_fmha_gen_module
 
 try:
     import cudnn
 
     CUDNN_AVAILABLE = True
+    # Narrow "this config isn't supported" signal from the cuDNN frontend. The
+    # direct/mixed cu_seq_len path is guarded by a version compare, but that gate
+    # can be optimistic (e.g. a dev frontend whose package version overstates its
+    # compiled cuDNN); catching this lets such a build fall back to the legacy
+    # element-conversion path instead of failing. Only this narrow error triggers
+    # fallback -- real errors propagate.
+    _CUDNN_UNSUPPORTED_ERRORS = (cudnn.cudnnGraphNotSupportedError,)
 except Exception:
     cudnn = None
     CUDNN_AVAILABLE = False
+    _CUDNN_UNSUPPORTED_ERRORS = ()
 
 
 @functools.cache
@@ -715,6 +724,11 @@ def _batch_prefill_with_kv_cache(
     graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     if return_lse:
+        # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
+        # backend returns base-2 LSE (they fold log2e into the softmax scale, so
+        # their kernels emit base-2 directly). Convert here so the cuDNN backend
+        # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
+        lse.mul_(log2e)
         return out, lse
     else:
         return out, None
@@ -995,36 +1009,53 @@ def cudnn_batch_prefill_with_kv_cache(
             if use_direct:
                 # The token-unit q indptr is both cu_seq_len_q and the Q/O
                 # ragged offset (per-tensor multipliers applied in the builder).
-                run_kwargs["cu_seq_lens_q"] = batch_offsets_q
+                # Probe the actual build: the version gate above can be optimistic,
+                # so if cuDNN rejects the direct/mixed graph as unsupported, fall
+                # back to the legacy element-conversion path below rather than
+                # failing the call. (A build failure happens before execute, so
+                # out/lse are untouched and the fallback is clean.)
+                direct_kwargs = dict(run_kwargs)
+                direct_kwargs["cu_seq_lens_q"] = batch_offsets_q
                 if block_tables is None:
-                    run_kwargs["cu_seq_lens_kv"] = batch_offsets_k
+                    direct_kwargs["cu_seq_lens_kv"] = batch_offsets_k
                 # Paged: KV masked by actual_seq_lens_kv (already in run_kwargs);
                 # batch_offsets_k/v stay None.
-            else:
-                # Old cuDNN/frontend or paged: convert the token-unit indptrs
-                # to the element units the legacy graph expects. Names are
-                # rebound, not mutated, so the aliasing defaults above (o from
-                # q, v from k) still read the original token-unit buffers.
+                try:
+                    return _batch_prefill_with_kv_cache(
+                        **direct_kwargs,
+                        batch_offsets_q=batch_offsets_q,
+                        batch_offsets_o=batch_offsets_o,
+                        batch_offsets_k=batch_offsets_k,
+                        batch_offsets_v=batch_offsets_v,
+                        batch_offsets_stats=batch_offsets_stats,
+                    )
+                except _CUDNN_UNSUPPORTED_ERRORS:
+                    pass
 
-                # The legacy graph's padding mask needs per-request lengths;
-                # derive them from the token-unit indptrs when omitted.
-                if actual_seq_lens_q is None:
-                    run_kwargs["actual_seq_lens_q"] = (
-                        batch_offsets_q[1:] - batch_offsets_q[:-1]
-                    ).view(-1, 1, 1, 1)
-                if actual_seq_lens_kv is None:
-                    run_kwargs["actual_seq_lens_kv"] = (
-                        batch_offsets_k[1:] - batch_offsets_k[:-1]
-                    ).view(-1, 1, 1, 1)
+            # Old cuDNN/frontend, unsupported direct build, or paged fallback:
+            # convert the token-unit indptrs to the element units the legacy graph
+            # expects. Names are rebound, not mutated, so the aliasing defaults
+            # above (o from q, v from k) still read the original token-unit buffers.
 
-                def apply_multiplier(offsets, multiplier):
-                    return offsets * multiplier if offsets is not None else None
+            # The legacy graph's padding mask needs per-request lengths;
+            # derive them from the token-unit indptrs when omitted.
+            if actual_seq_lens_q is None:
+                run_kwargs["actual_seq_lens_q"] = (
+                    batch_offsets_q[1:] - batch_offsets_q[:-1]
+                ).view(-1, 1, 1, 1)
+            if actual_seq_lens_kv is None:
+                run_kwargs["actual_seq_lens_kv"] = (
+                    batch_offsets_k[1:] - batch_offsets_k[:-1]
+                ).view(-1, 1, 1, 1)
 
-                batch_offsets_q = apply_multiplier(batch_offsets_q, h_qo * d_qk)
-                batch_offsets_o = apply_multiplier(batch_offsets_o, h_qo * d_vo)
-                batch_offsets_k = apply_multiplier(batch_offsets_k, h_kv * d_qk)
-                batch_offsets_v = apply_multiplier(batch_offsets_v, h_kv * d_vo)
-                batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
+            def apply_multiplier(offsets, multiplier):
+                return offsets * multiplier if offsets is not None else None
+
+            batch_offsets_q = apply_multiplier(batch_offsets_q, h_qo * d_qk)
+            batch_offsets_o = apply_multiplier(batch_offsets_o, h_qo * d_vo)
+            batch_offsets_k = apply_multiplier(batch_offsets_k, h_kv * d_qk)
+            batch_offsets_v = apply_multiplier(batch_offsets_v, h_kv * d_vo)
+            batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
 
         return _batch_prefill_with_kv_cache(
             **run_kwargs,
