@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+from flashinfer.moe_ep import (
+    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+)
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     MegaMoEBf16Mxfp8Config,
@@ -62,6 +65,18 @@ def test_mixed_backend_is_registered():
     assert backend.kernel_name() == "sm100_bf16_mxfp8_bf16_cutedsl"
 
 
+def test_mixed_config_inherits_bf16_options():
+    config = Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        gate_up_clamp=1.5,
+        in_kernel_fc2_reduce=True,
+    )
+    assert isinstance(config, Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig)
+    assert config.gate_up_clamp == 1.5
+    assert config.in_kernel_fc2_reduce
+
+
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("kind", "weight_dtype"),
@@ -86,7 +101,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
         pytest.skip("PyTorch lacks E8M0 support required by the mixed reference")
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (

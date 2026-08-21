@@ -12,8 +12,11 @@ from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_mxfp8_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
 from ......weights import MoEWeightPack
+from ..common.bf16_staging import (
+    stage_mega_moe_inputs,
+    validate_bf16_forward_inputs,
+)
 from .config import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_bf16_forward_inputs
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
