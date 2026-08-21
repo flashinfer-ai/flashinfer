@@ -138,7 +138,13 @@ def _validate_mm_bf16_swiglu_tensors(
 
     m, k = (int(dim) for dim in a.shape)
     if not 1 <= m <= _MAX_M:
-        raise ValueError(f"mm_bf16_swiglu requires 1 <= M <= {_MAX_M}; got M={m}")
+        raise ValueError(
+            f"mm_bf16_swiglu requires 1 <= M <= {_MAX_M}; got M={m}. Above the "
+            "cap the tile selector degrades badly, and this op cannot fall back "
+            "internally because it only holds the interleaved weight. Use "
+            "mm_bf16 followed by silu_and_mul on the canonical (2 * N, K) "
+            "weight instead."
+        )
     if int(b.shape[0]) != k:
         raise ValueError(
             f"incompatible shapes: a is {tuple(a.shape)}, b is {tuple(b.shape)}"
@@ -227,6 +233,19 @@ def mm_bf16_swiglu(
     count and L2 capacity, not by profiling, so this op is not registered
     with the autotuner and :func:`flashinfer.autotuner.autotune` has no
     effect on it.
+
+    ``M`` is capped at 64 rather than falling back to an unfused path,
+    because ``b`` is interleaved and the unfused composition needs the
+    canonical weight this function never receives.  **Retain the canonical
+    ``(2 * N, K)`` weight** if the caller can exceed the cap; the fallback is
+    :func:`~flashinfer.gemm.mm_bf16` on it followed by
+    :func:`~flashinfer.activation.silu_and_mul`.  The cap itself is not a
+    hardware limit: past it a wide ``N`` can leave no tile satisfying either
+    the one-wave or the L2-residency bound, and the tile selector then
+    degrades badly.
+
+    TODO(@mattteochen): rank tiles by weight traffic once neither bound is
+    satisfiable, then raise or drop the cap entirely.
 
     Parameters
     ----------
