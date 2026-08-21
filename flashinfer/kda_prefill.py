@@ -93,6 +93,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "persistent_m128",
                 "small_bh_m128",
                 "m128_unbounded_softplus",
+                "m128_bt64_unbounded_softplus",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -112,7 +113,7 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial
-    state, beta padding, and schedule-specific M64/M128-N32/M128-N16 TMA
+    state, beta padding, and schedule-specific M64/M128-N32/M128-N16/BT64 TMA
     descriptor storage and small-BH packet-ring storage for the lifetime of
     the graph. Persistent M128 is an
     eager-only B200/GB200 route; explicit workspaces use direct M128 or M64 so graph
@@ -371,8 +372,11 @@ def _select_flash_kda_prefill_variant(
     use_small_bh_m128: bool = False,
     use_exact_n16: bool = False,
     unbounded_softplus: bool = False,
+    use_bt64_unbounded_softplus: bool = False,
 ) -> "FlashKDAVariant | CakeKDAVariant":
     if unbounded_softplus:
+        if use_bt64_unbounded_softplus:
+            return "m128_bt64_unbounded_softplus"
         return "m128_unbounded_softplus"
     if num_heads == 12 or use_exact_n16:
         return "m128_n16"
@@ -1227,6 +1231,12 @@ def _run_flash_kda_prefill(
         use_small_bh_m128=small_bh_candidate,
         use_exact_n16=use_exact_n16,
         unbounded_softplus=lower_bound is None,
+        use_bt64_unbounded_softplus=(
+            lower_bound is None
+            and num_heads == 4
+            and checkpoint_every_n_tokens > 0
+            and checkpoint_every_n_tokens % 64 == 0
+        ),
     )
     if fixed_layout:
         cu_seqlens_i64 = _fixed_cu_seqlens(
@@ -1406,7 +1416,10 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        if variant == "m128_unbounded_softplus":
+        if variant in (
+            "m128_unbounded_softplus",
+            "m128_bt64_unbounded_softplus",
+        ):
             module = _get_cake_kda_prefill_module(
                 variant, _select_cake_kda_prefill_target(q.device)
             )

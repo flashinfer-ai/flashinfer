@@ -30,6 +30,7 @@ kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
+cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
 
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
@@ -39,6 +40,30 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
     )
     assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
+
+
+def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
+    assert cake_kda_jit_api.CAKE_KDA_VARIANTS == (
+        "m128_unbounded_softplus",
+        "m128_bt64_unbounded_softplus",
+    )
+    for target in ("sm100a", "sm103a"):
+        n32_uri = cake_kda_jit_api.get_cake_kda_uri(
+            "m128_unbounded_softplus", target
+        )
+        bt64_uri = cake_kda_jit_api.get_cake_kda_uri(
+            "m128_bt64_unbounded_softplus", target
+        )
+        assert n32_uri != bt64_uri
+        assert bt64_uri.endswith(f"_d5674b35de_{target}")
+    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    assert (
+        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu"
+    ).is_file()
+    assert (
+        csrc_dir
+        / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
+    ).is_file()
 
 
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
@@ -973,6 +998,25 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
 def test_variant_selector_exposes_specialized_routes_only_when_requested():
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+        )
+        == "m128_unbounded_softplus"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+            use_bt64_unbounded_softplus=True,
+        )
+        == "m128_bt64_unbounded_softplus"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=True,
             num_sequences=1,
             num_heads=8,
@@ -1303,6 +1347,75 @@ def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
     (args,) = module.calls
     assert len(args) == 28
     assert args[18] == num_heads
+    assert args[26] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens", "checkpoint_cu_starts", "expected"),
+    [
+        (4, 64, [0, 2, 5], "m128_bt64_unbounded_softplus"),
+        (4, 32, [0, 3, 8], "m128_unbounded_softplus"),
+        (8, 64, [0, 2, 5], "m128_unbounded_softplus"),
+    ],
+)
+def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
+    cuda_device,
+    monkeypatch,
+    num_heads,
+    checkpoint_every_n_tokens,
+    checkpoint_cu_starts,
+    expected,
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_cake_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
+    )
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=num_heads,
+        packed=True,
+    )
+    checkpoint_cu_starts_tensor = torch.tensor(
+        checkpoint_cu_starts, dtype=torch.int64, device=cuda_device
+    )
+    state_checkpoints = torch.empty(
+        (checkpoint_cu_starts[-1], num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=cuda_device,
+    )
+
+    output, state, returned_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts_tensor,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert returned_checkpoints is state_checkpoints
+    assert routes == [(expected, "sm100a")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[14].data_ptr() == state_checkpoints.data_ptr()
+    assert args[15].data_ptr() == checkpoint_cu_starts_tensor.data_ptr()
+    assert args[18] == num_heads
+    assert args[24] == checkpoint_every_n_tokens
     assert args[26] == 0.0
 
 
