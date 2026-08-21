@@ -75,7 +75,8 @@ struct SM120BlockScalingMMAConfig {
 
 template <int TileM_ = 128, int TileN_ = 128, int TileK_ = 128, int Stages_ = 4,
           int ScaleGranularityM_ = 1, int ScaleGranularityN_ = 128, int ScaleGranularityK_ = 128,
-          sm120_common::GemmType GemmType_ = sm120_common::GemmType::Normal, bool SwapAB_ = false>
+          sm120_common::GemmType GemmType_ = sm120_common::GemmType::Normal,
+          bool SwapAB_ = false>
 struct SM120BlockScalingBuilder {
   using ElementA = cute::float_e4m3_t;
   using ElementB = cute::float_e4m3_t;
@@ -90,9 +91,7 @@ struct SM120BlockScalingBuilder {
                                        GemmType_ == sm120_common::GemmType::MGroupedMasked);
   static constexpr bool kUseTmaStore =
       sm120_common::utils::EnableTmaStore<kFlat, kSwapAB, TileN_, kPerBatchAB>();
-  static constexpr bool kUseStagedR2G =
-      GemmType_ == sm120_common::GemmType::MGroupedContiguousWithZeroPadding && !SwapAB_ &&
-      TileM_ >= 64;
+  static constexpr bool kUseStagedR2G = false;
   static constexpr bool kUnionSmem = !kUseTmaStore && !kUseStagedR2G;
   static constexpr int AB_Stages = Stages_;
   static constexpr uint32_t LoadRegisterRequirement = kUseStagedR2G ? 88 : 40;
