@@ -29,9 +29,7 @@ from flashinfer.mamba import SSDCombined
 
 
 def _load_cake_benchmark_module():
-    path = (
-        Path(__file__).parents[2] / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
-    )
+    path = Path(__file__).parents[2] / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
     spec = importlib.util.spec_from_file_location("bench_cake_mamba_ssd_combined", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -309,15 +307,23 @@ def test_cake_ssd_combined_updates_caller_buffers():
     torch.testing.assert_close(actual_cumsum, preserved_cumsum, rtol=0, atol=0)
 
 
-def test_cake_ssd_combined_writes_selected_checkpoint_state():
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen"))
+def test_cake_ssd_combined_writes_selected_checkpoint_state(varlen, state_dtype):
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
-    constructor, tensors, arguments = _case(varlen=True)
-    sequence_start = 96
+    constructor, tensors, arguments = _case(
+        varlen=varlen,
+        state_dtype=state_dtype,
+    )
+    sequence_index = 1 if varlen else 0
+    sequence_start = 96 if varlen else 0
     checkpoint_length = 128
-    checkpoint_token = sequence_start + checkpoint_length
+    checkpoint_token = (
+        sequence_start + checkpoint_length if varlen else checkpoint_length
+    )
     checkpoint_states = torch.full(
         (3, *arguments["initial_states"].shape[1:]),
         torch.nan,
@@ -325,43 +331,78 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state():
         device="cuda",
     )
     checkpoint_state = checkpoint_states[2:3]
-    full_arguments = {
-        **arguments,
-        # Expose sequence 1's checkpoint inside physical chunk 1 as a logical
-        # segment boundary. This is the packed shape used by SGLang.
-        "chunk_indices": torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda"),
-        "chunk_offsets": torch.tensor([0, 96, 0, 96], dtype=torch.int32, device="cuda"),
-        "seq_chunk_cumsum": torch.tensor([0, 1, 4], dtype=torch.int32, device="cuda"),
-        "checkpoint_token_indices": torch.tensor(
-            [-1, checkpoint_token], dtype=torch.int32, device="cuda"
-        ),
-        "checkpoint_state_slots": torch.tensor(
-            [-1, 2], dtype=torch.int32, device="cuda"
-        ),
-        "checkpoint_states": checkpoint_states,
-    }
+    if varlen:
+        full_arguments = {
+            **arguments,
+            # Expose sequence 1's checkpoint inside physical chunk 1 as a logical
+            # segment boundary. This is the packed shape used by SGLang.
+            "chunk_indices": torch.tensor(
+                [0, 0, 1, 1], dtype=torch.int32, device="cuda"
+            ),
+            "chunk_offsets": torch.tensor(
+                [0, 96, 0, 96], dtype=torch.int32, device="cuda"
+            ),
+            "seq_chunk_cumsum": torch.tensor(
+                [0, 1, 4], dtype=torch.int32, device="cuda"
+            ),
+            "checkpoint_token_indices": torch.tensor(
+                [-1, checkpoint_token], dtype=torch.int32, device="cuda"
+            ),
+            "checkpoint_state_slots": torch.tensor(
+                [-1, 2], dtype=torch.int32, device="cuda"
+            ),
+            "checkpoint_states": checkpoint_states,
+        }
+    else:
+        full_arguments = {
+            **arguments,
+            "checkpoint_token_indices": torch.tensor(
+                [checkpoint_token, -1], dtype=torch.int32, device="cuda"
+            ),
+            "checkpoint_state_slots": torch.tensor(
+                [2, -1], dtype=torch.int32, device="cuda"
+            ),
+            "checkpoint_states": checkpoint_states,
+        }
     SSDCombined(**constructor, backend="cake").run(*tensors, **full_arguments)
 
     x, dt, A, B, C = tensors
     prefix_tensors = (
-        x[:, sequence_start:checkpoint_token].contiguous(),
-        dt[:, sequence_start:checkpoint_token].contiguous(),
+        x[
+            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+        ].contiguous(),
+        dt[
+            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+        ].contiguous(),
         A,
-        B[:, sequence_start:checkpoint_token].contiguous(),
-        C[:, sequence_start:checkpoint_token].contiguous(),
+        B[
+            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+        ].contiguous(),
+        C[
+            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+        ].contiguous(),
     )
     prefix_arguments = {
         **arguments,
-        "z": arguments["z"][:, sequence_start:checkpoint_token].contiguous(),
-        "initial_states": arguments["initial_states"][1:2].contiguous(),
-        "seq_idx": torch.zeros(
-            (1, checkpoint_length), dtype=torch.int32, device="cuda"
-        ),
-        "chunk_indices": torch.zeros(1, dtype=torch.int32, device="cuda"),
-        "chunk_offsets": torch.zeros(1, dtype=torch.int32, device="cuda"),
-        "seq_chunk_cumsum": torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        "z": arguments["z"][
+            sequence_index : sequence_index + 1,
+            sequence_start:checkpoint_token,
+        ].contiguous(),
+        "initial_states": arguments["initial_states"][
+            sequence_index : sequence_index + 1
+        ].contiguous(),
     }
-    _, expected_state = SSDCombined(**constructor, backend="cute").run(
+    prefix_constructor = {**constructor, "has_varlen": varlen}
+    if varlen:
+        prefix_arguments.update(
+            seq_idx=torch.zeros(
+                (1, checkpoint_length), dtype=torch.int32, device="cuda"
+            ),
+            chunk_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            chunk_offsets=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            seq_chunk_cumsum=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        )
+    _, expected_state = SSDCombined(**prefix_constructor, backend="cute").run(
         *prefix_tensors, **prefix_arguments
     )
     torch.testing.assert_close(
@@ -542,6 +583,46 @@ def test_cake_ssd_combined_public_seq_chunk_cumsum_helpers():
 
     assert returned is actual
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    allocated = runner.compute_seq_chunk_cumsum(
+        seq_idx,
+        chunk_indices,
+        chunk_offsets,
+        128,
+        2,
+        seq_chunk_cumsum=None,
+        tile_state=None,
+    )
+    torch.testing.assert_close(allocated, expected, rtol=0, atol=0)
+
+    num_seqs = 2048
+    multiblock_seq_idx = (
+        torch.arange(num_seqs, dtype=torch.int32, device="cuda")
+        .repeat_interleave(128)
+        .unsqueeze(0)
+    )
+    multiblock_chunk_indices = torch.arange(num_seqs, dtype=torch.int32, device="cuda")
+    multiblock_chunk_offsets = torch.zeros(num_seqs, dtype=torch.int32, device="cuda")
+    multiblock_expected = torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda")
+    multiblock_actual = torch.full_like(multiblock_expected, -1)
+    multiblock_tile_state_bytes = runner.tile_state_size(num_seqs)
+    assert multiblock_tile_state_bytes > 0
+    multiblock_tile_state = torch.empty(
+        multiblock_tile_state_bytes, dtype=torch.uint8, device="cuda"
+    )
+
+    multiblock_returned = runner.compute_seq_chunk_cumsum(
+        multiblock_seq_idx,
+        multiblock_chunk_indices,
+        multiblock_chunk_offsets,
+        128,
+        num_seqs,
+        seq_chunk_cumsum=multiblock_actual,
+        tile_state=multiblock_tile_state,
+    )
+
+    assert multiblock_returned is multiblock_actual
+    torch.testing.assert_close(multiblock_actual, multiblock_expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("invalid", ["a_dtype", "out_shape"])
@@ -955,6 +1036,10 @@ def _public_runner_without_constructor(backend, cake_result=None):
     runner = object.__new__(SSDCombined)
     runner.chunk_size = 128
     runner._backend = backend
+    runner._io_torch_dtype = torch.bfloat16
+    runner._state_torch_dtype = torch.bfloat16
+    runner._has_d = False
+    runner._has_init_states = False
 
     class CakeRunner:
         def __init__(self):
@@ -982,20 +1067,17 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
     runner = _public_runner_without_constructor("cake", result)
     tensors = _cpu_public_run_inputs()
     sentinels = {
-        name: object()
-        for name in (
-            "D",
-            "z",
-            "dt_bias",
-            "initial_states",
-            "seq_idx",
-            "chunk_indices",
-            "chunk_offsets",
-            "seq_chunk_cumsum",
-            "checkpoint_token_indices",
-            "checkpoint_state_slots",
-            "checkpoint_states",
-        )
+        "D": torch.empty(2, dtype=torch.bfloat16),
+        "z": torch.empty((1, 128, 2, 64), dtype=torch.bfloat16),
+        "dt_bias": object(),
+        "initial_states": torch.empty((1, 2, 64, 128), dtype=torch.bfloat16),
+        "seq_idx": torch.zeros((1, 128), dtype=torch.int32),
+        "chunk_indices": torch.zeros(1, dtype=torch.int32),
+        "chunk_offsets": torch.zeros(1, dtype=torch.int32),
+        "seq_chunk_cumsum": object(),
+        "checkpoint_token_indices": object(),
+        "checkpoint_state_slots": object(),
+        "checkpoint_states": object(),
     }
     out = torch.empty((1, 2, 64, 1, 128), dtype=torch.bfloat16)
     kwargs = {
@@ -1022,6 +1104,20 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         ("out_shape", AssertionError),
         ("out_dtype", AssertionError),
         ("out_contiguous", AssertionError),
+        ("x_dtype", AssertionError),
+        ("b_dtype", AssertionError),
+        ("c_dtype", AssertionError),
+        ("d_dtype", AssertionError),
+        ("z_dtype", AssertionError),
+        ("initial_dtype", AssertionError),
+        ("seq_idx_shape", AssertionError),
+        ("seq_idx_dtype", AssertionError),
+        ("chunk_indices_ndim", AssertionError),
+        ("chunk_indices_dtype", AssertionError),
+        ("chunk_offsets_ndim", AssertionError),
+        ("chunk_offsets_dtype", AssertionError),
+        ("chunk_vector_shape", AssertionError),
+        ("varlen_initial", ValueError),
     ),
 )
 def test_source_public_shared_validation_error_parity_without_gpu(invalid, exception):
@@ -1038,14 +1134,56 @@ def test_source_public_shared_validation_error_parity_without_gpu(invalid, excep
         kwargs["out"] = torch.empty((1,), dtype=torch.bfloat16)
     elif invalid == "out_dtype":
         kwargs["out"] = torch.empty((1, 2, 64, 1, 128), dtype=torch.float16)
-    else:
+    elif invalid == "out_contiguous":
         storage = torch.empty((1, 2, 64, 1, 129), dtype=torch.bfloat16)
         kwargs["out"] = storage[..., :128]
         assert not kwargs["out"].is_contiguous()
+    elif invalid in {"x_dtype", "b_dtype", "c_dtype"}:
+        tensor_index = {"x_dtype": 0, "b_dtype": 3, "c_dtype": 4}[invalid]
+        tensors = (
+            *tensors[:tensor_index],
+            tensors[tensor_index].to(torch.float16),
+            *tensors[tensor_index + 1 :],
+        )
+    elif invalid == "d_dtype":
+        kwargs["D"] = torch.empty(2, dtype=torch.float16)
+    elif invalid == "z_dtype":
+        kwargs["z"] = torch.empty_like(tensors[0], dtype=torch.float16)
+    elif invalid == "initial_dtype":
+        kwargs["initial_states"] = torch.empty((1, 2, 64, 128), dtype=torch.float16)
+    else:
+        seq_idx = torch.empty((1, 128), dtype=torch.int32)
+        chunk_indices = torch.zeros(1, dtype=torch.int32)
+        chunk_offsets = torch.zeros(1, dtype=torch.int32)
+        if invalid == "seq_idx_shape":
+            seq_idx = torch.empty((2, 128), dtype=torch.int32)
+        elif invalid == "seq_idx_dtype":
+            seq_idx = torch.empty((1, 128), dtype=torch.float32)
+        elif invalid == "chunk_indices_ndim":
+            chunk_indices = torch.zeros((1, 1), dtype=torch.int32)
+        elif invalid == "chunk_indices_dtype":
+            chunk_indices = torch.zeros(1, dtype=torch.int64)
+        elif invalid == "chunk_offsets_ndim":
+            chunk_offsets = torch.zeros((1, 1), dtype=torch.int32)
+        elif invalid == "chunk_offsets_dtype":
+            chunk_offsets = torch.zeros(1, dtype=torch.int64)
+        elif invalid == "chunk_vector_shape":
+            chunk_offsets = torch.zeros(2, dtype=torch.int32)
+        kwargs.update(
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+        if invalid != "varlen_initial":
+            kwargs["initial_states"] = torch.empty(
+                (1, 2, 64, 128), dtype=torch.bfloat16
+            )
 
     errors = {}
     for backend in ("cute", "cake"):
         runner = _public_runner_without_constructor(backend)
+        runner._has_d = invalid == "d_dtype"
+        runner._has_init_states = invalid == "initial_dtype"
         with pytest.raises(exception) as exc_info:
             runner.run(*tensors, **kwargs)
         errors[backend] = (type(exc_info.value), str(exc_info.value))
@@ -1182,8 +1320,6 @@ def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, 
     monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
     monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
     cake_runner = _source_cake_runner_without_constructor()
-    runner = _public_runner_without_constructor("cake")
-    runner._cake_runner = cake_runner
     tensors = list(_cpu_public_run_inputs(batch=2))
     kwargs = {}
 
@@ -1211,9 +1347,7 @@ def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, 
     elif invalid == "varlen_metadata":
         cake_runner.has_initial_states = True
         cake_runner.has_varlen = True
-        kwargs["initial_states"] = torch.empty(
-            (2, 2, 64, 128), dtype=torch.bfloat16
-        )
+        kwargs["initial_states"] = torch.empty((2, 2, 64, 128), dtype=torch.bfloat16)
     elif invalid == "batched_metadata":
         kwargs["seq_idx"] = torch.empty((2, 128), dtype=torch.int32)
     elif invalid == "batched_cumsum":
@@ -1227,9 +1361,7 @@ def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, 
         )
     elif invalid == "initial_dtype":
         cake_runner.has_initial_states = True
-        kwargs["initial_states"] = torch.empty(
-            (2, 2, 64, 128), dtype=torch.float16
-        )
+        kwargs["initial_states"] = torch.empty((2, 2, 64, 128), dtype=torch.float16)
     elif invalid in {"d_shape", "d_dtype"}:
         cake_runner.has_d = True
         kwargs["D"] = torch.empty(
@@ -1268,7 +1400,7 @@ def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, 
             kwargs["seq_chunk_cumsum"] = torch.empty(3, dtype=torch.int64)
 
     with pytest.raises(ValueError, match=match):
-        runner.run(*tensors, **kwargs)
+        cake_runner.run(*tensors, **kwargs)
 
 
 def _source_cute_runner_without_constructor():
@@ -1361,9 +1493,7 @@ def test_source_public_cute_backend_validation_without_gpu(
         kwargs["z"] = torch.empty_like(tensors[0], dtype=torch.float16)
     elif invalid == "initial_dtype":
         runner._has_init_states = True
-        kwargs["initial_states"] = torch.empty(
-            (2, 2, 64, 128), dtype=torch.float16
-        )
+        kwargs["initial_states"] = torch.empty((2, 2, 64, 128), dtype=torch.float16)
     elif invalid == "varlen_initial":
         kwargs.update(
             seq_idx=seq_idx,

@@ -312,6 +312,7 @@ class SSDCombined:
         self._has_init_states = has_initial_states
         self._has_varlen = has_varlen
         self._has_z = has_z
+        self._io_torch_dtype = io_dtype
         self._state_torch_dtype = state_dtype
         self._backend = backend
 
@@ -355,7 +356,6 @@ class SSDCombined:
         self._state_dtype = _state_dtype_map[state_dtype]
         self._cumsum_dtype = cutlass.Float32
         self._acc_dtype = cutlass.Float32
-        self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
 
         # Resolve seq_idx dtype
         _seq_idx_dtype_map = {
@@ -589,6 +589,67 @@ class SSDCombined:
                 "out must be contiguous in (B, EH, D, C, L) layout"
             )
 
+        io_torch_dtype = self._io_torch_dtype
+        assert x.dtype == io_torch_dtype, (
+            f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
+        )
+        assert B.dtype == io_torch_dtype, (
+            f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
+        )
+        assert C.dtype == io_torch_dtype, (
+            f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
+        )
+        if self._has_d and D is not None:
+            assert D.dtype == io_torch_dtype, (
+                f"D dtype {D.dtype} doesn't match io_dtype {io_torch_dtype}"
+            )
+        if z is not None:
+            assert z.dtype == io_torch_dtype, (
+                f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
+            )
+        if self._has_init_states and initial_states is not None:
+            assert initial_states.dtype == self._state_torch_dtype, (
+                f"init_states dtype {initial_states.dtype} doesn't match "
+                f"state_dtype {self._state_torch_dtype}"
+            )
+        if seq_idx is not None:
+            assert seq_idx.shape == (batch, seqlen), (
+                f"seq_idx shape {seq_idx.shape} doesn't match "
+                f"(batch={batch}, seqlen={seqlen})"
+            )
+            assert seq_idx.dtype in (torch.int32, torch.int64), (
+                f"seq_idx must be int32 or int64, got {seq_idx.dtype}"
+            )
+        if chunk_indices is not None:
+            assert chunk_indices.dim() == 1, (
+                f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
+            )
+            assert chunk_indices.dtype == torch.int32, (
+                f"chunk_indices must be int32, got {chunk_indices.dtype}"
+            )
+        if chunk_offsets is not None:
+            assert chunk_offsets.dim() == 1, (
+                f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
+            )
+            assert chunk_offsets.dtype == torch.int32, (
+                f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
+            )
+        if chunk_indices is not None and chunk_offsets is not None:
+            assert chunk_indices.shape == chunk_offsets.shape, (
+                "chunk_indices and chunk_offsets must have the same shape, "
+                f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
+            )
+        if (
+            seq_idx is not None
+            and chunk_indices is not None
+            and chunk_offsets is not None
+            and initial_states is None
+        ):
+            raise ValueError(
+                "initial_states must be provided in varlen mode (when seq_idx, "
+                "chunk_indices, and chunk_offsets are given) to determine num_seqs"
+            )
+
         if self._backend == "cake":
             return self._cake_runner.run(
                 x,
@@ -628,35 +689,6 @@ class SSDCombined:
 
         _, _, ngroups, dstate = B.shape
 
-        # Validate varlen arguments
-        if seq_idx is not None:
-            assert seq_idx.shape == (batch, seqlen), (
-                f"seq_idx shape {seq_idx.shape} doesn't match "
-                f"(batch={batch}, seqlen={seqlen})"
-            )
-            assert seq_idx.dtype in (torch.int32, torch.int64), (
-                f"seq_idx must be int32 or int64, got {seq_idx.dtype}"
-            )
-        if chunk_indices is not None:
-            assert chunk_indices.dim() == 1, (
-                f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
-            )
-            assert chunk_indices.dtype == torch.int32, (
-                f"chunk_indices must be int32, got {chunk_indices.dtype}"
-            )
-        if chunk_offsets is not None:
-            assert chunk_offsets.dim() == 1, (
-                f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
-            )
-            assert chunk_offsets.dtype == torch.int32, (
-                f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
-            )
-        if chunk_indices is not None and chunk_offsets is not None:
-            assert chunk_indices.shape == chunk_offsets.shape, (
-                f"chunk_indices and chunk_offsets must have the same shape, "
-                f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
-            )
-
         # Triton kernel outputs dt_processed directly in io_dtype (bf16),
         # avoiding a separate float32->bf16 copy.
         dA_cumsum, dt_processed = chunk_cumsum_fwd(
@@ -684,18 +716,12 @@ class SSDCombined:
 
         # x: (B, seqlen, EH, D) -> (D, L, C, EH, B)
         x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-        assert x.dtype == io_torch_dtype, (
-            f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
-        )
         x_permuted = x_reshaped.permute(4, 2, 1, 3, 0)
 
         # z: same layout as x
         z_permuted = None
         if z is not None:
             z_reshaped = z.reshape(batch, nchunks, chunk_size, nheads, headdim)
-            assert z.dtype == io_torch_dtype, (
-                f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
-            )
             z_permuted = z_reshaped.permute(4, 2, 1, 3, 0)
 
         # dt: already in io_dtype from cumsum kernel
@@ -710,24 +736,15 @@ class SSDCombined:
 
         # B: (B, seqlen, G, N) -> (L, N, C, G, B)
         B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        assert B.dtype == io_torch_dtype, (
-            f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
-        )
         b_permuted = B_reshaped.permute(2, 4, 1, 3, 0)
 
         # C: (B, seqlen, G, N) -> (L, N, C, G, B)
         C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        assert C.dtype == io_torch_dtype, (
-            f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
-        )
         c_permuted = C_reshaped.permute(2, 4, 1, 3, 0)
 
         # D tensor: reshape to match kernel layout
         d_tensor = None
         if self._has_d and D is not None:
-            assert D.dtype == io_torch_dtype, (
-                f"D dtype {D.dtype} doesn't match io_dtype {io_torch_dtype}"
-            )
             if self._d_has_hdim:
                 if D.dim() == 1:
                     # (nheads,) -> (headdim, nheads): broadcast must be materialized
@@ -749,10 +766,6 @@ class SSDCombined:
         # init_states: (B, EH, D, N) -> (N, D, EH, B)
         init_states_permuted = None
         if self._has_init_states and initial_states is not None:
-            assert initial_states.dtype == self._state_torch_dtype, (
-                f"init_states dtype {initial_states.dtype} doesn't match "
-                f"state_dtype {self._state_torch_dtype}"
-            )
             init_states_permuted = initial_states.permute(3, 2, 1, 0)
 
         # out: (B, EH, D, C, L) -> (L, D, C, EH, B)
@@ -775,11 +788,6 @@ class SSDCombined:
             and chunk_indices is not None
             and chunk_offsets is not None
         ):
-            if initial_states is None:
-                raise ValueError(
-                    "initial_states must be provided in varlen mode (when seq_idx, "
-                    "chunk_indices, and chunk_offsets are given) to determine num_seqs"
-                )
             num_seqs = initial_states.shape[0]
             if seq_chunk_cumsum is None or update_seq_chunk_cumsum:
                 seq_chunk_cumsum = self.compute_seq_chunk_cumsum(
