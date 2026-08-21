@@ -33,7 +33,7 @@ def test_bf16_kernel_matches_mega_reference(monkeypatch):
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.weights import (
