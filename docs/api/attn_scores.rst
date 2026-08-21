@@ -11,15 +11,26 @@ KV tokens to keep:
 
 .. math::
 
-  \mathrm{logits}[t, p] = s_p \cdot \sum_h w_{t,h} \cdot \mathrm{relu}\left( q_{t,h} \cdot k_p \right)
+  \mathrm{logits}[t, p] = \sum_h w_{t,h} \cdot \mathrm{relu}\left( q_{t,h} \cdot k_p \right)
 
-Note that the rectifier is applied **per head**, before the weighted sum.
+Two things about that expression are easy to get wrong:
+
+* The rectifier is applied **per head, before** the weighted sum -- not to the
+  summed score. Because the weights may be negative, the result may be too.
+* :func:`fp8_paged_mqa_logits` additionally multiplies by the per-token FP32 KV
+  scale carried in the tail of each ``kv_fused`` row, so its result is
+  :math:`s_p` times the above. :func:`fp4_paged_mqa_logits` has no such
+  per-position factor: MXFP4 block scales are folded into the dequantised
+  values themselves.
 
 .. note::
 
-  The kernels write every position unconditionally and do not apply a
-  causal or context mask. Callers must mask positions beyond each request's
-  context length themselves.
+  Within a request's context the kernels write every position unconditionally
+  and apply no causal or context mask, so callers must mask positions beyond
+  each request's context length themselves. A request with
+  ``context_lens[b] == 0`` is skipped entirely and its output row is never
+  written -- when passing ``out=``, initialise it if you intend to read those
+  rows.
 
 .. currentmodule:: flashinfer
 
