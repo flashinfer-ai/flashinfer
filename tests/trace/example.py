@@ -19,6 +19,7 @@ fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
+gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -779,6 +780,19 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── GDN fused decode step (the registry's SM120 geometry, TP=1) ──────────────
+# Suppressed like the other optional-dependency examples: on a non-SM120 card
+# the op falls back to its composable path (which still traces), and the trace
+# is emitted before any kernel dispatch either way.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.gdn import (  # noqa: PLC0415
+        gdn_fused_decode_trace,
+    )
+
+    flashinfer.gdn_fused_decode_step(
+        **gdn_fused_decode_trace.init(batch_size=4, num_pages=8, device=device)
+    )
 
 # ── recurrent KDA decode with separate committed state ───────────────────────
 rk_B, rk_H, rk_HV, rk_D = 4, 8, 16, 128

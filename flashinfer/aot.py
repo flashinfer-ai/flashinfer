@@ -622,6 +622,16 @@ def gen_all_modules(
             for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
 
+    # The experimental fused GDN decode step is deliberately NOT built here.
+    # Its preferred backend is CuTe-DSL, which this AOT pass does not cover at
+    # all, so an AOT entry could only ever pre-build the second-choice CUDA
+    # impl -- which never serves a registered geometry on an install where the
+    # CuTe-DSL one loads.  Paying jit-cache size for a kernel that does not run
+    # is the wrong trade when that budget is shared with kernels that do.  It
+    # JIT-compiles on first eager dispatch instead, which is already how the
+    # CuTe-DSL impl reaches the CUDA-graph capture phase warm.  See
+    # flashinfer/gdn_kernels/experimental/README.md.
+
     if add_act:
         for act_name in act_func_def_str:
             jit_specs.append(gen_act_and_mul_module(act_name))

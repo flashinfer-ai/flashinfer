@@ -1249,7 +1249,7 @@ def test_tier_1024_experts_routing(
 
 
 # num_tokens is chosen to straddle the dispatch thresholds in routingCustom::run
-# (see trtllm_fused_moe_routing_custom.cu):
+# (see trtllm_fused_moe_routing_custom.cuh):
 #   - tokens == 8  : dyn-block kernel path (tokens <= DynBlockKernelMaxNumTokens=16,
 #                    numExperts <= DynBlockKernelMaxNumExperts=512)
 #   - tokens == 32 : block-per-token "split" path on the single-cluster kernel

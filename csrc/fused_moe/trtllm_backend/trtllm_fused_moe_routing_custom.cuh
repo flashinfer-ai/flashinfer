@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Custom routing: entry point, kernel definitions, and launch wrappers.
+// Custom routing implementation included by the per-family translation units.
 //
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
@@ -36,6 +36,31 @@
 
 namespace moe::dev::routing {
 namespace routingCustom {
+
+#if (defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP) +   \
+     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) + \
+     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE) + \
+     defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)) != 1
+#error "Define exactly one FLASHINFER_ROUTING_CUSTOM_* translation-unit selector"
+#endif
+
+bool launchBlockKernel(Data const& data, void* stream);
+bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchClusterKernelBlockDim256(Data const& data, void* stream);
+bool launchClusterKernelBlockDim512(Data const& data, void* stream);
+bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
+bool launchClusterKernel(Data const& data, void* stream);
+bool launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
+                                 void* stream);
+bool launchBlockScoresKernel(Data const& data, void* stream);
+void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream);
+void launchInitExpertCounts(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t numThreadsHist,
+                           void* stream);
+void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
+                         void* stream);
+
+#if defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -645,6 +670,8 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
   return queryPolicyHasCompiledTier(data);
 }
 
+#endif  // defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // 2. Cluster kernel — single-cluster fused kernel for ≤256 tokens (SM90+).
@@ -659,6 +686,9 @@ static constexpr int MaxNumTokensClusterScores256 =
     NumBlocksPerCluster * (ClusterBlockDim256 / WarpSize);
 static constexpr int MaxNumTokensClusterScores512 =
     NumBlocksPerCluster * (ClusterBlockDim512 / WarpSize);
+
+#if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) || \
+    defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
 
 template <typename TierT, typename TierListT>
 struct PrependTier;
@@ -843,29 +873,19 @@ bool launchClusterKernelForBlockDim(Data const& data, void* stream) {
   return dispatched;
 }
 
-// Returns whether a compiled tier covered the runtime (numExperts, topK) and the
-// kernel was actually launched (see launchBlockKernel).
-bool launchClusterKernel(Data const& data, void* stream) {
-  // Use the wider cluster only for permutation-only launches in the bounded high-expert/high-TopK
-  // range. Score-to-TopK fused clusters retain the general capacity-based dispatch.
-  bool const useWidePermutationCluster =
-      data.mPtrScores == nullptr &&
-      topk::isInHighExpertLaneOwnedTopKRange(data.mNumExperts, data.mTopK) &&
-      data.mNumTokens >= 32 && data.mNumTokens <= 64;
-  if (useWidePermutationCluster) {
-    return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
-  }
+// Returns whether the cluster tier dispatch found a covering tier and launched a kernel.
+#if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
+bool launchClusterKernelBlockDim256(Data const& data, void* stream) {
+  return launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+}
 
-  // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
-  // Use them only where the requested token count fits; otherwise keep the original 1024-thread
-  // launch.
-  if (data.mNumTokens <= MaxNumTokensClusterScores256) {
-    return launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
-  }
-  if (data.mNumTokens <= MaxNumTokensClusterScores512) {
-    return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
-  }
+bool launchClusterKernelBlockDim512(Data const& data, void* stream) {
+  return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+}
+#endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
 
+#if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
+bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
   bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr &&
                                     data.mPreprocessType == RoutingPreprocessType::None &&
                                     data.mPostprocessType == RoutingPostprocessType::Softmax;
@@ -878,6 +898,36 @@ bool launchClusterKernel(Data const& data, void* stream) {
                         /*smemSize=*/0,  // No dynamic smem
                         stream);
   return queryPolicyHasCompiledTier(data);
+}
+#endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
+
+#endif  // FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL || FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE
+
+#if defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)
+
+// Returns whether a compiled tier covered the runtime (numExperts, topK) and the
+// kernel was actually launched (see launchBlockKernel).
+bool launchClusterKernel(Data const& data, void* stream) {
+  // Use the wider cluster only for permutation-only launches in the bounded high-expert/high-TopK
+  // range. Score-to-TopK fused clusters retain the general capacity-based dispatch.
+  bool const useWidePermutationCluster =
+      data.mPtrScores == nullptr &&
+      topk::isInHighExpertLaneOwnedTopKRange(data.mNumExperts, data.mTopK) &&
+      data.mNumTokens >= 32 && data.mNumTokens <= 64;
+  if (useWidePermutationCluster) {
+    return launchClusterKernelBlockDim512(data, stream);
+  }
+
+  // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
+  // Use them only where the requested token count fits; otherwise keep the original 1024-thread
+  // launch.
+  if (data.mNumTokens <= MaxNumTokensClusterScores256) {
+    return launchClusterKernelBlockDim256(data, stream);
+  }
+  if (data.mNumTokens <= MaxNumTokensClusterScores512) {
+    return launchClusterKernelBlockDim512(data, stream);
+  }
+  return launchClusterKernelBlockDim1024(data, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1778,6 +1828,8 @@ void run(Data const& data, void* stream) {
     }
   }
 }
+
+#endif  // defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
