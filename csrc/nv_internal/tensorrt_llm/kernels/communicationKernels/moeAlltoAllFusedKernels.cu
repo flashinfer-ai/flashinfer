@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "flashinfer/exception.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 
