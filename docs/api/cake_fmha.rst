@@ -29,6 +29,14 @@ exact optimized match; other nonzero thresholds remain compatibility routes.
 Selector misses, insufficient route workspace, and NVFP4 adapter load failures
 fail closed to ``compat_v1``.
 
+The BF16 context adapter also contains two measured single-mask profiles for
+batch-four HND calls: uniform q511/KV2047 with P32 shared page tables, and
+uniform q257/KV1024 with P1024 separate K/V page tables.  FlashInfer selects
+these bodies only after every semantic and shape guard matches and the four KV
+lengths plus five Q-indptr values confirm the exact uniform lengths.  A
+nonuniform length, a near-miss shape, or CUDA graph capture retains the generic
+authenticated context body; it never reuses a fixed-length specialization.
+
 Optimized routes are fail-closed.  In particular, optimized FP8 decode is
 qualified for HND pages, a shared K/V page table, and GQA group size eight;
 other valid FP8 decode shapes remain Cake-owned and use the authenticated

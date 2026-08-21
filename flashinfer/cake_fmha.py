@@ -1237,7 +1237,15 @@ def select_cake_fmha_context_route(
             enable_sink=sinks is not None,
             kv_layout=kv_layout,
         )
-    if component in ("context_fp16_hd256", "context_fp8_hd256"):
+    if exact_profile == "q511":
+        pack_g = 5
+        num_m_blocks = 11
+        l2_swizzle = 1
+    elif exact_profile == "q257":
+        pack_g = 5
+        num_m_blocks = 6
+        l2_swizzle = 8
+    elif component in ("context_fp16_hd256", "context_fp8_hd256"):
         pack_g = 1
         num_m_blocks = (max_q_len + 127) // 128
         l2_swizzle = 1
@@ -1247,8 +1255,6 @@ def select_cake_fmha_context_route(
         num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (2 * tok_per_stage)
         total_bh = batch_size * (num_q_heads // pack_g)
         l2_swizzle = 8 if total_bh % 8 == 0 else 1
-    if exact_profile == "q511":
-        l2_swizzle = 1
     if component == "context_nvfp4" and not _context_nvfp4_workspace_supported(
         workspace_buffer,
         key_cache,
