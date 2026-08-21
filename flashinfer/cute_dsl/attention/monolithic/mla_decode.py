@@ -32,7 +32,7 @@ from flashinfer.utils import device_support_pdl
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout
+from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
     get_max_active_clusters,
@@ -441,6 +441,7 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
+        Float32(1.0),  # lse_scale placeholder
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -466,6 +467,7 @@ def cute_dsl_mla_decode(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    lse_scale: float = 1 / LOG2_E,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     enable_dcp: bool = False,
@@ -861,6 +863,7 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
+        Float32(lse_scale),
     )
 
     if return_lse:

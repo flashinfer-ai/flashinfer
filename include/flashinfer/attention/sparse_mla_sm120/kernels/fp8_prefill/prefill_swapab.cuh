@@ -30,6 +30,7 @@
 
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
+#include "../../common/lse.cuh"
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_stage.cuh"
 #include "../../compute/scale_mma.cuh"
@@ -465,7 +466,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     if (gid == 0) {
 #pragma unroll
       for (int ih = 0; ih < 2; ih++)
-        out_lse[(size_t)s_i * cold.out_lse_stride_elems + h_base + 2 * tid + ih] = lse[ih];
+        out_lse[(size_t)s_i * cold.out_lse_stride_elems + h_base + 2 * tid + ih] =
+            scale_output_lse(lse[ih], cold.lse_scale);
     }
 
     const size_t out_base = ((size_t)s_i * NUM_HEADS + h_base) * D_V;

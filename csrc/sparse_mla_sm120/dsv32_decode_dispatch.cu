@@ -37,7 +37,8 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
                                       int num_tokens, int num_splits, int chunks_per_block_override,
                                       float sm_scale, size_t stride_kv_block,
                                       size_t stride_indices_token, int stride_kv_row,
-                                      size_t stride_out_lse, int page_size, cudaStream_t stream) {
+                                      size_t stride_out_lse, int page_size, cudaStream_t stream,
+                                      float lse_scale) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
@@ -86,7 +87,7 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
   merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
-      stride_out_lse);
+      stride_out_lse, lse_scale);
   DSV32_CUDA_CHECK(cudaGetLastError());
   return true;
 }
@@ -99,7 +100,7 @@ cudaError_t dispatch_dsv32_heads(const execution::AttentionParams& p,
         p.num_heads, p.topk, p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.output,
         p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits, plan.cpb, p.sm_scale,
         p.page_stride_bytes, p.indices_stride_elems, plan.metadata.row_stride_bytes,
-        p.out_lse_stride_elems, plan.metadata.page_size, stream);
+        p.out_lse_stride_elems, plan.metadata.page_size, stream, p.lse_scale);
     return cudaSuccess;
   });
 }

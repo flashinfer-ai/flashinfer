@@ -376,6 +376,7 @@ def get_trtllm_gen_prefill_module():
             uses_spcompress,
             is_causal,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
         )
@@ -6863,7 +6864,7 @@ def trtllm_batch_context_with_kv_cache(
             query.device, cake_route
         ).cake_paged_attention_context
 
-    run_func(
+    run_args = [
         out,
         out_scale_factor,
         query,
@@ -6896,9 +6897,11 @@ def trtllm_batch_context_with_kv_cache(
         uses_spcompress,
         causal,
         lse,
-        lse_stride_tokens,
-        lse_stride_heads,
-    )
+    ]
+    if backend != "cake":
+        run_args.append(1.0)  # lse_scale
+    run_args.extend((lse_stride_tokens, lse_stride_heads))
+    run_func(*run_args)
     result_out = (
         out
         if out_dtype != "nvfp4"
