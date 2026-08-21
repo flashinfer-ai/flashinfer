@@ -45,6 +45,38 @@ def test_bf16_frontend_rejects_unsupported_shapes(
         )
 
 
+def test_bf16_factory_accepts_pinned_default_knobs(monkeypatch):
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16
+
+    def fake_zeros(shape, dtype):
+        tensor = torch.zeros(shape, dtype=dtype)
+        tensor._mega_plain_alloc = True
+        return tensor
+
+    monkeypatch.setattr(bf16, "sym_zeros", fake_zeros)
+    knobs = default_knobs(8, dtype="bf16")
+    knobs["token_back_mode"] = "reuse_dispatch_warps"
+    knobs["in_kernel_fc2_reduce"] = True
+    buf = bf16.get_symm_buffer_for_bf16_mega_moe(
+        4,
+        8,
+        2,
+        128,
+        128,
+        0,
+        1,
+        token_back_mode="epi_warps",
+        knobs=knobs,
+    )
+    try:
+        assert buf._frontend.config.token_back_mode == "reuse_dispatch_warps"
+        assert buf._frontend.config.in_kernel_fc2_reduce is False
+    finally:
+        buf.destroy()
+
+
 def test_bf16_backend_defaults_to_scale_free_contract():
     config = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=64, top_k=1)
     assert config.kernel_name == "sm100_bf16_bf16_bf16_cutedsl"
