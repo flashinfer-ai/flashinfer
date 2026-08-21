@@ -1528,6 +1528,134 @@ def test_oversized_out_returns_exact_rows(variant):
     assert torch.equal(res, call(exact))
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("preallocated_out", [False, True])
+def test_empty_batch_returns_without_launching(variant, preallocated_out):
+    """B == 0 returns an empty result without scheduling, compiling or launching.
+
+    The persistent kernel's grid is num_sms regardless of batch size, and each
+    CTA's prologue clamps with min(start_q, batch_size - 1) -- which is -1 for an
+    empty batch, an out-of-bounds read of an empty mContextLens (reproduced as a
+    CUDA illegal memory access before this guard existed).
+
+    Both "did not schedule" and "did not compile" are checked directly rather
+    than by patching:
+      * a deliberately malformed schedule_meta is passed. Both arms of the
+        schedule branch call _validate_schedule_meta, so reaching that branch
+        would raise; returning cleanly proves it was skipped.
+      * the compile entry points are functools-cached, so cache_info() moving
+        would mean the compile path was entered.
+
+    Regression for PR #4365 review r3824960307.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_context_len,
+    )
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_compile_fp8_kernel,
+    )
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    next_n = 1
+
+    context_lens = torch.zeros((0,), dtype=torch.int32, device=device)
+    block_table = torch.zeros((0, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(0, H, device=device, dtype=torch.float32)
+    dtype = torch.float32 if variant == "fp8" else torch.bfloat16
+
+    # malformed on purpose: the wrong shape entirely. If the schedule branch is
+    # reached, _validate_schedule_meta raises.
+    bad_schedule = torch.zeros((3, 2), dtype=torch.int32, device=device)
+
+    out = None
+    if preallocated_out:
+        out = torch.empty((0, padded_context_len(ctx)), device=device, dtype=dtype)
+
+    compile_fn = (
+        _cached_compile_fp8_kernel if variant == "fp8" else _cached_compile_fp4_kernel
+    )
+    before = compile_fn.cache_info()
+
+    if variant == "fp8":
+        q = torch.zeros(0, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(4, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+        res = fp8_paged_mqa_logits(
+            q,
+            kv,
+            w,
+            context_lens,
+            block_table,
+            ctx,
+            schedule_meta=bad_schedule,
+            out=out,
+        )
+    else:
+        q = torch.zeros(0, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        sf_q = torch.zeros(0, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(4, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+        res = fp4_paged_mqa_logits(
+            q,
+            sf_q,
+            kv,
+            w,
+            context_lens,
+            block_table,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=bad_schedule,
+            out=out,
+        )
+    torch.cuda.synchronize()
+
+    assert res.shape == (0, ctx), f"expected (0, {ctx}), got {tuple(res.shape)}"
+    assert res.dtype == dtype
+    assert res.device.type == "cuda"
+    if preallocated_out:
+        assert res.data_ptr() == out.data_ptr(), "should be a view of out="
+
+    after = compile_fn.cache_info()
+    assert (after.hits, after.misses) == (before.hits, before.misses), (
+        "the compile path was entered for an empty batch"
+    )
+
+
+def test_empty_batch_still_validates_out():
+    """The empty-batch short-circuit sits after out= validation, not before.
+
+    A malformed out= must still be rejected when B == 0; otherwise the guard
+    would silently accept buffers it never checks.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits, padded_context_len
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    context_lens = torch.zeros((0,), dtype=torch.int32, device=device)
+    block_table = torch.zeros((0, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(0, H, device=device, dtype=torch.float32)
+    q = torch.zeros(0, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv = torch.zeros(4, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+    wrong_dtype = torch.empty(
+        (0, padded_context_len(ctx)), device=device, dtype=torch.float16
+    )
+    with pytest.raises(ValueError, match="out.dtype"):
+        fp8_paged_mqa_logits(q, kv, w, context_lens, block_table, ctx, out=wrong_dtype)
+
+    too_narrow = torch.empty((0, 8), device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="out must be at least"):
+        fp8_paged_mqa_logits(q, kv, w, context_lens, block_table, ctx, out=too_narrow)
+
+
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
