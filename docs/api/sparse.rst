@@ -45,6 +45,10 @@ producer and deterministic reduction once the query reaches 8192 tokens.
 Call :func:`flashinfer.msa_ops.supports_packed_kv` with the active device when
 integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.
+Per-token tensor ``num_valid_pages`` for
+:func:`flashinfer.msa_ops.msa_topk_select` is likewise SM120/SM121-only;
+compute capability 10.0/10.3 requires a scalar value or ``None`` and rejects
+the tensor form before backend dispatch.
 
 CUDA graph capture of sparse prefill or decode on compute capability 10.0/10.3
 requires a caller-owned

@@ -118,6 +118,10 @@ def msa_topk_select(
         Entries are clamped in-kernel to ``[0, max_k_tiles]`` (checking them on
         the host would sync), so an over-large count degrades to the full block
         range rather than reading out of bounds.
+
+        The tensor form is supported only on SM120/SM121.  On compute
+        capability 10.0/10.3, pass a scalar or ``None``; a tensor is rejected
+        before dispatch because that backend accepts only a scalar bound.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
         ``(total_qo_len, num_qo_heads, topk)``, dtype int32.  Allocated
@@ -135,6 +139,11 @@ def msa_topk_select(
         slots.
     """
     if is_blackwell_msa_device(max_score.device):
+        if isinstance(num_valid_pages, torch.Tensor):
+            raise NotImplementedError(
+                "per-token tensor num_valid_pages is only supported on "
+                "SM120/SM121; compute capability 10.0/10.3 requires a scalar"
+            )
         return blackwell_msa_topk_select(
             max_score,
             topk,
