@@ -15,16 +15,12 @@ def test_sm100_sm103_reject_per_token_bounds_before_backend_dispatch(monkeypatch
     def backend_must_not_run(*_args, **_kwargs):
         raise AssertionError("backend must not be called")
 
-    monkeypatch.setattr(
-        _topk_module, "blackwell_msa_topk_select", backend_must_not_run
-    )
+    monkeypatch.setattr(_topk_module, "blackwell_msa_topk_select", backend_must_not_run)
 
     max_score = torch.empty((1, 16, 2), dtype=torch.float32)
     num_valid_pages = torch.ones(2, dtype=torch.int32)
     with pytest.raises(NotImplementedError, match=r"SM120/SM121.*scalar"):
-        _topk_module.msa_topk_select(
-            max_score, 16, num_valid_pages=num_valid_pages
-        )
+        _topk_module.msa_topk_select(max_score, 16, num_valid_pages=num_valid_pages)
 
 
 def test_sm100_sm103_scalar_bound_still_reaches_backend(monkeypatch):
