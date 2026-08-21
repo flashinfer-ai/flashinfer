@@ -25,7 +25,6 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    RoutingMethodType,
     normalize_activation_type,
 )
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -4536,7 +4535,10 @@ def _trtllm_gen_routing_init(
     return {
         "routing_logits": routing_logits,
         "routing_bias": None,
-        "routing_method": RoutingMethodType.Renormalize,
+        # Plain int rather than RoutingMethodType.Renormalize: this source is
+        # rendered into the dumped JSON and must exec standalone, without
+        # flashinfer imports (see tests/trace/test_rendered_source_standalone.py).
+        "routing_method": 1,  # RoutingMethodType.Renormalize
         "top_k": top_k,
         "num_fused_shared_experts": 0,
         "n_group": 0,

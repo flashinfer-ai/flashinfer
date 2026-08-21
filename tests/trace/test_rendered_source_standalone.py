@@ -71,3 +71,22 @@ def test_dense_trtllm_decode_reference_renders_standalone():
     output = namespace["_trtllm_batch_decode_reference"](**inputs)
     assert output.shape == inputs["query"].shape
     assert torch.isfinite(output.float()).all()
+
+
+def test_trtllm_gen_routing_init_renders_standalone():
+    """The routing init must not leak flashinfer names into the dumped source.
+
+    ``routing_method`` is the trap here: writing ``RoutingMethodType.Renormalize``
+    dumps fine (the live module resolves it) but leaves a NameError for anyone
+    exec'ing the JSON, so the init emits the plain enum value instead.
+    """
+    from flashinfer.trace.template import _render_init_source
+    from flashinfer.trace.templates.moe import _trtllm_gen_routing_init
+
+    namespace = _exec_in_fresh_namespace(_render_init_source(_trtllm_gen_routing_init))
+    inputs = namespace["_trtllm_gen_routing_init"](
+        num_tokens=4, num_experts=8, top_k=2, device="cpu"
+    )
+    assert inputs["routing_logits"].shape == (4, 8)
+    assert inputs["routing_method"] == 1  # RoutingMethodType.Renormalize
+    assert inputs["top_k"] == 2
