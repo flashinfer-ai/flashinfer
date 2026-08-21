@@ -189,6 +189,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "bt16_chain_m64_s8",
                 "bt16_chain_m64_s9",
                 "m128_unbounded_softplus",
+                "m128_bt64_unbounded_softplus",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -224,11 +225,11 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
-    descriptor storage, small-BH packet-ring storage, and BT16 prepare/chain
-    metadata, factors, and independent descriptor storage. Persistent M128 is
-    an eager-only B200/GB200 route; explicit workspaces use non-persistent
-    direct, M64, small-BH, or eligible BT16 schedules so graph capture never
-    synchronizes sequence lengths to construct host task bins.
+    and BT64 descriptor storage, small-BH packet-ring storage, and BT16
+    prepare/chain metadata, factors, and independent descriptor storage.
+    Persistent M128 is an eager-only B200/GB200 route; explicit workspaces use
+    non-persistent direct, M64, small-BH, or eligible BT16 schedules so graph
+    capture never synchronizes sequence lengths to construct host task bins.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -490,8 +491,11 @@ def _select_flash_kda_prefill_variant(
     use_small_bh_m128: bool = False,
     use_exact_n16: bool = False,
     unbounded_softplus: bool = False,
+    use_bt64_unbounded_softplus: bool = False,
 ) -> "FlashKDAVariant | CakeKDAVariant":
     if unbounded_softplus:
+        if use_bt64_unbounded_softplus:
+            return "m128_bt64_unbounded_softplus"
         return "m128_unbounded_softplus"
     if num_heads == 12 or use_exact_n16:
         return "m128_n16"
@@ -2434,6 +2438,11 @@ def _run_flash_kda_prefill(
             num_sequences=num_sequences,
             num_heads=num_heads,
             unbounded_softplus=True,
+            use_bt64_unbounded_softplus=(
+                num_heads == 4
+                and checkpoint_every_n_tokens > 0
+                and checkpoint_every_n_tokens % 64 == 0
+            ),
         )
         persistent_plan = None
     if checkpoint_every_n_tokens and variant == "m128_n16":
@@ -2732,7 +2741,10 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        if variant == "m128_unbounded_softplus":
+        if variant in (
+            "m128_unbounded_softplus",
+            "m128_bt64_unbounded_softplus",
+        ):
             module = _get_cake_kda_prefill_module(
                 variant, _select_cake_kda_prefill_target(q.device)
             )

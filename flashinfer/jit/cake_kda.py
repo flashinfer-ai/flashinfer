@@ -27,10 +27,16 @@ from .core import (
     sm103a_nvcc_flags,
 )
 
-CakeKDAVariant = Literal["m128_unbounded_softplus"]
+CakeKDAVariant = Literal[
+    "m128_unbounded_softplus",
+    "m128_bt64_unbounded_softplus",
+]
 CakeKDATarget = Literal["sm100a", "sm103a"]
 
-CAKE_KDA_VARIANTS: tuple[CakeKDAVariant, ...] = ("m128_unbounded_softplus",)
+CAKE_KDA_VARIANTS: tuple[CakeKDAVariant, ...] = (
+    "m128_unbounded_softplus",
+    "m128_bt64_unbounded_softplus",
+)
 
 _CAKE_KDA_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
@@ -45,6 +51,7 @@ _CAKE_KDA_TARGET_DEFINE = {
 # implementation so an installed cache cannot satisfy a refreshed export.
 _CAKE_KDA_MODULE_IDENTS = {
     "m128_unbounded_softplus": "d7a7b33c69",
+    "m128_bt64_unbounded_softplus": "d5674b35de",
 }
 
 
@@ -133,6 +140,14 @@ def gen_cake_kda_m128_unbounded_softplus_module(target: CakeKDATarget) -> JitSpe
     return gen_cake_kda_module("m128_unbounded_softplus", target)
 
 
+def gen_cake_kda_m128_bt64_unbounded_softplus_module(
+    target: CakeKDATarget,
+) -> JitSpec:
+    """Generate the checkpoint-aligned native unbounded-softplus BT64 module."""
+
+    return gen_cake_kda_module("m128_bt64_unbounded_softplus", target)
+
+
 @functools.cache
 def load_cake_kda_module(variant: CakeKDAVariant, target: CakeKDATarget):
     """Build or load one physical, target-specific CakeKDA module."""
@@ -148,6 +163,12 @@ def load_cake_kda_m128_unbounded_softplus_module(target: CakeKDATarget):
     return load_cake_kda_module("m128_unbounded_softplus", target)
 
 
+def load_cake_kda_m128_bt64_unbounded_softplus_module(target: CakeKDATarget):
+    """Load the checkpoint-aligned native unbounded-softplus BT64 module."""
+
+    return load_cake_kda_module("m128_bt64_unbounded_softplus", target)
+
+
 def get_cake_kda_prefill_module(variant: CakeKDAVariant, target: CakeKDATarget):
     """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
 
@@ -158,10 +179,12 @@ __all__ = [
     "CAKE_KDA_VARIANTS",
     "CakeKDATarget",
     "CakeKDAVariant",
+    "gen_cake_kda_m128_bt64_unbounded_softplus_module",
     "gen_cake_kda_m128_unbounded_softplus_module",
     "gen_cake_kda_module",
     "get_cake_kda_prefill_module",
     "get_cake_kda_uri",
+    "load_cake_kda_m128_bt64_unbounded_softplus_module",
     "load_cake_kda_m128_unbounded_softplus_module",
     "load_cake_kda_module",
 ]

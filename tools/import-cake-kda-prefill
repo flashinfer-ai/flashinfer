@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Import the exact Cake KDA unbounded-softplus prefill export.
+"""Import the exact Cake KDA unbounded-softplus prefill exports.
 
-The two architecture-specific export profiles are deliberately accepted as
-separate inputs even though their generated CUDA text is currently identical.
+Each variant's two architecture-specific export profiles are deliberately
+accepted as separate inputs even when their generated CUDA text is identical.
 This keeps the SM100 and SM103 provenance fibers independent while checking
-that the checked-in frozen sources are reproducible from the sealed exports.
+that every checked-in frozen source is reproducible from sealed exports.
 """
 
 from __future__ import annotations
@@ -76,6 +76,18 @@ VARIANTS = {
         raw_bytes=177223,
         smem_bytes=227328,
     ),
+    "bt64_unbounded_softplus": Variant(
+        key="bt64_unbounded_softplus",
+        frozen_filename="cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu",
+        binding_filename=(
+            "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
+        ),
+        source_module_ident="flashkda_bf16_fused_m128_f27048d264",
+        module_ident="cake_kda_bf16_fused_m128_f27048d264",
+        raw_sha256="f27048d2646ae8e5b33d45ba6dfd6c8022b1b5cb09c429c1fdc702989afe9101",
+        raw_bytes=317175,
+        smem_bytes=232448,
+    ),
 }
 
 PROFILES = {
@@ -92,6 +104,24 @@ PROFILES = {
         "profile_path": "flashkda_bf16_fused_m128_unbounded_softplus_sm103.json",
         "profile_sha256": "2f186bdd334aced41d8b1fc531567e0477d5919914126a4a8357d3c08f1728c9",
         "variant": "unbounded_softplus",
+    },
+    "sm100_bt64_unbounded_softplus": {
+        "arch": "sm_100a",
+        "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm100",
+        "profile_path": (
+            "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json"
+        ),
+        "profile_sha256": "8eca6d93840bd55f643b2a73379126da61bacc03b81e0efcb87b4c8cd4d15cb6",
+        "variant": "bt64_unbounded_softplus",
+    },
+    "sm103_bt64_unbounded_softplus": {
+        "arch": "sm_103a",
+        "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm103",
+        "profile_path": (
+            "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json"
+        ),
+        "profile_sha256": "5d6aa7d5d48ed7af5342c8b993efea0a430e38696cd66d7613d0601ed3fe8b5a",
+        "variant": "bt64_unbounded_softplus",
     },
 }
 
@@ -281,6 +311,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sm100-unbounded-softplus-profile", type=Path, required=True)
     parser.add_argument("--sm103-unbounded-softplus-profile", type=Path, required=True)
     parser.add_argument(
+        "--sm100-bt64-unbounded-softplus-source", type=Path, required=True
+    )
+    parser.add_argument(
+        "--sm103-bt64-unbounded-softplus-source", type=Path, required=True
+    )
+    parser.add_argument(
+        "--sm100-bt64-unbounded-softplus-profile", type=Path, required=True
+    )
+    parser.add_argument(
+        "--sm103-bt64-unbounded-softplus-profile", type=Path, required=True
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parents[1] / "csrc" / "kda",
@@ -294,10 +336,22 @@ def main() -> int:
     paths = {
         "sm100_unbounded_softplus": args.sm100_unbounded_softplus_source,
         "sm103_unbounded_softplus": args.sm103_unbounded_softplus_source,
+        "sm100_bt64_unbounded_softplus": (
+            args.sm100_bt64_unbounded_softplus_source
+        ),
+        "sm103_bt64_unbounded_softplus": (
+            args.sm103_bt64_unbounded_softplus_source
+        ),
     }
     profile_paths = {
         "sm100_unbounded_softplus": args.sm100_unbounded_softplus_profile,
         "sm103_unbounded_softplus": args.sm103_unbounded_softplus_profile,
+        "sm100_bt64_unbounded_softplus": (
+            args.sm100_bt64_unbounded_softplus_profile
+        ),
+        "sm103_bt64_unbounded_softplus": (
+            args.sm103_bt64_unbounded_softplus_profile
+        ),
     }
     raw: dict[str, bytes] = {}
     for profile_key, path in paths.items():
@@ -309,21 +363,31 @@ def main() -> int:
         raise ValueError(
             "unbounded-softplus SM100 and SM103 generated source text differs"
         )
+    if (
+        raw["sm100_bt64_unbounded_softplus"]
+        != raw["sm103_bt64_unbounded_softplus"]
+    ):
+        raise ValueError(
+            "BT64 unbounded-softplus SM100 and SM103 generated source text differs"
+        )
 
     frozen = {
         "unbounded_softplus": _freeze(
             raw["sm100_unbounded_softplus"], VARIANTS["unbounded_softplus"]
         ),
-    }
-    outputs = {
-        args.output_dir / VARIANTS["unbounded_softplus"].frozen_filename: frozen[
-            "unbounded_softplus"
-        ],
-        args.output_dir
-        / "cake_kda_bf16_fused_m128_unbounded_softplus_import_manifest.json": _manifest(
-            frozen
+        "bt64_unbounded_softplus": _freeze(
+            raw["sm100_bt64_unbounded_softplus"],
+            VARIANTS["bt64_unbounded_softplus"],
         ),
     }
+    outputs = {
+        args.output_dir / variant.frozen_filename: frozen[key]
+        for key, variant in VARIANTS.items()
+    }
+    outputs[
+        args.output_dir
+        / "cake_kda_bf16_fused_m128_unbounded_softplus_import_manifest.json"
+    ] = _manifest(frozen)
     matched = True
     for path, data in outputs.items():
         matched = _write_or_check(path, data, args.check) and matched
