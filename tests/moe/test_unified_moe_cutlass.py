@@ -339,6 +339,41 @@ def test_cutlass_integer_scalars_materialize_float32():
     assert all(t is not None and t.dtype is torch.float32 for t in params.values())
 
 
+def test_cutlass_activation_params_derived_when_build_did_not_cache_them():
+    # _build() normally caches the config-derived scalars. A runner that never
+    # built (or whose _build() was overridden) must still resolve the typed
+    # activation rather than raising, or silently dropping non-default scalars.
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0, beta=1.0, limit=7.0))
+    runner.device = torch.device("cpu")
+    assert not hasattr(runner, "_config_activation_params")
+
+    resolved = runner._resolve_activation_params({})
+    for name, value in (
+        ("swiglu_alpha", 2.0),
+        ("swiglu_beta", 1.0),
+        ("swiglu_limit", 7.0),
+    ):
+        assert resolved[name].dtype is torch.float32
+        torch.testing.assert_close(resolved[name], torch.full((4,), value))
+
+    # Per-expert overrides still win over the derived scalars.
+    alpha = torch.arange(4, dtype=torch.float32)
+    assert (
+        runner._resolve_activation_params({"gemm1_alpha": alpha})["swiglu_alpha"]
+        is alpha
+    )
+
+    # SwiGLUStep carries only a limit; the other slots stay unset.
+    step = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    step.config = _config(activation=SwiGLUStep(limit=5.0))
+    step.device = torch.device("cpu")
+    step_resolved = step._resolve_activation_params({})
+    torch.testing.assert_close(step_resolved["swiglu_limit"], torch.full((4,), 5.0))
+    assert step_resolved["swiglu_alpha"] is None
+    assert step_resolved["swiglu_beta"] is None
+
+
 def test_cutlass_per_expert_activation_overrides():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner.config = _config(activation=SwiGLU(alpha=2.0))
