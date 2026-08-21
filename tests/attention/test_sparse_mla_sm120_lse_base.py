@@ -204,8 +204,14 @@ def _run(
     return_lse: bool = True,
     lse: torch.Tensor | None = None,
     seq_lens=_UNSET,
+    clone: bool = True,
 ):
-    """Call the public sparse path; clone results so later calls can't alias them."""
+    """Call the public sparse path.
+
+    Results are cloned by default so a later call can't alias them -- the runner
+    owns its internal LSE buffer. Pass ``clone=False`` to inspect the objects the
+    API actually returned, which is what the caller-buffer identity check needs.
+    """
     result = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
         query=inputs.q.unsqueeze(1),
         kv_cache=inputs.kv_hnd,
@@ -226,9 +232,13 @@ def _run(
         return_lse_base_on_e=return_lse_base_on_e,
     )
     if not return_lse:
-        return result.squeeze(1).clone()
+        out = result.squeeze(1)
+        return out.clone() if clone else out
     out, out_lse = result
-    return out.squeeze(1).clone(), out_lse.clone()
+    out = out.squeeze(1)
+    if clone:
+        return out.clone(), out_lse.clone()
+    return out, out_lse
 
 
 # --------------------------------------------------------------------------------------
@@ -377,12 +387,17 @@ def test_sparse_mla_lse_base_writes_user_lse_buffer(
         shape, float("nan"), dtype=torch.float32, device=inputs.device
     )
 
-    _, returned = _run(inputs, return_lse_base_on_e=return_lse_base_on_e, lse=user_lse)
+    _, returned = _run(
+        inputs, return_lse_base_on_e=return_lse_base_on_e, lse=user_lse, clone=False
+    )
 
+    # The contract is the caller's buffer itself, not a copy: the sparse path
+    # returns ``user_lse`` unchanged. Identity is what pins that down -- an
+    # implementation that scaled a runner-owned copy would still match on values.
+    assert returned is user_lse
     assert returned.shape == shape
     expected = inputs.expected_lse(return_lse_base_on_e).reshape(shape)
     torch.testing.assert_close(returned, expected, **_LSE_TOL)
-    torch.testing.assert_close(user_lse, expected, **_LSE_TOL)
 
 
 @pytest.mark.parametrize("return_lse_base_on_e", [None, False, True])

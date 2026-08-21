@@ -3544,7 +3544,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     uses_shared_paged_kv_idx: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
-    return_lse_base_on_e: Optional[bool] = None,
     cute_dsl_impl: str = "auto",
     kv_scale_format: str = "auto",
     cum_seq_lens_q: Optional[torch.Tensor] = None,
@@ -3556,6 +3555,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
+    return_lse_base_on_e: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 

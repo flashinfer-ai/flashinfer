@@ -32,7 +32,9 @@ WORKSPACE_BYTES = 128 * 1024 * 1024
 
 def _require_trtllm_gen(device: torch.device) -> None:
     major, minor = get_compute_capability(device)
-    if major != 10:
+    # SM100 (B200) and SM103 (B300) only; an SM101/SM102 part would otherwise
+    # fall through to an unsupported launch instead of skipping.
+    if (major, minor) not in ((10, 0), (10, 3)):
         pytest.skip(
             "trtllm-gen requires SM100/SM103, got "
             f"sm{major}{minor}; the LSE base is kernel-side and cannot be checked here"
@@ -137,7 +139,7 @@ def _mla_reference_lse_natural(
     MLA post-absorption is a single 576-wide dot product against the compressed KV
     row, so the reference needs no nope/rope split.
     """
-    batch_size, q_len, num_heads, _ = query.shape
+    batch_size = query.shape[0]
     page_size = kv_cache.shape[1]
     q = query.float()
     # Upcast before gathering: advanced indexing on fp8 is patchy, and casting
