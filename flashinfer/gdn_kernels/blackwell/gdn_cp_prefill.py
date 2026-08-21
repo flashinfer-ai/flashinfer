@@ -31,6 +31,7 @@ from .gated_delta_net_cp import (
     CPDeltaRuleMNPrecomputeUtcmma1Sm100,
 )
 from .gated_delta_net_cp_prefill import CPDeltaRulePrefillTcgen05Sm100
+from ...cute_dsl.utils import cute_dsl_compile_arch
 from .gdn_prefill import _cutlass_state_dtype, _mark_state_layout
 
 
@@ -41,7 +42,11 @@ def _blackwell_compile_options(device: torch.device):
         raise RuntimeError(
             f"SM100 CP delta rule requires a compute 10.x device, got {major}.{minor}"
         )
-    return cute.EnableTVMFFI(True), cute.GPUArch(f"sm_{major}{minor}a")
+    # Resolve the arch instead of formatting it: this guard only checks the
+    # major, so Rubin (10.7) reaches here, and f"sm_107a" is absent from the
+    # Arch enum of any DSL older than 4.8 -- producing `KeyError: 'sm_107a'`
+    # from inside cute.compile with no frame pointing back here.
+    return cute.EnableTVMFFI(True), cute.GPUArch(cute_dsl_compile_arch(major, minor))
 
 
 def _get_cp_workspace(name, shape, dtype, device):
