@@ -562,7 +562,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
   std::vector<CutlassGemmConfig> candidate_configs;
   for (int cluster_m = 1; cluster_m <= 2; cluster_m++) {
     bool Is2SM = cluster_m == 2;
-    for (int cluster_n = 1; cluster_n <= 2; cluster_n++) {
+    // SM110 shares the SM100 dispatch path, which uses a runtime cluster shape and
+    // therefore supports only 1x1x1 and 2x1x1 (see are_tile_shapes_supported_sm100).
+    // Emitting cluster_n == 2 produces candidates that always TLLM_THROW at dispatch:
+    // "Unsupported tile (64, 64, 64) and cluster (1, 2, 1) shape combination for arch 100".
+    for (int cluster_n = 1; cluster_n <= 1; cluster_n++) {
       std::vector base = {// M=128
                           CutlassTileConfigSM100::CtaShape128x128x128B,
                           CutlassTileConfigSM100::CtaShape128x256x128B};
