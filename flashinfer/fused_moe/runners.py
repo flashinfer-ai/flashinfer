@@ -484,6 +484,12 @@ class _CutlassRunnerBase(MoERunner):
     _use_w4_group_scaling: ClassVar[bool]
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
+    # Typed-activation scalars, populated from the config in _build(). The
+    # empty class-level defaults keep _resolve_activation_params() total: a
+    # runner whose _build() is overridden or has not yet run resolves to the
+    # per-expert view overrides alone instead of raising AttributeError.
+    _activation_params: dict[str, torch.Tensor | None] = {}
+    _config_activation_params: dict[str, torch.Tensor | None] = {}
     # Keep the best N tactics per GEMM stage, then return their Cartesian
     # product as compound candidates for the outer end-to-end autotuner. N=1
     # preserves the legacy independent-winner behavior.

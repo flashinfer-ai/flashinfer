@@ -604,6 +604,15 @@ def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
     runner._variant = QuantVariant.NVFP4
     runner._num_weight_rows = rows
     runner._intermediate_size = I
+    # _validate_fp4_tensors derives the expected GEMM1 row count from the
+    # activation's gating, so the bare runner needs a config to validate against.
+    runner.config = MoEConfig(
+        routing=RoutingConfig(num_experts=rows, top_k=2),
+        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        experts=ExpertConfig(intermediate_size=I),
+        activation=SwiGLU(),
+        backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
+    )
     act = MoEActivationPack(
         hidden_states_q=torch.zeros(T, H // 2, dtype=torch.uint8, device="cuda"),
         hidden_states_scale=torch.ones(
