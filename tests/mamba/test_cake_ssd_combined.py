@@ -564,27 +564,35 @@ def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
     assert errors["cake"] == errors["cute"]
 
 
-def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
+def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, request):
     module = importlib.import_module("flashinfer.mamba.ssd_combined")
     runners = []
+    active_stream = {"handle": 0x1000}
 
     class Runner:
         def __init__(self, *args, **kwargs):
             self.constructor_args = args
             self.constructor_kwargs = kwargs
-            self.run_args = None
-            self.run_kwargs = None
+            self.run_calls = []
             runners.append(self)
 
         def run(self, *args, **kwargs):
-            self.run_args = args
-            self.run_kwargs = kwargs
-            return (object(), None)
+            self.run_calls.append((args, kwargs))
+            return (self, None)
 
+    module._get_ssd_combined_runner.cache_clear()
+    request.addfinalizer(module._get_ssd_combined_runner.cache_clear)
     monkeypatch.setattr(module, "SSDCombined", Runner)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_: SimpleNamespace(cuda_stream=active_stream["handle"]),
+    )
     x = SimpleNamespace(
         shape=(1, 128, 8, 64),
         dtype=torch.bfloat16,
+        device=torch.device("cuda:0"),
     )
     B = SimpleNamespace(shape=(1, 128, 8, 128))
     checkpoint_states = SimpleNamespace(dtype=torch.float16)
@@ -615,6 +623,22 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
         *positional,
         **optional,
     )
+    repeated = module.ssd_combined_fwd(*positional, **optional)
+
+    active_stream["handle"] = 0x2000
+    different_stream = module.ssd_combined_fwd(*positional, **optional)
+
+    active_stream["handle"] = 0x1000
+    x_device_one = SimpleNamespace(
+        shape=x.shape,
+        dtype=x.dtype,
+        device=torch.device("cuda:1"),
+    )
+    different_device = module.ssd_combined_fwd(
+        x_device_one,
+        *positional[1:],
+        **optional,
+    )
     second = module.ssd_combined_fwd(
         x,
         object(),
@@ -625,7 +649,11 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
     )
 
     assert isinstance(first, tuple) and isinstance(second, tuple)
-    assert len(runners) == 2 and runners[0] is not runners[1]
+    assert first[0] is repeated[0]
+    assert first[0] is not different_stream[0]
+    assert first[0] is not different_device[0]
+    assert first[0] is not second[0]
+    assert len(runners) == 4
     assert all(runner.constructor_kwargs["backend"] == "cake" for runner in runners)
     assert all(
         runner.constructor_kwargs["state_dtype"] == torch.float16 for runner in runners
@@ -642,9 +670,8 @@ def test_ssd_combined_fwd_keeps_default_and_runner_ownership(monkeypatch):
         "seq_idx_dtype": torch.int32,
         "backend": "cake",
     }
-    assert runners[0].run_args == positional
-    assert runners[0].run_kwargs == optional
-    assert runners[1].run_kwargs["dt_softplus"] is False
+    assert runners[0].run_calls == [(positional, optional), (positional, optional)]
+    assert runners[-1].run_calls[0][1]["dt_softplus"] is False
 
 
 def _signature_contract(callable_, *, drop_self=False):
@@ -1772,6 +1799,32 @@ def test_source_generated_catalog_is_sealed_and_inactive():
             for source in sources:
                 path = module._source_dir() / "generated" / source["path"]
                 assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
+
+
+def test_active_f16_source_package_declares_cuda_half_types_explicitly():
+    source_root = Path(__file__).parents[2] / "csrc" / "cake_mamba_ssd_combined"
+    f16_sources = (
+        source_root / "cake_mamba_ssd_f16_batched_device.cu",
+        source_root / "cake_mamba_ssd_f16_varlen_device.cu",
+    )
+    for source_path in f16_sources:
+        source = source_path.read_text(encoding="utf-8")
+        assert source.count("#include <cuda_fp16.h>") == 1
+        assert "#include <cuda_bf16.h>\n#include <cuda_fp16.h>\n" in source
+
+    other_active_sources = (
+        source_root / name
+        for name in (
+            "cake_mamba_ssd_metadata_device.cu",
+            "cake_mamba_ssd_preprocess_device.cu",
+            "cake_mamba_ssd_bf16_batched_device.cu",
+            "cake_mamba_ssd_bf16_varlen_device.cu",
+        )
+    )
+    assert all(
+        "#include <cuda_fp16.h>" not in source_path.read_text(encoding="utf-8")
+        for source_path in other_active_sources
+    )
 
 
 def test_source_generated_multistage_loader_binds_exact_cubins(monkeypatch, tmp_path):

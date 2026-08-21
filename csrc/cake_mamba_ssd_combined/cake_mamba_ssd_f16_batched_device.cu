@@ -17,6 +17,7 @@ typedef struct __align__(64) {
 } CUtensorMap;
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512

@@ -214,6 +214,111 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
+    from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
+
+    templates = ssd_combined_trace_dispatch.templates
+    assert len(templates) == 12
+    assert len({id(template) for template in templates}) == 12
+    assert {template.name_prefix for template in templates} == {
+        f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}"
+        for mode in ("batched", "varlen")
+        for d_layout in ("none", "vector", "matrix")
+        for final_suffix in ("no_final", "final")
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "d_layout", "return_final_states"),
+    [
+        (mode, d_layout, return_final_states)
+        for mode in ("batched", "varlen")
+        for d_layout in ("none", "vector", "matrix")
+        for return_final_states in (False, True)
+    ],
+)
+def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
+    mode,
+    d_layout,
+    return_final_states,
+):
+    module = __import__(
+        "flashinfer.mamba.ssd_combined",
+        fromlist=["ssd_combined_fwd"],
+    )
+    batch_size, seqlen, nheads, headdim, ngroups, dstate = 2, 128, 8, 64, 8, 128
+    kwargs = {
+        "x": torch.empty(
+            batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16
+        ),
+        "dt": torch.empty(batch_size, seqlen, nheads, dtype=torch.float32),
+        "A": torch.empty(nheads, dtype=torch.float32),
+        "B": torch.empty(
+            batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16
+        ),
+        "C": torch.empty(
+            batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16
+        ),
+        "dt_limit": (0.0, float("inf")),
+        "return_final_states": return_final_states,
+    }
+    if d_layout == "vector":
+        kwargs["D"] = torch.empty(nheads, dtype=torch.bfloat16)
+    elif d_layout == "matrix":
+        kwargs["D"] = torch.empty(nheads, headdim, dtype=torch.bfloat16)
+
+    expected_state_dtype = "bfloat16"
+    if mode == "varlen":
+        num_sequences, num_logical_chunks = 3, 4
+        kwargs.update(
+            initial_states=torch.empty(
+                num_sequences,
+                nheads,
+                headdim,
+                dstate,
+                dtype=torch.float16,
+            ),
+            seq_idx=torch.empty(batch_size, seqlen, dtype=torch.int32),
+            chunk_indices=torch.empty(num_logical_chunks, dtype=torch.int32),
+            chunk_offsets=torch.empty(num_logical_chunks, dtype=torch.int32),
+            seq_chunk_cumsum=torch.empty(num_sequences + 1, dtype=torch.int32),
+        )
+        expected_state_dtype = "float16"
+    elif d_layout == "matrix" and return_final_states:
+        kwargs.update(
+            checkpoint_token_indices=torch.empty(batch_size, dtype=torch.int32),
+            checkpoint_state_slots=torch.empty(batch_size, dtype=torch.int32),
+            checkpoint_states=torch.empty(
+                2, nheads, headdim, dstate, dtype=torch.float16
+            ),
+        )
+        expected_state_dtype = "float16"
+
+    definition = module.ssd_combined_fwd.fi_trace(**kwargs)
+
+    final_suffix = "final" if return_final_states else "no_final"
+    assert definition["name"].startswith(
+        f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}_"
+    )
+    assert ("D" in definition["inputs"]) == (d_layout != "none")
+    assert ("seq_idx" in definition["inputs"]) == (mode == "varlen")
+    assert definition["inputs"]["out"]["optional"] is True
+    assert "param" not in definition["outputs"]["out"]
+    assert definition["outputs"]["checkpoint_states"]["optional"] is True
+    assert definition["outputs"]["checkpoint_states"]["param"] == "checkpoint_states"
+    assert ("seq_chunk_cumsum" in definition["outputs"]) == (mode == "varlen")
+    if mode == "varlen":
+        assert definition["outputs"]["seq_chunk_cumsum"]["optional"] is True
+        assert (
+            definition["outputs"]["seq_chunk_cumsum"]["param"]
+            == "seq_chunk_cumsum"
+        )
+    assert ("final_states" in definition["outputs"]) == return_final_states
+    if return_final_states:
+        assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype
+    json.dumps(definition, allow_nan=False)
+
+
 def test_packed_kda_decode_fi_trace_resolves_singleton_without_output():
     import flashinfer.kda_decode
 

@@ -22,6 +22,7 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 """
 
 import functools
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cutlass
@@ -31,7 +32,10 @@ import cuda.bindings.driver as cuda_drv
 import torch
 from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+
+from ..api_logging import flashinfer_api
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
+from ..trace.templates.mamba import ssd_combined_trace_dispatch
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 from .ssd_kernel import SSDKernel
 
@@ -821,6 +825,57 @@ class SSDCombined:
         return out_view, fstate_out
 
 
+@dataclass(frozen=True)
+class _SSDCombinedRunnerConfig:
+    """Immutable constructor configuration for the functional API cache."""
+
+    chunk_size: int
+    nheads: int
+    headdim: int
+    dstate: int
+    ngroups: int
+    io_dtype: torch.dtype
+    state_dtype: torch.dtype
+    has_d: bool
+    d_has_hdim: bool
+    has_initial_states: bool
+    has_varlen: bool
+    has_z: bool
+    seq_idx_dtype: torch.dtype
+    backend: str
+
+
+@functools.cache
+def _get_ssd_combined_runner(
+    device_index: int,
+    cuda_stream: int,
+    config: _SSDCombinedRunnerConfig,
+) -> SSDCombined:
+    """Return a process-local runner isolated by device, stream, and config."""
+
+    # ``cuda_stream`` participates in the cache key even though construction
+    # itself only needs the device. Runner workspaces are mutable, so sharing
+    # one across concurrently active streams would make reuse unsafe.
+    with torch.cuda.device(device_index):
+        return SSDCombined(
+            config.chunk_size,
+            config.nheads,
+            config.headdim,
+            config.dstate,
+            config.ngroups,
+            io_dtype=config.io_dtype,
+            state_dtype=config.state_dtype,
+            has_d=config.has_d,
+            d_has_hdim=config.d_has_hdim,
+            has_initial_states=config.has_initial_states,
+            has_varlen=config.has_varlen,
+            has_z=config.has_z,
+            seq_idx_dtype=config.seq_idx_dtype,
+            backend=config.backend,
+        )
+
+
+@flashinfer_api(trace=ssd_combined_trace_dispatch)
 def ssd_combined_fwd(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -855,12 +910,12 @@ def ssd_combined_fwd(
         if checkpoint_states is not None
         else torch.bfloat16
     )
-    runner = SSDCombined(
-        128,
-        nheads,
-        headdim,
-        dstate,
-        ngroups,
+    config = _SSDCombinedRunnerConfig(
+        chunk_size=128,
+        nheads=nheads,
+        headdim=headdim,
+        dstate=dstate,
+        ngroups=ngroups,
         io_dtype=x.dtype,
         state_dtype=state_dtype,
         has_d=D is not None,
@@ -871,6 +926,12 @@ def ssd_combined_fwd(
         seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
         backend="cake",
     )
+    device_index = x.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    with torch.cuda.device(device_index):
+        cuda_stream = int(torch.cuda.current_stream(device_index).cuda_stream)
+        runner = _get_ssd_combined_runner(device_index, cuda_stream, config)
     return runner.run(
         x,
         dt,
