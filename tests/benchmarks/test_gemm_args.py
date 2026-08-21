@@ -11,9 +11,14 @@ sys.path.insert(0, str(BENCHMARK_ROOT))
 from routines.gemm import _dynamic_mxfp8_problem_bytes, parse_gemm_args  # noqa: E402
 
 
-def test_mm_mxfp8_dynamic_quant_defaults_to_trtllm() -> None:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--routine")
+    parser.add_argument("--verbose", action="count", default=0)
+    return parser
+
+
+def test_mm_mxfp8_dynamic_quant_defaults_to_trtllm() -> None:
     args = parse_gemm_args(
         [
             "--routine",
@@ -26,7 +31,7 @@ def test_mm_mxfp8_dynamic_quant_defaults_to_trtllm() -> None:
             "4096",
             "--dynamic_quant",
         ],
-        parser,
+        _parser(),
     )
     assert args.backends == ["trtllm"]
 
@@ -44,8 +49,6 @@ def test_mm_mxfp8_accepts_supported_dynamic_quant_layout_backend_pair(
     dynamic_quant_layout: str,
     backend: str,
 ) -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--routine")
     args = parse_gemm_args(
         [
             "--routine",
@@ -62,7 +65,7 @@ def test_mm_mxfp8_accepts_supported_dynamic_quant_layout_backend_pair(
             "--dynamic_quant_layout",
             dynamic_quant_layout,
         ],
-        parser,
+        _parser(),
     )
     assert args.dynamic_quant is True
     assert args.dynamic_quant_layout == dynamic_quant_layout
@@ -77,9 +80,6 @@ def test_mm_mxfp8_rejects_dynamic_quant_layout_backend_mismatch(
     dynamic_quant_layout: str,
     backend: str,
 ) -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--routine")
-
     with pytest.raises(
         ValueError,
         match=rf"--dynamic_quant_layout {dynamic_quant_layout} supports only",
@@ -100,7 +100,7 @@ def test_mm_mxfp8_rejects_dynamic_quant_layout_backend_mismatch(
                 "--dynamic_quant_layout",
                 dynamic_quant_layout,
             ],
-            parser,
+            _parser(),
         )
 
 
@@ -109,8 +109,6 @@ def test_dynamic_mxfp8_problem_bytes_includes_quantization_traffic() -> None:
 
 
 def test_mm_mxfp8_dynamic_quant_rejects_non_bf16_output() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--routine")
     with pytest.raises(ValueError, match="bfloat16 output"):
         parse_gemm_args(
             [
@@ -128,13 +126,11 @@ def test_mm_mxfp8_dynamic_quant_rejects_non_bf16_output() -> None:
                 "float16",
                 "--dynamic_quant",
             ],
-            parser,
+            _parser(),
         )
 
 
 def test_mm_mxfp8_dynamic_quant_accepts_fp16_for_fixed_cute_dsl() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--routine")
     args = parse_gemm_args(
         [
             "--routine",
@@ -153,6 +149,6 @@ def test_mm_mxfp8_dynamic_quant_accepts_fp16_for_fixed_cute_dsl() -> None:
             "--dynamic_quant_layout",
             "128x4",
         ],
-        parser,
+        _parser(),
     )
     assert args.out_dtype == "float16"
