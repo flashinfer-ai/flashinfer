@@ -384,7 +384,7 @@ def test_measure_policy_overrides_profiling_config(cache_root, monkeypatch):
         monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0}, record_configs=seen
     )
     # The op's own config has both flags False (TuningConfig defaults).
-    with autotune_v2(measure=MeasurementPolicy(execution_mode="cuda_graph")):
+    with autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="cuda_graph")):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -397,7 +397,9 @@ def test_measure_policy_overrides_profiling_config(cache_root, monkeypatch):
     _install_fake_profile(
         monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0}, record_configs=seen2
     )
-    with autotune_v2(persistent_cache=False, measure=MeasurementPolicy(cold_l2=True)):
+    with autotune_v2(
+        persistent_cache=False, measurement_policy=MeasurementPolicy(cold_l2=True)
+    ):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)])
     assert seen2 and all(c.use_cold_l2_cache is True for c in seen2)
     assert all(c.use_cuda_graph is False for c in seen2)  # inherited
@@ -422,7 +424,7 @@ def test_measure_policy_isolates_store_identity(cache_root, monkeypatch):
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     policy = MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True)
-    with autotune_v2(measure=policy):
+    with autotune_v2(measurement_policy=policy):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -448,12 +450,12 @@ def test_measure_policy_attach_carries_to_serving(cache_root, monkeypatch):
     policy-tuned entries after the context exits."""
     policy = MeasurementPolicy(execution_mode="cuda_graph")
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(measure=policy):
+    with autotune_v2(measurement_policy=policy):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)])
 
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(mode="replay", measure=policy):
+    with autotune_v2(mode="replay", measurement_policy=policy):
         pass  # hydrate with the matching policy
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
@@ -485,18 +487,18 @@ def test_measure_policy_timer_validation(cache_root):
 def test_measure_policy_execution_mode_resolution(cache_root):
     """execution_mode is the primary axis; cuda_graph is derived, not a field."""
     g = MeasurementPolicy(execution_mode="cuda_graph")
-    assert g.cuda_graph is True  # derived property
+    assert g.use_cuda_graph is True  # derived property
     assert g.timer == "events"  # host-excluded implementation, auto-selected
     assert g.manifest_fields()["measure_execution_mode"] == "cuda_graph"
 
     e = MeasurementPolicy(execution_mode="eager")
-    assert e.cuda_graph is False
+    assert e.use_cuda_graph is False
     assert e.timer == "events_no_delay"
     assert e.manifest_fields()["measure_execution_mode"] == "eager"
 
     unset = MeasurementPolicy()
     assert unset.execution_mode == "auto"  # explicit library-decides default
-    assert unset.cuda_graph is None  # auto: inherit each op's TuningConfig
+    assert unset.use_cuda_graph is None  # auto: inherit each op's TuningConfig
     assert unset.timer == "events"  # auto: today's host-excluded resolution
 
     # Expert timer override within an execution mode, when not contradictory.
@@ -515,7 +517,7 @@ def test_measure_policy_execution_mode_resolution(cache_root):
 def test_measure_policy_timer_in_manifest(cache_root, monkeypatch):
     """An explicit timer is part of the store's environment identity."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(measure=MeasurementPolicy(_timer="cupti")):
+    with autotune_v2(measurement_policy=MeasurementPolicy(_timer="cupti")):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)])
     manifests = [
         json.loads(p.read_text()) for p in cache_root.glob("v2/*/manifest.json")
@@ -528,7 +530,7 @@ def test_measure_policy_all_none_is_default_identity(cache_root, monkeypatch):
     _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     _fresh_process()
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune_v2(mode="replay", measure=MeasurementPolicy()):
+    with autotune_v2(mode="replay", measurement_policy=MeasurementPolicy()):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -555,7 +557,9 @@ def test_alternating_identities_keep_per_identity_memo(cache_root, monkeypatch):
 
     # Detour through store B (eager identity): empty env -> miss, and it must
     # NOT drop store A's memo.
-    with autotune_v2(mode="replay", measure=MeasurementPolicy(execution_mode="eager")):
+    with autotune_v2(
+        mode="replay", measurement_policy=MeasurementPolicy(execution_mode="eager")
+    ):
         _, tactic = AutoTuner.get().choose_one(
             _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
         )
@@ -595,7 +599,7 @@ def test_policy_switch_reprofiles_in_process(cache_root, monkeypatch):
         _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 0
 
-    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+    with autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="eager")):
         _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 1  # re-profiled under eager, not served tactic 0 from memory
     assert ("eager", 0) in calls  # eager tuning really ran
@@ -640,7 +644,9 @@ def test_nested_v2_context_raises(cache_root):
     store (codex round-5)."""
     with autotune_v2():  # noqa: SIM117 -- nesting is the behavior under test
         with pytest.raises(RuntimeError, match="nested autotune_v2"):
-            with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+            with autotune_v2(
+                measurement_policy=MeasurementPolicy(execution_mode="eager")
+            ):
                 pass
     # After the outer exits, a fresh top-level context is fine again.
     with autotune_v2():
@@ -832,7 +838,7 @@ def test_bare_serving_after_policy_context_uses_ambient_identity(
         _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 0  # default-identity winner
 
-    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+    with autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="eager")):
         _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 1  # eager-identity winner
 
@@ -901,7 +907,7 @@ def test_sequential_contexts_last_wins_ambient(cache_root, monkeypatch):
     inputs = [torch.zeros(8, 16)]
     with autotune_v2():
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
-    with autotune_v2(measure=MeasurementPolicy(execution_mode="eager")):
+    with autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="eager")):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     _, tactic = AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, inputs)
     assert tactic == 1  # eager winner: last top-level attach won the ambient

@@ -79,10 +79,13 @@ When a FlashInfer operation executes, the autotuner resolves the best
    process.
 2. **User-loaded file configs** — loaded via ``load_configs()`` or
    ``autotune(cache=...)``.
-3. **Bundled package configs** — legacy ``.py`` config files shipped with
+3. **Managed v2 store** — the FlashInfer-managed per-entry store attached by
+   :func:`flashinfer.autotune_v2` (experimental), consulted when a store is
+   active for the current context or attached to the process.
+4. **Bundled package configs** — legacy ``.py`` config files shipped with
    FlashInfer (only when the ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``
    environment variable is set and tuning mode is off).
-4. **Fallback tactic (−1)** — a safe default that every runner must implement.
+5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
 Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes
@@ -97,6 +100,12 @@ Config Caching
    Single-process and multi-threaded use is fully supported.
    Multi-process and multi-node use is best-effort: concurrent writes to
    a shared cache file may result in lost updates from race conditions.
+
+   This race-condition caveat applies to the **v1 file cache** described
+   here.  The experimental :func:`flashinfer.autotune_v2` managed store
+   removes it by writing one atomically-published file per entry — there is
+   no shared file to race on, so all ranks can tune concurrently into one
+   store.
 
 By default, autotuning results live only in memory and are lost when the
 process exits.  The ``cache`` parameter on ``flashinfer.autotune`` lets you

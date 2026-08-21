@@ -1,7 +1,7 @@
 """Reproduce the exact vLLM/SGLang autotune_v2 usage SEQUENCE against a real
 op, short of a full model server:
 
-    with autotune_v2(cache_root=..., measure=P):   # warmup
+    with autotune_v2(cache_root=..., measurement_policy=P):   # warmup
         for m in shape_grid: op(m)                 # tune buckets
     autotune_v2_reload()                           # rank-consistency finalize
     for m in serve_shapes: op(m)                   # bare serving
@@ -71,7 +71,10 @@ def run(policy_name, measure, root):
 
     # 1) vLLM/SGLang warmup: one context around the dummy forwards.
     _PROFILE_CALLS[0] = 0
-    with torch.inference_mode(), autotune_v2(cache_root=root, measure=measure):
+    with (
+        torch.inference_mode(),
+        autotune_v2(cache_root=root, measurement_policy=measure),
+    ):
         for m in WARMUP_MS:
             ops[m]()
     tuned = _PROFILE_CALLS[0]
