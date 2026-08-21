@@ -82,8 +82,8 @@ VARIANTS = {
         binding_filename=(
             "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
         ),
-        source_module_ident="flashkda_bf16_fused_m128_f27048d264",
-        module_ident="cake_kda_bf16_fused_m128_f27048d264",
+        source_module_ident="flashkda_bf16_fused_m128_7ea2ab9707",
+        module_ident="cake_kda_bf16_fused_m128_7ea2ab9707",
         raw_sha256="f27048d2646ae8e5b33d45ba6dfd6c8022b1b5cb09c429c1fdc702989afe9101",
         raw_bytes=317175,
         smem_bytes=232448,
@@ -111,7 +111,7 @@ PROFILES = {
         "profile_path": (
             "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json"
         ),
-        "profile_sha256": "8eca6d93840bd55f643b2a73379126da61bacc03b81e0efcb87b4c8cd4d15cb6",
+        "profile_sha256": "0dc5a6e40d9a959c71b43fa0c74bf317a170c511ff09195853aef012dab00bbd",
         "variant": "bt64_unbounded_softplus",
     },
     "sm103_bt64_unbounded_softplus": {
@@ -120,7 +120,7 @@ PROFILES = {
         "profile_path": (
             "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json"
         ),
-        "profile_sha256": "5d6aa7d5d48ed7af5342c8b993efea0a430e38696cd66d7613d0601ed3fe8b5a",
+        "profile_sha256": "a2696545a0979b180cf38cdf9defaee45152ef232e3fc754acfa553ab4e398d9",
         "variant": "bt64_unbounded_softplus",
     },
 }
