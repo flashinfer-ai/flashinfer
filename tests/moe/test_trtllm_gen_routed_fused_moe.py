@@ -25,6 +25,7 @@ from typing import Literal
 import pytest
 import torch
 
+from flashinfer.autotuner import autotune
 from flashinfer import (
     ActivationType,
     RoutingMethodType,
@@ -37,6 +38,9 @@ from flashinfer import (
 from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
+    prims_ts_bf16_routed_moe,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
@@ -49,10 +53,18 @@ from flashinfer.fused_moe import (
     trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
+from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.utils import device_support_pdl, get_compute_capability
+
 from .trtllm_gen_fused_moe_utils import (
+    FP4Moe,
     FP8BlockScaleMoe,
+    MoeGemmBackend,
     QuantMode,
+    check_accuracy,
+    moe_args,
+    pack_topk_for_routed_moe,
+    run_moe_test,
     routing_reference_renormalize,
     routing_reference_renormalize_naive,
     routing_reference_topk,
@@ -390,6 +402,187 @@ def test_trtllm_gen_routed_fused_moe_unpacked_fp32(
             quant_mode="MxFP4xBf16",
             routing_format="unpacked_fp32",
         )
+
+
+def test_prims_ts_fp4_nvfp4_routed_renormalize_smoke():
+    """Representative PrimTS FP4 routed case after env-switch removal."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3)]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=512,
+        intermediate_size=512,
+        moe_impl=FP4Moe(QuantMode.FP4_NVFP4_NVFP4),
+        routing_config={
+            "num_experts": 64,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [512],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices={},
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
+def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3)]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens = 32
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 64
+    top_k = 8
+    padding = 8
+    activation_type = ActivationType.Swiglu
+
+    moe_impl = FP4Moe(QuantMode.FP4_NVFP4_NVFP4)
+    moe_impl._cache_permute_indices = {}
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    gemm1_weights = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / hidden_size**0.5
+    )
+    gemm2_weights = (
+        torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / intermediate_size**0.5
+    )
+    routing_logits = torch.randn(
+        (num_tokens, num_experts), device=device, dtype=torch.bfloat16
+    )
+
+    permute_info, scores = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, padding
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    topk_weights = scores.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+
+    weights_data = moe_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    inputs_data = moe_impl.quantize_inputs(
+        hidden_states, weights_data["hidden_states_scale_global"]
+    )
+    quant_data = {**weights_data, **inputs_data}
+    args = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        padding,
+        quant_data["hidden_states"],
+        quant_data["hidden_states_scale"],
+        quant_data["hidden_states_scale_global"],
+        scores,
+        quant_data["gemm1_weights"],
+        quant_data["gemm1_scales"],
+        quant_data["gemm1_scales_global"],
+        quant_data["gemm2_weights"],
+        quant_data["gemm2_scales"],
+        quant_data["gemm2_scales_global"],
+        permute_info,
+        False,
+        activation_type,
+    )
+    _, args_dequant = moe_impl.compute_reference(args)
+    static_data = moe_impl.prepare_static_weights_for_kernel(
+        args_dequant,
+        args,
+        gemm1_weights,
+        gemm2_weights,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        {"use_shuffled_weight": True, "layout": WeightLayout.MajorK},
+    )
+
+    common_kwargs = dict(
+        routing_bias=None,
+        hidden_states=quant_data["hidden_states"],
+        hidden_states_scale=quant_data["hidden_states_scale"],
+        gemm1_weights=static_data["gemm1_weights_fp4_shuffled"],
+        gemm1_weights_scale=static_data["gemm1_scales_fp4_shuffled"],
+        gemm1_bias=static_data["gemm1_bias_shuffled"],
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=static_data["gemm2_weights_fp4_shuffled"],
+        gemm2_weights_scale=static_data["gemm2_scales_fp4_shuffled"],
+        gemm2_bias=static_data["gemm2_bias_shuffled"],
+        output1_scale_scalar=static_data["scale_c_fc1"],
+        output1_scale_gate_scalar=static_data["scale_gate_fc1"],
+        output2_scale_scalar=static_data["scale_c_fc2"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        enable_pdl=device_support_pdl(device),
+        activation_type=activation_type.value,
+        per_token_scale=None,
+        tune_max_num_tokens=4096,
+    )
+
+    with autotune(False):
+        logits_output = prims_ts_fp4_block_scale_moe(
+            routing_logits=routing_logits,
+            **common_kwargs,
+        )[0].to(torch.float)
+        packed_output = prims_ts_fp4_block_scale_routed_moe(
+            pack_topk_for_routed_moe(topk_ids, topk_weights),
+            **common_kwargs,
+        )[0].to(torch.float)
+        unpacked_output = prims_ts_fp4_block_scale_routed_moe(
+            (topk_ids, topk_weights),
+            **common_kwargs,
+        )[0].to(torch.float)
+
+    check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
+    check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)
 
 
 def _run_trtllm_gen_fp8_routed_fused_moe_case(
@@ -784,6 +977,7 @@ def _run_trtllm_gen_bf16_routed_fused_moe_case(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     routing_format: Literal["packed", "unpacked_fp32"],
+    moe_gemm_backend: MoeGemmBackend = MoeGemmBackend.TRTLLM,
 ):
     """Test Bf16 scale routed MoE matches standard routing."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -869,7 +1063,12 @@ def _run_trtllm_gen_bf16_routed_fused_moe_case(
     else:
         routing_input = (topk_ids, expert_weights.to(torch.float32))
 
-    output = trtllm_bf16_routed_moe(
+    routed_moe_op = (
+        prims_ts_bf16_routed_moe
+        if moe_gemm_backend == MoeGemmBackend.PRIMS_TS
+        else trtllm_bf16_routed_moe
+    )
+    output = routed_moe_op(
         topk_ids=routing_input,
         hidden_states=hidden_states,
         gemm1_weights=gemm1_weights,
@@ -914,7 +1113,10 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    moe_gemm_backend: MoeGemmBackend,
 ):
+    if moe_gemm_backend == MoeGemmBackend.PRIMS_TS and not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
     _run_trtllm_gen_bf16_routed_fused_moe_case(
         num_tokens,
         hidden_size,
@@ -923,6 +1125,7 @@ def test_trtllm_gen_bf16_routed_fused_moe(
         num_experts,
         routing_method_type,
         "packed",
+        moe_gemm_backend=moe_gemm_backend,
     )
 
 
@@ -1210,6 +1413,7 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, (
+        f"Mismatch percentage is {mismatch_pct:.2f}%"
         f"{routing_format} mismatch percentage is {mismatch_pct:.2f}%"
     )
 

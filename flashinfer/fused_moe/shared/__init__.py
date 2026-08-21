@@ -1,0 +1,34 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared MoE infrastructure reused across TRT-LLM cubin and Prims-TS backends."""
+
+from .inputs import (
+    MoEInputs,
+    MoeRunnerInputs,
+    alloc_trtllm_moe_output,
+    unpack_trtllm_moe_output,
+)
+from .tuning import make_moe_tuning_config, moe_topk_ids_init
+from .validation import validate_bf16_gemm1_activation_params
+
+__all__ = [
+    "MoEInputs",
+    "MoeRunnerInputs",
+    "alloc_trtllm_moe_output",
+    "make_moe_tuning_config",
+    "moe_topk_ids_init",
+    "unpack_trtllm_moe_output",
+    "validate_bf16_gemm1_activation_params",
+]

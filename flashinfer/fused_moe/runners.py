@@ -1152,6 +1152,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -1610,6 +1611,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -1932,6 +1934,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from ..tllm_enums import RoutingMethodType, WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -2211,6 +2214,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -2422,6 +2426,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,

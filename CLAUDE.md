@@ -38,6 +38,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
+| Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
+| Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
 
 The minimum Python version used by CI and build tooling is defined in
 `.python-version`. CI Docker images use a stable Conda environment name and
@@ -580,6 +582,13 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
+| `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM. |
+| `FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` | `--opt-level 2` | `flashinfer/prims_ts/utils.py`, `batched_gemm_run.py` | Extra CuTe-DSL / nvc compile options passed when building Prims-TS kernels. |
+| `FLASHINFER_PRIMS_TS_BF16_CONSTANT_WEIGHTS` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills BF16 autotune/cast-A weight tensors with constant `1.0` (debug / deterministic fill). |
+| `FLASHINFER_PRIMS_TS_CASTA_CONSTANT_ACT` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills cast-A / BF16 activation tensors with constant `1.0` during autotune buffer setup. |
+| `FLASHINFER_PRIMS_TS_CASTA_PATTERN_ACT` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills activations with a quarter-wise pattern `(1,2,4,6)` instead of random data. |
+| `FLASHINFER_PRIMS_TS_CASTA_PATTERN_WEIGHTS` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills cast-A weights with a deterministic pattern (takes precedence over constant fill). |
+| `FLASHINFER_PRIMS_TS_CASTA_CONSTANT_WEIGHTS` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills cast-A weights with constant values when pattern fill is not set. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py`, `flashinfer/comm/pcie_ipc_tuning.py` | Override the disk path for AutoTuner cache files (MLA, and the PCIe IPC all-reduce). Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
 | `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
 | `FLASHINFER_CUTILE_AUTOTUNE_DISABLED` | `0` | `flashinfer/quantization/kernels/cutile/rope_quantize_fp8_cutile.py` | Non-zero skips exhaustive cuTile RoPE-FP8 tuning and uses the built-in token-count heuristic. |
