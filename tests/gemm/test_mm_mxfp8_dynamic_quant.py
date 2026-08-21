@@ -117,11 +117,13 @@ def test_dynamic_quant_trace_unshuffles_trtllm_rows() -> None:
 def _prepare_trtllm_weight(
     n: int, k: int, device: torch.device | str = "cuda"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    weight = torch.randn((n, k), device=device, dtype=torch.bfloat16)
-    weight_q, weight_sf = mxfp8_quantize(
-        weight,
-        sf_swizzle_layout=SfLayout.layout_linear,
-    )
+    target_device = torch.device(device)
+    with torch.cuda.device(target_device):
+        weight = torch.randn((n, k), device=target_device, dtype=torch.bfloat16)
+        weight_q, weight_sf = mxfp8_quantize(
+            weight,
+            sf_swizzle_layout=SfLayout.layout_linear,
+        )
     weight_q, weight_sf = prepare_mxfp8_trtllm_weights(weight_q, weight_sf)
     return weight, weight_q, weight_sf
 
