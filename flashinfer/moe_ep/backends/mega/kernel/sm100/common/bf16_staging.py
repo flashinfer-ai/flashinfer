@@ -1,4 +1,4 @@
-"""Stage BF16 activations and routing for BF16 MegaMoE."""
+"""Stage BF16 activations and routing for SM100 MegaMoE."""
 
 from __future__ import annotations
 
