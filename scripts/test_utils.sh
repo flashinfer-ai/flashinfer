@@ -30,7 +30,7 @@ export MAX_JOBS
 # local tag is stripped because PEP-517 build environments must be able to
 # resolve the constraint from PyPI, where local-version wheels do not exist.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-    _cuda_stack_pins=$(python - <<'PY' 2>/dev/null || true
+    if ! _cuda_stack_pins=$(python - <<'PY'
 import importlib.metadata as metadata
 import torch
 
@@ -41,7 +41,10 @@ for package in ("cuda-python", "nvidia-cudnn-cu12", "nvidia-cudnn-cu13"):
     except metadata.PackageNotFoundError:
         pass
 PY
-    )
+    ); then
+        echo "ERROR: failed to inspect the image CUDA stack; refusing unpinned pip installs" >&2
+        return 1
+    fi
     if [ -n "${_cuda_stack_pins}" ]; then
         _constraint_file=$(mktemp /tmp/ci-cuda-stack-constraint.XXXXXX.txt)
         printf '%s\n' "${_cuda_stack_pins}" > "${_constraint_file}"
@@ -49,6 +52,9 @@ PY
         echo "Pinning the image CUDA stack for job-time pip installs:"
         printf '%s\n' "${_cuda_stack_pins}"
         unset _constraint_file
+    else
+        echo "ERROR: image CUDA stack inspection returned no package constraints" >&2
+        return 1
     fi
     unset _cuda_stack_pins
 fi

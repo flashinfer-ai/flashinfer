@@ -8,6 +8,7 @@ on:
     paths:
       - '.python-version'
       - 'build_utils.py'
+      - 'ci/validate_cuda_versions.py'
       - 'docker/**'
       - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
@@ -18,6 +19,7 @@ on:
     paths:
       - '.python-version'
       - 'build_utils.py'
+      - 'ci/validate_cuda_versions.py'
       - 'docker/**'
       - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
@@ -26,6 +28,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   generate-tag:
@@ -36,11 +41,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate CUDA configuration
+        run: python3 ci/validate_cuda_versions.py
+
       - name: Generate version tag
         id: generate_tag
         run: |
           DATE_SHA=$(date +'%Y%m%d')-$(git rev-parse --short HEAD)
-          echo "date_sha=${DATE_SHA}" >> $GITHUB_OUTPUT
+          echo "date_sha=${DATE_SHA}" >> "$GITHUB_OUTPUT"
           echo "Generated version tag: ${DATE_SHA}"
 
       - name: Load runtime CUDA matrix
@@ -91,11 +99,14 @@ jobs:
           sbom: false
 
       - name: Test candidate image before publishing
+        env:
+          CUDA_VERSION: ${{ matrix.cuda.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           docker image inspect "${IMAGE_TAG}" >/dev/null
-          docker run --rm --pull=never --platform "linux/${{ matrix.arch }}" -i \
+          docker run --rm --pull=never --platform "linux/${TARGET_ARCH}" -i \
             "${IMAGE_TAG}" \
-            python3 - "${{ matrix.cuda.version }}" "${{ matrix.arch }}" \
+            python3 - "${CUDA_VERSION}" "${TARGET_ARCH}" \
             < docker/test_ci_image.py
 
       - name: Push tested image
@@ -127,12 +138,13 @@ jobs:
       - name: Create and push multi-arch manifest for ${{ matrix.cuda.label }}
         env:
           DATE_SHA: ${{ needs.generate-tag.outputs.date_sha }}
+          IMAGE_REPOSITORY: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}
         run: |
           docker buildx imagetools create \
-            -t flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${DATE_SHA} \
-            -t flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:latest \
-            flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:amd64-${DATE_SHA} \
-            flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:arm64-${DATE_SHA}
+            -t "${IMAGE_REPOSITORY}:${DATE_SHA}" \
+            -t "${IMAGE_REPOSITORY}:latest" \
+            "${IMAGE_REPOSITORY}:amd64-${DATE_SHA}" \
+            "${IMAGE_REPOSITORY}:arm64-${DATE_SHA}"
 
   update-docker-tags:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

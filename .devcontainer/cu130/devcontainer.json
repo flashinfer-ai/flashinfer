@@ -6,7 +6,8 @@
         "target": "dev",
         "args": {
             "CUDA_IMAGE": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
-            "PYTORCH_INDEX": "cu130"
+            "PYTORCH_INDEX": "cu130",
+            "CUDNN_VERSION": "9.24.0.43"
         }
     },
     "runArgs": [
