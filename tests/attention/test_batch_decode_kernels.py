@@ -1407,6 +1407,85 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
         )
 
 
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_group_size_7(use_tensor_cores):
+    # Regression test for https://github.com/flashinfer-ai/flashinfer/issues/2896
+    # GQA group_size=7 (e.g. Qwen2.5-Math-7B: 28 query heads, 4 KV heads) used to
+    # crash the CUDA-cores decode path with "Unsupported group_size: 7".
+    batch_size = 4
+    kv_len = 129
+    page_size = 16
+    head_dim = 128
+    dtype = torch.bfloat16
+    num_qo_heads, num_kv_heads = 28, 4
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=dtype)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data_fp32 = torch.randn(
+        total_num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float32,
+        device="cuda:0",
+    )
+    kv_data = kv_data_fp32.to(dtype)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o = wrapper.run(q, kv_data)
+
+    # reference: unbatched CUDA-cores decode against the unpacked KV cache
+    for i in range(batch_size):
+        ki = torch.cat(
+            [
+                kv_data_fp32[kv_indptr[i] : kv_indptr[i + 1] - 1, 0].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                kv_data_fp32[kv_indptr[i + 1] - 1, 0, : kv_last_page_len[i], :].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                kv_data_fp32[kv_indptr[i] : kv_indptr[i + 1] - 1, 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                kv_data_fp32[kv_indptr[i + 1] - 1, 1, : kv_last_page_len[i], :].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(q[i], ki, vi)
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-2, atol=1e-2)
+
+
 # Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
 # masked logits are IEEE -inf, so any finite logit must win over masked positions
 # and fully masked rows must yield zero output with LSE = -inf.
