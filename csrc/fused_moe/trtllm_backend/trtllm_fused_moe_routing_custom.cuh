@@ -44,6 +44,29 @@ namespace routingCustom {
 #error "Define exactly one FLASHINFER_ROUTING_CUSTOM_* translation-unit selector"
 #endif
 
+// The post-TopK wrapper translation units export the same launcher ABI as the
+// general routing wrappers, but instantiate only the fixed policy used after
+// expert selection. Each JIT module lists exactly one wrapper family.
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+#define LAUNCH_ROUTING_CUSTOM_POST_TOPK(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
+                                        stream)                                                    \
+  LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream,     \
+                            NoOpPreprocess, SoftmaxPostprocess)
+
+static inline int32_t queryPostTopKMaxExperts(Data const& data) {
+  int32_t result = getMaxNumExperts(data.mNumExperts);
+  using Pairs = typename PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>::Pairs;
+  dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
+                    [&](auto eTag, auto /*kTag*/) { result = decltype(eTag)::value; });
+  return result;
+}
+
+static inline bool queryPostTopKHasCompiledTier(Data const& data) {
+  using Pairs = typename PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>::Pairs;
+  return dispatchTierPairs(static_cast<Pairs*>(nullptr), data, [](auto, auto) {});
+}
+#endif
+
 bool launchBlockKernel(Data const& data, void* stream);
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 bool launchClusterKernelBlockDim256(Data const& data, void* stream);
@@ -326,12 +349,21 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 // kernel was actually launched. A false return means no routing output was written;
 // the caller (run) must not proceed to the downstream pipeline in that case.
 bool launchBlockKernel(Data const& data, void* stream) {
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  uint32_t const numThreadsBlock =
+      std::min(1024u, static_cast<uint32_t>(queryPostTopKMaxExperts(data)));
+  LAUNCH_ROUTING_CUSTOM_POST_TOPK(data, false, routingIndicesBlockKernel, 1, numThreadsBlock,
+                                  /*smemSize=*/0,  // No dynamic smem
+                                  stream);
+  return queryPostTopKHasCompiledTier(data);
+#else
   uint32_t const numThreadsBlock =
       std::min(1024u, static_cast<uint32_t>(queryDispatchedMaxExperts(data)));
   LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockKernel, 1, numThreadsBlock,
                         /*smemSize=*/0,  // No dynamic smem
                         stream);
   return queryPolicyHasCompiledTier(data);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -659,15 +691,25 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
 // kernel was actually launched (see launchBlockKernel).
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream) {
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  int32_t const maxExperts = queryPostTopKMaxExperts(data);
+#else
   int32_t const maxExperts = queryDispatchedMaxExperts(data);
+#endif
   int const numSlots = data.mNumTokens * maxExperts;
   int const smemSize = numSlots + numSlots * 2 + 128 +
                        2 * (maxExperts / WarpSize) * static_cast<int>(sizeof(int32_t));
   int const threads =
       std::min(std::max(data.mNumTokens * static_cast<int>(WarpSize), maxExperts), 1024);
 
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  LAUNCH_ROUTING_CUSTOM_POST_TOPK(data, false, routingIndicesDynBlockKernel, 1, threads, smemSize,
+                                  stream);
+  return queryPostTopKHasCompiledTier(data);
+#else
   LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesDynBlockKernel, 1, threads, smemSize, stream);
   return queryPolicyHasCompiledTier(data);
+#endif
 }
 
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
@@ -876,16 +918,30 @@ bool launchClusterKernelForBlockDim(Data const& data, void* stream) {
 // Returns whether the cluster tier dispatch found a covering tier and launched a kernel.
 #if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
 bool launchClusterKernelBlockDim256(Data const& data, void* stream) {
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  return launchClusterKernelForPolicy<ClusterBlockDim256, NoOpPreprocess, SoftmaxPostprocess>(
+      data, stream);
+#else
   return launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+#endif
 }
 
 bool launchClusterKernelBlockDim512(Data const& data, void* stream) {
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  return launchClusterKernelForPolicy<ClusterBlockDim512, NoOpPreprocess, SoftmaxPostprocess>(
+      data, stream);
+#else
   return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+#endif
 }
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
 
 #if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
+#if defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+  return launchClusterKernelForPolicy<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>(
+      data, stream);
+#else
   bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr &&
                                     data.mPreprocessType == RoutingPreprocessType::None &&
                                     data.mPostprocessType == RoutingPostprocessType::Softmax;
@@ -898,6 +954,7 @@ bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
                         /*smemSize=*/0,  // No dynamic smem
                         stream);
   return queryPolicyHasCompiledTier(data);
+#endif
 }
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
 
@@ -936,6 +993,8 @@ bool launchClusterKernel(Data const& data, void* stream) {
 //    Used as step 1 of the multi-kernel pipeline when input is raw logits.
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
 
 template <int MaxNumExperts, int MaxNumTopExperts>
 struct HistogramScoresLaunchConfig : DefaultRoutingLaunchConfig<MaxNumExperts, MaxNumTopExperts> {
@@ -1416,6 +1475,8 @@ bool launchBlockScoresKernel(Data const& data, void* stream) {
   return launched;
 }
 
+#endif  // !defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // 4. Coop kernel — cooperative histogram + offsets via grid-sync.
@@ -1524,6 +1585,8 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 // Entry point
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
 
 void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
@@ -1829,9 +1892,13 @@ void run(Data const& data, void* stream) {
   }
 }
 
+#endif  // !defined(FLASHINFER_ROUTING_POST_TOPK_ONLY)
+
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace routingCustom
 }  // namespace moe::dev::routing
+
+#undef LAUNCH_ROUTING_CUSTOM_POST_TOPK

@@ -333,7 +333,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_bf16, moe_activation_bf1
 
 // ============================ moeSort bindings ============================
 // moe_sort - Sort tokens by expert assignment and generate mapping tensors
-// This uses DeepSeekV3 routing method with pre-computed expert selections
+// This uses the shared routing pipeline with pre-computed expert selections.
 //
 // Returns via output pointers:
 // - tile_idx_to_expert_idx: [max_num_tiles], mapping from tile to local expert index
@@ -425,12 +425,21 @@ void moe_sort(
   routingData.mSumEpsilon = 1e-20f;
   routingData.mUseRoutingSoftmax = false;
 
-  // Run the routing kernel
+  // The DeepSeek entry point immediately delegates precomputed top-k inputs
+  // to this routing-method-neutral pipeline. Call it directly so this utility
+  // module does not need to compile the unused score-routing implementation.
+  FLASHINFER_CHECK(routingData.mPtrTopKIds != nullptr,
+                   "Routing kernel requires at least one input parameter");
+  FLASHINFER_CHECK(routingData.mTopK > 0, "mTopK must be positive");
+  FLASHINFER_CHECK(routingData.mPtrTopKWeights != nullptr,
+                   "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
+                   "precomputed routing.");
+
   // Use explicit stream if provided (for CUDA graph compatibility), otherwise fall back to TVM FFI
   // stream
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
-  moe::dev::routing::routingDeepSeek::run(routingData, stream);
+  moe::dev::routing::runPostTopKPipeline(routingData, stream);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
