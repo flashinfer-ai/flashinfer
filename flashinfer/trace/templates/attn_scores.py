@@ -164,12 +164,15 @@ def _paged_mqa_logits_masked_check(
     atol=2e-2,
     **_unused,
 ):
-    """Compare kernel logits vs reference over the causal, in-context, finite region.
+    """Compare kernel logits vs reference over the causal, in-context region.
 
     Positions beyond each row's causal limit (and the SPLIT_KV-padded padding the
-    kernel may write) are excluded, as are positions where either side is non-finite
-    (fp8/fp4 accumulation-order can differ at extremes).  Uses an element-wise
-    tolerance plus a cosine-similarity floor."""
+    kernel may write) are excluded.  A non-finite *reference* is tolerated --
+    that is the fp8/fp4 accumulation-order argument -- but a non-finite *actual*
+    is a kernel failure and fails the check.  Excluding both sides symmetrically
+    made an all-NaN kernel output pass: every NaN position was dropped from
+    ``valid``, ``valid.any()`` went False, and the checker returned True having
+    compared nothing.  Uses an element-wise tolerance plus a relative-L2 floor."""
     ref = (
         reference_outputs[0]
         if isinstance(reference_outputs, (list, tuple))
@@ -196,10 +199,23 @@ def _paged_mqa_logits_masked_check(
 
     r = ref.float().masked_fill(neginf_mask, 0)
     a = act.float().masked_fill(neginf_mask, 0)
-    finite = torch.isfinite(r) & torch.isfinite(a)
-    valid = (~neginf_mask) & finite
+    # A non-finite value the KERNEL produced inside the causal region is a
+    # failure, never something to filter out. Checked before `valid` is built so
+    # it cannot be masked away by its own presence.
+    in_region = ~neginf_mask
+    if in_region.any() and not torch.isfinite(a[in_region]).all():
+        return False
+
+    # A non-finite REFERENCE is tolerated: fp8/fp4 accumulation order can differ
+    # at extremes, and that is a property of the comparison target, not of the
+    # kernel under test.
+    valid = in_region & torch.isfinite(r)
     if not valid.any():
-        return True
+        # Nothing comparable. Only a vacuously-empty causal region is a pass;
+        # a region that exists but whose reference is entirely non-finite gives
+        # no evidence either way, so do not claim success.
+        return not in_region.any()
+
     rv, av = r[valid], a[valid]
     if not torch.allclose(av, rv, rtol=rtol, atol=atol):
         # Fallback: relative-L2 error ||a-r|| / ||r||. Tolerates a few boundary
@@ -207,9 +223,15 @@ def _paged_mqa_logits_masked_check(
         # unlike a loose cosine floor — REJECTS a systematic k*ref scale error
         # (rel-L2 == |k-1|), so a mis-scaled / bad-weight-cast kernel cannot pass.
         rnorm = rv.double().norm()
-        rel_l2 = float((av.double() - rv.double()).norm() / rnorm) if rnorm > 0 else 0.0
-        if rel_l2 > 0.05:
-            return False
+        if rnorm > 0:
+            if float((av.double() - rv.double()).norm() / rnorm) > 0.05:
+                return False
+        else:
+            # An all-zero reference makes the relative error undefined; the old
+            # code substituted 0.0, which no threshold can exceed, so ANY actual
+            # passed. Fall back to an absolute comparison against zero.
+            if not torch.allclose(av, torch.zeros_like(av), rtol=0, atol=atol):
+                return False
     return True
 
 
