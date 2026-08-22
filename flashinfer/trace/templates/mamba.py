@@ -187,7 +187,7 @@ class _SSDCombinedTraceTemplate(TraceTemplate):
         return fi_trace
 
 
-_SSD_COMBINED_COMMON_AXES = {
+_SSD_COMBINED_COMMON_AXES: dict[str, Var | Const] = {
     "batch_size": Var(description="Input batch size."),
     "seqlen": Var(description="Tokens per batch row."),
     "nheads": Const(abbrev="h", description="Number of SSD heads."),
@@ -205,8 +205,8 @@ def _make_ssd_combined_trace(
     d_layout: str,
     return_final_states: bool,
 ) -> TraceTemplate:
-    axes = dict(_SSD_COMBINED_COMMON_AXES)
-    inputs = {
+    axes: dict[str, Var | Const] = dict(_SSD_COMBINED_COMMON_AXES)
+    inputs: dict[str, Tensor | Scalar] = {
         "x": Tensor(["batch_size", "seqlen", "nheads", "headdim"]),
         "dt": Tensor(["batch_size", "seqlen", "nheads"]),
         "A": Tensor(["nheads"], dtype="float32"),
@@ -297,7 +297,7 @@ def _make_ssd_combined_trace(
         }
     )
 
-    outputs = {
+    outputs: dict[str, Tensor | Scalar] = {
         "out": Tensor(
             ["batch_size", "seqlen", "nheads", "headdim"],
             dtype_from="x",
