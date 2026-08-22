@@ -65,7 +65,7 @@ def _select_scan_route(
     shallow_varlen = mode_varlen and num_logical_chunks <= num_sequences
     if dt_min < 0.0 or not shallow_varlen:
         return _ROUTE_EXACT_SCAN
-    if prefix_route_selected and nheads >= 8 * ngroups:
+    if prefix_route_selected and nheads == 128 and ngroups == 8:
         return _ROUTE_PREFIX_VARLEN
     return _ROUTE_SHALLOW_VARLEN
 

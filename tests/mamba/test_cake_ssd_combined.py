@@ -1703,6 +1703,8 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         (True, 2, 2, 128, 8, 0.0, False, "shallow_varlen"),
         (True, 0, 2, 128, 8, 0.0, False, "shallow_varlen"),
         (True, 2, 2, 8, 8, 0.0, True, "shallow_varlen"),
+        (True, 2, 2, 8, 1, 0.0, True, "shallow_varlen"),
+        (True, 2, 2, 128, 1, 0.0, True, "shallow_varlen"),
         (True, 2, 2, 128, 8, 0.0, True, "prefix_varlen"),
     ],
 )
