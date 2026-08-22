@@ -9,58 +9,235 @@ from mpi4py import MPI
 import pytest
 import torch
 
+from flashinfer import mxfp4_quantize, nvfp4_quantize
 from flashinfer.comm import MoeAlltoAll, moe_a2a_active_rank_mask
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 from flashinfer.tllm_enums import SfLayout
+from tests.utils_fp8 import mxfp8_quantize_reference
 
 from .conftest import mnnvl_available
 
 
 def test_fused_module_keeps_the_public_python_contract():
+    import flashinfer.comm as public_api
     import flashinfer.comm.trtllm_moe_alltoall as api
 
-    assert "moe_a2a_active_rank_mask" in api.__all__
-    assert tuple(inspect.signature(api.moe_a2a_dispatch).parameters) == (
-        "token_selected_experts",
-        "input_payloads",
-        "workspace",
-        "metainfo",
-        "runtime_max_tokens_per_rank",
-        "ep_rank",
-        "ep_size",
-        "top_k",
-        "num_experts",
-        "enable_pdl",
-        "eplb_local_stats",
-        "enable_rank_mask",
-        "active_rank_mask",
-    )
+    expected_module_parameters = {
+        "moe_a2a_active_rank_mask": ("active_ranks", "ep_size"),
+        "moe_a2a_initialize": (
+            "workspace",
+            "ep_rank",
+            "ep_size",
+            "max_num_tokens",
+            "eplb_stats_num_experts",
+        ),
+        "moe_a2a_wrap_payload_tensor_in_workspace": (
+            "workspace",
+            "leading_shape",
+            "slice_start",
+            "slice_end",
+            "dtype",
+        ),
+        "moe_a2a_dispatch": (
+            "token_selected_experts",
+            "input_payloads",
+            "workspace",
+            "metainfo",
+            "runtime_max_tokens_per_rank",
+            "ep_rank",
+            "ep_size",
+            "top_k",
+            "num_experts",
+            "enable_pdl",
+            "eplb_local_stats",
+            "enable_rank_mask",
+            "active_rank_mask",
+        ),
+        "moe_a2a_combine": (
+            "payload",
+            "local_num_tokens",
+            "workspace",
+            "metainfo",
+            "runtime_max_tokens_per_rank",
+            "ep_rank",
+            "ep_size",
+            "top_k",
+            "combine_payload_offset",
+            "payload_in_workspace",
+            "output_dtype",
+            "output_scales",
+            "output_scalar_scale",
+            "sf_layout",
+            "output",
+            "use_low_precision",
+            "enable_pdl",
+            "enable_rank_mask",
+            "active_rank_mask",
+        ),
+        "moe_a2a_sanitize_expert_ids": (
+            "expert_ids",
+            "workspace",
+            "metainfo",
+            "ep_rank",
+            "invalid_expert_id",
+            "enable_pdl",
+        ),
+        "moe_a2a_get_workspace_size_per_rank": (
+            "ep_size",
+            "max_num_tokens",
+            "total_dispatch_payload_size_per_token",
+            "combine_payload_size_per_token",
+            "eplb_stats_num_experts",
+        ),
+    }
+    expected_module_defaults = {
+        "moe_a2a_active_rank_mask": {},
+        "moe_a2a_initialize": {"eplb_stats_num_experts": 0},
+        "moe_a2a_wrap_payload_tensor_in_workspace": {},
+        "moe_a2a_dispatch": {
+            "enable_pdl": None,
+            "eplb_local_stats": None,
+            "enable_rank_mask": False,
+            "active_rank_mask": None,
+        },
+        "moe_a2a_combine": {
+            "payload_in_workspace": False,
+            "output_dtype": None,
+            "output_scales": None,
+            "output_scalar_scale": 1.0,
+            "sf_layout": SfLayout.layout_linear,
+            "output": None,
+            "use_low_precision": False,
+            "enable_pdl": None,
+            "enable_rank_mask": False,
+            "active_rank_mask": None,
+        },
+        "moe_a2a_sanitize_expert_ids": {"enable_pdl": None},
+        "moe_a2a_get_workspace_size_per_rank": {"eplb_stats_num_experts": 0},
+    }
+    assert set(api.__all__) == {"MoeAlltoAll", *expected_module_parameters}
+    for name, expected_parameters in expected_module_parameters.items():
+        assert getattr(public_api, name) is getattr(api, name)
+        signature = inspect.signature(getattr(api, name))
+        assert tuple(signature.parameters) == expected_parameters
+        assert {
+            parameter_name: parameter.default
+            for parameter_name, parameter in signature.parameters.items()
+            if parameter.default is not inspect.Parameter.empty
+        } == expected_module_defaults[name]
+
+    assert public_api.MoeAlltoAll is api.MoeAlltoAll
+    expected_class_parameters = {
+        "__init__": (
+            "self",
+            "mapping",
+            "max_num_tokens",
+            "top_k",
+            "num_experts",
+            "workspace_size_per_rank",
+            "hidden_size",
+            "mnnvl_config",
+            "eplb_stats_num_experts",
+            "enable_rank_mask",
+        ),
+        "get_workspace": (
+            "workspace_size_per_rank",
+            "ep_rank",
+            "ep_size",
+            "max_num_tokens",
+            "mapping",
+            "eplb_stats_num_experts",
+        ),
+        "get_moe_workspace_size_per_rank": (
+            "ep_size",
+            "top_k",
+            "max_num_tokens",
+            "hidden_size",
+            "extra_payload_bytes_per_token",
+            "eplb_stats_num_experts",
+        ),
+        "checkpoint_prepare": ("self",),
+        "checkpoint_restore": ("self", "comm_backend"),
+        "dispatch": (
+            "self",
+            "token_selected_experts",
+            "input_payloads",
+            "runtime_max_tokens_per_rank",
+            "invalid_token_expert_id",
+            "expert_id_payload_index",
+            "eplb_local_stats",
+            "active_rank_mask",
+        ),
+        "combine": (
+            "self",
+            "payload",
+            "runtime_max_tokens_per_rank",
+            "payload_in_workspace",
+            "output_dtype",
+            "output_scales",
+            "output_scalar_scale",
+            "sf_layout",
+            "output",
+            "use_low_precision",
+            "active_rank_mask",
+        ),
+        "get_combine_payload_tensor_in_workspace": (
+            "self",
+            "runtime_max_tokens_per_rank",
+            "hidden_size",
+            "dtype",
+        ),
+    }
+    expected_class_defaults = {
+        "__init__": {
+            "workspace_size_per_rank": None,
+            "hidden_size": None,
+            "mnnvl_config": None,
+            "eplb_stats_num_experts": 0,
+            "enable_rank_mask": False,
+        },
+        "get_workspace": {"eplb_stats_num_experts": 0},
+        "get_moe_workspace_size_per_rank": {
+            "extra_payload_bytes_per_token": 0,
+            "eplb_stats_num_experts": 0,
+        },
+        "checkpoint_prepare": {},
+        "checkpoint_restore": {},
+        "dispatch": {
+            "invalid_token_expert_id": None,
+            "expert_id_payload_index": None,
+            "eplb_local_stats": None,
+            "active_rank_mask": None,
+        },
+        "combine": {
+            "payload_in_workspace": False,
+            "output_dtype": None,
+            "output_scales": None,
+            "output_scalar_scale": 1.0,
+            "sf_layout": SfLayout.layout_linear,
+            "output": None,
+            "use_low_precision": False,
+            "active_rank_mask": None,
+        },
+        "get_combine_payload_tensor_in_workspace": {},
+    }
+    for name, expected_parameters in expected_class_parameters.items():
+        signature = inspect.signature(getattr(api.MoeAlltoAll, name))
+        assert tuple(signature.parameters) == expected_parameters
+        assert {
+            parameter_name: parameter.default
+            for parameter_name, parameter in signature.parameters.items()
+            if parameter.default is not inspect.Parameter.empty
+        } == expected_class_defaults[name]
+
     combine = inspect.signature(api.moe_a2a_combine)
-    assert tuple(combine.parameters) == (
-        "payload",
-        "local_num_tokens",
-        "workspace",
-        "metainfo",
-        "runtime_max_tokens_per_rank",
-        "ep_rank",
-        "ep_size",
-        "top_k",
-        "combine_payload_offset",
-        "payload_in_workspace",
-        "output_dtype",
-        "output_scales",
-        "output_scalar_scale",
-        "sf_layout",
-        "output",
-        "use_low_precision",
-        "enable_pdl",
-        "enable_rank_mask",
-        "active_rank_mask",
-    )
-    assert combine.parameters["sf_layout"].default is SfLayout.layout_linear
-    assert combine.parameters["output"].default is None
     assert combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
+    class_combine = inspect.signature(api.MoeAlltoAll.combine)
+    assert (
+        class_combine.parameters["use_low_precision"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
 
 
 def test_active_rank_mask_preserves_upper_u64_bits_in_dispatch():
@@ -325,22 +502,291 @@ def test_workspace_initialization_rendezvous_is_ordered_and_cached(monkeypatch):
     assert events == ["allocate", "view", "initialize", "barrier"]
 
 
+_HIDDEN_SIZE = 128
+_ROUTES_BY_RANK = (
+    ((0, 3), (4, 4), (2, 1)),
+    ((3, 0), (1, 4), (3, 3)),
+)
+_QUANTIZATION_CELLS = (
+    ("mxfp8", SfLayout.layout_linear),
+    ("mxfp8", SfLayout.layout_128x4),
+    ("mxfp8", SfLayout.layout_8x4),
+    ("mxfp4", SfLayout.layout_128x4),
+    ("nvfp4", SfLayout.layout_128x4),
+)
+
+
 def _payloads(rank, experts):
     tokens = experts.shape[0]
-    columns = torch.arange(8, dtype=torch.float32, device="cuda")
+    columns = torch.arange(_HIDDEN_SIZE, dtype=torch.float32, device="cuda")
     rows = torch.arange(tokens, dtype=torch.float32, device="cuda")[:, None]
     hidden = (rank * 100 + rows * 10 + columns).to(torch.bfloat16)
-    weights = torch.arange(tokens * 2, dtype=torch.float32, device="cuda").reshape(tokens, 2)
+    top_k = experts.shape[1]
+    weights = torch.arange(
+        tokens * top_k, dtype=torch.float32, device="cuda"
+    ).reshape(tokens, top_k)
     weights.add_(rank * 10)
-    lora_ids = (rank * 10 + torch.arange(tokens, dtype=torch.int32, device="cuda"))[:, None]
+    lora_ids = (
+        rank * 10 + torch.arange(tokens, dtype=torch.int32, device="cuda")
+    )[:, None]
     fp8 = (hidden.float() * 0.125).to(torch.float8_e4m3fn)
-    packed = torch.arange(tokens * 4, dtype=torch.uint8, device="cuda").reshape(tokens, 4)
+    packed = torch.arange(
+        tokens * (_HIDDEN_SIZE // 2), dtype=torch.uint8, device="cuda"
+    ).reshape(tokens, _HIDDEN_SIZE // 2)
     packed.add_(rank * 20)
     return [hidden, experts, weights, lora_ids, fp8, packed]
 
 
 def _owner(expert_id):
     return 0 if expert_id < 3 else 1
+
+
+def _scale_extent(quantization, rows, columns, layout):
+    vector_size = 16 if quantization == "nvfp4" else 32
+    scale_columns = (columns + vector_size - 1) // vector_size
+    if layout is SfLayout.layout_linear:
+        return rows * scale_columns
+    if layout is SfLayout.layout_128x4:
+        padded_rows = (rows + 127) // 128 * 128
+    elif layout is SfLayout.layout_8x4:
+        padded_rows = (rows + 7) // 8 * 8
+    else:
+        raise ValueError(f"unsupported scale layout: {layout}")
+    padded_columns = (scale_columns + 3) // 4 * 4
+    return padded_rows * padded_columns
+
+
+def _assert_exact_physical_bytes(actual, expected, label):
+    actual_bytes = actual.contiguous().view(torch.uint8).reshape(-1)
+    expected_bytes = expected.contiguous().view(torch.uint8).reshape(-1)
+    assert actual_bytes.shape == expected_bytes.shape, (
+        f"{label} byte extent mismatch: "
+        f"{actual_bytes.shape} != {expected_bytes.shape}"
+    )
+    if not torch.equal(actual_bytes, expected_bytes):
+        mismatches = torch.nonzero(actual_bytes != expected_bytes, as_tuple=False)
+        first = int(mismatches[0, 0].item())
+        raise AssertionError(
+            f"{label} physical bytes differ at {len(mismatches)} positions; "
+            f"first index {first}: actual={int(actual_bytes[first].item())}, "
+            f"expected={int(expected_bytes[first].item())}"
+        )
+
+
+def _dispatch_public_round(
+    collective,
+    rank,
+    routes,
+    payloads,
+    active_mask,
+    active_sources,
+    *,
+    gather_eplb,
+):
+    local_stats = None
+    if gather_eplb:
+        local_stats = rank * 100 + torch.arange(5, dtype=torch.int32, device="cuda")
+    received = collective.dispatch(
+        routes,
+        payloads,
+        routes.shape[0],
+        invalid_token_expert_id=5,
+        expert_id_payload_index=1,
+        eplb_local_stats=local_stats,
+        active_rank_mask=active_mask,
+    )
+
+    if gather_eplb:
+        expected_stats = torch.stack(
+            [
+                source * 100
+                + torch.arange(5, dtype=torch.int32, device="cuda")
+                for source in active_sources
+            ]
+        )
+        torch.testing.assert_close(
+            collective.eplb_gathered_stats, expected_stats, atol=0, rtol=0
+        )
+    else:
+        assert collective.eplb_gathered_stats is None
+
+    expected_payloads = [
+        _payloads(
+            source,
+            torch.tensor(_ROUTES_BY_RANK[source], dtype=torch.int32, device="cuda"),
+        )
+        for source in active_sources
+    ]
+    valid_slots = {}
+    for source, source_payloads in zip(
+        active_sources, expected_payloads, strict=True
+    ):
+        expected_tokens = [
+            token
+            for token, selected in enumerate(_ROUTES_BY_RANK[source])
+            if rank in {_owner(expert) for expert in selected}
+        ]
+        slots = {
+            int(received[3][source, slot, 0].item()): slot
+            for slot in range(len(expected_tokens))
+        }
+        assert set(slots) == {source * 10 + token for token in expected_tokens}
+        valid_slots[source] = slots
+        for token in expected_tokens:
+            slot = slots[source * 10 + token]
+            for payload_index, source_payload in enumerate(source_payloads):
+                _assert_exact_physical_bytes(
+                    received[payload_index][source, slot],
+                    source_payload[token],
+                    f"dispatch payload {payload_index}",
+                )
+        if len(expected_tokens) < routes.shape[0]:
+            assert torch.all(received[1][source, len(expected_tokens) :] == 5)
+    return received, valid_slots
+
+
+def _fill_expert_output_and_reference(
+    expert_output,
+    received,
+    valid_slots,
+    payloads,
+    rank,
+    active_owners,
+):
+    expert_output.zero_()
+    for source, slots in valid_slots.items():
+        for slot in slots.values():
+            lora_id = int(received[3][source, slot, 0].item())
+            factor = rank + 1 + (lora_id + 1) / 16
+            expert_output[source, slot].copy_(
+                (received[0][source, slot].float() * factor).to(torch.bfloat16)
+            )
+
+    reference = torch.zeros_like(payloads[0])
+    for token, selected in enumerate(_ROUTES_BY_RANK[rank]):
+        lora_id = int(payloads[3][token, 0].item())
+        contributions = [
+            (payloads[0][token].float() * (owner + 1 + (lora_id + 1) / 16)).to(
+                torch.bfloat16
+            )
+            for owner in {_owner(expert) for expert in selected}
+            if owner in active_owners
+        ]
+        if contributions:
+            reference[token].copy_(
+                torch.stack(contributions).float().sum(dim=0).to(torch.bfloat16)
+            )
+    return reference
+
+
+def _quantized_reference(reference, quantization, layout, scalar_scale):
+    if quantization == "mxfp8":
+        return mxfp8_quantize_reference(reference, sf_swizzle_layout=layout)
+    if quantization == "mxfp4":
+        return mxfp4_quantize(reference, sfLayout=layout)
+    if quantization == "nvfp4":
+        global_scale = torch.tensor(
+            [scalar_scale], dtype=torch.float32, device=reference.device
+        )
+        return nvfp4_quantize(
+            reference,
+            global_scale,
+            sfLayout=layout,
+            sf_vec_size=16,
+            do_shuffle=False,
+        )
+    raise ValueError(f"unsupported quantization: {quantization}")
+
+
+def _run_public_combine_round(
+    collective,
+    rank,
+    routes,
+    payloads,
+    active_mask,
+    active_sources,
+    active_owners,
+    *,
+    payload_in_workspace,
+    gather_eplb=False,
+    quantization=None,
+    layout=SfLayout.layout_linear,
+):
+    received, valid_slots = _dispatch_public_round(
+        collective,
+        rank,
+        routes,
+        payloads,
+        active_mask,
+        active_sources,
+        gather_eplb=gather_eplb,
+    )
+    if payload_in_workspace:
+        expert_output = collective.get_combine_payload_tensor_in_workspace(
+            routes.shape[0], _HIDDEN_SIZE, torch.bfloat16
+        )
+    else:
+        expert_output = torch.empty_like(received[0])
+    reference = _fill_expert_output_and_reference(
+        expert_output,
+        received,
+        valid_slots,
+        payloads,
+        rank,
+        active_owners,
+    )
+
+    if quantization is None:
+        caller_output = torch.empty_like(reference)
+        result = collective.combine(
+            expert_output,
+            routes.shape[0],
+            payload_in_workspace=payload_in_workspace,
+            output=caller_output,
+            active_rank_mask=active_mask,
+        )
+        assert result is caller_output
+        torch.testing.assert_close(result, reference, atol=1e-2, rtol=1e-2)
+        return
+
+    if quantization == "mxfp8":
+        output_dtype = torch.float8_e4m3fn
+        scale_dtype = torch.uint8
+        output_columns = _HIDDEN_SIZE
+    else:
+        output_dtype = torch.uint8
+        scale_dtype = (
+            torch.float8_e4m3fn if quantization == "nvfp4" else torch.uint8
+        )
+        output_columns = _HIDDEN_SIZE // 2
+    output_scales = torch.zeros(
+        _scale_extent(quantization, routes.shape[0], _HIDDEN_SIZE, layout),
+        dtype=scale_dtype,
+        device="cuda",
+    )
+    caller_output = torch.empty(
+        routes.shape[0], output_columns, dtype=output_dtype, device="cuda"
+    )
+    scalar_scale = 2.5
+    result = collective.combine(
+        expert_output,
+        routes.shape[0],
+        payload_in_workspace=payload_in_workspace,
+        output_dtype=output_dtype,
+        output_scales=output_scales,
+        output_scalar_scale=scalar_scale,
+        sf_layout=layout,
+        output=caller_output,
+        active_rank_mask=active_mask,
+    )
+    assert result is caller_output
+    expected_output, expected_scales = _quantized_reference(
+        reference, quantization, layout, scalar_scale
+    )
+    _assert_exact_physical_bytes(result, expected_output, f"{quantization} output")
+    _assert_exact_physical_bytes(
+        output_scales, expected_scales, f"{quantization} scales"
+    )
 
 
 def _run_public_mpi2_cycle():
@@ -358,20 +804,16 @@ def _run_public_mpi2_cycle():
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
-    routes_by_rank = (
-        ((0, 3), (4, 4), (2, 1)),
-        ((3, 0), (1, 4), (3, 3)),
-    )
-    routes = torch.tensor(routes_by_rank[rank], dtype=torch.int32, device="cuda")
+    routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
     payloads = _payloads(rank, routes)
     max_tokens = routes.shape[0]
     top_k = routes.shape[1]
-    extra_payload_bytes = 4 + 8 + 4
+    extra_payload_bytes = 4 + _HIDDEN_SIZE + _HIDDEN_SIZE // 2
     workspace_size = MoeAlltoAll.get_moe_workspace_size_per_rank(
         2,
         top_k,
         max_tokens,
-        8,
+        _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
         eplb_stats_num_experts=5,
     )
@@ -386,81 +828,59 @@ def _run_public_mpi2_cycle():
         enable_rank_mask=True,
     )
     active_mask = moe_a2a_active_rank_mask((0, 1), 2)
-    local_stats = rank * 100 + torch.arange(5, dtype=torch.int32, device="cuda")
-    received = collective.dispatch(
+    _run_public_combine_round(
+        collective,
+        rank,
         routes,
         payloads,
-        max_tokens,
-        invalid_token_expert_id=5,
-        expert_id_payload_index=1,
-        eplb_local_stats=local_stats,
-        active_rank_mask=active_mask,
-    )
-
-    expected_stats = torch.stack(
-        [source * 100 + torch.arange(5, dtype=torch.int32, device="cuda") for source in range(2)]
-    )
-    torch.testing.assert_close(collective.eplb_gathered_stats, expected_stats, atol=0, rtol=0)
-
-    expected_payloads = [
-        _payloads(
-            source,
-            torch.tensor(routes_by_rank[source], dtype=torch.int32, device="cuda"),
-        )
-        for source in range(2)
-    ]
-    valid_slots = {}
-    for source in range(2):
-        expected_tokens = [
-            token
-            for token, selected in enumerate(routes_by_rank[source])
-            if rank in {_owner(expert) for expert in selected}
-        ]
-        slots = {
-            int(received[3][source, slot, 0].item()): slot
-            for slot in range(len(expected_tokens))
-        }
-        assert set(slots) == {source * 10 + token for token in expected_tokens}
-        valid_slots[source] = slots
-        for token in expected_tokens:
-            slot = slots[source * 10 + token]
-            for payload_index, source_payload in enumerate(expected_payloads[source]):
-                torch.testing.assert_close(
-                    received[payload_index][source, slot],
-                    source_payload[token],
-                    atol=0,
-                    rtol=0,
-                )
-        if len(expected_tokens) < max_tokens:
-            assert torch.all(received[1][source, len(expected_tokens) :] == 5)
-
-    expert_output = torch.zeros_like(received[0])
-    for source, slots in valid_slots.items():
-        for slot in slots.values():
-            expert_output[source, slot].copy_(received[0][source, slot] * (rank + 1))
-
-    caller_output = torch.empty_like(payloads[0])
-    result = collective.combine(
-        expert_output,
-        max_tokens,
+        active_mask,
+        (0, 1),
+        (0, 1),
         payload_in_workspace=False,
-        output=caller_output,
-        active_rank_mask=active_mask,
+        gather_eplb=True,
     )
-    assert result is caller_output
-    factors = torch.tensor(
-        [
-            sum({_owner(expert) + 1 for expert in selected})
-            for selected in routes_by_rank[rank]
-        ],
-        dtype=torch.bfloat16,
-        device="cuda",
+    _run_public_combine_round(
+        collective,
+        rank,
+        routes,
+        payloads,
+        active_mask,
+        (0, 1),
+        (0, 1),
+        payload_in_workspace=True,
     )
-    reference = payloads[0] * factors[:, None]
-    torch.testing.assert_close(result, reference, atol=1e-2, rtol=1e-2)
+
+    for quantization, layout in _QUANTIZATION_CELLS:
+        _run_public_combine_round(
+            collective,
+            rank,
+            routes,
+            payloads,
+            active_mask,
+            (0, 1),
+            (0, 1),
+            payload_in_workspace=False,
+            quantization=quantization,
+            layout=layout,
+        )
+
+    comm.barrier()
+    if rank == 0:
+        rank_zero_mask = moe_a2a_active_rank_mask((0,), 2)
+        _run_public_combine_round(
+            collective,
+            rank,
+            routes,
+            payloads,
+            rank_zero_mask,
+            (0,),
+            (0,),
+            payload_in_workspace=False,
+        )
     comm.barrier()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_public_mpi2_nondivisible_six_payload_eplb_and_external_output():
+    """Exercise the complete source-adapter boundary through public APIs only."""
     _run_public_mpi2_cycle()
