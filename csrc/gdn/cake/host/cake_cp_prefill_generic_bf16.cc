@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_9bab8e297c);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_823360d1d6);
 
 namespace cake_host_shim {
 
@@ -388,7 +388,7 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T, TensorView arg_O, TensorView arg_alpha, TensorView arg_cu_seqlens, TensorView arg_fixed_state, TensorView arg_initial_state_workspace, TensorView arg_tensormap_workspace, int64_t arg_cp_chunk_len, int64_t arg_num_q_heads, int64_t arg_num_k_heads, int64_t arg_num_v_heads, int64_t arg_num_sab_heads, double arg_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T, TensorView arg_O, TensorView arg_alpha, TensorView arg_cu_seqlens, TensorView arg_fixed_state, TensorView arg_initial_state_workspace, TensorView arg_tensormap_workspace, int64_t arg_cp_chunk_len, int64_t arg_source_cp_chunk_len, int64_t arg_num_q_heads, int64_t arg_num_k_heads, int64_t arg_num_v_heads, int64_t arg_num_sab_heads, double arg_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_Q, "Q");
   CheckDtype(arg_Q, "Q", 4, 16, 1);
   CheckCudaTensor(arg_K, "K");
@@ -416,6 +416,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   CheckContiguous(arg_tensormap_workspace, "tensormap_workspace");
   TVM_FFI_CHECK(arg_cp_chunk_len >= -2147483648LL && arg_cp_chunk_len <= 2147483647LL, ValueError)
       << "scalar 'cp_chunk_len' value " << arg_cp_chunk_len
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_source_cp_chunk_len >= -2147483648LL && arg_source_cp_chunk_len <= 2147483647LL, ValueError)
+      << "scalar 'source_cp_chunk_len' value " << arg_source_cp_chunk_len
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_num_q_heads >= -2147483648LL && arg_num_q_heads <= 2147483647LL, ValueError)
       << "scalar 'num_q_heads' value " << arg_num_q_heads
@@ -456,14 +459,15 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   void* p_initial_state_workspace = arg_initial_state_workspace.data_ptr();
   void* p_tensormap_workspace = arg_tensormap_workspace.data_ptr();
   int32_t v_cp_chunk_len = (int32_t)arg_cp_chunk_len;
+  int32_t v_source_cp_chunk_len = (int32_t)arg_source_cp_chunk_len;
   int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
   int32_t v_num_k_heads = (int32_t)arg_num_k_heads;
   int32_t v_num_v_heads = (int32_t)arg_num_v_heads;
   int32_t v_num_sab_heads = (int32_t)arg_num_sab_heads;
   float v_scale = (float)arg_scale;
-  void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
+  void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_source_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_9bab8e297c::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1", 224768);
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_823360d1d6::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1", 224768);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
 

@@ -7152,7 +7152,7 @@
       ]
     }
   ],
-  "generator_commit": "c8964370632ef184ed31f11318c39741c5d3141c",
+  "generator_commit": "daba24dbebd62b87766bc77cfae3adcab9fe777f",
   "kernels": [
     {
       "abi": [
@@ -8932,6 +8932,10 @@
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
+          "name": "source_cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
           "name": "num_q_heads",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
@@ -9002,6 +9006,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9034,10 +9042,10 @@
           ]
         ],
         "entry": "run_cp_prefill",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_a923ee3e3c",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_68ee2bc4ae",
         "path": "host/cake_cp_prefill.cc",
-        "sha256": "7f8ac1c5ef2aa0716f77c7b4a2303597a89c44521d53be5b623953dfaca16c7c",
-        "size_bytes": 23029
+        "sha256": "1f82165f1673ca7bd9f4f1ace99e0e6fb74bc52449983ad449de45dd90a11ca9",
+        "size_bytes": 23401
       },
       "name": "cp_prefill",
       "outputs": [
@@ -9047,8 +9055,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill.cu",
-          "sha256": "261d8a766ff68cabde78accd25e69c854a045f2a796ab1bfd550b5ca073dadf2",
-          "size_bytes": 144964
+          "sha256": "09f597e1c8b4ffdb8c24e20cd129a84ded08db8780975d6ea2d7c30a53d80880",
+          "size_bytes": 146254
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_v1",
@@ -9099,6 +9107,10 @@
         },
         {
           "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "source_cp_chunk_len",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
@@ -9172,6 +9184,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9204,10 +9220,10 @@
           ]
         ],
         "entry": "run_cp_prefill_equal_head",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_88c2f9b9ae",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_a2bfadcb58",
         "path": "host/cake_cp_prefill_equal_head.cc",
-        "sha256": "c26cc88c5c309d710d9960aca99595cff88bb3162b07f12efa89c2f051c3ee65",
-        "size_bytes": 23084
+        "sha256": "304e813dd8da630f2523792921855716f813722c764658ea3b6b69c9855a6130",
+        "size_bytes": 23456
       },
       "name": "cp_prefill_equal_head",
       "outputs": [
@@ -9217,8 +9233,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_equal_head.cu",
-          "sha256": "775d9962ccf6c3cab4eef8ae138bf5bc4cec06a6e0587b470d031ffa58687315",
-          "size_bytes": 144885
+          "sha256": "1ac90b325c5a8f6b69f18f02490bd4871b753047502dea510ae5231b5dd2b1f8",
+          "size_bytes": 146175
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1",
@@ -9269,6 +9285,10 @@
         },
         {
           "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "source_cp_chunk_len",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
@@ -9342,6 +9362,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9374,10 +9398,10 @@
           ]
         ],
         "entry": "run_cp_prefill_equal_head_h32",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_3ad4919d84",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_0d9a427db3",
         "path": "host/cake_cp_prefill_equal_head_h32.cc",
-        "sha256": "c5c7c7a70641dba38de57d0a03fa9f4784b30b56862c25f3647ceba7f2b5eee2",
-        "size_bytes": 23104
+        "sha256": "67235678d1f4fda0cc7f71b81d8f82863b6bb5a8da958762305e5312e0dd918f",
+        "size_bytes": 23476
       },
       "name": "cp_prefill_equal_head_h32",
       "outputs": [
@@ -9386,8 +9410,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_equal_head_h32.sm_103a.cu",
-          "sha256": "21032777d838e80bf004839e00893ca4d0d392998ccb63bc4fc7a2236872d171",
-          "size_bytes": 144972
+          "sha256": "d5d45f2efb470294e9284b6e6b11f3b15489ee604631802f34823c441d2683e7",
+          "size_bytes": 146262
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1",
@@ -9438,6 +9462,10 @@
         },
         {
           "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "source_cp_chunk_len",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
@@ -9511,6 +9539,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9543,10 +9575,10 @@
           ]
         ],
         "entry": "run_cp_prefill_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_7826ac69dc",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_4169e85706",
         "path": "host/cake_cp_prefill_bf16.cc",
-        "sha256": "1b1cb8698c557f35725c0ad1266616bc7d2f8a858f37af145f15211d1bc9c61b",
-        "size_bytes": 23059
+        "sha256": "32e94efd9d3e20979ad3754ece7edbe2e26e138317e77df6111feaad8d8cca97",
+        "size_bytes": 23431
       },
       "name": "cp_prefill_bf16",
       "outputs": [
@@ -9556,8 +9588,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_bf16.cu",
-          "sha256": "9fc5df0f3ebddfef86227cbc24b49c80b26e2bd34dc6d2064711df5da0da2e62",
-          "size_bytes": 144975
+          "sha256": "0a8ef7719796983234afe70dc2809f5548f30d8b0a824d80aa6ec7419bdbc952",
+          "size_bytes": 146265
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1",
@@ -9608,6 +9640,10 @@
         },
         {
           "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "source_cp_chunk_len",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
@@ -9681,6 +9717,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9713,10 +9753,10 @@
           ]
         ],
         "entry": "run_cp_prefill_generic",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_221f64e2a1",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_190b559882",
         "path": "host/cake_cp_prefill_generic.cc",
-        "sha256": "84ed912bbfb02ccf0d1a1fd98d6466ffe88637f4ee344b3fe422f99fbdad6399",
-        "size_bytes": 23069
+        "sha256": "a2d0bb48ffdee6b494e71c6fbaf29fea2f869adea3c9ca0bb17742a333591e32",
+        "size_bytes": 23441
       },
       "name": "cp_prefill_generic",
       "outputs": [
@@ -9726,8 +9766,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_generic.cu",
-          "sha256": "d56ee3eca8c597ff657c23afab92e44c6c75626dcd7664fed954397a8485761c",
-          "size_bytes": 146940
+          "sha256": "409f20001ecf7e2302d32c37ae59a7c14f5595f9657bec73863f3b81c8e0bd04",
+          "size_bytes": 148230
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1",
@@ -9778,6 +9818,10 @@
         },
         {
           "name": "cp_chunk_len",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
+          "name": "source_cp_chunk_len",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
@@ -9851,6 +9895,10 @@
           ],
           [
             "parameter",
+            "source_cp_chunk_len"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -9883,10 +9931,10 @@
           ]
         ],
         "entry": "run_cp_prefill_generic_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_9bab8e297c",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_823360d1d6",
         "path": "host/cake_cp_prefill_generic_bf16.cc",
-        "sha256": "3a4fea4767d146357c1813d8e1987c3be4e9a80373139ce84567d3dce56c066c",
-        "size_bytes": 23099
+        "sha256": "ee3867762a5dfef62a704ab5bea9606186204c8e4dac613fd6775e9213e7eae6",
+        "size_bytes": 23471
       },
       "name": "cp_prefill_generic_bf16",
       "outputs": [
@@ -9896,8 +9944,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill_generic_bf16.cu",
-          "sha256": "f11fcc3abde7922ac10d1f8ea7c43296ad076725cce90760d3bb9f7a3e839d75",
-          "size_bytes": 146951
+          "sha256": "0a96addb2b04d88d1b441f587b7aa3e46ceb4ee03b8d485f97f2fc8fe3c640a3",
+          "size_bytes": 148241
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1",
