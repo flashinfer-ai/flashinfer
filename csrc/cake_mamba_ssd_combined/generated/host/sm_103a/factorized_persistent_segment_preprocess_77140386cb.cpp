@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_dd1a781b6b);
+TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_77140386cb);
 
 namespace cake_host_shim {
 
@@ -168,7 +168,7 @@ void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView
   float v_dt_max = (float)arg_dt_max;
   void* kargs[] = {&p_dt, &p_A, &p_dt_bias, &p_segment_starts, &p_segment_lengths, &p_chunk_indices, &p_chunk_offsets, &p_delta, &p_cumsum, &v_num_segments, &v_nheads, &v_seqlen, &v_direct_varlen_metadata, &v_dt_softplus, &v_dt_min, &v_dt_max};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(factorized_persistent_segment_preprocess_dd1a781b6b, "kernel_factorized_persistent_segment_preprocess");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(factorized_persistent_segment_preprocess_77140386cb, "kernel_factorized_persistent_segment_preprocess");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 

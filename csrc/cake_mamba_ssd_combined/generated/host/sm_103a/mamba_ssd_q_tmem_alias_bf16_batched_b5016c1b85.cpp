@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec);
+TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85);
 
 namespace cake_host_shim {
 
@@ -477,7 +477,7 @@ void Run(TensorView arg_x_map, TensorView arg_b_map, TensorView arg_c_map, Tenso
   int32_t v_checkpoint_state_count = (int32_t)arg_checkpoint_state_count;
   void* kargs[] = {&p_x_map, &p_b_map, &p_c_map, &p_out_map, &p_x, &p_dt, &p_delta_precomputed, &p_cumsum_precomputed, &p_A, &p_B_tensor, &p_C, &p_D, &p_z, &p_dt_bias, &p_initial_states, &p_final_states, &p_checkpoint_states, &p_checkpoint_token_indices, &p_checkpoint_state_slots, &p_seq_idx_i32, &p_seq_idx_i64, &p_chunk_indices, &p_chunk_offsets, &p_seq_chunk_cumsum, &p_out_native, &v_nheads, &v_ngroups, &v_batch, &v_seqlen, &v_nchunks, &v_sequence_count, &v_num_logical_chunks, &v_mode_varlen, &v_has_seq_chunk_cumsum, &v_seq_idx_int64, &v_D_mode, &v_has_z, &v_has_initial, &v_dt_softplus, &v_dt_min, &v_dt_max, &v_write_final_states, &v_checkpoint_state_count};
 
-  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_bf16_batched_e10625a2ec::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_q_tmem_alias_bf16_batched", 231936);
+  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_q_tmem_alias_bf16_batched", 231936);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(512u, 1u, 1u);
 

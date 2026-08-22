@@ -16,8 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186);
-TVM_FFI_EMBED_CUBIN(prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3);
+TVM_FFI_EMBED_CUBIN(mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487);
+TVM_FFI_EMBED_CUBIN(prefix_factorized_segment_preprocess_onewarp_a104f24f9d);
 
 namespace cake_host_shim {
 
@@ -96,7 +96,7 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
 namespace stage_preprocess {
 
 inline auto& Kernel() {
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(prefix_factorized_segment_preprocess_onewarp_3b4f51c5d3, "kernel_prefix_factorized_segment_preprocess_onewarp");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(prefix_factorized_segment_preprocess_onewarp_a104f24f9d, "kernel_prefix_factorized_segment_preprocess_onewarp");
   return kernel;
 }
 
@@ -426,7 +426,7 @@ inline CUtensorMap EncodeTma_out_map(const TensorView& t) {
 }
 
 inline auto& Kernel() {
-  static auto kernel = EmbedCubinModule_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_0209f23186::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1", 149248);
+  static auto kernel = EmbedCubinModule_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1", 149248);
   return kernel;
 }
 
