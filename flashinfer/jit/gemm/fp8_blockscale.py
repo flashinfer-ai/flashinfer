@@ -4,7 +4,7 @@ from ..core import (
     gen_jit_spec,
     sm90a_nvcc_flags,
 )
-from ..cpp_ext import is_cuda_version_at_least
+from ..cpp_ext import version_gated_nvcc_flag
 
 
 def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec:
@@ -13,7 +13,9 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
-        *(("-DENABLE_FP8_BLOCK_SCALE",) if is_cuda_version_at_least("12.8") else ()),
+        version_gated_nvcc_flag(
+            "-DENABLE_FP8_BLOCK_SCALE", "12.8", "fp8_blockscale_gemm_90"
+        ),
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
     ]
 

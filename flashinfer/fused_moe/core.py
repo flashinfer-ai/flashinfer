@@ -66,8 +66,9 @@ from ..jit import (
     setup_cubin_loader,
 )
 from ..jit.core import logger
-from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.cpp_ext import get_cuda_version
 from ..jit.fused_moe import (
+    cutlass_fused_moe_fp8_block_scale_supported,
     gen_cutlass_fused_moe_sm89_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -1424,9 +1425,13 @@ def cutlass_fused_moe(
             raise NotImplementedError(
                 "FP8 block scaling not yet implemented for Blackwell."
             )
-        elif not is_cuda_version_at_least("12.8"):
+        elif not cutlass_fused_moe_fp8_block_scale_supported("90"):
             raise NotImplementedError(
-                "FP8 block scaling not implemented for CUDA 12.6 or lower."
+                "use_deepseek_fp8_block_scale=True requires the fused_moe_90 "
+                "module to be built with -DENABLE_FP8_BLOCK_SCALE, which was "
+                "dropped because the CUDA toolkit used for JIT compilation is "
+                f"{get_cuda_version()} (12.8+ is required). Upgrade the toolkit "
+                "or install a matching flashinfer-jit-cache wheel."
             )
 
     if enable_pdl is None:

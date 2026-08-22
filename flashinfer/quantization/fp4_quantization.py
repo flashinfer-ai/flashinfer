@@ -43,7 +43,7 @@ from ..jit import (
     sm100f_nvcc_flags,
     sm90a_nvcc_flags,
 )
-from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.cpp_ext import version_gated_nvcc_flag
 from ..utils import (
     backend_requirement,
     device_support_pdl,
@@ -202,6 +202,9 @@ def gen_fp4_quantization_sm121_module() -> JitSpec:
 
 
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
+    enable_fp4_flag = version_gated_nvcc_flag(
+        "-DENABLE_FP4", "12.8", f"fp4_quantization_{device_arch}"
+    )
     return gen_jit_spec(
         f"fp4_quantization_{device_arch}",
         [
@@ -218,12 +221,12 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+            enable_fp4_flag,
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+            enable_fp4_flag,
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
