@@ -13,14 +13,19 @@ Note: The `replay` command is tested in tests/utils/test_logging_replay.py along
 the other logging/replay functionality tests, since it's tightly coupled with that feature.
 """
 
+import json
+from pathlib import Path
+import sys
+
+from packaging.version import Version
+
+from flashinfer.artifacts import ArtifactPath
+
 from .cli_cmd_helpers import (
     _test_cmd_helper,
     _assert_output_contains_all,
     _assert_output_contains_any,
 )
-from flashinfer.artifacts import ArtifactPath
-from packaging.version import Version
-import sys
 
 
 def test_show_config_cmd_real():
@@ -381,6 +386,32 @@ def test_install_jit_cache_wheel_cmd_floors_newer_cuda_minor(monkeypatch):
     )
 
 
+def test_install_jit_cache_wheel_cmd_supports_cu134(monkeypatch):
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "13.4",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "CUDA version: 13.4",
+        "Wheel CUDA label: cu134",
+        "https://flashinfer.ai/whl/cu134",
+        "flashinfer-jit-cache==0.4.1+cu134",
+    )
+
+
 def test_install_jit_cache_wheel_cmd_rejects_unsupported_cuda_floor():
     from click.testing import CliRunner
 
@@ -401,7 +432,7 @@ def test_install_jit_cache_wheel_cmd_rejects_unsupported_cuda_floor():
     _assert_output_contains_all(
         result.output,
         "No compatible flashinfer-jit-cache wheel found for CUDA 12.7",
-        "Supported wheel labels: cu128, cu129, cu130",
+        "Supported wheel labels: cu129, cu130, cu134",
     )
 
 
@@ -423,7 +454,7 @@ def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
         [
             "download-jit-cache",
             "--cuda-version",
-            "12.8",
+            "12.9",
             "--flashinfer-version",
             "0.4.2",
         ]
@@ -431,10 +462,21 @@ def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
 
     _assert_output_contains_all(
         out,
-        "https://flashinfer.ai/whl/cu128",
-        "flashinfer-jit-cache==0.4.2+cu128",
+        "https://flashinfer.ai/whl/cu129",
+        "flashinfer-jit-cache==0.4.2+cu129",
     )
-    assert recorded["cmd"][-1] == "flashinfer-jit-cache==0.4.2+cu128"
+    assert recorded["cmd"][-1] == "flashinfer-jit-cache==0.4.2+cu129"
+
+
+def test_supported_jit_cache_versions_match_cuda_config():
+    from flashinfer.__main__ import _SUPPORTED_JIT_CACHE_CUDA_VERSIONS
+
+    config_path = Path(__file__).parents[2] / "ci" / "cuda-versions.json"
+    config = json.loads(config_path.read_text())
+
+    assert [str(version) for version in _SUPPORTED_JIT_CACHE_CUDA_VERSIONS] == [
+        entry["version"] for entry in config["jit_cache"]
+    ]
 
 
 def test_download_kernels_cmd_mocked(monkeypatch):

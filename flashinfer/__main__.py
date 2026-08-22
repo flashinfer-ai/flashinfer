@@ -39,10 +39,9 @@ from .jit.cpp_ext import get_cuda_path, get_cuda_version
 # Import __version__ from centralized version module
 from .version import __version__
 
-# Keep this in sync with the flashinfer-jit-cache CUDA matrices in
-# .github/workflows/release.yml and .github/workflows/nightly-release.yml.
+# Keep this in sync with ci/cuda-versions.json. The CLI tests enforce it.
 _SUPPORTED_JIT_CACHE_CUDA_VERSIONS = tuple(
-    Version(version) for version in ("12.8", "12.9", "13.0")
+    Version(version) for version in ("12.9", "13.0", "13.4")
 )
 
 
