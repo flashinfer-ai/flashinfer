@@ -5759,7 +5759,7 @@ def fmha_v2_prefill_sm120(
     ``scale_bmm2`` and contains the V dequantization scale. If either is
     omitted, the kernel uses the corresponding host-encoded scale.
 
-    This entry point is validated for SM120. SM121 support is not enabled.
+    This entry point is validated for SM120 and SM121.
 
     Parameters
     ----------
@@ -5782,13 +5782,10 @@ def fmha_v2_prefill_sm120(
     scale_bmm1_d, scale_bmm2_d : torch.Tensor, optional
         Persistent one-element FP32 CUDA scale tensors overriding host scales.
     """
-    if not is_sm12x_supported(query.device) or torch.cuda.get_device_capability(
+    if not is_sm12x_supported(query.device) or get_compute_capability(
         query.device
-    ) != (12, 0):
-        raise ValueError(
-            "fmha_v2_prefill_sm120 is only supported on SM120 GPUs; "
-            "SM121 has not been validated."
-        )
+    ) not in ((12, 0), (12, 1)):
+        raise ValueError("fmha_v2_prefill_sm120 is only supported on SM120/SM121 GPUs.")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
         raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.dtype != torch.float8_e4m3fn:
