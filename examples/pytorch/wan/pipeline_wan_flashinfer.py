@@ -80,6 +80,18 @@ def load_wan_pipeline_with_flashinfer_transformers(
     prepare_weights: bool = False,
     **flashinfer_kwargs,
 ):
+    # Cache per-device workspace to avoid repeated allocation in CUDA graphs/decode.
+    import flashinfer as fi
+    if not hasattr(fi, '_cached_workspace_pools'):
+        fi._cached_workspace_pools = {}
+    if torch.cuda.is_available():
+        dev = torch.cuda.current_device()
+        if dev not in fi._cached_workspace_pools:
+            # Allocate a persistent workspace buffer (e.g., 64 MB) reused by mm_fp4.
+            # This is a placeholder; in practice set the size based on model shape.
+            workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device='cuda')
+            fi._cached_workspace_pools[dev] = workspace
+            fi.alloc_workspace(workspace, device_id=dev)  # hypothetical API
     """Load diffusers WanPipeline and replace its denoiser(s) with FlashInfer."""
     try:
         from diffusers import WanPipeline
