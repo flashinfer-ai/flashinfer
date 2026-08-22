@@ -258,6 +258,13 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .wan_hybrid import (
+    WanHybridAttentionWorkspace as WanHybridAttentionWorkspace,
+)
+from .wan_hybrid import (
+    is_wan_hybrid_attention_available as is_wan_hybrid_attention_available,
+)
+from .wan_hybrid import wan_hybrid_attention as wan_hybrid_attention
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
