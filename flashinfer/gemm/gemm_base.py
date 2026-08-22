@@ -2933,22 +2933,32 @@ def clear_cudnn_graph_cache() -> None:
     AutoTuner.get().clear_cache()
 
 
-# One cudnn handle per each GPU
+# One cudnn handle per each GPU, plus the stream each one is currently bound to
 _cudnn_handles: dict[int, int] = {}
+_cudnn_handle_streams: dict[int, int] = {}
 
 
 def _get_cudnn_handle(device, stream: torch.cuda.Stream):
-    """Create and return a cached cuDNN handle."""
+    """Create and return a cached cuDNN handle bound to ``stream``."""
     global _cudnn_handles
     device_id = device.index
 
     if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
         _cudnn_handles[device_id] = cudnn.create_handle()
-        print("cudnn_handle created for device_id = {}\n".format(device_id))
-    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+        logger.debug("created cuDNN handle for device_id %s", device_id)
+    handle = _cudnn_handles[device_id]
 
-    return _cudnn_handles[device_id]
+    # cudnnSetStream re-runs its green-context detection and per-priority stream-pool
+    # driver queries on every call (~2.4 us) even when the stream has not changed, so
+    # only call it when the binding actually differs.  Keyed on the raw stream handle:
+    # re-binding the same pointer is a no-op for cuDNN, so an ABA on it is harmless.
+    stream_id = stream.cuda_stream
+    if _cudnn_handle_streams.get(device_id) != stream_id:
+        cudnn.set_stream(handle, stream_id)
+        _cudnn_handle_streams[device_id] = stream_id
+
+    return handle
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):

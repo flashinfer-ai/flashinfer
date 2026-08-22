@@ -631,41 +631,49 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+@functools.cache
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
+@functools.cache
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+@functools.cache
 def is_sm120a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm120f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm12x_supported(device: torch.device) -> bool:
     """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
 
@@ -1393,6 +1401,49 @@ def backend_requirement(
                 capability = major * 10 + minor
             return capability
 
+        # Validation depends only on the shapes / strides / dtypes / devices of the
+        # tensor arguments and the values of the scalar ones, so a repeat call with the
+        # same signature reaches the same verdict.  Memoise successes -- the checks
+        # themselves cost ~14-29 us/call on the GEMM APIs (sig.bind + apply_defaults +
+        # one requirement check per backend + the heuristic), which dominates the host
+        # cost of a small GEMM.  Failures are not memoised: they are off the hot path
+        # and re-raising a stored exception would lose the original context.
+        _check_memo: dict = {}
+        _CHECK_MEMO_MAX = 4096
+        _UNSUMMARISABLE = object()
+
+        def _memo_summary(value):
+            if isinstance(value, torch.Tensor):
+                return (
+                    tuple(value.shape),
+                    value.stride(),
+                    value.dtype,
+                    value.device.type,
+                    value.device.index,
+                )
+            if value is None or isinstance(value, (bool, int, float, str, torch.dtype)):
+                return value
+            return _UNSUMMARISABLE
+
+        def _memo_key(args, kwargs):
+            """Bind each summary to its parameter name.
+
+            Positional values keep their index and keyword values carry their name, so
+            ``f(a=x, b=y)`` and ``f(b=x, a=y)`` can never collide on one entry.
+            """
+            parts = []
+            for value in args:
+                summary = _memo_summary(value)
+                if summary is _UNSUMMARISABLE:
+                    return None
+                parts.append(summary)
+            for name in sorted(kwargs):
+                summary = _memo_summary(kwargs[name])
+                if summary is _UNSUMMARISABLE:
+                    return None
+                parts.append((name, summary))
+            return tuple(parts)
+
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
@@ -1402,6 +1453,14 @@ def backend_requirement(
             skip_check = kwargs.pop("skip_check", False)
 
             if not skip_check:
+                memo_key = _memo_key(args, kwargs)
+                if memo_key is not None:
+                    memo_hit = _check_memo.get(memo_key)
+                    if memo_hit is not None:
+                        if memo_hit[0] is not None:
+                            wrapper.suitable_auto_backends = memo_hit[0]
+                        return func(*args, **kwargs)
+
                 # Apply defaults from the function signature for validation
                 # This ensures that all parameters (including backend) have their default values
                 # if not explicitly provided by the caller
@@ -1446,6 +1505,12 @@ def backend_requirement(
                         raise ValueError(
                             f"Problem size is not supported for {func.__name__}"
                         )
+                if memo_key is not None and len(_check_memo) < _CHECK_MEMO_MAX:
+                    _check_memo[memo_key] = (
+                        getattr(wrapper, "suitable_auto_backends", None)
+                        if backend == "auto"
+                        else None,
+                    )
             elif skip_check and heuristic_func is not None:
                 if kwargs.get("backend") == "auto":
                     # This needs to be called for heuristic function
@@ -1454,6 +1519,7 @@ def backend_requirement(
 
             return func(*args, **kwargs)
 
+        wrapper.clear_check_memo = _check_memo.clear
         wrapper.is_backend_supported = is_backend_supported
         wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.has_backend = has_backend
