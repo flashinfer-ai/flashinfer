@@ -704,9 +704,7 @@ def test_public_dispatch_gates_cake_with_its_jit_nvcc(
     )
     monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "Blackwell")
     monkeypatch.setattr(gdn_prefill.torch.version, "cuda", torch_cuda)
-    monkeypatch.setattr(
-        gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: nvcc_version
-    )
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: nvcc_version)
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_cake_sm100",
@@ -1138,8 +1136,7 @@ def _allocate_state_pool(
         inner_stride,
     )
     span = 1 + sum(
-        (size - 1) * stride
-        for size, stride in zip(shape, strides, strict=True)
+        (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
     )
     return torch.empty(span, dtype=dtype, device="cuda").as_strided(shape, strides)
 
@@ -1529,9 +1526,7 @@ def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
     assert torch.is_inference(cu_seqlens)
     assert torch.is_inference(state_indices)
 
-    reference_cu = torch.tensor(
-        [0, 0, 64, 129, 129], dtype=torch.int32, device="cuda"
-    )
+    reference_cu = torch.tensor([0, 0, 64, 129, 129], dtype=torch.int32, device="cuda")
     reference_indices = torch.tensor(state_slots, dtype=torch.int32, device="cuda")
     reference_initial = state_values.clone()
     reference_state = torch.full_like(reference_initial, -7.0)
