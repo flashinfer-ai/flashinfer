@@ -33,6 +33,13 @@ namespace {
 constexpr int kMaxEpSize = 32;  // single-node NVLink domain; wait kernels use one warp
 constexpr int kMaxTopK = 8;     // matches the pipe's top_k validation; sizes in-register row lists
 
+void check_same_device(TensorView reference, TensorView tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(reference.device().device_type, tensor.device().device_type)
+      << name << " must be on the same device as the output";
+  TVM_FFI_ICHECK_EQ(reference.device().device_id, tensor.device().device_id)
+      << name << " must be on the same device as the output";
+}
+
 __device__ __forceinline__ float atomic_max_nonneg(float* addr, float v) {
   return __int_as_float(atomicMax(reinterpret_cast<int*>(addr), __float_as_int(v)));
 }
@@ -835,6 +842,127 @@ __global__ void compact_quant_persistent_kernel(
   }
 }
 
+__global__ void build_padded_offsets_kernel(PushLayout L, const int64_t* __restrict__ offsets,
+                                            int64_t* __restrict__ padded_offsets,
+                                            int64_t* __restrict__ tile_prefix,
+                                            int32_t* __restrict__ padded_m,
+                                            const int32_t* __restrict__ round_ctr, int token_tile_n,
+                                            int64_t max_real_rows, int64_t max_padded_rows) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  uint32_t tag = static_cast<uint32_t>(*round_ctr);
+  if (offsets[0] != 0) {
+    printf("sm90_push: invalid compact offsets[0]=%lld\n", static_cast<long long>(offsets[0]));
+    publish_abort_all(L, tag);
+    asm volatile("trap;");
+  }
+  int64_t padded = 0;
+  int64_t tiles = 0;
+  padded_offsets[0] = 0;
+  tile_prefix[0] = 0;
+  for (int expert = 0; expert < L.num_local_experts; ++expert) {
+    int64_t begin = offsets[expert];
+    int64_t end = offsets[expert + 1];
+    if (begin < 0 || end < begin || end > max_real_rows) {
+      printf("sm90_push: invalid compact offsets at expert %d (%lld, %lld), capacity %lld\n",
+             expert, static_cast<long long>(begin), static_cast<long long>(end),
+             static_cast<long long>(max_real_rows));
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+    }
+    int64_t rows = end - begin;
+    int64_t padded_rows = ((rows + 7) / 8) * 8;
+    padded += padded_rows;
+    tiles += (padded_rows + token_tile_n - 1) / token_tile_n;
+    padded_offsets[expert + 1] = padded;
+    tile_prefix[expert + 1] = tiles;
+  }
+  if (padded > max_padded_rows || padded > INT32_MAX) {
+    printf("sm90_push: padded compact overflow (%lld > %lld)\n", static_cast<long long>(padded),
+           static_cast<long long>(max_padded_rows));
+    publish_abort_all(L, tag);
+    asm volatile("trap;");
+  }
+  *padded_m = static_cast<int32_t>(padded);
+}
+
+__global__ void zero_padded_rows_kernel(__nv_bfloat16* output, const int64_t* offsets,
+                                        const int64_t* padded_offsets, int num_experts, int width) {
+  int expert = blockIdx.x;
+  if (expert >= num_experts) return;
+  int64_t rows = offsets[expert + 1] - offsets[expert];
+  int64_t begin = padded_offsets[expert] + rows;
+  int64_t end = padded_offsets[expert + 1];
+  int4* vectors = reinterpret_cast<int4*>(output);
+  int64_t vector_begin = begin * (width / 8);
+  int64_t vector_end = end * (width / 8);
+  for (int64_t index = vector_begin + threadIdx.x; index < vector_end; index += blockDim.x) {
+    vectors[index] = int4{};
+  }
+}
+
+__global__ void compact_bf16_padded_kernel(
+    PushLayout L, const int32_t* __restrict__ seg_src_base,
+    const int32_t* __restrict__ seg_out_base, const int32_t* __restrict__ m_dev,
+    int32_t* __restrict__ next_row, const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ padded_offsets, const int32_t* __restrict__ round_ctr,
+    __nv_bfloat16* __restrict__ a_bf16, int32_t* __restrict__ meta_out,
+    int32_t* __restrict__ real_to_padded, int K, bool fp8_payload) {
+  __shared__ int s_row;
+  int nkeys = L.num_local_experts * L.ep_size;
+  uint32_t tag = static_cast<uint32_t>(*round_ctr);
+  for (;;) {
+    __syncthreads();
+    if (threadIdx.x == 0) s_row = atomicAdd(next_row, 1);
+    __syncthreads();
+    int row = s_row;
+    if (row >= *m_dev) return;
+    int seg = find_segment(seg_out_base, nkeys, row);
+    int expert = seg / L.ep_size;
+    int record = seg_src_base[seg] + (row - seg_out_base[seg]);
+    int64_t padded_row = padded_offsets[expert] + row - offsets[expert];
+    if (record < 0 || record >= L.meta_rows) {
+      if (threadIdx.x == 0) {
+        printf("sm90_push: compact record %d exceeds meta capacity %d\n", record, L.meta_rows);
+        publish_abort_all(L, tag);
+        asm volatile("trap;");
+      }
+      return;
+    }
+    const SlotMeta* metadata = L.pool_meta(L.rank, record);
+    int payload_slot = metadata->payload_slot;
+    if (payload_slot < 0 || payload_slot >= L.pool_rows) {
+      if (threadIdx.x == 0) {
+        printf("sm90_push: compact payload slot %d exceeds pool capacity %d\n", payload_slot,
+               L.pool_rows);
+        publish_abort_all(L, tag);
+        asm volatile("trap;");
+      }
+      return;
+    }
+    __nv_bfloat16* out = a_bf16 + padded_row * K;
+    if (fp8_payload) {
+      const auto* src = reinterpret_cast<const __nv_fp8_e4m3*>(L.pool_row(L.rank, payload_slot));
+      const float* scales = L.pool_sc_row(L.rank, payload_slot);
+      for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        out[k] = __float2bfloat16(static_cast<float>(src[k]) * scales[k >> 7]);
+      }
+    } else {
+      const auto* src = reinterpret_cast<const int4*>(L.pool_row(L.rank, payload_slot));
+      auto* dst = reinterpret_cast<int4*>(out);
+      for (int k = threadIdx.x; k < K / 8; k += blockDim.x) dst[k] = src[k];
+    }
+    if (threadIdx.x == 0) {
+      int32_t rank_k = metadata->src_rank_k;
+      int32_t* compact_meta = meta_out + static_cast<int64_t>(row) * 4;
+      compact_meta[0] = unpack_src_rank(rank_k);
+      compact_meta[1] = metadata->src_token;
+      compact_meta[2] = unpack_k(rank_k);
+      compact_meta[3] = __float_as_int(metadata->weight);
+      real_to_padded[row] = static_cast<int32_t>(padded_row);
+    }
+  }
+}
+
 __global__ void silu_mul_quant_grouped_kernel(
     const __nv_bfloat16* __restrict__ h, const int64_t* __restrict__ offsets,
     const int32_t* __restrict__ pad_base, const int32_t* __restrict__ m_dev,
@@ -964,6 +1092,65 @@ __global__ void combine_publish_kernel(PushLayout L, const __nv_bfloat16* __rest
         __threadfence_system();
         st_release_sys_u64(L.cdone_cell(dst, L.rank),
                            pack_count_tag(rows_per_src[dst], static_cast<uint32_t>(*round_ctr)));
+      }
+    }
+  }
+}
+
+__global__ void combine_publish_mapped_kernel(
+    PushLayout L, const __nv_bfloat16* __restrict__ y, const int32_t* __restrict__ meta,
+    const int32_t* __restrict__ row_map, const int32_t* __restrict__ m_dev,
+    const int32_t* __restrict__ rows_per_src, int32_t* __restrict__ cdone_local,
+    const int32_t* __restrict__ round_ctr, int64_t logical_rows, int64_t y_rows) {
+  uint32_t tag = static_cast<uint32_t>(*round_ctr);
+  int total_rows = *m_dev;
+  if (total_rows < 0 || total_rows > logical_rows) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      printf("sm90_push: combine rows %d exceed logical capacity %lld\n", total_rows,
+             static_cast<long long>(logical_rows));
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+    }
+    return;
+  }
+  for (int r = blockIdx.x; r < total_rows; r += gridDim.x) {
+    const int32_t* mrow = meta + static_cast<int64_t>(r) * 4;
+    int dst = meta_src_rank(mrow);
+    int source_row = row_map[r];
+    if (source_row < 0 || source_row >= y_rows) {
+      if (threadIdx.x == 0) {
+        printf("sm90_push: combine row %d maps to invalid source %d of %lld\n", r, source_row,
+               static_cast<long long>(y_rows));
+        publish_abort_all(L, tag);
+        asm volatile("trap;");
+      }
+      return;
+    }
+    float w = meta_weight(mrow);
+    const __nv_bfloat16* row = y + static_cast<uint64_t>(source_row) * L.hidden;
+    __nv_bfloat16* out = L.combine_row(dst, meta_src_token(mrow), meta_route_k(mrow));
+    const uint4* src4 = reinterpret_cast<const uint4*>(row);
+    uint4* dst4 = reinterpret_cast<uint4*>(out);
+    int nv = L.hidden >> 3;
+    for (int v = threadIdx.x; v < nv; v += blockDim.x) {
+      uint4 pk = src4[v];
+      __nv_bfloat162 h2[4];
+      memcpy(h2, &pk, sizeof(pk));
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        float2 f = __bfloat1622float2(h2[j]);
+        h2[j] = __floats2bfloat162_rn(f.x * w, f.y * w);
+      }
+      memcpy(&pk, h2, sizeof(pk));
+      dst4[v] = pk;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence_system();
+      int prev = atomicAdd(&cdone_local[dst], 1);
+      if (prev + 1 == rows_per_src[dst]) {
+        __threadfence_system();
+        st_release_sys_u64(L.cdone_cell(dst, L.rank), pack_count_tag(rows_per_src[dst], tag));
       }
     }
   }
@@ -1577,6 +1764,80 @@ void sm90_push_compact(TensorView a_fp8, TensorView sfa, TensorView meta_out, Te
                  m_dev, p_dev, next_row, fp8_payload);
 }
 
+void sm90_push_compact_bf16_padded(TensorView a_bf16, TensorView meta_out,
+                                   TensorView real_to_padded, TensorView padded_offsets,
+                                   TensorView tile_prefix, TensorView padded_m,
+                                   int64_t token_tile_n, LAYOUT_PARAMS, TensorView offsets,
+                                   TensorView seg_src_base, TensorView seg_out_base,
+                                   TensorView m_dev, TensorView next_row, TensorView round_ctr) {
+  check_layout(LAYOUT_ARGS);
+  auto L = build_layout(LAYOUT_ARGS);
+  bool fp8_payload = L.bytes_per_row == L.hidden;
+  TVM_FFI_ICHECK(fp8_payload || L.bytes_per_row == 2 * L.hidden)
+      << "compact_bf16_padded: invalid payload width";
+  CHECK_INPUT_AND_TYPE(a_bf16, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(meta_out, dl_int32);
+  CHECK_INPUT_AND_TYPE(real_to_padded, dl_int32);
+  CHECK_INPUT_AND_TYPE(padded_offsets, dl_int64);
+  CHECK_INPUT_AND_TYPE(tile_prefix, dl_int64);
+  CHECK_INPUT_AND_TYPE(padded_m, dl_int32);
+  CHECK_INPUT_AND_TYPE(offsets, dl_int64);
+  CHECK_INPUT_AND_TYPE(seg_src_base, dl_int32);
+  CHECK_INPUT_AND_TYPE(seg_out_base, dl_int32);
+  CHECK_INPUT_AND_TYPE(m_dev, dl_int32);
+  CHECK_INPUT_AND_TYPE(next_row, dl_int32);
+  CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
+  check_same_device(a_bf16, meta_out, "meta_out");
+  check_same_device(a_bf16, real_to_padded, "real_to_padded");
+  check_same_device(a_bf16, padded_offsets, "padded_offsets");
+  check_same_device(a_bf16, tile_prefix, "tile_prefix");
+  check_same_device(a_bf16, padded_m, "padded_m");
+  check_same_device(a_bf16, offsets, "offsets");
+  check_same_device(a_bf16, seg_src_base, "seg_src_base");
+  check_same_device(a_bf16, seg_out_base, "seg_out_base");
+  check_same_device(a_bf16, m_dev, "m_dev");
+  check_same_device(a_bf16, next_row, "next_row");
+  check_same_device(a_bf16, round_ctr, "round_ctr");
+  TVM_FFI_ICHECK(a_bf16.ndim() == 2 && a_bf16.size(1) == L.hidden)
+      << "compact_bf16_padded: output must be (Mcap, H)";
+  TVM_FFI_ICHECK(meta_out.numel() >= static_cast<int64_t>(L.meta_rows) * 4)
+      << "compact_bf16_padded: meta too small";
+  TVM_FFI_ICHECK(real_to_padded.numel() >= L.meta_rows) << "compact_bf16_padded: row map too small";
+  TVM_FFI_ICHECK(padded_offsets.numel() >= L.num_local_experts + 1 &&
+                 tile_prefix.numel() >= L.num_local_experts + 1)
+      << "compact_bf16_padded: expert prefix buffers too small";
+  int64_t nkeys = static_cast<int64_t>(L.num_local_experts) * L.ep_size;
+  TVM_FFI_ICHECK(offsets.numel() >= L.num_local_experts + 1)
+      << "compact_bf16_padded: offsets too small";
+  TVM_FFI_ICHECK(seg_src_base.numel() >= nkeys && seg_out_base.numel() >= nkeys + 1)
+      << "compact_bf16_padded: segment buffers too small";
+  TVM_FFI_ICHECK(padded_m.numel() >= 1 && m_dev.numel() >= 1 && next_row.numel() >= 1 &&
+                 round_ctr.numel() >= 1)
+      << "compact_bf16_padded: scalar buffers are empty";
+  TVM_FFI_ICHECK(token_tile_n > 0 && token_tile_n <= INT32_MAX)
+      << "compact_bf16_padded: token_tile_n must be positive";
+  auto stream = get_stream(a_bf16.device());
+  build_padded_offsets_kernel<<<1, 1, 0, stream>>>(
+      L, static_cast<const int64_t*>(offsets.data_ptr()),
+      static_cast<int64_t*>(padded_offsets.data_ptr()),
+      static_cast<int64_t*>(tile_prefix.data_ptr()), static_cast<int32_t*>(padded_m.data_ptr()),
+      static_cast<const int32_t*>(round_ctr.data_ptr()), static_cast<int>(token_tile_n),
+      L.meta_rows, a_bf16.size(0));
+  zero_padded_rows_kernel<<<L.num_local_experts, 256, 0, stream>>>(
+      static_cast<__nv_bfloat16*>(a_bf16.data_ptr()),
+      static_cast<const int64_t*>(offsets.data_ptr()),
+      static_cast<const int64_t*>(padded_offsets.data_ptr()), L.num_local_experts, L.hidden);
+  compact_bf16_padded_kernel<<<compact_grid_blocks(a_bf16.device()), 256, 0, stream>>>(
+      L, static_cast<const int32_t*>(seg_src_base.data_ptr()),
+      static_cast<const int32_t*>(seg_out_base.data_ptr()),
+      static_cast<const int32_t*>(m_dev.data_ptr()), static_cast<int32_t*>(next_row.data_ptr()),
+      static_cast<const int64_t*>(offsets.data_ptr()),
+      static_cast<const int64_t*>(padded_offsets.data_ptr()),
+      static_cast<const int32_t*>(round_ctr.data_ptr()),
+      static_cast<__nv_bfloat16*>(a_bf16.data_ptr()), static_cast<int32_t*>(meta_out.data_ptr()),
+      static_cast<int32_t*>(real_to_padded.data_ptr()), L.hidden, fp8_payload);
+}
+
 void sm90_silu_mul_quant_grouped(TensorView a_fp8, TensorView sfa, TensorView h, TensorView offsets,
                                  TensorView pad_base, TensorView m_dev, TensorView p_dev,
                                  TensorView row_expert, int64_t m_cap) {
@@ -1642,6 +1903,11 @@ static void combine_common(TensorView y, TensorView meta, const PushLayout& L, T
   CHECK_INPUT_AND_TYPE(rows_per_src, dl_int32);
   CHECK_INPUT_AND_TYPE(cdone_local, dl_int32);
   CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
+  check_same_device(y, meta, "meta");
+  check_same_device(y, m_dev, "m_dev");
+  check_same_device(y, rows_per_src, "rows_per_src");
+  check_same_device(y, cdone_local, "cdone_local");
+  check_same_device(y, round_ctr, "round_ctr");
   int64_t Mcap = y.size(0);
   int64_t H = y.size(1);
   TVM_FFI_ICHECK(H == L.hidden) << "combine: y hidden mismatch";
@@ -1674,6 +1940,42 @@ void sm90_push_combine(TensorView y, TensorView meta, LAYOUT_PARAMS, TensorView 
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   combine_common(y, meta, L, m_dev, rows_per_src, cdone_local, round_ctr, /*fp8_combine=*/false);
+}
+
+void sm90_push_combine_mapped(TensorView y, TensorView meta, TensorView row_map, LAYOUT_PARAMS,
+                              TensorView m_dev, TensorView rows_per_src, TensorView cdone_local,
+                              TensorView round_ctr) {
+  check_layout(LAYOUT_ARGS);
+  auto L = build_layout(LAYOUT_ARGS);
+  CHECK_INPUT_AND_TYPE(y, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(meta, dl_int32);
+  CHECK_INPUT_AND_TYPE(row_map, dl_int32);
+  CHECK_INPUT_AND_TYPE(m_dev, dl_int32);
+  CHECK_INPUT_AND_TYPE(rows_per_src, dl_int32);
+  CHECK_INPUT_AND_TYPE(cdone_local, dl_int32);
+  CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
+  check_same_device(y, meta, "meta");
+  check_same_device(y, row_map, "row_map");
+  check_same_device(y, m_dev, "m_dev");
+  check_same_device(y, rows_per_src, "rows_per_src");
+  check_same_device(y, cdone_local, "cdone_local");
+  check_same_device(y, round_ctr, "round_ctr");
+  TVM_FFI_ICHECK(y.ndim() == 2 && y.size(1) == L.hidden) << "combine_mapped: y hidden mismatch";
+  TVM_FFI_ICHECK(meta.numel() >= row_map.numel() * 4) << "combine_mapped: packed meta too small";
+  TVM_FFI_ICHECK(rows_per_src.numel() >= L.ep_size && cdone_local.numel() >= L.ep_size)
+      << "combine_mapped: per-source scratch too small";
+  TVM_FFI_ICHECK(m_dev.numel() >= 1 && round_ctr.numel() >= 1)
+      << "combine_mapped: scalar buffers are empty";
+  auto stream = get_stream(y.device());
+  auto* cdl = static_cast<int32_t*>(cdone_local.data_ptr());
+  cudaMemsetAsync(cdl, 0, static_cast<size_t>(L.ep_size) * sizeof(int32_t), stream);
+  if (row_map.numel() == 0) return;
+  combine_publish_mapped_kernel<<<compact_grid_blocks(y.device()), 256, 0, stream>>>(
+      L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
+      static_cast<const int32_t*>(meta.data_ptr()), static_cast<const int32_t*>(row_map.data_ptr()),
+      static_cast<const int32_t*>(m_dev.data_ptr()),
+      static_cast<const int32_t*>(rows_per_src.data_ptr()), cdl,
+      static_cast<const int32_t*>(round_ctr.data_ptr()), row_map.numel(), y.size(0));
 }
 
 void sm90_push_combine_fp8(TensorView y, TensorView meta, LAYOUT_PARAMS, TensorView m_dev,
@@ -1841,10 +2143,12 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_dispatch_dedup, sm90_push_dispatch_dedup
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_dispatch_dedup_fp8, sm90_push_dispatch_dedup_fp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_wait_prefix, sm90_push_wait_prefix);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_compact, sm90_push_compact);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_compact_bf16_padded, sm90_push_compact_bf16_padded);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_silu_mul_quant_grouped, sm90_silu_mul_quant_grouped);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_silu_mul_gated, sm90_silu_mul_gated);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_quant_grouped, sm90_quant_grouped);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_combine, sm90_push_combine);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_combine_mapped, sm90_push_combine_mapped);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_combine_fp8, sm90_push_combine_fp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_combine_fp8_grouped, sm90_push_combine_fp8_grouped);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_push_wait_combine, sm90_push_wait_combine);

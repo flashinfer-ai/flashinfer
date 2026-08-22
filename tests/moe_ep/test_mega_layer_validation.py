@@ -107,6 +107,65 @@ def test_mega_layer_requires_weights():
         )
 
 
+def test_mega_layer_accepts_transformed_layout_without_source_weights():
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+    )
+
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
+    ):
+        layer = MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=None,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                transformed_weights=_fake_deep_gemm_transformed(),
+            ),
+        )
+    assert layer._weights is None
+
+
+def test_mega_layer_rejects_missing_source_and_transformed_weights():
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        DeepGemmMegaMoeConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpConfigError,
+        MoEEpMegaLayer,
+    )
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
+        ),
+        pytest.raises(MoEEpConfigError, match="weights are required"),
+    ):
+        MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=1,
+                max_tokens_per_rank=64,
+                token_hidden_size=128,
+            ),
+            weights=None,
+            backend=MegaConfig(
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                preprocess_weights=False,
+            ),
+        )
+
+
 def test_mega_layer_forward_rejects_token_overflow():
     import torch
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import ast
+from importlib import resources as importlib_resources
 import re
 import subprocess
 import sys
-from importlib import resources as importlib_resources
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -300,8 +300,10 @@ def test_capacity_factor_bounds_private_gemm_storage() -> None:
     assert "max_rows_ = ceil_div(max_rows, int64_t{4}) * 4;" in binding
     assert "expected_m exceeds int32" in binding
     assert "padded max_rows exceeds int32" in binding
+    assert 'name == "get_moe_workspace_size_with_scale_problems"' in binding
+    assert "scale_problems must cover every GEMM problem" in binding
     assert (
-        "padded_rows_ = deep_gemm::compute_padded_offset(max_rows, num_problems);"
+        "padded_rows_ = deep_gemm::compute_padded_offset(max_rows, scale_problems);"
         in binding
     )
 

@@ -81,12 +81,25 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
 )
+from .backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
+    Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
+    estimate_residency as estimate_sm90_push_nvfp4_residency,
+    load_modelopt_dual_weights as load_sm90_push_nvfp4_modelopt_dual_weights,
+    load_modelopt_folded_fp8_weights as load_sm90_push_nvfp4_modelopt_folded_fp8_weights,
+    load_modelopt_hot_folded_weights as load_sm90_push_nvfp4_modelopt_hot_folded_weights,
+    load_modelopt_transformed_weights as load_sm90_push_nvfp4_modelopt_weights,
+    make_dual_weights_from_checkpoints as make_sm90_push_nvfp4_dual_weights,
+    make_folded_fp8_weights_from_checkpoints as make_sm90_push_nvfp4_folded_fp8_weights,
+    make_hot_folded_weights_from_checkpoints as make_sm90_push_nvfp4_hot_folded_weights,
+    preprocess_mega_weights as preprocess_sm90_push_nvfp4_mega_weights,
+)
 
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
 # These WILL BE REMOVED in a future release, together with the matching
 # deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
-# "mxfp8_cutedsl", "bf16_cutedsl", "sm90_pull_fp8", "sm90_push_fp8" — see
+# "mxfp8_cutedsl", "bf16_cutedsl", "sm90_pull_fp8", "sm90_push_fp8",
+# "sm90_push_nvfp4" — see
 # core/kernel/registry.py).
 Bf16CutedslMegaMoeConfig = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 DeepGemmMegaMoeConfig = Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
@@ -94,6 +107,7 @@ Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
+Sm90PushNvFp4MegaMoeConfig = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig
 
 from .config import (
     BootstrapConfig,
@@ -170,6 +184,7 @@ __all__ = [
     "Nvfp4CutedslMegaMoeConfig",
     "Sm90PullFp8MegaMoeConfig",
     "Sm90PushFp8MegaMoeConfig",
+    "Sm90PushNvFp4MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
@@ -211,6 +226,7 @@ __all__ = [
     "NCCLEPConfig",
     "NcclEpConfig",
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig",
     "NvepConfig",
     "QuantType",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
@@ -221,6 +237,15 @@ __all__ = [
     "bootstrap_ep_rank_world",
     "bootstrap_ep_world_size",
     "bootstrap_moe_ep_runtime",
+    "load_sm90_push_nvfp4_modelopt_folded_fp8_weights",
+    "load_sm90_push_nvfp4_modelopt_dual_weights",
+    "load_sm90_push_nvfp4_modelopt_hot_folded_weights",
+    "load_sm90_push_nvfp4_modelopt_weights",
+    "make_sm90_push_nvfp4_folded_fp8_weights",
+    "make_sm90_push_nvfp4_dual_weights",
+    "estimate_sm90_push_nvfp4_residency",
+    "make_sm90_push_nvfp4_hot_folded_weights",
+    "preprocess_sm90_push_nvfp4_mega_weights",
     "create_fleet",
     "dummy_moe_weights",
     "ensure_bootstrap_dist_validated",
