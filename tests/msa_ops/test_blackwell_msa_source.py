@@ -9,6 +9,9 @@ from pathlib import Path
 _CSRC_DIR = Path(__file__).resolve().parents[2] / "csrc" / "blackwell_msa"
 _MANIFEST = json.loads((_CSRC_DIR / "route_manifest.json").read_text())
 _INVENTORY = _MANIFEST["source_inventory"]
+_ILLEGAL_QUALIFIED_V8_B32 = re.compile(
+    r"\b(?:ld|st)\.global(?:\.[A-Za-z0-9_:]+)*\.v8\.b32\b"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -107,3 +110,18 @@ def test_sources_do_not_embed_device_images_or_device_tma_arenas() -> None:
     for path in _CSRC_DIR.glob("sm*/*.cu"):
         text = path.read_text()
         assert not [token for token in forbidden if token in text], path
+
+
+def test_sources_do_not_use_unsupported_qualified_v8_b32_operations() -> None:
+    illegal_examples = (
+        "ld.global.v8.b32",
+        "ld.global.nc.v8.b32",
+        "ld.global.ca.L2::128B.v8.b32",
+        "st.global.L2::128B.v8.b32",
+    )
+    assert all(_ILLEGAL_QUALIFIED_V8_B32.search(text) for text in illegal_examples)
+    assert not _ILLEGAL_QUALIFIED_V8_B32.search("ld.global.ca.v4.b32")
+
+    for target in _INVENTORY["targets"]:
+        for path in (_CSRC_DIR / target).glob("*.cu"):
+            assert not _ILLEGAL_QUALIFIED_V8_B32.search(path.read_text()), path
