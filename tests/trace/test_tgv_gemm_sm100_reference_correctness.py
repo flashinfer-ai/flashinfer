@@ -3,10 +3,7 @@
 import torch
 import pytest
 
-from tests.trace.reference_utils import (
-    _cc,
-    _check,
-)
+from tests.trace.reference_utils import _check
 
 
 @pytest.mark.parametrize(
@@ -18,9 +15,9 @@ from tests.trace.reference_utils import (
 )
 def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     """TGV SM100-family kernel vs the a @ b + bias reference."""
-    from flashinfer.utils import is_sm100f_supported
+    from flashinfer.utils import get_compute_capability, is_sm100f_supported
 
-    if _cc() not in [(10, 0), (10, 3)]:
+    if get_compute_capability(torch.device("cuda")) not in [(10, 0), (10, 3)]:
         pytest.skip("tgv_gemm_sm100 requires SM100 or SM103")
     if not is_sm100f_supported(torch.device("cuda")):
         pytest.skip("tgv_gemm_sm100 requires SM100f support (CUDA 12.9+)")
