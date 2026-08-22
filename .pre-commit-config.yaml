@@ -18,10 +18,10 @@
 # periodically (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs.
 # The shim/ layers next to them are ours and stay checked.
-# The selective-state CUDA/host trees and frozen KDA fallback sources are
-# byte-faithful generated exports; their SHA-256 digests are checked by the JIT
-# manifest and must not be rewritten.
-exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|csrc/kda/training_fallback_pointer_sm_(?:100a|103a)\.cu|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+# The Cake selective-state and Mamba CUDA/host trees, along with frozen KDA
+# fallback sources, are byte-faithful generated exports; their SHA-256 digests
+# are checked by JIT manifests and must not be rewritten.
+exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|csrc/cake_mamba_ssd_combined/generated/|csrc/kda/training_fallback_pointer_sm_(?:100a|103a)\.cu|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
