@@ -37,7 +37,7 @@ Both are SM100 (B200-class Blackwell) only.
 import functools
 import importlib.util
 import os
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1466,6 +1466,7 @@ def precompile_paged_mqa_logits(
     device: torch.device = None,
     variants: Tuple[str, ...] = ("fp8", "fp4"),
     output_dtypes: Tuple[torch.dtype, ...] = None,
+    batch_sizes: Sequence[int] = None,
 ) -> None:
     """Pre-compile paged MQA logits kernels for common static configs.
 
@@ -1493,6 +1494,15 @@ def precompile_paged_mqa_logits(
                        bfloat16 and float32 for FP4 -- the API default plus
                        the dtype consumers with a float logits ABI require.
                        Pass an explicit tuple to build only what you run.
+        batch_sizes:   Batch sizes whose GPU schedule kernel should be warmed.
+                       The schedule kernel specializes on
+                       ``ceil(batch_size / 32) * 32``, so it is compiled per
+                       32-row bucket and is NOT covered by the shape sweep
+                       above.  Sizes in the same bucket collapse to one build.
+                       Defaults to None, which warms no schedule buckets --
+                       a deployment that captures CUDA graphs for a known set
+                       of batch sizes should pass them, or the first capture
+                       of each bucket pays compilation.
     """
     if not _CUTE_DSL_AVAILABLE:
         return
@@ -1568,3 +1578,13 @@ def precompile_paged_mqa_logits(
                             False,
                             arch,
                         )
+
+        # The schedule kernel is keyed on the aligned batch size, not on the
+        # shape tuple above, so it needs its own warm-up. Dedup first: every
+        # batch size inside a 32-row bucket compiles the same kernel.
+        from .kernels.schedule_kernel import _compile_schedule_kernel
+
+        for aligned_b in sorted(
+            {max(((int(b) + 31) // 32) * 32, 32) for b in (batch_sizes or ())}
+        ):
+            _compile_schedule_kernel(aligned_b, _SPLIT_KV, num_sms, arch)
