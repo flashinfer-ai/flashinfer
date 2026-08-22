@@ -267,10 +267,9 @@ def _get_host_cpu_arch() -> str:
 
 
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
-    base = FLASHINFER_CUBINS_REPOSITORY
     cpu_arch = _get_host_cpu_arch()
 
-    cubin_dirs = [
+    artifact_dirs = [
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
@@ -285,57 +284,18 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ),
     ]
 
-    # Get checksums of all files
-    checksums = get_checksums(cubin_dirs)
-
-    # The meta info header files first.
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
-        ],
-    )
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
-        safe_urljoin(
-            ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
-        ),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
-        ],
-    )
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
-        ],
-    )
-
-    # All the actual kernel cubin's.
-    for cubin_dir in cubin_dirs:
-        checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
+    # The manifests are authoritative. Directory indexes are HTML pages and
+    # may contain artifact types other than cubins, such as CuTe DSL shared
+    # objects. Enumerating from the manifests also keeps downloads and checksum
+    # verification on the same file set.
+    checksums = get_checksums(artifact_dirs)
+    for artifact_dir in artifact_dirs:
+        checksum_path = safe_urljoin(artifact_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
-        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
+        artifact_prefix = artifact_dir.rstrip("/") + "/"
+        for full_path, checksum in checksums.items():
+            if full_path.startswith(artifact_prefix):
+                yield (full_path, checksum)
 
 
 def download_artifacts() -> None:
