@@ -17,9 +17,11 @@ except (ImportError, RuntimeError):
 
 try:
     from .cake_gdn_cp_prefill import (
+        _cake_gdn_cp_nvcc_version,
         chunk_gated_delta_rule_cake_sm100 as _chunk_gated_delta_rule_cake_sm100,
     )
 except (ImportError, RuntimeError):
+    _cake_gdn_cp_nvcc_version = None  # type: ignore
     _chunk_gated_delta_rule_cake_sm100 = None  # type: ignore
 
 __all__ = [
