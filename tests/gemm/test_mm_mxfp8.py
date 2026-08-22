@@ -18,11 +18,35 @@ from flashinfer.utils import get_compute_capability
 _MIN_COS_SIM = 0.98
 
 
-def test_mm_mxfp8_trtllm_autotune_matches_graph_serving() -> None:
-    tuning_config = gemm_base._get_mm_mxfp8_tuning_config(["trtllm"])
+@pytest.mark.parametrize(
+    ("backends", "use_cuda_graph", "use_cold_l2_cache"),
+    [
+        (["trtllm"], True, True),
+        (["cute-dsl"], True, True),
+        (["cutlass"], False, False),
+        (["cudnn"], False, False),
+        (["cutlass", "cudnn"], False, False),
+    ],
+)
+def test_mm_mxfp8_autotune_config_is_backend_specific(
+    backends: list[str],
+    use_cuda_graph: bool,
+    use_cold_l2_cache: bool,
+) -> None:
+    tuning_config = gemm_base._get_mm_mxfp8_tuning_config(backends)
 
-    assert tuning_config.use_cuda_graph
-    assert tuning_config.use_cold_l2_cache
+    assert tuning_config.use_cuda_graph is use_cuda_graph
+    assert tuning_config.use_cold_l2_cache is use_cold_l2_cache
+
+
+def test_mm_mxfp8_trtllm_cache_key_tracks_profiling_objective() -> None:
+    _skip_if_unsupported("trtllm")
+    runner = _get_trtllm_mxfp8_runner(use_8x4_sf_layout=True)
+
+    assert runner.get_cache_key_extras([]) == (
+        True,
+        "cuda-graph-cold-l2-v1",
+    )
 
 
 def _assert_cosine_similarity(
@@ -65,6 +89,14 @@ def _skip_if_unsupported(backend: str = "cutlass"):
         # Not a hasattr(MmaMXF8Op) probe: the op exists on versions the gate rejects.
         if not _b12x_mxfp8_dsl_supported():
             pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
+
+
+def _get_trtllm_mxfp8_runner(
+    use_8x4_sf_layout: bool,
+) -> gemm_base.TunableRunner:
+    return gemm_base.get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+        use_8x4_sf_layout=use_8x4_sf_layout
+    )
 
 
 def _run_mm_mxfp8(
@@ -178,6 +210,21 @@ def test_mm_mxfp8(m, n, k, input_dtype, out_dtype, backend, auto_tuning):
         auto_tuning,
         provide_out=True,
         use_8x4_sf_layout_for_a=backend == "trtllm",
+    )
+
+
+@pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
+def test_mm_mxfp8_trtllm_autotune_layouts(use_8x4_sf_layout: bool) -> None:
+    _run_mm_mxfp8(
+        128,
+        256,
+        256,
+        torch.bfloat16,
+        torch.bfloat16,
+        "trtllm",
+        auto_tuning=True,
+        provide_out=True,
+        use_8x4_sf_layout_for_a=use_8x4_sf_layout,
     )
 
 
