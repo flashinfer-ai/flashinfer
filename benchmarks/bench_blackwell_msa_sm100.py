@@ -738,7 +738,9 @@ def _candidate_call(
                 causal=shape.causal,
                 page_table=inputs["page_table"],
                 seqused_k=inputs["seqused_k"],
-                return_softmax_lse=False,
+                return_softmax_lse=True,
+                return_temperature_lse=True,
+                lse_temperature_scale=1.0,
             )
 
     else:

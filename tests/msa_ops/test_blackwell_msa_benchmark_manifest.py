@@ -1,4 +1,4 @@
-"""CPU-only contract tests for the SM100/SM103 TopK16 serving portfolio."""
+"""CPU-only contract tests for the SM100/SM103 serving portfolio."""
 
 from argparse import Namespace
 from dataclasses import FrozenInstanceError, replace
@@ -60,10 +60,10 @@ def test_manifest_covers_audited_shape_axes_and_route_complements():
     shapes = benchmark.SHAPE_MANIFEST
 
     assert {shape.kv_layout for shape in shapes} == {"flat_varlen", "paged"}
-    assert {shape.topk for shape in shapes} == {16}
+    assert {shape.topk for shape in shapes} == {4, 8, 16, 32}
     assert {shape.batch_size for shape in shapes}.issuperset({1, 2, 3, 32, 64, 128})
     assert {shape.seqlen_q for shape in shapes}.issuperset({1, 4, 8, 16, 1024, 4096})
-    assert {shape.seqlen_kv for shape in shapes}.issuperset({1921, 4096, 8192, 65536})
+    assert {shape.seqlen_kv for shape in shapes} == {257, 4096, 8192, 65536}
     assert {shape.num_q_heads // shape.num_kv_heads for shape in shapes}.issuperset(
         {4, 8, 16}
     )
@@ -108,6 +108,46 @@ def test_public_shape_schema_exposes_stable_metadata():
     assert public["provenance"] == shape.provenance
     assert public["selection_rationale"] == shape.selection_rationale
     assert public["baseline_mode"] == "minimax_public"
+
+
+def test_prefill_candidate_requests_both_lse_outputs(monkeypatch):
+    captured = {}
+
+    class FakeMsaOps:
+        @staticmethod
+        def msa_sparse_attention(*args, **kwargs):
+            captured.update(kwargs)
+            return "out", "lse", "temperature_lse"
+
+    monkeypatch.setattr(
+        benchmark.importlib,
+        "import_module",
+        lambda name: FakeMsaOps,
+    )
+    shape = next(
+        item
+        for item in benchmark.SHAPE_MANIFEST
+        if item.operation == "sparse_prefill" and item.topk == 8
+    )
+    inputs = {
+        name: object()
+        for name in (
+            "q",
+            "k",
+            "v",
+            "q2k",
+            "cu_q",
+            "cu_k",
+            "page_table",
+            "seqused_k",
+        )
+    }
+    call, _api, _setup = benchmark._candidate_call(shape, inputs)
+
+    assert call()[0] == "out"
+    assert captured["return_softmax_lse"] is True
+    assert captured["return_temperature_lse"] is True
+    assert captured["lse_temperature_scale"] == 1.0
 
 
 def test_paged_cache_builder_pads_partial_final_page_without_changing_tokens():
