@@ -296,7 +296,7 @@ def get_gemm_module():
 
     # Register the module
     _gemm_module = SimpleNamespace(
-        cublas_fp8_gemm_runner=cublas_fp8_gemm_runner,
+        cublas_fp8_gemm_runner=functools.lru_cache(maxsize=64)(cublas_fp8_gemm_runner),
         cutlass_segment_gemm=cutlass_segment_gemm,
     )
 
@@ -1156,7 +1156,9 @@ def get_gemm_sm120_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -1196,7 +1198,9 @@ def get_gemm_sm100_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -1257,7 +1261,9 @@ def get_gemm_sm100_module_cutlass_bf16():
         return CutlassBf16GemmRunner()
 
     return SimpleNamespace(
-        cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+        cutlass_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_bf16_gemm_runner
+        ),
     )
 
 
@@ -1378,7 +1384,9 @@ def get_mm_bf16_cublaslt_module():
         return CublasltBf16GemmRunner()
 
     return SimpleNamespace(
-        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+        cublaslt_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cublaslt_bf16_gemm_runner
+        ),
     )
 
 
@@ -1403,6 +1411,7 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+@functools.lru_cache(maxsize=64)
 def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
 
@@ -1949,7 +1958,9 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassFp4GemmRunner()
 
     return SimpleNamespace(
-        cutlass_fp4_gemm_runner=cutlass_fp4_gemm_runner,
+        cutlass_fp4_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp4_gemm_runner
+        ),
     )
 
 
@@ -2922,22 +2933,32 @@ def clear_cudnn_graph_cache() -> None:
     AutoTuner.get().clear_cache()
 
 
-# One cudnn handle per each GPU
+# One cudnn handle per each GPU, plus the stream each one is currently bound to
 _cudnn_handles: dict[int, int] = {}
+_cudnn_handle_streams: dict[int, int] = {}
 
 
 def _get_cudnn_handle(device, stream: torch.cuda.Stream):
-    """Create and return a cached cuDNN handle."""
+    """Create and return a cached cuDNN handle bound to ``stream``."""
     global _cudnn_handles
     device_id = device.index
 
     if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
         _cudnn_handles[device_id] = cudnn.create_handle()
-        print("cudnn_handle created for device_id = {}\n".format(device_id))
-    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+        logger.debug("created cuDNN handle for device_id %s", device_id)
+    handle = _cudnn_handles[device_id]
 
-    return _cudnn_handles[device_id]
+    # cudnnSetStream re-runs its green-context detection and per-priority stream-pool
+    # driver queries on every call (~2.4 us) even when the stream has not changed, so
+    # only call it when the binding actually differs.  Keyed on the raw stream handle:
+    # re-binding the same pointer is a no-op for cuDNN, so an ABA on it is harmless.
+    stream_id = stream.cuda_stream
+    if _cudnn_handle_streams.get(device_id) != stream_id:
+        cudnn.set_stream(handle, stream_id)
+        _cudnn_handle_streams[device_id] = stream_id
+
+    return handle
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -2956,6 +2977,22 @@ def _validate_bf16_output_dtype(dtype: torch.dtype):
             f"Unsupported output dtype: {dtype}. "
             f"Only torch.bfloat16, torch.float16, and torch.float32 are supported for BF16 GEMM operations."
         )
+
+
+def _effective_cache_m(tuning_config, actual_m: int, spec_idx: int = 0) -> int:
+    """Bucket ``actual_m`` with the *currently effective* tuning buckets.
+
+    Resolved per call rather than captured when the runner is built: the mapper
+    reflects the active ``autotune(tuning_buckets=..., round_up=...)`` override,
+    so a runner constructed under one context must not keep serving another
+    context's buckets.  Capturing it at construction is also what makes the
+    runner factories unsafe to memoize -- the graph's ``cache_m`` would freeze at
+    whatever was effective on the first call and silently stop matching the key
+    the AutoTuner looks the tactic up under.
+    """
+    return AutoTuner.get().get_effective_map_to_tuning_buckets(
+        tuning_config, spec_idx=spec_idx
+    )(actual_m)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -3961,15 +3998,12 @@ def _cudnn_gemm_fp8(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp8_runner():
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _FP8_GEMM_SM100_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -3981,7 +4015,7 @@ def _cudnn_gemm_fp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             # tactic value only be 0 or -1 to hit the graph cache
             return build_cudnn_gemm_fp8_graph_override_shape(
@@ -4417,6 +4451,7 @@ def _cudnn_gemm_bf16(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_bf16_runner(
     is_a_k_major: Optional[bool] = None,
     is_b_k_major: Optional[bool] = None,
@@ -4445,10 +4480,6 @@ def _cudnn_gemm_bf16_runner(
     ``a.stride()[-1] == 1`` / ``b.stride()[-2] == 1``.
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _BF16_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnBf16GemmRunner(TunableRunner):
         def __init__(
             self,
@@ -4456,7 +4487,7 @@ def _cudnn_gemm_bf16_runner(
             is_b_k_major: Optional[bool],
         ):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _BF16_GEMM_SM100_TUNING_CONFIG
             # Default to k-major (the convention torch.rand-synthesized
             # profile tensors use) when caller didn't specify.
             self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
@@ -4483,7 +4514,7 @@ def _cudnn_gemm_bf16_runner(
             # contiguous tensor regardless of the real layout, so reading
             # its stride would build a different graph than the runtime
             # call, breaking tactic-index alignment.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             graph = build_cudnn_gemm_bf16_graph_override_shape(
                 batch=batch,
@@ -4800,7 +4831,9 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassMxfp8GemmRunner()
 
     return SimpleNamespace(
-        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+        cutlass_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_mxfp8_gemm_runner
+        ),
     )
 
 
@@ -5384,6 +5417,7 @@ def _cute_dsl_gemm_mxfp8_runner(
     return CuteDSLMxfp8GemmRunner()
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_mm_mxfp8_runner():
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
@@ -5400,14 +5434,10 @@ def _cudnn_mm_mxfp8_runner():
     per-shape graph is built (HEURISTICS_CHOICE).
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _MM_MXFP8_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnMmMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _MM_MXFP8_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -5419,7 +5449,7 @@ def _cudnn_mm_mxfp8_runner():
             actual_m = a.shape[0]
             k = a.shape[1]
             n = b.shape[1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
             return build_cudnn_gemm_mxfp8_graph_override_shape(
                 batch=1,
                 n=n,
@@ -5777,6 +5807,7 @@ def _cudnn_gemm_fp4(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp4_runner(tuning_config):
     """Build a CudnnFp4GemmRunner.
 
@@ -5805,14 +5836,10 @@ def _cudnn_gemm_fp4_runner(tuning_config):
         runtime-time produce the same ``cache_m`` for the same input.
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        tuning_config, spec_idx=0
-    )
-
     class CudnnFp4GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = tuning_config
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(
@@ -5828,14 +5855,14 @@ def _cudnn_gemm_fp4_runner(tuning_config):
 
             # cache_m must match the AutoTuner cache key so the runtime
             # graph is the SAME graph the autotuner profiled tactics on.
-            # ``self._m_bucket_mapper`` is the *currently effective*
+            # ``_effective_cache_m`` resolves the *currently effective*
             # ``map_to_tuning_buckets`` (with any
             # ``autotune(tuning_buckets=..., round_up=...)`` override
             # applied).  Sharing the mapper keeps cache_m and the tactic
             # cache key in lockstep -- otherwise a tactic profiled on
             # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
             # at runtime, which has a different plan-index meaning.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             graph = build_cudnn_gemm_fp4_graph_override_shape(
                 batch=batch,
@@ -9482,15 +9509,12 @@ def _cudnn_gemm_mxfp8(
     )
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_mxfp8_runner():
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _FP8_GEMM_SM100_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -9502,7 +9526,7 @@ def _cudnn_gemm_mxfp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             return build_cudnn_gemm_mxfp8_graph_override_shape(
                 batch=batch,

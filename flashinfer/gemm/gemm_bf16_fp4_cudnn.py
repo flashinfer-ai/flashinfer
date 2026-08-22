@@ -25,6 +25,7 @@ from ..utils import _get_cache_buf, get_native_fp4_dtype
 from .gemm_base import (
     CUDNN_AVAILABLE,
     DEFAULT_WORKSPACE_SIZE,
+    _effective_cache_m,
     UIDs,
     _check_cudnn_fp4_availability,
     _get_cudnn_handle,
@@ -375,15 +376,17 @@ _BF16_FP4_TUNING_CONFIG = TuningConfig(
 
 
 def _cudnn_bf16_fp4_runner(tuning_config):
-    """Build a ``CudnnBf16Fp4Runner`` bound to the active tuning config."""
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        tuning_config, spec_idx=0
-    )
+    """Build a ``CudnnBf16Fp4Runner`` for ``tuning_config``.
+
+    The M-bucket mapper is resolved per call (see :func:`_effective_cache_m`),
+    not captured here, so an active ``autotune(tuning_buckets=...)`` override is
+    always the one that shapes the cuDNN graph.
+    """
 
     class CudnnBf16Fp4Runner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = tuning_config
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -395,7 +398,7 @@ def _cudnn_bf16_fp4_runner(tuning_config):
         ):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
             return build_cudnn_bf16_fp4_graph_override_shape(
                 batch=1,
                 n=n,
