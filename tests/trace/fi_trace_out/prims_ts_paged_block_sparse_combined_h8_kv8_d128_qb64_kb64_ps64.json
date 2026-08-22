@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q, the combined HND paged KV cache form, request page tables, and per-KV-head BSR metadata.",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the combined HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
@@ -17,10 +17,6 @@
     "seq_len_q": {
       "type": "var",
       "description": "Fixed query length per request."
-    },
-    "seq_len_kv": {
-      "type": "var",
-      "description": "Static maximum logical K/V length."
     },
     "num_qo_heads": {
       "type": "const",
@@ -54,6 +50,10 @@
       "type": "const",
       "value": 64
     },
+    "max_seq_len_kv": {
+      "type": "var",
+      "description": "Static maximum logical K/V length planned for every request."
+    },
     "num_pages": {
       "type": "var",
       "description": "Total number of allocated physical KV pages."
@@ -68,7 +68,7 @@
     },
     "num_page_indices": {
       "type": "var",
-      "description": "Number of runtime physical page IDs."
+      "description": "Capacity of the runtime physical-page ID tensor; the final live page-table offset may be smaller."
     },
     "kv_planes": {
       "type": "const",
@@ -84,11 +84,15 @@
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
     "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
-    "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
     "mask_type is None or mask_type in ('dense', 'causal')",
     "num_page_offsets == batch_size + 1",
-    "num_page_indices == paged_kv_indptr[-1].item()",
-    "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+    "paged_kv_indptr[0].item() == 0",
+    "min(paged_kv_indptr[1:] - paged_kv_indptr[:-1]) >= 0",
+    "paged_kv_indptr[-1].item() <= num_page_indices",
+    "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)",
+    "seq_lens_kv is None or min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)",
+    "seq_lens_kv is None or max(seq_lens_kv) <= max_seq_len_kv",
     "page_size in (16, 32, 64, 128)",
     "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
     "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0",
@@ -163,19 +167,19 @@
         "num_page_offsets"
       ],
       "dtype": "int32",
-      "description": "Request offsets into paged_kv_indices."
+      "description": "Live request offsets into paged_kv_indices, read for this call."
     },
     "paged_kv_indices": {
       "shape": [
         "num_page_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime physical page IDs."
+      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is live."
     },
-    "seq_len_kv": {
+    "max_seq_len_kv": {
       "shape": null,
       "dtype": "int32",
-      "description": "Static maximum logical K/V length."
+      "description": "Static maximum logical K/V length used for planning."
     },
     "seq_lens_kv": {
       "shape": [
@@ -183,7 +187,7 @@
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Optional per-request logical K/V lengths."
+      "description": "Optional live per-request logical K/V lengths read for this call; omission selects the static maximum for every request."
     }
   },
   "outputs": {
