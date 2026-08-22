@@ -492,6 +492,99 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
     )
 
 
+def test_nvfp4_sm103_8k_fallback_matches_reference_tactics():
+    """The guarded SM103 fallback matches the original and measured tactics."""
+    if get_compute_capability(torch.device(device="cuda")) != (10, 3):
+        pytest.skip("Requires exact SM103.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens = 8192
+    hidden_size = 7168
+    intermediate_size = 512
+    num_experts = 384
+    top_k = 8
+    inputs = _build_fp4_routed_moe_inputs(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        quant_mode="NvFP4xNvFP4",
+        routing_method_type=RoutingMethodType.Renormalize,
+        device=device,
+    )
+    profile_shapes = _moe_profile_shapes(inputs, num_tokens, num_tokens)
+
+    def _run(tactic: list[int] | None) -> torch.Tensor:
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        output = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=inputs["packed_topk"],
+            routing_bias=None,
+            hidden_states=inputs["hidden_states"],
+            hidden_states_scale=inputs["hidden_states_scale"],
+            gemm1_weights=inputs["w13"],
+            gemm1_weights_scale=inputs["w13_scale"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=inputs["w2"],
+            gemm2_weights_scale=inputs["w2_scale"],
+            gemm2_bias=None,
+            output1_scale_scalar=inputs["output1_scale_scalar"],
+            output1_scale_gate_scalar=inputs["output1_scale_gate_scalar"],
+            output2_scale_scalar=inputs["output2_scale_scalar"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            do_finalize=True,
+            enable_pdl=True,
+            activation_type=ActivationType.Swiglu.value,
+            tune_max_num_tokens=num_tokens,
+        )[0]
+        torch.cuda.synchronize()
+        return output.clone()
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
+    )
+    assert [256, 1] in [list(tactic) for tactic in valid_tactics]
+
+    fallback = _run(None)
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+    original_fallback = _run([128, -1])
+    assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+        "the original [128, -1] fallback was not dispatched through the autotuner cache"
+    )
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+    measured_tactic = _run([256, 1])
+    assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+        "the explicit [256, 1] tactic was not dispatched through the autotuner cache"
+    )
+
+    assert torch.isfinite(fallback).all()
+    assert torch.isfinite(original_fallback).all()
+    assert torch.isfinite(measured_tactic).all()
+    assert torch.equal(fallback, original_fallback)
+    assert torch.equal(fallback, measured_tactic)
+
+
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 @pytest.mark.parametrize("num_tokens", [16, 23, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
