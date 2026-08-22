@@ -28,6 +28,7 @@ The kernel is a single 32-lane warp that:
 """
 
 import functools
+from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -176,12 +177,32 @@ class PagedMQALogitsScheduleKernel:
 
 
 @functools.cache
+def _cached_schedule_source_files() -> Tuple[str, ...]:
+    """Files whose contents change this kernel's generated code.
+
+    Only this module: the schedule kernel's codegen is fully determined by
+    ``PagedMQALogitsScheduleKernel`` plus the four values in the cache key.
+    Deliberately excludes attn_scores.py -- unlike the FP8/FP4 wrappers, no
+    shape preparation for this kernel happens there, so including it would
+    invalidate every cached bucket on any unrelated edit to that module.
+    """
+    return (__file__,)
+
+
+@functools.cache
 def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: str):
     """Compile GPU schedule kernel; cached by (aligned_b, split_kv, num_sms, arch).
 
     ``arch`` pins codegen to the target device rather than to CUTLASS's
     default probe, which queries ordinal 0 unconditionally.
+
+    Backed by the same persistent on-disk cache as the FP8/FP4 kernels. The
+    in-process ``functools.cache`` only spares the reload within one process;
+    without the disk layer every worker recompiled every batch bucket, because
+    ``_gpu_schedule`` specializes on ``ceil(batch_size / 32) * 32``.
     """
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
     sym_B = cute.sym_int()
     cl_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (sym_B,), stride_order=(0,)
@@ -192,11 +213,20 @@ def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: 
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     kern = PagedMQALogitsScheduleKernel(aligned_b, split_kv, num_sms)
-    return cute.compile(
-        kern,
-        cl_fake,
-        sm_fake,
-        cutlass.Int32(1),
-        fake_stream,
-        options=f"--gpu-arch {arch} --enable-tvm-ffi",
+
+    def _compile_fn():
+        return cute.compile(
+            kern,
+            cl_fake,
+            sm_fake,
+            cutlass.Int32(1),
+            fake_stream,
+            options=f"--gpu-arch {arch} --enable-tvm-ffi",
+        )
+
+    return build_and_load_cute_dsl_kernel(
+        "attn_scores_schedule",
+        f"sched_b{aligned_b}_split{split_kv}_sms{num_sms}_{arch}",
+        _compile_fn,
+        extra_key_files=_cached_schedule_source_files(),
     )
