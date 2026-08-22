@@ -76,8 +76,7 @@ def cake_gdn_cp_nvcc_version() -> tuple[int, int]:
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"failed to query the Cake GDN CP-prefill nvcc at {nvcc}:\n"
-            f"{result.stdout}"
+            f"failed to query the Cake GDN CP-prefill nvcc at {nvcc}:\n{result.stdout}"
         )
     match = re.search(r"\brelease\s+(\d+)\.(\d+)\b", result.stdout)
     if match is None:
