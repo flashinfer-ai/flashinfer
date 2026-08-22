@@ -1558,6 +1558,7 @@ def prepare_b12x_w4a16_weights(
     *,
     activation: str,
     source_format: str = "modelopt",
+    reuse_input_storage: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Build the SM12x W4A16 ``b12x_w4a16`` weight view.
 
@@ -1577,6 +1578,11 @@ def prepare_b12x_w4a16_weights(
     source_format : str
         Checkpoint scale convention: ``"modelopt"`` or
         ``"compressed_tensors"``.
+    reuse_input_storage : bool
+        If ``True``, destructively repack ``w1_fp4`` and ``w2_fp4`` in their
+        existing storage instead of retaining an additional packed-weight
+        copy. The source tensors must be dedicated to this backend and cannot
+        be reused by a fallback or another weight layout after this call.
 
     Returns
     -------
@@ -1606,6 +1612,7 @@ def prepare_b12x_w4a16_weights(
         activation=activation,
         params_dtype=torch.bfloat16,
         source_format="modelopt",
+        reuse_input_storage=reuse_input_storage,
     )
     return {
         "w1_weight": w1_fp4,
