@@ -82,9 +82,9 @@ VARIANTS = {
         binding_filename=(
             "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
         ),
-        source_module_ident="flashkda_bf16_fused_m128_7ea2ab9707",
-        module_ident="cake_kda_bf16_fused_m128_7ea2ab9707",
-        raw_sha256="f27048d2646ae8e5b33d45ba6dfd6c8022b1b5cb09c429c1fdc702989afe9101",
+        source_module_ident="flashkda_bf16_fused_m128_6e53073ae4",
+        module_ident="cake_kda_bf16_fused_m128_6e53073ae4",
+        raw_sha256="83be16e6aaddf87a37a0380325a78bc3d48bcd9875d3df318b0ac88ef6183539",
         raw_bytes=317175,
         smem_bytes=232448,
     ),
@@ -109,14 +109,14 @@ PROFILES = {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm100",
         "profile_path": ("flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json"),
-        "profile_sha256": "0dc5a6e40d9a959c71b43fa0c74bf317a170c511ff09195853aef012dab00bbd",
+        "profile_sha256": "0ced4cd5c789677875771e2e5731ac4097fe1b1dcb0be5b763a57be73221c09d",
         "variant": "bt64_unbounded_softplus",
     },
     "sm103_bt64_unbounded_softplus": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm103",
         "profile_path": ("flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json"),
-        "profile_sha256": "a2696545a0979b180cf38cdf9defaee45152ef232e3fc754acfa553ab4e398d9",
+        "profile_sha256": "e6e1bf91a604dc857164238a6c4a94d36cdfda305eaac07f055ea31ec312fdda",
         "variant": "bt64_unbounded_softplus",
     },
 }

@@ -51,7 +51,7 @@ _CAKE_KDA_TARGET_DEFINE = {
 # implementation so an installed cache cannot satisfy a refreshed export.
 _CAKE_KDA_MODULE_IDENTS = {
     "m128_unbounded_softplus": "d7a7b33c69",
-    "m128_bt64_unbounded_softplus": "102236bfbf",
+    "m128_bt64_unbounded_softplus": "8f5147c17f",
 }
 
 

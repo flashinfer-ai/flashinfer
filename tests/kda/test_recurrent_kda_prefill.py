@@ -54,7 +54,7 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
             "m128_bt64_unbounded_softplus", target
         )
         assert n32_uri != bt64_uri
-        assert bt64_uri.endswith(f"_102236bfbf_{target}")
+        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
     csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
     assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
     assert (
