@@ -216,7 +216,7 @@ def test_mm_mxfp8(m, n, k, input_dtype, out_dtype, backend, auto_tuning):
 @pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
 def test_mm_mxfp8_trtllm_autotune_layouts(use_8x4_sf_layout: bool) -> None:
     _run_mm_mxfp8(
-        128,
+        64,
         256,
         256,
         torch.bfloat16,
