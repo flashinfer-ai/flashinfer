@@ -27,6 +27,7 @@ packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+gemm_bf16_swiglu_g1024_K6144.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
@@ -398,6 +399,14 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── Fused low-M BF16 GEMM + SwiGLU (GLM-5.2 TP4 shared expert) ──────────────
+with contextlib.suppress(Exception):
+    M, N, K = 3, 512, 6144
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    gate_up_weight = torch.randn(2 * N, K, dtype=torch.bfloat16, device=device)
+    prepared_weight = flashinfer.prepare_bf16_swiglu_weight(gate_up_weight)
+    flashinfer.mm_bf16_swiglu(a, prepared_weight)
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.
