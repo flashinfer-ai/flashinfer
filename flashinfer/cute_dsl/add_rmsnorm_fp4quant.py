@@ -43,7 +43,7 @@ from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.norm import add_rmsnorm_fp4quant_trace_dispatch
-from ..utils import device_support_pdl
+from ..utils import device_support_pdl, last_positive_power_of_2
 from .fp4_common import (
     # Constants
     FLOAT4_E2M1_MAX,
@@ -194,19 +194,12 @@ class AddRMSNormFP4QuantKernel:
     Supports both NVFP4 (block_size=16) and MXFP4 (block_size=32) formats.
     """
 
-    # Offline sweep-tuned launch overrides.  Unlisted configurations use the
-    # general scale-block heuristic below.
-    # (sm_version, H, block_size, is_fp16):
-    #     (cluster_n, threads_per_row, num_threads)
-    _KNOB_LUT = {
-        (103, 1024, 16, False): (1, 64, 256),
-    }
-
     def __init__(
         self,
         dtype: cutlass.Numeric,
         H: int,
         block_size: int,
+        launch_config: tuple[int, int, int],
         output_swizzled: bool,
         is_fp16: bool,
         sm_version: int | None = None,
@@ -233,20 +226,8 @@ class AddRMSNormFP4QuantKernel:
             "scale_format must be 'e4m3' or 'ue8m0'"
         )
 
-        knobs = self._select_knobs(H, block_size, is_fp16, self.sm_version)
-        if knobs is None:
-            self.cluster_n = self._compute_cluster_n(
-                H, dtype, self.sm_version, block_size
-            )
-            self.H_per_cta = H // self.cluster_n
-            self.threads_per_row = self._compute_threads_per_row(
-                self.H_per_cta, block_size
-            )
-            self.num_threads = self._compute_num_threads(self.threads_per_row)
-        else:
-            self.cluster_n, self.threads_per_row, self.num_threads = knobs
-            self.H_per_cta = H // self.cluster_n
-
+        self.cluster_n, self.threads_per_row, self.num_threads = launch_config
+        self.H_per_cta = H // self.cluster_n
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
 
@@ -268,9 +249,7 @@ class AddRMSNormFP4QuantKernel:
             self.k_tile_stride = 512
 
     @staticmethod
-    def _compute_cluster_n(
-        H: int, dtype: cutlass.Numeric, sm_version: int, block_size: int
-    ) -> int:
+    def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
         """Compute optimal cluster size based on H and device shared memory.
 
         Dynamically determines the minimum cluster_n that fits within the
@@ -288,7 +267,7 @@ class AddRMSNormFP4QuantKernel:
             if H % cluster_n != 0:
                 continue
             smem_needed = AddRMSNormFP4QuantKernel._estimate_smem_bytes(
-                H, cluster_n, elem_size, block_size
+                H, cluster_n, elem_size
             )
             if smem_needed <= max_smem_bytes:
                 return cluster_n
@@ -296,43 +275,80 @@ class AddRMSNormFP4QuantKernel:
         return 16
 
     @staticmethod
-    def _compute_threads_per_row(H_per_cta: int, block_size: int) -> int:
-        """Assign one warp per 32 scale-factor blocks, capped at 8 warps."""
-        num_sf_blocks = H_per_cta // block_size
-        return min(((num_sf_blocks + 31) // 32) * 32, 256)
+    def _compute_threads_per_row(H_per_cta: int) -> int:
+        """Compute optimal threads per row."""
+        if H_per_cta <= 64:
+            return 8
+        elif H_per_cta <= 128:
+            return 16
+        elif H_per_cta <= 3072:
+            return 32
+        elif H_per_cta <= 6144:
+            return 64
+        elif H_per_cta <= 16384:
+            return 128
+        else:
+            return 256
 
     @staticmethod
-    def _compute_num_threads(threads_per_row: int) -> int:
-        """Use multiple rows per block while keeping a 128-thread target."""
-        rows_per_block = max(1, 128 // threads_per_row)
-        return rows_per_block * threads_per_row
+    def _compute_num_threads(H_per_cta: int) -> int:
+        """Compute total threads per block."""
+        return 128 if H_per_cta <= 16384 else 256
 
     @staticmethod
-    def _select_knobs(
+    def _compute_sm100_sm103_launch_config(
+        H_per_cta: int,
+        M: int,
+    ) -> tuple[int, int]:
+        """Select the measured GB200/GB300 launch config."""
+        kernel = AddRMSNormFP4QuantKernel
+        threads_per_row = kernel._compute_threads_per_row(H_per_cta)
+        num_threads = kernel._compute_num_threads(H_per_cta)
+
+        # The optimal launch config depends on both H and M.
+        if H_per_cta >= 8192:
+            return 256, 256
+        if H_per_cta < 2048 or H_per_cta * M < (1 << 22):
+            return threads_per_row, num_threads
+
+        # Four FP16/BF16 tiles fit in a 96 KiB shared-memory budget.
+        max_rows = max(1, (3 << 12) // H_per_cta)
+        rows_per_block = last_positive_power_of_2(max_rows)
+        if rows_per_block > 1:
+            return 256 // rows_per_block, 256
+
+        return threads_per_row, num_threads
+
+    @staticmethod
+    def _compute_launch_config(
         H: int,
-        block_size: int,
-        is_fp16: bool,
+        M: int,
+        dtype: cutlass.Numeric,
         sm_version: int,
-    ) -> tuple[int, int, int] | None:
-        """Return an offline-tuned launch, if one is available."""
-        return AddRMSNormFP4QuantKernel._KNOB_LUT.get(
-            (sm_version, H, block_size, is_fp16)
-        )
+    ) -> tuple[int, int, int]:
+        """Compute a launch config while preserving the original fallback."""
+        kernel = AddRMSNormFP4QuantKernel
+        cluster_n = kernel._compute_cluster_n(H, dtype, sm_version)
+        H_per_cta = H // cluster_n
+
+        if sm_version in (100, 103):
+            config = kernel._compute_sm100_sm103_launch_config(H_per_cta, M)
+            return cluster_n, *config
+
+        threads_per_row = kernel._compute_threads_per_row(H_per_cta)
+        num_threads = kernel._compute_num_threads(H_per_cta)
+        return cluster_n, threads_per_row, num_threads
 
     @staticmethod
-    def _estimate_smem_bytes(
-        H: int, cluster_n: int, elem_size: int, block_size: int
-    ) -> int:
+    def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
         """Estimate shared memory bytes needed for given configuration.
 
         This is used to dynamically determine cluster_n based on device
         shared memory limits.
         """
         H_per_cta = H // cluster_n
-        threads_per_row = AddRMSNormFP4QuantKernel._compute_threads_per_row(
-            H_per_cta, block_size
-        )
-        num_threads = AddRMSNormFP4QuantKernel._compute_num_threads(threads_per_row)
+        threads_per_row = AddRMSNormFP4QuantKernel._compute_threads_per_row(H_per_cta)
+        num_threads = AddRMSNormFP4QuantKernel._compute_num_threads(H_per_cta)
         rows_per_block = num_threads // threads_per_row
         warps_per_row = max(threads_per_row // 32, 1)
 
@@ -1109,6 +1125,7 @@ def _get_compiled_kernel(
     sm_version: int,
     scale_format: str,
     is_sf_swizzled_layout: bool,
+    launch_config: tuple[int, int, int],
     output_both_sf_layouts: bool = False,
     enable_pdl: bool = False,
     output_norm: bool = False,
@@ -1124,6 +1141,7 @@ def _get_compiled_kernel(
         dtype=cutlass_dtype,
         H=hidden_size,
         block_size=block_size,
+        launch_config=launch_config,
         output_swizzled=is_sf_swizzled_layout,
         is_fp16=is_fp16,
         sm_version=sm_version,
@@ -1513,6 +1531,13 @@ def add_rmsnorm_fp4quant(
         # output_norm=False (the store is compiled out).
         y_norm_arg = weight_contig
 
+    # Cache the M-selected config instead of M to avoid compiling for every batch size.
+    launch_config = AddRMSNormFP4QuantKernel._compute_launch_config(
+        hidden_size,
+        batch_size,
+        cutlass.Float16 if is_fp16 else cutlass.BFloat16,
+        sm_version,
+    )
     tensor_api = _get_compiled_kernel(
         hidden_size,
         block_size,
@@ -1520,6 +1545,7 @@ def add_rmsnorm_fp4quant(
         sm_version,
         actual_scale_format,
         is_sf_swizzled_layout,
+        launch_config,
         output_both_sf_layouts,
         enable_pdl,
         output_norm,
