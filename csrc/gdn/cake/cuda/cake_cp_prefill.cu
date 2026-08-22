@@ -87,7 +87,7 @@ __device__ __forceinline__ void mma_ts_step(
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
+kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int source_cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -340,6 +340,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                     int valid_tokens_cg0 = 64;
                     {
                     }
+                    int source_block_end_cg0 = chunk_start - (int)cu_seqlens[blockIdx.y] + block_cg0 * 64 + valid_tokens_cg0;
+                    int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
+                    int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg0) * 8, gate_phase_cg0);
                     mbarrier_wait(load_t_full_addr + (t_stage_cg0) * 8, t_phase_cg0);
                     mbarrier_wait(ainv_empty_addr + (ainv_stage_cg0) * 8, ainv_empty_phase_cg0);
@@ -406,7 +409,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                                                 float gamma_cg0 = 0.0f;
                                                 float symmetric_scale_cg0 = 0.0f;
                                                 t_valid_cg0 = ((t_col_cg0 >= t_row_cg0) ? 1 : 0);
-                                                if (block_cg0 >= num_valid_blocks - 1) {
+                                                if (source_final_block_cg0 != 0) {
                                                     int final_t_threshold_cg0 = valid_tokens_cg0 - 33;
                                                     if (final_t_threshold_cg0 < 0) {
                                                         final_t_threshold_cg0 = 0;
@@ -424,7 +427,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                                                 int qk_valid_cg0 = 0;
                                                 float qk_scale_cg0 = 0.0f;
                                                 qk_valid_cg0 = ((t_row_cg0 >= t_col_cg0) ? 1 : 0);
-                                                if (block_cg0 >= num_valid_blocks - 1) {
+                                                if (source_final_block_cg0 != 0) {
                                                     int final_qk_threshold_cg0 = valid_tokens_cg0 - 33;
                                                     if (final_qk_threshold_cg0 < 0) {
                                                         final_qk_threshold_cg0 = 0;
@@ -618,6 +621,16 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                 unsigned int state_input_empty_phase_cg1 = 1;
                 #pragma unroll 1
                 for (int block_cg1 = 0; block_cg1 < num_padded_blocks_1; block_cg1++) {
+                    int valid_tokens_cg1 = chunk_end_1 - (chunk_start_1 + block_cg1 * 64);
+                    if (valid_tokens_cg1 > 64) {
+                        valid_tokens_cg1 = 64;
+                    }
+                    if (valid_tokens_cg1 < 0) {
+                        valid_tokens_cg1 = 0;
+                    }
+                    int source_block_end_cg1 = chunk_start_1 - (int)cu_seqlens[blockIdx.y] + block_cg1 * 64 + valid_tokens_cg1;
+                    int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
+                    int source_final_full_block_cg1 = ((valid_tokens_cg1 == 64 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg1) * 8, gate_phase_cg1);
                     int gate_base_cg1 = gate_stage_cg1 * 64;
                     mbarrier_wait(kv_acc_full_addr + (kv_stage_cg1) * 8, kv_full_phase_cg1);
@@ -761,7 +774,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                     #pragma unroll
                     for (int vks_pair_cg1 = 0; vks_pair_cg1 < 16; vks_pair_cg1++) {
                         {
-                            if (block_cg1 >= num_valid_blocks_1 - 1) {
+                            if (source_final_full_block_cg1 != 0) {
                                 vks_bits_lo_cg1[vks_pair_cg1] = v_frag_lo_cg1[vks_pair_cg1];
                                 vks_bits_hi_cg1[vks_pair_cg1] = v_frag_hi_cg1[vks_pair_cg1];
                             } else {
@@ -797,7 +810,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(qs_frag_early_cg1)[_ls], _scale2_3);
                         }
-                        if (block_cg1 >= num_valid_blocks_1 - 1) {
+                        if (source_final_full_block_cg1 != 0) {
                             qs_frag_early_cg1[0] = 0.0f;
                             qs_frag_early_cg1[1] = 0.0f;
                             qs_frag_early_cg1[2] = 0.0f;
@@ -854,7 +867,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_4);
                         }
-                        if (block_cg1 >= num_valid_blocks_1 - 1) {
+                        if (source_final_full_block_cg1 != 0) {
                             _tmem_load_1[0] = 0.0f;
                             _tmem_load_1[1] = 0.0f;
                             _tmem_load_1[2] = 0.0f;
