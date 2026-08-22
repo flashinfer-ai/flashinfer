@@ -3204,8 +3204,13 @@ def gated_delta_rule_mtp_wide_vec(
         v_ = _mark_batch_dynamic(v)
         a_ = _mark_batch_dynamic(a)
         b_ = _mark_batch_dynamic(b)
-        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+        # These vectors are loaded elementwise, so require only their scalar
+        # alignment. Parameter slices with a nonzero storage_offset are valid
+        # inputs but are not necessarily aligned to a 32-byte boundary.
+        A_log_ = from_dlpack(A_log, assumed_align=4, enable_tvm_ffi=True)
+        dt_bias_ = from_dlpack(
+            dt_bias, assumed_align=dt_bias.element_size(), enable_tvm_ffi=True
+        )
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
         h0_idx_ = _mark_index_dynamic(
             initial_state_indices
@@ -3483,8 +3488,13 @@ def gated_delta_rule_t1_wide_vec(
         v_ = _mark_batch_dynamic(v)
         a_ = _mark_batch_dynamic(a)
         b_ = _mark_batch_dynamic(b)
-        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+        # These vectors are loaded elementwise, so require only their scalar
+        # alignment. Parameter slices with a nonzero storage_offset are valid
+        # inputs but are not necessarily aligned to a 32-byte boundary.
+        A_log_ = from_dlpack(A_log, assumed_align=4, enable_tvm_ffi=True)
+        dt_bias_ = from_dlpack(
+            dt_bias, assumed_align=dt_bias.element_size(), enable_tvm_ffi=True
+        )
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
         h0_idx_ = _mark_index_dynamic(
             initial_state_indices
@@ -3864,8 +3874,13 @@ def gated_delta_rule_mtp(
         v_ = _mark_batch_dynamic(v)
         a_ = _mark_batch_dynamic(a)
         b_ = _mark_batch_dynamic(b)
-        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+        # These vectors are loaded elementwise, so require only their scalar
+        # alignment. Parameter slices with a nonzero storage_offset are valid
+        # inputs but are not necessarily aligned to a 32-byte boundary.
+        A_log_ = from_dlpack(A_log, assumed_align=4, enable_tvm_ffi=True)
+        dt_bias_ = from_dlpack(
+            dt_bias, assumed_align=dt_bias.element_size(), enable_tvm_ffi=True
+        )
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
         h0_idx_ = _mark_index_dynamic(
             initial_state_indices
