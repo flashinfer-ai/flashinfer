@@ -1425,9 +1425,7 @@ def cutlass_fused_moe(
                 "FP8 block scaling not yet implemented for Blackwell."
             )
         elif not is_cuda_version_at_least("12.8"):
-            raise NotImplementedError(
-                "FP8 block scaling not implemented for CUDA 12.6 or lower."
-            )
+            raise NotImplementedError("FP8 block scaling requires CUDA 12.8 or newer.")
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)

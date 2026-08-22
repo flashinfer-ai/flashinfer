@@ -46,8 +46,11 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuteDslConfig,
     CuteDslNvfp4Runner,
-    CutlassConfig,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassMxfp8Config,
+    CutlassNvfp4Config,
     ExecutionConfig,
     MoEFinalizeConfig,
     ExpertConfig,
@@ -240,11 +243,11 @@ class TestReprRoundTrip:
         assert _eval_repr(cfg) == cfg
 
     def test_backend_options_multi(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         reconstructed = _eval_repr(opts)
         assert len(reconstructed) == 2
         assert isinstance(reconstructed.candidates[0], TrtllmFp4Config)
-        assert isinstance(reconstructed.candidates[1], CutlassConfig)
+        assert isinstance(reconstructed.candidates[1], CutlassNvfp4Config)
 
     def test_backend_options_single(self):
         opts = BackendOptions(candidates=(TrtllmFp8PerTensorConfig(),))
@@ -274,7 +277,7 @@ class TestReprRoundTrip:
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=ActivationConfig(type=ActivationType.Geglu),
             backend=BackendOptions(
-                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+                candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=4096),
         )
@@ -288,13 +291,13 @@ class TestReprRoundTrip:
 
 class TestBackendOptions:
     def test_explicit_candidates(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         assert isinstance(opts, BackendOptions)
         assert len(opts) == 2
 
     def test_multiple_candidates(self):
         opts = BackendOptions(
-            candidates=(TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassNvfp4Config())
         )
         assert len(opts) == 3
 
@@ -313,7 +316,6 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
-        assert not CutlassConfig.supported(100)
         assert CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
@@ -332,11 +334,11 @@ class TestBackendOptions:
         assert not TrtllmFp8PerTensorConfig.supported(120)
 
     def test_iteration(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         items = list(opts)
         assert len(items) == 2
         assert any(isinstance(c, TrtllmFp4Config) for c in items)
-        assert any(isinstance(c, CutlassConfig) for c in items)
+        assert any(isinstance(c, CutlassNvfp4Config) for c in items)
 
     def test_empty(self):
         opts = BackendOptions()
@@ -426,7 +428,9 @@ class TestImmutableReplace:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
-        narrow = dataclasses.replace(cfg, backend=BackendOptions((CutlassConfig(),)))
+        narrow = dataclasses.replace(
+            cfg, backend=BackendOptions((CutlassNvfp4Config(),))
+        )
         assert len(narrow.backend) == 1
 
 
@@ -508,7 +512,9 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmFp4Config(), CutlassNvfp4Config())
+            ),
         )
         assert cfg.routing.method == RoutingMethodType.DeepSeekV3
         assert cfg.quant.variant == QuantVariant.NVFP4
@@ -526,7 +532,7 @@ class TestExpressiveness:
             experts=ExpertConfig(intermediate_size=512),
             activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions(
-                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+                candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
         )
         assert cfg.quant.variant == QuantVariant.MxFp8
@@ -537,7 +543,9 @@ class TestExpressiveness:
             routing=RoutingConfig(num_experts=8, top_k=2),
             quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
+            backend=BackendOptions(
+                candidates=(TrtllmFp8PerTensorConfig(), CutlassFp8PerTensorConfig())
+            ),
         )
         assert cfg.quant.variant == QuantVariant.FP8PerTensor
 
@@ -568,17 +576,15 @@ class TestExpressiveness:
         assert cfg.quant.variant == QuantVariant.MxInt4
 
     def test_cutlass_modular_fp8(self):
-        """Legacy declarative CUTLASS modular FP8 config."""
+        """CUTLASS DeepSeek block-scale FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=2048),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions((CutlassConfig(),)),
+            backend=BackendOptions((CutlassFp8BlockConfig(),)),
         )
-        # CutlassConfig preserves the historical quant-neutral declarative form for
-        # compatibility; it is not a registered runnable backend.
-        assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
+        assert any(isinstance(c, CutlassFp8BlockConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
         """CuteDSL NVFP4 config."""
@@ -587,7 +593,7 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassConfig())),
+            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassNvfp4Config())),
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
 
