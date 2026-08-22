@@ -1311,8 +1311,8 @@
       "sha256": "eb14046099958a747438e49fd4e927e6b082201391695b21106ded802dc5e24e"
     },
     "runtime/cake_fmha_qmul4.py": {
-      "bytes": 6244,
-      "sha256": "6e38b54be083f264e57d4aca94f0557ad69155a8c70235e812a511200c07bcbf"
+      "bytes": 6781,
+      "sha256": "f85a96d54a6a41e22c8bc9346c1913392009d3598625d3aa03292a7e1fff8dc9"
     }
   },
   "capability": {

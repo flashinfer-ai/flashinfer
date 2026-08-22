@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fail-closed Blackwell QMUL4 cubin patch/load protocol.
 
-The native CUDA source families contain register-faithful LOP3 markers because
-public PTX does not expose the required QMUL4 lane-swizzle variants.  Compile a
-native source to a cubin, then pass the cubin and the manifest-recorded marker
-counts to :func:`patch_and_load_qmul4_cubin`.  Never load an unpatched native
-cubin: the marker instruction is valid SASS but does not implement QMUL4.
+The native CUDA source families contain register-faithful FFMA markers because
+public PTX does not expose the required QMUL4 lane-swizzle variants.  FFMA puts
+the scale in its non-commutable addend slot and gives ptxas a valid floating-
+point dependency schedule.  Compile a native source to a cubin, then pass the
+cubin and the manifest-recorded marker counts to
+:func:`patch_and_load_qmul4_cubin`.  Never load an unpatched native cubin: the
+marker instruction is valid SASS but does not implement QMUL4.
 """
 
 from __future__ import annotations
@@ -74,9 +76,11 @@ def patch_qmul4_cubin(
             if instruction_offset < 0 or instruction_offset + 16 > len(patched):
                 continue
             low, high = struct.unpack_from("<QQ", patched, instruction_offset)
-            if low >> 32 != marker or low & 0xFFFF != 0x7812:
+            # Exact marker form emitted by ptxas:
+            # FFMA Rd, Ra, 0f<marker>, Rc(scale).
+            if low >> 32 != marker or low & 0xFFFF != 0x7823:
                 continue
-            if high & 0xFFFFFF00 != 0x078E9600:
+            if high & 0xFFFFFF00:
                 continue
             rd = (low >> 16) & 0xFF
             ra = (low >> 24) & 0xFF
@@ -88,7 +92,13 @@ def patch_qmul4_cubin(
                 | (rd << 16)
                 | 0x727C
             )
-            qmul_high = (high & 0xFFFFFFFF00000000) | 0x0501A000 | (a_swizzle << 10)
+            qmul_semantic_high = 0x0501A000 | (a_swizzle << 10)
+            schedule = high >> 32
+            # FFMA's Rc reuse bit is QMUL4's Rb reuse bit.  Preserve all other
+            # ptxas dependency fields while moving that one reuse annotation.
+            if schedule & 0x10000000:
+                schedule = (schedule & ~0x10000000) | 0x08000000
+            qmul_high = (schedule << 32) | qmul_semantic_high
             struct.pack_into("<QQ", patched, instruction_offset, qmul_low, qmul_high)
             actual[marker_id] += 1
 
