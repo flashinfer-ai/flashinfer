@@ -66,6 +66,12 @@ def test_trtllm_dynamic_quant_buckets_match_lookup_mapping() -> None:
     assert dynamic_spec.map_to_tuning_buckets(3) == 3
 
 
+def test_trtllm_dynamic_quant_profiles_like_runtime() -> None:
+    tuning_config = gemm_base._MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG
+    assert tuning_config.use_cuda_graph
+    assert tuning_config.use_cold_l2_cache
+
+
 def test_trtllm_dynamic_quant_buckets_keep_low_m_exact() -> None:
     assert gemm_base._get_trtllm_mxfp8_tuning_buckets(64) == (
         *range(1, 33),

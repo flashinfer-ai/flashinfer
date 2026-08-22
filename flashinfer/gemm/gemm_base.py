@@ -7348,6 +7348,8 @@ _TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS = (
 
 
 _MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=_TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS,
     constraint_specs=(
         ConstraintSpec(
