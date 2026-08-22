@@ -570,9 +570,12 @@ def _should_use_bt16_prepare_chain(
 
 
 def _direct_m128_route(*, num_heads: int, max_sequence_length: int = 0) -> str:
+    # The exported N16 binding does not meet the BF16 qualification tolerance
+    # for the short H96 production rows; the existing N32 module does.
+    short_n16 = 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK and num_heads != 96
     return (
         _FLASH_KDA_ROUTE_DIRECT_M128_N16
-        if num_heads == 12 or 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
+        if num_heads == 12 or short_n16
         else _FLASH_KDA_ROUTE_DIRECT_M128
     )
 
