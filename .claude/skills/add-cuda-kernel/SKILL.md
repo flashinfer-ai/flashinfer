@@ -236,6 +236,14 @@ def gen_scale_module(dtype_in, dtype_out):
 - URI uniquely identifies the module configuration
 - **NEVER write to package directories** - see "JIT Directory Rules" in `CLAUDE.md`
 
+`JitSpecNvcc` also records a per-module `meta.json` build fingerprint. Keep all
+generated translation units in `sources` and all relevant header roots in
+`extra_include_paths`; both are content-hashed. The current rendered Ninja
+configuration and toolchain/ABI identities are fingerprinted automatically.
+Missing or mismatched metadata causes the entire module build directory to be
+removed, and metadata is committed only after a successful Ninja build. Do not
+write build artifacts or metadata outside the `JitSpecNvcc` build lifecycle.
+
 ### (Optional) Specifying Supported CUDA Architectures
 
 FlashInfer uses `CompilationContext` to manage CUDA architecture targets. This is critical because some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100).
