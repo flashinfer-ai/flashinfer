@@ -18,6 +18,13 @@ from flashinfer.utils import get_compute_capability
 _MIN_COS_SIM = 0.98
 
 
+def test_mm_mxfp8_trtllm_autotune_matches_graph_serving() -> None:
+    tuning_config = gemm_base._get_mm_mxfp8_tuning_config(["trtllm"])
+
+    assert tuning_config.use_cuda_graph
+    assert tuning_config.use_cold_l2_cache
+
+
 def _assert_cosine_similarity(
     reference: torch.Tensor,
     result: torch.Tensor,
