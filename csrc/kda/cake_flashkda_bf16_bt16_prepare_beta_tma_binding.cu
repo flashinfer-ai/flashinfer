@@ -37,4 +37,5 @@
 #undef int16_t
 
 #define FLASHINFER_BT16_PREPARE_KERNEL kernel_flashkda_bf16_bt16_prepare
+#define FLASHINFER_BT16_PREPARE_USES_BETA_TMA 1
 #include "cake_flashkda_bt16_prepare_binding_impl.cuh"

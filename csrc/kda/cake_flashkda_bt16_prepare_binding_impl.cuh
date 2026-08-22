@@ -17,6 +17,12 @@
 #ifndef FLASHINFER_BT16_PREPARE_KERNEL
 #error "FLASHINFER_BT16_PREPARE_KERNEL must name the frozen prepare kernel"
 #endif
+#ifndef FLASHINFER_BT16_PREPARE_USES_BETA_TMA
+#error "FLASHINFER_BT16_PREPARE_USES_BETA_TMA must be 0 or 1"
+#endif
+
+static_assert(FLASHINFER_BT16_PREPARE_USES_BETA_TMA == 0 ||
+              FLASHINFER_BT16_PREPARE_USES_BETA_TMA == 1);
 
 namespace flashinfer {
 namespace flash_kda {
@@ -46,9 +52,9 @@ void RunBt16Prepare(TensorView q, TensorView k, TensorView raw_gate, TensorView 
             "cudaFuncSetAttribute(BT16 prepare)");
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const Bt16PrepareTmaPointers tma =
-      EncodeBt16PrepareTma(q, k, raw_gate, beta_logits, ws_qd, ws_kd, ws_w, descriptor_storage,
-                           prepare_descriptors, stream);
+  const Bt16PrepareTmaPointers tma = EncodeBt16PrepareTma < FLASHINFER_BT16_PREPARE_USES_BETA_TMA !=
+                                     0 > (q, k, raw_gate, beta_logits, ws_qd, ws_kd, ws_w,
+                                          descriptor_storage, prepare_descriptors, stream);
   const dim3 grid(static_cast<uint32_t>(prepare_total_ctas), 1, 1);
   const dim3 block(THREADS, 1, 1);
   FLASHINFER_BT16_PREPARE_KERNEL<<<grid, block, kSmemBytes, stream>>>(
@@ -81,3 +87,4 @@ void RunBt16Prepare(TensorView q, TensorView k, TensorView raw_gate, TensorView 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunBt16Prepare);
 
 #undef FLASHINFER_BT16_PREPARE_KERNEL
+#undef FLASHINFER_BT16_PREPARE_USES_BETA_TMA

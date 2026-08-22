@@ -1044,6 +1044,7 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         (True, 1, 12, True, 512, "bt16_prepare_chain_m64"),
         (True, 8, 12, True, 1024, "direct_m128"),
         (False, 8, 12, False, 3072, "bt16_prepare_chain_m64"),
+        (True, 1, 4, True, 65_536, "bt16_prepare_chain_m64"),
         (True, 1, 1, True, 65_535, "small_bh_owner_helper_m128"),
         (True, 1, 1, True, 65_536, "bt16_prepare_chain_m64"),
         (True, 1, 64, True, 512, "independent_dvsplit_m64"),
@@ -1105,6 +1106,14 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         num_heads=64,
         max_sequence_length=4096,
     ) == ("bt16_prepare_beta_tma", "bt16_chain_m64_s8", True)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=4,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare", "bt16_chain_m64_s9", False)
     assert kda_prefill_api._select_bt16_physical_variants(
         compute_capability=(10, 3),
         sm_count=152,
@@ -2241,6 +2250,136 @@ def test_frozen_small_bh_prefill_cuda_graph_replay_matches_direct_control(
         direct_state.float(),
         atol=1e-2,
         rtol=1e-2,
+    )
+
+
+def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        seed=2050,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append(variant)
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    actual_output = actual_output.clone()
+    actual_state = actual_state.clone()
+
+    inputs["initial_state"].copy_(initial_state_seed)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert routes[:2] == ["bt16_prepare", "bt16_chain_m64_s9"]
+    assert routes[-1] == "m128"
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_frozen_bt16_scalar_prepare_subgroup_heads_cuda_graph_replay(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=4,
+        packed=False,
+        initial_state=False,
+        seed=2051,
+    )
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
+    torch.testing.assert_close(
+        replay_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), direct_state.float(), atol=1e-2, rtol=1e-2
     )
 
 
