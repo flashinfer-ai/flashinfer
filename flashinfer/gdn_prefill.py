@@ -23,6 +23,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    _cake_gdn_cp_nvcc_version,
     _chunk_gated_delta_rule_cake_sm100,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
@@ -92,6 +93,7 @@ def _use_cake_cp_sm100(
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
+    arch_minor: int,
     cuda_major: int,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -111,8 +113,6 @@ def _cp_delta_rule_rejection_reason(
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
-        if cuda_major < 13:
-            return "CP delta rule SM100 requires CUDA 13 or newer"
         use_cake = _use_cake_cp_sm100(
             initial_state=initial_state,
             output_state=output_state,
@@ -121,10 +121,35 @@ def _cp_delta_rule_rejection_reason(
             checkpoint_cu_starts=checkpoint_cu_starts,
             cp_chunk_len=cp_chunk_len,
         )
-        if use_cake and _chunk_gated_delta_rule_cake_sm100 is None:
-            return "Cake-only CP delta rule SM100 kernel is unavailable"
-        if not use_cake and cp_delta_rule_dsl_sm100 is None:
-            return "CP delta rule SM100 DSL kernel is unavailable"
+        if use_cake:
+            capability = (arch_major, arch_minor)
+            minimum_nvcc = {(10, 0): (12, 8), (10, 3): (12, 9)}.get(capability)
+            if minimum_nvcc is None:
+                return (
+                    "Cake-only CP delta rule supports only compute capabilities "
+                    "10.0 and 10.3"
+                )
+            if _chunk_gated_delta_rule_cake_sm100 is None:
+                return "Cake-only CP delta rule SM100 kernel is unavailable"
+            if _cake_gdn_cp_nvcc_version is None:
+                return "Cake-only CP delta rule SM100 nvcc toolchain is unavailable"
+            try:
+                nvcc_version = _cake_gdn_cp_nvcc_version()
+            except RuntimeError as error:
+                return f"Cake-only CP delta rule SM100 nvcc toolchain is unavailable: {error}"
+            if nvcc_version < minimum_nvcc:
+                required = ".".join(map(str, minimum_nvcc))
+                observed = ".".join(map(str, nvcc_version))
+                return (
+                    f"Cake-only CP delta rule for compute capability "
+                    f"{arch_major}.{arch_minor} requires nvcc {required} or newer, "
+                    f"got {observed}"
+                )
+        else:
+            if cuda_major < 13:
+                return "CP delta rule SM100 DSL kernel requires CUDA 13 or newer"
+            if cp_delta_rule_dsl_sm100 is None:
+                return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
@@ -440,6 +465,7 @@ def chunk_gated_delta_rule(
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
+            arch_minor=_device_capability[1],
             cuda_major=_cuda_major,
             q=q,
             k=k,
