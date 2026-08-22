@@ -56,6 +56,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.cute_dsl.fused_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe_mxfp8_mxfp4",
     "flashinfer.fused_moe.fused_routing_dsv3",
+    "flashinfer.fused_moe.glm5",
     "flashinfer.fused_moe.hash_topk",
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",

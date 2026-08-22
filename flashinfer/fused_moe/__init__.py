@@ -130,6 +130,15 @@ from .monomoe import (  # noqa: F401
     get_scratchpad_size_bytes as get_scratchpad_size_bytes,
     interleave_for_tma_wgmma_up as interleave_for_tma_wgmma_up,
 )
+from .glm5 import (  # noqa: F401
+    Glm5LowLatencyMoeWeights,
+    Glm5LowLatencyMoeWorkspace,
+    alloc_glm5_low_latency_moe_workspace,
+    glm5_low_latency_moe,
+    pack_glm5_low_latency_moe_gate_up_scale,
+    pack_glm5_low_latency_moe_gate_up_weight,
+    prepare_glm5_low_latency_moe_weights,
+)
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
@@ -232,6 +241,13 @@ __all__ = [
     "alloc_scratchpad",
     "get_scratchpad_size_bytes",
     "interleave_for_tma_wgmma_up",
+    "Glm5LowLatencyMoeWeights",
+    "Glm5LowLatencyMoeWorkspace",
+    "alloc_glm5_low_latency_moe_workspace",
+    "glm5_low_latency_moe",
+    "pack_glm5_low_latency_moe_gate_up_scale",
+    "pack_glm5_low_latency_moe_gate_up_weight",
+    "prepare_glm5_low_latency_moe_weights",
 ]
 
 # Add CuteDSL exports if available
