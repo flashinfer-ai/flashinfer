@@ -62,8 +62,10 @@ def get_available_cubin_files(
         try:
             response = requests.get(source, timeout=timeout)
             response.raise_for_status()
-            hrefs = re.findall(r'\<a href=".*\.cubin">', response.text)
-            return tuple((h[9:-8] + ".cubin") for h in hrefs)
+            # Kernel binaries are shipped as .cubin (trtllm-gen, deepgemm)
+            # or .so (cute-dsl, exported via TVM-FFI).
+            hrefs = re.findall(r'<a href="([^"]+\.(?:cubin|so))">', response.text)
+            return tuple(hrefs)
 
         except requests.exceptions.RequestException as e:
             logger.warning(
@@ -267,7 +269,6 @@ def _get_host_cpu_arch() -> str:
 
 
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
-    base = FLASHINFER_CUBINS_REPOSITORY
     cpu_arch = _get_host_cpu_arch()
 
     cubin_dirs = [
@@ -289,53 +290,39 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     checksums = get_checksums(cubin_dirs)
 
     # The meta info header files first.
-    yield (
+    meta_info_headers = (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
-        ],
-    )
-    yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
         safe_urljoin(
             ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
         ),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
-        ],
-    )
-    yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
-        ],
     )
+    for header_path in meta_info_headers:
+        yield (header_path, checksums[header_path])
 
-    # All the actual kernel cubin's.
+    # The checksum manifests themselves, pinned by CheckSumHash.
     for cubin_dir in cubin_dirs:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
-        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
+
+    # Everything else each directory's checksums.txt manifest lists.
+    #
+    # The manifest is authoritative for a directory's contents: it is generated
+    # by the cubin publishing pipeline, already fetched by get_checksums(), and
+    # pinned by SHA-256 via CheckSumHash.map_checksums. Enumerating downloads
+    # from it (instead of scraping the artifactory HTML index for hard-coded
+    # extensions) guarantees every published artifact is downloaded and
+    # checksum-verified by download_artifacts(). Scraping silently dropped any
+    # file the regex did not anticipate -- the cute-dsl FMHA kernels ship as
+    # .so, so none of them were ever pre-fetched and each was lazily fetched
+    # over HTTP inside the first forward pass that needed it (#4432). It also
+    # made a failed/unparseable index listing indistinguishable from an empty
+    # directory, silently skipping the whole directory.
+    for file_path, checksum in checksums.items():
+        if file_path not in meta_info_headers:
+            yield (file_path, checksum)
 
 
 def download_artifacts() -> None:

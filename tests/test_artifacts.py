@@ -270,6 +270,61 @@ def test_get_available_cubin_files():
         )
 
 
+# Directory index of a cute-dsl DSL_FMHA arch directory: the kernels there are
+# TVM-FFI shared objects (.so), not .cubin files (#4432). Mixed with a stray
+# .cubin and non-kernel files to check the enumerator keeps both kernel
+# extensions and nothing else.
+success_dsl_fmha_response = """
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta name="robots" content="noindex"/>
+        <title>Index of sw-kernelinferencelibrary-public-generic-local/5b34f84266cbc2135066ce96885b664992535670/fmha/cute-dsl/x86_64/sm_103a</title>
+    </head>
+    <body>
+        <h1>Index of sw-kernelinferencelibrary-public-generic-local/5b34f84266cbc2135066ce96885b664992535670/fmha/cute-dsl/x86_64/sm_103a</h1>
+        <pre>Name                                          Last modified      Size</pre>
+        <hr/>
+        <pre>
+            <a href="../">../</a>
+            <a href="cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvmffi.so">cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvmffi.so</a>
+            03-Sep-2025 03:45  1.2 MB
+<a href="cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so">cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so</a>
+            03-Sep-2025 03:45  1.2 MB
+<a href="some_kernel.cubin">some_kernel.cubin</a>
+            03-Sep-2025 03:45  60.79 KB
+<a href="checksums.txt">checksums.txt</a>
+            03-Sep-2025 03:45  40.12 KB
+<a href="LICENSE">LICENSE</a>
+            03-Sep-2025 03:45  11.09 KB
+
+        </pre>
+        <hr/>
+        <address style="font-size:small;">Artifactory/7.117.14 Server</address>
+    </body>
+</html>
+"""
+
+expected_dsl_fmha_kernel_files = {
+    "cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvmffi.so",
+    "cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so",
+    "some_kernel.cubin",
+}
+
+
+@responses.activate
+def test_get_available_cubin_files_matches_so():
+    """Regression for #4432: kernel .so files (cute-dsl) must be enumerated
+    alongside .cubin files; non-kernel files must still be excluded."""
+    source = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.DSL_FMHA, "x86_64/sm_103a/"),
+    )
+    responses.add(responses.GET, source, body=success_dsl_fmha_response, status=200)
+    available_files = get_available_cubin_files(source, retries=1, delay=0, timeout=5)
+    assert set(available_files) == expected_dsl_fmha_kernel_files
+
+
 @responses.activate
 def test_get_available_cubin_files_non_200_response():
     """Test that non-200 response codes return an empty tuple."""
@@ -462,10 +517,15 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 
     # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
     # Pin to x86_64 so the test is deterministic regardless of the runner arch.
+    # The cute-dsl kernels ship as .so, not .cubin (#4432).
     monkeypatch.setattr(artifacts, "_get_host_cpu_arch", lambda: "x86_64")
-    checksums_dsl_fmha = "aabbccdd11223344 cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so\n"
+    checksums_dsl_fmha = """aabbccdd11223344 cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so
+bbccddee22334455 cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvmffi.so
+"""
     # Minimal directory index: an empty HTML page with no cubin/header hrefs.
-    # This avoids 404 retry overhead while still exercising the code path.
+    # Enumeration is driven by the checksums.txt manifest, so the index body
+    # must not matter; this one is registered only so a regression back to
+    # HTML scraping fails fast (empty listing) instead of retrying 404s.
     empty_dir_index = '<html><body><pre><a href="../">../</a></pre></body></html>'
     for sm_arch in artifact_paths.DSL_FMHA_ARCHS:
         subdir = safe_urljoin(artifact_paths.DSL_FMHA, f"x86_64/{sm_arch}/")
@@ -563,3 +623,54 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
             f"{shared_name} resolved to the same checksum for both pins "
             f"({by_path[plain_path]}) -- the per-pin hashes collided"
         )
+
+    # Regression for #4432: the cute-dsl FMHA kernels are .so files, which the
+    # old HTML-scraping enumerator (cubin/header regexes only) silently
+    # skipped, so download_artifacts() reported success while every DSL kernel
+    # was missing from the cache. Every manifest-listed .so must be enumerated
+    # for every arch, carrying the checksum from its own manifest.
+    for sm_arch in artifact_paths.DSL_FMHA_ARCHS:
+        subdir = safe_urljoin(artifact_paths.DSL_FMHA, f"x86_64/{sm_arch}/")
+        for so_name, so_sha in (
+            (
+                "cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so",
+                "aabbccdd11223344",
+            ),
+            (
+                "cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvmffi.so",
+                "bbccddee22334455",
+            ),
+        ):
+            so_path = safe_urljoin(subdir, so_name)
+            assert so_path in by_path, (
+                f"DSL FMHA kernel '{so_path}' not enumerated -- .so artifacts "
+                f"would be silently skipped by download_artifacts() (#4432)"
+            )
+            assert by_path[so_path] == so_sha
+
+    # Mixed-content directory: enumeration is manifest-driven, so files with
+    # extensions the old scraper never anticipated (e.g. deepgemm's
+    # kernel_map.json) must be enumerated too, not only .cubin/.h files.
+    kernel_map_path = safe_urljoin(artifact_paths.DEEPGEMM, "kernel_map.json")
+    assert kernel_map_path in by_path
+
+    # Every entry of every manifest must be enumerated, so a file that is
+    # listed but missing on the server now fails download_artifacts() loudly
+    # instead of being silently skipped.
+    manifest_entries = artifacts.get_checksums(
+        [
+            artifact_paths.TRTLLM_GEN_FMHA,
+            artifact_paths.TRTLLM_GEN_BMM,
+            artifact_paths.TRTLLM_GEN_GEMM,
+            artifact_paths.TRTLLM_GEN_BMM_RUBIN,
+            artifact_paths.TRTLLM_GEN_GEMM_RUBIN,
+            artifact_paths.DEEPGEMM,
+            artifact_paths.DEEPGEMM_RUBIN,
+        ]
+        + [
+            safe_urljoin(artifact_paths.DSL_FMHA, f"x86_64/{sm_arch}/")
+            for sm_arch in artifact_paths.DSL_FMHA_ARCHS
+        ]
+    )
+    missing = set(manifest_entries) - set(by_path)
+    assert not missing, f"manifest entries not enumerated for download: {missing}"
