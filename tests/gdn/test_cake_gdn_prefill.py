@@ -97,7 +97,7 @@ def test_generated_source_inventory_and_hashes() -> None:
     assert len(manifest["cuda_headers"]) == 1
     assert manifest["cuda_headers"][0]["path"] == "cuda/cake_common.cuh"
     assert manifest["cuda_headers"][0]["sha256"] == (
-        "8a76a2e9c99b1362ca58cc1060d5643fa88606942920f531912f798f10f149b5"
+        "d61494318fda829af229b2c507af4c83bf5f5a7f1a58dea1baa1c8226fe95e03"
     )
     assert [record["name"] for record in manifest["kernels"]] == [
         "t_precompute",
