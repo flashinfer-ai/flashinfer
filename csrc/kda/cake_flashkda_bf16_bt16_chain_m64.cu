@@ -30,6 +30,12 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_KD_OFF 5120
 #define SMEM_SMEM_KD_STAGE_BYTES 4096
 #define SMEM_SMEM_KD_STRIDE 15360
+#define SMEM_SMEM_KD_LEFT_OFF 5120
+#define SMEM_SMEM_KD_LEFT_STAGE_BYTES 2048
+#define SMEM_SMEM_KD_LEFT_STRIDE 15360
+#define SMEM_SMEM_KD_RIGHT_OFF 7168
+#define SMEM_SMEM_KD_RIGHT_STAGE_BYTES 2048
+#define SMEM_SMEM_KD_RIGHT_STRIDE 15360
 #define SMEM_SMEM_KR_TRANS_OFF 9216
 #define SMEM_SMEM_KR_TRANS_STAGE_BYTES 4096
 #define SMEM_SMEM_KR_TRANS_STRIDE 15360
@@ -475,6 +481,10 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_kd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 5120);
     const int smem_kd_addr = smem + 5120;
+    __nv_bfloat16* smem_kd_left = reinterpret_cast<__nv_bfloat16*>(smem_raw + 5120);
+    const int smem_kd_left_addr = smem + 5120;
+    __nv_bfloat16* smem_kd_right = reinterpret_cast<__nv_bfloat16*>(smem_raw + 7168);
+    const int smem_kd_right_addr = smem + 7168;
     __nv_bfloat16* smem_kr_trans = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
     const int smem_kr_trans_addr = smem + 9216;
     __nv_bfloat16* smem_kr_trans_left = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
@@ -490,8 +500,8 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
     float* smem_gt_all = reinterpret_cast<float*>(smem_raw + 15872);
     const int smem_gt_all_addr = smem + 15872;
 
-    // Mbarrier init (10 groups, 68 barriers)
-    // Mbarriers at smem_raw[0..544)
+    // Mbarrier init (11 groups, 76 barriers)
+    // Mbarriers at smem_raw[0..608)
 
     if (warp == 0) {
         // --- pipeline 'tma_pipe' ---
@@ -499,6 +509,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
         // --- pipeline 'chunk_pipe' ---
         // smem_free: 8 barriers, init_count=2
         // state_inp_ready: 8 barriers, init_count=8
+        // state_inp_left_ready: 8 barriers, init_count=4
         // old_out_ready: 8 barriers, init_count=1
         // u2_inp_ready: 8 barriers, init_count=8
         // recurrence_left_done: 8 barriers, init_count=2
@@ -518,22 +529,25 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
             mbarrier_init(smem + 128 + _bar * 8, 8);
         }
         for (int _bar = lane; _bar < 8; _bar += 32) {
-            mbarrier_init(smem + 192 + _bar * 8, 1);
+            mbarrier_init(smem + 192 + _bar * 8, 4);
         }
         for (int _bar = lane; _bar < 8; _bar += 32) {
-            mbarrier_init(smem + 256 + _bar * 8, 8);
+            mbarrier_init(smem + 256 + _bar * 8, 1);
+        }
+        for (int _bar = lane; _bar < 8; _bar += 32) {
+            mbarrier_init(smem + 320 + _bar * 8, 8);
         }
         for (int _bar = lane; _bar < 16; _bar += 32) {
-            mbarrier_init(smem + 320 + _bar * 8, 2);
+            mbarrier_init(smem + 384 + _bar * 8, 2);
         }
         for (int _bar = lane; _bar < 8; _bar += 32) {
-            mbarrier_init(smem + 448 + _bar * 8, 1);
+            mbarrier_init(smem + 512 + _bar * 8, 1);
         }
         for (int _bar = lane; _bar < 3; _bar += 32) {
-            mbarrier_init(smem + 512 + _bar * 8, 4);
+            mbarrier_init(smem + 576 + _bar * 8, 4);
         }
         for (int _bar = lane; _bar < 1; _bar += 32) {
-            mbarrier_init(smem + 536 + _bar * 8, 3);
+            mbarrier_init(smem + 600 + _bar * 8, 3);
         }
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
@@ -541,9 +555,9 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 544);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 608);
     if (warp == 0) {
-        int _tmem_hold = smem + 544;
+        int _tmem_hold = smem + 608;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -555,13 +569,14 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
     #define qk_full_addr (mbar_base + 0)
     #define smem_free_addr (mbar_base + 64)
     #define state_inp_ready_addr (mbar_base + 128)
-    #define old_out_ready_addr (mbar_base + 192)
-    #define u2_inp_ready_addr (mbar_base + 256)
-    #define recurrence_left_done_addr (mbar_base + 320)
-    #define recurrence_right_done_addr (mbar_base + 384)
-    #define output_ready_addr (mbar_base + 448)
-    #define out_empty_addr (mbar_base + 512)
-    #define tmem_dealloc_ready_addr (mbar_base + 536)
+    #define state_inp_left_ready_addr (mbar_base + 192)
+    #define old_out_ready_addr (mbar_base + 256)
+    #define u2_inp_ready_addr (mbar_base + 320)
+    #define recurrence_left_done_addr (mbar_base + 384)
+    #define recurrence_right_done_addr (mbar_base + 448)
+    #define output_ready_addr (mbar_base + 512)
+    #define out_empty_addr (mbar_base + 576)
+    #define tmem_dealloc_ready_addr (mbar_base + 600)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -614,8 +629,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                         "tcgen05.ld.sync.aligned.16x256b.x2.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[7]))
-                        : "r"(taddr + 192 + epilogue_output_acc_stage * 16 + (unsigned int)tmem_row_base)
-                        : "memory");
+                        : "r"(taddr + 192 + epilogue_output_acc_stage * 16 + (unsigned int)tmem_row_base));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     const float2 _scale2_0 = {scale, scale};
                     #pragma unroll
@@ -668,8 +682,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                         "tcgen05.ld.sync.aligned.16x256b.x2.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[7]))
-                        : "r"(taddr + 192 + epilogue_output_acc_stage * 16 + (unsigned int)tmem_row_base)
-                        : "memory");
+                        : "r"(taddr + 192 + epilogue_output_acc_stage * 16 + (unsigned int)tmem_row_base));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     const float2 _scale2_2 = {scale, scale};
                     #pragma unroll
@@ -787,8 +800,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
             asm volatile(
                 "tcgen05.st.sync.aligned.16x256b.x8.b32"
                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                :: "r"(taddr + 64 + (unsigned int)tmem_row_base_1), "r"(*reinterpret_cast<const uint32_t*>(&state_init[0])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[1])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[2])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[3])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[4])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[5])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[6])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[7])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[8])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[9])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[10])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[11])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[12])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[13])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[14])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[15])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[16])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[17])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[18])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[19])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[20])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[21])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[22])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[23])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[24])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[25])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[26])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[27])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[28])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[29])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[30])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[31]))
-                : "memory");
+                :: "r"(taddr + 64 + (unsigned int)tmem_row_base_1), "r"(*reinterpret_cast<const uint32_t*>(&state_init[0])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[1])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[2])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[3])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[4])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[5])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[6])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[7])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[8])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[9])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[10])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[11])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[12])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[13])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[14])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[15])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[16])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[17])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[18])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[19])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[20])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[21])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[22])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[23])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[24])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[25])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[26])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[27])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[28])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[29])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[30])), "r"(*reinterpret_cast<const uint32_t*>(&state_init[31])));
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             unsigned int compute_left_stage = 0;
             unsigned int compute_left_tma_stage = 0;
@@ -802,8 +814,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
-                    : "r"(state_addr)
-                    : "memory");
+                    : "r"(state_addr));
                 mbarrier_wait(qk_full_addr + (compute_left_tma_stage) * 8, compute_left_tma_phase);
                 uint32_t _tmem_load_0_bf16[16];
                 #pragma unroll
@@ -814,8 +825,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x128b.x8.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base_1), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[15]))
-                    : "memory");
+                    :: "r"(taddr + (unsigned int)tmem_row_base_1), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[15])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     mbarrier_arrive(state_inp_ready_addr + (compute_left_stage) * 8);
@@ -840,8 +850,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x8.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                    :: "r"(state_addr), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[31]))
-                    : "memory");
+                    :: "r"(state_addr), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0[31])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     mbarrier_arrive(u2_inp_ready_addr + (compute_left_stage) * 8);
@@ -858,8 +867,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[31]))
-                    : "r"(taddr + 64 + (unsigned int)tmem_row_base_1)
-                    : "memory");
+                    : "r"(taddr + 64 + (unsigned int)tmem_row_base_1));
                 #pragma unroll
                 for (int state_col_group_2 = 0; state_col_group_2 < 8; state_col_group_2++) {
                     int state_col_pair_2 = state_col_group_2 * 8 + lane_quad_1 * 2;
@@ -953,8 +961,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x8.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                    :: "r"(taddr + 64 + (unsigned int)tmem_row_base_2 + (unsigned int)(state_col_half * 64)), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[15])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[16])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[17])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[18])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[19])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[20])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[21])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[22])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[23])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[24])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[25])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[26])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[27])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[28])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[29])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[30])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[31]))
-                    : "memory");
+                    :: "r"(taddr + 64 + (unsigned int)tmem_row_base_2 + (unsigned int)(state_col_half * 64)), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[15])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[16])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[17])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[18])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[19])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[20])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[21])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[22])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[23])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[24])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[25])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[26])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[27])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[28])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[29])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[30])), "r"(*reinterpret_cast<const uint32_t*>(&state_init_1[31])));
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             unsigned int compute_stage = 0;
@@ -970,8 +977,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[31]))
-                    : "r"(state_tail_addr)
-                    : "memory");
+                    : "r"(state_tail_addr));
                 mbarrier_wait(qk_full_addr + (compute_tma_stage) * 8, compute_tma_phase);
                 uint32_t _tmem_load_2_bf16[16];
                 #pragma unroll
@@ -982,8 +988,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x128b.x8.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base_2 + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[15]))
-                    : "memory");
+                    :: "r"(taddr + (unsigned int)tmem_row_base_2 + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[15])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     mbarrier_arrive(state_inp_ready_addr + (compute_stage) * 8);
@@ -1008,8 +1013,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x8.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                    :: "r"(state_tail_addr), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[31]))
-                    : "memory");
+                    :: "r"(state_tail_addr), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2[31])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 int v_stage_addr = smem_v_addr + compute_stage * 15360;
                 unsigned int v_prefetch_bits[4];
@@ -1032,8 +1036,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[15]))
-                    : "r"(taddr + 192 + 48 + (unsigned int)tmem_row_base_2)
-                    : "memory");
+                    : "r"(taddr + 192 + 48 + (unsigned int)tmem_row_base_2));
                 uint32_t _tmem_load_3_bf16[8];
                 #pragma unroll
                 for (int _lp = 0; _lp < 8; _lp++) {
@@ -1054,8 +1057,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x128b.x2.b32"
                     " [%0], {%1, %2, %3, %4};"
-                    :: "r"(taddr + 192 + 48 + (unsigned int)tmem_row_base_2), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[3]))
-                    : "memory");
+                    :: "r"(taddr + 192 + 48 + (unsigned int)tmem_row_base_2), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&residual_packed[3])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
@@ -1074,8 +1076,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                         "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[31]))
-                        : "r"(taddr + 64 + (unsigned int)tmem_row_base_2 + (unsigned int)(state_col_half_1 * 64))
-                        : "memory");
+                        : "r"(taddr + 64 + (unsigned int)tmem_row_base_2 + (unsigned int)(state_col_half_1 * 64)));
                     #pragma unroll
                     for (int state_col_group_5 = 0; state_col_group_5 < 8; state_col_group_5++) {
                         int state_col_pair_5 = state_col_half_1 * 64 + state_col_group_5 * 8 + lane_quad_2 * 2;
@@ -1191,14 +1192,16 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
             unsigned int mma_stage = 0;
             unsigned int mma_tma_stage = 0;
             unsigned int mma_tma_phase = 0;
+            unsigned int _phase_state_inp_left_ready = 0;
             unsigned int _phase_state_inp_ready_1 = 0;
             unsigned int _phase_u2_inp_ready_1 = 0;
             #pragma unroll 1
             for (int _chunk_idx_2 = 0; _chunk_idx_2 < num_chunks_4; _chunk_idx_2++) {
                 mbarrier_wait(qk_full_addr + (mma_tma_stage) * 8, mma_tma_phase);
-                mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready_1);
-                int _mma_b_lo_2 = make_warp_uniform((((smem_kd_addr) >> 4) & 0x3FFF) + (mma_stage) * 960);
-                asm volatile(
+                {
+                    mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready_1);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_kd_addr) >> 4) & 0x3FFF) + (mma_stage) * 960);
+                    asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
@@ -1242,17 +1245,18 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_2), "r"(tmem_tmem_state_inp), "r"(0));
+                    :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_4), "r"(tmem_tmem_state_inp), "r"(0));
+                }
                 elect_commit(old_out_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready_1);
-                int _mma_b_lo_3 = make_warp_uniform(((((smem_kr_trans_left_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_stage) * 960);
-                mma_ts_step(tmem_tmem_state, tmem_tmem_u2_inp, _mma_b_lo_3, 0x40004040, 68224144, 1);
+                int _mma_b_lo_5 = make_warp_uniform(((((smem_kr_trans_left_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_stage) * 960);
+                mma_ts_step(tmem_tmem_state, tmem_tmem_u2_inp, _mma_b_lo_5, 0x40004040, 68224144, 1);
                 elect_commit(recurrence_left_done_addr + (mma_stage) * 8);
-                int _mma_b_lo_4 = make_warp_uniform(((((smem_kr_trans_right_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_stage) * 960);
-                mma_ts_step((tmem_tmem_state + (64)), tmem_tmem_u2_inp, _mma_b_lo_4, 0x40004040, 68224144, 1);
+                int _mma_b_lo_6 = make_warp_uniform(((((smem_kr_trans_right_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_stage) * 960);
+                mma_ts_step((tmem_tmem_state + (64)), tmem_tmem_u2_inp, _mma_b_lo_6, 0x40004040, 68224144, 1);
                 elect_commit2(recurrence_right_done_addr + (mma_stage) * 8, smem_free_addr + (mma_stage) * 8);
                 mma_stage += 1;
-                if (mma_stage == 8) { mma_stage = 0; _phase_state_inp_ready_1 ^= 1; _phase_u2_inp_ready_1 ^= 1; }
+                if (mma_stage == 8) { mma_stage = 0; _phase_state_inp_left_ready ^= 1; _phase_state_inp_ready_1 ^= 1; _phase_u2_inp_ready_1 ^= 1; }
                 mma_tma_stage += 1;
                 if (mma_tma_stage == 8) { mma_tma_stage = 0; mma_tma_phase ^= 1; }
             }
