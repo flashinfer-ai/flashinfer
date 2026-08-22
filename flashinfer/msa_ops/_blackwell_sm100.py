@@ -35,6 +35,7 @@ _BLOCK_SIZE = 128
 _HEAD_DIM = 128
 _TOPK_SELECT = 16
 _ATTENTION_TOPK = 16
+_SUPPORTED_ATTENTION_TOPK = {4, 8, 16, 32}
 _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _M128_Q_TILE = 256
 _M128_GQA8_Q_TILE = 32
@@ -77,6 +78,7 @@ class MSASparseAttentionWorkspace:
         self._lock = threading.Lock()
         self._buffers: dict[str, torch.Tensor] = {}
         self._long_prefill_state: dict = {}
+        self._reverse_prefill_states: dict[str, dict] = {}
         self._warmed_launches: set[tuple] = set()
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
@@ -88,6 +90,8 @@ _eager_decode_dummies: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
 _eager_decode_dummies_lock = threading.Lock()
 _implicit_long_prefill_states: dict[tuple, dict] = {}
 _implicit_long_prefill_states_lock = threading.Lock()
+_implicit_reverse_prefill_states: dict[str, dict] = {}
+_implicit_reverse_prefill_states_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
@@ -455,9 +459,9 @@ def _validate_attention_tensors(
             "(num_kv_heads, total_q, topk)"
         )
     topk = int(q2k_indices.shape[2])
-    if topk != _ATTENTION_TOPK:
+    if topk not in _SUPPORTED_ATTENTION_TOPK:
         raise ValueError(
-            f"Blackwell MSA sparse attention requires topk={_ATTENTION_TOPK}"
+            "Blackwell MSA sparse attention requires topk in {4, 8, 16, 32}"
         )
     return total_q, num_q_heads, num_kv_heads, group_size
 
@@ -571,6 +575,140 @@ def _decode_variant(
         return f"decode_m16_bf16_query_fp8_kv_{layout}"  # type: ignore[return-value]
     dtype_name = "fp16" if q_dtype == torch.float16 else "bf16"
     return f"decode_m16_{dtype_name}_{layout}"  # type: ignore[return-value]
+
+
+def _exact_non16_decode_variant(
+    *,
+    requested_schedule: str,
+    capturing: bool,
+    paged: bool,
+    force_fused: Optional[bool],
+    causal: bool,
+    q_offset_is_none: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    batch_size: int,
+    total_q: int,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    topk: int,
+    k_outer_dim: int,
+    max_pages: int,
+) -> Optional["BlackwellMSAVariant"]:
+    """Select one of the two exact eager non-TopK16 decode routes."""
+
+    common = (
+        requested_schedule == ""
+        and not capturing
+        and paged
+        and force_fused is True
+        and causal
+        and q_offset_is_none
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+    )
+    if not common:
+        return None
+    if (
+        topk == 32
+        and batch_size == 64
+        and total_q == 512
+        and seqlen_q == 8
+        and num_q_heads == 64
+        and num_kv_heads == 4
+        and k_outer_dim == 32768
+        and max_pages == 512
+    ):
+        return "decode_m16_bf16_paged_topk32"
+    if (
+        topk == 4
+        and batch_size == 2
+        and total_q == 2
+        and seqlen_q == 1
+        and num_q_heads == 8
+        and num_kv_heads == 1
+        and k_outer_dim == 6
+        and max_pages == 3
+    ):
+        return "decode_m16_bf16_paged_topk4_active8"
+    return None
+
+
+def _is_exact_fp8_topk8_qagg_prefill(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    paged: bool,
+    batch_size: int,
+    causal: bool,
+    q_offset_is_none: bool,
+    softmax_scale: Optional[float],
+    return_temperature_lse: bool,
+    lse_temperature_scale: float,
+    requested_schedule: str,
+    capturing: bool,
+) -> bool:
+    return bool(
+        not capturing
+        and requested_schedule == ""
+        and not paged
+        and batch_size == 3
+        and q.dtype == torch.bfloat16
+        and tuple(q.shape) == (3072, 32, _HEAD_DIM)
+        and k.dtype == v.dtype == torch.float8_e4m3fn
+        and tuple(k.shape) == tuple(v.shape) == (24576, 2, _HEAD_DIM)
+        and tuple(q2k_indices.shape) == (2, 3072, 8)
+        and tuple(cu_q.shape) == tuple(cu_k.shape) == (4,)
+        and causal
+        and q_offset_is_none
+        and softmax_scale is None
+        and return_temperature_lse
+        and lse_temperature_scale == 1.0
+    )
+
+
+def _is_exact_bf16_topk4_qload4_prefill(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    page_table: torch.Tensor,
+    kv_lens: torch.Tensor,
+    paged: bool,
+    batch_size: int,
+    causal: bool,
+    q_offset_is_none: bool,
+    softmax_scale: Optional[float],
+    return_temperature_lse: bool,
+    lse_temperature_scale: float,
+    requested_schedule: str,
+) -> bool:
+    return bool(
+        requested_schedule == ""
+        and paged
+        and batch_size == 3
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and tuple(q.shape) == (12288, 8, _HEAD_DIM)
+        and tuple(k.shape)
+        == tuple(v.shape)
+        == (192, 2, _BLOCK_SIZE, _HEAD_DIM)
+        and tuple(q2k_indices.shape) == (2, 12288, 4)
+        and tuple(cu_q.shape) == tuple(cu_k.shape) == (4,)
+        and tuple(page_table.shape) == (3, 64)
+        and tuple(kv_lens.shape) == (3,)
+        and causal
+        and q_offset_is_none
+        and softmax_scale is None
+        and (not return_temperature_lse or lse_temperature_scale == 1.0)
+    )
 
 
 def _resolve_fp8_q1_schedule(
@@ -1041,6 +1179,486 @@ def _run_long_prefill_modules(
     _record_successful_launch(workspace, signature, capturing=capturing)
 
 
+def _reverse_prefill_state(
+    workspace: Optional[MSASparseAttentionWorkspace], route: str
+) -> dict:
+    states = (
+        workspace._reverse_prefill_states
+        if workspace is not None
+        else _implicit_reverse_prefill_states
+    )
+    return states.setdefault(route, {})
+
+
+def _run_exact_fp8_topk8_qagg_prefill(
+    *,
+    target: "BlackwellMSATarget",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    stream_ptr: int,
+    workspace: Optional[MSASparseAttentionWorkspace],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch the exact eager TopK8 producer/reducer pair."""
+
+    from ._blackwell_sm100_reverse_plan import prepare_fp8_topk8_qagg_plan
+
+    route = "fp8_topk8_qagg_pdl"
+    context = (
+        nullcontext()
+        if workspace is not None
+        else _implicit_reverse_prefill_states_lock
+    )
+    with context:
+        state = _reverse_prefill_state(workspace, route)
+        try:
+            plan = prepare_fp8_topk8_qagg_plan(
+                q2k_indices,
+                cu_q,
+                cu_k,
+                sm_count=torch.cuda.get_device_properties(
+                    q.device
+                ).multi_processor_count,
+                stream_id=stream_ptr,
+                state=state,
+            )
+            geometry = plan["geometry"]
+            completion_counts = _long_state_tensor(
+                state,
+                "completion_counts",
+                (384,),
+                dtype=torch.uint32,
+                device=q.device,
+            )
+            if "launches_completed" not in state:
+                completion_counts.zero_()
+                state["launches_completed"] = 0
+            launches_completed = int(state["launches_completed"])
+            if launches_completed >= (1 << 32) - 1:
+                state.clear()
+                raise OverflowError(
+                    "TopK8 qagg generation exhausted; the plan was invalidated"
+                )
+            generation = launches_completed + 1
+            out = _long_state_tensor(
+                state,
+                "out",
+                (3072, 32, _HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            lse = _long_state_tensor(
+                state,
+                "lse",
+                (3072, 32),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            temperature_lse = _long_state_tensor(
+                state,
+                "temperature_lse",
+                (3072, 32),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            partial_o = _long_state_tensor(
+                state,
+                "partial_o",
+                (8, 3072, 32, _HEAD_DIM),
+                dtype=torch.float8_e4m3fn,
+                device=q.device,
+            )
+            partial_lse = _long_state_tensor(
+                state,
+                "partial_lse",
+                (8, 3072, 32),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            partial_temperature_lse = _long_state_tensor(
+                state,
+                "partial_temperature_lse",
+                (8, 3072, 32),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            i32_dummy = _long_state_tensor(
+                state,
+                "i32_dummy",
+                (1,),
+                dtype=torch.int32,
+                device=q.device,
+            )
+            if "i32_dummy_initialized" not in state:
+                i32_dummy.zero_()
+                state["i32_dummy_initialized"] = True
+            producer_variant: BlackwellMSAVariant = (
+                "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl"
+            )
+            reducer_variant: BlackwellMSAVariant = (
+                "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce"
+            )
+            producer_tensors = (
+                q,
+                k.view(torch.uint8),
+                v.view(torch.uint8),
+                plan["scheduler_metadata"],
+                plan["k2q_row_ptr"],
+                plan["k2q_qsplit_indices"],
+                partial_o,
+                partial_lse,
+                partial_temperature_lse,
+                completion_counts,
+                cu_q,
+                cu_k,
+                i32_dummy,
+                i32_dummy,
+                i32_dummy,
+            )
+            producer_scalars = (
+                3072,
+                32,
+                2,
+                int(geometry.total_rows),
+                3072 * 8,
+                int(geometry.schedule_capacity),
+                int(geometry.work_count),
+                8,
+                0,
+                1,
+                1,
+                (_HEAD_DIM**-0.5) / math.log(2.0),
+                1.0,
+                0,
+            )
+            reducer_tensors = (
+                partial_o,
+                partial_lse,
+                partial_temperature_lse,
+                plan["split_counts"],
+                plan["q_order"],
+                plan["contributor_work_ids"],
+                completion_counts,
+                out,
+                lse,
+                temperature_lse,
+            )
+            reducer_scalars = (
+                3072,
+                32,
+                2,
+                16,
+                8,
+                generation,
+                1,
+                1,
+            )
+            _get_module(producer_variant, target).run(
+                *producer_tensors,
+                *producer_scalars,
+                384,
+                1,
+                1,
+                stream_ptr,
+            )
+            _get_module(reducer_variant, target).run(
+                *reducer_tensors,
+                *reducer_scalars,
+                3072,
+                1,
+                1,
+                stream_ptr,
+            )
+            state["launches_completed"] = generation
+            return out, lse, temperature_lse
+        except BaseException:
+            state.clear()
+            raise
+
+
+def _exact_topk4_launch_parts(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    return_softmax_lse: bool,
+    return_temperature_lse: bool,
+    state: dict,
+) -> tuple[
+    tuple,
+    tuple,
+    tuple[int, int, int],
+    tuple,
+    tuple,
+    tuple[int, int, int],
+    tuple,
+]:
+    plan = state
+    geometry = plan["geometry"]
+    out = _long_state_tensor(
+        state,
+        "out",
+        (12288, 8, _HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    lse = _long_state_tensor(
+        state,
+        "lse",
+        (12288, 8),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    temperature_lse = _long_state_tensor(
+        state,
+        "temperature_lse",
+        (12288, 8),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_o = _long_state_tensor(
+        state,
+        "partial_o",
+        (4, 12288, 8, _HEAD_DIM),
+        dtype=torch.uint8,
+        device=q.device,
+    )
+    partial_scale = _long_state_tensor(
+        state,
+        "partial_scale",
+        (4, 12288, 8, 4),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_lse = _long_state_tensor(
+        state,
+        "partial_lse",
+        (4, 12288, 8),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_temperature_lse = _long_state_tensor(
+        state,
+        "partial_temperature_lse",
+        (4, 12288, 8),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    producer_tensors = (
+        q,
+        k,
+        v,
+        plan["scheduler_metadata"],
+        plan["k2q_row_ptr"],
+        plan["k2q_qsplit_indices"],
+        partial_o,
+        partial_scale,
+        partial_lse,
+        partial_temperature_lse,
+        cu_q,
+        cu_k,
+        cu_k,
+        kv_lens,
+        page_table,
+    )
+    producer_scalars = (
+        *plan["group_segment_ends"],
+        12288,
+        8,
+        2,
+        int(geometry.total_rows),
+        12288 * 4,
+        int(geometry.schedule_capacity),
+        int(geometry.work_count),
+        4,
+        64,
+        1,
+        1,
+        (_HEAD_DIM**-0.5) / math.log(2.0),
+        1.0,
+        int(return_temperature_lse),
+    )
+    reducer_tensors = (
+        partial_o,
+        partial_scale,
+        partial_lse,
+        partial_temperature_lse,
+        plan["split_counts"],
+        out,
+        lse,
+        temperature_lse,
+    )
+    reducer_scalars = (
+        12288,
+        8,
+        2,
+        4,
+        4,
+        int(return_softmax_lse or return_temperature_lse),
+        int(return_temperature_lse),
+    )
+    return (
+        producer_tensors,
+        producer_scalars,
+        (int(geometry.work_count), 1, 1),
+        reducer_tensors,
+        reducer_scalars,
+        (3072, 1, 1),
+        (out, lse, temperature_lse),
+    )
+
+
+def _enqueue_exact_topk4_pair(
+    *,
+    target: "BlackwellMSATarget",
+    parts: tuple,
+    stream_ptr: int,
+) -> None:
+    (
+        producer_tensors,
+        producer_scalars,
+        producer_grid,
+        reducer_tensors,
+        reducer_scalars,
+        reducer_grid,
+        _outputs,
+    ) = parts
+    producer_variant: BlackwellMSAVariant = (
+        "reverse_prefill_bf16_paged_topk4_qload4"
+    )
+    reducer_variant: BlackwellMSAVariant = (
+        "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce"
+    )
+    _get_module(producer_variant, target).run(
+        *producer_tensors,
+        *producer_scalars,
+        *producer_grid,
+        stream_ptr,
+    )
+    _get_module(reducer_variant, target).run(
+        *reducer_tensors,
+        *reducer_scalars,
+        *reducer_grid,
+        stream_ptr,
+    )
+
+
+def _run_exact_bf16_topk4_qload4_prefill(
+    *,
+    target: "BlackwellMSATarget",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    return_softmax_lse: bool,
+    return_temperature_lse: bool,
+    stream_ptr: int,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch or replay the exact paged TopK4 producer/reducer pair."""
+
+    from ._blackwell_sm100_reverse_plan import prepare_bf16_paged_topk4_plan
+
+    route = "bf16_paged_topk4_qload4"
+    context = (
+        nullcontext()
+        if workspace is not None
+        else _implicit_reverse_prefill_states_lock
+    )
+    with context:
+        state = _reverse_prefill_state(workspace, route)
+        try:
+            prepare_bf16_paged_topk4_plan(
+                q2k_indices,
+                cu_q,
+                cu_k,
+                page_table,
+                kv_lens,
+                sm_count=torch.cuda.get_device_properties(
+                    q.device
+                ).multi_processor_count,
+                stream_id=stream_ptr,
+                state=state,
+            )
+            parts = _exact_topk4_launch_parts(
+                q=q,
+                k=k,
+                v=v,
+                cu_q=cu_q,
+                cu_k=cu_k,
+                kv_lens=kv_lens,
+                page_table=page_table,
+                return_softmax_lse=return_softmax_lse,
+                return_temperature_lse=return_temperature_lse,
+                state=state,
+            )
+            outputs = parts[-1]
+            producer_tensors, producer_scalars, producer_grid = parts[:3]
+            reducer_tensors, reducer_scalars, reducer_grid = parts[3:6]
+            signature = _launch_signature(
+                variant="reverse_prefill_bf16_paged_topk4_qload4_graph",
+                target=target,
+                tensors=(*producer_tensors, *reducer_tensors),
+                scalars=(*producer_scalars, *reducer_scalars),
+                grid=producer_grid,
+            )
+            _check_warmed_launch(workspace, signature, capturing=capturing)
+            if capturing:
+                _enqueue_exact_topk4_pair(
+                    target=target, parts=parts, stream_ptr=stream_ptr
+                )
+            else:
+                graph_state = state.get("graph_state")
+                graph_signature = (
+                    signature,
+                    reducer_grid,
+                    tuple(_tensor_signature(tensor) for tensor in outputs),
+                )
+                if not isinstance(graph_state, dict) or graph_state.get(
+                    "signature"
+                ) != graph_signature:
+                    _enqueue_exact_topk4_pair(
+                        target=target, parts=parts, stream_ptr=stream_ptr
+                    )
+                    current_stream = torch.cuda.current_stream(q.device)
+                    capture_stream = torch.cuda.Stream(device=q.device)
+                    capture_stream.wait_stream(current_stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=capture_stream):
+                        _enqueue_exact_topk4_pair(
+                            target=target,
+                            parts=parts,
+                            stream_ptr=int(capture_stream.cuda_stream),
+                        )
+                    graph_state = {
+                        "signature": graph_signature,
+                        "graph": graph,
+                        "capture_stream": capture_stream,
+                        "keepalive": parts,
+                    }
+                    state["graph_state"] = graph_state
+                graph_state["graph"].replay()
+            _record_successful_launch(
+                workspace, signature, capturing=capturing
+            )
+            return outputs
+        except BaseException:
+            state.clear()
+            raise
+
+
 def _run_fp8_direct_module(
     *,
     schedule: str,
@@ -1467,6 +2085,97 @@ def blackwell_msa_sparse_attention(
         temperature_scale = float(lse_temperature_scale)
         if not math.isfinite(temperature_scale) or temperature_scale <= 0:
             raise ValueError("lse_temperature_scale must be positive and finite")
+        target = _select_target(q.device)
+        requested_prefill_schedule = os.environ.get(
+            "FLASHINFER_MSA_PREFILL_SCHEDULE", ""
+        )
+        if requested_prefill_schedule not in {"", "m64"}:
+            raise ValueError("FLASHINFER_MSA_PREFILL_SCHEDULE must be empty or 'm64'")
+        use_topk8_qagg = _is_exact_fp8_topk8_qagg_prefill(
+            q=q,
+            k=k,
+            v=v,
+            q2k_indices=q2k_indices,
+            cu_q=cu_q,
+            cu_k=cu_k,
+            paged=paged,
+            batch_size=batch_size,
+            causal=causal,
+            q_offset_is_none=q_offset is None,
+            softmax_scale=softmax_scale,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=temperature_scale,
+            requested_schedule=requested_prefill_schedule,
+            capturing=capturing,
+        )
+        use_topk4_qload4 = _is_exact_bf16_topk4_qload4_prefill(
+            q=q,
+            k=k,
+            v=v,
+            q2k_indices=q2k_indices,
+            cu_q=cu_q,
+            cu_k=cu_k,
+            page_table=page_table_arg,
+            kv_lens=kv_lens,
+            paged=paged,
+            batch_size=batch_size,
+            causal=causal,
+            q_offset_is_none=q_offset is None,
+            softmax_scale=softmax_scale,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=temperature_scale,
+            requested_schedule=requested_prefill_schedule,
+        )
+        topk = int(q2k_indices.shape[2])
+        if topk != _ATTENTION_TOPK and not (
+            use_topk8_qagg or use_topk4_qload4
+        ):
+            raise ValueError(
+                "non-TopK16 Blackwell MSA attention is restricted to exact routes"
+            )
+        if use_topk8_qagg:
+            exact_out, exact_lse, exact_temperature_lse = (
+                _run_exact_fp8_topk8_qagg_prefill(
+                    target=target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    q2k_indices=q2k_indices,
+                    cu_q=cu_q,
+                    cu_k=cu_k,
+                    stream_ptr=stream_ptr,
+                    workspace=workspace,
+                )
+            )
+            if return_temperature_lse:
+                return exact_out, exact_lse, exact_temperature_lse
+            if return_softmax_lse:
+                return exact_out, exact_lse
+            return exact_out
+        if use_topk4_qload4:
+            exact_out, exact_lse, exact_temperature_lse = (
+                _run_exact_bf16_topk4_qload4_prefill(
+                    target=target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    q2k_indices=q2k_indices,
+                    cu_q=cu_q,
+                    cu_k=cu_k,
+                    kv_lens=kv_lens,
+                    page_table=page_table_arg,
+                    return_softmax_lse=return_softmax_lse,
+                    return_temperature_lse=return_temperature_lse,
+                    stream_ptr=stream_ptr,
+                    workspace=workspace,
+                    capturing=capturing,
+                )
+            )
+            if return_temperature_lse:
+                return exact_out, exact_lse, exact_temperature_lse
+            if return_softmax_lse:
+                return exact_out, exact_lse
+            return exact_out
 
         out = _workspace_buffer(
             workspace,
@@ -1489,12 +2198,6 @@ def blackwell_msa_sparse_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        target = _select_target(q.device)
-        requested_prefill_schedule = os.environ.get(
-            "FLASHINFER_MSA_PREFILL_SCHEDULE", ""
-        )
-        if requested_prefill_schedule not in {"", "m64"}:
-            raise ValueError("FLASHINFER_MSA_PREFILL_SCHEDULE must be empty or 'm64'")
         if _should_use_long_prefill(
             requested_schedule=requested_prefill_schedule,
             batch_size=batch_size,
@@ -1714,20 +2417,6 @@ def blackwell_msa_sparse_decode_attention(
             raise ValueError("softmax_scale must be finite")
         if not math.isfinite(output_scale):
             raise ValueError("v_global_scale must be finite")
-        out = _workspace_buffer(
-            workspace,
-            "decode_out",
-            tuple(q.shape),
-            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
-            device=q.device,
-        )
-        lse = _workspace_buffer(
-            workspace,
-            "decode_lse",
-            (total_q, num_q_heads),
-            dtype=torch.float32,
-            device=q.device,
-        )
         target = _select_target(q.device)
         requested_schedule = os.environ.get("FLASHINFER_MSA_FP8_Q1_SCHEDULE", "")
         valid_schedules = {
@@ -1743,6 +2432,69 @@ def blackwell_msa_sparse_decode_attention(
                 "FLASHINFER_MSA_FP8_Q1_SCHEDULE must be batch_attention, "
                 "q1_exact, q1_flat_xform2, q1_paged_xform2, or paged_uniform_fp8"
             )
+        non16_variant = _exact_non16_decode_variant(
+            requested_schedule=requested_schedule,
+            capturing=capturing,
+            paged=paged,
+            force_fused=force_fused,
+            causal=causal,
+            q_offset_is_none=q_offset is None,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            batch_size=batch_size,
+            total_q=total_q,
+            seqlen_q=seqlen_q,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            topk=int(q2k_indices.shape[2]),
+            k_outer_dim=int(k.shape[0]),
+            max_pages=max_pages,
+        )
+        if int(q2k_indices.shape[2]) != _ATTENTION_TOPK and non16_variant is None:
+            raise ValueError(
+                "non-TopK16 Blackwell MSA attention is restricted to exact routes"
+            )
+        out = _workspace_buffer(
+            workspace,
+            "decode_out",
+            tuple(q.shape),
+            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
+            device=q.device,
+        )
+        lse = _workspace_buffer(
+            workspace,
+            "decode_lse",
+            (total_q, num_q_heads),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if non16_variant is not None:
+            _run_decode_module(
+                variant=non16_variant,
+                target=target,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                lse=lse,
+                q2k_indices=q2k_indices,
+                cu_q=cu_q,
+                cu_k=cu_k,
+                q_offsets=q_offsets,
+                kv_lens=kv_lens,
+                page_table=page_table_arg,
+                topk=int(q2k_indices.shape[2]),
+                max_pages=max_pages,
+                seqlen_q=seqlen_q,
+                softmax_scale_log2=scale / math.log(2.0),
+                causal=causal,
+                paged=paged,
+                derive_q_offset=derive_q_offset,
+                workspace=workspace,
+                capturing=capturing,
+                stream_ptr=stream_ptr,
+            )
+            return (out, lse) if return_softmax_lse else out
         uniform_fp8 = q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
         uniform_fp8_direct = (
             paged

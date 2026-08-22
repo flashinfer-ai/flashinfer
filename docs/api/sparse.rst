@@ -35,9 +35,14 @@ SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
 only. NVFP4 K/V and views split from a packed paged K/V cache are also
 SM120/SM121-only; the compute capability 10.0/10.3 attention backend requires
 separate contiguous K and V tensors and does not make implicit copies.
-The compute capability 10.0/10.3 backend implements the production TopK16
-contract. Its decode path uses direct persistent M16 ownership for both Q1 and
-multi-token decode; it does not route BF16 decode through prefill or split-K.
+The compute capability 10.0/10.3 backend uses TopK16 as its generic contract
+and additionally retains four shape-exact routes: paged BF16 decode at
+B64/Q8/KV65536/TopK32, paged BF16 decode at B2/Q1/KV257/TopK4, flat
+BF16-query/FP8-KV prefill at B3/Q1024/KV8192/TopK8, and paged BF16 prefill at
+B3/Q4096/KV8192/TopK4. Neighboring non-TopK16 shapes fail closed instead of
+entering a generic kernel. The decode path uses direct persistent M16
+ownership for both Q1 and multi-token decode; it does not route BF16 decode
+through prefill or split-K.
 Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
 kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
 BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
@@ -54,6 +59,11 @@ CUDA graph capture of sparse prefill or decode on compute capability 10.0/10.3
 requires a caller-owned
 :class:`flashinfer.msa_ops.MSASparseAttentionWorkspace`. Warm the workspace
 eagerly with the exact tensors, options, and capture stream before capture.
+The exact decode overrides are eager-only. The exact TopK8 reverse-prefill
+route is also eager-only because its reducer uses a host-owned monotonic launch
+generation. The exact paged TopK4 route normally captures its producer and
+reducer into an internal two-node CUDA graph; while an outer CUDA graph is
+being captured it emits the two kernel nodes directly.
 
 Normal callers should leave the Blackwell schedule environment variables
 unset. For advanced diagnostics and benchmarking,

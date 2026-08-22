@@ -32,6 +32,8 @@ BlackwellMSAVariant = Literal[
     "decode_m16_bf16_paged",
     "decode_m16_bf16_query_fp8_kv_flat",
     "decode_m16_bf16_query_fp8_kv_paged",
+    "decode_m16_bf16_paged_topk32",
+    "decode_m16_bf16_paged_topk4_active8",
     "decode_m16_fp16_flat",
     "decode_m16_fp16_paged",
     "decode_q1_bf16_query_fp8_kv_exact_flat",
@@ -62,6 +64,10 @@ BlackwellMSAVariant = Literal[
     "prefill_union_bf16_query_fp8_kv_paged",
     "prefill_union_fp16_flat",
     "prefill_union_fp16_paged",
+    "reverse_prefill_bf16_paged_topk4_qload4",
+    "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+    "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+    "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
     "topk",
 ]
 BlackwellMSATarget = Literal["sm100a", "sm103a"]
@@ -71,6 +77,8 @@ _COMMON_VARIANTS: tuple[BlackwellMSAVariant, ...] = (
     "decode_m16_bf16_paged",
     "decode_m16_bf16_query_fp8_kv_flat",
     "decode_m16_bf16_query_fp8_kv_paged",
+    "decode_m16_bf16_paged_topk32",
+    "decode_m16_bf16_paged_topk4_active8",
     "decode_m16_fp16_flat",
     "decode_m16_fp16_paged",
     "decode_q1_bf16_query_fp8_kv_exact_flat",
@@ -94,6 +102,10 @@ _COMMON_VARIANTS: tuple[BlackwellMSAVariant, ...] = (
     "prefill_union_bf16_query_fp8_kv_paged",
     "prefill_union_fp16_flat",
     "prefill_union_fp16_paged",
+    "reverse_prefill_bf16_paged_topk4_qload4",
+    "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+    "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+    "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
     "topk",
 )
 

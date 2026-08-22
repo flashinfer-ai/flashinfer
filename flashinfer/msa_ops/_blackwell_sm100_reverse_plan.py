@@ -490,6 +490,38 @@ def _binding_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
+def _uploaded_plan_signature(
+    route: str,
+    *,
+    sm_count: int,
+    stream_id: int,
+    owners: tuple[torch.Tensor, ...],
+) -> tuple[Any, ...]:
+    return (
+        route,
+        int(sm_count),
+        int(stream_id),
+        tuple(_binding_signature(tensor) for tensor in owners),
+    )
+
+
+def _cached_uploaded_plan(
+    state: dict[str, Any],
+    signature: tuple[Any, ...],
+    owners: tuple[torch.Tensor, ...],
+) -> bool:
+    cached_owners = state.get("owners")
+    return bool(
+        state.get("signature") == signature
+        and isinstance(cached_owners, tuple)
+        and len(cached_owners) == len(owners)
+        and all(
+            cached_owners[index] is tensor
+            for index, tensor in enumerate(owners)
+        )
+    )
+
+
 def _require_cuda_i32(
     tensor: torch.Tensor,
     *,
@@ -528,22 +560,13 @@ def _prepare_uploaded_plan(
     state: dict[str, Any],
     build,
 ) -> dict[str, Any]:
-    signature = (
+    signature = _uploaded_plan_signature(
         route,
-        int(sm_count),
-        int(stream_id),
-        tuple(_binding_signature(tensor) for tensor in owners),
+        sm_count=sm_count,
+        stream_id=stream_id,
+        owners=owners,
     )
-    cached_owners = state.get("owners")
-    if (
-        state.get("signature") == signature
-        and isinstance(cached_owners, tuple)
-        and len(cached_owners) == len(owners)
-        and all(
-            cached_owners[index] is tensor
-            for index, tensor in enumerate(owners)
-        )
-    ):
+    if _cached_uploaded_plan(state, signature, owners):
         return state
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"{route} plan must be prepared before CUDA graph capture")
@@ -587,6 +610,19 @@ def prepare_fp8_topk8_qagg_plan(
     )
     _require_cuda_i32(cu_seqlens_q, name="cu_seqlens_q", shape=(4,))
     _require_cuda_i32(cu_seqlens_k, name="cu_seqlens_k", shape=(4,))
+    owners = (q2k_indices, cu_seqlens_q, cu_seqlens_k)
+    signature = _uploaded_plan_signature(
+        _FP8_TOPK8_SHAPE.route,
+        sm_count=sm_count,
+        stream_id=stream_id,
+        owners=owners,
+    )
+    if _cached_uploaded_plan(state, signature, owners):
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "fp8_topk8_qagg_pdl plan must be prepared before CUDA graph capture"
+        )
     _require_exact_values(
         cu_seqlens_q,
         name="cu_seqlens_q",
@@ -600,7 +636,7 @@ def prepare_fp8_topk8_qagg_plan(
     return _prepare_uploaded_plan(
         route=_FP8_TOPK8_SHAPE.route,
         q2k_indices=q2k_indices,
-        owners=(q2k_indices, cu_seqlens_q, cu_seqlens_k),
+        owners=owners,
         sm_count=sm_count,
         stream_id=stream_id,
         state=state,
@@ -632,6 +668,25 @@ def prepare_bf16_paged_topk4_plan(
     _require_cuda_i32(cu_seqlens_k, name="cu_seqlens_k", shape=(4,))
     _require_cuda_i32(page_table, name="page_table", shape=(3, 64))
     _require_cuda_i32(seqused_k, name="seqused_k", shape=(3,))
+    owners = (
+        q2k_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_table,
+        seqused_k,
+    )
+    signature = _uploaded_plan_signature(
+        _BF16_TOPK4_SHAPE.route,
+        sm_count=sm_count,
+        stream_id=stream_id,
+        owners=owners,
+    )
+    if _cached_uploaded_plan(state, signature, owners):
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "bf16_paged_topk4_qload4 plan must be prepared before CUDA graph capture"
+        )
     _require_exact_values(
         cu_seqlens_q,
         name="cu_seqlens_q",
@@ -650,13 +705,7 @@ def prepare_bf16_paged_topk4_plan(
     return _prepare_uploaded_plan(
         route=_BF16_TOPK4_SHAPE.route,
         q2k_indices=q2k_indices,
-        owners=(
-            q2k_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            page_table,
-            seqused_k,
-        ),
+        owners=owners,
         sm_count=sm_count,
         stream_id=stream_id,
         state=state,

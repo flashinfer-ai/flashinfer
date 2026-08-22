@@ -15,8 +15,8 @@ def test_variant_manifest_matches_each_target_source_directory() -> None:
         "sm100a",
         "sm103a",
     }
-    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]) == 32
-    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]) == 31
+    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]) == 38
+    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]) == 37
     for target, variants in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET.items():
         target_dir = csrc_dir / target
         bodies = tuple(
