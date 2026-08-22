@@ -26,6 +26,7 @@ from .trace.templates.page import (
     append_paged_mla_kv_cache_trace,
     nvfp4_quantize_append_paged_kv_cache_trace,
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace,
+    nvfp4_quantize_append_paged_mla_kv_cache_trace,
 )
 from .jit.page import gen_page_module
 from .utils import (
@@ -74,6 +75,63 @@ def _append_paged_mla_kv_cache_kernel(
         kv_indptr,
         kv_last_page_len,
     )
+
+
+@register_custom_op(
+    "flashinfer::nvfp4_quantize_append_paged_mla_kv_cache",
+    mutates_args=("ckv_cache", "ckv_sf_cache", "kpe_cache"),
+)
+def _nvfp4_quantize_append_paged_mla_kv_cache_kernel(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    ckv_sf_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    ckv_scale: float,
+    kpe_scale: float,
+) -> None:
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
+    get_page_module().nvfp4_quantize_append_paged_mla_kv_cache(
+        append_ckv,
+        append_kpe,
+        batch_indices,
+        positions,
+        ckv_cache,
+        ckv_sf_cache,
+        kpe_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        ckv_scale,
+        kpe_scale,
+    )
+
+
+@register_fake_op("flashinfer::nvfp4_quantize_append_paged_mla_kv_cache")
+def _fake_nvfp4_quantize_append_paged_mla_kv_cache_kernel(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    ckv_sf_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    ckv_scale: float,
+    kpe_scale: float,
+) -> None:
+    pass
 
 
 @register_custom_op(
@@ -396,6 +454,124 @@ def append_paged_mla_kv_cache(
         kv_indices,
         kv_indptr,
         kv_last_page_len,
+    )
+
+
+@flashinfer_api(trace=nvfp4_quantize_append_paged_mla_kv_cache_trace)
+def nvfp4_quantize_append_paged_mla_kv_cache(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    ckv_sf_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    ckv_scale: float,
+    kpe_scale: float,
+) -> None:
+    r"""Quantize and append MLA (ckv, kpe) rows into an NVFP4 MLA paged KV cache.
+
+    The compressed-kv part is quantized to NVFP4 (packed E2M1 with one FP8
+    E4M3 scale per 16 channels); the rope part is kept in FP8 E4M3 because
+    rope channels are much hotter than ckv channels in DeepSeek-family
+    latents. Dequantization reconstructs
+    ``e2m1_value * block_scale * ckv_scale`` for the compressed-kv part and
+    ``fp8_value * kpe_scale`` for the rope part. Inputs are quantized
+    directly from fp16/bf16 with no intermediate FP8 requantization.
+
+    Currently only ``ckv_dim=512`` and ``kpe_dim=64`` are supported.
+
+    Parameters
+    ----------
+    append_ckv : torch.Tensor
+        The compressed kv tensor to append in ragged tensor format, shape
+        ``[append_indptr[-1], 512]``, dtype ``torch.float16`` or
+        ``torch.bfloat16``.
+    append_kpe : torch.Tensor
+        The rope part to append in ragged tensor format, shape
+        ``[append_indptr[-1], 64]``, same dtype as ``append_ckv``. Rope must
+        already be applied by the caller (pass the unrotated values for
+        NoPE-style models).
+    batch_indices : torch.Tensor
+        The batch indices of each entry in the appended rows, shape
+        ``[append_indptr[-1]]``.
+    positions : torch.Tensor
+        The positions of each entry in the appended rows, shape
+        ``[append_indptr[-1]]``.
+    ckv_cache : torch.Tensor
+        Packed NVFP4 compressed-kv cache, dtype ``torch.uint8``, shape
+        ``[num_pages, page_size, 256]`` (two E2M1 values per byte).
+    ckv_sf_cache : torch.Tensor
+        Compressed-kv block scale cache, dtype ``torch.float8_e4m3fn``, shape
+        ``[num_pages, page_size, 32]`` (one scale per 16 channels).
+    kpe_cache : torch.Tensor
+        FP8 rope cache, dtype ``torch.float8_e4m3fn``, shape
+        ``[num_pages, page_size, 64]``.
+    kv_indices : torch.Tensor
+        The page indices of the paged kv-cache, shape ``[kv_indptr[-1]]``.
+    kv_indptr : torch.Tensor
+        The indptr of the paged kv-cache, shape ``[batch_size + 1]``.
+    kv_last_page_len : torch.Tensor
+        The number of entries in the last page of each request in the paged
+        kv cache, shape ``[batch_size]``.
+    ckv_scale : float
+        Positive finite global decode scale for the compressed-kv part.
+    kpe_scale : float
+        Positive finite global decode scale for the rope part.
+
+    Returns
+    -------
+    None
+        This function updates ``ckv_cache``, ``ckv_sf_cache``, and
+        ``kpe_cache`` in place.
+
+    See Also
+    --------
+    append_paged_mla_kv_cache
+    nvfp4_quantize_append_paged_kv_cache
+    """
+    if append_ckv.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"append_ckv must be float16 or bfloat16, got {append_ckv.dtype}"
+        )
+    if append_kpe.dtype != append_ckv.dtype:
+        raise ValueError(
+            f"append_ckv and append_kpe must have the same dtype, got "
+            f"{append_ckv.dtype} and {append_kpe.dtype}"
+        )
+    if ckv_cache.dtype != torch.uint8:
+        raise ValueError("NVFP4 ckv_cache must have dtype torch.uint8")
+    if ckv_sf_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError("ckv_sf_cache must have dtype torch.float8_e4m3fn")
+    if kpe_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError("kpe_cache must have dtype torch.float8_e4m3fn")
+    ckv_scale = float(ckv_scale)
+    kpe_scale = float(kpe_scale)
+    if (
+        not math.isfinite(ckv_scale)
+        or not math.isfinite(kpe_scale)
+        or ckv_scale <= 0.0
+        or kpe_scale <= 0.0
+    ):
+        raise ValueError(
+            "ckv_scale and kpe_scale must be positive finite global decode scales"
+        )
+    _nvfp4_quantize_append_paged_mla_kv_cache_kernel(
+        append_ckv,
+        append_kpe,
+        batch_indices,
+        positions,
+        ckv_cache,
+        ckv_sf_cache,
+        kpe_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        ckv_scale,
+        kpe_scale,
     )
 
 
