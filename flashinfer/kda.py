@@ -93,8 +93,12 @@ def recurrent_kda(
     multi-token prefill uses the architecture-specific CuTe DSL backend. On
     SM100a (B200/GB200) and SM103a (B300/GB300), the FlashKDA-compatible subset
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
-    kernel. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback.
+    kernel. The Cake backend includes a generated two-stage BT=16
+    prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
+    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
+    contracts and keeps Cake as the feature-complete fallback; use
+    ``backend="cake"`` to select and benchmark the generated portfolio
+    explicitly.
 
     Args:
         q (torch.Tensor):
@@ -228,7 +232,9 @@ def recurrent_kda(
             prefill, including the SM120 backend and SM100-family state
             checkpoints, and otherwise falls back to an exported frozen Cake
             specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
+            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
+            Cake prefill path chooses among direct, persistent, small-BH, and
+            two-stage BT16 schedules from the input shape and physical device.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``

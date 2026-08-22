@@ -9,6 +9,13 @@ to the natural device/shape dispatcher and records its resolved module; use
 `--candidate-route nonpersistent` for a B200 direct-family route A/B.
 `bench_recurrent_kda_prefill.py --case-set small_bh` runs the four fixed-layout
 small-BH cases through the same cold-L2 CUPTI path.
+`bench_recurrent_kda_prefill.py --case-set production --backend cake` runs the
+complete 29-shape fixed/packed inference portfolio. Its JSON records the logical
+route, every physical Cake module used (including BT16 prepare plus chain), and
+the explicit per-shape dry/repeat iteration budget. Large state shapes reduce
+the sample count to stay within the rotating-state capacity and set
+`timing_iteration_budget.low_sample_count` when fewer than ten measured
+iterations fit.
 
 ## Overview
 
