@@ -1952,13 +1952,21 @@ def _compile_options(device: torch.device) -> tuple:
 
 
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
-# (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
-# pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
+# (stream, device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T
+# decode pays only a T-row copy-in (no per-call F.pad realloc/re-zero). The
+# CUDA stream is part of the key because the buffers are mutable: two same-shape
+# calls on different streams would otherwise share one buffer, and the second
+# call's copy-in can overwrite it while the first call's kernel is still reading
+# (observed corrupting outputs by ~0.37 absmax). Same-stream reuse is safe —
+# stream order guarantees the kernel consumes the buffer before the next copy-in.
+# A destroyed stream leaves a stale entry; harmless because a recycled stream
+# handle re-stages valid rows on first use and the zero tail rows never change.
 _STAGE: dict = {}
 # When False, the T<16 path assumes the staging buffers already hold the current
 # inputs and skips the per-call copy-in. Set this only when the producer writes
 # q/k/v/a/b directly into the persistent T=16 buffers (the fixed-buffer serving
-# pattern) or to benchmark the bare kernel. Default True = always safe drop-in.
+# pattern, one buffer set per stream) or to benchmark the bare kernel.
+# Default True = always safe drop-in.
 _RESTAGE = True
 # (native-short-T) When set, the T<T_KERNEL path passes q/k to the kernel as the
 # real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
@@ -2186,7 +2194,8 @@ def gated_delta_rule_mtp(
             _ab_native_flag = True
             # q, k, v and a, b all stay native [B, T, ...].
         elif _native:
-            skey: tuple = (str(device), B, HV, str(_io_dtype), T, "ab")
+            _stream = torch.cuda.current_stream(device).cuda_stream
+            skey: tuple = (_stream, str(device), B, HV, str(_io_dtype), T, "ab")
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
@@ -2203,7 +2212,19 @@ def gated_delta_rule_mtp(
             a, b = ab, bb
             # q, k, v stay as the native [B, T, ...] tensors.
         else:
-            skey = (str(device), B, H, HK, HV, K_dim, V_dim, str(_io_dtype), T)
+            _stream = torch.cuda.current_stream(device).cuda_stream
+            skey = (
+                _stream,
+                str(device),
+                B,
+                H,
+                HK,
+                HV,
+                K_dim,
+                V_dim,
+                str(_io_dtype),
+                T,
+            )
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
