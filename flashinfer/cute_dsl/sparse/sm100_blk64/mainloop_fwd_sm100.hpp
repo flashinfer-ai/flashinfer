@@ -836,10 +836,38 @@ struct CollectiveMainloopFwd {
     }
   }
 
+  // Correction warp-pair reduce barrier (warps w and w^2, kRows = 64 threads).
+  //
+  // These must not share an id with the SmStats barriers.  Correction warp w
+  // reaches its reduce arrival while its partner w^2 may still be blocked on
+  // its own stage-1 SmStats barrier, and nothing orders the two: the four
+  // correction warps run independently up to this point.  With the previous
+  // user ids (Reduce_02 == 4 == the stage-1 SmStats id of correction warp 0,
+  // Reduce_13 == 5 == that of correction warp 1) a reduce arrival could
+  // complete a SmStats barrier instead, consuming the softmax partner's
+  // arrival.  The correction warp then blocked forever on an arrival nobody
+  // would make, the epilogue warp never received its 128th o_epi commit, and
+  // the CTA wedged.  Observed live as exactly that warp map: correction warp 0
+  // alone at a SmStats barrier, the other 14 warps parked at the exit
+  // rendezvous, and the epilogue warp inside its elect_one waiting on o_epi.
+  //
+  // The reserved-enum NamedBarrier ctor applies no +ReservedNamedBarrierCount
+  // offset, so these land on hardware barriers 1 and 2 -- both unused by this
+  // kernel (0 = __syncthreads, 7 = SM103 exit rendezvous, 8..15 = SmStats).
+  CUTLASS_DEVICE static void reduce_barrier_sync(int pair_sel) {
+    using cutlass::arch::NamedBarrier;
+    using cutlass::arch::ReservedNamedBarriers;
+    if (pair_sel) {
+      NamedBarrier(kRows, ReservedNamedBarriers::TransposeBarrier).arrive_and_wait();
+    } else {
+      NamedBarrier(kRows, ReservedNamedBarriers::EpilogueBarrier).arrive_and_wait();
+    }
+  }
+
   template <typename SmemTensorO, typename EpiStorage, typename NamedBarriers>
   CUTLASS_DEVICE static void correction_combine(uint32_t tmem_o0, uint32_t tmem_o1, float my_scale0,
                                                 float my_scale1, int corr_warp, int lane_idx,
-                                                int reduce_bar, EpiStorage& el, SmemTensorO& sO) {
+                                                int reduce_pair, EpiStorage& el, SmemTensorO& sO) {
     using namespace cute;
 
     // Pass 1: each warp computes weighted O and writes ALL chunks to OWN slot
@@ -872,7 +900,7 @@ struct CollectiveMainloopFwd {
     }
 
     // Single barrier: all warps' exchange writes visible
-    cutlass::arch::NamedBarrier::arrive_and_wait(kRows, reduce_bar);
+    reduce_barrier_sync(reduce_pair);
 
     // Pass 2: warps 0,1 read own + partner exchange data → add → bf16 → sO
     {
@@ -1002,13 +1030,13 @@ struct CollectiveMainloopFwd {
 
     // ---- (f) Warp-pair stats exchange + combine weight ----
     auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
-    const int reduce_bar = (corr_warp & 1) ? NamedBarriers::Reduce_13 : NamedBarriers::Reduce_02;
+    const int reduce_pair = corr_warp & 1;
 
     float my_weight;
     {
       el.o_staging[corr_warp ^ 2][lane_idx * 2 + 0] = my_sum;
       el.o_staging[corr_warp ^ 2][lane_idx * 2 + 1] = my_max;
-      NamedBarrier::arrive_and_wait(kRows, reduce_bar);
+      reduce_barrier_sync(reduce_pair);
 
       float partner_sum = el.o_staging[corr_warp][lane_idx * 2 + 0];
       float partner_max = el.o_staging[corr_warp][lane_idx * 2 + 1];
@@ -1041,7 +1069,7 @@ struct CollectiveMainloopFwd {
     float my_scale0 = scale0 * my_weight;
     float my_scale1 = scale1 * my_weight;
     correction_combine<decltype(sO), decltype(el), NamedBarriers>(
-        tmem_o0, tmem_o1, my_scale0, my_scale1, corr_warp, lane_idx, reduce_bar, el, sO);
+        tmem_o0, tmem_o1, my_scale0, my_scale1, corr_warp, lane_idx, reduce_pair, el, sO);
 
     // ---- (h) Fence + signal epilogue warp ----
     cutlass::arch::fence_view_async_shared();
