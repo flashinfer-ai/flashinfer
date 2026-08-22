@@ -147,7 +147,8 @@ inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char*
 
 #if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
 constexpr int kFlashKDATargetMinor = FLASHINFER_FLASH_KDA_TARGET_MINOR;
-static_assert(kFlashKDATargetMinor == 0, "legacy exact FlashKDA target must be SM100a");
+static_assert(kFlashKDATargetMinor == 0 || kFlashKDATargetMinor == 3,
+              "exact FlashKDA target must be SM100a or SM103a");
 #else
 constexpr int kFlashKDATargetFamily = FLASHINFER_FLASH_KDA_TARGET_FAMILY;
 static_assert(kFlashKDATargetFamily == 100, "FlashKDA family target must be SM100f");
@@ -433,11 +434,14 @@ inline int64_t ResolveAndCheckServingStatePool(
 inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
                                          const TensorView& checkpoint_cu_starts, int32_t device_id,
                                          int64_t num_seqs, int64_t num_heads,
-                                         int64_t checkpoint_every_n_tokens) {
+                                         int64_t checkpoint_every_n_tokens,
+                                         int64_t checkpoint_token_granularity = 32) {
+  TVM_FFI_ICHECK(checkpoint_token_granularity > 0)
+      << "checkpoint_token_granularity must be positive";
   TVM_FFI_ICHECK(checkpoint_every_n_tokens >= 0 &&
                  checkpoint_every_n_tokens <= std::numeric_limits<int32_t>::max() &&
-                 checkpoint_every_n_tokens % 32 == 0)
-      << "checkpoint_every_n_tokens must be zero or a multiple of 32";
+                 checkpoint_every_n_tokens % checkpoint_token_granularity == 0)
+      << "checkpoint_every_n_tokens must be zero or a multiple of " << checkpoint_token_granularity;
   if (checkpoint_every_n_tokens == 0) {
     return;
   }

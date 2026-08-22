@@ -33,6 +33,19 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .api_logging import flashinfer_api
+from .kda_backward import (
+    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
+)
+from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
+from .kda_training import (
+    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
+)
+from .kda_training import (
+    recurrent_kda_training_backward as recurrent_kda_training_backward,
+)
+from .kda_training import (
+    recurrent_kda_training_forward as recurrent_kda_training_forward,
+)
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
@@ -206,8 +219,9 @@ def recurrent_kda(
             Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
-            must be divisible by 32. SGLang normally uses 64 or a larger
-            cache-page-aligned multiple.
+            must be divisible by 32, except that the SM100-family exact-N16
+            frozen route also accepts multiples of 16. SGLang normally uses
+            64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake"]):
             Implementation backend. ``"auto"`` selects the architecture-
             appropriate CuTe DSL kernel for supported ordinary multi-token
