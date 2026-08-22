@@ -1073,29 +1073,29 @@ def test_bt16_route_policy_matches_measured_crossovers(
 
 def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
     assert (
-        kda_prefill_api._direct_m128_route(
-            num_heads=64, max_sequence_length=16
-        )
+        kda_prefill_api._direct_m128_route(num_heads=64, max_sequence_length=16)
         == "direct_m128_n16"
     )
     assert (
-        kda_prefill_api._direct_m128_route(
-            num_heads=64, max_sequence_length=17
-        )
+        kda_prefill_api._direct_m128_route(num_heads=64, max_sequence_length=17)
         == "direct_m128"
     )
-    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
-        num_heads=12, total_chunks=128
-    ) == 1
-    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
-        num_heads=12, total_chunks=129
-    ) == 4
-    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
-        num_heads=64, total_chunks=255
-    ) == 6
-    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
-        num_heads=64, total_chunks=256
-    ) == 8
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=12, total_chunks=128)
+        == 1
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=12, total_chunks=129)
+        == 4
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=64, total_chunks=255)
+        == 6
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=64, total_chunks=256)
+        == 8
+    )
 
     assert kda_prefill_api._select_bt16_physical_variants(
         compute_capability=(10, 3),

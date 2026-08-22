@@ -24,20 +24,20 @@ namespace flash_kda {
 static_assert(THREADS == 128);
 static_assert(SMEM_TOTAL == 44032);
 
-void RunBt16Prepare(
-    TensorView q, TensorView k, TensorView raw_gate, TensorView beta_logits,
-    TensorView a_log, TensorView dt_bias, TensorView cu_seqlens, TensorView cu_chunks,
-    TensorView chunk_to_seq, TensorView ws_qd, TensorView ws_kd,
-    TensorView ws_w, TensorView ws_qk_t, TensorView ws_diag, TensorView descriptor_storage,
-    int64_t prepare_descriptors, int64_t total_chunks, int64_t num_heads,
-    double gate_lower_bound, int64_t prepare_total_ctas, int64_t cuda_stream) {
+void RunBt16Prepare(TensorView q, TensorView k, TensorView raw_gate, TensorView beta_logits,
+                    TensorView a_log, TensorView dt_bias, TensorView cu_seqlens,
+                    TensorView cu_chunks, TensorView chunk_to_seq, TensorView ws_qd,
+                    TensorView ws_kd, TensorView ws_w, TensorView ws_qk_t, TensorView ws_diag,
+                    TensorView descriptor_storage, int64_t prepare_descriptors,
+                    int64_t total_chunks, int64_t num_heads, double gate_lower_bound,
+                    int64_t prepare_total_ctas, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckBt16PrepareInputs(q, k, raw_gate, beta_logits, a_log, dt_bias, cu_seqlens, cu_chunks,
-                         chunk_to_seq, ws_qd, ws_kd, ws_w, ws_qk_t, ws_diag,
-                         descriptor_storage, prepare_descriptors, prepare_total_ctas, total_chunks,
-                         num_heads, gate_lower_bound);
+                         chunk_to_seq, ws_qd, ws_kd, ws_w, ws_qk_t, ws_diag, descriptor_storage,
+                         prepare_descriptors, prepare_total_ctas, total_chunks, num_heads,
+                         gate_lower_bound);
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
@@ -47,8 +47,8 @@ void RunBt16Prepare(
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const Bt16PrepareTmaPointers tma =
-      EncodeBt16PrepareTma(q, k, raw_gate, beta_logits, ws_qd, ws_kd, ws_w,
-                           descriptor_storage, prepare_descriptors, stream);
+      EncodeBt16PrepareTma(q, k, raw_gate, beta_logits, ws_qd, ws_kd, ws_w, descriptor_storage,
+                           prepare_descriptors, stream);
   const dim3 grid(static_cast<uint32_t>(prepare_total_ctas), 1, 1);
   const dim3 block(THREADS, 1, 1);
   FLASHINFER_BT16_PREPARE_KERNEL<<<grid, block, kSmemBytes, stream>>>(
@@ -62,8 +62,7 @@ void RunBt16Prepare(
       reinterpret_cast<flashkda_generated_CakeTensorMap const*>(tma.beta_logits),
       reinterpret_cast<float*>(a_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<int*>(cu_chunks.data_ptr()),
-      reinterpret_cast<int*>(chunk_to_seq.data_ptr()),
+      reinterpret_cast<int*>(cu_chunks.data_ptr()), reinterpret_cast<int*>(chunk_to_seq.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(ws_qd.data_ptr()),
       reinterpret_cast<flashkda_generated_CakeTensorMap const*>(tma.ws_qd),
       reinterpret_cast<__nv_bfloat16*>(ws_kd.data_ptr()),

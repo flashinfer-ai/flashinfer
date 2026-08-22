@@ -56,12 +56,11 @@ inline void CheckBt16TokenTensor(const TensorView& tensor, const char* name, int
 inline int64_t CheckBt16PrepareInputs(
     const TensorView& q, const TensorView& k, const TensorView& raw_gate,
     const TensorView& beta_logits, const TensorView& a_log, const TensorView& dt_bias,
-    const TensorView& cu_seqlens, const TensorView& cu_chunks,
-    const TensorView& chunk_to_seq, const TensorView& ws_qd, const TensorView& ws_kd,
-    const TensorView& ws_w, const TensorView& ws_qk_t, const TensorView& ws_diag,
-    const TensorView& descriptor_storage, int64_t prepare_descriptors,
-    int64_t prepare_total_ctas, int64_t total_chunks, int64_t num_heads,
-    double gate_lower_bound) {
+    const TensorView& cu_seqlens, const TensorView& cu_chunks, const TensorView& chunk_to_seq,
+    const TensorView& ws_qd, const TensorView& ws_kd, const TensorView& ws_w,
+    const TensorView& ws_qk_t, const TensorView& ws_diag, const TensorView& descriptor_storage,
+    int64_t prepare_descriptors, int64_t prepare_total_ctas, int64_t total_chunks,
+    int64_t num_heads, double gate_lower_bound) {
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   CheckFlashKDATarget(device_id);
@@ -87,8 +86,7 @@ inline int64_t CheckBt16PrepareInputs(
   CheckBt16TokenTensor(raw_gate, "raw_gate", device_id, token_count, num_heads);
 
   CheckBt16DenseTensor(beta_logits, "beta_logits", device_id, dl_bfloat16);
-  TVM_FFI_ICHECK(beta_logits.ndim() >= 2 &&
-                 beta_logits.size(beta_logits.ndim() - 1) == num_heads &&
+  TVM_FFI_ICHECK(beta_logits.ndim() >= 2 && beta_logits.size(beta_logits.ndim() - 1) == num_heads &&
                  beta_logits.numel() == token_count * num_heads)
       << "beta_logits must match flattened [tokens, H] storage";
   CheckBt16DenseTensor(a_log, "a_log", device_id, dl_float32);
@@ -117,15 +115,13 @@ inline int64_t CheckBt16PrepareInputs(
         << named.second << " must have shape [1, H, total_chunks * 16, 128]";
   }
   CheckBt16DenseTensor(ws_qk_t, "ws_qk_t", device_id, dl_bfloat16);
-  TVM_FFI_ICHECK(ws_qk_t.ndim() == 5 && ws_qk_t.size(0) == 1 &&
-                 ws_qk_t.size(1) == num_heads && ws_qk_t.size(2) == total_chunks &&
-                 ws_qk_t.size(3) == kBt16ChunkTokens &&
+  TVM_FFI_ICHECK(ws_qk_t.ndim() == 5 && ws_qk_t.size(0) == 1 && ws_qk_t.size(1) == num_heads &&
+                 ws_qk_t.size(2) == total_chunks && ws_qk_t.size(3) == kBt16ChunkTokens &&
                  ws_qk_t.size(4) == kBt16ChunkTokens)
       << "ws_qk_t must have shape [1, H, total_chunks, 16, 16]";
   CheckBt16DenseTensor(ws_diag, "ws_diag", device_id, dl_float32);
-  TVM_FFI_ICHECK(ws_diag.ndim() == 4 && ws_diag.size(0) == 1 &&
-                 ws_diag.size(1) == num_heads && ws_diag.size(2) == total_chunks &&
-                 ws_diag.size(3) == kHeadDim)
+  TVM_FFI_ICHECK(ws_diag.ndim() == 4 && ws_diag.size(0) == 1 && ws_diag.size(1) == num_heads &&
+                 ws_diag.size(2) == total_chunks && ws_diag.size(3) == kHeadDim)
       << "ws_diag must have shape [1, H, total_chunks, 128]";
   CheckBt16DescriptorStorage(descriptor_storage, device_id, prepare_descriptors);
   return token_count;
@@ -182,9 +178,8 @@ inline int64_t CheckBt16ChainInputs(
                  ws_qk.size(4) == kBt16ChunkTokens)
       << "ws_qk must have shape [1, H, total_chunks, 16, 16]";
   CheckBt16DenseTensor(ws_diag, "ws_diag", device_id, dl_float32);
-  TVM_FFI_ICHECK(ws_diag.ndim() == 4 && ws_diag.size(0) == 1 &&
-                 ws_diag.size(1) == num_heads && ws_diag.size(2) == total_chunks &&
-                 ws_diag.size(3) == kHeadDim)
+  TVM_FFI_ICHECK(ws_diag.ndim() == 4 && ws_diag.size(0) == 1 && ws_diag.size(1) == num_heads &&
+                 ws_diag.size(2) == total_chunks && ws_diag.size(3) == kHeadDim)
       << "ws_diag must have shape [1, H, total_chunks, 128]";
 
   CheckBt16DenseTensor(v, "v", device_id, dl_bfloat16);
@@ -236,11 +231,10 @@ inline CUtensorMap EncodeBt16QkWorkspaceTma(const TensorView& tensor) {
       static_cast<uint64_t>(tensor.size(4)), static_cast<uint64_t>(tensor.size(3)),
       static_cast<uint64_t>(tensor.size(2)), static_cast<uint64_t>(tensor.size(1)),
       static_cast<uint64_t>(tensor.size(0))};
-  uint64_t global_strides[4] = {
-      static_cast<uint64_t>(tensor.stride(3) * sizeof(__nv_bfloat16)),
-      static_cast<uint64_t>(tensor.stride(2) * sizeof(__nv_bfloat16)),
-      static_cast<uint64_t>(tensor.stride(1) * sizeof(__nv_bfloat16)),
-      static_cast<uint64_t>(tensor.stride(0) * sizeof(__nv_bfloat16))};
+  uint64_t global_strides[4] = {static_cast<uint64_t>(tensor.stride(3) * sizeof(__nv_bfloat16)),
+                                static_cast<uint64_t>(tensor.stride(2) * sizeof(__nv_bfloat16)),
+                                static_cast<uint64_t>(tensor.stride(1) * sizeof(__nv_bfloat16)),
+                                static_cast<uint64_t>(tensor.stride(0) * sizeof(__nv_bfloat16))};
   uint32_t box_dim[5] = {16, 16, 1, 1, 1};
   uint32_t elem_strides[5] = {1, 1, 1, 1, 1};
   CUtensorMap map{};
@@ -257,10 +251,9 @@ inline CUtensorMap EncodeBt16DiagWorkspaceTma(const TensorView& tensor) {
   uint64_t global_dim[4] = {
       static_cast<uint64_t>(tensor.size(3)), static_cast<uint64_t>(tensor.size(2)),
       static_cast<uint64_t>(tensor.size(1)), static_cast<uint64_t>(tensor.size(0))};
-  uint64_t global_strides[3] = {
-      static_cast<uint64_t>(tensor.stride(2) * sizeof(float)),
-      static_cast<uint64_t>(tensor.stride(1) * sizeof(float)),
-      static_cast<uint64_t>(tensor.stride(0) * sizeof(float))};
+  uint64_t global_strides[3] = {static_cast<uint64_t>(tensor.stride(2) * sizeof(float)),
+                                static_cast<uint64_t>(tensor.stride(1) * sizeof(float)),
+                                static_cast<uint64_t>(tensor.stride(0) * sizeof(float))};
   uint32_t box_dim[4] = {128, 1, 1, 1};
   uint32_t elem_strides[4] = {1, 1, 1, 1};
   CUtensorMap map{};
@@ -321,11 +314,10 @@ inline Bt16PrepareTmaPointers EncodeBt16PrepareTma(
     const TensorView& ws_w, const TensorView& descriptor_storage, int64_t prepare_descriptors,
     cudaStream_t stream) {
   if (prepare_descriptors != 0) {
-    PublishBt16Maps(
-        {EncodeQkTma<16>(q, "q"), EncodeQkTma<16>(k, "k"), EncodeGateTma<16>(raw_gate),
-         EncodeBetaTma<16>(beta_logits), EncodeBt16FactorTma<2>(ws_qd, "ws_qd"),
-         EncodeBt16FactorTma<2>(ws_kd, "ws_kd"), EncodeBt16FactorTma<1>(ws_w, "ws_w")},
-        descriptor_storage, prepare_descriptors, stream);
+    PublishBt16Maps({EncodeQkTma<16>(q, "q"), EncodeQkTma<16>(k, "k"), EncodeGateTma<16>(raw_gate),
+                     EncodeBetaTma<16>(beta_logits), EncodeBt16FactorTma<2>(ws_qd, "ws_qd"),
+                     EncodeBt16FactorTma<2>(ws_kd, "ws_kd"), EncodeBt16FactorTma<1>(ws_w, "ws_w")},
+                    descriptor_storage, prepare_descriptors, stream);
   }
   auto* bytes = static_cast<unsigned char*>(descriptor_storage.data_ptr());
   constexpr size_t stride = sizeof(CUtensorMap);
@@ -343,18 +335,18 @@ struct Bt16ChainTmaPointers {
   void* out;
 };
 
-inline Bt16ChainTmaPointers EncodeBt16ChainTma(
-    const TensorView& ws_qd, const TensorView& ws_kd, const TensorView& ws_w,
-    const TensorView& ws_qk, const TensorView& ws_diag, const TensorView& v,
-    const TensorView& out, const TensorView& descriptor_storage, int64_t prepare_descriptors,
-    cudaStream_t stream) {
+inline Bt16ChainTmaPointers EncodeBt16ChainTma(const TensorView& ws_qd, const TensorView& ws_kd,
+                                               const TensorView& ws_w, const TensorView& ws_qk,
+                                               const TensorView& ws_diag, const TensorView& v,
+                                               const TensorView& out,
+                                               const TensorView& descriptor_storage,
+                                               int64_t prepare_descriptors, cudaStream_t stream) {
   if (prepare_descriptors != 0) {
-    PublishBt16Maps(
-        {EncodeBt16FactorTma<2>(ws_qd, "ws_qd"), EncodeBt16FactorTma<2>(ws_kd, "ws_kd"),
-         EncodeBt16FactorTma<2>(ws_w, "ws_w"), EncodeBt16QkWorkspaceTma(ws_qk),
-         EncodeBt16DiagWorkspaceTma(ws_diag), EncodeValueTma<64, 16>(v),
-         EncodeOutputTma<64, 16>(out)},
-        descriptor_storage, prepare_descriptors, stream);
+    PublishBt16Maps({EncodeBt16FactorTma<2>(ws_qd, "ws_qd"), EncodeBt16FactorTma<2>(ws_kd, "ws_kd"),
+                     EncodeBt16FactorTma<2>(ws_w, "ws_w"), EncodeBt16QkWorkspaceTma(ws_qk),
+                     EncodeBt16DiagWorkspaceTma(ws_diag), EncodeValueTma<64, 16>(v),
+                     EncodeOutputTma<64, 16>(out)},
+                    descriptor_storage, prepare_descriptors, stream);
   }
   auto* bytes = static_cast<unsigned char*>(descriptor_storage.data_ptr());
   constexpr size_t stride = sizeof(CUtensorMap);

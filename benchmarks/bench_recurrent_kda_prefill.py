@@ -197,9 +197,7 @@ PRODUCTION_CASES = (
     Case("h1_packed_524288_524288", 1, (524288, 524288), True, 11022),
 )
 
-_BT16_PREPARE_VARIANTS = frozenset(
-    ("bt16_prepare", "bt16_prepare_beta_tma")
-)
+_BT16_PREPARE_VARIANTS = frozenset(("bt16_prepare", "bt16_prepare_beta_tma"))
 _BT16_CHAIN_VARIANTS = frozenset(
     (
         "bt16_chain_m64_s7",
@@ -852,9 +850,7 @@ def main() -> None:
             "dry_run_iters": dry_run_iters,
             "repeat_iters": repeat_iters,
             "total_stateful_calls_per_block": (
-                _CUPTI_ESTIMATE_CALLS_PER_BLOCK
-                + dry_run_iters
-                + repeat_iters
+                _CUPTI_ESTIMATE_CALLS_PER_BLOCK + dry_run_iters + repeat_iters
             ),
             "state_rotation_capacity": state_rotations,
             "low_sample_count": repeat_iters < 10,
