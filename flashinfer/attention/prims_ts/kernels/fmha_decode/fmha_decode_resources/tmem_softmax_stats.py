@@ -256,6 +256,18 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
             )
         return [self._alloc]
 
+    def get_producer_requirements(self) -> list[SmemAllocation | TmemAllocation]:
+        """Return the allocation written by the active stats handoff path."""
+        if self.cfg.keeps_stats_via_smem:
+            return self.get_smem_requirements()
+        return self.get_tmem_requirements()
+
+    def get_consumer_requirements(self) -> list[SmemAllocation | TmemAllocation]:
+        """Return the allocation read by the active stats handoff path."""
+        if self.cfg.keeps_stats_via_smem:
+            return self.get_smem_requirements()
+        return self.get_tmem_requirements()
+
     @cute.jit
     def _create_initial_task_locals(
         self, context: ResourceContext | None = None
@@ -743,7 +755,7 @@ class TmemSoftmaxGlobalResource(DecodeGenResourceBase):
     ) -> None:
         """Apply FP8 P-quantization denominator correction through TmemS."""
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_qkv):
+        if cutlass.const_expr(not cfg.use_fp8_q):
             return
 
         num_scale_groups = cfg.num_softmax_scale_groups

@@ -109,6 +109,7 @@ WARP_THREADS = 32
 # TMEM column layout for staged SwapsMmaAb O. A TMEM row holds 256 columns, and
 # the tcgen05 descriptor encodes a 16-row jump in the high 16 bits.
 TMEM_COLUMNS_PER_ROW = 256
+TMEM_MAX_ALLOCATION_COLUMNS = 512
 TMEM_ROW_STRIDE = 16 << 16
 
 # Number of scalar softmax/output values packed in one register for the

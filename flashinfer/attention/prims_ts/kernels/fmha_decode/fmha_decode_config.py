@@ -24,7 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 
 import cutlass.utils as utils
-from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN
 
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
@@ -61,6 +61,7 @@ from .fmha_decode_constants import (
     REDUCTION_THREADS_PER_CTA,
     SPLIT_KV_MIN_TOKENS_PER_CTA,
     TMEM_COLUMNS_PER_ROW,
+    TMEM_MAX_ALLOCATION_COLUMNS,
     TMEM_ROW_STRIDE,
     TOTAL_SMEM_BUDGET_KIB,
     WARP_THREADS,
@@ -320,7 +321,7 @@ _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 
 
 def enumerate_grouped_q_mma_candidates(
-    *, heads_q_per_kv: int, seq_len_q: int
+    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
 ) -> tuple[GroupedQMmaCandidate, ...]:
     """Return grouped-Q candidates without applying launch policy.
 
@@ -328,7 +329,8 @@ def enumerate_grouped_q_mma_candidates(
     leave structural padding rows and the final CTA may own fewer tokens than
     its capacity; the common Q geometry and row masks already represent both
     cases.  This helper deliberately does not inspect dtypes, reduction modes,
-    scheduler state, or mutate ``FmhaDecodeConfig``.
+    scheduler state, or mutate ``FmhaDecodeConfig``. ``swaps_only`` excludes
+    KeepsMmaAb tiles for profiles such as transformed mixed-precision K/V.
     """
     if heads_q_per_kv <= 0:
         raise ValueError("heads_q_per_kv must be positive")
@@ -337,6 +339,8 @@ def enumerate_grouped_q_mma_candidates(
 
     candidates = []
     for variant, tile_size_q in _GROUPED_Q_MMA_TILES:
+        if swaps_only and variant != "swaps_mma_ab":
+            continue
         if tile_size_q < heads_q_per_kv:
             continue
         q_tokens_per_cta = tile_size_q // heads_q_per_kv
@@ -524,11 +528,11 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Data types
     # ------------------------------------------------------------------
-    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN. Must equal
-    # kv_dtype — mixed Q/KV element types are not supported yet; enforced by
-    # the guard in make_decode_config.
+    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN.
     q_dtype: type = Float16
     # K and V element type. One of Float16 / BFloat16 / Float8E4M3FN.
+    # Float4E2M1FN is allowed only as packed raw NVFP4 KV cache input; the
+    # transform task dequantizes it to q_dtype before MMA consumes it.
     kv_dtype: type = Float16
     # Output O element type. One of Float16 / BFloat16 / Float8E4M3FN.
     out_dtype: type = Float16
@@ -545,6 +549,13 @@ class FmhaDecodeConfig:
     # K/V TMA pipeline depth. Deeper KV staging hides the long
     # GMEM→SMEM latency in the BMM1↔BMM2 chain.
     kv_stages: int = 4
+    # Transformed K/V pipeline depth for mixed Q/KV modes. Raw K/V is loaded
+    # into SmemKv, converted to the Q-side MMA input type, then consumed by MMA.
+    # Zero selects the profile-derived stage count.
+    transformed_kv_stages: int = 0
+    # Store the transformed NVFP4 K/V operand ring in TMEM. The supported
+    # FP8-Q Swaps profile defaults to this path; other mixed modes use SMEM.
+    store_transformed_kv_in_tmem: bool = False
 
     # ------------------------------------------------------------------
     # TMEM column counts
@@ -609,6 +620,10 @@ class FmhaDecodeConfig:
     # ClcLoadTask: under persistent scheduling, warp 15 issues the CLC
     # response loads.
     clc_load_warp_idx: int = 15
+    # TransformKvTask (mixed Q/KV): converts raw K/V into the Q-side MMA input
+    # type. Finalization preserves its configured role order while compacting.
+    transform_kv_warp_idx: int = 14
+    transform_kv_num_warps: int = 2
     # PaddingTask placement is derived after selecting the active task roles.
     # Each active warp group is compacted first, then its unused tail warps are
     # assigned to the corresponding padding task. Persistent layouts retain
@@ -628,15 +643,20 @@ class FmhaDecodeConfig:
     # The full TileQ128 Keeps graph has the largest live softmax/correction
     # fragments and needs registers moved from its descriptor-only task group.
     # A long KV256 graph instead moves a smaller share from Softmax to its
-    # heavier correction tail. Short KV256 loops avoid the fixed hand-off cost.
+    # heavier correction tail. Mixed Q/KV graphs also reserve registers for
+    # TransformKvTask. Short KV256 loops avoid the fixed hand-off cost.
     @property
     def uses_task_register_reallocation(self) -> bool:
-        return self.use_keeps_mma_ab and (
-            self.tile_size_q == 128
-            or (
-                self.tile_size_q == 64
-                and self.tile_size_kv == 256
-                and self.total_kv_tiles >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+        return self.use_transform_kv or (
+            self.use_keeps_mma_ab
+            and (
+                self.tile_size_q == 128
+                or (
+                    self.tile_size_q == 64
+                    and self.tile_size_kv == 256
+                    and self.total_kv_tiles
+                    >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+                )
             )
         )
 
@@ -644,17 +664,37 @@ class FmhaDecodeConfig:
     def softmax_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
+        if self.use_transform_kv:
+            if self.headdim == 64 and self.num_insts_kv != 1:
+                return 168
+            return 184
         return 176 if self.tile_size_kv == 256 else 184
 
     @property
     def correction_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
+        if self.use_transform_kv:
+            return 88
         return 104 if self.tile_size_kv == 256 else 88
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
-        return 56 if self.uses_task_register_reallocation else None
+        if not self.uses_task_register_reallocation:
+            return None
+        if self.use_transform_kv and self.headdim == 64 and self.num_insts_kv != 1:
+            return 88
+        return 56
+
+    @property
+    def transform_kv_task_num_registers(self) -> int | None:
+        if not self.use_transform_kv:
+            return None
+        if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
+            return 184
+        if self.headdim == 64:
+            return 88
+        return 56
 
     # ------------------------------------------------------------------
     # SMEM allocation alignment
@@ -719,8 +759,53 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_tile_bytes(self) -> int:
-        """SMEM bytes for one staged K or V tile."""
+        """SMEM bytes for loading one K or V stage."""
+        if self.use_nvfp4_kv:
+            return self.tile_size_kv * self.head_dim_kv_stage // 2
         return self.tile_size_kv * self.head_dim_kv_stage * self.kv_dtype_bytes
+
+    @property
+    def smem_kv_storage_tile_bytes(self) -> int:
+        """SMEM bytes for storing one K or V stage."""
+        return self.smem_kv_tile_elements * self.kv_dtype_bytes
+
+    @property
+    def smem_kv_sf_bytes_per_token(self) -> int:
+        """SMEM bytes for one staged K or V of a token."""
+        if self.use_nvfp4_kv:
+            sf_bytes_per_token = self.head_dim_kv_stage // 16
+            if self.num_head_dim_stages_kv > 1:
+                # A split head-dimension stage cannot fold scale bytes from
+                # adjacent tokens because its slice is not contiguous in the
+                # source tensor. Keep its inner box at TMA's 16-byte minimum.
+                sf_bytes_per_token = max(sf_bytes_per_token, 16)
+            return sf_bytes_per_token
+        return 0
+
+    @property
+    def smem_kv_sf_tile_bytes(self) -> int:
+        """SMEM bytes for one staged K or V NVFP4 scale-factor tile."""
+        return self.tile_size_kv * self.smem_kv_sf_bytes_per_token
+
+    @property
+    def sf_tma_reshape_factor(self) -> int:
+        """Token-fold factor that widens the NVFP4 SF TMA inner box to 128 B."""
+        sf_per_token = self.headdim // 16
+        return min(max(1, 128 // sf_per_token), self.num_tokens_per_page)
+
+    @property
+    def smem_transformed_kv_tile_bytes(self) -> int:
+        """SMEM bytes for one transformed K or V tile consumed by MMA."""
+        return self.tile_size_kv * self.head_dim_kv_stage * self.q_dtype_bytes
+
+    @property
+    def tmem_transformed_kv_stage_cols(self) -> int:
+        """TMEM columns occupied by one transformed K or V stage."""
+        if not self.store_transformed_kv_in_tmem:
+            return 0
+        return (
+            self.tile_size_kv * self.head_dim_kv_stage * self.q_dtype_bytes // (128 * 4)
+        )
 
     @property
     def head_dim_kv_stage(self) -> int:
@@ -792,30 +877,36 @@ class FmhaDecodeConfig:
 
     @property
     def tmem_total_cols(self) -> int:
-        """Sum of TMEM columns used by the kernel: 2× S, 2× softmax stats,
-        and o_stages× O accumulators (the factor 2 is the two softmax
-        instances K0/V0 and K1/V1)."""
+        """Sum of TMEM columns used by the kernel: (S + softmax) * num_insts_kv +
+        o_stages * O accumulators + transformed K/V stages (if any)."""
+        total_cols = 0
         if self.use_keeps_mma_ab:
             if self.num_insts_kv == 1:
-                return (
+                total_cols = (
                     self.tmem_s_cols
                     + self.tmem_stats_cols
                     + self.tmem_p_cols
                     + self.tmem_o_stage_cols * self.o_stages
                 )
-            return (
-                2 * self.tmem_s_cols
-                + (
-                    2 * self.tmem_stats_cols
-                    if self.keeps_separates_tmem_s_and_stats
-                    else 0
+            else:
+                total_cols = (
+                    2 * self.tmem_s_cols
+                    + (
+                        2 * self.tmem_stats_cols
+                        if self.keeps_separates_tmem_s_and_stats
+                        else 0
+                    )
+                    + self.tmem_o_stage_cols * self.o_stages
                 )
+        else:
+            total_cols = (
+                self.num_insts_kv * self.tmem_s_cols
+                + self.num_insts_kv * self.tmem_stats_cols
                 + self.tmem_o_stage_cols * self.o_stages
             )
         return (
-            2 * self.tmem_s_cols
-            + 2 * self.tmem_stats_cols
-            + self.tmem_o_stage_cols * self.o_stages
+            total_cols
+            + self.tmem_transformed_kv_stage_cols * self.transformed_kv_stages
         )
 
     @property
@@ -848,8 +939,8 @@ class FmhaDecodeConfig:
 
     @property
     def kv_dtype_bytes(self) -> int:
-        """Byte width of one K/V element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.kv_dtype == Float8E4M3FN else 2
+        """Integral byte width used for raw K/V storage bookkeeping."""
+        return 1 if self.use_nvfp4_kv or self.use_fp8_kv else 2
 
     @property
     def o_dtype_bytes(self) -> int:
@@ -862,9 +953,9 @@ class FmhaDecodeConfig:
         return 4 if self.acc_dtype == Float32 else 2
 
     @property
-    def use_bf16_qkv(self) -> bool:
-        """Whether Q/K/V use BF16 storage and MMA inputs."""
-        return self.kv_dtype == BFloat16
+    def use_bf16_q(self) -> bool:
+        """Whether Q uses BF16 storage and MMA inputs."""
+        return self.q_dtype == BFloat16
 
     @property
     def use_bf16_output(self) -> bool:
@@ -872,9 +963,9 @@ class FmhaDecodeConfig:
         return self.out_dtype == BFloat16
 
     @property
-    def use_fp8_qkv(self) -> bool:
-        """fp8 (E4M3) Q/K/V path: switches MMA kind and P-quantization."""
-        return self.kv_dtype == Float8E4M3FN
+    def use_fp8_q(self) -> bool:
+        """FP8 Q-side MMA path: switches MMA kind and P quantization."""
+        return self.q_dtype == Float8E4M3FN
 
     @property
     def use_fp8_output(self) -> bool:
@@ -899,6 +990,21 @@ class FmhaDecodeConfig:
         ) or (
             self.q_dtype == Float8E4M3FN and self.out_dtype in (Float16, Float8E4M3FN)
         )
+
+    @property
+    def use_transform_kv(self) -> bool:
+        """Whether raw K/V must be transformed before MMA consumes it."""
+        return self.q_dtype != self.kv_dtype
+
+    @property
+    def use_nvfp4_kv(self) -> bool:
+        """Whether the raw KV cache uses packed NVFP4 storage."""
+        return self.kv_dtype == Float4E2M1FN
+
+    @property
+    def use_fp8_kv(self) -> bool:
+        """Whether the raw KV cache uses FP8 E4M3 storage."""
+        return self.kv_dtype == Float8E4M3FN
 
     # ------------------------------------------------------------------
     # Feature flags
@@ -1043,7 +1149,13 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_tile_elements(self) -> int:
-        """Return K or V elements in one staged SMEM tile."""
+        """Return physical K or V elements in one staged SMEM tile.
+
+        When using nvfp4 KV with TmemTransformedKvResource, TMA uses ``B4X16_P64`` format.
+        It adds 4 padding bits to each 4-bit e2m1 value.
+        """
+        if self.store_transformed_kv_in_tmem and self.use_nvfp4_kv:
+            return self.tile_size_kv * self.head_dim_kv_stage
         return self.smem_kv_tile_bytes // self.kv_dtype_bytes
 
     @property
@@ -1085,13 +1197,13 @@ class FmhaDecodeConfig:
         """Return packed P registers stored by each softmax producer lane."""
         if self.use_keeps_mma_ab:
             values_per_reg = (
-                FP8_VALUES_PER_REG if self.use_fp8_qkv else FP16_VALUES_PER_REG
+                FP8_VALUES_PER_REG if self.use_fp8_q else FP16_VALUES_PER_REG
             )
             return max(self.num_s_regs_per_thread // values_per_reg, 1)
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
-            if self.use_fp8_qkv
+            if self.use_fp8_q
             else FP16_P_PACKED_REGS_PER_Q_REPEAT
         )
         return regs_per_repeat * q_repeats
@@ -1179,17 +1291,25 @@ class FmhaDecodeConfig:
         """Validate decode input, output, and accumulator dtypes."""
         for name, dtype, supported in (
             ("q_dtype", self.q_dtype, SUPPORTED_IO_DTYPES),
-            ("kv_dtype", self.kv_dtype, SUPPORTED_IO_DTYPES),
+            ("kv_dtype", self.kv_dtype, SUPPORTED_KV_DTYPES),
             ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
             ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
         if self.q_dtype != self.kv_dtype:
-            raise ValueError(
-                f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
-                "mixed Q/KV element types are not supported"
+            supported_mixed = (
+                self.q_dtype == BFloat16 and self.kv_dtype == Float8E4M3FN
+            ) or (
+                self.q_dtype in (BFloat16, Float8E4M3FN)
+                and self.kv_dtype == Float4E2M1FN
             )
+            if not supported_mixed:
+                raise ValueError(
+                    f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
+                    "only BF16 Q with E4M3 K/V or BF16/FP8 Q with NVFP4 K/V "
+                    "mixed modes are supported"
+                )
 
     def validate_boolean_fields(self) -> None:
         """Require every boolean config field to carry a real Python bool."""
@@ -1610,7 +1730,7 @@ class FmhaDecodeConfig:
         """Whether two-instance Keeps has room for standalone stats tiles."""
         if not (
             self.use_keeps_mma_ab
-            and self.use_fp8_qkv
+            and self.use_fp8_q
             and self.tile_size_kv == 128
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -1908,6 +2028,7 @@ class FmhaDecodeConfig:
 
 
 SUPPORTED_IO_DTYPES = {Float16, BFloat16, Float8E4M3FN}
+SUPPORTED_KV_DTYPES = SUPPORTED_IO_DTYPES | {Float4E2M1FN}
 SUPPORTED_ACC_DTYPES = {Float32}
 
 
@@ -2068,6 +2189,22 @@ def _set_if_implicit(
         setattr(cfg, field_name, value)
 
 
+def _set_explicit(
+    cfg: FmhaDecodeConfig,
+    field_name: str,
+    value: ConfigValue,
+    explicit_fields: set[str],
+) -> None:
+    """Set a field and add it to explicit fields."""
+    if field_name in explicit_fields:
+        assert getattr(cfg, field_name) == value, (
+            f"conflicting {field_name} selections: "
+            f"config overrides requested {value} but it's currently set to {getattr(cfg, field_name)}"
+        )
+    setattr(cfg, field_name, value)
+    explicit_fields.add(field_name)
+
+
 def _finalize_static_decode_config(
     cfg: FmhaDecodeConfig,
     explicit_fields: set[str],
@@ -2076,6 +2213,14 @@ def _finalize_static_decode_config(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
 
+    # When using paged KV, the WG3's spare warps are taken.
+    # Force num_insts_kv == 1 to have enough warps for the transformed-KV task.
+    if cfg.use_transform_kv and cfg.use_paged_kv:
+        _set_explicit(cfg, "num_insts_kv", 1, explicit_fields)
+    uses_full_wg_transform = cfg.use_transform_kv and cfg.num_insts_kv == 1
+    if uses_full_wg_transform:
+        _set_if_implicit(cfg, "transform_kv_warp_idx", 4, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
     use_keeps_mma_ab = cfg.use_keeps_mma_ab
     if not use_keeps_mma_ab and cfg.headdim > 128:
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
@@ -2130,8 +2275,44 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "ordered_softmax_barrier_mode", 1, explicit_fields)
 
+    # MmaTask publishes one TMEM O stage per K/V instance in each loop group,
+    # and Correction uses those stage slots as the corresponding accumulators.
+    _set_if_implicit(cfg, "o_stages", cfg.num_insts_kv, explicit_fields)
+
+    _set_if_implicit(
+        cfg,
+        "store_transformed_kv_in_tmem",
+        (
+            cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and not cfg.use_keeps_mma_ab
+            and cfg.head_dim_kv_stage == 128
+            and cfg.tile_size_kv == 128
+        ),
+        explicit_fields,
+    )
+    if cfg.store_transformed_kv_in_tmem:
+        # Allocate the remaining TMEM columns to transformed K/V eagerly.
+        if (
+            "transformed_kv_stages" not in explicit_fields
+            or cfg.transformed_kv_stages == 0
+        ):
+            cfg.transformed_kv_stages = (
+                TMEM_MAX_ALLOCATION_COLUMNS - cfg.tmem_total_cols
+            ) // cfg.tmem_transformed_kv_stage_cols
+
     if cfg.tile_size_kv != 256 and "kv_stages" not in explicit_fields:
         cfg.kv_stages = cfg.inferred_kv_stages
+
+    if (
+        cfg.use_transform_kv
+        and not cfg.store_transformed_kv_in_tmem
+        and cfg.transformed_kv_stages == 0
+    ):
+        # SMEM-backed mixed modes still need a real number of stages.
+        _set_if_implicit(
+            cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
+        )
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
     # downstream consumers can gate on use_persistent_scheduler alone without
@@ -2237,6 +2418,7 @@ def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) ->
                 f"warp group {wg_idx} has {num_warps} active warps; at most 4 are allowed"
             )
 
+    # When using persistent scheduling, force 4 warp groups
     if cfg.use_persistent_scheduler:
         total_num_wgs = MAX_WARP_GROUPS
 
@@ -2283,6 +2465,15 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
                 "softmax1_warp_idx",
                 cfg.softmax1_warp_idx,
                 cfg.softmax1_num_warps,
+            )
+        )
+    if cfg.use_transform_kv:
+        roles.append(
+            _WarpRole(
+                "transform_kv",
+                "transform_kv_warp_idx",
+                cfg.transform_kv_warp_idx,
+                cfg.transform_kv_num_warps,
             )
         )
 
@@ -3000,7 +3191,18 @@ def _apply_auto_grouped_q_mma_config(
     SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
     caller-provided MMA fields retain the existing path. Explicit fanout
     controls bypass this selector together with explicit launch and MMA fields.
+    The compact H64 paged mixed-precision profile shares this selection path,
+    but considers only SwapsMmaAb because transform-KV does not support Keeps.
     """
+    is_h64_paged_mixed_q_len = (
+        cfg.headdim == 64
+        and seq_len_q > 1
+        and cfg.use_transform_kv
+        and cfg.use_paged_kv
+    )
+    is_default_grouped_q_profile = (
+        cfg.use_paged_kv and cfg.num_tokens_per_page == 32 and cfg.mask_type == CAUSAL
+    )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
@@ -3008,8 +3210,7 @@ def _apply_auto_grouped_q_mma_config(
         or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
-        or cfg.mask_type != CAUSAL
+        or not (is_default_grouped_q_profile or is_h64_paged_mixed_q_len)
         or cfg.use_sliding_window_causal
         or cfg.use_attention_sinks
         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
@@ -3022,6 +3223,7 @@ def _apply_auto_grouped_q_mma_config(
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
+        swaps_only=cfg.use_transform_kv,
     )
     if not candidates:
         return None
@@ -3092,6 +3294,25 @@ def _apply_auto_grouped_q_mma_config(
     return selected
 
 
+def _apply_dtype_config(
+    cfg: FmhaDecodeConfig,
+    *,
+    explicit_fields: set[str],
+    qkv_dtype: type,
+    kv_dtype: type | None,
+    o_dtype: type,
+) -> None:
+    """Apply the Q, K/V, and output dtypes to the config."""
+    _set_if_implicit(cfg, "q_dtype", qkv_dtype, explicit_fields)
+    _set_if_implicit(
+        cfg,
+        "kv_dtype",
+        kv_dtype if kv_dtype is not None else qkv_dtype,
+        explicit_fields,
+    )
+    _set_if_implicit(cfg, "out_dtype", o_dtype, explicit_fields)
+
+
 def _apply_default_q_grouping(
     cfg: FmhaDecodeConfig,
     *,
@@ -3133,6 +3354,7 @@ def _apply_feature_config(
     use_attention_sinks: bool,
 ) -> None:
     """Apply feature flags that affect config construction."""
+
     if sliding_window_causal:
         cfg.use_sliding_window_causal = True
         cfg.attention_window_size = attention_window_size
@@ -3150,9 +3372,20 @@ def _should_auto_select_launch_mode(
     *,
     auto_tuner: bool,
     split_kv_mode: str,
+    qkv_layout: str,
     seq_len_q: int,
 ) -> bool:
     """Return whether automatic launch-mode selection is allowed for this shape."""
+    if (
+        auto_tuner
+        and split_kv_mode == "disabled"
+        and not cfg.use_sliding_window_causal
+        and not cfg.use_attention_sinks
+        and _is_h64_paged_mixed_q_len(
+            cfg=cfg, seq_len_q=seq_len_q, qkv_layout=qkv_layout
+        )
+    ):
+        return True
     single_query = seq_len_q == 1
     grouped_query = cfg.groups_tokens_heads_q and seq_len_q > 1
     return (
@@ -3179,11 +3412,27 @@ def _num_q_tiles_for_launch(cfg: FmhaDecodeConfig) -> int:
     return max(q_geometry.num_q_ctas(cfg.max_seq_len_q), 1)
 
 
+def _is_h64_paged_mixed_q_len(
+    *,
+    cfg: FmhaDecodeConfig,
+    seq_len_q: int,
+    qkv_layout: str,
+) -> bool:
+    """Return whether this is the compact mixed-KV SQ>1 profile."""
+    return (
+        cfg.headdim == 64
+        and seq_len_q > 1
+        and cfg.use_transform_kv
+        and qkv_layout == "pagedKv"
+    )
+
+
 def _apply_auto_launch_mode(
     cfg: FmhaDecodeConfig,
     *,
     auto_tuner: bool,
     split_kv_mode: str,
+    qkv_layout: str,
     batch_size: int,
     num_heads_q: int,
     num_heads_kv: int,
@@ -3195,6 +3444,7 @@ def _apply_auto_launch_mode(
         cfg,
         auto_tuner=auto_tuner,
         split_kv_mode=split_kv_mode,
+        qkv_layout=qkv_layout,
         seq_len_q=seq_len_q,
     ):
         return split_kv_mode
@@ -3408,6 +3658,8 @@ def _validate_profile_support(
     use_groups_tokens_heads_q = cfg.groups_tokens_heads_q
     tile_size_q = cfg.tile_size_q
     cfg.validate_boolean_fields()
+    if cfg.o_stages != cfg.num_insts_kv:
+        raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
@@ -3514,6 +3766,11 @@ def _validate_profile_support(
                 "ungrouped Keeps profile"
             )
     if cfg.use_variable_seqlens_q:
+        if cfg.use_transform_kv:
+            raise ValueError(
+                "packed variable-Q does not support mixed Q/KV dtypes or "
+                "transformed K/V"
+            )
         # Packed Q supports the broad grouped Swaps matrix plus the narrow
         # grouped Keeps direct profile validated above.
         if use_keeps_mma_ab and not (
@@ -3528,6 +3785,26 @@ def _validate_profile_support(
                 "packed ungrouped SwapsMmaAb does not support cluster SMEM reduction; "
                 "use grouped Q or a GMEM reduction mode"
             )
+    if cfg.use_transform_kv and cfg.use_paged_kv and cfg.num_tokens_per_page == 16:
+        raise ValueError(
+            "mixed Q/KV dtypes do not support paged-KV page size 16; "
+            "use 32, 64, or 128 tokens per page"
+        )
+    if cfg.store_transformed_kv_in_tmem and not (
+        cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and not cfg.use_keeps_mma_ab
+        and cfg.head_dim_kv_stage == 128
+        and cfg.tile_size_kv == 128
+        and cfg.transform_kv_num_warps == 4
+        and cfg.transformed_kv_stages > 0
+        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
+    ):
+        raise ValueError(
+            "store_transformed_kv_in_tmem requires FP8 Q, NVFP4 K/V, "
+            "SwapsMmaAb, 128-wide K/V head-dimension stages and KV tiles, "
+            "and a four-warp TransformKvTask"
+        )
     if use_keeps_mma_ab:
         if headdim not in (64, 128, 256):
             raise ValueError("fmha_decode keepsMmaAb supports headdim=64, 128, or 256")
@@ -3634,12 +3911,10 @@ def _validate_profile_support(
     # Keep the ungrouped one-token-per-CTA control available at the same tile Q
     # as grouped profiles so explicit ungrouped launches retain the MMA shape.
     effective_head_dim_stage = cfg.head_dim_per_stage_kv
-    effective_num_insts_kv = cfg.num_insts_kv
     if headdim == 256:
-        if effective_head_dim_stage != 128 or effective_num_insts_kv != 2:
+        if effective_head_dim_stage != 128:
             raise ValueError(
-                "fmha_decode SwapsMmaAb headDim=256 requires "
-                "head_dim_per_stage_kv=128 and num_insts_kv=2"
+                "fmha_decode SwapsMmaAb headDim=256 requires head_dim_per_stage_kv=128"
             )
     elif effective_head_dim_stage != 0:
         raise ValueError(
@@ -3688,8 +3963,16 @@ def _validate_profile_support(
         raise ValueError(
             "fmha_decode SwapsMmaAb supports headDim in "
             "{64,128,256}. headDim=256 uses the staged profile with "
-            "head_dim_per_stage_kv=128 and num_insts_kv=2."
+            "head_dim_per_stage_kv=128."
         )
+    # Validate constraints imposed by mixed precision KV.
+    if cfg.use_nvfp4_kv:
+        if not cfg.use_paged_kv:
+            raise ValueError("NVFP4 KV cache is supported only with pagedKv layout")
+        if cfg.headdim % 16 != 0:
+            raise ValueError("NVFP4 KV cache requires headdim to be a multiple of 16")
+    if cfg.use_keeps_mma_ab and cfg.use_transform_kv:
+        raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
 
 
 def normalize_qkv_layout(qkv_layout: str) -> str:
@@ -3720,6 +4003,7 @@ def make_decode_config(
     num_heads_q: int | None = None,
     num_heads_kv: int | None = None,
     qkv_dtype: type = Float16,
+    kv_dtype: type | None = None,
     o_dtype: type = Float16,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
@@ -3738,6 +4022,10 @@ def make_decode_config(
     constructor: it reads only ``FmhaDecodeConfig`` fields from ``args`` and
     applies static profile defaults. When launch-shape inputs are supplied, it
     additionally runs the decode kernel-selection workflow below.
+
+    ``qkv_dtype`` is the default dtype for both Q and KV. Pass ``kv_dtype`` to
+    select a different KV storage dtype; mixed-profile scheduling defaults are
+    inferred from the resulting Q and KV dtypes.
 
     Workflow:
     1. Create a default ``FmhaDecodeConfig`` and apply caller-supplied config
@@ -3820,15 +4108,24 @@ def make_decode_config(
         cfg,
         explicit_fields=explicit_fields,
     )
-    cfg.q_dtype = qkv_dtype
-    cfg.kv_dtype = qkv_dtype
-    cfg.out_dtype = o_dtype
-
+    _apply_swaps_tile_config(
+        cfg,
+        explicit_fields=explicit_fields,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+    )
     qkv_layout = _apply_layout_config(
         cfg,
         qkv_layout=qkv_layout,
         num_tokens_per_page=num_tokens_per_page,
         seq_len_kv=seq_len_kv,
+    )
+    _apply_dtype_config(
+        cfg,
+        explicit_fields=explicit_fields,
+        qkv_dtype=qkv_dtype,
+        kv_dtype=kv_dtype,
+        o_dtype=o_dtype,
     )
     _apply_feature_config(
         cfg,
@@ -3913,6 +4210,7 @@ def make_decode_config(
                 cfg,
                 auto_tuner=auto_tuner,
                 split_kv_mode=split_kv_mode,
+                qkv_layout=qkv_layout,
                 batch_size=batch_size,
                 num_heads_q=num_heads_q,
                 num_heads_kv=num_heads_kv,
