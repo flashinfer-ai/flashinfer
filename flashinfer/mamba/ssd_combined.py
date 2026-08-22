@@ -906,8 +906,61 @@ def ssd_combined_fwd(
     checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
-):
-    """Run the source-built Cake SSDCombined backend for its focused domain."""
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Run the source-built Cake SSDCombined backend.
+
+    Args:
+        x: BF16 input tensor of shape
+            ``[batch, seqlen, nheads, headdim]``.
+        dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
+        A: Float32 state-transition coefficients of shape ``[nheads]``.
+        B: BF16 input projection of shape
+            ``[batch, seqlen, ngroups, dstate]``.
+        C: BF16 output projection with the same shape as ``B``.
+        D: Optional BF16 skip coefficient with shape ``[nheads]`` or
+            ``[nheads, headdim]``.
+        z: Optional BF16 gating tensor with the same shape as ``x``.
+        dt_bias: Optional step-size bias of shape ``[nheads]``.
+        dt_softplus: Whether to apply softplus to ``dt + dt_bias``.
+        dt_limit: Inclusive lower and upper limits for processed step sizes.
+        initial_states: Optional BF16 or FP16 initial states of shape
+            ``[num_seqs, nheads, headdim, dstate]`` in packed-varlen mode, or
+            ``[batch, nheads, headdim, dstate]`` in batched mode. Its dtype
+            selects the state dtype.
+        seq_idx: Optional int32 or int64 packed-sequence IDs of shape
+            ``[batch, seqlen]``.
+        chunk_indices: Optional int32 physical-chunk index for every logical
+            packed-varlen segment.
+        chunk_offsets: Optional int32 in-chunk start offset for every logical
+            packed-varlen segment.
+        seq_chunk_cumsum: Optional caller-owned int32 tensor of shape
+            ``[num_seqs + 1]``. It is treated as precomputed unless
+            ``update_seq_chunk_cumsum`` is true; when omitted, the runner
+            computes an internal buffer.
+        update_seq_chunk_cumsum: Whether to recompute ``seq_chunk_cumsum`` into
+            the supplied tensor.
+        checkpoint_token_indices: Optional contiguous int32 vector containing
+            one exclusive checkpoint token boundary per sequence. Batched
+            boundaries are sequence-relative and packed-varlen boundaries are
+            absolute; negative entries disable capture.
+        checkpoint_state_slots: Optional contiguous int32 vector mapping each
+            sequence to a row in ``checkpoint_states``. Negative entries
+            disable capture.
+        checkpoint_states: Optional caller-owned contiguous checkpoint output
+            with shape ``[num_checkpoints, nheads, headdim, dstate]`` and the
+            selected state dtype. All three checkpoint arguments must be
+            supplied together.
+        out: Optional caller-owned contiguous output storage with shape
+            ``[batch, nheads, headdim, nchunks, 128]``. A fresh tensor is
+            allocated when omitted.
+        return_final_states: Whether to return the final state for every batch
+            element or packed sequence.
+
+    Returns:
+        A pair containing token-major output with shape
+        ``[batch, seqlen, nheads, headdim]`` and either final states or ``None``
+        when ``return_final_states`` is false.
+    """
 
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
