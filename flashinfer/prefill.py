@@ -4193,10 +4193,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             return out
         elif self._backend == "cute-dsl":
-            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
-                raise NotImplementedError(
-                    "cute-dsl backend does not support FP8 scale parameters"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cute-dsl backend does not support NVFP4 packed KV cache "
@@ -4223,6 +4219,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # separate-V-dtype variants).  Windowed plans stay on the
                 # modular path for every V dtype.
                 p = self._cute_dsl_fmha_plan
+                bmm1_scale = (
+                    p["sm_scale"]
+                    * (q_scale if q_scale is not None else 1.0)
+                    * (k_scale if k_scale is not None else 1.0)
+                )
+                bmm2_scale = (v_scale if v_scale is not None else 1.0) * (
+                    o_scale if o_scale is not None else 1.0
+                )
                 return trtllm_ragged_attention_deepseek(
                     query=q,
                     key=k,
@@ -4231,8 +4235,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     seq_lens=p["seq_lens"],
                     max_q_len=p["max_q_len"],
                     max_kv_len=p["max_kv_len"],
-                    bmm1_scale=p["sm_scale"],
-                    bmm2_scale=1.0,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
                     o_sf_scale=1.0,
                     batch_size=p["batch_size"],
                     window_left=p["window_left"],
@@ -4244,6 +4248,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     backend="cute-dsl",
+                )
+            # Modular CuTe DSL backend does not support scale parameters.
+            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
+                raise NotImplementedError(
+                    "cute-dsl backend does not support FP8 scale parameters"
                 )
             if return_lse:
                 # Standard-path modular kernel computes LSE natively; the
