@@ -593,8 +593,8 @@ void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_ra
       << "max_kv_tiles must equal " << host_extent_5      << ", got " << arg_max_kv_tiles;
   TVM_FFI_CHECK(arg_record_tasks >= 1, ValueError)
       << "record_tasks must be >= " << 1      << ", got " << arg_record_tasks;
-  TVM_FFI_CHECK(arg_msa_max_pages >= 1, ValueError)
-      << "msa_max_pages must be >= " << 1      << ", got " << arg_msa_max_pages;
+  TVM_FFI_CHECK(arg_msa_max_pages >= 0, ValueError)
+      << "msa_max_pages must be >= " << 0      << ", got " << arg_msa_max_pages;
 
 
   CUtensorMap p_Q = EncodeTma_Q(arg_Q);

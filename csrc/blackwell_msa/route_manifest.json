@@ -399,7 +399,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "7f0864b03cb4539e3110f23bb8f58fcca95b715aa529d5a39e6e9d1de7fb501a",
         "vendored_sha256": "5ac7f9d571a33a990d063aaf46324992f50bde7783265cd80c8d373024142e22",
-        "binding_sha256": "a2e4c0fc53558dd82517d5d246a0417cb3259fd7992a8188f23901628074885b",
+        "binding_sha256": "d19dac7d7736c3e6cae85347278bc30ac2e544ad447f06896da9840849e303b4",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
         "replacement_counts": {
@@ -429,7 +429,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "8d8d991cccc464b2047cf0a056d3c0224978112ad6d06ab20524e42c13b67998",
         "vendored_sha256": "fc165e545c33ac685126e64c6bc35b73a5a530e0bfa7f3dba6af615cf1783b99",
-        "binding_sha256": "072bfa76a4353e042a5bf5b600005454a8f651690ab83628be0d472dc2cf973a",
+        "binding_sha256": "89ca7c15031064e00856e766cb8618b5368bfbc88ae7fe39786c2beda6b3615f",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
         "replacement_counts": {
@@ -459,7 +459,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "b4670cf719649062c751485d89fe76d9f2391f9df192a2ee0fa860dc43290fbc",
         "vendored_sha256": "becc848d30d0b7521773f89d747bb222279534f35d614eac4f1989e2c171376a",
-        "binding_sha256": "ba525fe35cf471d1583114123447569dcd07ecaf4fd91e83fbddd503f843227e",
+        "binding_sha256": "1ec5c2175321d8429afc3d9e87fdb261e6a3389e6db012c938cd97d454a9dcd9",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
         "replacement_counts": {
@@ -489,7 +489,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "677fc068699db235602ed66c77fd99b0c10cc14a15d29762b13edcd4391ff3b9",
         "vendored_sha256": "dc840aa00ee6ed096bf8f15e58d25dd13df51c349a109ed4ef593ec62767a1f0",
-        "binding_sha256": "5cf3eddba1b95e40783c709170c02a0cc134dbc61caa69ed08ad25bf1deb49b1",
+        "binding_sha256": "065403cab715cb8c0478065b7b64fdcf6fa2747957ecfe08851e8c6917ecec8b",
         "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
         "replacement_counts": {
@@ -519,7 +519,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "0b7ba07d62078c2c0c5f7e25c1af581d8aa9eacd3545a7d3ba7c2735449f68a2",
         "vendored_sha256": "1a87b07dd79501176b2ac2e5077aee92e77a31207e46980dd8248d44df462d68",
-        "binding_sha256": "0f36eb04884b4d84cc573712b0869b2ae5467e3a89daa800bbedf6a4d1eda381",
+        "binding_sha256": "113462d8fe4e104880261ba6c832bb66e94f1b5185373e1e43091bf1647a826d",
         "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_flat_xform2_v1",
         "replacement_counts": {
@@ -564,7 +564,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "e3cb196f82b1a21bf74b5d41b05873f3e6a020c36f04f1708f8a703daccae16c",
         "vendored_sha256": "cb587f06a01ec47b5adec1097fc94439866adf0108cd1489b349f4b00d39ae04",
-        "binding_sha256": "b051b510e89a370fdebc74fc00380d96361c5f53f1ccd3829a024c8afa6a33c3",
+        "binding_sha256": "d0b9d8c5e756e610edaa7b1cf4e22358b9d846ec0118dde26f0a353ada17029f",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -684,7 +684,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "2a532fbdbdfc84e0b258d0fe46409b6fe91d4aff344303b4b8fac15be91e4f95",
         "vendored_sha256": "55b4099894616b2f0cac2ab4fa26ecd3ec67a37e2a90ae5ba61e7682c5472782",
-        "binding_sha256": "41307b8549c4940a7bc53d4ad68d8108c35618d0b6afa9003acf96569fe6203c",
+        "binding_sha256": "9092b15b9e49b9fdc91dfe85065bbd9b606ddfb6a044365283c9fc046b7eaedd",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -699,7 +699,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "9c743e9770e7566c681dd7f8375a4cbb3fe244ce7dda523d79a7693e22ec463d",
         "vendored_sha256": "36b7e6c1011600c846f22e8b389d7792592a7c186aa33d6929ad8082435e5eb4",
-        "binding_sha256": "559022ddcab5bb7a7f20905d569f75b72d13e7f8e31a2c0fe9ae91d0837b8d2b",
+        "binding_sha256": "219768301a73f2c18628f2213c8dc48b9b30f9f87432e8a1efe69a4c1de5651a",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -759,7 +759,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "796b573ccba934683a121cbeb8798f4425f061d91f5e4a70518205890908a76f",
         "vendored_sha256": "bcbe4d5c39954ac992702283d28d86e4763766e89f4a0beebd8a2b1afec23baa",
-        "binding_sha256": "5d883e7284c6502bdd879eca431a1143522d69f3132b9736fdcc578d4cc72630",
+        "binding_sha256": "f22af4c05ff27ac22d0b4b92a82eaf8408b74f14f1a4a1d7fb2e8b05fb39e774",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -804,7 +804,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "71405a0c9f3b69551d4b870189bf2213f4eba472d0e8eb0d2f73d0ed0f4bb788",
         "vendored_sha256": "d3e95ddacd87ccb8aa8a07717044e7c2d5a409e53162c4b77940e55ce943f48a",
-        "binding_sha256": "e8645e79529c2c72dde8ac23942cd73f88efd74a304aecb00df7821c08b04eac",
+        "binding_sha256": "08a30a277558ac551b996f37ad941fc7d7162762da03049055c7ae55e459bdb3",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -834,7 +834,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "bf317349c841527d4c6b1a182df4d50caae3b0bca52186abc20a29dabb95bf3f",
         "vendored_sha256": "553795f551a996caff20760045b412826c11c68a159f79685b8986e26f06cdc8",
-        "binding_sha256": "e452ef396e04a8d44996078360f5d0bbb407fa4e755f67fc5334ce61cacd3ef6",
+        "binding_sha256": "9165db9d93a913db073b3a69c3f6af35c5983832d8825942b80bd47bcb645db1",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -879,7 +879,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "7f0864b03cb4539e3110f23bb8f58fcca95b715aa529d5a39e6e9d1de7fb501a",
         "vendored_sha256": "5ac7f9d571a33a990d063aaf46324992f50bde7783265cd80c8d373024142e22",
-        "binding_sha256": "a2e4c0fc53558dd82517d5d246a0417cb3259fd7992a8188f23901628074885b",
+        "binding_sha256": "d19dac7d7736c3e6cae85347278bc30ac2e544ad447f06896da9840849e303b4",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
         "replacement_counts": {
@@ -909,7 +909,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "8d8d991cccc464b2047cf0a056d3c0224978112ad6d06ab20524e42c13b67998",
         "vendored_sha256": "fc165e545c33ac685126e64c6bc35b73a5a530e0bfa7f3dba6af615cf1783b99",
-        "binding_sha256": "072bfa76a4353e042a5bf5b600005454a8f651690ab83628be0d472dc2cf973a",
+        "binding_sha256": "89ca7c15031064e00856e766cb8618b5368bfbc88ae7fe39786c2beda6b3615f",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
         "replacement_counts": {
@@ -939,7 +939,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "b4670cf719649062c751485d89fe76d9f2391f9df192a2ee0fa860dc43290fbc",
         "vendored_sha256": "becc848d30d0b7521773f89d747bb222279534f35d614eac4f1989e2c171376a",
-        "binding_sha256": "ba525fe35cf471d1583114123447569dcd07ecaf4fd91e83fbddd503f843227e",
+        "binding_sha256": "1ec5c2175321d8429afc3d9e87fdb261e6a3389e6db012c938cd97d454a9dcd9",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
         "replacement_counts": {
@@ -969,7 +969,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "677fc068699db235602ed66c77fd99b0c10cc14a15d29762b13edcd4391ff3b9",
         "vendored_sha256": "dc840aa00ee6ed096bf8f15e58d25dd13df51c349a109ed4ef593ec62767a1f0",
-        "binding_sha256": "5cf3eddba1b95e40783c709170c02a0cc134dbc61caa69ed08ad25bf1deb49b1",
+        "binding_sha256": "065403cab715cb8c0478065b7b64fdcf6fa2747957ecfe08851e8c6917ecec8b",
         "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
         "replacement_counts": {
@@ -999,7 +999,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "0b7ba07d62078c2c0c5f7e25c1af581d8aa9eacd3545a7d3ba7c2735449f68a2",
         "vendored_sha256": "1a87b07dd79501176b2ac2e5077aee92e77a31207e46980dd8248d44df462d68",
-        "binding_sha256": "0f36eb04884b4d84cc573712b0869b2ae5467e3a89daa800bbedf6a4d1eda381",
+        "binding_sha256": "113462d8fe4e104880261ba6c832bb66e94f1b5185373e1e43091bf1647a826d",
         "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_flat_xform2_v1",
         "replacement_counts": {
@@ -1044,7 +1044,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "7c8aa364b98face6dead72484df270051419ee09946464da65789cca317e14b1",
         "vendored_sha256": "3af9f5ea4c0c99708b5b5dfcfe4c7acf2e834ba08964c7f71add1c89c73d895d",
-        "binding_sha256": "1318901f73c2a22958fdef84c4ea67141a608edbe22c06f00e6ffba05bb5e393",
+        "binding_sha256": "2db3a23581ed10e35aa03f6ce16fa1074718ef1413c44efc041b23cdd05a116b",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -1149,7 +1149,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "2a532fbdbdfc84e0b258d0fe46409b6fe91d4aff344303b4b8fac15be91e4f95",
         "vendored_sha256": "55b4099894616b2f0cac2ab4fa26ecd3ec67a37e2a90ae5ba61e7682c5472782",
-        "binding_sha256": "41307b8549c4940a7bc53d4ad68d8108c35618d0b6afa9003acf96569fe6203c",
+        "binding_sha256": "9092b15b9e49b9fdc91dfe85065bbd9b606ddfb6a044365283c9fc046b7eaedd",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -1164,7 +1164,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "9c743e9770e7566c681dd7f8375a4cbb3fe244ce7dda523d79a7693e22ec463d",
         "vendored_sha256": "36b7e6c1011600c846f22e8b389d7792592a7c186aa33d6929ad8082435e5eb4",
-        "binding_sha256": "559022ddcab5bb7a7f20905d569f75b72d13e7f8e31a2c0fe9ae91d0837b8d2b",
+        "binding_sha256": "219768301a73f2c18628f2213c8dc48b9b30f9f87432e8a1efe69a4c1de5651a",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -1224,7 +1224,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "796b573ccba934683a121cbeb8798f4425f061d91f5e4a70518205890908a76f",
         "vendored_sha256": "bcbe4d5c39954ac992702283d28d86e4763766e89f4a0beebd8a2b1afec23baa",
-        "binding_sha256": "5d883e7284c6502bdd879eca431a1143522d69f3132b9736fdcc578d4cc72630",
+        "binding_sha256": "f22af4c05ff27ac22d0b4b92a82eaf8408b74f14f1a4a1d7fb2e8b05fb39e774",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -1269,7 +1269,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "71405a0c9f3b69551d4b870189bf2213f4eba472d0e8eb0d2f73d0ed0f4bb788",
         "vendored_sha256": "d3e95ddacd87ccb8aa8a07717044e7c2d5a409e53162c4b77940e55ce943f48a",
-        "binding_sha256": "e8645e79529c2c72dde8ac23942cd73f88efd74a304aecb00df7821c08b04eac",
+        "binding_sha256": "08a30a277558ac551b996f37ad941fc7d7162762da03049055c7ae55e459bdb3",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {
@@ -1299,7 +1299,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "bf317349c841527d4c6b1a182df4d50caae3b0bca52186abc20a29dabb95bf3f",
         "vendored_sha256": "553795f551a996caff20760045b412826c11c68a159f79685b8986e26f06cdc8",
-        "binding_sha256": "e452ef396e04a8d44996078360f5d0bbb407fa4e755f67fc5334ce61cacd3ef6",
+        "binding_sha256": "9165db9d93a913db073b3a69c3f6af35c5983832d8825942b80bd47bcb645db1",
         "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
         "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
         "replacement_counts": {

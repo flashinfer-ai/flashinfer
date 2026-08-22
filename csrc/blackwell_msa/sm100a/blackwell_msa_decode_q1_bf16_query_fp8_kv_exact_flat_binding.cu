@@ -303,8 +303,8 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   int64_t host_extent_2 = 128;
   TVM_FFI_CHECK(arg_V.size(2) == host_extent_2, ValueError)
       << "V dimension 2 must be equal " << host_extent_2      << ", got " << arg_V.size(2);
-  TVM_FFI_CHECK(arg_msa_max_pages >= 1, ValueError)
-      << "msa_max_pages must be >= " << 1      << ", got " << arg_msa_max_pages;
+  TVM_FFI_CHECK(arg_msa_max_pages >= 0, ValueError)
+      << "msa_max_pages must be >= " << 0      << ", got " << arg_msa_max_pages;
   TVM_FFI_CHECK(arg_num_requests >= 1, ValueError)
       << "num_requests must be >= " << 1      << ", got " << arg_num_requests;
 

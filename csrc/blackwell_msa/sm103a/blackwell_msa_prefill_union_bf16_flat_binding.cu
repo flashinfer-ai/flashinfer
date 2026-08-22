@@ -360,8 +360,8 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "total_q * num_q_heads");
   TVM_FFI_CHECK(arg_temperature_lse.numel() >= host_extent_5, ValueError)
       << "temperature_lse requires at least " << (host_extent_5)      << " TensorView storage elements, got " << arg_temperature_lse.numel();
-  TVM_FFI_CHECK(arg_max_pages >= 1, ValueError)
-      << "max_pages must be >= " << 1      << ", got " << arg_max_pages;
+  TVM_FFI_CHECK(arg_max_pages >= 0, ValueError)
+      << "max_pages must be >= " << 0      << ", got " << arg_max_pages;
   TVM_FFI_CHECK(arg_total_q >= 1, ValueError)
       << "total_q must be >= " << 1      << ", got " << arg_total_q;
   TVM_FFI_CHECK(arg_num_q_heads >= 1, ValueError)
