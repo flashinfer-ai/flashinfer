@@ -180,6 +180,7 @@ def test_long_row_dispatch_is_exact(
     assert plan.t_kernel == expected_t
     if expected_chunk is not None:
         assert plan.cp_chunk_len == expected_chunk
+        assert plan.source_cp_chunk_len == 32768
 
 
 @pytest.mark.parametrize(
@@ -247,6 +248,7 @@ def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
     )
 
     assert plan.cp_chunk_len == 128
+    assert plan.source_cp_chunk_len == 128
     assert plan.checkpoint_count == 5
     assert cake._checkpoint_fixed_state_indices(plan, device).tolist() == [
         0,

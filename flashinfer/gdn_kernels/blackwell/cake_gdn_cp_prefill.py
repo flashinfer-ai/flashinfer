@@ -125,6 +125,7 @@ class CakeGDNCPPrefillPlan:
     total_tokens: int
     num_sms: int
     cp_chunk_len: int
+    source_cp_chunk_len: int
     checkpoint_every_n_tokens: int
     checkpoint_count: int
     total_t_blocks: int
@@ -220,9 +221,10 @@ def _build_plan(
     num_sab_heads = max(hq, hv)
     props = torch.cuda.get_device_properties(q.device)
     num_sms = int(props.multi_processor_count)
-    cp_chunk_len = checkpoint_every_n_tokens or _choose_chunk_len(
+    source_cp_chunk_len = checkpoint_every_n_tokens or _choose_chunk_len(
         total_tokens=total_tokens, num_heads=num_sab_heads, num_sms=num_sms
     )
+    cp_chunk_len = source_cp_chunk_len
     if (
         not checkpoint_every_n_tokens
         and arch == "sm_103a"
@@ -268,6 +270,7 @@ def _build_plan(
         total_tokens=total_tokens,
         num_sms=num_sms,
         cp_chunk_len=cp_chunk_len,
+        source_cp_chunk_len=source_cp_chunk_len,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         checkpoint_count=(
             sum(length // checkpoint_every_n_tokens for length in seq_lens)
@@ -740,6 +743,7 @@ class CakeGDNCPPrefill:
             self.initial_state_workspace,
             self.tensormap_workspace,
             p.cp_chunk_len,
+            p.source_cp_chunk_len,
             p.num_q_heads,
             p.num_k_heads,
             p.num_v_heads,
