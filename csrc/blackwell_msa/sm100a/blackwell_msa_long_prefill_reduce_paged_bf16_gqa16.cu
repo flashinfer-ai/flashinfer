@@ -1,3 +1,4 @@
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -240,19 +241,72 @@ kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100(uint8
     float inv_lse_sum = ((lse_sum > 0.0f && lse_sum == lse_sum) ? _rcp_0 : 0.0f);
     weight0 *= inv_lse_sum;
     weight1 *= inv_lse_sum;
+    if (return_temperature_lse != 0) {
+        float temperature0 = -BLACKWELL_MSA_INF;
+        float temperature1 = -BLACKWELL_MSA_INF;
+        if (row_valid != 0 && split0 < split_count) {
+            long long temperature_row0 = (long long)split0 * (long long)total_rows_out + (long long)row;
+            temperature0 = partial_temperature_lse[temperature_row0];
+        }
+        if (row_valid != 0 && split1 < split_count) {
+            long long temperature_row1 = (long long)split1 * (long long)total_rows_out + (long long)row;
+            temperature1 = partial_temperature_lse[temperature_row1];
+        }
+        float _max_1 = max_noftz(temperature0, temperature1);
+        float temperature_max = _max_1;
+        float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, temperature_max, 4);
+        float peer_temperature_max = _shfl_xor_6;
+        if (peer_temperature_max > temperature_max) {
+            temperature_max = peer_temperature_max;
+        }
+        float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, temperature_max, 2);
+        float peer_temperature_max_0 = _shfl_xor_7;
+        if (peer_temperature_max_0 > temperature_max) {
+            temperature_max = peer_temperature_max_0;
+        }
+        float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, temperature_max, 1);
+        float peer_temperature_max_1 = _shfl_xor_8;
+        if (peer_temperature_max_1 > temperature_max) {
+            temperature_max = peer_temperature_max_1;
+        }
+        float safe_temperature_max = ((temperature_max == -BLACKWELL_MSA_INF) ? 0.0f : temperature_max);
+        float temperature_sum = 0.0f;
+        if (split0 < split_count) {
+            float _exp2_2 = approx_exp2((temperature0 - safe_temperature_max) * 1.4426950408889634f);
+            float temperature_contribution0 = _exp2_2;
+            if (temperature0 == -BLACKWELL_MSA_INF) {
+                temperature_contribution0 = 0.0f;
+            }
+            temperature_sum += temperature_contribution0;
+        }
+        if (split1 < split_count) {
+            float _exp2_3 = approx_exp2((temperature1 - safe_temperature_max) * 1.4426950408889634f);
+            float temperature_contribution1 = _exp2_3;
+            if (temperature1 == -BLACKWELL_MSA_INF) {
+                temperature_contribution1 = 0.0f;
+            }
+            temperature_sum += temperature_contribution1;
+        }
+        float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, temperature_sum, 4);
+        temperature_sum += _shfl_xor_9;
+        float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, temperature_sum, 2);
+        temperature_sum += _shfl_xor_10;
+        float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, temperature_sum, 1);
+        temperature_sum += _shfl_xor_11;
+        if (row_valid != 0 && lane_in_row == 0) {
+            float _log2_0;
+            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(temperature_sum));
+            temperature_lse[row] = ((temperature_sum > 0.0f) ? safe_temperature_max + _log2_0 * 0.6931471805599453f : -BLACKWELL_MSA_INF);
+        }
+    }
     float center_sum = 0.0f;
     float scaled_weight0 = weight0;
     float scaled_weight1 = weight1;
-    if (row_valid != 0 && lane_in_row == 0) {
-        float _log2_0;
-        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(lse_sum));
-        float combined_lse = ((lse_sum > 0.0f) ? safe_lse_max + _log2_0 * 0.6931471805599453f : -BLACKWELL_MSA_INF);
-        if (return_softmax_lse != 0) {
-            lse[row] = combined_lse;
-        }
-        if (return_temperature_lse != 0) {
-            temperature_lse[row] = combined_lse;
-        }
+    if (return_softmax_lse != 0 && row_valid != 0 && lane_in_row == 0) {
+        float _log2_1;
+        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(lse_sum));
+        float combined_lse = ((lse_sum > 0.0f) ? safe_lse_max + _log2_1 * 0.6931471805599453f : -BLACKWELL_MSA_INF);
+        lse[row] = combined_lse;
     }
     int combine_output_valid = row_valid;
     if (combine_output_valid != 0) {

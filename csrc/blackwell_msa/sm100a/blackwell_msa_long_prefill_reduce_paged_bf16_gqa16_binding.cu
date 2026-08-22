@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstdint>
 
 #include "tvm_ffi_utils.h"
@@ -71,30 +72,6 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
       << ", lanes=" << (int)d.lanes << ")";
 }
 
-// A logical axis.outer(trailing) folds every source dim above the trailing
-// dimensions. Shape products are independent of physical strides, so verify
-// the leading dimensions form one dense row-major chain instead of inventing
-// a "folded stride". The descriptor reads its exact adjacent physical step
-// separately through stride[-(trailing + 1)].
-
-#if !defined(FLASHINFER_BLACKWELL_MSA_TARGET_MINOR)
-#error "the exact Blackwell MSA target minor must be defined"
-#endif
-
-inline void CheckBlackwellMsaTarget(int32_t device_id) {
-  int major = 0;
-  int minor = 0;
-  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
-  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_MSA_TARGET_MINOR, RuntimeError)
-      << "this Blackwell MSA module requires compute capability 10."
-      << FLASHINFER_BLACKWELL_MSA_TARGET_MINOR << ", got " << major << "." << minor;
-}
-
 inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char* name) {
   TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
       << name << " cannot fold leading dimensions above " << trailing
@@ -118,12 +95,48 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
   }
 }
 
+#if !defined(FLASHINFER_BLACKWELL_MSA_TARGET_MINOR)
+#error "the exact Blackwell MSA target minor must be defined"
+#endif
+
+inline void CheckBlackwellMsaTarget(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
+  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_MSA_TARGET_MINOR, RuntimeError)
+      << "this Blackwell MSA module requires compute capability 10."
+      << FLASHINFER_BLACKWELL_MSA_TARGET_MINOR << ", got " << major << "." << minor;
+}
+
+inline int64_t HostCheckedExtentValue(int64_t value, const char* formula) {
+  TVM_FFI_CHECK(value >= 0, ValueError)
+      << "host extent " << formula << " must resolve inside [0, INT64_MAX], got " << value;
+  return value;
+}
+
+inline int64_t HostCheckedExtentMul(int64_t lhs, int64_t rhs, const char* formula) {
+  TVM_FFI_CHECK(lhs >= 0 && rhs >= 0 && (rhs == 0 || lhs <= INT64_MAX / rhs), ValueError)
+      << "host extent overflow while evaluating " << formula;
+  return lhs * rhs;
+}
+
+inline int64_t HostCheckedExtentAdd(int64_t lhs, int64_t rhs, const char* formula) {
+  TVM_FFI_CHECK(lhs >= 0 && rhs >= 0 && lhs <= INT64_MAX - rhs, ValueError)
+      << "host extent overflow while evaluating " << formula;
+  return lhs + rhs;
+}
+
 void Run(TensorView arg_partial_o, TensorView arg_partial_scale, TensorView arg_partial_lse, TensorView arg_partial_temperature_lse, TensorView arg_split_counts, TensorView arg_out, TensorView arg_lse, TensorView arg_temperature_lse, int64_t arg_total_q, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_qhead_per_kv, int64_t arg_topk, int64_t arg_return_softmax_lse, int64_t arg_return_temperature_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError) << "cuda_stream must be non-negative";
+  CheckCudaTensor(arg_partial_o, "partial_o");
   ffi::CUDADeviceGuard device_guard(arg_partial_o.device().device_id);
   CheckBlackwellMsaTarget(arg_partial_o.device().device_id);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  CheckCudaTensor(arg_partial_o, "partial_o");
   CheckDtype(arg_partial_o, "partial_o", 1, 8, 1);
   CheckContiguous(arg_partial_o, "partial_o");
   CheckCudaTensor(arg_partial_scale, "partial_scale");
@@ -178,6 +191,70 @@ void Run(TensorView arg_partial_o, TensorView arg_partial_scale, TensorView arg_
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  int64_t host_extent_0 = 128;
+  host_extent_0 = HostCheckedExtentMul(host_extent_0, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "128 * topk * total_q * num_q_heads");
+  host_extent_0 = HostCheckedExtentMul(host_extent_0, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "128 * topk * total_q * num_q_heads");
+  host_extent_0 = HostCheckedExtentMul(host_extent_0, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "128 * topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_o.numel() >= host_extent_0, ValueError)
+      << "partial_o requires at least " << (host_extent_0)      << " TensorView storage elements, got " << arg_partial_o.numel();
+  int64_t host_extent_1 = 1;
+  host_extent_1 = HostCheckedExtentMul(host_extent_1, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
+  host_extent_1 = HostCheckedExtentMul(host_extent_1, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
+  host_extent_1 = HostCheckedExtentMul(host_extent_1, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_lse.numel() >= host_extent_1, ValueError)
+      << "partial_lse requires at least " << (host_extent_1)      << " TensorView storage elements, got " << arg_partial_lse.numel();
+  int64_t host_extent_2 = 1;
+  host_extent_2 = HostCheckedExtentMul(host_extent_2, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
+  host_extent_2 = HostCheckedExtentMul(host_extent_2, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
+  host_extent_2 = HostCheckedExtentMul(host_extent_2, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_temperature_lse.numel() >= host_extent_2, ValueError)
+      << "partial_temperature_lse requires at least " << (host_extent_2)      << " TensorView storage elements, got " << arg_partial_temperature_lse.numel();
+  int64_t host_extent_3 = 1;
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "total_q * num_kv_heads");
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_num_kv_heads), "num_kv_heads"), "total_q * num_kv_heads");
+  TVM_FFI_CHECK(arg_split_counts.numel() >= host_extent_3, ValueError)
+      << "split_counts requires at least " << (host_extent_3)      << " TensorView storage elements, got " << arg_split_counts.numel();
+  int64_t host_extent_4 = 128;
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "128 * total_q * num_q_heads");
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "128 * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_out.numel() >= host_extent_4, ValueError)
+      << "out requires at least " << (host_extent_4)      << " TensorView storage elements, got " << arg_out.numel();
+  int64_t host_extent_5 = 1;
+  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "total_q * num_q_heads");
+  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_lse.numel() >= host_extent_5, ValueError)
+      << "lse requires at least " << (host_extent_5)      << " TensorView storage elements, got " << arg_lse.numel();
+  int64_t host_extent_6 = 1;
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "total_q * num_q_heads");
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_temperature_lse.numel() >= host_extent_6, ValueError)
+      << "temperature_lse requires at least " << (host_extent_6)      << " TensorView storage elements, got " << arg_temperature_lse.numel();
+  int64_t host_extent_7 = 4;
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "4 * topk * total_q * num_q_heads");
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "4 * topk * total_q * num_q_heads");
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "4 * topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_scale.numel() >= host_extent_7, ValueError)
+      << "partial_scale requires at least " << (host_extent_7)      << " TensorView storage elements, got " << arg_partial_scale.numel();
+  TVM_FFI_CHECK(arg_total_q >= 1, ValueError)
+      << "total_q must be >= " << 1      << ", got " << arg_total_q;
+  TVM_FFI_CHECK(arg_num_q_heads >= 1, ValueError)
+      << "num_q_heads must be >= " << 1      << ", got " << arg_num_q_heads;
+  int64_t host_extent_8 = 1;
+  host_extent_8 = HostCheckedExtentMul(host_extent_8, HostCheckedExtentValue(static_cast<int64_t>(arg_qhead_per_kv), "qhead_per_kv"), "qhead_per_kv * num_kv_heads");
+  host_extent_8 = HostCheckedExtentMul(host_extent_8, HostCheckedExtentValue(static_cast<int64_t>(arg_num_kv_heads), "num_kv_heads"), "qhead_per_kv * num_kv_heads");
+  TVM_FFI_CHECK(arg_num_q_heads == host_extent_8, ValueError)
+      << "num_q_heads must equal " << host_extent_8      << ", got " << arg_num_q_heads;
+  TVM_FFI_CHECK(arg_num_kv_heads > 0 && arg_num_q_heads % arg_num_kv_heads == 0, ValueError)
+      << "num_q_heads must be divisible by num_kv_heads";
+  TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
+      << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
+  TVM_FFI_CHECK(arg_topk >= 1, ValueError)
+      << "topk must be >= " << 1      << ", got " << arg_topk;
+  TVM_FFI_CHECK(arg_topk <= 16, ValueError)
+      << "topk must be <= " << 16      << ", got " << arg_topk;
+  TVM_FFI_CHECK(arg_qhead_per_kv >= 1, ValueError)
+      << "qhead_per_kv must be >= " << 1      << ", got " << arg_qhead_per_kv;
+
 
   void* p_partial_o = arg_partial_o.data_ptr();
   void* p_partial_scale = arg_partial_scale.data_ptr();

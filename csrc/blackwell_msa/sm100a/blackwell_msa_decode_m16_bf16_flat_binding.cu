@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstdint>
 
 #include "tvm_ffi_utils.h"
@@ -71,30 +72,6 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
       << ", lanes=" << (int)d.lanes << ")";
 }
 
-// A logical axis.outer(trailing) folds every source dim above the trailing
-// dimensions. Shape products are independent of physical strides, so verify
-// the leading dimensions form one dense row-major chain instead of inventing
-// a "folded stride". The descriptor reads its exact adjacent physical step
-// separately through stride[-(trailing + 1)].
-
-#if !defined(FLASHINFER_BLACKWELL_MSA_TARGET_MINOR)
-#error "the exact Blackwell MSA target minor must be defined"
-#endif
-
-inline void CheckBlackwellMsaTarget(int32_t device_id) {
-  int major = 0;
-  int minor = 0;
-  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
-  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_MSA_TARGET_MINOR, RuntimeError)
-      << "this Blackwell MSA module requires compute capability 10."
-      << FLASHINFER_BLACKWELL_MSA_TARGET_MINOR << ", got " << major << "." << minor;
-}
-
 inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char* name) {
   TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
       << name << " cannot fold leading dimensions above " << trailing
@@ -116,6 +93,42 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
           << ", expected " << expected;
     }
   }
+}
+
+#if !defined(FLASHINFER_BLACKWELL_MSA_TARGET_MINOR)
+#error "the exact Blackwell MSA target minor must be defined"
+#endif
+
+inline void CheckBlackwellMsaTarget(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
+  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_MSA_TARGET_MINOR, RuntimeError)
+      << "this Blackwell MSA module requires compute capability 10."
+      << FLASHINFER_BLACKWELL_MSA_TARGET_MINOR << ", got " << major << "." << minor;
+}
+
+inline int64_t HostCheckedExtentValue(int64_t value, const char* formula) {
+  TVM_FFI_CHECK(value >= 0, ValueError)
+      << "host extent " << formula << " must resolve inside [0, INT64_MAX], got " << value;
+  return value;
+}
+
+inline int64_t HostCheckedExtentMul(int64_t lhs, int64_t rhs, const char* formula) {
+  TVM_FFI_CHECK(lhs >= 0 && rhs >= 0 && (rhs == 0 || lhs <= INT64_MAX / rhs), ValueError)
+      << "host extent overflow while evaluating " << formula;
+  return lhs * rhs;
+}
+
+inline int64_t HostCheckedExtentAdd(int64_t lhs, int64_t rhs, const char* formula) {
+  TVM_FFI_CHECK(lhs >= 0 && rhs >= 0 && lhs <= INT64_MAX - rhs, ValueError)
+      << "host extent overflow while evaluating " << formula;
+  return lhs + rhs;
 }
 
 // 3D TMA descriptor for buffer 'Q' — compiled from the
@@ -147,7 +160,7 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   };
   uint32_t box_dim[3] = {64u, 16u, 2u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -184,7 +197,7 @@ inline CUtensorMap EncodeTma_Q_prefill(const TensorView& t) {
   };
   uint32_t box_dim[4] = {64u, 128u, 1u, 2u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -221,7 +234,7 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   };
   uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -260,7 +273,7 @@ inline CUtensorMap EncodeTma_K_prefill_pair(const TensorView& t) {
   };
   uint32_t box_dim[5] = {64u, 64u, 2u, 2u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -297,7 +310,7 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
   };
   uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -336,7 +349,7 @@ inline CUtensorMap EncodeTma_V_prefill_pair(const TensorView& t) {
   };
   uint32_t box_dim[5] = {64u, 64u, 2u, 2u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -371,7 +384,7 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
   };
   uint32_t box_dim[2] = {64u, 1u};
   uint32_t elem_strides[2] = {1u, 1u};
-  CUtensorMap tm;
+  CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
@@ -383,10 +396,10 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
 
 void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_raw, TensorView arg_K, TensorView arg_K_prefill_pair, TensorView arg_V, TensorView arg_V_prefill_pair, TensorView arg_KV, TensorView arg_O, TensorView arg_partial_O, TensorView arg_partial_M, TensorView arg_partial_D, TensorView arg_split_completion, TensorView arg_msa_lse, TensorView arg_kv_indices, TensorView arg_qo_indptr, TensorView arg_kv_indptr, TensorView arg_kv_len_arr, TensorView arg_task_kind, TensorView arg_task_request, TensorView arg_task_kv_head, TensorView arg_task_q_tile, TensorView arg_task_split, TensorView arg_task_kv_tile_begin, TensorView arg_task_kv_tile_end, TensorView arg_task_qo_begin, TensorView arg_task_qo_end, TensorView arg_task_page_begin, TensorView arg_task_page_end, TensorView arg_status, int64_t arg_num_requests, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_max_kv_tiles, int64_t arg_max_splits, int64_t arg_max_task_claims, double arg_softmax_scale_log2, int64_t arg_attention_mode, int64_t arg_is_causal, int64_t arg_derive_q_offset, int64_t arg_record_tasks, int64_t arg_msa_max_pages, int64_t arg_msa_split_policy, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError) << "cuda_stream must be non-negative";
+  CheckCudaTensor(arg_Q, "Q");
   ffi::CUDADeviceGuard device_guard(arg_Q.device().device_id);
   CheckBlackwellMsaTarget(arg_Q.device().device_id);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  CheckCudaTensor(arg_Q, "Q");
   CheckDtype(arg_Q, "Q", 4, 16, 1);
   CheckCudaTensor(arg_Q_prefill, "Q_prefill");
   CheckDtype(arg_Q_prefill, "Q_prefill", 4, 16, 1);
@@ -542,6 +555,47 @@ void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_ra
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  TVM_FFI_CHECK(arg_Q.ndim() == 3, ValueError)
+      << "Q must have rank 3, got " << arg_Q.ndim();
+  int64_t host_extent_0 = 128;
+  TVM_FFI_CHECK(arg_Q.size(2) == host_extent_0, ValueError)
+      << "Q dimension 2 must be equal " << host_extent_0      << ", got " << arg_Q.size(2);
+  TVM_FFI_CHECK(arg_K.ndim() == 3, ValueError)
+      << "K must have rank 3, got " << arg_K.ndim();
+  int64_t host_extent_1 = 128;
+  TVM_FFI_CHECK(arg_K.size(2) >= host_extent_1, ValueError)
+      << "K dimension 2 must be at least " << host_extent_1      << ", got " << arg_K.size(2);
+  TVM_FFI_CHECK(arg_V.ndim() == 3, ValueError)
+      << "V must have rank 3, got " << arg_V.ndim();
+  int64_t host_extent_2 = 128;
+  TVM_FFI_CHECK(arg_V.size(2) >= host_extent_2, ValueError)
+      << "V dimension 2 must be at least " << host_extent_2      << ", got " << arg_V.size(2);
+  int64_t host_extent_3 = 128;
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_num_requests), "num_requests"), "128 * num_requests * num_q_heads");
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "128 * num_requests * num_q_heads");
+  TVM_FFI_CHECK(arg_O.numel() >= host_extent_3, ValueError)
+      << "O requires at least " << (host_extent_3)      << " TensorView storage elements, got " << arg_O.numel();
+  int64_t host_extent_4 = 1;
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_num_requests), "num_requests"), "num_requests * num_q_heads");
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "num_requests * num_q_heads");
+  TVM_FFI_CHECK(arg_msa_lse.numel() >= host_extent_4, ValueError)
+      << "msa_lse requires at least " << (host_extent_4)      << " TensorView storage elements, got " << arg_msa_lse.numel();
+  TVM_FFI_CHECK(arg_num_requests >= 1, ValueError)
+      << "num_requests must be >= " << 1      << ", got " << arg_num_requests;
+  TVM_FFI_CHECK(arg_num_q_heads >= 1, ValueError)
+      << "num_q_heads must be >= " << 1      << ", got " << arg_num_q_heads;
+  TVM_FFI_CHECK(arg_num_kv_heads > 0 && arg_num_q_heads % arg_num_kv_heads == 0, ValueError)
+      << "num_q_heads must be divisible by num_kv_heads";
+  TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
+      << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
+  int64_t host_extent_5 = 16;
+  TVM_FFI_CHECK(arg_max_kv_tiles == host_extent_5, ValueError)
+      << "max_kv_tiles must equal " << host_extent_5      << ", got " << arg_max_kv_tiles;
+  TVM_FFI_CHECK(arg_record_tasks >= 1, ValueError)
+      << "record_tasks must be >= " << 1      << ", got " << arg_record_tasks;
+  TVM_FFI_CHECK(arg_msa_max_pages >= 1, ValueError)
+      << "msa_max_pages must be >= " << 1      << ", got " << arg_msa_max_pages;
+
 
   CUtensorMap p_Q = EncodeTma_Q(arg_Q);
   CUtensorMap p_Q_prefill = EncodeTma_Q_prefill(arg_Q_prefill);
