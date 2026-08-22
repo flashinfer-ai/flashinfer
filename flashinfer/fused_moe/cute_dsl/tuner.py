@@ -46,6 +46,7 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
+from ...cute_dsl.utils import is_rubin_cute_dsl_available
 from ...utils import get_compute_capability
 from ..utils import (
     get_hybrid_num_tokens_buckets,
@@ -692,6 +693,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 # The Rubin (SM107) kernels only implement the gated (SwiGLU)
                 # activation path; skip Rubin tactics for non-gated activations.
                 if not gated:
+                    return False
+
+                # The Rubin kernels import ``cutlass.utils.rubin_helpers`` at
+                # module scope, which only exists from CuTe DSL 4.8.  A tactic
+                # we cannot even import is not runnable, so drop it here rather
+                # than letting the import escape as a ``ModuleNotFoundError``
+                # and take down autotuning for the Blackwell tactics too.
+                if not is_rubin_cute_dsl_available():
                     return False
 
                 from .rubin import (

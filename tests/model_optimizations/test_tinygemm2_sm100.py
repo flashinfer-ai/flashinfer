@@ -10,14 +10,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_datacenter_blackwell
 
 
 def _skip_if_not_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("tinygemm2_sm100 tests require a CUDA device")
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("tinygemm2_sm100 requires SM100/SM103")
+    # `is_sm100a_supported` is a family check (major == 10), so it also accepts
+    # Rubin/SM107, where the kernel's own guard then fails with
+    # "requires an SM100/SM103 (B200/B300 class) device".  Match that guard.
+    if not is_datacenter_blackwell(torch.device("cuda")):
+        pytest.skip("tinygemm2_sm100 requires SM100 (cc 10.0) or SM103 (cc 10.3)")
 
 
 def _make_case(batch_size, output_features, input_features, seed=0):

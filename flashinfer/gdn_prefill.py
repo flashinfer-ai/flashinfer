@@ -354,6 +354,16 @@ def chunk_gated_delta_rule(
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
+    # Every GDN prefill backend below is a CuTe-DSL kernel compiled for the
+    # device's own architecture (``cute.GPUArch(f"sm_{major}{minor}a")``), so a
+    # DSL release that predates the device raises a bare ``KeyError: 'sm_107a'``
+    # from inside kernel compilation.  ``native_only=True`` because the family
+    # target (sm_100f) does not help here: the arch string is built from the
+    # device, not from ``CUTE_DSL_ARCH``.  Imported lazily: ``cute_dsl.utils``
+    # imports ``cutlass`` at module scope and GDN must still import without it.
+    from .cute_dsl.utils import require_cute_dsl_arch
+
+    require_cute_dsl_arch(device, native_only=True)
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
         num_seqs * num_sab_heads,
         _sm_count,

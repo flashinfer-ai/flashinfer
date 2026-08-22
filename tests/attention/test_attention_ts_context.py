@@ -50,12 +50,16 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
     build_fmha_task_manager,
 )
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_datacenter_blackwell
 
 
+# NOTE: `is_sm100a_supported` is a family check (major == 10) and is therefore
+# also True on Rubin/SM107, where the plan path rejects the device with
+# "requires an SM100a/B200 or SM103a/B300 GPU".  Gate on the exact
+# capabilities the kernel supports so SM107 skips instead of failing.
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="PrimTS context attention requires SM100 or SM103",
+    not torch.cuda.is_available() or not is_datacenter_blackwell(torch.device("cuda")),
+    reason="PrimTS context attention requires SM100 (cc 10.0) or SM103 (cc 10.3)",
 )
 
 _HEAD_DIM = 128

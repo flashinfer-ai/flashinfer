@@ -23,6 +23,8 @@ import random
 import torch
 import pytest
 
+from tests.test_helpers.test_helpers import skip_if_cute_dsl_arch_unsupported
+
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
 from flashinfer.utils import (
@@ -36,6 +38,10 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 def _skip_if_unsupported():
     """Skip test if not SM90, SM100, or SM12x (with CUDA 13+) architecture."""
     device = torch.device("cuda")
+    # Every GDN backend is a CuTe-DSL kernel compiled for the device's own
+    # arch; an older DSL raises a bare KeyError (e.g. 'sm_107a' on CuTe DSL
+    # 4.7 / Rubin).  Treat that as an environment gap and skip.
+    skip_if_cute_dsl_arch_unsupported(device)
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
@@ -51,6 +57,10 @@ def _skip_if_unsupported():
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
+    # Every GDN backend is a CuTe-DSL kernel compiled for the device's own
+    # arch; an older DSL raises a bare KeyError (e.g. 'sm_107a' on CuTe DSL
+    # 4.7 / Rubin).  Treat that as an environment gap and skip.
+    skip_if_cute_dsl_arch_unsupported(device)
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
@@ -65,6 +75,10 @@ def _skip_if_cp_unsupported():
 def _skip_if_not_sm100():
     """Skip test if not SM100 (Blackwell) with CUDA 13+."""
     device = torch.device("cuda")
+    # Every GDN backend is a CuTe-DSL kernel compiled for the device's own
+    # arch; an older DSL raises a bare KeyError (e.g. 'sm_107a' on CuTe DSL
+    # 4.7 / Rubin).  Treat that as an environment gap and skip.
+    skip_if_cute_dsl_arch_unsupported(device)
     if not is_sm100a_supported(device):
         pytest.skip("Requires SM100 (Blackwell)")
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0

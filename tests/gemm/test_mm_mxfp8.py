@@ -2,6 +2,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.test_helpers.test_helpers import skip_if_cute_dsl_arch_unsupported
+
 from flashinfer import (
     autotune,
     mm_mxfp8,
@@ -52,6 +54,11 @@ def _skip_if_unsupported(backend: str = "cutlass"):
             "Skipping test because mm_mxfp8 backend is not supported on compute "
             f"capability {compute_capability_number}."
         )
+    if backend in ("cute-dsl", "b12x"):
+        # These backends compile a CuTe-DSL kernel for the device's own arch; a
+        # DSL release older than the device raises a bare KeyError (e.g.
+        # 'sm_107a' on CuTe DSL 4.7 / Rubin).  Environment gap, not a bug.
+        skip_if_cute_dsl_arch_unsupported(torch.device("cuda"))
     if backend == "b12x":
         if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x mm_mxfp8 requires CUDA 13+")
