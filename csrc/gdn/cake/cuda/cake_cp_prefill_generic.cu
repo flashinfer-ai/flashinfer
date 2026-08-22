@@ -649,7 +649,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     }
                     int source_block_end_cg1 = chunk_start_1 - (int)cu_seqlens[blockIdx.y] + block_cg1 * 64 + valid_tokens_cg1;
                     int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg1 = ((valid_tokens_cg1 > 0 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
+                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && source_block_end_cg1 == source_chunk_end_cg1 || valid_tokens_cg1 > 0 && source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg1) * 8, gate_phase_cg1);
                     int gate_base_cg1 = gate_stage_cg1 * 64;
                     mbarrier_wait(kv_acc_full_addr + (kv_stage_cg1) * 8, kv_full_phase_cg1);
