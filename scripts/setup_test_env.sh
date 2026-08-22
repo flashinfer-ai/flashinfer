@@ -9,26 +9,40 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Pin the preinstalled CUDA torch for every job-time pip install (same guard as
-# test_utils.sh; idempotent — whichever is sourced first wins). Prevents a dep's
-# transitive constraints from making pip re-resolve torch and silently evict the
-# CUDA build (on aarch64 pip backtracks to the CPU-only PyPI wheel -> "Torch not
-# compiled with CUDA enabled"); with the constraint such a resolution fails
-# loudly at install time. The +cuXXX local tag is stripped: PEP 440 lets the
-# installed 2.X.Y+cuNNN satisfy ==2.X.Y, but PEP-517 build envs (flashinfer-
-# jit-cache's build-system.requires includes torch) inherit PIP_CONSTRAINT and
-# must be able to resolve the pin from PyPI, where local-version wheels don't
-# exist.
+# Pin the preinstalled CUDA Python stack for every job-time pip install (same
+# guard as test_utils.sh; idempotent — whichever is sourced first wins). This
+# prevents a branch dependency sync from replacing torch, cuda-python, or the
+# cuDNN backend selected and validated when the image was built. The +cuXXX
+# torch local tag is stripped because PEP-517 build environments must be able
+# to resolve the constraint from PyPI, where local-version wheels do not exist.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-  _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
-  if [ -n "${_torch_pin}" ]; then
-    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
-    echo "${_torch_pin}" > "${_constraint_file}"
-    export PIP_CONSTRAINT="${_constraint_file}"
-    echo "Pinning for all pip installs in this job: ${_torch_pin}"
-    unset _constraint_file
+  if ! _cuda_stack_pins=$(python - <<'PY'
+import importlib.metadata as metadata
+import torch
+
+print("torch==" + torch.__version__.split("+")[0])
+for package in ("cuda-python", "nvidia-cudnn-cu12", "nvidia-cudnn-cu13"):
+    try:
+        print(f"{package}=={metadata.version(package)}")
+    except metadata.PackageNotFoundError:
+        pass
+PY
+  ); then
+    echo "ERROR: failed to inspect the image CUDA stack; refusing unpinned pip installs" >&2
+    return 1
   fi
-  unset _torch_pin
+  if [ -n "${_cuda_stack_pins}" ]; then
+    _constraint_file=$(mktemp /tmp/ci-cuda-stack-constraint.XXXXXX.txt)
+    printf '%s\n' "${_cuda_stack_pins}" > "${_constraint_file}"
+    export PIP_CONSTRAINT="${_constraint_file}"
+    echo "Pinning the image CUDA stack for job-time pip installs:"
+    printf '%s\n' "${_cuda_stack_pins}"
+    unset _constraint_file
+  else
+    echo "ERROR: image CUDA stack inspection returned no package constraints" >&2
+    return 1
+  fi
+  unset _cuda_stack_pins
 fi
 
 # Install only what this branch moved past the image. Installing the full file
