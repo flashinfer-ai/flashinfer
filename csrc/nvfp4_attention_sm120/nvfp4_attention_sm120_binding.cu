@@ -226,12 +226,17 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK(out.dtype() == dl_bfloat16 || out.dtype() == dl_float16)
       << "out must be bfloat16 or float16";
 
-  ffi::CUDADeviceGuard device_guard(q_fp4.device().device_id);
-  cudaDeviceProp props;
-  cudaError_t status = cudaGetDeviceProperties(&props, q_fp4.device().device_id);
+  const int device_id = q_fp4.device().device_id;
+  ffi::CUDADeviceGuard device_guard(device_id);
+  // Runs on every forward; cudaGetDeviceProperties would cost ~1.7 ms here.
+  int major = 0, minor = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "cudaGetDeviceProperties failed: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(props.major == 12 && (props.minor == 0 || props.minor == 1))
+      << "cudaDeviceGetAttribute(ComputeCapabilityMajor) failed: " << cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cudaDeviceGetAttribute(ComputeCapabilityMinor) failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(major == 12 && (minor == 0 || minor == 1))
       << "NVFP4 attention SM120 kernel requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp4.size(0);
