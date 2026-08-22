@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_4169e85706);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_a90d0f5dfe);
 
 namespace cake_host_shim {
 
@@ -467,7 +467,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   float v_scale = (float)arg_scale;
   void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_source_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_4169e85706::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1", 224768);
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_a90d0f5dfe::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1", 224768);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
 

@@ -35,7 +35,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNCPArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-pr4078-cake-only-standalone-export-v3"
-_MANIFEST_SHA256 = "ceb88817fcb8edfd4382885010e51d5cd4bb729d4bbbfcd831a0a69f03a3d9b5"
+_MANIFEST_SHA256 = "235073dcb8471b9b142da1a186582789eb5aefbe56b40d7075deec690df6fd15"
 _BASELINE_REVISION = "6cb2e70995d92edbc443b1bfc317ecacac907640"
 _FOCUS_CONTRACT = (
     150,
@@ -215,8 +215,7 @@ def load_cake_gdn_cp_kernel(name: str, arch: CakeGDNCPArch):
         observed = _sha256(path)
         if observed != expected:
             raise RuntimeError(
-                f"Cake GDN CP-prefill source drift at {path}: "
-                f"expected {expected}, got {observed}"
+                f"Cake GDN CP-prefill source drift at {path}: expected {expected}, got {observed}"
             )
     compile_digest = hashlib.sha256(
         "\0".join([cuda["sha256"], *(header["sha256"] for header in headers)]).encode()

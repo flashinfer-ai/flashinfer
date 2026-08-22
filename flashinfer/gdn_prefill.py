@@ -238,8 +238,8 @@ def chunk_gated_delta_rule(
         when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
-        from row ``state_indices[i]``; the pool may be non-compact (padded
-        first-dimension stride, inner ``[H, V, K]`` block contiguous).
+        from row ``state_indices[i]``; the pool may use arbitrary positive
+        strides, with distinct first-dimension rows occupying disjoint storage.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -291,16 +291,17 @@ def chunk_gated_delta_rule(
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
         and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
-        Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
+        Int32 or int64 tensor of shape ``[num_seqs]``
+        (SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
         ``state_indices[i]`` and writes its final state back to the same row
         (in place when ``output_state is initial_state``). This lets callers
         that keep a paged/indexed state pool avoid gathering the active rows
-        into a packed buffer and scattering the result back. The pool may be
-        non-compact (padded first-dimension stride). ``None`` (default) keeps
-        the packed, sequence-ordered layout.
+        into a packed buffer and scattering the result back. The pool may use
+        arbitrary positive strides as long as distinct first-dimension rows do
+        not overlap. ``None`` (default) keeps the packed, sequence-ordered layout.
 
         The ids **must be unique**: as with any indexed scatter, two sequences
         sharing a slot id would concurrently write the same pool row across
@@ -325,10 +326,11 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.  The SM100
-      path requires ``head_size == 128`` and
-      ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
-      flashinfer-python[cu13]``).
+    - Requires SM90 (Hopper) or SM100/SM103 (Blackwell) architecture. The
+      Cake SM100/SM103 CP path requires ``head_size == 128`` and an installed
+      CUDA toolkit with nvcc 12.8/12.9 or newer, respectively. CuTe-DSL
+      fallback routes require ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip
+      install flashinfer-python[cu13]``).
     """
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
