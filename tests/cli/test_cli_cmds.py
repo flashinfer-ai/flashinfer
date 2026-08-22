@@ -142,6 +142,70 @@ def test_install_cubin_wheel_cmd_mocked(monkeypatch):
     assert recorded["check"] is False
 
 
+def test_install_jit_cache_wheel_cmd_minimal_does_not_add_sm80(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    recorded = {}
+
+    def mock_run(cmd, check=False):
+        recorded["cmd"] = cmd
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--mode",
+            "minimal",
+            "--sm",
+            "12.0f",
+        ]
+    )
+
+    _assert_output_contains_all(out, "Install mode: minimal", "Providers: sm120f")
+    assert recorded["cmd"] == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-deps",
+        "--index-url",
+        "https://flashinfer.ai/whl/cu130",
+        "flashinfer-jit-cache==0.4.1+cu130",
+        "flashinfer-jit-cache-sm120f==0.4.1+cu130",
+    ]
+
+
+def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(
+        flashinfer_main.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(9, "0a")},
+    )
+
+    out = _test_cmd_helper(
+        ["install-jit-cache-wheel", "--mode", "minimal", "--dry-run"]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "Providers: sm90a",
+        "flashinfer-jit-cache-sm90a==0.4.1+cu129",
+    )
+
+
 def test_install_cubin_wheel_cmd_nightly_dry_run(monkeypatch):
     monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1.dev20260421")
 
@@ -304,7 +368,6 @@ def test_install_jit_cache_wheel_cmd_mocked(monkeypatch):
         "pip",
         "install",
         "--upgrade",
-        "--no-deps",
         "--index-url",
         "https://flashinfer.ai/whl/cu129",
         "flashinfer-jit-cache==0.4.1+cu129",
@@ -525,7 +588,6 @@ def test_download_kernels_cmd_mocked(monkeypatch):
                 "pip",
                 "install",
                 "--upgrade",
-                "--no-deps",
                 "--index-url",
                 "https://flashinfer.ai/whl/cu129",
                 "flashinfer-jit-cache==0.4.1+cu129",

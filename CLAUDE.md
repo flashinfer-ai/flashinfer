@@ -534,6 +534,9 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
+| `FLASHINFER_JIT_CACHE_WHEEL_KIND` | `legacy` | `flashinfer-jit-cache/build_backend.py` | Select `legacy` for the monolithic binary wheel or experimental `shim` mode for a pure-Python wheel whose dependencies install binary providers. |
+| `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | falls back to `FLASHINFER_CUDA_ARCH_LIST` | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. Required for a shim build when `FLASHINFER_CUDA_ARCH_LIST` is unset. |
+| `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | unset | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building an experimental binary provider wheel. |
 
 ##### Cubin / Artifact Loader
 

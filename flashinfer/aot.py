@@ -383,7 +383,7 @@ def gen_attention(
         from .jit.attention import gen_batch_prefill_attention_sink_module
 
         for dtype in f16_dtype_:
-            for backend in ["fa2", "fa3"]:
+            for backend in ["fa2"] + (["fa3"] if has_sm90 else []):
                 for use_swa in [True, False]:
                     yield gen_batch_prefill_attention_sink_module(
                         backend=backend,

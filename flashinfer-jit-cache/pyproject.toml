@@ -5,9 +5,9 @@ backend-path = ["."]
 
 [project]
 name = "flashinfer-jit-cache"
-dynamic = ["version"]
-description = "Pre-compiled JIT Cache for FlashInfer"
-readme = {text = "This package contains pre-compiled JIT Cache for FlashInfer. It provides most of the necessary shared libraries (.so files) of FlashInfer.", content-type = "text/plain"}
+dynamic = ["version", "dependencies"]
+description = "JIT cache provider shim for FlashInfer"
+readme = {text = "This package discovers compatible pre-compiled FlashInfer JIT cache providers. Legacy builds may also contain the shared libraries directly.", content-type = "text/plain"}
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [
@@ -28,8 +28,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
-
 [project.urls]
 Homepage = "https://github.com/flashinfer-ai/flashinfer"
 Documentation = "https://github.com/flashinfer-ai/flashinfer"
@@ -42,6 +40,7 @@ include-package-data = true
 
 [tool.setuptools.dynamic]
 version = {attr = "flashinfer_jit_cache.__version__"}
+dependencies = {file = ["flashinfer_jit_cache/_provider_requirements.txt"]}
 
 [tool.setuptools.package-data]
 flashinfer_jit_cache = ["jit_cache/**/*.so"]
