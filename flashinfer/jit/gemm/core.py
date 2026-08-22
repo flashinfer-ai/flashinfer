@@ -807,9 +807,12 @@ def gen_tgv_gemm_sm10x_module(
         )
 
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
-    module_name = f"tgv_gemm_{dtype_str}"
+    target = "sm100f" if use_sm_100f else "sm100a"
+    module_name = f"tgv_gemm_{dtype_str}_{target}"
 
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / f"gen_tgv_gemm_{dtype_str}"
+    gen_directory = (
+        jit_env.FLASHINFER_GEN_SRC_DIR / f"gen_tgv_gemm_{dtype_str}_{target}"
+    )
     os.makedirs(gen_directory, exist_ok=True)
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / "tgv_gemm.cu",
