@@ -26,10 +26,12 @@ namespace flashinfer::trtllm {
 struct SageQuantParams {
   // Required arguments for SageQuantQk (Q or K).
   int sumSeqLensQk{};
+  int batchSize{};
   int numHeads{};
   int headDim{};
   int tokenBlockSize{};
   bool kSmooth{false};
+  int const* ptrCuSeqLensQk{nullptr};
   void const* ptrQk{nullptr};
   void* ptrQkQuant{nullptr};
   Data_type inputType{DATA_TYPE_FP16};

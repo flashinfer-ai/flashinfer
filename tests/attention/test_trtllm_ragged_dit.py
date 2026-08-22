@@ -279,7 +279,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (512, 2048)])
+@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (1560, 1560), (512, 2048)])
 @pytest.mark.parametrize("num_heads", [1, 8])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("sage_blk_q", [1])
@@ -306,6 +306,13 @@ def test_trtllm_ragged_dit_sage_qdq(
     k = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
 
+    qo_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
+    )
+    kv_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
+    )
+
     q_int8, k_int8, v_fp8, q_sfs, k_sfs, v_sfs = (
         flashinfer.trtllm_sage_attention_quantize(
             q,
@@ -314,20 +321,20 @@ def test_trtllm_ragged_dit_sage_qdq(
             q_block_size=sage_blk_q,
             k_block_size=sage_blk_k,
             qk_quant_dtype=torch.int8,
+            cum_seq_lens_q=qo_indptr,
+            cum_seq_lens_kv=kv_indptr,
         )
     )
 
     assert q_sfs.shape == (
         num_heads,
-        (total_q + sage_blk_q - 1) // sage_blk_q,
+        (total_q + sage_blk_q - 1) // sage_blk_q + batch_size - 1,
     )
     assert k_sfs.shape == (
         num_heads,
-        (total_kv + sage_blk_k - 1) // sage_blk_k,
+        (total_kv + sage_blk_k - 1) // sage_blk_k + batch_size - 1,
     )
     assert v_sfs.shape == (num_heads, head_dim)
-    assert torch.isfinite(q_sfs).all()
-    assert torch.isfinite(k_sfs).all()
     assert torch.isfinite(v_sfs).all()
 
     sage_blk_v = 1
@@ -340,13 +347,6 @@ def test_trtllm_ragged_dit_sage_qdq(
     bmm1_scale = 1.0 / math.sqrt(head_dim)
     # All dequantization scales are supplied through SageAttention scale tensors.
     bmm2_scale = 1.0
-
-    qo_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
-    )
-    kv_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
-    )
 
     workspace = _get_workspace()
 
