@@ -24,7 +24,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp16_v1(float* __restrict__ packed, int* __restrict__ state_indices, __half* __restrict__ output, long long pool_stride0, int num_heads, long long total_values, int use_indices)
+kernel_flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp16_v1(float* __restrict__ packed, int* __restrict__ state_indices, __half* __restrict__ output, long long pool_stride0, long long pool_stride1, long long pool_stride2, long long pool_stride3, int num_heads, long long total_values, int use_indices)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -40,11 +40,15 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp16_v1(float* __restri
         long long values_per_seq = (long long)num_heads * 128 * 128;
         int seq_idx = (int)(linear / values_per_seq);
         long long inner = linear % values_per_seq;
+        long long head_idx = inner / 16384;
+        long long matrix_inner = inner % 16384;
+        long long row_idx = matrix_inner / 128;
+        long long col_idx = matrix_inner % 128;
         int pool_row = seq_idx;
         if (use_indices != 0) {
             pool_row = state_indices[seq_idx];
         }
-        long long output_index = (long long)pool_row * pool_stride0 + inner;
+        long long output_index = (long long)pool_row * pool_stride0 + head_idx * pool_stride1 + row_idx * pool_stride2 + col_idx * pool_stride3;
         output[output_index] = packed[linear];
     }
 }
