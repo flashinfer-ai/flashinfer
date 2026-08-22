@@ -310,6 +310,22 @@ def test_modelopt_state_dict_loader_uses_global_decode_scale_directly():
     assert canonical_dequantize_nvfp4(checkpoint)[0, 0, 0].item() == 0.125
 
 
+def test_modelopt_state_dict_loader_preserves_single_expert_alpha_scope():
+    state_dict = {
+        "experts.weight": torch.tensor([[[0x21] * 8]], dtype=torch.uint8),
+        "experts.weight_scale": torch.ones((1, 1, 1), dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        ),
+        "experts.weight_scale_2": torch.tensor([0.25], dtype=torch.float32),
+    }
+    checkpoint = load_modelopt_nvfp4_state_dict(state_dict, prefix="experts")
+
+    assert checkpoint.logical_shape == (1, 1, 16)
+    assert checkpoint.alpha_scope == "per_expert"
+    assert checkpoint.global_alpha.shape == (1,)
+    assert checkpoint.global_alpha.item() == 0.25
+
+
 def test_modelopt_nvfp4_bundled_golden():
     assert _BUNDLED_MODELOPT_GOLDEN.stat().st_size <= 16 * 1024
     assert (

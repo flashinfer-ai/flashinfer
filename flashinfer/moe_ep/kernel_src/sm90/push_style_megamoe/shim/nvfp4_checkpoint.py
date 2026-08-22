@@ -286,6 +286,7 @@ def load_modelopt_nvfp4_state_dict(
             "ModelOpt weight_scale must be [N,K/16] or [E,N,K/16], got "
             f"{tuple(scales.shape)}"
         )
+    packed_was_2d = packed.ndim == 2
     if packed.ndim == 2:
         packed = packed.unsqueeze(0)
     if scales.ndim == 2:
@@ -316,7 +317,7 @@ def load_modelopt_nvfp4_state_dict(
     # Collapse only this source convention; NVFP4Checkpoint itself deliberately
     # preserves an E=1 vector as per-expert metadata.
     global_alpha = global_decode_scale.contiguous()
-    if global_alpha.numel() == 1:
+    if packed_was_2d and global_alpha.numel() == 1:
         global_alpha = global_alpha.reshape(())
     physical_shape = (packed.shape[0], packed.shape[1], packed.shape[2] * 2)
     if logical_shape is None:
