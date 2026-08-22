@@ -18,16 +18,16 @@
 #define CAKE_INF CUDART_INF_F
 #define NUM_K_PIPE_STAGES 1
 #define NUM_BETA_PIPE_STAGES 1
-#define SMEM_SMEM_K_OFF 128
+#define SMEM_SMEM_K_OFF 1024
 #define SMEM_SMEM_K_STAGE_BYTES 16384
 #define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_SMEM_INVERSE_OFF 16512
+#define SMEM_SMEM_INVERSE_OFF 17408
 #define SMEM_SMEM_INVERSE_STAGE_BYTES 8192
 #define SMEM_SMEM_INVERSE_STRIDE 8192
-#define SMEM_SMEM_BETA_OFF 24704
+#define SMEM_SMEM_BETA_OFF 25600
 #define SMEM_SMEM_BETA_STAGE_BYTES 256
 #define SMEM_SMEM_BETA_STRIDE 256
-#define SMEM_TOTAL 24960
+#define SMEM_TOTAL 25856
 #define THREADS 128
 
 
@@ -49,12 +49,12 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
-    __half* smem_k = reinterpret_cast<__half*>(smem_raw + 128);
-    const int smem_k_addr = smem + 128;
-    __half* smem_inverse = reinterpret_cast<__half*>(smem_raw + 16512);
-    const int smem_inverse_addr = smem + 16512;
-    float* smem_beta = reinterpret_cast<float*>(smem_raw + 24704);
-    const int smem_beta_addr = smem + 24704;
+    __half* smem_k = reinterpret_cast<__half*>(smem_raw + 1024);
+    const int smem_k_addr = smem + 1024;
+    __half* smem_inverse = reinterpret_cast<__half*>(smem_raw + 17408);
+    const int smem_inverse_addr = smem + 17408;
+    float* smem_beta = reinterpret_cast<float*>(smem_raw + 25600);
+    const int smem_beta_addr = smem + 25600;
 
     // Mbarrier init (4 groups, 4 barriers)
     // Mbarriers at smem_raw[0..32)
@@ -328,9 +328,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
             : "=r"(c_frag[0])
             : "r"((smem_inverse_addr + (unsigned int)(warp * 16 / 8 * 1024 + (warp * 16 + 8 + lane_row_1) * 16 + warp * 16 % 8 * 2)))
             : "memory");
-        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};\n"
             : "=f"(dc_acc[0]), "=f"(dc_acc[1]), "=f"(dc_acc[2]), "=f"(dc_acc[3])
-            : "r"(d_frag[0]), "r"(d_frag[1]), "r"(c_frag[0]));
+            : "r"(d_frag[0]), "r"(d_frag[1]), "r"(c_frag[0]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
         const float2 _scale2_1 = {-1.0f, -1.0f};
         #pragma unroll
         for (int _ls = 0; _ls < 2; _ls++)
@@ -344,9 +344,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
             : "=r"(a_frag[0])
             : "r"((smem_inverse_addr + (unsigned int)(warp * 16 / 8 * 1024 + (warp * 16 + lane_row_1) * 16 + warp * 16 % 8 * 2)))
             : "memory");
-        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};\n"
             : "=f"(out_acc[0]), "=f"(out_acc[1]), "=f"(out_acc[2]), "=f"(out_acc[3])
-            : "r"(dc_f16[0]), "r"(dc_f16[1]), "r"(a_frag[0]));
+            : "r"(dc_f16[0]), "r"(dc_f16[1]), "r"(a_frag[0]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
         #pragma unroll
         for (int _lp = 0; _lp < 2; _lp++) {
             __half2 _h2 = __float22half2_rn(make_float2(out_acc[_lp*2 + 0], out_acc[_lp*2+1 + 0]));
@@ -377,12 +377,12 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
                     : "r"((smem_inverse_addr + (unsigned int)((inverse_thread / 32 * 32 + inverse32_repeat * 8) / 8 * 1024 + (inverse_thread / 32 * 32 + 16 + lane_row_0) * 16 + (inverse_thread / 32 * 32 + inverse32_repeat * 8) % 8 * 2)))
                     : "memory");
             }
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                 : "=f"(dc_acc_3[0]), "=f"(dc_acc_3[1]), "=f"(dc_acc_3[2]), "=f"(dc_acc_3[3])
-                : "r"(d_frag_1[0]), "r"(d_frag_1[1]), "r"(d_frag_1[2]), "r"(d_frag_1[3]), "r"(c_frag_2[0]), "r"(c_frag_2[1]));
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+                : "r"(d_frag_1[0]), "r"(d_frag_1[1]), "r"(d_frag_1[2]), "r"(d_frag_1[3]), "r"(c_frag_2[0]), "r"(c_frag_2[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                 : "=f"(dc_acc_3[4]), "=f"(dc_acc_3[(4) + 1]), "=f"(dc_acc_3[(4) + 2]), "=f"(dc_acc_3[(4) + 3])
-                : "r"(d_frag_1[0]), "r"(d_frag_1[1]), "r"(d_frag_1[2]), "r"(d_frag_1[3]), "r"(c_frag_2[2]), "r"(c_frag_2[(2) + 1]));
+                : "r"(d_frag_1[0]), "r"(d_frag_1[1]), "r"(d_frag_1[2]), "r"(d_frag_1[3]), "r"(c_frag_2[2]), "r"(c_frag_2[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
             const float2 _scale2_3 = {-1.0f, -1.0f};
             #pragma unroll
             for (int _ls = 0; _ls < 4; _ls++)
@@ -399,12 +399,12 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
                     : "r"((smem_inverse_addr + (unsigned int)((inverse_thread / 32 * 32 + inverse32_repeat_1 * 8) / 8 * 1024 + (inverse_thread / 32 * 32 + lane_row_0) * 16 + (inverse_thread / 32 * 32 + inverse32_repeat_1 * 8) % 8 * 2)))
                     : "memory");
             }
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                 : "=f"(out_acc_6[0]), "=f"(out_acc_6[1]), "=f"(out_acc_6[2]), "=f"(out_acc_6[3])
-                : "r"(dc_f16_4[0]), "r"(dc_f16_4[1]), "r"(dc_f16_4[2]), "r"(dc_f16_4[3]), "r"(a_frag_5[0]), "r"(a_frag_5[1]));
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+                : "r"(dc_f16_4[0]), "r"(dc_f16_4[1]), "r"(dc_f16_4[2]), "r"(dc_f16_4[3]), "r"(a_frag_5[0]), "r"(a_frag_5[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                 : "=f"(out_acc_6[4]), "=f"(out_acc_6[(4) + 1]), "=f"(out_acc_6[(4) + 2]), "=f"(out_acc_6[(4) + 3])
-                : "r"(dc_f16_4[0]), "r"(dc_f16_4[1]), "r"(dc_f16_4[2]), "r"(dc_f16_4[3]), "r"(a_frag_5[2]), "r"(a_frag_5[(2) + 1]));
+                : "r"(dc_f16_4[0]), "r"(dc_f16_4[1]), "r"(dc_f16_4[2]), "r"(dc_f16_4[3]), "r"(a_frag_5[2]), "r"(a_frag_5[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __half2 _h2 = __float22half2_rn(make_float2(out_acc_6[_lp*2 + 0], out_acc_6[_lp*2+1 + 0]));
@@ -471,18 +471,18 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6(const
                 : "r"((smem_inverse_addr + (unsigned int)(inv64_a_repeat * 8 / 8 * 1024 + (inv64_x * 16 + inv64_lane_row) * 16 + inv64_a_repeat * 8 % 8 * 2)))
                 : "memory");
         }
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=f"(inv64_out0_acc[0]), "=f"(inv64_out0_acc[1]), "=f"(inv64_out0_acc[2]), "=f"(inv64_out0_acc[3])
-            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[0]), "r"(inv64_a[1]));
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[0]), "r"(inv64_a[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=f"(inv64_out0_acc[4]), "=f"(inv64_out0_acc[(4) + 1]), "=f"(inv64_out0_acc[(4) + 2]), "=f"(inv64_out0_acc[(4) + 3])
-            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[2]), "r"(inv64_a[(2) + 1]));
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[2]), "r"(inv64_a[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=f"(inv64_out1_acc[0]), "=f"(inv64_out1_acc[1]), "=f"(inv64_out1_acc[2]), "=f"(inv64_out1_acc[3])
-            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[4]), "r"(inv64_a[(4) + 1]));
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[4]), "r"(inv64_a[(4) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=f"(inv64_out1_acc[4]), "=f"(inv64_out1_acc[(4) + 1]), "=f"(inv64_out1_acc[(4) + 2]), "=f"(inv64_out1_acc[(4) + 3])
-            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[6]), "r"(inv64_a[(6) + 1]));
+            : "r"(inv64_dc_f16[0]), "r"(inv64_dc_f16[1]), "r"(inv64_dc_f16[2]), "r"(inv64_dc_f16[3]), "r"(inv64_a[6]), "r"(inv64_a[(6) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
         unsigned int inv64_out0_f16[4];
         unsigned int inv64_out1_f16[4];
         #pragma unroll
