@@ -63,7 +63,8 @@ DECLARE_COMBINE_TOP_K(22)
 #undef DECLARE_COMBINE_TOP_K
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(
-    float*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, float, int, int, bool);
+    uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, int, float, int, int,
+    bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_sanitize_expert_ids(
     int*, int*, int, int, int, int, int);
@@ -286,8 +287,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
                            : (quantized ? params.accumulation_data : params.output_data);
   FLASHINFER_CHECK(accumulation != nullptr, "combine accumulation output must be defined");
   int const output_dtype_code =
-      quantized ? kDTypeFloat32
-                : (params.use_low_precision ? kDTypeBFloat16 : dtypeCode(params.dtype));
+      params.use_low_precision ? kDTypeBFloat16 : dtypeCode(params.dtype);
   int const grid = std::max(params.local_num_tokens, 1);
 #define LAUNCH_COMBINE_TOP_K(TOP_K)                                                       \
   case TOP_K:                                                                             \
@@ -337,11 +337,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   launchWithPdlWhenEnabled(
       "mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
       kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid, kQuantThreads, 0,
-      params.stream, static_cast<float*>(params.accumulation_data),
-      output_bytes, output_bytes, scale_bytes, scale_bytes, params.elements_per_token,
+      params.stream, static_cast<uint8_t*>(params.accumulation_data), output_bytes, output_bytes,
+      scale_bytes, scale_bytes, params.elements_per_token, dtypeBytes(params.dtype),
       dtypeCode(params.dtype), quant_mode, static_cast<int>(params.swizzle_mode),
-      params.output_scalar_scale,
-      blocks_per_row, padded_scale_cols, params.enable_pdl);
+      params.output_scalar_scale, blocks_per_row, padded_scale_cols, params.enable_pdl);
 }
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters,

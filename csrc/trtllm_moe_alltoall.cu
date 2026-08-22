@@ -520,8 +520,11 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
     TVM_FFI_ICHECK_EQ(scales.numel(), expectedScales)
         << "output_scales extent does not match the requested quantization layout";
     params.output_scales = scales.data_ptr();
+    // Preserve the public physical payload boundary through the inverse
+    // combine: each owner stores one BF16/FP16 partial before the final
+    // quantizer reads the byte-carried intermediate.
     accumulationStorage =
-        alloc_tensor({localNumTokens, elementsPerToken}, dl_float32, payload.device());
+        alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
     params.accumulation_data = accumulationStorage.data_ptr();
   } else if (useLowPrecision) {
     // Low-precision combine upcasts the FP8 recv buffers to a BF16 output; no output scales.

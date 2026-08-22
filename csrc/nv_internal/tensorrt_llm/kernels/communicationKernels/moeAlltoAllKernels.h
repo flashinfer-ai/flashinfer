@@ -210,7 +210,7 @@ struct MoeA2ACombineParams {
   MoeA2ACombineSwizzleSFMode swizzle_mode{
       MoeA2ACombineSwizzleSFMode::LINEAR};  // Output swizzle mode
   void* output_data;                        // Output buffer [local_num_tokens, elements_per_token]
-  void* accumulation_data;                  // Optional float32 intermediate for quantized output
+  void* accumulation_data;  // Optional BF16/FP16 intermediate for quantized output
   void* output_scales;                      // Optional output scales for quantized outputs
   float output_scalar_scale{1.0f};  // Per-tensor global scale applied before FP4 block scaling
                                     // (SFScaleVal); ignored by MXFP8/MXFP4 paths

@@ -95,7 +95,9 @@ def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
 
     api.get_moe_alltoall_module.cache_clear()
     monkeypatch.setattr(api, "register_custom_op", register)
-    monkeypatch.setattr(api, "gen_moe_alltoall_module", lambda: FakeSpec())
+    monkeypatch.setattr(api, "gen_moe_alltoall_module", lambda target: FakeSpec())
+    monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 0))
     try:
         module = api.get_moe_alltoall_module()
         assert set(vars(module)) == {
@@ -122,7 +124,26 @@ def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
         api.get_moe_alltoall_module.cache_clear()
 
 
-def test_fused_jit_inventory_is_self_contained(monkeypatch):
+@pytest.mark.parametrize(
+    ("target", "module_name", "generated_name", "arch_flag"),
+    [
+        (
+            "sm100a",
+            "mnnvl_moe_alltoall_sm100a",
+            "mnnvl_moe_alltoall_sm100.cu",
+            "compute_100a,code=sm_100a",
+        ),
+        (
+            "sm103a",
+            "mnnvl_moe_alltoall_sm103a",
+            "mnnvl_moe_alltoall_sm103.cu",
+            "compute_103a,code=sm_103a",
+        ),
+    ],
+)
+def test_fused_jit_inventory_is_exact_arch_and_self_contained(
+    monkeypatch, target, module_name, generated_name, arch_flag
+):
     import flashinfer.jit.comm as jit_comm
 
     captured = {}
@@ -132,13 +153,16 @@ def test_fused_jit_inventory_is_self_contained(monkeypatch):
         return object()
 
     monkeypatch.setattr(jit_comm, "gen_jit_spec", capture)
-    jit_comm.gen_moe_alltoall_module()
+    jit_comm.gen_moe_alltoall_module(target)
     names = {path.name for path in captured["sources"]}
-    assert captured["name"] == "mnnvl_moe_alltoall"
-    assert "moeAlltoAllKernels.cu" not in names
+    assert captured["name"] == module_name
+    assert generated_name in names
     assert {
         "trtllm_moe_alltoall.cu",
         "moeAlltoAllFusedKernels.cu",
+    } <= names
+    assert not {
+        "moeAlltoAllKernels.cu",
         "moeAlltoAllPrepareDispatch.cu",
         "moeAlltoAllDispatch.cu",
         "moeAlltoAllStageCombine.cu",
@@ -146,8 +170,96 @@ def test_fused_jit_inventory_is_self_contained(monkeypatch):
         "moeAlltoAllCombine.cu",
         "moeAlltoAllQuantizeCombine.cu",
         "moeAlltoAllSanitize.cu",
-    } <= names
-    assert all(path.is_file() for path in captured["sources"])
+    } & names
+    assert {
+        path.name for path in captured["sources"] if path.parent.name == "generated"
+    } == {generated_name}
+    assert any(arch_flag in flag for flag in captured["kwargs"]["extra_cuda_cflags"])
+
+
+def test_runtime_module_selection_uses_exact_current_device_capability(monkeypatch):
+    import flashinfer.comm.trtllm_moe_alltoall as api
+
+    monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 7)
+    selected = []
+    monkeypatch.setattr(
+        api,
+        "_get_moe_alltoall_module_for_target",
+        lambda target: selected.append(target) or target,
+    )
+
+    monkeypatch.setattr(
+        api.torch.cuda, "get_device_capability", lambda device: (10, 0)
+    )
+    assert api.get_moe_alltoall_module() == "sm100a"
+    monkeypatch.setattr(
+        api.torch.cuda, "get_device_capability", lambda device: (10, 3)
+    )
+    assert api.get_moe_alltoall_module() == "sm103a"
+    assert selected == ["sm100a", "sm103a"]
+
+    monkeypatch.setattr(
+        api.torch.cuda, "get_device_capability", lambda device: (12, 0)
+    )
+    with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
+        api.get_moe_alltoall_module()
+
+
+def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
+    from flashinfer import aot
+    import flashinfer.jit.comm as jit_comm
+
+    selected = []
+
+    def spec(name):
+        return SimpleNamespace(name=name)
+
+    monkeypatch.setattr(aot, "gen_spdlog_module", lambda: spec("spdlog"))
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    monkeypatch.setattr(aot, "gen_cudnn_fmha_module", lambda: spec("cudnn"))
+    monkeypatch.setattr(jit_comm, "gen_comm_alltoall_module", lambda: spec("comm"))
+    monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
+    monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))
+    monkeypatch.setattr(
+        jit_comm,
+        "gen_moe_alltoall_module",
+        lambda target: selected.append(target) or spec(f"mnnvl_{target}"),
+    )
+
+    aot.gen_all_modules(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        {"sm100a_exact": True, "sm103a_exact": True},
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+    assert selected == ["sm100a", "sm103a"]
+
+
+def test_quantized_combine_preserves_the_physical_accumulator_dtype():
+    repo_root = Path(__file__).resolve().parents[2]
+    adapter_source = (repo_root / "csrc/trtllm_moe_alltoall.cu").read_text()
+    launcher_source = (
+        repo_root
+        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
+    ).read_text()
+
+    assert (
+        "alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device())"
+        in adapter_source
+    )
+    assert "static_cast<uint8_t*>(params.accumulation_data)" in launcher_source
+    assert "params.elements_per_token, dtypeBytes(params.dtype)," in launcher_source
+    assert "quantized ? kDTypeFloat32" not in launcher_source
 
 
 def test_combine_inventory_is_specialized_and_fail_closed():

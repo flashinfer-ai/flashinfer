@@ -67,10 +67,22 @@ class _A2AState:
     eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
+def _moe_alltoall_target(device_index: int) -> str:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 0):
+        return "sm100a"
+    if capability == (10, 3):
+        return "sm103a"
+    raise RuntimeError(
+        "MNNVL MoE all-to-all requires exact compute capability 10.0 or 10.3, "
+        f"got {capability[0]}.{capability[1]}"
+    )
+
+
 @functools.cache
-def get_moe_alltoall_module():
-    """Get or build the MOE A2A JIT module."""
-    module = gen_moe_alltoall_module().build_and_load()
+def _get_moe_alltoall_module_for_target(target: str):
+    """Build or load one exact-architecture MNNVL MoE all-to-all module."""
+    module = gen_moe_alltoall_module(target).build_and_load()
 
     @register_custom_op(
         "flashinfer::moe_a2a_initialize",
@@ -349,6 +361,15 @@ def get_moe_alltoall_module():
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
     )
+
+
+def get_moe_alltoall_module():
+    """Return the module for the current device's exact compute capability."""
+    device_index = torch.cuda.current_device()
+    return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
+
+
+get_moe_alltoall_module.cache_clear = _get_moe_alltoall_module_for_target.cache_clear
 
 
 @flashinfer_api
