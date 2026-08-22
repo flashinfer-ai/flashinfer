@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple, replace
@@ -139,6 +140,18 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+
+# The CUTLASS FP4 GEMM sizes its workspace from the problem shape, and on SM120
+# that request exceeds 32 MiB for the batch sizes that dominate decoding: a
+# 5120x34816 NVFP4 GEMM asks for 34 MiB at every M from 1 to 256. When the
+# shared buffer is smaller than the request, csrc/fp4_gemm_cutlass_sm120.cu
+# allocates a private workspace per call and lets it fall out of scope right
+# after an asynchronous launch, which puts a device allocation on the model's
+# hot path and inside CUDA graph capture. Give mm_fp4 a shared buffer large
+# enough that the fallback is not taken.
+MM_FP4_WORKSPACE_SIZE = (
+    int(os.environ.get("FLASHINFER_MM_FP4_WORKSPACE_MB", "256")) * 1024 * 1024
+)
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -7149,7 +7162,7 @@ def mm_fp4(
         )
 
     workspace_buffer = _get_cache_buf(
-        "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        "mm_fp4_workspace", MM_FP4_WORKSPACE_SIZE, a.device
     )
 
     # Auto-select the best backend
