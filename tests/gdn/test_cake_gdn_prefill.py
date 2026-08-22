@@ -26,11 +26,10 @@ import flashinfer
 import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_prefill as cake
 from flashinfer.jit import cake_gdn_cp_prefill as cake_jit
-from flashinfer.utils import is_sm100a_supported
 
 
 def _cake_sm100_toolchain_available() -> bool:
-    if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
+    if not torch.cuda.is_available():
         return False
     minimum = {(10, 0): (12, 8), (10, 3): (12, 9)}.get(
         torch.cuda.get_device_capability()
@@ -1127,15 +1126,22 @@ def _allocate_state_pool(
     *,
     dtype: torch.dtype,
     padding: int,
+    inner_stride: int = 1,
 ) -> torch.Tensor:
-    if padding == 0:
+    if padding == 0 and inner_stride == 1:
         return torch.empty((rows, heads, 128, 128), dtype=dtype, device="cuda")
-    row_stride = heads * 128 * 128 + padding
-    storage = torch.empty((rows * row_stride,), dtype=dtype, device="cuda")
-    return storage.as_strided(
-        (rows, heads, 128, 128),
-        (row_stride, 128 * 128, 128, 1),
+    shape = (rows, heads, 128, 128)
+    strides = (
+        heads * 128 * 128 * inner_stride + padding,
+        128 * 128 * inner_stride,
+        128 * inner_stride,
+        inner_stride,
     )
+    span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(shape, strides, strict=True)
+    )
+    return torch.empty(span, dtype=dtype, device="cuda").as_strided(shape, strides)
 
 
 @pytest.mark.skipif(
@@ -1480,3 +1486,152 @@ def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
     for row in range(candidate_state.shape[0]):
         if row not in selected:
             assert torch.equal(candidate_state[row], state_before[row])
+
+
+@pytest.mark.skipif(
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
+)
+def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover public metadata caching and arbitrary positive state strides."""
+
+    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+        cp_delta_rule_dsl_sm100,
+    )
+
+    torch.manual_seed(504539)
+    seq_lens = (0, 64, 65, 0)
+    total = sum(seq_lens)
+    hq, hk, hv = 4, 1, 1
+    state_heads = max(hq, hv)
+    pool_rows = 7
+    state_slots = (4, 1, 6, 2)
+
+    q_values = torch.randn((total, hq, 128), dtype=torch.bfloat16, device="cuda")
+    k_values = torch.nn.functional.normalize(
+        torch.randn((total, hk, 128), dtype=torch.float32, device="cuda"),
+        p=2.0,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v_values = torch.randn((total, hv, 128), dtype=torch.bfloat16, device="cuda")
+    state_values = torch.randn(
+        (pool_rows, state_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    with torch.inference_mode():
+        cu_seqlens = torch.tensor(
+            [0, 0, 64, 129, 129], dtype=torch.int64, device="cuda"
+        )
+        state_indices = torch.tensor(state_slots, dtype=torch.int64, device="cuda")
+    assert torch.is_inference(cu_seqlens)
+    assert torch.is_inference(state_indices)
+
+    reference_cu = torch.tensor(
+        [0, 0, 64, 129, 129], dtype=torch.int32, device="cuda"
+    )
+    reference_indices = torch.tensor(state_slots, dtype=torch.int32, device="cuda")
+    reference_initial = state_values.clone()
+    reference_state = torch.full_like(reference_initial, -7.0)
+    expected_output = torch.empty(
+        (total, state_heads, 128), dtype=torch.bfloat16, device="cuda"
+    )
+    ones = torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
+    cp_delta_rule_dsl_sm100(
+        expected_output,
+        reference_state,
+        q_values,
+        k_values,
+        v_values,
+        ones,
+        ones,
+        reference_cu,
+        0.125,
+        initial_state=reference_initial,
+        state_indices=reference_indices,
+        max_seqlen=max(seq_lens),
+    )
+
+    candidates = []
+    for _ in range(2):
+        q = q_values.clone()
+        k = k_values.clone()
+        v = v_values.clone()
+        initial = _allocate_state_pool(
+            pool_rows,
+            state_heads,
+            dtype=torch.bfloat16,
+            padding=96,
+            inner_stride=2,
+        )
+        state = _allocate_state_pool(
+            pool_rows,
+            state_heads,
+            dtype=torch.bfloat16,
+            padding=96,
+            inner_stride=2,
+        )
+        initial.copy_(state_values)
+        state.fill_(-7.0)
+        output = torch.empty_like(expected_output)
+        candidates.append((q, k, v, initial, state, output))
+
+    immutable_metadata = (cu_seqlens.clone(), state_indices.clone())
+    immutable_inputs = tuple(
+        tuple(tensor.clone() for tensor in candidate[:4]) for candidate in candidates
+    )
+    state_before = tuple(candidate[4].clone() for candidate in candidates)
+    real_prepare = cake.prepare_cake_gdn_cp_prefill
+    prepare_calls = 0
+
+    def counted_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cake, "prepare_cake_gdn_cp_prefill", counted_prepare)
+    cake._reset_cake_gdn_cp_prefill_cache()
+    try:
+        for q, k, v, initial, state, output in candidates:
+            with torch.inference_mode():
+                actual_output, actual_state = gdn_prefill.chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g=None,
+                    beta=None,
+                    scale=0.125,
+                    initial_state=initial,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=False,
+                    output=output,
+                    output_state=state,
+                    use_cp=True,
+                    state_indices=state_indices,
+                )
+            torch.cuda.synchronize()
+            assert actual_output is output
+            assert actual_state is state
+            _assert_oracle_close(actual_output, expected_output)
+            _assert_oracle_close(actual_state, reference_state)
+    finally:
+        cake._reset_cake_gdn_cp_prefill_cache()
+
+    assert prepare_calls == 1
+    assert torch.equal(cu_seqlens, immutable_metadata[0])
+    assert torch.equal(state_indices, immutable_metadata[1])
+    selected = set(state_slots)
+    for candidate, before_inputs, before_state in zip(
+        candidates, immutable_inputs, state_before, strict=True
+    ):
+        for observed, before in zip(candidate[:4], before_inputs, strict=True):
+            assert torch.equal(observed, before)
+        state = candidate[4]
+        for row in range(pool_rows):
+            if row not in selected:
+                assert torch.equal(state[row], before_state[row])
+        for empty_slot in (state_slots[0], state_slots[-1]):
+            assert torch.equal(state[empty_slot], candidate[3][empty_slot])
