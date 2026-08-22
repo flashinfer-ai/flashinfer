@@ -296,7 +296,7 @@ def get_gemm_module():
 
     # Register the module
     _gemm_module = SimpleNamespace(
-        cublas_fp8_gemm_runner=cublas_fp8_gemm_runner,
+        cublas_fp8_gemm_runner=functools.lru_cache(maxsize=64)(cublas_fp8_gemm_runner),
         cutlass_segment_gemm=cutlass_segment_gemm,
     )
 
@@ -1156,7 +1156,9 @@ def get_gemm_sm120_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -1196,7 +1198,9 @@ def get_gemm_sm100_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -1257,7 +1261,9 @@ def get_gemm_sm100_module_cutlass_bf16():
         return CutlassBf16GemmRunner()
 
     return SimpleNamespace(
-        cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+        cutlass_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_bf16_gemm_runner
+        ),
     )
 
 
@@ -1378,7 +1384,9 @@ def get_mm_bf16_cublaslt_module():
         return CublasltBf16GemmRunner()
 
     return SimpleNamespace(
-        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+        cublaslt_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cublaslt_bf16_gemm_runner
+        ),
     )
 
 
@@ -1403,6 +1411,7 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+@functools.lru_cache(maxsize=64)
 def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
 
@@ -1949,7 +1958,9 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassFp4GemmRunner()
 
     return SimpleNamespace(
-        cutlass_fp4_gemm_runner=cutlass_fp4_gemm_runner,
+        cutlass_fp4_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp4_gemm_runner
+        ),
     )
 
 
@@ -3977,6 +3988,7 @@ def _cudnn_gemm_fp8(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
@@ -4429,6 +4441,7 @@ def _cudnn_gemm_bf16(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_bf16_runner(
     is_a_k_major: Optional[bool] = None,
     is_b_k_major: Optional[bool] = None,
@@ -4808,7 +4821,9 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassMxfp8GemmRunner()
 
     return SimpleNamespace(
-        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+        cutlass_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_mxfp8_gemm_runner
+        ),
     )
 
 
@@ -5392,6 +5407,7 @@ def _cute_dsl_gemm_mxfp8_runner(
     return CuteDSLMxfp8GemmRunner()
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_mm_mxfp8_runner():
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
@@ -5781,6 +5797,7 @@ def _cudnn_gemm_fp4(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp4_runner(tuning_config):
     """Build a CudnnFp4GemmRunner.
 
@@ -9482,6 +9499,7 @@ def _cudnn_gemm_mxfp8(
     )
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_mxfp8_runner():
     class CudnnMxfp8GemmRunner(TunableRunner):
         def __init__(self):
