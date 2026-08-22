@@ -7039,6 +7039,7 @@ _MM_MXFP8_TRTLLM_TUNING_CONFIG = replace(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
 )
+_MM_MXFP8_TRTLLM_CACHE_OBJECTIVE = "cuda-graph-cold-l2-v1"
 
 
 def _get_mm_mxfp8_tuning_config(backends: list[str]) -> TuningConfig:
@@ -7898,6 +7899,12 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
     ):
         # monkey patch to align with cutlass runner's input format
         class TrtllmMxFp8GemmRunner(TrtllmGemmRunner):
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                return (
+                    *super().get_cache_key_extras(inputs),
+                    _MM_MXFP8_TRTLLM_CACHE_OBJECTIVE,
+                )
+
             def unpack_inputs(
                 self,
                 inputs: List[torch.Tensor],
