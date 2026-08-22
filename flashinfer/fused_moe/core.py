@@ -5354,7 +5354,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``0`` Gelu; ``3`` Swiglu;
-        ``4`` Geglu; ``6`` Relu2 (non-gated); ``7`` Identity.
+        ``4`` Geglu; ``6`` Relu2 (non-gated); ``9`` Identity.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
