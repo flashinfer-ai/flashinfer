@@ -248,17 +248,11 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     )
     batch_size, seqlen, nheads, headdim, ngroups, dstate = 2, 128, 8, 64, 8, 128
     kwargs = {
-        "x": torch.empty(
-            batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16
-        ),
+        "x": torch.empty(batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16),
         "dt": torch.empty(batch_size, seqlen, nheads, dtype=torch.float32),
         "A": torch.empty(nheads, dtype=torch.float32),
-        "B": torch.empty(
-            batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16
-        ),
-        "C": torch.empty(
-            batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16
-        ),
+        "B": torch.empty(batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "C": torch.empty(batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16),
         "dt_limit": (0.0, float("inf")),
         "return_final_states": return_final_states,
     }
@@ -309,10 +303,7 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     assert ("seq_chunk_cumsum" in definition["outputs"]) == (mode == "varlen")
     if mode == "varlen":
         assert definition["outputs"]["seq_chunk_cumsum"]["optional"] is True
-        assert (
-            definition["outputs"]["seq_chunk_cumsum"]["param"]
-            == "seq_chunk_cumsum"
-        )
+        assert definition["outputs"]["seq_chunk_cumsum"]["param"] == "seq_chunk_cumsum"
     assert ("final_states" in definition["outputs"]) == return_final_states
     if return_final_states:
         assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype

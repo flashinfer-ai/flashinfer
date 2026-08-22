@@ -1550,16 +1550,12 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     monkeypatch.setattr(
         module,
         "_generated_program_profile",
-        lambda _name, _arch: {
-            "stages": {"preprocess": {"block": [128, 1, 1]}}
-        },
+        lambda _name, _arch: {"stages": {"preprocess": {"block": [128, 1, 1]}}},
     )
     monkeypatch.setattr(
         module,
         "_run_generated_program",
-        lambda name, _arch, _device_index, **kwargs: calls.__setitem__(
-            name, kwargs
-        ),
+        lambda name, _arch, _device_index, **kwargs: calls.__setitem__(name, kwargs),
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
     monkeypatch.setattr(

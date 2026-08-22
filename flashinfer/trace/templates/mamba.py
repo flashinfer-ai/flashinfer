@@ -252,12 +252,8 @@ def _make_ssd_combined_trace(
                     optional=True,
                 ),
                 "seq_idx": Tensor(["batch_size", "seqlen"]),
-                "chunk_indices": Tensor(
-                    ["num_logical_chunks"], dtype="int32"
-                ),
-                "chunk_offsets": Tensor(
-                    ["num_logical_chunks"], dtype="int32"
-                ),
+                "chunk_indices": Tensor(["num_logical_chunks"], dtype="int32"),
+                "chunk_offsets": Tensor(["num_logical_chunks"], dtype="int32"),
                 "seq_chunk_cumsum": Tensor(
                     ["seq_chunk_cumsum_size"], dtype="int32", optional=True
                 ),
