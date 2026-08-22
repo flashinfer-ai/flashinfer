@@ -236,7 +236,9 @@ def _build_plan(
     ):
         t_kernel = "t_precompute_gb300_hv48_min6"
     max_seqlen = max(seq_lens)
-    generic_tail = any(length % (2 * _BLOCK) != 0 for length in seq_lens)
+    generic_tail = cp_chunk_len % (2 * _BLOCK) != 0 or any(
+        length % (2 * _BLOCK) != 0 for length in seq_lens
+    )
     if q.dtype == torch.float16 and not generic_tail and hq == hk == hv:
         prefill_kernel = (
             "cp_prefill_equal_head_h32"
