@@ -995,27 +995,24 @@ def test_variant_selector_exposes_specialized_routes_only_when_requested():
     (
         "compute_capability",
         "sm_count",
-        "fixed_layout",
         "num_sequences",
         "num_heads",
         "sequence_length",
         "expected",
     ),
     [
-        ((10, 0), 148, True, 1, 8, 2048, True),
-        ((10, 3), 152, True, 2, 4, 65536, True),
-        ((10, 3), 64, True, 8, 1, 131072, True),
-        ((10, 0), 63, True, 8, 1, 2048, False),
-        ((10, 0), 148, False, 1, 8, 2048, False),
-        ((10, 0), 148, True, 1, 8, 2047, False),
-        ((10, 0), 148, True, 3, 3, 2048, False),
-        ((10, 0), 148, True, 1, 9, 2048, False),
+        ((10, 0), 148, 1, 8, 2048, True),
+        ((10, 3), 152, 2, 4, 65536, True),
+        ((10, 3), 64, 8, 1, 131072, True),
+        ((10, 0), 63, 8, 1, 2048, False),
+        ((10, 0), 148, 1, 8, 2047, False),
+        ((10, 0), 148, 3, 3, 2048, False),
+        ((10, 0), 148, 1, 9, 2048, False),
     ],
 )
 def test_small_bh_owner_helper_policy_matches_residency_contract(
     compute_capability,
     sm_count,
-    fixed_layout,
     num_sequences,
     num_heads,
     sequence_length,
@@ -1025,13 +1022,211 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         kda_prefill_api._should_use_small_bh_owner_helper(
             compute_capability=compute_capability,
             sm_count=sm_count,
-            fixed_layout=fixed_layout,
             num_sequences=num_sequences,
             num_heads=num_heads,
             sequence_length=sequence_length,
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "fixed_layout",
+        "num_sequences",
+        "num_heads",
+        "uniform_sequences",
+        "max_sequence_length",
+        "expected_route",
+    ),
+    [
+        (True, 1, 64, True, 4096, "bt16_prepare_chain_m64"),
+        (True, 1, 12, True, 512, "bt16_prepare_chain_m64"),
+        (True, 8, 12, True, 1024, "direct_m128"),
+        (False, 8, 12, False, 3072, "bt16_prepare_chain_m64"),
+        (True, 1, 4, True, 65_536, "bt16_prepare_chain_m64"),
+        (True, 1, 1, True, 65_535, "small_bh_owner_helper_m128"),
+        (True, 1, 1, True, 65_536, "bt16_prepare_chain_m64"),
+        (True, 1, 64, True, 512, "independent_dvsplit_m64"),
+    ],
+)
+def test_bt16_route_policy_matches_measured_crossovers(
+    fixed_layout,
+    num_sequences,
+    num_heads,
+    uniform_sequences,
+    max_sequence_length,
+    expected_route,
+):
+    assert (
+        kda_prefill_api._select_flash_kda_bf16_route(
+            compute_capability=(10, 3),
+            sm_count=152,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            uniform_sequences=uniform_sequences,
+            max_sequence_length=max_sequence_length,
+        )
+        == expected_route
+    )
+
+
+def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
+    assert (
+        kda_prefill_api._direct_m128_route(num_heads=64, max_sequence_length=16)
+        == "direct_m128_n16"
+    )
+    assert (
+        kda_prefill_api._direct_m128_route(num_heads=64, max_sequence_length=17)
+        == "direct_m128"
+    )
+    assert (
+        kda_prefill_api._direct_m128_route(num_heads=96, max_sequence_length=16)
+        == "direct_m128"
+    )
+    assert (
+        kda_prefill_api._direct_m128_route(num_heads=12, max_sequence_length=16)
+        == "direct_m128_n16"
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=12, total_chunks=128)
+        == 1
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=12, total_chunks=129)
+        == 4
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=64, total_chunks=255)
+        == 6
+    )
+    assert (
+        kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=64, total_chunks=256)
+        == 8
+    )
+
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=64,
+        max_sequence_length=4096,
+    ) == ("bt16_prepare_beta_tma", "bt16_chain_m64_s8", True)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=4,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare", "bt16_chain_m64_s9", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=8,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare", "bt16_chain_m64_s9", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=148,
+        fixed_layout=False,
+        num_sequences=8,
+        num_heads=12,
+        max_sequence_length=3072,
+    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
+
+
+def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
+    prepare_module = _RecorderModule()
+    chain_module = _RecorderModule()
+    modules = {
+        "bt16_prepare_beta_tma": prepare_module,
+        "bt16_chain_m64_s8": chain_module,
+    }
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: modules[variant],
+    )
+    q = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    factor = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    qk = torch.empty((1, 1, 1, 1, 1), dtype=torch.bfloat16)
+    diag = torch.empty((1, 1, 1, 1), dtype=torch.float32)
+    cu_chunks = torch.tensor([0, 256], dtype=torch.int32)
+    chunk_to_seq = torch.zeros(256, dtype=torch.int32)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_bt16_workspace",
+        lambda **kwargs: (
+            cu_chunks,
+            chunk_to_seq,
+            factor,
+            factor.clone(),
+            factor.clone(),
+            qk,
+            diag,
+            256,
+            760,
+        ),
+    )
+    workspace = SimpleNamespace(
+        _descriptor_signatures={},
+        _descriptor_storages={
+            variant: torch.empty(896, dtype=torch.uint8) for variant in modules
+        },
+    )
+    cu_seqlens = torch.tensor([0, 4096], dtype=torch.int64)
+    seq_order = torch.tensor([0], dtype=torch.int32)
+    state = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+
+    kda_prefill_api._run_bt16_prepare_chain(
+        workspace=workspace,
+        target="sm100f",
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        A_log=torch.empty(64, dtype=torch.float32),
+        dt_bias=torch.empty((64, 128), dtype=torch.float32),
+        cu_seqlens=cu_seqlens,
+        seq_order=seq_order,
+        initial_state=state,
+        out=output,
+        final_state=state,
+        offsets=(0, 4096),
+        num_heads=64,
+        sm_count=152,
+        compute_capability=(10, 3),
+        fixed_layout=True,
+        max_sequence_length=4096,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.125,
+        lower_bound=-5.0,
+        stream_ptr=17,
+        capturing=False,
+    )
+
+    (prepare_args,) = prepare_module.calls
+    assert len(prepare_args) == 21
+    assert prepare_args[6] is cu_seqlens
+    assert prepare_args[7] is cu_chunks
+    assert prepare_args[8] is chunk_to_seq
+    assert prepare_args[15] == 1
+    assert prepare_args[16:21] == (256, 64, -5.0, 760, 17)
+    (chain_args,) = chain_module.calls
+    assert len(chain_args) == 20
+    assert chain_args[6] is cu_seqlens
+    assert chain_args[7] is cu_chunks
+    assert chain_args[8] is seq_order
+    assert chain_args[12].dtype == torch.uint8
+    assert chain_args[13:20] == (1, 64, 1, 1, 0.125, 128, 17)
 
 
 def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
@@ -1135,7 +1330,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
-        (False, 64, "m64"),
+        (False, 64, "m128"),
         (True, 64, "m128"),
         (True, 2, "m128"),
         (False, 12, "m128_n16"),
@@ -2066,6 +2261,136 @@ def test_frozen_small_bh_prefill_cuda_graph_replay_matches_direct_control(
     )
 
 
+def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        seed=2050,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append(variant)
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    actual_output = actual_output.clone()
+    actual_state = actual_state.clone()
+
+    inputs["initial_state"].copy_(initial_state_seed)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert routes[:2] == ["bt16_prepare", "bt16_chain_m64_s9"]
+    assert routes[-1] == "m128"
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_frozen_bt16_scalar_prepare_subgroup_heads_cuda_graph_replay(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=4,
+        packed=False,
+        initial_state=False,
+        seed=2051,
+    )
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
+    torch.testing.assert_close(
+        replay_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), direct_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("non_default_stream", [False, True])
 def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_stream):
@@ -2501,21 +2826,37 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
 
 
 @pytest.mark.parametrize(
-    ("packed", "num_heads", "has_initial_state"),
-    [(False, 64, True), (True, 2, False)],
+    (
+        "packed",
+        "num_heads",
+        "has_initial_state",
+        "seq_lens",
+        "output_final_state",
+        "seed",
+        "compare_eager_control",
+    ),
+    [
+        (False, 64, True, (2,), True, 2028, False),
+        (True, 2, False, (1, 2), True, 2028, False),
+        (True, 96, True, (16,), False, 11018, True),
+    ],
 )
 def test_frozen_prefill_cuda_graph_capture_and_replay(
     flash_kda_device,
     packed,
     num_heads,
     has_initial_state,
+    seq_lens,
+    output_final_state,
+    seed,
+    compare_eager_control,
 ):
     inputs = _make_inputs(
-        seq_lens=[1, 2] if packed else [2],
+        seq_lens=seq_lens,
         num_heads=num_heads,
         packed=packed,
         initial_state=has_initial_state,
-        seed=2028,
+        seed=seed,
     )
     initial_state_seed = (
         inputs["initial_state"].clone() if inputs["initial_state"] is not None else None
@@ -2530,7 +2871,13 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     )
     output = torch.empty_like(inputs["q"])
     seq_order = (
-        torch.tensor([1, 0], dtype=torch.int32, device=flash_kda_device)
+        torch.arange(
+            len(seq_lens) - 1,
+            -1,
+            -1,
+            dtype=torch.int32,
+            device=flash_kda_device,
+        )
         if packed
         else None
     )
@@ -2541,13 +2888,21 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     call_kwargs = {
         **_strict_prefill_kwargs(inputs),
         "output": output,
-        "output_final_state": True,
+        "output_final_state": output_final_state,
         "seq_order": seq_order,
         "prefill_workspace": workspace,
         "backend": "cake",
     }
     with torch.cuda.stream(capture_stream):
-        recurrent_kda(**call_kwargs)
+        warm_output, warm_state = recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+    observed_warm_state = (
+        inputs["initial_state"] if inputs["initial_state"] is not None else warm_state
+    )
+    assert observed_warm_state is not None
+    with torch.cuda.stream(capture_stream):
+        warm_output_control = warm_output.clone()
+        warm_state_control = observed_warm_state.clone()
         if initial_state_seed is not None:
             inputs["initial_state"].copy_(initial_state_seed)
         output.zero_()
@@ -2566,23 +2921,48 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     torch.cuda.synchronize()
 
     assert captured_output.data_ptr() == output.data_ptr()
-    if inputs["initial_state"] is None:
+    if not output_final_state:
+        assert captured_state is None
+    elif inputs["initial_state"] is None:
+        assert captured_state is not None
         assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
     else:
         assert captured_state is inputs["initial_state"]
     assert workspace._captured
-    torch.testing.assert_close(
-        captured_output.float(),
-        expected_output.float(),
-        atol=1e-2,
-        rtol=1e-2,
+    observed_captured_state = (
+        inputs["initial_state"]
+        if inputs["initial_state"] is not None
+        else captured_state
     )
-    torch.testing.assert_close(
-        captured_state.float(),
-        expected_state.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    assert observed_captured_state is not None
+    if compare_eager_control:
+        torch.testing.assert_close(
+            warm_output_control.float(),
+            expected_output.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            warm_state_control.float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        assert torch.equal(captured_output, warm_output_control)
+        assert torch.equal(observed_captured_state, warm_state_control)
+    else:
+        torch.testing.assert_close(
+            captured_output.float(),
+            expected_output.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            observed_captured_state.float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
 
 @pytest.mark.parametrize("num_heads", [12, 64])

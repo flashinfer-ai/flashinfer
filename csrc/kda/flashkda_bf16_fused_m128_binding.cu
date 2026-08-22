@@ -17,6 +17,7 @@
 #include "flashkda_binding_common.cuh"
 
 // See the M64 binding for why the frozen standalone typedefs are isolated.
+#define int8_t flashkda_generated_int8_t
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
 #define uint32_t flashkda_generated_uint32_t
@@ -30,6 +31,7 @@
 #undef CUtensorMap
 #undef FlashKDATensorMapPack
 #undef FlashKDATensorMap
+#undef int8_t
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -40,8 +42,12 @@
 namespace flashinfer {
 namespace flash_kda {
 
-static_assert(THREADS == 1024);
-static_assert(SMEM_TOTAL == 227328);
+// The frozen source declares __launch_bounds__(1024) but no longer emits a
+// duplicate THREADS macro for its host binding.
+constexpr int kThreads = 1024;
+static_assert(STORE_BACKWARD_TAPE == 0);
+static_assert(SPLIT_WORK_ITEMS == 0);
+static_assert(SMEM_TOTAL == 227968);
 
 void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
              TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
@@ -86,7 +92,7 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
   TVM_FFI_ICHECK(grid_x_i64 > 0 && grid_x_i64 <= std::numeric_limits<uint32_t>::max())
       << "M128 FlashKDA grid.x is out of range: " << grid_x_i64;
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
-  const dim3 block(THREADS, 1, 1);
+  const dim3 block(kThreads, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const TmaPointers tma = EncodeTmaPointers<128, 32>(q, k, v, g, beta_tma, out, descriptor_storage,
                                                      prepare_descriptors, stream);
@@ -116,7 +122,16 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(state_checkpoints.data_ptr())),
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())),
       static_cast<int64_t>(beta_token_stride), static_cast<int64_t>(state_slot_stride),
-      static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens));
+      static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens),
+      // The frozen forward/training source retains a private training-only ABI tail even though
+      // STORE_BACKWARD_TAPE and SPLIT_WORK_ITEMS are both fixed to zero in this serving export.
+      // Keep those data pointers null so an accidental use fails validation instead of silently
+      // corrupting a public tensor. TensorMap acquire is emitted for every descriptor argument,
+      // so the final disabled slot deliberately aliases the already valid q descriptor.
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int32_t>(0),
+      static_cast<int32_t>(0),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q));
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 launch");
 }
 

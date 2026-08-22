@@ -33,6 +33,11 @@ FlashKDAVariant = Literal[
     "m128_n16",
     "persistent_m128",
     "small_bh_m128",
+    "bt16_prepare",
+    "bt16_prepare_beta_tma",
+    "bt16_chain_m64_s7",
+    "bt16_chain_m64_s8",
+    "bt16_chain_m64_s9",
 ]
 FlashKDATarget = Literal["sm100a", "sm100f"]
 
@@ -42,6 +47,11 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m128_n16",
     "persistent_m128",
     "small_bh_m128",
+    "bt16_prepare",
+    "bt16_prepare_beta_tma",
+    "bt16_chain_m64_s7",
+    "bt16_chain_m64_s8",
+    "bt16_chain_m64_s9",
 )
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -58,10 +68,15 @@ _FLASH_KDA_TARGET_DEFINE = {
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
-    "m128": "ea022a2f1f",
-    "m128_n16": "ef8b47d690",
+    "m128": "ae83f7331a",
+    "m128_n16": "bfc7b64cd3",
     "persistent_m128": "64bc19d01c",
     "small_bh_m128": "73369168de",
+    "bt16_prepare": "2c6cc4c1f6",
+    "bt16_prepare_beta_tma": "d9394ce430",
+    "bt16_chain_m64_s7": "350dbb8897",
+    "bt16_chain_m64_s8": "9e1ea1ef2d",
+    "bt16_chain_m64_s9": "e83ce16115",
 }
 
 _FLASH_KDA_BINDING_STEMS = {
@@ -70,6 +85,11 @@ _FLASH_KDA_BINDING_STEMS = {
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
     "small_bh_m128": "cake_flashkda_bf16_small_bh_m128",
+    "bt16_prepare": "cake_flashkda_bf16_bt16_prepare",
+    "bt16_prepare_beta_tma": "cake_flashkda_bf16_bt16_prepare_beta_tma",
+    "bt16_chain_m64_s7": "cake_flashkda_bf16_bt16_chain_m64_s7",
+    "bt16_chain_m64_s8": "cake_flashkda_bf16_bt16_chain_m64",
+    "bt16_chain_m64_s9": "cake_flashkda_bf16_bt16_chain_m64_s9",
 }
 
 
@@ -182,6 +202,36 @@ def gen_flash_kda_small_bh_m128_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("small_bh_m128", target)
 
 
+def gen_flash_kda_bt16_prepare_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the scalar-beta BT16 factor-preparation module."""
+
+    return gen_flash_kda_module("bt16_prepare", target)
+
+
+def gen_flash_kda_bt16_prepare_beta_tma_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the beta-TMA BT16 factor-preparation module."""
+
+    return gen_flash_kda_module("bt16_prepare_beta_tma", target)
+
+
+def gen_flash_kda_bt16_chain_m64_s7_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the two-resident S7 BT16 recurrence-chain module."""
+
+    return gen_flash_kda_module("bt16_chain_m64_s7", target)
+
+
+def gen_flash_kda_bt16_chain_m64_s8_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the canonical S8 BT16 recurrence-chain module."""
+
+    return gen_flash_kda_module("bt16_chain_m64_s8", target)
+
+
+def gen_flash_kda_bt16_chain_m64_s9_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the underfilled-grid S9 BT16 recurrence-chain module."""
+
+    return gen_flash_kda_module("bt16_chain_m64_s9", target)
+
+
 @functools.cache
 def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Build or load one physical, target-specific FlashKDA module."""
@@ -221,6 +271,26 @@ def load_flash_kda_small_bh_m128_module(target: FlashKDATarget):
     return load_flash_kda_module("small_bh_m128", target)
 
 
+def load_flash_kda_bt16_prepare_module(target: FlashKDATarget):
+    return load_flash_kda_module("bt16_prepare", target)
+
+
+def load_flash_kda_bt16_prepare_beta_tma_module(target: FlashKDATarget):
+    return load_flash_kda_module("bt16_prepare_beta_tma", target)
+
+
+def load_flash_kda_bt16_chain_m64_s7_module(target: FlashKDATarget):
+    return load_flash_kda_module("bt16_chain_m64_s7", target)
+
+
+def load_flash_kda_bt16_chain_m64_s8_module(target: FlashKDATarget):
+    return load_flash_kda_module("bt16_chain_m64_s8", target)
+
+
+def load_flash_kda_bt16_chain_m64_s9_module(target: FlashKDATarget):
+    return load_flash_kda_module("bt16_chain_m64_s9", target)
+
+
 def get_flash_kda_prefill_module(variant: FlashKDAVariant, target: FlashKDATarget):
     """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
 
@@ -231,6 +301,11 @@ __all__ = [
     "FLASH_KDA_VARIANTS",
     "FlashKDATarget",
     "FlashKDAVariant",
+    "gen_flash_kda_bt16_chain_m64_s7_module",
+    "gen_flash_kda_bt16_chain_m64_s8_module",
+    "gen_flash_kda_bt16_chain_m64_s9_module",
+    "gen_flash_kda_bt16_prepare_beta_tma_module",
+    "gen_flash_kda_bt16_prepare_module",
     "gen_flash_kda_m64_module",
     "gen_flash_kda_m128_module",
     "gen_flash_kda_m128_n16_module",
@@ -244,5 +319,10 @@ __all__ = [
     "load_flash_kda_m128_n16_module",
     "load_flash_kda_persistent_m128_module",
     "load_flash_kda_small_bh_m128_module",
+    "load_flash_kda_bt16_chain_m64_s7_module",
+    "load_flash_kda_bt16_chain_m64_s8_module",
+    "load_flash_kda_bt16_chain_m64_s9_module",
+    "load_flash_kda_bt16_prepare_beta_tma_module",
+    "load_flash_kda_bt16_prepare_module",
     "load_flash_kda_module",
 ]
