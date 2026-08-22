@@ -69,6 +69,15 @@ CUTLASS Fused MoE
 
     cutlass_fused_moe
 
+cuTile Fused MoE
+----------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    CuTileBf16Config
+    CuTileBf16Runner
+
 TensorRT-LLM Fused MoE
 ----------------------
 

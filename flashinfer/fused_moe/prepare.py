@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..tllm_enums import ActivationType
 from ..trace.templates.moe import (
     sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch,
     sm90_mixed_gemm_scale_interleave_trace,
@@ -1234,6 +1235,59 @@ def prepare_cutlass_bf16_weights(
     return {
         "fc1_expert_weights": w1_bf16.to(device).contiguous(),
         "fc2_expert_weights": w2_bf16.to(device).contiguous(),
+    }
+
+
+def prepare_cutile_bf16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the native BF16 weight view for ``CuTileBf16Runner``.
+
+    Gated canonical GEMM1 weights use ``[E, 2I, H]`` in semantic
+    ``[up, gate]`` order; preparation swaps the halves before transposing.
+    Non-gated weights use ``[E, I, H]`` and need only the transpose. GEMM2
+    changes from ``[E, H, I]`` to ``[E, I, H]`` for both activation families.
+    """
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            "prepare_cutile_bf16_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    activation_type = ActivationType(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+        raise ValueError(
+            f"unsupported cuTile BF16 activation {activation_type!r}; expected "
+            "Swiglu or Relu2."
+        )
+    expected_w1 = (
+        num_local_experts,
+        intermediate_size * (2 if activation_type.is_gated else 1),
+        hidden_size,
+    )
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+    w1 = w1_bf16.to(device)
+    if activation_type.is_gated:
+        up, gate = w1.chunk(2, dim=1)
+        w1 = torch.cat((gate, up), dim=1)
+    return {
+        "w1": w1.transpose(1, 2).contiguous(),
+        "w2": w2_bf16.to(device).transpose(1, 2).contiguous(),
     }
 
 

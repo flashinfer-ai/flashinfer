@@ -32,6 +32,7 @@ from .api import (
     B12xW4A16Config,
     CutlassBf16Config,
     CutlassW4A16Config,
+    CuTileBf16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -47,6 +48,7 @@ from .runners import (
     B12xW4A16Runner,
     CutlassBf16Runner,
     CutlassW4A16Runner,
+    CuTileBf16Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
@@ -63,6 +65,7 @@ from .utils import map_to_hybrid_bucket
 _RunnerT = Union[
     CutlassBf16Runner,
     CutlassW4A16Runner,
+    CuTileBf16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
@@ -77,6 +80,7 @@ _RunnerT = Union[
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassBf16Config: CutlassBf16Runner,
     CutlassW4A16Config: CutlassW4A16Runner,
+    CuTileBf16Config: CuTileBf16Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
