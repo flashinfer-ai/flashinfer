@@ -320,6 +320,7 @@ def get_sparse_mla_sm120_module():
         extra_topk_length: Optional[torch.Tensor],
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
+        lse_scale: float,
     ) -> None:
         num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
@@ -360,6 +361,7 @@ def get_sparse_mla_sm120_module():
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
+                lse_scale=lse_scale,
             )
             return
 
@@ -379,6 +381,7 @@ def get_sparse_mla_sm120_module():
                 mid_lse_view,
                 output,
                 out_lse,
+                lse_scale,
                 sm_scale,
                 topk_length=topk_length,
                 attn_sink=attn_sink,
@@ -405,6 +408,7 @@ def get_sparse_mla_sm120_module():
             indices,
             output,
             out_lse,
+            lse_scale,
             sm_scale,
             model_type,
             topk_length,
@@ -439,6 +443,7 @@ def _sparse_mla_sm120_paged_attention(
     extra_topk_length: Optional[torch.Tensor] = None,
     mid_out: Optional[torch.Tensor] = None,
     mid_lse: Optional[torch.Tensor] = None,
+    lse_scale: float = 1.0,
 ) -> None:
     r"""Internal Sparse-MLA paged attention on SM120.
 
@@ -501,6 +506,13 @@ def _sparse_mla_sm120_paged_attention(
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
         ``mid_out`` when the call dispatches to a decode kernel.
+    lse_scale : float
+        Multiplier applied to ``out_lse`` at the store. These kernels compute
+        LSE in base 2, so ``1.0`` (the default) returns base-2 values and
+        ``1 / log2(e)`` converts to base-e. The ``-1e30`` empty-row sentinel is
+        written unscaled, since it is not a log-domain value in either base.
+        Set from ``return_lse_base_on_e`` by
+        ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla``.
 
     Notes
     -----
@@ -527,6 +539,7 @@ def _sparse_mla_sm120_paged_attention(
         extra_topk_length,
         mid_out,
         mid_lse,
+        lse_scale,
     )
 
 
@@ -684,6 +697,7 @@ class _SparseMLAPagedAttentionRunner:
         mid_out: Optional[torch.Tensor] = None,
         mid_lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        lse_scale: float = 1.0,
     ) -> Optional[torch.Tensor]:
         """Run sparse-MLA paged attention.
 
@@ -743,6 +757,7 @@ class _SparseMLAPagedAttentionRunner:
             extra_topk_length=extra_topk_length,
             mid_out=mid_out,
             mid_lse=mid_lse,
+            lse_scale=lse_scale,
         )
         return out_lse_view if return_lse else None
 
@@ -792,6 +807,7 @@ class _SparseMlaDecodeDsv3Runner(TunableRunner):
         q, indices, mid_out, mid_lse, output, out_lse = inputs[:6]
         sm_scale = kwargs["sm_scale"]
         kv_cache = kwargs["kv_cache"]
+        lse_scale = kwargs["lse_scale"]
         if len(inputs) > 6:
             topk_length, attn_sink = inputs[6:8]
         else:
@@ -808,6 +824,7 @@ class _SparseMlaDecodeDsv3Runner(TunableRunner):
             mid_lse,
             output,
             out_lse,
+            lse_scale,
             num_splits,
             sm_scale,
             topk_length,
@@ -870,6 +887,7 @@ def _get_sparse_mla_decode_dsv4_module():
             q, indices, mid_out, mid_lse, output, out_lse = inputs[:6]
             sm_scale = kwargs["sm_scale"]
             kv_cache = kwargs["kv_cache"]
+            lse_scale = kwargs["lse_scale"]
             extra_kv_cache = kwargs.get("extra_kv_cache")
             if len(inputs) > 6:
                 (
@@ -895,6 +913,7 @@ def _get_sparse_mla_decode_dsv4_module():
                 mid_lse,
                 output,
                 out_lse,
+                lse_scale,
                 num_splits,
                 sm_scale,
                 topk_length,
@@ -1125,6 +1144,7 @@ def sparse_mla_sm120_decode_dsv3_2(
     mid_lse: torch.Tensor,
     output: torch.Tensor,
     out_lse: torch.Tensor,
+    lse_scale: float,
     sm_scale: float,
     *,
     topk_length: Optional[torch.Tensor] = None,
@@ -1156,6 +1176,7 @@ def sparse_mla_sm120_decode_dsv3_2(
     forward_kwargs = {
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
+        "lse_scale": lse_scale,
     }
 
     if chunks_per_block is not None:
@@ -1219,6 +1240,7 @@ def sparse_mla_sm120_decode_dsv4(
     output: torch.Tensor,
     out_lse: torch.Tensor,
     sm_scale: float,
+    lse_scale: float,
     *,
     topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
@@ -1294,6 +1316,7 @@ def sparse_mla_sm120_decode_dsv4(
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
         "extra_kv_cache": extra_kv_cache,
+        "lse_scale": lse_scale,
     }
 
     if chunks_per_block is not None:

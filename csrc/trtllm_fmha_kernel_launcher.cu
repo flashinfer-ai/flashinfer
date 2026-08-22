@@ -121,8 +121,8 @@ void trtllm_paged_attention_launcher(
     bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
-    bool uses_spcompress, cudaStream_t stream) {
+    int64_t lse_stride_heads, double lse_scale, int64_t bf16q_fp8kv_transform_mode,
+    bool use_fp16_softmax, bool uses_spcompress, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -294,6 +294,7 @@ void trtllm_paged_attention_launcher(
         sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
         "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
+    runner_params.lseScale = lse_scale;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
   }
@@ -355,8 +356,8 @@ void trtllm_paged_attention_decode(
     int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
-    Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, bool enable_block_sparse_attention,
+    Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, double lse_scale,
+    int64_t lse_stride_tokens, int64_t lse_stride_heads, bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens, int64_t bf16q_fp8kv_transform_mode,
     Optional<bool> use_fp16_softmax) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
@@ -532,8 +533,8 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
-      lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      lse_stride_tokens, lse_stride_heads, lse_scale, bf16q_fp8kv_transform_mode,
+      use_fp16_softmax_value, uses_spcompress_value, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -547,7 +548,8 @@ void trtllm_paged_attention_context(
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
     Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
-    Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
+    Optional<TensorView> lse, double lse_scale, int64_t lse_stride_tokens,
+    int64_t lse_stride_heads) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -676,8 +678,8 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
-      lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      lse_stride_tokens, lse_stride_heads, lse_scale, /*bf16q_fp8kv_transform_mode=*/0,
+      use_fp16_softmax_value, uses_spcompress_value, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -765,6 +767,7 @@ void trtllm_ragged_attention_launcher(
         sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
         "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
+    runner_params.lseScale = 1.0f;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
   }
@@ -1034,8 +1037,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
-      /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, /*use_fp16_softmax=*/false,
-      /*uses_spcompress=*/false, stream);
+      /*lse_stride_heads=*/0, /*lse_scale=*/1.0f, /*bf16q_fp8kv_transform_mode=*/0,
+      /*use_fp16_softmax=*/false, /*uses_spcompress=*/false, stream);
 }
 
 namespace trtllm_cubin_loader {

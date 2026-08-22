@@ -797,7 +797,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge_kernel(
     const bf16* __restrict__ mid_out, const float* __restrict__ mid_lse, bf16* __restrict__ output,
-    float* __restrict__ out_lse,
+    float* __restrict__ out_lse, float lse_scale,
     const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable. natural-log domain.
     int num_tokens, int num_splits) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
@@ -909,7 +909,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
     *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
-    out_lse[(size_t)t_idx * NUM_HEADS + h] = sm_glse;
+    out_lse[(size_t)t_idx * NUM_HEADS + h] = (sm_glse != -1e30f) ? lse_scale * sm_glse : sm_glse;
   }
 }
 

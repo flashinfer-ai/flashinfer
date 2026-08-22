@@ -401,6 +401,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
+        lse_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
@@ -454,6 +455,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type softmax_scale: cutlass.Float32
         :param output_scale: The scale factor for the output
         :type output_scale: cutlass.Float32
+        :param lse_scale: Multiplier applied to the stored LSE. This kernel
+            accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
+            values and ``1.0`` keeps base 2. Plumbed from
+            ``return_lse_base_on_e`` on the public MLA decode API.
+        :type lse_scale: cutlass.Float32
         :param stream: The CUDA stream to execute the kernel on
         :type stream: cuda.CUstream
 
@@ -988,6 +994,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             block_split_kvs,
             softmax_scale_log2,
             output_scale,
+            lse_scale,
             q_latent_smem_layout_staged,
             q_rope_smem_layout_staged,
             kc_latent_smem_layout_staged,
@@ -1019,6 +1026,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cache_seqs,
                 cum_seq_lens_q,
                 block_split_kvs,
+                lse_scale,
             ).launch(
                 grid=(
                     o_unpacked.shape[0] * self.reducer_d_tiles,
@@ -1098,6 +1106,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        lse_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
         q_rope_smem_layout_staged: cute.ComposedLayout,
         kc_latent_smem_layout_staged: cute.ComposedLayout,
@@ -1173,6 +1182,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type softmax_scale_log2: cutlass.Float32
         :param output_scale: The scale factor for the output
         :type output_scale: cutlass.Float32
+        :param lse_scale: Multiplier applied to the stored LSE. This kernel
+            accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
+            values and ``1.0`` keeps base 2. Plumbed from
+            ``return_lse_base_on_e`` on the public MLA decode API.
+        :type lse_scale: cutlass.Float32
         :param q_latent_smem_layout_staged: Shared memory layout for query tensor
         :type q_latent_smem_layout_staged: cute.ComposedLayout
         :param q_rope_smem_layout_staged: Shared memory layout for query rope tensor
@@ -1837,6 +1851,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         softmax_scale_log2=softmax_scale_log2,
                         mAccLSE=mAccLSE,
                         mLSE=mLSE,
+                        lse_scale=lse_scale,
                     )
                     p_cor_consumer_state, mma_o_consumer_state = self.correction(
                         compute_common_params,
@@ -1923,6 +1938,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cache_seqs: cute.Tensor,
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
+        lse_scale: cutlass.Float32,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
@@ -1941,6 +1957,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
         :type block_split_kvs: cute.Tensor
+        :param lse_scale: Multiplier applied to the stored LSE. This kernel
+            accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
+            values and ``1.0`` keeps base 2. Plumbed from
+            ``return_lse_base_on_e`` on the public MLA decode API.
+        :type lse_scale: cutlass.Float32
         """
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -2032,9 +2053,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 if d_tile_idx == 0:
                     if tidx == 0:
                         if cutlass.const_expr(self.is_var_q):
-                            mLSE[head_idx, q_begin + bidy] = global_lse * (1.0 / LOG2_E)
+                            mLSE[head_idx, q_begin + bidy] = global_lse * lse_scale
                         else:
-                            mLSE[head_idx, bidy, bidz] = global_lse * (1.0 / LOG2_E)
+                            mLSE[head_idx, bidy, bidz] = global_lse * lse_scale
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_kv_idx = tidx + i * self.threads_per_warp
                     if cute.elem_less(split_kv_idx, local_split_kv):
@@ -4309,11 +4330,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if cutlass.const_expr(self.enable_dcp):
                 lse = lse if row_has_valid_key else -self.lse_dtype.inf
             # When writing directly to the user-facing mLSE (single-tile,
-            # no split-KV merge), convert from log2 base to natural log.
+            # no split-KV merge), apply the callers base conversion.
             # When writing the per-split intermediate (mAccLSE branch), keep
             # log2 base so the merge code above can use exp2 / log2 ops.
             if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                lse = lse * (1.0 / LOG2_E)
+                lse = lse * epilogue_params.lse_scale
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
                     gLSE[tidx] = lse

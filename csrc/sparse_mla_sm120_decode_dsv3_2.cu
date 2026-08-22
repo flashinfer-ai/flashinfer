@@ -34,8 +34,8 @@ template <ModelType MT, int NUM_HEADS, int TOPK>
 static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
                                       const int32_t* indices, bf16* mid_out, float* mid_lse,
                                       const int* topk_length, bf16* output, float* out_lse,
-                                      const float* attn_sink, int num_tokens, int num_splits,
-                                      int chunks_per_block_override, float sm_scale,
+                                      float lse_scale, const float* attn_sink, int num_tokens,
+                                      int num_splits, int chunks_per_block_override, float sm_scale,
                                       size_t stride_kv_block, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576);
@@ -118,8 +118,8 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   dim3 grid2(num_tokens, NUM_HEADS);
   dim3 block2(MERGE_BLOCK_THREADS);
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
-  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(mid_out, mid_lse, output, out_lse,
-                                                            attn_sink, num_tokens, num_splits);
+  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
+      mid_out, mid_lse, output, out_lse, lse_scale, attn_sink, num_tokens, num_splits);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
   return true;
 }
@@ -129,15 +129,17 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
-                                     bf16* output, float* out_lse, const int* topk_length,
-                                     const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
+                                     bf16* output, float* out_lse, float lse_scale,
+                                     const int* topk_length, const float* attn_sink,
+                                     int chunks_per_block_override, float sm_scale,
+                                     size_t stride_kv_block, cudaStream_t stream) {
   if (num_splits <= 0) return false;
-#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                     \
-  if (num_heads == (H) && topk == (K)) {                                                       \
-    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                      \
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
-        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
+#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                       \
+  if (num_heads == (H) && topk == (K)) {                                                         \
+    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                        \
+        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, lse_scale,         \
+        attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
+        stream);                                                                                 \
   }
 #define DSV3_2_DISPATCH(H, K)                      \
   do {                                             \
