@@ -87,29 +87,26 @@ void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
       << name << " must be on the same CUDA device as value";
 }
 
-void QuantizeValue(TensorView value, TensorView base, TensorView residual,
-                   TensorView base_scale_lo, TensorView base_scale_hi,
-                   TensorView residual_scale_lo, TensorView residual_scale_hi) {
+void QuantizeValue(TensorView value, TensorView base, TensorView residual, TensorView base_scale_lo,
+                   TensorView base_scale_hi, TensorView residual_scale_lo,
+                   TensorView residual_scale_hi) {
   CHECK_INPUT_AND_TYPE(value, dl_bfloat16);
   const int32_t device_id = value.device().device_id;
-  CheckExactTensor(value, "value", dl_bfloat16,
-                   {kBatch, kSequence, kHeads, kHeadDim}, device_id);
+  CheckExactTensor(value, "value", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
   CheckExactTensor(base, "base", dl_uint8, {kValueRows, kPackedColumns}, device_id);
-  CheckExactTensor(residual, "residual", dl_uint8,
-                   {kValueRows, kPackedColumns}, device_id);
-  CheckExactTensor(base_scale_lo, "base_scale_lo", dl_uint8,
-                   {kScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(base_scale_hi, "base_scale_hi", dl_uint8,
-                   {kScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(residual_scale_lo, "residual_scale_lo", dl_uint8,
-                   {kScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(residual_scale_hi, "residual_scale_hi", dl_uint8,
-                   {kScaleRows, kScaleColumns}, device_id);
+  CheckExactTensor(residual, "residual", dl_uint8, {kValueRows, kPackedColumns}, device_id);
+  CheckExactTensor(base_scale_lo, "base_scale_lo", dl_uint8, {kScaleRows, kScaleColumns},
+                   device_id);
+  CheckExactTensor(base_scale_hi, "base_scale_hi", dl_uint8, {kScaleRows, kScaleColumns},
+                   device_id);
+  CheckExactTensor(residual_scale_lo, "residual_scale_lo", dl_uint8, {kScaleRows, kScaleColumns},
+                   device_id);
+  CheckExactTensor(residual_scale_hi, "residual_scale_hi", dl_uint8, {kScaleRows, kScaleColumns},
+                   device_id);
 
   ffi::CUDADeviceGuard device_guard(device_id);
   const cudaStream_t stream = get_stream(value.device());
-  kernel_wan_hybrid_quantize_value<<<dim3(kGridX, 1, 1), dim3(THREADS, 1, 1),
-                                     SMEM_TOTAL, stream>>>(
+  kernel_wan_hybrid_quantize_value<<<dim3(kGridX, 1, 1), dim3(THREADS, 1, 1), SMEM_TOTAL, stream>>>(
       static_cast<__nv_bfloat16*>(value.data_ptr()),
       static_cast<wan_hybrid_generated_uint8_t*>(base.data_ptr()),
       static_cast<wan_hybrid_generated_uint8_t*>(residual.data_ptr()),
@@ -122,12 +119,10 @@ void QuantizeValue(TensorView value, TensorView base, TensorView residual,
       static_cast<wan_hybrid_generated_int32_t>(kPaddedSequence),
       static_cast<wan_hybrid_generated_int32_t>(kLogicalBlocks),
       static_cast<wan_hybrid_generated_int32_t>(kPhysicalBlocks));
-  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
-      << "wan_hybrid_quantize_value launch failed";
+  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess) << "wan_hybrid_quantize_value launch failed";
 }
 
 }  // namespace wan_hybrid
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(wan_hybrid_quantize_value,
-                              flashinfer::wan_hybrid::QuantizeValue);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wan_hybrid_quantize_value, flashinfer::wan_hybrid::QuantizeValue);

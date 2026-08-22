@@ -81,8 +81,7 @@ static_assert(sizeof(CUtensorMap) == kTensorMapBytes);
 static_assert(sizeof(wan_hybrid_generated_TensorMap) == kTensorMapBytes);
 
 void CheckCuda(cudaError_t status, const char* operation) {
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << operation << " failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
 void CheckDriver(CUresult status, const char* operation) {
@@ -163,21 +162,21 @@ void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorVie
   std::array<CUtensorMap, kTensorMapCount> maps{
       EncodeNHD(q, 128, "cuTensorMapEncodeTiled(q)"),
       EncodeNHD(k, 64, "cuTensorMapEncodeTiled(k)"),
-      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 64,
-               CU_TENSOR_MAP_SWIZZLE_64B, "cuTensorMapEncodeTiled(vt)"),
+      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 64, CU_TENSOR_MAP_SWIZZLE_64B,
+               "cuTensorMapEncodeTiled(vt)"),
       Encode2D(sfq, kScaleColumns, kScaleRows, 32, 32, CU_TENSOR_MAP_SWIZZLE_NONE,
                "cuTensorMapEncodeTiled(sfq)"),
       Encode2D(sfk, kScaleColumns, kScaleRows, 32, 32, CU_TENSOR_MAP_SWIZZLE_NONE,
                "cuTensorMapEncodeTiled(sfk)"),
-      Encode2D(sfvt_lo, kScaleColumns, kValueScaleRows, 32, 16,
-               CU_TENSOR_MAP_SWIZZLE_NONE, "cuTensorMapEncodeTiled(sfvt_lo)"),
-      Encode2D(sfvt_hi, kScaleColumns, kValueScaleRows, 32, 16,
-               CU_TENSOR_MAP_SWIZZLE_NONE, "cuTensorMapEncodeTiled(sfvt_hi)"),
+      Encode2D(sfvt_lo, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
+               "cuTensorMapEncodeTiled(sfvt_lo)"),
+      Encode2D(sfvt_hi, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
+               "cuTensorMapEncodeTiled(sfvt_hi)"),
       EncodeNHD(out, 128, "cuTensorMapEncodeTiled(out)"),
   };
-  CheckCuda(cudaMemcpy(descriptor_storage.data_ptr(), maps.data(), sizeof(maps),
-                       cudaMemcpyHostToDevice),
-            "cudaMemcpy(wan_hybrid tensor maps)");
+  CheckCuda(
+      cudaMemcpy(descriptor_storage.data_ptr(), maps.data(), sizeof(maps), cudaMemcpyHostToDevice),
+      "cudaMemcpy(wan_hybrid tensor maps)");
 }
 
 void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, TensorView sfk,
@@ -211,16 +210,16 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   }
 
   int multiprocessor_count = 0;
-  CheckCuda(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount,
-                                   device_id),
-            "cudaDeviceGetAttribute(multiProcessorCount)");
+  CheckCuda(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id),
+      "cudaDeviceGetAttribute(multiProcessorCount)");
   const int grid_x = 2 * std::min(multiprocessor_count / 2, static_cast<int>(kMaximumTiles));
   TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least two SMs";
 
   auto* descriptor_bytes = static_cast<uint8_t*>(descriptor_storage.data_ptr());
   auto tensor_map = [descriptor_bytes](int index) {
-    return reinterpret_cast<const wan_hybrid_generated_TensorMap*>(
-        descriptor_bytes + index * kTensorMapBytes);
+    return reinterpret_cast<const wan_hybrid_generated_TensorMap*>(descriptor_bytes +
+                                                                   index * kTensorMapBytes);
   };
   const auto* q_map = tensor_map(0);
   const auto* k_map = tensor_map(1);
@@ -254,10 +253,9 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   config.attrs = attributes;
   config.numAttrs = 2;
 
-  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map, k_map, vt_map,
-                               sfq_map, sfk_map, sfvt_lo_map, sfvt_hi_map, correction, out_map,
-                               seqlen_q, seqlen_kv, q_stride, kv_stride, softmax_scale_log2,
-                               heads, total_bh),
+  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map, k_map, vt_map, sfq_map,
+                               sfk_map, sfvt_lo_map, sfvt_hi_map, correction, out_map, seqlen_q,
+                               seqlen_kv, q_stride, kv_stride, softmax_scale_log2, heads, total_bh),
             "wan_hybrid_attention launch");
 }
 

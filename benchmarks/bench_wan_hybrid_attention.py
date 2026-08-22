@@ -36,9 +36,7 @@ def _require_cupti() -> str:
         raise RuntimeError("cupti-python is required for this benchmark") from error
     cupti_version = distribution_version("cupti-python")
     if int(cupti_version.split(".", maxsplit=1)[0]) < 13:
-        raise RuntimeError(
-            f"cupti-python>=13 is required, found {cupti_version}"
-        )
+        raise RuntimeError(f"cupti-python>=13 is required, found {cupti_version}")
     return cupti_version
 
 
@@ -184,12 +182,16 @@ def main() -> None:
     q_hnd = q.permute(0, 2, 1, 3)
     k_hnd = k.permute(0, 2, 1, 3)
     v_hnd = v.permute(0, 2, 1, 3)
-    reference = F.scaled_dot_product_attention(
-        q_hnd,
-        k_hnd,
-        v_hnd,
-        scale=softmax_scale,
-    ).permute(0, 2, 1, 3).contiguous()
+    reference = (
+        F.scaled_dot_product_attention(
+            q_hnd,
+            k_hnd,
+            v_hnd,
+            scale=softmax_scale,
+        )
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
     quality = _quality(out_candidate, reference)
     fa4_quality = _quality(out_fa4, reference)
 
@@ -200,9 +202,7 @@ def main() -> None:
     allocated_after = torch.cuda.memory_allocated(device)
     allocation_stable = allocated_after == allocated_before
 
-    orders = [
-        _measure_order(order, candidate_fn, fa4_fn) for order in _PAIRED_ORDERS
-    ]
+    orders = [_measure_order(order, candidate_fn, fa4_fn) for order in _PAIRED_ORDERS]
     passed = bool(
         quality["passed"]
         and repeat_bitwise

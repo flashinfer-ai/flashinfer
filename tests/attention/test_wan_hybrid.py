@@ -57,8 +57,7 @@ def _uninitialized_workspace() -> wan_hybrid.WanHybridAttentionWorkspace:
 
 def test_wan_hybrid_public_exports() -> None:
     assert (
-        flashinfer.WanHybridAttentionWorkspace
-        is wan_hybrid.WanHybridAttentionWorkspace
+        flashinfer.WanHybridAttentionWorkspace is wan_hybrid.WanHybridAttentionWorkspace
     )
     assert (
         flashinfer.is_wan_hybrid_attention_available
@@ -191,12 +190,8 @@ def test_wan_hybrid_quantizer_dispatches_cache_by_value_device(monkeypatch) -> N
         loaded_targets.append(target)
         return Module(target)
 
-    monkeypatch.setattr(
-        wan_hybrid, "_wan_hybrid_quantization_target", resolve_target
-    )
-    monkeypatch.setattr(
-        wan_hybrid, "_get_wan_hybrid_quantization_module", load_module
-    )
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_quantization_target", resolve_target)
+    monkeypatch.setattr(wan_hybrid, "_get_wan_hybrid_quantization_module", load_module)
     value = torch.empty((), dtype=torch.bfloat16, device="meta")
     outputs = [torch.empty((), dtype=torch.uint8, device="meta") for _ in range(6)]
 
@@ -227,9 +222,7 @@ def test_wan_hybrid_workspace_requires_cuda() -> None:
 @pytest.mark.parametrize("name", ["q", "k", "v", "out"])
 def test_wan_hybrid_rejects_non_exact_shape(name: str) -> None:
     tensors = {key: _meta_tensor() for key in ("q", "k", "v", "out")}
-    tensors[name] = torch.empty(
-        (1, 4799, 40, 128), device="meta", dtype=torch.bfloat16
-    )
+    tensors[name] = torch.empty((1, 4799, 40, 128), device="meta", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=rf"{name} must have NHD shape"):
         wan_hybrid.wan_hybrid_attention(
             tensors["q"],
@@ -496,8 +489,7 @@ def test_wan_hybrid_workspace_uses_exact_reusable_quantizer_storage() -> None:
             == scale_residual.untyped_storage().data_ptr()
         )
         assert scale_residual.data_ptr() == (
-            scale_base.data_ptr()
-            + scale_base.numel() * scale_base.element_size()
+            scale_base.data_ptr() + scale_base.numel() * scale_base.element_size()
         )
 
     views = workspace._attention_abi_views
@@ -540,7 +532,9 @@ def test_wan_hybrid_value_quantization_matches_reference_and_reuses_storage(
     repeated = wan_hybrid._quantize_wan_hybrid_value(v, workspace)
 
     assert tuple(tensor.data_ptr() for tensor in repeated) == pointers
-    for actual_tensor, repeated_tensor, first_tensor in zip(actual, repeated, first):
+    for actual_tensor, repeated_tensor, first_tensor in zip(
+        actual, repeated, first, strict=True
+    ):
         assert actual_tensor is repeated_tensor
         assert torch.equal(repeated_tensor, first_tensor)
     assert torch.equal(
@@ -553,9 +547,9 @@ def test_wan_hybrid_value_quantization_matches_reference_and_reuses_storage(
     )
     reconstructed = _decode_split_level(actual[0], actual[2], actual[3])
     reconstructed += _decode_split_level(actual[1], actual[4], actual[5])
-    expected_values = v.permute(0, 2, 3, 1).reshape(
-        _VALUE_ROWS, _EXACT_SHAPE[1]
-    ).float()
+    expected_values = (
+        v.permute(0, 2, 3, 1).reshape(_VALUE_ROWS, _EXACT_SHAPE[1]).float()
+    )
     delta = (reconstructed - expected_values).abs()
     cosine = torch.nn.functional.cosine_similarity(
         reconstructed.flatten(), expected_values.flatten(), dim=0
@@ -623,26 +617,28 @@ def test_wan_hybrid_value_quantization_cuda_graph_replay() -> None:
 
     assert any(
         not torch.equal(replayed_tensor, eager_tensor)
-        for replayed_tensor, eager_tensor in zip(replayed, eager_snapshot)
+        for replayed_tensor, eager_tensor in zip(replayed, eager_snapshot, strict=True)
     )
-    for replayed_tensor, reference_tensor in zip(replayed, reference):
+    for replayed_tensor, reference_tensor in zip(replayed, reference, strict=True):
         assert torch.equal(replayed_tensor, reference_tensor)
 
 
 def _wan_hybrid_bf16_reference(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
-    return torch.nn.functional.scaled_dot_product_attention(
-        q.permute(0, 2, 1, 3),
-        k.permute(0, 2, 1, 3),
-        v.permute(0, 2, 1, 3),
-        scale=_EXACT_SHAPE[-1] ** -0.5,
-    ).permute(0, 2, 1, 3).contiguous()
+    return (
+        torch.nn.functional.scaled_dot_product_attention(
+            q.permute(0, 2, 1, 3),
+            k.permute(0, 2, 1, 3),
+            v.permute(0, 2, 1, 3),
+            scale=_EXACT_SHAPE[-1] ** -0.5,
+        )
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
 
 
-def _assert_wan_hybrid_quality(
-    actual: torch.Tensor, expected: torch.Tensor
-) -> dict:
+def _assert_wan_hybrid_quality(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     actual_f32 = actual.float()
     expected_f32 = expected.float()
     delta = (actual_f32 - expected_f32).abs()
@@ -669,8 +665,7 @@ def test_wan_hybrid_attention_correctness_repeatability_and_reuse() -> None:
     _require_wan_hybrid_gpu()
     torch.manual_seed(4254)
     q, k, v = (
-        torch.randn(_EXACT_SHAPE, dtype=torch.bfloat16, device="cuda")
-        for _ in range(3)
+        torch.randn(_EXACT_SHAPE, dtype=torch.bfloat16, device="cuda") for _ in range(3)
     )
     out = torch.empty_like(q)
     workspace = wan_hybrid.WanHybridAttentionWorkspace(q.device)
@@ -679,9 +674,7 @@ def test_wan_hybrid_attention_correctness_repeatability_and_reuse() -> None:
         tensor.data_ptr() for tensor in workspace._buffers.values()
     ) + (workspace._descriptor_storage.data_ptr(),)
 
-    result = wan_hybrid.wan_hybrid_attention(
-        q, k, v, out=out, workspace=workspace
-    )
+    result = wan_hybrid.wan_hybrid_attention(q, k, v, out=out, workspace=workspace)
     torch.cuda.synchronize(q.device)
     assert result is out
     first = out.clone()
@@ -694,7 +687,7 @@ def test_wan_hybrid_attention_correctness_repeatability_and_reuse() -> None:
     repeat_bitwise = bool(torch.equal(out, first))
     input_immutable = all(
         torch.equal(actual, expected)
-        for actual, expected in zip((q, k, v), inputs_before)
+        for actual, expected in zip((q, k, v), inputs_before, strict=True)
     )
     workspace_pointers_stable = workspace_pointers == tuple(
         tensor.data_ptr() for tensor in workspace._buffers.values()
@@ -730,8 +723,7 @@ def test_wan_hybrid_attention_cuda_graph_replay() -> None:
     _require_wan_hybrid_gpu()
     torch.manual_seed(4254)
     q, k, v = (
-        torch.randn(_EXACT_SHAPE, dtype=torch.bfloat16, device="cuda")
-        for _ in range(3)
+        torch.randn(_EXACT_SHAPE, dtype=torch.bfloat16, device="cuda") for _ in range(3)
     )
     out = torch.empty_like(q)
     workspace = wan_hybrid.WanHybridAttentionWorkspace(q.device)
@@ -757,7 +749,7 @@ def test_wan_hybrid_attention_cuda_graph_replay() -> None:
 
     input_immutable = all(
         torch.equal(actual, expected)
-        for actual, expected in zip((q, k, v), updated_inputs)
+        for actual, expected in zip((q, k, v), updated_inputs, strict=True)
     )
     output_changed = not torch.equal(out, prewarm_output)
     assert captured is out

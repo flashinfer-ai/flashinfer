@@ -266,13 +266,10 @@ def _validate_tensor_metadata(name: str, tensor: torch.Tensor) -> None:
         raise TypeError(f"{name} must be a torch.Tensor")
     if tuple(tensor.shape) != _WAN_HYBRID_SHAPE:
         raise ValueError(
-            f"{name} must have NHD shape {_WAN_HYBRID_SHAPE}, "
-            f"got {tuple(tensor.shape)}"
+            f"{name} must have NHD shape {_WAN_HYBRID_SHAPE}, got {tuple(tensor.shape)}"
         )
     if tensor.dtype != torch.bfloat16:
-        raise ValueError(
-            f"{name} must have dtype torch.bfloat16, got {tensor.dtype}"
-        )
+        raise ValueError(f"{name} must have dtype torch.bfloat16, got {tensor.dtype}")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous, got stride={tensor.stride()}")
 

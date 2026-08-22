@@ -25,9 +25,7 @@ def main() -> None:
         raise RuntimeError("cupti-python is required for this benchmark") from error
     cupti_version = distribution_version("cupti-python")
     if int(cupti_version.split(".", maxsplit=1)[0]) < 13:
-        raise RuntimeError(
-            f"cupti-python>=13 is required, found {cupti_version}"
-        )
+        raise RuntimeError(f"cupti-python>=13 is required, found {cupti_version}")
 
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device)
