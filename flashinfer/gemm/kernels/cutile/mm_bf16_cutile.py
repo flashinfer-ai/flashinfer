@@ -36,6 +36,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ._tune_select import rank_measurements
+
 
 def _cdiv(a: int, b: int) -> int:
     """Ceiling division helper."""
@@ -256,6 +258,21 @@ def _autotune_configs(device=None):
                         occupancy=occupancy,
                         EPILOGUE_SUBTILE=0,
                     )
+
+
+def _config_sort_key(cfg):
+    """Deterministic tie-break order: prefer the config that launches the
+    fewest CTAs, then the smallest tile. Extra occupancy only adds no-op
+    CTAs when the tile count already covers the grid."""
+    return (
+        cfg.occupancy,
+        cfg.num_ctas,
+        cfg.BLOCK_M * cfg.BLOCK_N,
+        cfg.BLOCK_M,
+        cfg.BLOCK_K,
+        cfg.GROUP_SIZE_M,
+        cfg.EPILOGUE_SUBTILE,
+    )
 
 
 def _default_kernel_config(device=None):
@@ -514,8 +531,9 @@ def _gemm_alpha_beta_cutile(
             # exhaustive_search ranks configs by latency only — it does not
             # verify numerical correctness. We've observed configurations that
             # complete in measurable time but produce NaN on specific shape
-            # combinations. Walk the success list from fastest to slowest and
-            # pick the first config whose output is NaN/Inf-free.
+            # combinations. Walk the success list (fastest first, statistical
+            # ties broken deterministically) and pick the first config whose
+            # output is NaN/Inf-free.
             #
             # A reference is computed from torch.mm on the same inputs; we
             # accept the cfg if its output matches the reference's overall
@@ -523,7 +541,7 @@ def _gemm_alpha_beta_cutile(
             # cosine-similarity threshold here — the kernel itself is bit-
             # identical to TileGym's verified version, so any genuine
             # correctness mismatch would surface differently.
-            ranked = sorted(result.successes, key=lambda m: m.mean_us)
+            ranked = rank_measurements(result.successes, _config_sort_key)
             best_cfg = None
             tuned_kernel = None
             # Reuse the pre-allocated ``autotune_out`` rather than allocating
@@ -593,13 +611,13 @@ def _gemm_alpha_beta_cutile(
 
             if best_cfg is None:
                 # All autotune candidates produced NaN/Inf or failed at probe
-                # time. Fall back to exhaustive_search's nominal best so we
-                # still launch something — it at least completed one timed
-                # run successfully. Mirrors bmm.py. We deliberately avoid
+                # time. Fall back to the top-ranked config so we still launch
+                # something — it at least completed one timed run
+                # successfully. Mirrors bmm.py. We deliberately avoid
                 # ``_default_kernel_config`` here because its hand-picked
                 # shape (BLOCK_M=256 on sm100) is not guaranteed to work for
                 # rare small-M shapes the autotune space already covered.
-                best_cfg = result.best.config
+                best_cfg = ranked[0].config
                 tuned_kernel = _gemm_alpha_beta_kernel_cutile.replace_hints(
                     num_ctas=best_cfg.num_ctas,
                     occupancy=best_cfg.occupancy,
