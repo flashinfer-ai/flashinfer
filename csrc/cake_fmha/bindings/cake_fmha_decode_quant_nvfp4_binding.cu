@@ -5,14 +5,14 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_quant_nvfp4(const void* Qt, const void* Kp, const void* Vp, const void* Ksf, const void* Vsf, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
+extern "C" __global__ void kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* Kp, CakeFmhaTensorMap const* Vp, CakeFmhaTensorMap const* Ksf, CakeFmhaTensorMap const* Vsf, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_nvfp4(
-    const void* Qt,
-    const void* Kp,
-    const void* Vp,
-    const void* Ksf,
-    const void* Vsf,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* Kp,
+    CakeFmhaTensorMap const* Vp,
+    CakeFmhaTensorMap const* Ksf,
+    CakeFmhaTensorMap const* Vsf,
     uint8_t* O,
     int* page_table,
     int* seq_lens_kv,

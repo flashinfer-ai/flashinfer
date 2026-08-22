@@ -9,6 +9,11 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
+struct __align__(128) CakeFmhaTensorMap { uint64_t opaque[16]; };
+template <int N>
+struct __align__(128) CakeFmhaTensorMapPack { CakeFmhaTensorMap maps[N]; };
+
+typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
@@ -66,8 +71,12 @@ typedef short int          int16_t;
 #ifndef L2_SWIZZLE
 #define L2_SWIZZLE 8
 #endif
+#define STATIC_ONE_TILE 0
 #define RETURN_LSE 1
 #define ENABLE_SINK 0
+#define UNIFORM_Q_LEN -1
+#define UNIFORM_KV_LEN -1
+#define SINGLE_MASK_LOOP 0
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
@@ -75,6 +84,7 @@ typedef short int          int16_t;
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 16
 #endif
+#define KV_TOK_CHUNK 16
 
 #include <math_constants.h>
 
@@ -209,19 +219,21 @@ __device__ __forceinline__ void mma_ss_step(
 
 
 __device__ __forceinline__ void mma_ts_step(
-    int taddr_out, int taddr_a, int b_lo, uint32_t i_desc, int enable_d) {
+    int taddr_out, int taddr_a, int b_lo, uint32_t b_dhi,
+    uint32_t i_desc, int enable_d) {
     asm volatile(
         "{\n\t"
         ".reg .pred leader, p;\n\t"
         ".reg .b32 dhi;\n\t"
         ".reg .b64 db;\n\t"
         "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 dhi, 0x40004040;\n\t"
+        "setp.ne.b32 p, %5, 0;\n\t"
+        "mov.b32 dhi, %3;\n\t"
         "mov.b64 db, {%2, dhi};\n\t"
-        "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], db, %3, p;\n\t"
+        "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], db, %4, p;\n\t"
         "}\n"
-        :: "r"(taddr_out), "r"(taddr_a), "r"(b_lo), "r"(i_desc), "r"(enable_d));
+        :: "r"(taddr_out), "r"(taddr_a), "r"(b_lo), "r"(b_dhi),
+           "r"(i_desc), "r"(enable_d));
 }
 
 
@@ -306,16 +318,6 @@ __device__ __forceinline__ void tmem_st_x16_f32(int tmem_addr, const float* src)
            "f"(src[4]),  "f"(src[5]),  "f"(src[6]),  "f"(src[7]),
            "f"(src[8]),  "f"(src[9]),  "f"(src[10]), "f"(src[11]),
            "f"(src[12]), "f"(src[13]), "f"(src[14]), "f"(src[15]));
-}
-
-
-__device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count, uint32_t pred) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %2, 0;\n\t"
-        "@p mbarrier.init.shared::cta.b64 [%0], %1;\n\t"
-        "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
 }
 
 
@@ -495,6 +497,23 @@ __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
     return r;
 }
 
+__device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
+    float2 r;
+    asm volatile("{\n\t"
+        ".reg .f32 _c0, _c1;\n\t"
+        ".reg .b64 _neg_c;\n\t"
+        "mov.b64 {_c0, _c1}, %3;\n\t"
+        "neg.f32 _c0, _c0;\n\t"
+        "neg.f32 _c1, _c1;\n\t"
+        "mov.b64 _neg_c, {_c0, _c1};\n\t"
+        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
+        "}\n"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
+          "l"(*(unsigned long long*)&c));
+    return r;
+}
+
 __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
     float2 r;
     asm("mul.rn.ftz.f32x2 %0, %1, %2;"
@@ -573,7 +592,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict__ K, const void* __restrict__ V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter)
+kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -585,6 +604,13 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    if (tid == 0) {
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(Q)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V)) : "memory");
+    }
+    __syncthreads();
+
 
     // Kernel setup ops
     float* sScale = reinterpret_cast<float*>(smem_raw + 1024);
@@ -607,71 +633,74 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
-        // q_full: 2 barriers, init_count=1
-        mbarrier_init_pred(smem + 0, 1, leader);
-        mbarrier_init_pred(smem + 8, 1, leader);
-        // --- pipeline 'kv' ---
-        // kv_full: 3 barriers, init_count=1
-        mbarrier_init_pred(smem + 16, 1, leader);
-        mbarrier_init_pred(smem + 24, 1, leader);
-        mbarrier_init_pred(smem + 32, 1, leader);
-        // kv_empty: 3 barriers, init_count=1
-        mbarrier_init_pred(smem + 40, 1, leader);
-        mbarrier_init_pred(smem + 48, 1, leader);
-        mbarrier_init_pred(smem + 56, 1, leader);
-        // s_full: 2 barriers, init_count=1
-        mbarrier_init_pred(smem + 64, 1, leader);
-        mbarrier_init_pred(smem + 72, 1, leader);
-        // p_full: 2 barriers, init_count=256
-        mbarrier_init_pred(smem + 80, 256, leader);
-        mbarrier_init_pred(smem + 88, 256, leader);
-        // p_full_2: 2 barriers, init_count=128
-        mbarrier_init_pred(smem + 96, 128, leader);
-        mbarrier_init_pred(smem + 104, 128, leader);
-        // corr_sig: 2 barriers, init_count=128
-        mbarrier_init_pred(smem + 112, 128, leader);
-        mbarrier_init_pred(smem + 120, 128, leader);
-        // corr_done: 2 barriers, init_count=128
-        mbarrier_init_pred(smem + 128, 128, leader);
-        mbarrier_init_pred(smem + 136, 128, leader);
-        // order_p01_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 144, 128, leader);
-        // order_p01_1: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 152, 128, leader);
-        // o_full: 2 barriers, init_count=1
-        mbarrier_init_pred(smem + 160, 1, leader);
-        mbarrier_init_pred(smem + 168, 1, leader);
-        // q_empty: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 176, 1, leader);
-        // --- pipeline 'po' ---
-        // page_full: 6 barriers, init_count=1
-        mbarrier_init_pred(smem + 184, 1, leader);
-        mbarrier_init_pred(smem + 192, 1, leader);
-        mbarrier_init_pred(smem + 200, 1, leader);
-        mbarrier_init_pred(smem + 208, 1, leader);
-        mbarrier_init_pred(smem + 216, 1, leader);
-        mbarrier_init_pred(smem + 224, 1, leader);
-        // page_empty: 6 barriers, init_count=1
-        mbarrier_init_pred(smem + 232, 1, leader);
-        mbarrier_init_pred(smem + 240, 1, leader);
-        mbarrier_init_pred(smem + 248, 1, leader);
-        mbarrier_init_pred(smem + 256, 1, leader);
-        mbarrier_init_pred(smem + 264, 1, leader);
-        mbarrier_init_pred(smem + 272, 1, leader);
-        // work_id_full: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 280, 1, leader);
-        // work_id_empty: 1 barriers, init_count=15
-        mbarrier_init_pred(smem + 288, 15, leader);
-        asm volatile("fence.mbarrier_init.release.cluster;");
+        if (leader) {
+            // q_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            mbarrier_init(smem + 8, 1);
+            // --- pipeline 'kv' ---
+            // kv_full: 3 barriers, init_count=1
+            mbarrier_init(smem + 16, 1);
+            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 32, 1);
+            // kv_empty: 3 barriers, init_count=1
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
+            // p_full: 2 barriers, init_count=256
+            mbarrier_init(smem + 80, 256);
+            mbarrier_init(smem + 88, 256);
+            // p_full_2: 2 barriers, init_count=128
+            mbarrier_init(smem + 96, 128);
+            mbarrier_init(smem + 104, 128);
+            // corr_sig: 2 barriers, init_count=128
+            mbarrier_init(smem + 112, 128);
+            mbarrier_init(smem + 120, 128);
+            // corr_done: 2 barriers, init_count=128
+            mbarrier_init(smem + 128, 128);
+            mbarrier_init(smem + 136, 128);
+            // order_p01_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 144, 128);
+            // order_p01_1: 1 barriers, init_count=128
+            mbarrier_init(smem + 152, 128);
+            // o_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 168, 1);
+            // q_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 176, 1);
+            // --- pipeline 'po' ---
+            // page_full: 6 barriers, init_count=1
+            mbarrier_init(smem + 184, 1);
+            mbarrier_init(smem + 192, 1);
+            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 208, 1);
+            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 1);
+            // page_empty: 6 barriers, init_count=1
+            mbarrier_init(smem + 232, 1);
+            mbarrier_init(smem + 240, 1);
+            mbarrier_init(smem + 248, 1);
+            mbarrier_init(smem + 256, 1);
+            mbarrier_init(smem + 264, 1);
+            mbarrier_init(smem + 272, 1);
+            // work_id_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 280, 1);
+            // work_id_empty: 1 barriers, init_count=15
+            mbarrier_init(smem + 288, 15);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
     }
 
-    __syncthreads();
+    __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 296);
     if (warp == 0) {
         int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
@@ -704,19 +733,11 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
     const int tmem_output_0 = taddr + 256;
     const int tmem_output_1 = taddr + 384;
 
-    // ---- Register redistribution (per-WG, all warps aligned) ----
+    // ---- Register redistribution for WGs split across roles ----
     // Dec phase frees registers before any WG attempts inc.
-    if (warp >= 8 && warp <= 11) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-    } else if (warp >= 12 && warp <= 15) {
+    if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
-    __syncthreads();
-    // Inc phase consumes the registers released above.
-    if (warp >= 0 && warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 184;");
-    }
-    __syncthreads();
 
     // ---- Role: softmax ----
     if (warp <= 7) {
@@ -735,11 +756,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
             unsigned int _phase_corr_done = 0;
             #pragma unroll 1
             for (unsigned int tile_iter = 0; tile_iter < max_rounds; tile_iter++) {
-                mbarrier_wait(work_id_full_addr, _phase_work_id_full_0);
-                _phase_work_id_full_0 ^= 1;
-                unsigned int tile_idx = work_id_slot[0];
-                if (elect_sync()) {
-                    mbarrier_arrive(work_id_empty_addr);
+                unsigned int tile_idx;
+                {
+                    mbarrier_wait(work_id_full_addr, _phase_work_id_full_0);
+                    _phase_work_id_full_0 ^= 1;
+                    tile_idx = work_id_slot[0];
+                    if (elect_sync()) {
+                        mbarrier_arrive(work_id_empty_addr);
+                    }
                 }
                 if (tile_idx >= total_tiles) {
                     break;
@@ -750,8 +774,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     m_block = tile_idx % (unsigned int)NUM_M_BLOCKS;
                     bh = tile_idx / (unsigned int)NUM_M_BLOCKS;
                 }
-                int seqlen_kv_bh = seq_lens_kv[bh];
-                int seqlen_q_bh = seq_lens_q[bh];
+                int seqlen_kv_bh = UNIFORM_KV_LEN;
+                int seqlen_q_bh = UNIFORM_Q_LEN;
+                {
+                    seqlen_kv_bh = seq_lens_kv[bh];
+                }
+                {
+                    seqlen_q_bh = seq_lens_q[bh];
+                }
                 unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N;
                 int causal_row;
                 unsigned int num_masked_iters;
@@ -760,8 +790,10 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                 }
                 float row_max_val = -LOOM_INF;
                 float row_sum_val = 0.0f;
+                unsigned int masked_loop_end = num_masked_iters;
+                unsigned int unmasked_loop_start = num_masked_iters;
                 #pragma unroll 1
-                for (unsigned int n_iter = 0; n_iter < num_masked_iters; n_iter++) {
+                for (unsigned int n_iter = 0; n_iter < masked_loop_end; n_iter++) {
                     int n_block = num_n_blocks - 1 - n_iter;
                     mbarrier_wait(s_full_addr + (stage) * 8, _phase_s_full);
                     _phase_s_full ^= 1;
@@ -971,8 +1003,8 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_stage = (order_p01_stage + 1) % 1;
-                    if (order_p01_stage == 0) { order_p01_phase ^= 1; }
+                    order_p01_stage += 1;
+                    if (order_p01_stage == 1) { order_p01_stage = 0; order_p01_phase ^= 1; }
                     {
                         uint32_t _tmem_load_0_bf16_2[16];
                         #pragma unroll
@@ -995,7 +1027,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     row_sum_val = row_sum_val * acc_scale + _tmem_load_0_sum;
                 }
                 #pragma unroll 1
-                for (unsigned int n_iter_1 = num_masked_iters; n_iter_1 < num_n_blocks; n_iter_1++) {
+                for (unsigned int n_iter_1 = unmasked_loop_start; n_iter_1 < num_n_blocks; n_iter_1++) {
                     int n_block_1 = num_n_blocks - 1 - n_iter_1;
                     mbarrier_wait(s_full_addr + (stage) * 8, _phase_s_full);
                     _phase_s_full ^= 1;
@@ -1006,74 +1038,76 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     tmem_ld_x32(&_tmem_load_1[64], s_base_1 + 64);
                     tmem_ld_x32(&_tmem_load_1[96], s_base_1 + 96);
                     int tail_valid_1 = seqlen_kv_bh - n_block_1 * BLOCK_N;
-                    if (tail_valid_1 < BLOCK_N) {
-                        uint32_t _slice_lo_mask_8;
-                        {
-                            int _lim_20 = tail_valid_1;
-                            if (_lim_20 <= 0) { _slice_lo_mask_8 = 0u; }
-                            else if (_lim_20 >= 32) { _slice_lo_mask_8 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_8) : "r"(_lim_20));
+                    {
+                        if (tail_valid_1 < BLOCK_N) {
+                            uint32_t _slice_lo_mask_12;
+                            {
+                                int _lim_20 = tail_valid_1;
+                                if (_lim_20 <= 0) { _slice_lo_mask_12 = 0u; }
+                                else if (_lim_20 >= 32) { _slice_lo_mask_12 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_12) : "r"(_lim_20));
+                                }
                             }
-                        }
-                        #pragma unroll
-                        for (int _i_21 = 0; _i_21 < 32; _i_21++) {
-                            if (!(_slice_lo_mask_8 & (1u << _i_21))) _tmem_load_1[0 + _i_21] = -LOOM_INF;
-                        }
-                        uint32_t _slice_lo_mask_9;
-                        {
-                            int _lim_22 = tail_valid_1 - 32;
-                            if (_lim_22 <= 0) { _slice_lo_mask_9 = 0u; }
-                            else if (_lim_22 >= 32) { _slice_lo_mask_9 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_9) : "r"(_lim_22));
+                            #pragma unroll
+                            for (int _i_21 = 0; _i_21 < 32; _i_21++) {
+                                if (!(_slice_lo_mask_12 & (1u << _i_21))) _tmem_load_1[0 + _i_21] = -LOOM_INF;
                             }
-                        }
-                        #pragma unroll
-                        for (int _i_23 = 0; _i_23 < 32; _i_23++) {
-                            if (!(_slice_lo_mask_9 & (1u << _i_23))) _tmem_load_1[32 + _i_23] = -LOOM_INF;
-                        }
-                        uint32_t _slice_lo_mask_10;
-                        {
-                            int _lim_24 = tail_valid_1 - 64;
-                            if (_lim_24 <= 0) { _slice_lo_mask_10 = 0u; }
-                            else if (_lim_24 >= 32) { _slice_lo_mask_10 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_10) : "r"(_lim_24));
+                            uint32_t _slice_lo_mask_13;
+                            {
+                                int _lim_22 = tail_valid_1 - 32;
+                                if (_lim_22 <= 0) { _slice_lo_mask_13 = 0u; }
+                                else if (_lim_22 >= 32) { _slice_lo_mask_13 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_13) : "r"(_lim_22));
+                                }
                             }
-                        }
-                        #pragma unroll
-                        for (int _i_25 = 0; _i_25 < 32; _i_25++) {
-                            if (!(_slice_lo_mask_10 & (1u << _i_25))) _tmem_load_1[64 + _i_25] = -LOOM_INF;
-                        }
-                        uint32_t _slice_lo_mask_11;
-                        {
-                            int _lim_26 = tail_valid_1 - 96;
-                            if (_lim_26 <= 0) { _slice_lo_mask_11 = 0u; }
-                            else if (_lim_26 >= 32) { _slice_lo_mask_11 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_11) : "r"(_lim_26));
+                            #pragma unroll
+                            for (int _i_23 = 0; _i_23 < 32; _i_23++) {
+                                if (!(_slice_lo_mask_13 & (1u << _i_23))) _tmem_load_1[32 + _i_23] = -LOOM_INF;
                             }
-                        }
-                        #pragma unroll
-                        for (int _i_27 = 0; _i_27 < 32; _i_27++) {
-                            if (!(_slice_lo_mask_11 & (1u << _i_27))) _tmem_load_1[96 + _i_27] = -LOOM_INF;
+                            uint32_t _slice_lo_mask_14;
+                            {
+                                int _lim_24 = tail_valid_1 - 64;
+                                if (_lim_24 <= 0) { _slice_lo_mask_14 = 0u; }
+                                else if (_lim_24 >= 32) { _slice_lo_mask_14 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_14) : "r"(_lim_24));
+                                }
+                            }
+                            #pragma unroll
+                            for (int _i_25 = 0; _i_25 < 32; _i_25++) {
+                                if (!(_slice_lo_mask_14 & (1u << _i_25))) _tmem_load_1[64 + _i_25] = -LOOM_INF;
+                            }
+                            uint32_t _slice_lo_mask_15;
+                            {
+                                int _lim_26 = tail_valid_1 - 96;
+                                if (_lim_26 <= 0) { _slice_lo_mask_15 = 0u; }
+                                else if (_lim_26 >= 32) { _slice_lo_mask_15 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_15) : "r"(_lim_26));
+                                }
+                            }
+                            #pragma unroll
+                            for (int _i_27 = 0; _i_27 < 32; _i_27++) {
+                                if (!(_slice_lo_mask_15 & (1u << _i_27))) _tmem_load_1[96 + _i_27] = -LOOM_INF;
+                            }
                         }
                     }
                     float2 _reg_reduce_max2_28 = {-LOOM_INF, -LOOM_INF};
@@ -1116,14 +1150,44 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     } else {
                         mbarrier_wait(order_p01_1_addr, order_p01_phase);
                     }
+                    {
+                        #pragma unroll
+                        for (int _le = 0; _le < 32; _le++) {
+                            _tmem_load_1[_le] = approx_exp2(_tmem_load_1[_le]);
+                        }
+                    }
                     uint32_t _tmem_load_1_bf16[16];
-                    softmax_frag_exp2_cast(&_tmem_load_1[0], _tmem_load_1_bf16, !IS_CAUSAL);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 16; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                        _tmem_load_1_bf16[_lp] = *(uint32_t*)&_bf2;
+                    }
                     tmem_st_x16(p_base_1, _tmem_load_1_bf16);
+                    {
+                        #pragma unroll
+                        for (int _le = 0; _le < 32; _le++) {
+                            _tmem_load_1[_le + 32] = approx_exp2(_tmem_load_1[_le + 32]);
+                        }
+                    }
                     uint32_t _tmem_load_1_bf16_0[16];
-                    softmax_frag_exp2_cast(&_tmem_load_1[32], _tmem_load_1_bf16_0, !IS_CAUSAL);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 16; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 32], _tmem_load_1[_lp*2+1 + 32]));
+                        _tmem_load_1_bf16_0[_lp] = *(uint32_t*)&_bf2;
+                    }
                     tmem_st_x16(p_base_1 + 16, _tmem_load_1_bf16_0);
+                    {
+                        #pragma unroll
+                        for (int _le = 0; _le < 32; _le++) {
+                            _tmem_load_1[_le + 64] = approx_exp2(_tmem_load_1[_le + 64]);
+                        }
+                    }
                     uint32_t _tmem_load_1_bf16_1[16];
-                    softmax_frag_exp2_cast(&_tmem_load_1[64], _tmem_load_1_bf16_1, !IS_CAUSAL);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 16; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 64], _tmem_load_1[_lp*2+1 + 64]));
+                        _tmem_load_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                    }
                     tmem_st_x16(p_base_1 + 32, _tmem_load_1_bf16_1);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + (stage) * 8);
@@ -1136,8 +1200,8 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_stage = (order_p01_stage + 1) % 1;
-                    if (order_p01_stage == 0) { order_p01_phase ^= 1; }
+                    order_p01_stage += 1;
+                    if (order_p01_stage == 1) { order_p01_stage = 0; order_p01_phase ^= 1; }
                     {
                         uint32_t _tmem_load_1_bf16_2[16];
                         #pragma unroll
@@ -1164,8 +1228,9 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                 mbarrier_arrive(corr_sig_addr + (stage) * 8);
             }
         }
+    }
     // ---- Role: correction ----
-    } else if (warp >= 8 && warp <= 11) {
+    if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
             unsigned int total_tiles_1 = NUM_M_BLOCKS * total_bh;
@@ -1177,11 +1242,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
             unsigned int _phase_o_full_1 = 0;
             #pragma unroll 1
             for (unsigned int tile_iter_1 = 0; tile_iter_1 < max_rounds_1; tile_iter_1++) {
-                mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_1);
-                _phase_work_id_full_0_1 ^= 1;
-                unsigned int tile_idx_1 = work_id_slot[0];
-                if (elect_sync()) {
-                    mbarrier_arrive(work_id_empty_addr);
+                unsigned int tile_idx_1;
+                {
+                    mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_1);
+                    _phase_work_id_full_0_1 ^= 1;
+                    tile_idx_1 = work_id_slot[0];
+                    if (elect_sync()) {
+                        mbarrier_arrive(work_id_empty_addr);
+                    }
                 }
                 if (tile_idx_1 >= total_tiles_1) {
                     break;
@@ -1192,8 +1260,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     m_block_1 = tile_idx_1 % (unsigned int)NUM_M_BLOCKS;
                     bh_1 = tile_idx_1 / (unsigned int)NUM_M_BLOCKS;
                 }
-                int seqlen_kv_bh_1 = seq_lens_kv[bh_1];
-                int seqlen_q_bh_1 = seq_lens_q[bh_1];
+                int seqlen_kv_bh_1 = UNIFORM_KV_LEN;
+                int seqlen_q_bh_1 = UNIFORM_Q_LEN;
+                {
+                    seqlen_kv_bh_1 = seq_lens_kv[bh_1];
+                }
+                {
+                    seqlen_q_bh_1 = seq_lens_q[bh_1];
+                }
                 unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N;
                 int unit = bh_1 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int q_head_base = unit * PACK_G;
@@ -1310,15 +1384,16 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(final_sum));
                                 float _fma_3 = __fmaf_rn(final_max, softmax_scale_log2, _log2_0);
                                 float lse_val = _fma_3;
-                                *((float*)(LSE_ptr + o_row)) = lse_val;
+                                *(reinterpret_cast<float*>(LSE_ptr + o_row) + (0)) = lse_val;
                             }
                         }
                     }
                 }
             }
         }
+    }
     // ---- Role: mma ----
-    } else if (warp == 12) {
+    if (warp == 12) {
         { // mma_main
             unsigned int total_tiles_2 = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds_2 = total_tiles_2 + 1;
@@ -1333,11 +1408,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
             unsigned int _phase_p_full_2_1 = 0;
             #pragma unroll 1
             for (unsigned int tile_iter_2 = 0; tile_iter_2 < max_rounds_2; tile_iter_2++) {
-                mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_2);
-                _phase_work_id_full_0_2 ^= 1;
-                unsigned int tile_idx_2 = work_id_slot[0];
-                if (elect_sync()) {
-                    mbarrier_arrive(work_id_empty_addr);
+                unsigned int tile_idx_2;
+                {
+                    mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_2);
+                    _phase_work_id_full_0_2 ^= 1;
+                    tile_idx_2 = work_id_slot[0];
+                    if (elect_sync()) {
+                        mbarrier_arrive(work_id_empty_addr);
+                    }
                 }
                 if (tile_idx_2 >= total_tiles_2) {
                     break;
@@ -1348,17 +1426,22 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     m_block_2 = tile_idx_2 % (unsigned int)NUM_M_BLOCKS;
                     bh_2 = tile_idx_2 / (unsigned int)NUM_M_BLOCKS;
                 }
-                int seqlen_kv_bh_2 = seq_lens_kv[bh_2];
-                int seqlen_q_bh_2 = seq_lens_q[bh_2];
+                int seqlen_kv_bh_2 = UNIFORM_KV_LEN;
+                int seqlen_q_bh_2 = UNIFORM_Q_LEN;
+                {
+                    seqlen_kv_bh_2 = seq_lens_kv[bh_2];
+                }
+                {
+                    seqlen_q_bh_2 = seq_lens_q[bh_2];
+                }
                 unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
                 _phase_q_full_1 ^= 1;
                 mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, mma_kv_phase);
-                int _mma_a_lo_0 = make_warp_uniform((smem_q0_addr >> 4) & 0x3FFF);
-                int _mma_b_addr_0 = smem_kv_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_0 = make_warp_uniform((_mma_b_addr_0 >> 4) & 0x3FFF);
+                int _mma_a_lo_0 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
+                int _mma_b_lo_0 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1414,9 +1497,8 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_scores_0), "r"(0));
                 elect_commit(s_full_addr);
-                int _mma_a_lo_1 = make_warp_uniform((smem_q1_addr >> 4) & 0x3FFF);
-                int _mma_b_addr_1 = smem_kv_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_1 = make_warp_uniform((_mma_b_addr_1 >> 4) & 0x3FFF);
+                int _mma_a_lo_1 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
+                int _mma_b_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1473,21 +1555,20 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_scores_1), "r"(0));
                 elect_commit(s_full_addr + 8);
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
-                mma_kv_stage = (mma_kv_stage + 1) % 3;
-                if (mma_kv_stage == 0) { mma_kv_phase ^= 1; }
+                mma_kv_stage += 1;
+                if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {
                     unsigned int v_stage = mma_kv_stage;
                     unsigned int v_phase = mma_kv_phase;
-                    mma_kv_stage = (mma_kv_stage + 1) % 3;
-                    if (mma_kv_stage == 0) { mma_kv_phase ^= 1; }
+                    mma_kv_stage += 1;
+                    if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
                     mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
                     int first_pv_flag = first_pv;
                     mbarrier_wait(p_full_addr, _phase_p_full_0);
                     _phase_p_full_0 ^= 1;
-                    int _mma_b_addr_2 = smem_v_addr + v_stage * 32768;
-                    int _mma_b_lo_2 = make_warp_uniform(((_mma_b_addr_2 >> 4) & 0x3FFF) | 0x4000000);
+                    int _mma_b_lo_2 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1521,8 +1602,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_2), "r"(tmem_softmax_0), "r"(((first_pv_flag) ? 0 : 1)));
                     mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
                     _phase_p_full_2_0 ^= 1;
-                    int _mma_b_addr_3 = smem_v_addr + v_stage * 32768;
-                    int _mma_b_lo_3 = make_warp_uniform(((_mma_b_addr_3 >> 4) & 0x3FFF) | 0x4000000);
+                    int _mma_b_lo_3 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1544,12 +1624,11 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_3), "r"(tmem_softmax_0), "r"(1));
                     unsigned int k_stage = mma_kv_stage;
                     unsigned int k_phase = mma_kv_phase;
-                    mma_kv_stage = (mma_kv_stage + 1) % 3;
-                    if (mma_kv_stage == 0) { mma_kv_phase ^= 1; }
+                    mma_kv_stage += 1;
+                    if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
                     mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
-                    int _mma_a_lo_4 = make_warp_uniform((smem_q0_addr >> 4) & 0x3FFF);
-                    int _mma_b_addr_4 = smem_kv_addr + k_stage * 32768;
-                    int _mma_b_lo_4 = make_warp_uniform((_mma_b_addr_4 >> 4) & 0x3FFF);
+                    int _mma_a_lo_4 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1607,8 +1686,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     elect_commit(s_full_addr);
                     mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                     _phase_p_full_1 ^= 1;
-                    int _mma_b_addr_5 = smem_v_addr + v_stage * 32768;
-                    int _mma_b_lo_5 = make_warp_uniform(((_mma_b_addr_5 >> 4) & 0x3FFF) | 0x4000000);
+                    int _mma_b_lo_5 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1642,8 +1720,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_5), "r"(tmem_softmax_1), "r"(((first_pv_flag) ? 0 : 1)));
                     mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                     _phase_p_full_2_1 ^= 1;
-                    int _mma_b_addr_6 = smem_v_addr + v_stage * 32768;
-                    int _mma_b_lo_6 = make_warp_uniform(((_mma_b_addr_6 >> 4) & 0x3FFF) | 0x4000000);
+                    int _mma_b_lo_6 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1664,9 +1741,8 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     "}\n"
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_6), "r"(tmem_softmax_1), "r"(1));
                     elect_commit(kv_empty_addr + (v_stage) * 8);
-                    int _mma_a_lo_7 = make_warp_uniform((smem_q1_addr >> 4) & 0x3FFF);
-                    int _mma_b_addr_7 = smem_kv_addr + k_stage * 32768;
-                    int _mma_b_lo_7 = make_warp_uniform((_mma_b_addr_7 >> 4) & 0x3FFF);
+                    int _mma_a_lo_7 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
+                    int _mma_b_lo_7 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1730,8 +1806,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                 int first_pv_flag_1 = first_pv;
                 mbarrier_wait(p_full_addr, _phase_p_full_0);
                 _phase_p_full_0 ^= 1;
-                int _mma_b_addr_8 = smem_v_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_8 = make_warp_uniform(((_mma_b_addr_8 >> 4) & 0x3FFF) | 0x4000000);
+                int _mma_b_lo_8 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1765,8 +1840,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_8), "r"(tmem_softmax_0), "r"(((first_pv_flag_1) ? 0 : 1)));
                 mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
                 _phase_p_full_2_0 ^= 1;
-                int _mma_b_addr_9 = smem_v_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_9 = make_warp_uniform(((_mma_b_addr_9 >> 4) & 0x3FFF) | 0x4000000);
+                int _mma_b_lo_9 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1788,8 +1862,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_9), "r"(tmem_softmax_0), "r"(1));
                 mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                 _phase_p_full_1 ^= 1;
-                int _mma_b_addr_10 = smem_v_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_10 = make_warp_uniform(((_mma_b_addr_10 >> 4) & 0x3FFF) | 0x4000000);
+                int _mma_b_lo_10 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1823,8 +1896,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_10), "r"(tmem_softmax_1), "r"(((first_pv_flag_1) ? 0 : 1)));
                 mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                 _phase_p_full_2_1 ^= 1;
-                int _mma_b_addr_11 = smem_v_addr + mma_kv_stage * 32768;
-                int _mma_b_lo_11 = make_warp_uniform(((_mma_b_addr_11 >> 4) & 0x3FFF) | 0x4000000);
+                int _mma_b_lo_11 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_kv_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1845,13 +1917,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     "}\n"
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_11), "r"(tmem_softmax_1), "r"(1));
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
-                mma_kv_stage = (mma_kv_stage + 1) % 3;
-                if (mma_kv_stage == 0) { mma_kv_phase ^= 1; }
+                mma_kv_stage += 1;
+                if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
                 elect_commit2(o_full_addr, o_full_addr + 8);
             }
         }
+    }
     // ---- Role: page_offsets ----
-    } else if (warp == 13) {
+    if (warp == 13) {
         { // page_offsets_main
             unsigned int total_tiles_3 = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds_3 = total_tiles_3 + 1;
@@ -1860,11 +1933,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
             unsigned int _phase_page_empty = 1;
             #pragma unroll 1
             for (unsigned int tile_iter_3 = 0; tile_iter_3 < max_rounds_3; tile_iter_3++) {
-                mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_3);
-                _phase_work_id_full_0_3 ^= 1;
-                unsigned int tile_idx_3 = work_id_slot[0];
-                if (elect_sync()) {
-                    mbarrier_arrive(work_id_empty_addr);
+                unsigned int tile_idx_3;
+                {
+                    mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_3);
+                    _phase_work_id_full_0_3 ^= 1;
+                    tile_idx_3 = work_id_slot[0];
+                    if (elect_sync()) {
+                        mbarrier_arrive(work_id_empty_addr);
+                    }
                 }
                 if (tile_idx_3 >= total_tiles_3) {
                     break;
@@ -1875,8 +1951,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     m_block_3 = tile_idx_3 % (unsigned int)NUM_M_BLOCKS;
                     bh_3 = tile_idx_3 / (unsigned int)NUM_M_BLOCKS;
                 }
-                int seqlen_kv_bh_3 = seq_lens_kv[bh_3];
-                int seqlen_q_bh_3 = seq_lens_q[bh_3];
+                int seqlen_kv_bh_3 = UNIFORM_KV_LEN;
+                int seqlen_q_bh_3 = UNIFORM_Q_LEN;
+                {
+                    seqlen_kv_bh_3 = seq_lens_kv[bh_3];
+                }
+                {
+                    seqlen_q_bh_3 = seq_lens_q[bh_3];
+                }
                 unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N;
                 unsigned int b_idx = bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int pt_base = b_idx * (unsigned int)page_row_stride;
@@ -1888,72 +1970,51 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     mbarrier_wait(page_empty_addr + (po_stage) * 8, _phase_page_empty);
                     if (elect_sync()) {
                         int pg_idx = po_stage * 16;
-                        int _min_0 = ((base_tok / PAGE_SIZE) < (last_slot) ? (base_tok / PAGE_SIZE) : (last_slot));
-                        int s0 = _min_0;
-                        int _min_1 = (((base_tok + 16) / PAGE_SIZE) < (last_slot) ? ((base_tok + 16) / PAGE_SIZE) : (last_slot));
-                        int s1 = _min_1;
-                        int _min_2 = (((base_tok + 32) / PAGE_SIZE) < (last_slot) ? ((base_tok + 32) / PAGE_SIZE) : (last_slot));
-                        int s2 = _min_2;
-                        int _min_3 = (((base_tok + 48) / PAGE_SIZE) < (last_slot) ? ((base_tok + 48) / PAGE_SIZE) : (last_slot));
-                        int s3 = _min_3;
-                        int _min_4 = (((base_tok + 64) / PAGE_SIZE) < (last_slot) ? ((base_tok + 64) / PAGE_SIZE) : (last_slot));
-                        int s4 = _min_4;
-                        int _min_5 = (((base_tok + 80) / PAGE_SIZE) < (last_slot) ? ((base_tok + 80) / PAGE_SIZE) : (last_slot));
-                        int s5 = _min_5;
-                        int _min_6 = (((base_tok + 96) / PAGE_SIZE) < (last_slot) ? ((base_tok + 96) / PAGE_SIZE) : (last_slot));
-                        int s6 = _min_6;
-                        int _min_7 = (((base_tok + 112) / PAGE_SIZE) < (last_slot) ? ((base_tok + 112) / PAGE_SIZE) : (last_slot));
-                        int s7 = _min_7;
-                        smem_pages[pg_idx] = page_table_k[pt_base + s0];
-                        smem_pages[pg_idx + 1] = page_table_k[pt_base + s1];
-                        smem_pages[pg_idx + 2] = page_table_k[pt_base + s2];
-                        smem_pages[pg_idx + 3] = page_table_k[pt_base + s3];
-                        smem_pages[pg_idx + 4] = page_table_k[pt_base + s4];
-                        smem_pages[pg_idx + 5] = page_table_k[pt_base + s5];
-                        smem_pages[pg_idx + 6] = page_table_k[pt_base + s6];
-                        smem_pages[pg_idx + 7] = page_table_k[pt_base + s7];
-                        smem_pages[pg_idx + 8] = page_table_v[pt_base + s0];
-                        smem_pages[pg_idx + 9] = page_table_v[pt_base + s1];
-                        smem_pages[pg_idx + 10] = page_table_v[pt_base + s2];
-                        smem_pages[pg_idx + 11] = page_table_v[pt_base + s3];
-                        smem_pages[pg_idx + 12] = page_table_v[pt_base + s4];
-                        smem_pages[pg_idx + 13] = page_table_v[pt_base + s5];
-                        smem_pages[pg_idx + 14] = page_table_v[pt_base + s6];
-                        smem_pages[pg_idx + 15] = page_table_v[pt_base + s7];
+                        #pragma unroll
+                        for (int chunk = 0; chunk < BLOCK_N / KV_TOK_CHUNK; chunk++) {
+                            int _min_0 = (((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) < (last_slot) ? ((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) : (last_slot));
+                            int slot = _min_0;
+                            smem_pages[pg_idx + chunk] = page_table_k[pt_base + slot];
+                            smem_pages[pg_idx + 8 + chunk] = page_table_v[pt_base + slot];
+                        }
                         mbarrier_arrive(page_full_addr + (po_stage) * 8);
                     }
-                    po_stage = (po_stage + 1) % 6;
-                    if (po_stage == 0) { _phase_page_empty ^= 1; }
+                    po_stage += 1;
+                    if (po_stage == 6) { po_stage = 0; _phase_page_empty ^= 1; }
                 }
             }
         }
+    }
     // ---- Role: scheduler ----
-    } else if (warp == 14) {
+    if (warp == 14) {
         { // scheduler_main
-            unsigned int total_tiles_4 = NUM_M_BLOCKS * total_bh;
-            unsigned int max_rounds_4 = total_tiles_4 + 1;
             unsigned int _phase_work_id_empty_0 = 1;
-            if (elect_sync()) {
-                #pragma unroll 1
-                for (unsigned int tile_iter_4 = 0; tile_iter_4 < max_rounds_4; tile_iter_4++) {
-                    mbarrier_wait(work_id_empty_addr, _phase_work_id_empty_0);
-                    _phase_work_id_empty_0 ^= 1;
-                    unsigned int _atomic_old_0 = atomicAdd(dynamic_counter, 1);
-                    work_id_slot[0] = _atomic_old_0;
-                    mbarrier_arrive(work_id_full_addr);
-                    if (_atomic_old_0 >= total_tiles_4) {
-                        unsigned int last_fetch = total_tiles_4 + (unsigned int)num_ctas - 1;
-                        if (_atomic_old_0 == last_fetch) {
-                            unsigned int reset_add = -(last_fetch + 1);
-                            unsigned int _atomic_old_1 = atomicAdd(dynamic_counter, reset_add);
+            {
+                unsigned int total_tiles_4 = NUM_M_BLOCKS * total_bh;
+                unsigned int max_rounds_4 = total_tiles_4 + 1;
+                if (elect_sync()) {
+                    #pragma unroll 1
+                    for (unsigned int tile_iter_4 = 0; tile_iter_4 < max_rounds_4; tile_iter_4++) {
+                        mbarrier_wait(work_id_empty_addr, _phase_work_id_empty_0);
+                        _phase_work_id_empty_0 ^= 1;
+                        unsigned int _atomic_old_0 = atomicAdd(dynamic_counter, 1);
+                        work_id_slot[0] = _atomic_old_0;
+                        mbarrier_arrive(work_id_full_addr);
+                        if (_atomic_old_0 >= total_tiles_4) {
+                            unsigned int last_fetch = total_tiles_4 + (unsigned int)num_ctas - 1;
+                            if (_atomic_old_0 == last_fetch) {
+                                unsigned int reset_add = -(last_fetch + 1);
+                                unsigned int _atomic_old_1 = atomicAdd(dynamic_counter, reset_add);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
         }
+    }
     // ---- Role: load ----
-    } else if (warp == 15) {
+    if (warp == 15) {
         { // load_main
             unsigned int total_tiles_5 = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds_5 = total_tiles_5 + 1;
@@ -1965,11 +2026,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
             unsigned int _phase_kv_empty = 1;
             #pragma unroll 1
             for (unsigned int tile_iter_5 = 0; tile_iter_5 < max_rounds_5; tile_iter_5++) {
-                mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_4);
-                _phase_work_id_full_0_4 ^= 1;
-                unsigned int tile_idx_4 = work_id_slot[0];
-                if (elect_sync()) {
-                    mbarrier_arrive(work_id_empty_addr);
+                unsigned int tile_idx_4;
+                {
+                    mbarrier_wait(work_id_full_addr, _phase_work_id_full_0_4);
+                    _phase_work_id_full_0_4 ^= 1;
+                    tile_idx_4 = work_id_slot[0];
+                    if (elect_sync()) {
+                        mbarrier_arrive(work_id_empty_addr);
+                    }
                 }
                 if (tile_idx_4 >= total_tiles_5) {
                     break;
@@ -1980,8 +2044,14 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                     m_block_4 = tile_idx_4 % (unsigned int)NUM_M_BLOCKS;
                     bh_4 = tile_idx_4 / (unsigned int)NUM_M_BLOCKS;
                 }
-                int seqlen_kv_bh_4 = seq_lens_kv[bh_4];
-                int seqlen_q_bh_4 = seq_lens_q[bh_4];
+                int seqlen_kv_bh_4 = UNIFORM_KV_LEN;
+                int seqlen_q_bh_4 = UNIFORM_Q_LEN;
+                {
+                    seqlen_kv_bh_4 = seq_lens_kv[bh_4];
+                }
+                {
+                    seqlen_q_bh_4 = seq_lens_q[bh_4];
+                }
                 unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N;
                 int unit_1 = bh_4 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int kv_head = unit_1 * PACK_G / HEADS_PER_GROUP;
@@ -2003,65 +2073,39 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
                 for (unsigned int ni_1 = 0; ni_1 < num_n_blocks_4; ni_1++) {
                     unsigned int n_1 = num_n_blocks_4 - 1 - ni_1;
                     int base_tok_1 = n_1 * (unsigned int)BLOCK_N;
-                    int w0 = base_tok_1 % PAGE_SIZE;
-                    int w1 = (base_tok_1 + 16) % PAGE_SIZE;
-                    int w2 = (base_tok_1 + 32) % PAGE_SIZE;
-                    int w3 = (base_tok_1 + 48) % PAGE_SIZE;
-                    int w4 = (base_tok_1 + 64) % PAGE_SIZE;
-                    int w5 = (base_tok_1 + 80) % PAGE_SIZE;
-                    int w6 = (base_tok_1 + 96) % PAGE_SIZE;
-                    int w7 = (base_tok_1 + 112) % PAGE_SIZE;
                     mbarrier_wait(page_full_addr + (load_po_stage) * 8, _phase_page_full);
                     int pg_idx_1 = load_po_stage * 16;
                     mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 32768);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768, K, 0, w0, 0, kv_head, smem_pages[pg_idx_1], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 2048, K, 0, w1, 0, kv_head, smem_pages[pg_idx_1 + 1], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 4096, K, 0, w2, 0, kv_head, smem_pages[pg_idx_1 + 2], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 6144, K, 0, w3, 0, kv_head, smem_pages[pg_idx_1 + 3], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 8192, K, 0, w4, 0, kv_head, smem_pages[pg_idx_1 + 4], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 10240, K, 0, w5, 0, kv_head, smem_pages[pg_idx_1 + 5], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 12288, K, 0, w6, 0, kv_head, smem_pages[pg_idx_1 + 6], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 14336, K, 0, w7, 0, kv_head, smem_pages[pg_idx_1 + 7], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 16384, K, 0, w0, 1, kv_head, smem_pages[pg_idx_1], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 18432, K, 0, w1, 1, kv_head, smem_pages[pg_idx_1 + 1], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 20480, K, 0, w2, 1, kv_head, smem_pages[pg_idx_1 + 2], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 22528, K, 0, w3, 1, kv_head, smem_pages[pg_idx_1 + 3], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 24576, K, 0, w4, 1, kv_head, smem_pages[pg_idx_1 + 4], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 26624, K, 0, w5, 1, kv_head, smem_pages[pg_idx_1 + 5], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 28672, K, 0, w6, 1, kv_head, smem_pages[pg_idx_1 + 6], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 30720, K, 0, w7, 1, kv_head, smem_pages[pg_idx_1 + 7], kv_full_addr + (load_kv_stage) * 8);
+                        #pragma unroll
+                        for (int chunk_1 = 0; chunk_1 < BLOCK_N / KV_TOK_CHUNK; chunk_1++) {
+                            int tok_off = (base_tok_1 + chunk_1 * KV_TOK_CHUNK) % PAGE_SIZE;
+                            const int chunk_bytes = KV_TOK_CHUNK * 64 * 2;
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_1 * chunk_bytes), K, 0, tok_off, 0, kv_head, smem_pages[pg_idx_1 + chunk_1], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_1 * chunk_bytes), K, 0, tok_off, 1, kv_head, smem_pages[pg_idx_1 + chunk_1], kv_full_addr + (load_kv_stage) * 8);
+                        }
                     }
-                    load_kv_stage = (load_kv_stage + 1) % 3;
-                    if (load_kv_stage == 0) { _phase_kv_empty ^= 1; }
+                    load_kv_stage += 1;
+                    if (load_kv_stage == 3) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 32768);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768, V, 0, w0, 0, kv_head, smem_pages[pg_idx_1 + 8], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 2048, V, 0, w1, 0, kv_head, smem_pages[pg_idx_1 + 9], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 4096, V, 0, w2, 0, kv_head, smem_pages[pg_idx_1 + 10], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 6144, V, 0, w3, 0, kv_head, smem_pages[pg_idx_1 + 11], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 8192, V, 0, w4, 0, kv_head, smem_pages[pg_idx_1 + 12], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 10240, V, 0, w5, 0, kv_head, smem_pages[pg_idx_1 + 13], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 12288, V, 0, w6, 0, kv_head, smem_pages[pg_idx_1 + 14], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 14336, V, 0, w7, 0, kv_head, smem_pages[pg_idx_1 + 15], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 16384, V, 0, w0, 1, kv_head, smem_pages[pg_idx_1 + 8], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 18432, V, 0, w1, 1, kv_head, smem_pages[pg_idx_1 + 9], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 20480, V, 0, w2, 1, kv_head, smem_pages[pg_idx_1 + 10], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 22528, V, 0, w3, 1, kv_head, smem_pages[pg_idx_1 + 11], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 24576, V, 0, w4, 1, kv_head, smem_pages[pg_idx_1 + 12], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 26624, V, 0, w5, 1, kv_head, smem_pages[pg_idx_1 + 13], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 28672, V, 0, w6, 1, kv_head, smem_pages[pg_idx_1 + 14], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + 30720, V, 0, w7, 1, kv_head, smem_pages[pg_idx_1 + 15], kv_full_addr + (load_kv_stage) * 8);
+                        #pragma unroll
+                        for (int chunk_2 = 0; chunk_2 < BLOCK_N / KV_TOK_CHUNK; chunk_2++) {
+                            int tok_off_1 = (base_tok_1 + chunk_2 * KV_TOK_CHUNK) % PAGE_SIZE;
+                            const int chunk_bytes_1 = KV_TOK_CHUNK * 64 * 2;
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_2 * chunk_bytes_1), V, 0, tok_off_1, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_2 * chunk_bytes_1), V, 0, tok_off_1, 1, kv_head, smem_pages[pg_idx_1 + 8 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
+                        }
                     }
-                    load_kv_stage = (load_kv_stage + 1) % 3;
-                    if (load_kv_stage == 0) { _phase_kv_empty ^= 1; }
+                    load_kv_stage += 1;
+                    if (load_kv_stage == 3) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     if (elect_sync()) {
                         mbarrier_arrive(page_empty_addr + (load_po_stage) * 8);
                     }
-                    load_po_stage = (load_po_stage + 1) % 6;
-                    if (load_po_stage == 0) { _phase_page_full ^= 1; }
+                    load_po_stage += 1;
+                    if (load_po_stage == 6) { load_po_stage = 0; _phase_page_full ^= 1; }
                 }
             }
         }
@@ -2072,9 +2116,7 @@ kernel_cake_fmha_context_bf16(const void* __restrict__ Q, const void* __restrict
 
     if (warp == 0) {
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 }
 
 } // extern "C"
-

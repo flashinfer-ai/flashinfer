@@ -11,9 +11,10 @@
 using uint8_t = unsigned char;
 using int32_t = int;
 using uint32_t = unsigned int;
-using int64_t = long long;
+using cake_fmha_int64_t = long long;
 #else
 #include "cake_fmha_hd256_support.h"
+using cake_fmha_int64_t = int64_t;
 #endif
 
 namespace {
@@ -38,14 +39,15 @@ extern "C" __global__ void kernel_cake_fmha_hd256_stage_q(
     int num_q_heads,
     int padded_q,
     int head_dim_bytes,
-    int64_t q_token_stride_bytes,
-    int64_t q_head_stride_bytes) {
-  const int64_t total =
-      static_cast<int64_t>(batch_size) * num_q_heads * padded_q * head_dim_bytes;
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    cake_fmha_int64_t q_token_stride_bytes,
+    cake_fmha_int64_t q_head_stride_bytes) {
+  const cake_fmha_int64_t total =
+      static_cast<cake_fmha_int64_t>(batch_size) * num_q_heads * padded_q * head_dim_bytes;
+  for (cake_fmha_int64_t index =
+           static_cast<cake_fmha_int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < total;
-       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    int64_t remaining = index;
+       index += static_cast<cake_fmha_int64_t>(gridDim.x) * blockDim.x) {
+    cake_fmha_int64_t remaining = index;
     const int byte = remaining % head_dim_bytes;
     remaining /= head_dim_bytes;
     const int token = remaining % padded_q;
@@ -56,9 +58,9 @@ extern "C" __global__ void kernel_cake_fmha_hd256_stage_q(
     const int32_t q_length = q_indptr[batch + 1] - q_begin;
     uint8_t value = 0;
     if (token < q_length) {
-      const int64_t source =
-          static_cast<int64_t>(q_begin + token) * q_token_stride_bytes +
-          static_cast<int64_t>(head) * q_head_stride_bytes + byte;
+      const cake_fmha_int64_t source =
+          static_cast<cake_fmha_int64_t>(q_begin + token) * q_token_stride_bytes +
+          static_cast<cake_fmha_int64_t>(head) * q_head_stride_bytes + byte;
       value = q[source];
     }
     q_packed[index] = value;
@@ -77,17 +79,19 @@ extern "C" __global__ void kernel_cake_fmha_hd256_stage_kv(
     int page_size,
     int max_micro_pages,
     int head_dim_bytes,
-    int64_t source_page_stride_bytes,
-    int64_t source_token_stride_bytes,
-    int64_t source_head_stride_bytes,
-    int64_t page_table_batch_stride,
-    int64_t page_table_side_stride) {
-  const int64_t total = static_cast<int64_t>(batch_size) * num_kv_heads *
-                        max_micro_pages * kMicroPage * head_dim_bytes;
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    cake_fmha_int64_t source_page_stride_bytes,
+    cake_fmha_int64_t source_token_stride_bytes,
+    cake_fmha_int64_t source_head_stride_bytes,
+    cake_fmha_int64_t page_table_batch_stride,
+    cake_fmha_int64_t page_table_side_stride) {
+  const cake_fmha_int64_t total =
+      static_cast<cake_fmha_int64_t>(batch_size) * num_kv_heads * max_micro_pages *
+      kMicroPage * head_dim_bytes;
+  for (cake_fmha_int64_t index =
+           static_cast<cake_fmha_int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < total;
-       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    int64_t remaining = index;
+       index += static_cast<cake_fmha_int64_t>(gridDim.x) * blockDim.x) {
+    cake_fmha_int64_t remaining = index;
     const int byte = remaining % head_dim_bytes;
     remaining /= head_dim_bytes;
     const int token_in_micro = remaining % kMicroPage;
@@ -102,14 +106,18 @@ extern "C" __global__ void kernel_cake_fmha_hd256_stage_kv(
     if (token < seq_lens[batch]) {
       const int logical_page = token / page_size;
       const int page_offset = token % page_size;
-      const int64_t table_base = static_cast<int64_t>(batch) * page_table_batch_stride;
+      const cake_fmha_int64_t table_base =
+          static_cast<cake_fmha_int64_t>(batch) * page_table_batch_stride;
       const int32_t k_page = page_table[table_base + logical_page];
       const int32_t v_page =
           page_table[table_base + page_table_side_stride + logical_page];
-      const int64_t inner = static_cast<int64_t>(page_offset) * source_token_stride_bytes +
-                            static_cast<int64_t>(head) * source_head_stride_bytes + byte;
-      k_value = k_source[static_cast<int64_t>(k_page) * source_page_stride_bytes + inner];
-      v_value = v_source[static_cast<int64_t>(v_page) * source_page_stride_bytes + inner];
+      const cake_fmha_int64_t inner =
+          static_cast<cake_fmha_int64_t>(page_offset) * source_token_stride_bytes +
+          static_cast<cake_fmha_int64_t>(head) * source_head_stride_bytes + byte;
+      k_value =
+          k_source[static_cast<cake_fmha_int64_t>(k_page) * source_page_stride_bytes + inner];
+      v_value =
+          v_source[static_cast<cake_fmha_int64_t>(v_page) * source_page_stride_bytes + inner];
     }
     k_packed[index] = k_value;
     v_packed[index] = v_value;
@@ -154,14 +162,15 @@ extern "C" __global__ void kernel_cake_fmha_hd256_scatter_o(
     int num_q_heads,
     int padded_q,
     int head_dim_bytes,
-    int64_t output_token_stride_bytes,
-    int64_t output_head_stride_bytes) {
-  const int64_t total =
-      static_cast<int64_t>(batch_size) * num_q_heads * padded_q * head_dim_bytes;
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    cake_fmha_int64_t output_token_stride_bytes,
+    cake_fmha_int64_t output_head_stride_bytes) {
+  const cake_fmha_int64_t total =
+      static_cast<cake_fmha_int64_t>(batch_size) * num_q_heads * padded_q * head_dim_bytes;
+  for (cake_fmha_int64_t index =
+           static_cast<cake_fmha_int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < total;
-       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    int64_t remaining = index;
+       index += static_cast<cake_fmha_int64_t>(gridDim.x) * blockDim.x) {
+    cake_fmha_int64_t remaining = index;
     const int byte = remaining % head_dim_bytes;
     remaining /= head_dim_bytes;
     const int token = remaining % padded_q;
@@ -171,9 +180,9 @@ extern "C" __global__ void kernel_cake_fmha_hd256_scatter_o(
     const int32_t q_begin = q_indptr[batch];
     const int32_t q_length = q_indptr[batch + 1] - q_begin;
     if (token < q_length) {
-      const int64_t destination =
-          static_cast<int64_t>(q_begin + token) * output_token_stride_bytes +
-          static_cast<int64_t>(head) * output_head_stride_bytes + byte;
+      const cake_fmha_int64_t destination =
+          static_cast<cake_fmha_int64_t>(q_begin + token) * output_token_stride_bytes +
+          static_cast<cake_fmha_int64_t>(head) * output_head_stride_bytes + byte;
       output[destination] = o_packed[index];
     }
   }
@@ -188,8 +197,8 @@ extern "C" cudaError_t cake_fmha_launch_hd256_stage_q(
     int num_q_heads,
     int padded_q,
     int head_dim_bytes,
-    int64_t q_token_stride_bytes,
-    int64_t q_head_stride_bytes,
+    cake_fmha_int64_t q_token_stride_bytes,
+    cake_fmha_int64_t q_head_stride_bytes,
     unsigned int grid_x,
     cudaStream_t stream) {
   void* args[] = {
@@ -224,11 +233,11 @@ extern "C" cudaError_t cake_fmha_launch_hd256_stage_kv(
     int page_size,
     int max_micro_pages,
     int head_dim_bytes,
-    int64_t source_page_stride_bytes,
-    int64_t source_token_stride_bytes,
-    int64_t source_head_stride_bytes,
-    int64_t page_table_batch_stride,
-    int64_t page_table_side_stride,
+    cake_fmha_int64_t source_page_stride_bytes,
+    cake_fmha_int64_t source_token_stride_bytes,
+    cake_fmha_int64_t source_head_stride_bytes,
+    cake_fmha_int64_t page_table_batch_stride,
+    cake_fmha_int64_t page_table_side_stride,
     unsigned int grid_x,
     cudaStream_t stream) {
   void* args[] = {
@@ -304,8 +313,8 @@ extern "C" cudaError_t cake_fmha_launch_hd256_scatter_o(
     int num_q_heads,
     int padded_q,
     int head_dim_bytes,
-    int64_t output_token_stride_bytes,
-    int64_t output_head_stride_bytes,
+    cake_fmha_int64_t output_token_stride_bytes,
+    cake_fmha_int64_t output_head_stride_bytes,
     unsigned int grid_x,
     cudaStream_t stream) {
   void* args[] = {

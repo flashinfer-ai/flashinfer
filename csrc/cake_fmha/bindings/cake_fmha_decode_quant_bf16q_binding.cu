@@ -5,12 +5,12 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_quant_bf16q(uint32_t* Q_ptr, const void* K, const void* V, __nv_bfloat16* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
+extern "C" __global__ void kernel_cake_fmha_decode_quant_bf16q(uint32_t* Q_ptr, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_bf16q(
     uint32_t* Q_ptr,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __nv_bfloat16* O,
     int* page_table,
     int* seq_lens_kv,

@@ -5,12 +5,12 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_quant_fp8(const void* Qt, const void* K, const void* V, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
+extern "C" __global__ void kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     uint8_t* O,
     int* page_table,
     int* seq_lens_kv,
@@ -31,7 +31,7 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
     cudaError_t status = cudaFuncSetAttribute(
         reinterpret_cast<const void*>(kernel_cake_fmha_decode_quant_fp8),
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        140416);
+        157952);
     if (status != cudaSuccess) {
         return status;
     }
@@ -58,6 +58,6 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
         dim3(grid_x, grid_y, grid_z),
         dim3(512, 1, 1),
         kernel_args,
-        140416,
+        157952,
         stream);
 }

@@ -15,9 +15,9 @@
 struct __align__(128) CakeFmhaTensorMap { uint64_t opaque[16]; };
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __nv_bfloat16* O_ptr,
     float* LSE_ptr,
     int* page_table,
@@ -38,9 +38,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_fp16_nhd(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __half* O_ptr,
     float* LSE_ptr,
     int* page_table,
@@ -61,9 +61,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_fp16_nhd(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_fp16_hd512(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __half* O_ptr,
     float* LSE_ptr,
     int* page_table,
@@ -83,9 +83,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_fp16_hd512(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     uint8_t* O,
     int* page_table,
     int* seq_lens_kv,
@@ -106,11 +106,11 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_nvfp4(
-    const void* Qt,
-    const void* Kp,
-    const void* Vp,
-    const void* Ksf,
-    const void* Vsf,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* Kp,
+    CakeFmhaTensorMap const* Vp,
+    CakeFmhaTensorMap const* Ksf,
+    CakeFmhaTensorMap const* Vsf,
     uint8_t* O,
     int* page_table,
     int* seq_lens_kv,
@@ -132,8 +132,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_nvfp4(
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_bf16q(
     uint32_t* Q_ptr,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __nv_bfloat16* O,
     int* page_table,
     int* seq_lens_kv,
@@ -167,9 +167,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8_reduce(
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_bf16(
-    const void* Q,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __nv_bfloat16* O_ptr,
     float* LSE_ptr,
     float* sinks,
@@ -190,9 +190,9 @@ extern "C" cudaError_t cake_fmha_launch_context_bf16(
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_fp8(
-    const void* Q,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     uint8_t* O_ptr,
     float* LSE_ptr,
     float* sinks,
@@ -213,15 +213,26 @@ extern "C" cudaError_t cake_fmha_launch_context_fp8(
     cudaStream_t stream
 );
 
-extern "C" cudaError_t cake_fmha_launch_context_nvfp4_dequant(
-    uint8_t* K_packed,
-    uint8_t* V_packed,
-    uint8_t* K_scales,
-    uint8_t* V_scales,
-    uint8_t* K_output,
-    uint8_t* V_output,
-    int total_groups,
-    int output_page_stride,
+extern "C" cudaError_t cake_fmha_launch_context_nvfp4(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* Kp,
+    CakeFmhaTensorMap const* Vp,
+    CakeFmhaTensorMap const* Ksf,
+    CakeFmhaTensorMap const* Vsf,
+    uint8_t* O_ptr,
+    float* LSE_ptr,
+    float* sinks,
+    int* page_table_k,
+    int* page_table_v,
+    int* seq_lens_q,
+    int* seq_lens_kv,
+    int* cu_seq_lens_q,
+    float softmax_scale_log2,
+    float output_scale,
+    int total_bh,
+    int page_row_stride,
+    int num_ctas,
+    uint32_t* dynamic_counter,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -229,9 +240,9 @@ extern "C" cudaError_t cake_fmha_launch_context_nvfp4_dequant(
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_fp16_hd256(
-    const void* Q,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __half* O_ptr,
     int* page_table,
     int* seq_lens_q,
@@ -248,9 +259,9 @@ extern "C" cudaError_t cake_fmha_launch_context_fp16_hd256(
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_fp8_hd256(
-    const void* Q,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     uint8_t* O_ptr,
     int* page_table,
     int* seq_lens_q,

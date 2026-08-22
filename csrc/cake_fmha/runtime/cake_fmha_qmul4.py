@@ -92,20 +92,20 @@ def patch_qmul4_cubin(
             struct.pack_into("<QQ", patched, instruction_offset, qmul_low, qmul_high)
             actual[marker_id] += 1
 
-    missing = {
-        marker_id: {"expected_minimum": count, "patched": actual[marker_id]}
+    mismatched = {
+        marker_id: {"expected": count, "patched": actual[marker_id]}
         for marker_id, count in expected.items()
-        if actual[marker_id] < count
+        if actual[marker_id] != count
     }
     unexpected = {
         marker_id: count
         for marker_id, count in actual.items()
         if count and marker_id not in expected
     }
-    if missing or unexpected:
+    if mismatched or unexpected:
         raise RuntimeError(
             "native QMUL4 cubin patch count mismatch: "
-            f"missing={missing}, unexpected={unexpected}; refusing to load"
+            f"mismatched={mismatched}, unexpected={unexpected}; refusing to load"
         )
     return bytes(patched)
 

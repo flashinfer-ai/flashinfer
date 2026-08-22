@@ -22,7 +22,7 @@ CakeFmhaTarget = Literal["sm100a", "sm103a"]
 CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "64ef68043bedb06e7984401c8cffbe1b2a24f42bc86bdcd8c05563d8fdb0cc2e"
+    "c6bd592ad6d4c8813041ae3534175a6609c33ccf7cd68cf8c5e8d524fb7bf426"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (

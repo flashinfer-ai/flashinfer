@@ -285,16 +285,6 @@ __device__ __forceinline__ void tmem_st_x4_f32(int tmem_addr, const float* src) 
 }
 
 
-__device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count, uint32_t pred) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %2, 0;\n\t"
-        "@p mbarrier.init.shared::cta.b64 [%0], %1;\n\t"
-        "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
-}
-
-
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -468,56 +458,59 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
-        // q_full: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 0, 1, leader);
-        // q_empty: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 8, 1, leader);
-        // kv_full: 4 barriers, init_count=2
-        mbarrier_init_pred(smem + 16, 2, leader);
-        mbarrier_init_pred(smem + 24, 2, leader);
-        mbarrier_init_pred(smem + 32, 2, leader);
-        mbarrier_init_pred(smem + 40, 2, leader);
-        // kv_empty: 4 barriers, init_count=1
-        mbarrier_init_pred(smem + 48, 1, leader);
-        mbarrier_init_pred(smem + 56, 1, leader);
-        mbarrier_init_pred(smem + 64, 1, leader);
-        mbarrier_init_pred(smem + 72, 1, leader);
-        // s_full_0: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 80, 1, leader);
-        // s_full_1: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 88, 1, leader);
-        // p_full_0: 1 barriers, init_count=256
-        mbarrier_init_pred(smem + 96, 256, leader);
-        // p_full_1: 1 barriers, init_count=256
-        mbarrier_init_pred(smem + 104, 256, leader);
-        // corr_scale_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 112, 128, leader);
-        // corr_empty_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 120, 128, leader);
-        // corr_empty_1: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 128, 128, leader);
-        // stats_empty: 1 barriers, init_count=4
-        mbarrier_init_pred(smem + 136, 4, leader);
-        // o_ready_0: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 144, 1, leader);
-        // o_ready_1: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 152, 1, leader);
-        // o_empty_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 160, 128, leader);
-        // o_empty_1: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 168, 128, leader);
-        // tmem_dealloc: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 176, 128, leader);
-        asm volatile("fence.mbarrier_init.release.cluster;");
+        if (leader) {
+            // q_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            // q_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 8, 1);
+            // kv_full: 4 barriers, init_count=2
+            mbarrier_init(smem + 16, 2);
+            mbarrier_init(smem + 24, 2);
+            mbarrier_init(smem + 32, 2);
+            mbarrier_init(smem + 40, 2);
+            // kv_empty: 4 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
+            // s_full_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 80, 1);
+            // s_full_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 88, 1);
+            // p_full_0: 1 barriers, init_count=256
+            mbarrier_init(smem + 96, 256);
+            // p_full_1: 1 barriers, init_count=256
+            mbarrier_init(smem + 104, 256);
+            // corr_scale_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 112, 128);
+            // corr_empty_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 120, 128);
+            // corr_empty_1: 1 barriers, init_count=128
+            mbarrier_init(smem + 128, 128);
+            // stats_empty: 1 barriers, init_count=4
+            mbarrier_init(smem + 136, 4);
+            // o_ready_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 144, 1);
+            // o_ready_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 152, 1);
+            // o_empty_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 160, 128);
+            // o_empty_1: 1 barriers, init_count=128
+            mbarrier_init(smem + 168, 128);
+            // tmem_dealloc: 1 barriers, init_count=128
+            mbarrier_init(smem + 176, 128);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
     }
 
-    __syncthreads();
+    __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
     if (warp == 0) {
         int _tmem_hold = smem + 184;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
@@ -885,8 +878,9 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 }
             }
         }
+    }
     // ---- Role: correction ----
-    } else if (warp >= 8 && warp <= 11) {
+    if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
             const int tmem_row_base_v_1 = warp % 4 * 32;
@@ -1259,8 +1253,9 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
             }
             mbarrier_arrive(tmem_dealloc_addr);
         }
+    }
     // ---- Role: mma_warp ----
-    } else if (warp == 12) {
+    if (warp == 12) {
         { // mma_warp_main
             const int tmem_s0v = taddr;
             const int tmem_s1v = taddr + 8;
@@ -1810,10 +1805,10 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
             _phase_tmem_dealloc_0 ^= 1;
             int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
-            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
         }
+    }
     // ---- Role: load_pgoff ----
-    } else if (warp == 13) {
+    if (warp == 13) {
         { // load_pgoff_main
             unsigned int total_tiles_la = BATCH_SIZE * Q_LEN * NUM_KV_HEADS * NUM_SPLIT;
             #pragma unroll 1
@@ -1943,11 +1938,13 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 }
             }
         }
+    }
     // ---- Role: scheduler ----
-    } else if (warp == 14) {
+    if (warp == 14) {
         // idle — no tasks assigned
+    }
     // ---- Role: load_warp ----
-    } else if (warp == 15) {
+    if (warp == 15) {
         { // load_warp_main
             unsigned int total_tiles_l = BATCH_SIZE * Q_LEN * NUM_KV_HEADS * NUM_SPLIT;
             unsigned int _phase_q_empty_0 = 1;

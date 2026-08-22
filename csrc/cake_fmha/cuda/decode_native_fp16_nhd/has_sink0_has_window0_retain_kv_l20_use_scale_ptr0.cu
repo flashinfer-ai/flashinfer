@@ -9,6 +9,11 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
+struct __align__(128) CakeFmhaTensorMap { uint64_t opaque[16]; };
+template <int N>
+struct __align__(128) CakeFmhaTensorMapPack { CakeFmhaTensorMap maps[N]; };
+
+typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
@@ -254,16 +259,6 @@ __device__ __forceinline__ void tmem_st_x4_f32(int tmem_addr, const float* src) 
 }
 
 
-__device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count, uint32_t pred) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %2, 0;\n\t"
-        "@p mbarrier.init.shared::cta.b64 [%0], %1;\n\t"
-        "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
-}
-
-
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -375,7 +370,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void* __restrict__ K, const void* __restrict__ V, __half* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ scale_log2_ptr, float* __restrict__ sinks_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size)
+kernel_cake_fmha_decode_native_fp16_nhd(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __half* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ scale_log2_ptr, float* __restrict__ sinks_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -387,6 +382,13 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    if (tid == 0) {
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(Qt)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V)) : "memory");
+    }
+    __syncthreads();
+
 
     // Kernel setup ops
     float* smem_corr0 = reinterpret_cast<float*>(smem_raw + 1024);
@@ -420,56 +422,59 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
-        // q_full: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 0, 1, leader);
-        // q_empty: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 8, 1, leader);
-        // kv_full: 4 barriers, init_count=2
-        mbarrier_init_pred(smem + 16, 2, leader);
-        mbarrier_init_pred(smem + 24, 2, leader);
-        mbarrier_init_pred(smem + 32, 2, leader);
-        mbarrier_init_pred(smem + 40, 2, leader);
-        // kv_empty: 4 barriers, init_count=1
-        mbarrier_init_pred(smem + 48, 1, leader);
-        mbarrier_init_pred(smem + 56, 1, leader);
-        mbarrier_init_pred(smem + 64, 1, leader);
-        mbarrier_init_pred(smem + 72, 1, leader);
-        // s_full_0: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 80, 1, leader);
-        // s_full_1: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 88, 1, leader);
-        // p_full_0: 1 barriers, init_count=256
-        mbarrier_init_pred(smem + 96, 256, leader);
-        // p_full_1: 1 barriers, init_count=256
-        mbarrier_init_pred(smem + 104, 256, leader);
-        // corr_scale_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 112, 128, leader);
-        // corr_empty_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 120, 128, leader);
-        // corr_empty_1: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 128, 128, leader);
-        // stats_empty: 1 barriers, init_count=4
-        mbarrier_init_pred(smem + 136, 4, leader);
-        // o_ready_0: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 144, 1, leader);
-        // o_ready_1: 1 barriers, init_count=1
-        mbarrier_init_pred(smem + 152, 1, leader);
-        // o_empty_0: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 160, 128, leader);
-        // o_empty_1: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 168, 128, leader);
-        // tmem_dealloc: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 176, 128, leader);
-        asm volatile("fence.mbarrier_init.release.cluster;");
+        if (leader) {
+            // q_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            // q_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 8, 1);
+            // kv_full: 4 barriers, init_count=2
+            mbarrier_init(smem + 16, 2);
+            mbarrier_init(smem + 24, 2);
+            mbarrier_init(smem + 32, 2);
+            mbarrier_init(smem + 40, 2);
+            // kv_empty: 4 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
+            // s_full_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 80, 1);
+            // s_full_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 88, 1);
+            // p_full_0: 1 barriers, init_count=256
+            mbarrier_init(smem + 96, 256);
+            // p_full_1: 1 barriers, init_count=256
+            mbarrier_init(smem + 104, 256);
+            // corr_scale_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 112, 128);
+            // corr_empty_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 120, 128);
+            // corr_empty_1: 1 barriers, init_count=128
+            mbarrier_init(smem + 128, 128);
+            // stats_empty: 1 barriers, init_count=4
+            mbarrier_init(smem + 136, 4);
+            // o_ready_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 144, 1);
+            // o_ready_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 152, 1);
+            // o_empty_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 160, 128);
+            // o_empty_1: 1 barriers, init_count=128
+            mbarrier_init(smem + 168, 128);
+            // tmem_dealloc: 1 barriers, init_count=128
+            mbarrier_init(smem + 176, 128);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
     }
 
-    __syncthreads();
+    __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
     if (warp == 0) {
         int _tmem_hold = smem + 184;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
@@ -503,19 +508,11 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
     const int tmem_tmem_o0 = taddr + 80;
     const int tmem_tmem_o1 = taddr + 88;
 
-    // ---- Register redistribution (per-WG, all warps aligned) ----
+    // ---- Register redistribution for WGs split across roles ----
     // Dec phase frees registers before any WG attempts inc.
-    if (warp >= 8 && warp <= 11) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-    } else if (warp >= 12 && warp <= 15) {
+    if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
-    __syncthreads();
-    // Inc phase consumes the registers released above.
-    if (warp >= 0 && warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 184;");
-    }
-    __syncthreads();
 
     // ---- Role: softmax ----
     if (warp <= 7) {
@@ -574,9 +571,9 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     my_exch_u32_ptr[wg_tid] = _amf_enc_0;
                 }
                 if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 9, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 9, 128;" ::: "memory");
                 } else {
-                    asm volatile("barrier.sync 8, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 if (is_wg1 != 0) {
                     mbarrier_wait(s_full_1_addr, _phase_s_full_1_0);
@@ -663,9 +660,9 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                         atomicMax(&my_exch_u32_ptr[col_pair_base + 1], _amf_enc_2);
                     }
                     if (is_wg1 != 0) {
-                        asm volatile("barrier.sync 9, %0;" :: "r"(128));
+                        asm volatile("barrier.sync 9, 128;" ::: "memory");
                     } else {
-                        asm volatile("barrier.sync 8, %0;" :: "r"(128));
+                        asm volatile("barrier.sync 8, 128;" ::: "memory");
                     }
                     uint32_t _amf_u_3 = my_exch_u32_ptr[col_pair_base];
                     uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
@@ -726,7 +723,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (is_wg1 != 0) {
-                        asm volatile("barrier.arrive 11, %0;" :: "r"(256));
+                        asm volatile("barrier.arrive 11, 256;" ::: "memory");
                     } else {
                         mbarrier_arrive(corr_scale_0_addr);
                     }
@@ -812,9 +809,9 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     my_exch_ptr[warp_in_wg * 8 + col_pair_base + 1] = row_sum_pair[1];
                 }
                 if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 9, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 9, 128;" ::: "memory");
                 } else {
-                    asm volatile("barrier.sync 8, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 if (wg_tid < 4) {
                     my_corr_ptr[col_pair_base] = my_exch_ptr[col_pair_base] + my_exch_ptr[8 + col_pair_base] + my_exch_ptr[16 + col_pair_base] + my_exch_ptr[24 + col_pair_base];
@@ -823,19 +820,20 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     my_exch_ptr[col_pair_base + 1] = row_max_pair[1];
                 }
                 if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 9, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 9, 128;" ::: "memory");
                 } else {
-                    asm volatile("barrier.sync 8, %0;" :: "r"(128));
+                    asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 if (is_wg1 != 0) {
-                    asm volatile("barrier.arrive 11, %0;" :: "r"(256));
+                    asm volatile("barrier.arrive 11, 256;" ::: "memory");
                 } else {
                     mbarrier_arrive(corr_scale_0_addr);
                 }
             }
         }
+    }
     // ---- Role: correction ----
-    } else if (warp >= 8 && warp <= 11) {
+    if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
             const int tmem_row_base_v_1 = warp % 4 * 32;
@@ -870,7 +868,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     mbarrier_arrive(corr_empty_0_addr);
                     mbarrier_arrive(p_full_0_addr);
-                    asm volatile("barrier.sync 11, %0;" :: "r"(256));
+                    asm volatile("barrier.sync 11, 256;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     mbarrier_arrive(corr_empty_1_addr);
                     mbarrier_arrive(p_full_1_addr);
@@ -942,7 +940,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     }
                     mbarrier_arrive(o_empty_0_addr);
                     mbarrier_arrive(p_full_0_addr);
-                    asm volatile("barrier.sync 11, %0;" :: "r"(256));
+                    asm volatile("barrier.sync 11, 256;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_1[4];
                     tmem_ld_x4(&_tmem_load_1[0], taddr + 48 + (unsigned int)corr_row);
@@ -1009,7 +1007,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 }
                 mbarrier_wait(corr_scale_0_addr, _phase_corr_scale_0_0);
                 _phase_corr_scale_0_0 ^= 1;
-                asm volatile("barrier.sync 11, %0;" :: "r"(256));
+                asm volatile("barrier.sync 11, 256;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float scale0[8];
                 float scale1[8];
@@ -1062,10 +1060,10 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     if (group_ratio_rt > h_6) {
                         int q_head = kv_head_idx_1 * group_ratio_rt + h_6;
                         int o_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head) * HEAD_DIM + d_idx;
-                        *((__half*)(O_ptr + o_idx)) = __float2half_rn(final_o);
+                        *(reinterpret_cast<__half*>(O_ptr + o_idx) + (0)) = __float2half_rn(final_o);
                         if (d_idx == 0) {
                             int lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head;
-                            *((float*)(LSE_ptr + lse_idx)) = local_lse;
+                            *(reinterpret_cast<float*>(LSE_ptr + lse_idx) + (0)) = local_lse;
                         }
                     }
                 }
@@ -1077,8 +1075,9 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
             }
             mbarrier_arrive(tmem_dealloc_addr);
         }
+    }
     // ---- Role: mma_warp ----
-    } else if (warp == 12) {
+    if (warp == 12) {
         { // mma_warp_main
             const int tmem_s0v = taddr;
             const int tmem_s1v = taddr + 8;
@@ -1111,9 +1110,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(kv_full_addr, 0);
-                int _mma_a_addr_0 = smem_kv_addr;
-                int _mma_a_lo_0 = make_warp_uniform((_mma_a_addr_0 >> 4) & 0x3FFF);
-                int _mma_b_lo_0 = make_warp_uniform((smem_qt_addr >> 4) & 0x3FFF);
+                int _mma_a_lo_0 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (0) * 2048);
+                int _mma_b_lo_0 = make_warp_uniform(((smem_qt_addr) >> 4) & 0x3FFF);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1171,8 +1169,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 elect_commit(s_full_0_addr);
                 elect_commit(kv_empty_addr);
                 mbarrier_wait(kv_full_addr + 8, 0);
-                int _mma_a_addr_1 = smem_kv_addr + 32768;
-                int _mma_a_lo_1 = make_warp_uniform((_mma_a_addr_1 >> 4) & 0x3FFF);
+                int _mma_a_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (1) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1241,9 +1238,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                     _phase_p_full_0_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_addr_2 = smem_v_addr + (unsigned int)(s0_1 * 32768);
-                    int _mma_a_lo_2 = make_warp_uniform(((_mma_a_addr_2 >> 4) & 0x3FFF) | 0x4000000);
-                    int _mma_b_lo_2 = make_warp_uniform(((smem_p0_addr >> 4) & 0x3FFF) | 0x400000);
+                    int _mma_a_lo_2 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0_1) * 2048);
+                    int _mma_b_lo_2 = make_warp_uniform((((smem_p0_addr) >> 4) & 0x3FFF) | 0x400000);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1300,9 +1296,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_tmem_o0), "r"(((first_pv0) ? 0 : 1)));
                     elect_commit2(kv_empty_addr + (s0_1) * 8, o_ready_0_addr);
                     mbarrier_wait(kv_full_addr + (s0_next) * 8, 0);
-                    int _mma_a_addr_3 = smem_kv_addr + (unsigned int)(s0_next * 32768);
-                    int _mma_a_lo_3 = make_warp_uniform((_mma_a_addr_3 >> 4) & 0x3FFF);
-                    int _mma_b_lo_3 = make_warp_uniform((smem_qt_addr >> 4) & 0x3FFF);
+                    int _mma_a_lo_3 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s0_next) * 2048);
+                    int _mma_b_lo_3 = make_warp_uniform(((smem_qt_addr) >> 4) & 0x3FFF);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1365,9 +1360,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                     _phase_p_full_1_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_addr_4 = smem_v_addr + (unsigned int)(s1_1 * 32768);
-                    int _mma_a_lo_4 = make_warp_uniform(((_mma_a_addr_4 >> 4) & 0x3FFF) | 0x4000000);
-                    int _mma_b_lo_4 = make_warp_uniform(((smem_p1_addr >> 4) & 0x3FFF) | 0x400000);
+                    int _mma_a_lo_4 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1_1) * 2048);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_p1_addr) >> 4) & 0x3FFF) | 0x400000);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1424,8 +1418,7 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_tmem_o1), "r"(((first_pv1) ? 0 : 1)));
                     elect_commit2(kv_empty_addr + (s1_1) * 8, o_ready_1_addr);
                     mbarrier_wait(kv_full_addr + (s1_next) * 8, 0);
-                    int _mma_a_addr_5 = smem_kv_addr + (unsigned int)(s1_next * 32768);
-                    int _mma_a_lo_5 = make_warp_uniform((_mma_a_addr_5 >> 4) & 0x3FFF);
+                    int _mma_a_lo_5 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s1_next) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1495,9 +1488,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                 _phase_p_full_0_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                int _mma_a_addr_6 = smem_v_addr + (unsigned int)(s0_last * 32768);
-                int _mma_a_lo_6 = make_warp_uniform(((_mma_a_addr_6 >> 4) & 0x3FFF) | 0x4000000);
-                int _mma_b_lo_6 = make_warp_uniform(((smem_p0_addr >> 4) & 0x3FFF) | 0x400000);
+                int _mma_a_lo_6 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0_last) * 2048);
+                int _mma_b_lo_6 = make_warp_uniform((((smem_p0_addr) >> 4) & 0x3FFF) | 0x400000);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1559,9 +1551,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                 _phase_p_full_1_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                int _mma_a_addr_7 = smem_v_addr + (unsigned int)(s1_last * 32768);
-                int _mma_a_lo_7 = make_warp_uniform(((_mma_a_addr_7 >> 4) & 0x3FFF) | 0x4000000);
-                int _mma_b_lo_7 = make_warp_uniform(((smem_p1_addr >> 4) & 0x3FFF) | 0x400000);
+                int _mma_a_lo_7 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1_last) * 2048);
+                int _mma_b_lo_7 = make_warp_uniform((((smem_p1_addr) >> 4) & 0x3FFF) | 0x400000);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1623,10 +1614,10 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
             _phase_tmem_dealloc_0 ^= 1;
             int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
-            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
         }
+    }
     // ---- Role: load_pgoff ----
-    } else if (warp == 13) {
+    if (warp == 13) {
         { // load_pgoff_main
             unsigned int total_tiles_la = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
             #pragma unroll 1
@@ -1677,8 +1668,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                                 }
                             }
                         }
-                        kv_stage_la = (kv_stage_la + 1) % 4;
-                        if (kv_stage_la == 0) { kv_phase_la ^= 1; }
+                        kv_stage_la += 1;
+                        if (kv_stage_la == 4) { kv_stage_la = 0; kv_phase_la ^= 1; }
                     }
                     int main_ni_la = cta_n_blocks_3 - 2;
                     #pragma unroll 1
@@ -1766,11 +1757,13 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                 }
             }
         }
+    }
     // ---- Role: scheduler ----
-    } else if (warp == 14) {
+    if (warp == 14) {
         // idle — no tasks assigned
+    }
     // ---- Role: load_warp ----
-    } else if (warp == 15) {
+    if (warp == 15) {
         { // load_warp_main
             unsigned int total_tiles_l = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
             unsigned int _phase_q_empty_0 = 1;
@@ -1829,8 +1822,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
                                 }
                             }
                         }
-                        kv_stage = (kv_stage + 1) % 4;
-                        if (kv_stage == 0) { kv_phase ^= 1; }
+                        kv_stage += 1;
+                        if (kv_stage == 4) { kv_stage = 0; kv_phase ^= 1; }
                     }
                     int main_ni = cta_n_blocks_4 - 2;
                     #pragma unroll 1
@@ -1927,4 +1920,3 @@ kernel_cake_fmha_decode_native_fp16_nhd(const void* __restrict__ Qt, const void*
 }
 
 } // extern "C"
-

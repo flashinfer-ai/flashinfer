@@ -5,12 +5,12 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_native_fp16_hd512(const void* Qt, const void* K, const void* V, __half* O_ptr, float* LSE_ptr, int* page_table, int* causal_seqlens_kv_global, float* scale_log2_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size);
+extern "C" __global__ void kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __half* O_ptr, float* LSE_ptr, int* page_table, int* causal_seqlens_kv_global, float* scale_log2_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size);
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_fp16_hd512(
-    const void* Qt,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     __half* O_ptr,
     float* LSE_ptr,
     int* page_table,

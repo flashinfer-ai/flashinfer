@@ -5,12 +5,12 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_context_fp8_hd256(const void* Q, const void* K, const void* V, uint8_t* O_ptr, int* page_table, int* seq_lens_q, int* seq_lens_kv, int* cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int max_pages_per_seq, uint32_t* dynamic_counter);
+extern "C" __global__ void kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* O_ptr, int* page_table, int* seq_lens_q, int* seq_lens_kv, int* cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int max_pages_per_seq, uint32_t* dynamic_counter);
 
 extern "C" cudaError_t cake_fmha_launch_context_fp8_hd256(
-    const void* Q,
-    const void* K,
-    const void* V,
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
     uint8_t* O_ptr,
     int* page_table,
     int* seq_lens_q,
