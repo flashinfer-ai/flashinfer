@@ -180,9 +180,7 @@ class TestChunkScanCombined:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(
-        params=[128]
-    )  # Must match kernel's N (CUTLASS kernel is hardcoded for N=128)
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 
@@ -873,7 +871,7 @@ class TestChunkScanCombinedVarlen:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 
@@ -1366,7 +1364,7 @@ class TestChunkScanCombinedWithZ:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 

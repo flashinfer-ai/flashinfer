@@ -2718,6 +2718,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
+            tile=self.tile_shape_mnk_intra2[1:],  # NK = (D, L)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -2972,6 +2973,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
+            tile=self.tile_shape_mnk_intra1[1:],  # NK = (L, N)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -3634,12 +3636,13 @@ class SSDKernel:
         cluster_layout_vmnk,
         mma_tile_coord_v,
         block_in_cluster_coord_vmnk,
+        tile,
     ):
         # Local_tile partition global tensors
         # (D, L, 1, 1, C, EH, B)
         gX = cute.local_tile(
             tma_tensor_x,
-            self.tile_shape_mnk_intra2[1:],  # mnk = (L, D, L)
+            tile,
             (None, None, None, None, None),
         )
         # Partition global tensor with regard to TiledMMA
