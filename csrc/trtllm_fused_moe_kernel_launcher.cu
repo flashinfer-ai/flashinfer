@@ -4038,21 +4038,19 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   bool const matches_sm103_nvfp4_8k_fallback =
       config_index[0] == -1 && config_index[1] == -1 &&
       static_cast<RoutingInputMode>(routing_input_mode) == RoutingInputMode::PackedPrecomputed &&
-      mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1 &&
-      num_tokens == 8192 && num_experts == 384 && top_k == 8 && hidden_size == 7168 &&
-      output.size(1) == hidden_size && intermediate_size == 512 && local_expert_offset == 0 &&
-      local_num_experts == 384 && nFusedShared == 0 && !routing_bias.has_value() &&
-      !gemm1_bias.has_value() && !gemm1_lora_delta.has_value() && !gemm1_alpha.has_value() &&
-      !gemm1_beta.has_value() &&
+      mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1 && num_tokens == 8192 &&
+      num_experts == 384 && top_k == 8 && hidden_size == 7168 && output.size(1) == hidden_size &&
+      intermediate_size == 512 && local_expert_offset == 0 && local_num_experts == 384 &&
+      nFusedShared == 0 && !routing_bias.has_value() && !gemm1_bias.has_value() &&
+      !gemm1_lora_delta.has_value() && !gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
       !gemm1_clamp_limit.has_value() && !gemm2_bias.has_value() &&
       output1_scales_scalar.has_value() && output1_scales_gate_scalar.has_value() &&
       output2_scales_scalar.has_value() && !per_token_scales.has_value() &&
       routing_method_type == static_cast<int64_t>(RoutingMethodType::Renormalize) &&
       n_group.value_or(0) == 0 && topk_group.value_or(0) == 0 &&
       !routed_scaling_factor.has_value() && do_finalize && enable_pdl &&
-      act_type == static_cast<int64_t>(ActivationType::Swiglu) &&
-      !routing_replay_out.has_value() && da_routing_metadata.empty() && da_body_workspace.empty() &&
-      !is_da_body_preparation;
+      act_type == static_cast<int64_t>(ActivationType::Swiglu) && !routing_replay_out.has_value() &&
+      da_routing_metadata.empty() && da_body_workspace.empty() && !is_da_body_preparation;
   if (matches_sm103_nvfp4_8k_fallback) {
     int device_major = 0;
     int device_minor = 0;
