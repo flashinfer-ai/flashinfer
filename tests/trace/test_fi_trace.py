@@ -27,7 +27,11 @@ import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
-from flashinfer.trace.templates.gemm import bmm_mxfp8_trace, mm_mxfp8_trace
+from flashinfer.trace.templates.gemm import (
+    bmm_mxfp8_trace,
+    mm_mxfp8_dynamic_quant_trace,
+    mm_mxfp8_trace,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +456,25 @@ def test_mxfp8_trace_references_are_self_contained():
         batched_scale,
         torch.bfloat16,
     ).shape == (batch_size, m, n)
+
+
+def test_mxfp8_dynamic_quant_trace_handles_padded_weight_scales():
+    m, n, k = 3, 160, 256
+    a = torch.zeros((m, k), dtype=torch.bfloat16)
+    weight = torch.zeros((n, k), dtype=torch.float8_e4m3fn)
+    b_descale = torch.full((_mxfp8_scale_buffer_size(n, k),), 127, dtype=torch.uint8)
+    defn = mm_mxfp8_dynamic_quant_trace.build_fi_trace_fn(
+        "flashinfer.gemm.mm_mxfp8_dynamic_quant"
+    )(a=a, b=weight.T, b_descale=b_descale)
+
+    _check_defn(defn, "gemm_mxfp8_dynamic_quant", "mm_mxfp8_dynamic_quant")
+    namespace: dict[str, object] = {}
+    exec(defn["reference"], namespace)
+    reference = cast(
+        Callable[..., torch.Tensor],
+        namespace["_mm_mxfp8_dynamic_quant_reference"],
+    )
+    assert reference(a, weight.T, b_descale).shape == (m, n)
 
 
 def test_bmm_mxfp8_trace_init_quantizes_each_batch(

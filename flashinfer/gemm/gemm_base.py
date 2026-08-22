@@ -37,6 +37,7 @@ from ..trace.templates.gemm import (
     mm_bf16_trace,
     mm_fp4_trace,
     mm_fp8_trace,
+    mm_mxfp8_dynamic_quant_trace,
     mm_mxfp8_trace,
 )
 from ..trace.templates.attention import segment_gemm_run_trace
@@ -99,6 +100,8 @@ from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
+from ..quantization.fp8_quantization import mxfp8_quantize
+from ..quantization.fp4_quantization import shuffle_matrix_a, shuffle_matrix_sf_a
 from .routergemm import get_tinygemm2_module
 
 
@@ -5680,7 +5683,7 @@ def mm_mxfp8(
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
-        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+        "trtllm": lambda: get_trtllm_gemm_module(a.device).trtllm_mxfp8_gemm_runner(
             use_8x4_sf_layout
         ),
         "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
@@ -5694,11 +5697,12 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends == ["cute-dsl"]
-        else _MM_MXFP8_TUNING_CONFIG
-    )
+    if backends == ["cute-dsl"]:
+        tuning_config = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+    elif backends == ["trtllm"]:
+        tuning_config = _MM_MXFP8_TUNING_CONFIG
+    else:
+        tuning_config = _MM_MXFP8_TUNING_CONFIG
 
     inputs = [
         a,
@@ -5719,6 +5723,282 @@ def mm_mxfp8(
 
     runner(inputs=inputs, tactic=tactic)
     return out
+
+
+@flashinfer_api
+def prepare_mxfp8_trtllm_weights(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Prepare linear-layout MXFP8 weights for TRTLLM GEMM kernels.
+
+    ``weight`` and ``weight_scale`` are the outputs of
+    :func:`flashinfer.mxfp8_quantize` with ``sf_swizzle_layout=layout_linear``.
+    This function row-shuffles the weight, pads scale rows to the physical
+    128x4 layout, and returns the column-major weight view consumed by
+    :func:`mm_mxfp8_dynamic_quant`.
+
+    Parameters
+    ----------
+    weight : torch.Tensor
+        Contiguous MXFP8 weight with shape ``(N, K)``.
+    weight_scale : torch.Tensor
+        Linear E8M0 scales with ``N * (K // 32)`` elements.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        The TRTLLM-shuffled weight view with shape ``(K, N)`` and the flattened
+        128x4 E8M0 scale buffer.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"weight must have shape (N, K), got {weight.shape}")
+    n, k = weight.shape
+    if weight.dtype != torch.float8_e4m3fn or weight_scale.dtype != torch.uint8:
+        raise ValueError("weight and weight_scale must use MXFP8 storage")
+    if weight.device.type != "cuda":
+        raise ValueError("weight and weight_scale must be CUDA tensors")
+    if weight.device != weight_scale.device:
+        raise ValueError("weight and weight_scale must be on the same CUDA device")
+    if not weight.is_contiguous() or not weight_scale.is_contiguous():
+        raise ValueError("weight and weight_scale must be contiguous")
+    if n < 128 or n % 32 != 0:
+        raise ValueError(f"TRTLLM MXFP8 requires N >= 128 and divisible by 32, got {n}")
+    if k <= 0 or k % 256 != 0:
+        raise ValueError(f"TRTLLM MXFP8 requires K divisible by 256, got {k}")
+    if weight_scale.numel() != n * (k // 32):
+        raise ValueError(
+            "weight_scale must contain one linear scale per 32 weight values; "
+            f"expected {n * (k // 32)}, got {weight_scale.numel()}"
+        )
+
+    with torch.cuda.device(weight.device):
+        linear_scale = weight_scale.reshape(n, k // 32)
+        padded_n = _pad_up(n, 128)
+        if padded_n != n:
+            padding = torch.full(
+                (padded_n - n, k // 32),
+                127,
+                dtype=weight_scale.dtype,
+                device=weight_scale.device,
+            )
+            linear_scale = torch.cat((linear_scale, padding), dim=0)
+
+        prepared_weight = shuffle_matrix_a(weight, 128).reshape(n, k).T
+        prepared_scale = shuffle_matrix_sf_a(
+            linear_scale,
+            128,
+            num_elts_per_sf=32,
+        ).reshape(-1)
+        return prepared_weight, prepared_scale
+
+
+class _TrtllmDynamicQuantMxfp8Runner(TunableRunner):
+    def __init__(self, device: torch.device) -> None:
+        module = get_trtllm_gemm_module(device)
+        self._module = module
+        self._compute_capability = get_compute_capability(device)
+        self._gemm_runner_8x4 = module.trtllm_mxfp8_gemm_runner(True)
+        self._gemm_runner_128x4 = module.trtllm_mxfp8_gemm_runner(False)
+
+    def get_cache_key_extras(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[tuple[int, int]]:
+        return (self._compute_capability,)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[tuple[bool, int]]:
+        a_shape, b_shape = profile.get_opt_shapes()[:2]
+        return [
+            (use_8x4_sf_layout, tactic)
+            for use_8x4_sf_layout in (True, False)
+            for tactic in self._module.trtllm_mxfp8_gemm_tactics(
+                a_shape[0],
+                b_shape[1],
+                a_shape[1],
+                use_8x4_sf_layout,
+            )
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int | tuple[bool, int] = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        a, b, b_descale, out_dtype, out, workspace_buffer = inputs
+        if isinstance(tactic, tuple):
+            use_8x4_sf_layout, gemm_tactic = tactic
+        else:
+            use_8x4_sf_layout, gemm_tactic = True, tactic
+        sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
+        a_mxfp8, a_descale = mxfp8_quantize(a, sf_swizzle_layout=sf_layout)
+        gemm_runner = (
+            self._gemm_runner_8x4 if use_8x4_sf_layout else self._gemm_runner_128x4
+        )
+        return gemm_runner(
+            inputs=[
+                a_mxfp8,
+                b,
+                a_descale,
+                b_descale,
+                out_dtype,
+                out,
+                workspace_buffer,
+            ],
+            tactic=gemm_tactic,
+            do_preparation=do_preparation,
+        )
+
+
+def _check_mm_mxfp8_dynamic_quant_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["trtllm"] = "trtllm",
+) -> bool:
+    if a.dtype != torch.bfloat16:
+        raise ValueError(f"a must be a bfloat16 tensor, got {a.dtype}")
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError(f"expected a[M, K] and b[K, N], got {a.shape=} and {b.shape=}")
+    if a.shape[0] <= 0:
+        raise ValueError(f"TRTLLM MXFP8 M must be positive, got {a.shape[0]}")
+    if b.shape[1] < 128:
+        raise ValueError(f"TRTLLM MXFP8 requires N >= 128, got {b.shape[1]}")
+    if b.shape[1] % 32 != 0:
+        raise ValueError(f"TRTLLM MXFP8 requires N divisible by 32, got {b.shape[1]}")
+    if a.shape[1] <= 0:
+        raise ValueError(f"TRTLLM MXFP8 K must be positive, got {a.shape[1]}")
+    if b.dtype != torch.float8_e4m3fn or b_descale.dtype != torch.uint8:
+        raise ValueError("b and b_descale must use TRTLLM MXFP8 weight storage")
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            "TRTLLM MXFP8 dynamic quantization supports bfloat16 output only"
+        )
+    if a.device != b.device or a.device != b_descale.device:
+        raise ValueError("a, b, and b_descale must be on the same CUDA device")
+    if not a.is_contiguous():
+        raise ValueError("a must be contiguous")
+    if b.stride() != (1, b.shape[0]):
+        raise ValueError("b must be a column-major view of shuffled TRTLLM weights")
+    if not b_descale.is_contiguous():
+        raise ValueError("b_descale must be contiguous")
+    if a.shape[1] % 256 != 0:
+        raise ValueError(f"TRTLLM MXFP8 requires K divisible by 256, got {a.shape[1]}")
+    expected_b_descale_len = _mxfp8_swizzled_scale_len(
+        b.shape[1],
+        b.shape[0],
+        SfLayout.layout_128x4,
+    )
+    if b_descale.ndim != 1 or b_descale.numel() != expected_b_descale_len:
+        raise ValueError(
+            "b_descale must be the shuffled 128x4 weight-scale buffer; "
+            f"expected {expected_b_descale_len} elements, got {b_descale.shape}"
+        )
+    if out is not None and (
+        out.shape != (a.shape[0], b.shape[1])
+        or out.device != a.device
+        or out.dtype != out_dtype
+        or not out.is_contiguous()
+    ):
+        raise ValueError("out must match the expected shape, device, and output dtype")
+    return True
+
+
+@supported_compute_capability([100, 103, 107])
+def _trtllm_dynamic_quant_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["trtllm"] = "trtllm",
+) -> bool:
+    return True
+
+
+@backend_requirement(
+    {"trtllm": _trtllm_dynamic_quant_mxfp8_requirement},
+    common_check=_check_mm_mxfp8_dynamic_quant_problem_size,
+)
+@flashinfer_api(trace=mm_mxfp8_dynamic_quant_trace)
+def mm_mxfp8_dynamic_quant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["trtllm"] = "trtllm",
+) -> torch.Tensor:
+    r"""Quantize BF16 activations and run a TRTLLM MXFP8 GEMM.
+
+    The autotuner profiles activation quantization and GEMM together, jointly
+    selecting the activation scale layout and TRTLLM tactic. Weights must use
+    TRTLLM's shuffled 128x4 MXFP8 storage. Run autotuning during model warmup
+    and load the resulting cache before CUDA Graph capture. Without a cached
+    result, this API uses TRTLLM's existing 8x4 fallback. Blackwell SM100,
+    SM103, and SM107 are supported. ``N`` must be at least 128 and divisible
+    by 32; ``K`` must be divisible by 256. Autotuning evaluates exact
+    ``M=1..32`` profiles, which increases one-time warmup work but avoids
+    sharing decode tactics across distinct low-token shapes.
+
+    Prepare weights once before warmup::
+
+        weight_q, weight_sf = flashinfer.mxfp8_quantize(
+            weight, sf_swizzle_layout=flashinfer.SfLayout.layout_linear
+        )
+        b, b_descale = flashinfer.prepare_mxfp8_trtllm_weights(
+            weight_q, weight_sf
+        )
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Contiguous BF16 activation matrix with shape ``(M, K)``.
+    b : torch.Tensor
+        Column-major MXFP8 weight view with shape ``(K, N)``. The underlying
+        ``(N, K)`` weight and its scales must use TRTLLM's shuffled layout.
+    b_descale : torch.Tensor
+        Contiguous, flattened E8M0 weight-scale buffer in 128x4 layout.
+    out : Optional[torch.Tensor]
+        Optional contiguous BF16 output buffer with shape ``(M, N)``.
+    out_dtype : torch.dtype
+        Output dtype. Only ``torch.bfloat16`` is supported.
+    backend : Literal["trtllm"]
+        GEMM backend. Only ``"trtllm"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 output matrix with shape ``(M, N)``.
+    """
+    with torch.cuda.device(a.device):
+        if out is None:
+            out = torch.empty(
+                (a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype
+            )
+
+        workspace_buffer = _get_cache_buf(
+            "mm_mxfp8_dynamic_quant_workspace",
+            DEFAULT_WORKSPACE_SIZE,
+            a.device,
+        )
+        runners: List[TunableRunner] = [_TrtllmDynamicQuantMxfp8Runner(a.device)]
+        inputs = [a, b, b_descale, out_dtype, out, workspace_buffer]
+        runner, tactic = AutoTuner.get().choose_one(
+            custom_op="mxfp8_dynamic_quant_gemm",
+            runners=runners,
+            tuning_config=_MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG,
+            inputs=inputs,
+        )
+        runner(inputs=inputs, tactic=tactic)
+        return out
 
 
 def _cudnn_gemm_fp4(
@@ -7038,6 +7318,49 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
 )
 
 
+_TRTLLM_MXFP8_EXACT_M_MAX = 32
+
+
+def _get_trtllm_mxfp8_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    exact_end = min(max(max_num_tokens, 1), _TRTLLM_MXFP8_EXACT_M_MAX)
+    exact = range(1, exact_end + 1)
+    hybrid_max = _map_to_trtllm_mxfp8_tuning_bucket(max(max_num_tokens, 1))
+    hybrid = get_hybrid_num_tokens_buckets(hybrid_max)
+    return tuple(sorted(set(exact).union(hybrid)))
+
+
+def _map_to_trtllm_mxfp8_tuning_bucket(num_tokens: int) -> int:
+    if num_tokens <= 0:
+        return 1
+    if num_tokens <= _TRTLLM_MXFP8_EXACT_M_MAX:
+        return num_tokens
+    return map_to_hybrid_bucket_uncapped(num_tokens)
+
+
+_TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS = (
+    DynamicTensorSpec(
+        (0,),
+        (0,),
+        _get_trtllm_mxfp8_tuning_buckets,
+        _map_to_trtllm_mxfp8_tuning_bucket,
+    ),
+)
+
+
+_MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
+    dynamic_tensor_specs=_TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS,
+    constraint_specs=(
+        ConstraintSpec(
+            4,
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_gemm_fp4_requirement,
@@ -7751,8 +8074,9 @@ def gemm_fp8_nt_groupwise(
     return out
 
 
-def get_trtllm_gemm_module():
-    device = torch.device("cuda", torch.cuda.current_device())
+def get_trtllm_gemm_module(device: Optional[torch.device] = None):
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     enable_rubin = get_compute_capability(device) == (10, 7)
     return _get_trtllm_gemm_module_impl(enable_rubin)
 
@@ -7762,6 +8086,23 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
     mod = gen_trtllm_gen_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
     setup_cubin_loader(str(mod.get_library_path()))
+
+    def trtllm_mxfp8_gemm_tactics(
+        m: int,
+        n: int,
+        k: int,
+        use_8x4_sf_layout: bool,
+    ) -> List[int]:
+        return list(
+            op.trtllm_gemm_tactics(
+                m,
+                n,
+                k,
+                DtypeTrtllmGen.MxE4m3,
+                DtypeTrtllmGen.Bfloat16,
+                use_8x4_sf_layout,
+            )
+        )
 
     class TrtllmGemmRunner(TunableRunner):
         def __init__(
@@ -7860,7 +8201,7 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
                 a,
                 b.T,
                 a_descale,
-                b_descale.T,
+                b_descale.mT if b_descale.ndim == 2 else b_descale,
                 alpha,
                 out,
                 self._use_8x4_sf_layout,
@@ -7920,6 +8261,7 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
         trtllm_gemm_runner=trtllm_gemm_runner,
         trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
         trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
+        trtllm_mxfp8_gemm_tactics=trtllm_mxfp8_gemm_tactics,
         trtllm_gemm=op.trtllm_gemm,
     )
 
