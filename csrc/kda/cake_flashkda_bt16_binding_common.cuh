@@ -308,15 +308,27 @@ struct Bt16PrepareTmaPointers {
   void* ws_w;
 };
 
+template <bool UsesBetaTma>
 inline Bt16PrepareTmaPointers EncodeBt16PrepareTma(
     const TensorView& q, const TensorView& k, const TensorView& raw_gate,
     const TensorView& beta_logits, const TensorView& ws_qd, const TensorView& ws_kd,
     const TensorView& ws_w, const TensorView& descriptor_storage, int64_t prepare_descriptors,
     cudaStream_t stream) {
   if (prepare_descriptors != 0) {
-    PublishBt16Maps({EncodeQkTma<16>(q, "q"), EncodeQkTma<16>(k, "k"), EncodeGateTma<16>(raw_gate),
-                     EncodeBetaTma<16>(beta_logits), EncodeBt16FactorTma<2>(ws_qd, "ws_qd"),
-                     EncodeBt16FactorTma<2>(ws_kd, "ws_kd"), EncodeBt16FactorTma<1>(ws_w, "ws_w")},
+    const CUtensorMap raw_gate_map = EncodeGateTma<16>(raw_gate);
+    CUtensorMap beta_map{};
+    if constexpr (UsesBetaTma) {
+      beta_map = EncodeBetaTma<16>(beta_logits);
+    } else {
+      // The scalar-beta frozen kernel only acquires the descriptor address; it
+      // reads beta_logits directly and never consumes this tensor map. Keep the
+      // seven-slot ABI stable with a valid descriptor so H < 8 does not need to
+      // satisfy the beta-TMA box constraints.
+      beta_map = raw_gate_map;
+    }
+    PublishBt16Maps({EncodeQkTma<16>(q, "q"), EncodeQkTma<16>(k, "k"), raw_gate_map, beta_map,
+                     EncodeBt16FactorTma<2>(ws_qd, "ws_qd"), EncodeBt16FactorTma<2>(ws_kd, "ws_kd"),
+                     EncodeBt16FactorTma<1>(ws_w, "ws_w")},
                     descriptor_storage, prepare_descriptors, stream);
   }
   auto* bytes = static_cast<unsigned char*>(descriptor_storage.data_ptr());
