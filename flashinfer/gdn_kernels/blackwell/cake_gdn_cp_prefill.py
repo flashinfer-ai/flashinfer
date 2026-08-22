@@ -178,8 +178,8 @@ def _read_seq_lens(
     if len(values) < 2 or values[0] != 0 or values[-1] != total_tokens:
         raise ValueError("cu_seqlens must start at zero and end at q.shape[0]")
     lengths = tuple(end - start for start, end in pairwise(values))
-    if any(length <= 0 for length in lengths):
-        raise ValueError("cu_seqlens must describe nonempty positive-length sequences")
+    if any(length < 0 for length in lengths):
+        raise ValueError("cu_seqlens must describe nonnegative sequence lengths")
     if expected is not None and tuple(int(length) for length in expected) != lengths:
         raise ValueError("seq_lens does not match cu_seqlens")
     return lengths
@@ -293,11 +293,16 @@ def _validate_state(
     expected_inner = (plan.num_sab_heads, _HEAD_DIM, _HEAD_DIM)
     if tensor.ndim != 4 or tuple(tensor.shape[1:]) != expected_inner:
         raise ValueError(f"{name} must have shape [N, {expected_inner[0]}, 128, 128]")
-    if tuple(tensor.stride()[1:]) != (_HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1):
-        raise ValueError(f"{name} must be contiguous in inner [H, V, K] modes")
-    inner = plan.num_sab_heads * _HEAD_DIM * _HEAD_DIM
-    if int(tensor.shape[0]) > 1 and int(tensor.stride(0)) < inner:
-        raise ValueError(f"{name} rows overlap: stride(0) must be at least {inner}")
+    if any(int(stride) <= 0 for stride in tensor.stride()):
+        raise ValueError(f"{name} strides must be positive")
+    inner_span = 1 + sum(
+        (int(size) - 1) * int(stride)
+        for size, stride in zip(tensor.shape[1:], tensor.stride()[1:], strict=True)
+    )
+    if int(tensor.shape[0]) > 1 and int(tensor.stride(0)) < inner_span:
+        raise ValueError(
+            f"{name} rows overlap: stride(0) must be at least {inner_span}"
+        )
     if not indexed and (
         int(tensor.shape[0]) != plan.num_seqs or not tensor.is_contiguous()
     ):
@@ -307,8 +312,10 @@ def _validate_state(
 def _state_carrier(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.is_contiguous():
         return tensor
-    inner = int(tensor.shape[1]) * _HEAD_DIM * _HEAD_DIM
-    span = (int(tensor.shape[0]) - 1) * int(tensor.stride(0)) + inner
+    span = 1 + sum(
+        (int(size) - 1) * int(stride)
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
     return tensor.as_strided((span,), (1,), storage_offset=int(tensor.storage_offset()))
 
 
@@ -652,6 +659,9 @@ class CakeGDNCPPrefill:
                 self.state_indices,
                 self.initial_state,
                 int(self.initial_state_input.stride(0)),
+                int(self.initial_state_input.stride(1)),
+                int(self.initial_state_input.stride(2)),
+                int(self.initial_state_input.stride(3)),
                 p.num_sab_heads,
                 total_values,
                 int(self._use_state_indices),
@@ -681,6 +691,9 @@ class CakeGDNCPPrefill:
                 self.checkpoint_indices,
                 self.state_checkpoints,
                 int(self.fixed_state.stride(0)),
+                int(self.fixed_state.stride(1)),
+                int(self.fixed_state.stride(2)),
+                int(self.fixed_state.stride(3)),
                 p.num_sab_heads,
                 total_values,
                 1,
@@ -696,6 +709,9 @@ class CakeGDNCPPrefill:
                 self.state_indices,
                 self._scatter_output,
                 int(self.final_state.stride(0)),
+                int(self.final_state.stride(1)),
+                int(self.final_state.stride(2)),
+                int(self.final_state.stride(3)),
                 p.num_sab_heads,
                 total_values,
                 int(self._use_state_indices),
@@ -829,11 +845,13 @@ def prepare_cake_gdn_cp_prefill(
 
     indexed = state_indices is not None
     if state_indices is not None:
+        if state_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("state_indices must have int32 or int64 dtype")
         _validate_contiguous_tensor(
             state_indices,
             name="state_indices",
             shape=(plan.num_seqs,),
-            dtype=torch.int32,
+            dtype=state_indices.dtype,
             device=device,
         )
     if checkpoint_every_n_tokens:
@@ -977,7 +995,7 @@ _public_metadata_binding: (
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
-        int,
+        int | None,
         int | None,
         int | None,
         tuple[
@@ -1015,6 +1033,19 @@ def _metadata_signature(
     return cu_values, state_values, checkpoint_values
 
 
+def _metadata_version(tensor: torch.Tensor | None) -> int | None:
+    """Return a mutation counter when the tensor type provides one."""
+
+    if tensor is None:
+        return None
+    try:
+        return int(tensor._version)
+    except RuntimeError:
+        if not torch.is_inference(tensor):
+            raise
+        return None
+
+
 def _reset_cake_gdn_cp_prefill_cache() -> None:
     """Release the internal public-dispatch plan and its owned workspaces."""
 
@@ -1046,12 +1077,9 @@ def chunk_gated_delta_rule_cake_sm100(
 
     global _public_key, _public_metadata_binding, _public_prepared
     stream = torch.cuda.current_stream(q.device)
-    state_indices_version = (
-        int(state_indices._version) if state_indices is not None else None
-    )
-    checkpoint_cu_starts_version = (
-        int(checkpoint_cu_starts._version) if checkpoint_cu_starts is not None else None
-    )
+    cu_seqlens_version = _metadata_version(cu_seqlens)
+    state_indices_version = _metadata_version(state_indices)
+    checkpoint_cu_starts_version = _metadata_version(checkpoint_cu_starts)
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing:
         if not (
@@ -1059,7 +1087,7 @@ def chunk_gated_delta_rule_cake_sm100(
             and _public_metadata_binding[0] is cu_seqlens
             and _public_metadata_binding[1] is state_indices
             and _public_metadata_binding[2] is checkpoint_cu_starts
-            and _public_metadata_binding[3] == int(cu_seqlens._version)
+            and _public_metadata_binding[3] == cu_seqlens_version
             and _public_metadata_binding[4] == state_indices_version
             and _public_metadata_binding[5] == checkpoint_cu_starts_version
         ):
@@ -1127,7 +1155,7 @@ def chunk_gated_delta_rule_cake_sm100(
             cu_seqlens,
             state_indices,
             checkpoint_cu_starts,
-            int(cu_seqlens._version),
+            cu_seqlens_version,
             state_indices_version,
             checkpoint_cu_starts_version,
             metadata_signature,
@@ -1140,7 +1168,7 @@ def chunk_gated_delta_rule_cake_sm100(
             cu_seqlens,
             state_indices,
             checkpoint_cu_starts,
-            int(cu_seqlens._version),
+            cu_seqlens_version,
             state_indices_version,
             checkpoint_cu_starts_version,
             metadata_signature,

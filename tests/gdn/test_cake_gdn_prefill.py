@@ -29,6 +29,14 @@ from flashinfer.jit import cake_gdn_cp_prefill as cake_jit
 from flashinfer.utils import is_sm100a_supported
 
 
+_CAKE_SM100_CUDA13_AVAILABLE = (
+    torch.cuda.is_available()
+    and is_sm100a_supported(torch.device("cuda"))
+    and torch.version.cuda is not None
+    and int(torch.version.cuda.split(".")[0]) >= 13
+)
+
+
 def _source_root() -> Path:
     return Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "cake"
 
@@ -301,6 +309,58 @@ def test_indexed_state_rows_must_not_overlap() -> None:
             device=torch.device("cpu"),
             indexed=True,
         )
+
+
+def test_indexed_state_preserves_positive_inner_strides() -> None:
+    heads = 2
+    inner_stride = 2
+    strides = (
+        heads * 128 * 128 * inner_stride + 96,
+        128 * 128 * inner_stride,
+        128 * inner_stride,
+        inner_stride,
+    )
+    span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip((3, heads, 128, 128), strides, strict=True)
+    )
+    state = torch.empty(span, dtype=torch.float32).as_strided(
+        (3, heads, 128, 128),
+        strides,
+    )
+    plan = SimpleNamespace(num_sab_heads=heads, num_seqs=1)
+
+    cake._validate_state(
+        state,
+        name="initial_state",
+        plan=plan,
+        device=torch.device("cpu"),
+        indexed=True,
+    )
+    assert cake._state_carrier(state).numel() == span
+
+
+def test_sequence_lengths_allow_empty_rows_but_not_decreasing_offsets() -> None:
+    cu_seqlens = torch.tensor([0, 4, 4], dtype=torch.int64)
+    assert cake._read_seq_lens(
+        cu_seqlens,
+        total_tokens=4,
+        expected=None,
+    ) == (4, 0)
+
+    with pytest.raises(ValueError, match="nonnegative"):
+        cake._read_seq_lens(
+            torch.tensor([0, 4, 3], dtype=torch.int64),
+            total_tokens=3,
+            expected=None,
+        )
+
+
+def test_metadata_version_accepts_inference_tensors() -> None:
+    with torch.inference_mode():
+        metadata = torch.tensor([0, 4], dtype=torch.int64)
+        assert torch.is_inference(metadata)
+        assert cake._metadata_version(metadata) is None
 
 
 def test_public_cake_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
@@ -696,8 +756,8 @@ def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an exact SM100a or SM103a GPU",
+    not _CAKE_SM100_CUDA13_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with CUDA 13+",
 )
 @pytest.mark.parametrize(
     ("total", "hq", "hv"),
@@ -775,8 +835,8 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an exact SM100a or SM103a GPU",
+    not _CAKE_SM100_CUDA13_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with CUDA 13+",
 )
 def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
@@ -933,8 +993,8 @@ def _allocate_state_pool(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an SM100a-compatible GPU",
+    not _CAKE_SM100_CUDA13_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with CUDA 13+",
 )
 @pytest.mark.parametrize(
     "case",
@@ -1153,8 +1213,8 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an SM100a-compatible GPU",
+    not _CAKE_SM100_CUDA13_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with CUDA 13+",
 )
 def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
