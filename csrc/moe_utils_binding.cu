@@ -333,7 +333,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_bf16, moe_activation_bf1
 
 // ============================ moeSort bindings ============================
 // moe_sort - Sort tokens by expert assignment and generate mapping tensors
-// This uses DeepSeekV3 routing method with pre-computed expert selections
+// This uses the shared routing pipeline with pre-computed expert selections.
 //
 // Returns via output pointers:
 // - tile_idx_to_expert_idx: [max_num_tiles], mapping from tile to local expert index
@@ -367,8 +367,8 @@ void moe_sort(
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
-  // Set up the routing data structure
-  moe::dev::routing::routingDeepSeek::Data routingData;
+  // Set up the routing-neutral post-TopK data structure.
+  moe::dev::routing::routingCustom::Data routingData{};
 
   // Configure dtypes
   routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
@@ -409,28 +409,26 @@ void moe_sort(
   routingData.mLocalExpertsStrideLog2 = 0;
   routingData.mNumLocalExperts = num_local_experts;
 
-  // Fused shared expert fields — unused in cute DSL moe_sort path, but must be zero-initialized
-  // because the routing kernel reads mNumFusedSharedExperts unconditionally (adds it to numExperts
-  // and topK at lines 576-577 of trtllm_fused_moe_routing_deepseek.cu).
+  // CuTe DSL moe_sort has no fused shared expert. Keep the shared post-TopK metadata explicit.
   routingData.mNumFusedSharedExperts = 0;
   routingData.mSharedExpertTokenOffset = 0;
   routingData.mSharedExpertNumTokens = 0;
   routingData.mTotalExpertsPerToken = top_k;
 
-  // DeepSeekV3 specific parameters
-  // For moe_sort, we use n_group=1, topk_group=1 since experts are already selected
-  routingData.mNumExpertGroups = 1;
-  routingData.mNumLimitedGroups = 1;
-  routingData.mRouteScale = 1.0f;
-  routingData.mSumEpsilon = 1e-20f;
-  routingData.mUseRoutingSoftmax = false;
+  // moe_sort already receives selected experts and weights, so call the shared post-TopK pipeline
+  // without compiling score-routing implementations.
+  FLASHINFER_CHECK(routingData.mPtrTopKIds != nullptr,
+                   "Routing kernel requires at least one input parameter");
+  FLASHINFER_CHECK(routingData.mTopK > 0, "mTopK must be positive");
+  FLASHINFER_CHECK(routingData.mPtrTopKWeights != nullptr,
+                   "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
+                   "precomputed routing.");
 
-  // Run the routing kernel
   // Use explicit stream if provided (for CUDA graph compatibility), otherwise fall back to TVM FFI
   // stream
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
-  moe::dev::routing::routingDeepSeek::run(routingData, stream);
+  moe::dev::routing::runPostTopKPipeline(routingData, stream);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
