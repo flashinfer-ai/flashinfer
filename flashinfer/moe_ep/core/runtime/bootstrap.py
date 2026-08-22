@@ -51,16 +51,34 @@ def _launched_via_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
 
+def _single_gpu_gloo() -> bool:
+    # Same env the kernel drops' own bootstraps honor (read at call time):
+    # rank-sharing single-GPU boxes (RTX sm_12x, GB10 / DGX Spark) cannot
+    # build an NCCL communicator with two ranks on one device, so the process
+    # group falls back to gloo and NVSHMEM UID travels over CPU.
+    return bool(int(os.environ.get("MEGA_SINGLE_GPU_GLOO", "0")))
+
+
 def _resolve_local_device(bootstrap: BootstrapConfig) -> int:
     """CUDA device ordinal for this rank.
 
     ``bootstrap.device`` wins when set (host frameworks pass the device they
     already bound); otherwise fall back to the LOCAL_RANK env var and then
-    ``bootstrap.rank`` (torchrun convention).
+    ``bootstrap.rank`` (torchrun convention). Only under the sm_12x
+    rank-sharing flow (``MEGA_SINGLE_GPU_GLOO=1``, N ranks per GPU) is the
+    rank folded onto the physical GPUs (``local_rank % device_count``,
+    drop-bootstrap parity); the default one-rank-per-GPU mapping stays raw.
     """
     if bootstrap.device is not None:
         return bootstrap.device
-    return int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+
+    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+    if not _single_gpu_gloo():
+        return local_rank
+    import torch
+
+    count = torch.cuda.device_count()
+    return local_rank % count if count else 0
 
 
 def _ensure_cuda_device(bootstrap: BootstrapConfig) -> None:
@@ -93,8 +111,11 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
     _ensure_cuda_device(bootstrap)
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
-        dist.init_process_group(backend="nccl", device_id=device)
+        if _single_gpu_gloo():
+            dist.init_process_group(backend="gloo")
+        else:
+            device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
+            dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
         dist.init_process_group(
             backend="gloo",
@@ -156,10 +177,17 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
 
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(uid_tensor, src=0, group=pg)
-    dist.barrier(group=pg)
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
+    if _single_gpu_gloo():
+        # gloo has no CUDA broadcast; the UID travels on the host.
+        uid_tensor = torch.from_numpy(uid_bytes)
+        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.barrier(group=pg)
+        uid._data[:] = uid_tensor.numpy().view(uid._data.dtype)
+    else:
+        uid_tensor = torch.from_numpy(uid_bytes).cuda()
+        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.barrier(group=pg)
+        uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
 
     nvshmem.core.init(
         device=dev,
@@ -288,6 +316,16 @@ def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
+def sm120_mxfp8_cutedsl_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the SM120 swap-AB MXFP8 mega kernel.
+
+    Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
+    """
+    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+
 __all__ = [
     "MoEEpRuntimeHandle",
     "NVSHMEM",
@@ -299,5 +337,6 @@ __all__ = [
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",
+    "sm120_mxfp8_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
